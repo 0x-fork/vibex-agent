@@ -15049,6 +15049,16 @@ impl VibexWorkbench {
         }
     }
 
+    /// Whether a session is known to own delegated children.
+    ///
+    /// Only a tree node or a loaded page can answer that. A session the
+    /// ownership tree has not seen used to answer "yes" on the grounds that it
+    /// might, which drew a disclosure in front of every row whose branch had
+    /// not been fetched yet — most of a long list, each one a toggle that
+    /// expanded to nothing. A branch nobody has asked about is unknown now, and
+    /// an unknown row draws no disclosure; the branch still loads when the
+    /// reader arrives at one of its children, which is also what puts the
+    /// toggle back on the parent's row.
     fn delegated_has_children(&self, session_id: &str) -> bool {
         self.delegated_tree
             .get(session_id)
@@ -15057,10 +15067,6 @@ impl VibexWorkbench {
                 .delegated_pages
                 .get(&Some(session_id.to_string()))
                 .is_some_and(|page| !page.session_ids.is_empty() || page.next_cursor.is_some())
-            || (!self.delegated_tree.contains_key(session_id)
-                && !self
-                    .delegated_pages
-                    .contains_key(&Some(session_id.to_string())))
     }
 
     fn delegated_branch_is_collapsed(&self, session_id: &str) -> bool {

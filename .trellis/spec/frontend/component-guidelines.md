@@ -658,19 +658,33 @@ The fixed rem-sized canvas changes only cell brightness, preserving adjacent
 text and row geometry. Keep the frame budget bounded, and render a fully
 visible static V for reduced motion or the opt-in inactive-window pause.
 Only live turns show the timeline mark. Sidebar session, group, and workspace
-rows use `ActivityIndicator::sidebar(id)`: the TUI's Unicode Braille spinner,
+rows use `ActivityIndicator::sidebar(id)`: the TUI's Braille spinner frames,
 directly reusing `vibex_tui::glyphs::spinner_frames(GlyphTier::Full)` and
-`frame_at`. Center the glyph in a fixed `size_5()` slot with the theme's
-monospace font, `text_xl()`, and a single-height line box. Hold each frame at
-full contrast for 100ms: the eight-frame cycle takes 800ms, with frame requests
-bounded to the same cadence. The timeline keeps its separate 2100ms cycle and
-30 fps budget. Scope animation IDs under the domain-keyed row, and hold the
-first spinner frame for reduced motion or the opt-in inactive-window pause.
+`frame_at`. **Paint those frames, never shape them.** The frame is a character
+from the Braille block, and the reader's code font is free to lack it —
+JetBrains Mono has no Braille, so the mark drew that font's replacement box
+instead of a spinner. `braille_dots` reads the dots back out of the frame, and
+the fixed `size_5()` canvas paints them in the two-by-four Braille cell, so the
+frame table stays the single source of truth while the mark renders whatever
+font the workbench is set to. Hold each frame at full contrast for 100ms: the
+eight-frame cycle takes 800ms, with frame requests bounded to the same cadence.
+The timeline keeps its separate 2100ms cycle and 30 fps budget. Scope animation
+IDs under the domain-keyed row, and hold the first spinner frame for reduced
+motion or the opt-in inactive-window pause.
 Running marks use the theme's
 `primary`; auto-continue sessions and groups use `success` (green). Workspace
 aggregates keep `primary` because their sessions can have different
 auto-continue settings. Waiting, error, and completion states keep their
 distinct symbols.
+
+The delegated-session disclosure follows the same rule of not claiming what the
+workbench does not know. A session row shows the chevron only when its children
+are known — from an ownership-tree node or a loaded branch page. A branch nobody
+has fetched is unknown, not "probably a parent": guessing drew a disclosure in
+front of every row whose branch had not loaded, shifting the row's logo and
+title out of column for a toggle that expanded to nothing. The disclosure
+reappears on the parent's row as soon as the branch loads, which opening any of
+its children already does.
 
 The running cue also reaches the session title: a sidebar row whose session is
 generating sweeps the title through `ShimmerText` at the shared timeline

@@ -1,15 +1,15 @@
 //! Activity marks for live timeline labels and compact sidebar rows.
 //!
-//! The timeline's V sweeps a highlight along its strokes; the sidebar reuses
-//! the TUI's Braille spinner at a faster cadence. Both use synchronized, bounded
-//! clocks and fixed, rem-sized slots so motion never reflows adjacent text.
+//! The timeline's V sweeps a highlight along its strokes; the sidebar paints
+//! the TUI's Braille spinner frames dot by dot. Both use synchronized, bounded
+//! clocks and fixed, rem-sized canvases so motion never reflows adjacent text.
 
 use std::f32::consts::{PI, TAU};
 use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt as _, App, Bounds, ElementId, Hsla, IntoElement, ParentElement as _,
-    RenderOnce, Styled as _, Window, canvas, div, fill, point, relative, size,
+    RenderOnce, Styled as _, Window, canvas, div, fill, point, size,
 };
 use gpui_component::ActiveTheme as _;
 use vibex_tui::glyphs::{self, GlyphTier};
@@ -80,9 +80,7 @@ impl RenderOnce for ActivityIndicator {
                 TIMELINE_MAX_FPS,
             ),
             ActivityStyle::Sidebar => (
-                div()
-                    .size_5()
-                    .font_family(cx.theme().mono_font_family.clone()),
+                div().size_5(),
                 cx.theme().primary,
                 SIDEBAR_FRAME_DURATION * glyphs::spinner_frames(GlyphTier::Full).len() as u32,
                 1.0 / SIDEBAR_FRAME_DURATION.as_secs_f32(),
@@ -137,19 +135,96 @@ fn timeline_mark(color: Hsla, phase: Option<f32>) -> impl IntoElement {
     .size_full()
 }
 
+/// The eight Braille dots of one spinner frame, as a bit mask.
+///
+/// The TUI's frames are the single source of truth for the sidebar mark, so the
+/// dots are read back out of the glyph rather than copied into a second table:
+/// an edit to the frame list moves both surfaces together.
+fn braille_dots(frame: &str) -> u8 {
+    frame
+        .chars()
+        .next()
+        .and_then(|glyph| (glyph as u32).checked_sub('\u{2800}' as u32))
+        .filter(|dots| *dots <= u8::MAX as u32)
+        .map_or(0, |dots| dots as u8)
+}
+
+/// Where each Braille dot sits in its two-by-four cell.
+///
+/// Dots 1-3 run down the left column and 4-6 down the right one, then the
+/// bottom row holds dots 7 and 8 — the arrangement a terminal cell uses, which
+/// is what makes the painted mark read as the same spinner the TUI draws.
+fn braille_dot_cell(index: usize) -> (f32, f32) {
+    match index {
+        0 => (0.0, 0.0),
+        1 => (0.0, 1.0),
+        2 => (0.0, 2.0),
+        3 => (1.0, 0.0),
+        4 => (1.0, 1.0),
+        5 => (1.0, 2.0),
+        6 => (0.0, 3.0),
+        _ => (1.0, 3.0),
+    }
+}
+
 fn sidebar_mark(color: Hsla, phase: Option<f32>) -> impl IntoElement {
     let frames = glyphs::spinner_frames(GlyphTier::Full);
     let step = (phase.unwrap_or(0.0) * frames.len() as f32) as u32;
+    let dots = braille_dots(glyphs::frame_at(frames, step, 1));
 
-    // Keep the actual TUI glyphs and frame order. Each frame occupies the same
-    // centered slot and holds at full contrast until the next discrete step.
-    div()
-        .size_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_xl()
-        .line_height(relative(1.0))
-        .text_color(color)
-        .child(glyphs::frame_at(frames, step, 1))
+    // The frame is painted, not shaped: the reader's code font is free to lack
+    // the Braille block — JetBrains Mono, for one, draws its replacement box for
+    // it — and then the running cue would be that box instead of a spinner. Each
+    // frame occupies the same centered cell and holds at full contrast until the
+    // next discrete step.
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let extent = bounds.size.width.min(bounds.size.height);
+            let center = bounds.center();
+            let diameter = extent * 0.16;
+            let pitch = extent * 0.26;
+            for index in 0..8 {
+                if dots & (1 << index) == 0 {
+                    continue;
+                }
+                let (column, row) = braille_dot_cell(index);
+                let origin = point(
+                    center.x + (column - 0.5) * pitch - diameter * 0.5,
+                    center.y + (row - 1.5) * pitch - diameter * 0.5,
+                );
+                window.paint_quad(
+                    fill(Bounds::new(origin, size(diameter, diameter)), color)
+                        .corner_radii(diameter * 0.5),
+                );
+            }
+        },
+    )
+    .size_full()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidebar_frames_read_back_as_braille_dots() {
+        let frames = glyphs::spinner_frames(GlyphTier::Full);
+        assert!(!frames.is_empty());
+        let mut masks = Vec::new();
+        for frame in frames {
+            let dots = braille_dots(frame);
+            // Every frame of the working spinner is a partial cell, so an empty
+            // mask would paint a mark that says nothing.
+            assert_ne!(dots, 0, "{frame} carries no dots");
+            assert!(!masks.contains(&dots), "{frame} repeats a frame");
+            masks.push(dots);
+        }
+    }
+
+    #[test]
+    fn non_braille_frames_have_no_dots_to_paint() {
+        assert_eq!(braille_dots("|"), 0);
+        assert_eq!(braille_dots(""), 0);
+    }
 }
