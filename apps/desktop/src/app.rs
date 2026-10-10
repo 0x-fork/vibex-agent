@@ -69876,10 +69876,13 @@ impl FoundationSettings {
     ///
     /// The scan reads the user's own browser directory, so the dialog opens
     /// immediately in its scanning state and fills in what it finds.
+    ///
+    /// This button lives on the settings page, which is itself a dialog, so it
+    /// must not bail out on `has_active_dialog`: that guard is always true here
+    /// and it turned the click into a no-op. Dialogs stack, and the newest one
+    /// covers the settings dialog, so opening over it is what the other pages
+    /// (storage cleanup, RC import) already do.
     fn open_browser_login_import_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if window.has_active_dialog(cx) {
-            return;
-        }
         self.browser_import_choice = None;
         self.start_browser_profile_scan(cx);
         let entity = cx.weak_entity();
@@ -92270,6 +92273,28 @@ mod tests {
             settings_search_candidates_for_query("start page", english)
                 .iter()
                 .any(|candidate| candidate.section == SettingsSection::Browser)
+        );
+    }
+
+    /// The import button lives on the settings page, and the settings page is
+    /// itself a dialog, so `has_active_dialog` is always true where this handler
+    /// runs: bailing out on it made "Choose profile…" do nothing at all. The
+    /// storage-cleanup and RC-import pages already open their own dialogs over
+    /// settings, so this one does too, and the guard must not come back.
+    #[test]
+    fn choosing_a_browser_profile_opens_its_dialog_over_the_settings_dialog() {
+        let source = include_str!("app.rs");
+        let scanner = "\n    /// Asks the runtime host for the profiles";
+        let handler = source
+            .split_once("    fn open_browser_login_import_dialog(")
+            .and_then(|(_, tail)| tail.split_once(scanner))
+            .map(|(body, _)| body)
+            .expect("the login-state import opener should remain inspectable");
+        assert!(handler.contains("self.start_browser_profile_scan(cx)"));
+        assert!(handler.contains("window.open_dialog(cx"));
+        assert!(
+            !handler.contains("has_active_dialog"),
+            "an active-dialog guard here swallows the click: settings is a dialog"
         );
     }
 
