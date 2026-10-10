@@ -55,7 +55,7 @@ fn steps(view: &Entity<ArenaView>, count: usize, cx: &mut VisualTestContext) {
     draw(cx);
 }
 fn awaken(view: &Entity<ArenaView>, cx: &mut VisualTestContext) {
-    steps(view, 86, cx);
+    steps(view, 172, cx);
     assert_eq!(view.read_with(cx, |v, _| v.arena.phase), Phase::Battle);
 }
 fn click(cx: &mut VisualTestContext, id: &'static str) {
@@ -333,7 +333,7 @@ fn agent_switches_select_the_model_and_victory_hides_it_until_the_next_switch(
                 v.arena.phase_time = VICTORY_DURATION - 0.05;
                 cx.notify();
             });
-            steps(&view, 8, cx);
+            steps(&view, 16, cx);
             draw(cx);
             assert!(view.read_with(cx, |v, _| v.closed && v.clock.is_none()));
             assert!(cx.debug_bounds("unbound-game").is_none());
@@ -375,7 +375,7 @@ fn the_first_frame_uses_the_measured_pose_and_full_home_projection(cx: &mut Test
         cx,
         |v, _| v.arena.boss.position.minus(sample.boss.position).length() < 0.05
     ));
-    steps(&view, 35, cx);
+    steps(&view, 70, cx);
     assert!(view.read_with(cx, |v, _| v.home_opacity.get() < 0.01));
     press(cx, "escape");
     assert!(cx.debug_bounds("home-composer").is_some());
@@ -393,7 +393,7 @@ fn death_rebirth_clears_input_and_never_opens_a_result_surface(cx: &mut TestAppC
         v.arena.phase_time = 0.0;
         cx.notify();
     });
-    steps(&view, 106, cx);
+    steps(&view, 212, cx);
     view.read_with(cx, |v, _| {
         assert_eq!(v.arena.phase, Phase::Battle);
         assert_ne!(v.arena.player.position, before);
@@ -412,7 +412,7 @@ fn keyboard_pointer_focus_and_pause_use_the_live_battle_without_chrome(cx: &mut 
     let view = battle_view(&home, cx);
     awaken(&view, cx);
     key(cx, "j", true);
-    steps(&view, 22, cx);
+    steps(&view, 44, cx);
     key(cx, "j", false);
     assert_eq!(
         view.read_with(cx, |v, _| v.arena.arrow.state),
@@ -428,12 +428,12 @@ fn keyboard_pointer_focus_and_pause_use_the_live_battle_without_chrome(cx: &mut 
     click(cx, "unbound-battlefield");
     assert!(view.read_with(cx, |v, _| !v.paused && v.clock.is_some() && !v.mouse_shoot));
     press(cx, "r");
-    steps(&view, 43, cx);
+    steps(&view, 86, cx);
     assert_eq!(view.read_with(cx, |v, _| v.arena.phase), Phase::Battle);
     let field = cx.debug_bounds("unbound-battlefield").unwrap();
     let target = field.center() + point(px(50.0), px(-30.0));
     cx.simulate_mouse_down(target, MouseButton::Left, Modifiers::none());
-    steps(&view, 22, cx);
+    steps(&view, 44, cx);
     cx.simulate_mouse_up(
         point(px(-1.0), px(-1.0)),
         MouseButton::Left,

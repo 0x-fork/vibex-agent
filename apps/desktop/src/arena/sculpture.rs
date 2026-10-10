@@ -3,7 +3,7 @@
 
 use super::{
     geometry::{Vec2, smoothstep},
-    guardian::{Attack, Boss, BossState, Guardian},
+    guardian::{Attack, Boss, BossState, Guardian, IDLE_LOOP, STEMS, Shard, spark_height},
     raster::{DepthBuffer, Raster, ink::*},
 };
 use std::f32::consts::{PI, TAU};
@@ -27,9 +27,6 @@ impl Point3 {
     }
     fn scale(self, s: f32) -> Self {
         Self::new(self.x * s, self.y * s, self.z * s)
-    }
-    fn lerp(self, p: Self, t: f32) -> Self {
-        self.add(p.sub(self).scale(t))
     }
     fn dot(self, p: Self) -> f32 {
         self.x * p.x + self.y * p.y + self.z * p.z
@@ -57,15 +54,25 @@ impl Point3 {
     }
 }
 
+fn p3(x: f32, y: f32, z: f32) -> Point3 {
+    Point3::new(x, y, z)
+}
+
 const CLAY: [u8; 5] = [BODY_SHADOW, BODY_DARK, BODY, BODY_LIGHT, BODY_GLEAM];
 const ARMOR: [u8; 5] = [BODY_SHADOW, BODY_SHADOW, BODY_DARK, BODY, BODY_LIGHT];
+/// Front faces keep the light body tone, like the flat logo surface.
+const FRAME: [u8; 5] = [BODY_DARK, BODY, BODY_LIGHT, BODY_GLEAM, BODY_GLEAM];
+/// Saturated skin whose front faces keep the exact logo tone.
+const SKIN: [u8; 5] = [BODY_SHADOW, BODY_DARK, BODY, BODY, BODY_LIGHT];
+const BELLY: [u8; 5] = [BODY_DARK, BODY, BODY_LIGHT, BODY_GLEAM, BODY_GLEAM];
 const METAL: [u8; 5] = [BODY_SHADOW, GOLD_DARK, GOLD, IVORY, WHITE];
 const DARK: [u8; 5] = [OUTLINE, OUTLINE, SHADOW, BODY_SHADOW, BODY_DARK];
-const GLASS: [u8; 5] = [WATER_DARK, WATER_DARK, WATER, WATER_LIGHT, CORE_LIGHT];
-const BONE: [u8; 5] = [GOLD_DARK, DUST, IVORY, WHITE, WHITE];
+const GLASS: [u8; 5] = [WATER_DARK, WATER_DARK, WATER, WATER_LIGHT, WHITE];
 const PORCELAIN: [u8; 5] = [DUST, IVORY, WHITE, WHITE, WHITE];
 const ENERGY: [u8; 5] = [CORE_DARK, CORE, CORE_LIGHT, WHITE, WHITE];
 const LUMINOUS: [u8; 5] = [CORE, CORE_LIGHT, WHITE, WHITE, WHITE];
+const EMBER: [u8; 5] = [CORE_DARK, CORE_DARK, CORE, CORE, CORE_LIGHT];
+const RUNE: [u8; 5] = [GOLD_DARK, GOLD_DARK, GOLD, GOLD, IVORY];
 
 struct Face {
     points: [Point3; 4],
@@ -198,26 +205,36 @@ impl Mesh {
             }
         }
     }
-    fn ellipsoid(&mut self, center: Point3, size: Point3, ramp: [u8; 5]) {
-        for lat in 0..8 {
-            for lon in 0..12 {
-                let point = |lat: usize, lon: usize| {
-                    let a = lat as f32 / 8.0 * PI - PI * 0.5;
-                    let b = lon as f32 / 12.0 * TAU;
-                    center.add(Point3::new(
-                        a.cos() * b.cos() * size.x,
-                        a.cos() * b.sin() * size.y,
-                        a.sin() * size.z,
-                    ))
-                };
+    /// A tessellated ellipsoid whose material may vary with the unit normal.
+    fn sphere(
+        &mut self,
+        center: Point3,
+        size: Point3,
+        rings: usize,
+        segments: usize,
+        paint: impl Fn(Point3) -> [u8; 5],
+    ) {
+        let unit = |lat: usize, lon: usize| {
+            let a = lat as f32 / rings as f32 * PI - PI * 0.5;
+            let b = lon as f32 / segments as f32 * TAU;
+            Point3::new(a.cos() * b.cos(), a.cos() * b.sin(), a.sin())
+        };
+        for lat in 0..rings {
+            for lon in 0..segments {
+                let points = [
+                    unit(lat, lon),
+                    unit(lat, lon + 1),
+                    unit(lat + 1, lon + 1),
+                    unit(lat + 1, lon),
+                ];
+                let middle = points
+                    .iter()
+                    .fold(Point3::default(), |sum, p| sum.add(*p))
+                    .scale(0.25);
                 self.quad(
-                    [
-                        point(lat, lon),
-                        point(lat, lon + 1),
-                        point(lat + 1, lon + 1),
-                        point(lat + 1, lon),
-                    ],
-                    ramp,
+                    points
+                        .map(|p| center.add(Point3::new(p.x * size.x, p.y * size.y, p.z * size.z))),
+                    paint(middle),
                 );
             }
         }
@@ -301,20 +318,6 @@ impl Mesh {
     fn beam(&mut self, a: Point3, b: Point3, radius: f32, ramp: [u8; 5]) {
         self.tube(&[a, b], &[radius, radius], 1.0, ramp);
     }
-    fn frame(&mut self, center: Point3, size: Point3, border: f32, ramp: [u8; 5]) {
-        for side in [-1.0, 1.0] {
-            self.cuboid(
-                center.add(Point3::new(side * (size.x - border) * 0.5, 0.0, 0.0)),
-                Point3::new(border, size.y, size.z),
-                ramp,
-            );
-            self.cuboid(
-                center.add(Point3::new(0.0, 0.0, side * (size.z - border) * 0.5)),
-                Point3::new(size.x - border * 2.0, size.y, border),
-                ramp,
-            );
-        }
-    }
     fn hoop(&mut self, center: Point3, size: Point3, border: f32, ramp: [u8; 5]) {
         let point = |ix: usize, inner: bool, front: bool| {
             let a = ix as f32 * TAU / 12.0;
@@ -353,6 +356,14 @@ impl Mesh {
             }
         }
     }
+    /// Reshapes every face, e.g. a landing squash about the ground contact.
+    fn deform(&mut self, change: impl Fn(Point3) -> Point3) {
+        for face in &mut self.faces {
+            for point in &mut face.points {
+                *point = change(*point);
+            }
+        }
+    }
     fn draw(self, frame: &mut Raster, anchor: Vec2, angles: Point3, height: f32, pivot: Point3) {
         let mut faces = Vec::with_capacity(self.faces.len());
         let (mut left, mut top, mut right, mut bottom) = (
@@ -371,7 +382,8 @@ impl Mesh {
                     .rotate(angles.z, 0.0, 0.0)
                     .add(Point3::new(0.0, 0.0, height))
             });
-            let normal = points[1].sub(points[0]).cross(points[2].sub(points[0]));
+            // Diagonals keep the winding of quads that collapse to triangles.
+            let normal = points[2].sub(points[0]).cross(points[3].sub(points[1]));
             if normal.y + normal.z * 0.62 <= 0.00001 {
                 continue;
             }
@@ -403,6 +415,7 @@ impl Mesh {
         for (points, color) in faces {
             frame.polygon_depth(&points, color, &mut depth);
         }
+        frame.outline(&depth, OUTLINE);
     }
 }
 
@@ -410,293 +423,157 @@ pub(super) fn draw(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, redu
     let time = if reduced {
         0.0
     } else {
-        time.rem_euclid(super::art::IDLE_PERIOD)
+        time.rem_euclid(IDLE_LOOP)
     };
     let fall = smoothstep(fallen / 1.8);
     let mut mesh = Mesh::new();
-    let pivot = match boss.guardian {
-        Guardian::Claude => {
-            claude(&mut mesh, boss, fall);
-            Point3::new(0.0, 3.7, 6.3)
-        }
-        Guardian::Codex => {
-            codex(&mut mesh, boss, time, fall);
-            Point3::new(0.0, 0.0, 11.0)
-        }
-        Guardian::Pi => {
-            pi(&mut mesh, boss, time, fall);
-            Point3::new(-2.6, -0.6, 17.0)
-        }
-        Guardian::OpenCode => {
-            terminal(&mut mesh, boss, time, fall);
-            Point3::new(0.0, 5.7, 9.0)
-        }
-        Guardian::DeepSeek => {
-            whale(&mut mesh, boss, time, fall);
-            Point3::new(0.0, -15.5, 15.0)
-        }
-        Guardian::Copilot => {
-            copilot(&mut mesh, boss, time, fall);
-            Point3::new(0.0, 4.2, 3.8)
-        }
-    };
-    let (pitch, bank, height) = match boss.guardian {
-        Guardian::Claude => (
-            boss.pitch + fall * 0.38,
-            boss.bank,
-            boss.height - fall * 4.0,
+    match boss.guardian {
+        Guardian::Claude => spark(
+            &mut mesh,
+            boss.scale(),
+            boss.squash,
+            boss.spin,
+            (fall <= 0.0).then_some(boss.generation >= 4),
+            time,
+            fall,
         ),
-        Guardian::Codex => (boss.spin, boss.bank, boss.height),
-        Guardian::Pi => (boss.pitch, boss.bank, boss.height),
-        Guardian::OpenCode => (boss.pitch, boss.bank + fall * 0.18, boss.height),
+        Guardian::Codex => knot(&mut mesh, boss, time, fall),
+        Guardian::Pi => glyph(&mut mesh, boss, time, fall),
+        Guardian::OpenCode => chest(&mut mesh, boss, fall),
+        Guardian::DeepSeek => whale(&mut mesh, boss, time, fall),
+        Guardian::Copilot => copilot(&mut mesh, boss, time, fall),
+    }
+    let (x, y, z) = boss.pivot();
+    let (pitch, bank) = boss.tilt();
+    let (pitch, bank, height, yaw) = match boss.guardian {
+        // The flat spark keeps its face toward the viewer.
+        Guardian::Claude => (
+            pitch,
+            bank,
+            boss.height - fall * 4.0,
+            boss.yaw.clamp(-0.45, 0.45),
+        ),
         Guardian::DeepSeek => (
-            boss.pitch - fall * 0.4,
-            boss.bank,
+            pitch - fall * 0.4,
+            bank,
             boss.height - fall * 15.0,
+            boss.yaw,
         ),
         Guardian::Copilot => (
-            boss.pitch + fall * 0.45,
-            boss.bank + fall * 0.25,
+            pitch + fall * 0.45,
+            bank + fall * 0.25,
             boss.height * (1.0 - fall),
+            boss.yaw,
         ),
+        Guardian::OpenCode => (pitch, bank + fall * 0.18, boss.height, boss.yaw),
+        _ => (pitch, bank, boss.height, boss.yaw),
     };
     mesh.draw(
         frame,
         boss.position,
-        Point3::new(pitch, bank, boss.yaw),
+        Point3::new(pitch, bank, yaw),
         height,
-        pivot,
+        Point3::new(x, y, z),
     );
 }
 
-fn claude(mesh: &mut Mesh, boss: &Boss, fall: f32) {
-    let open = if boss.exposed > 0.0 { 1.0 } else { 0.0 };
-    let split = open * 2.5 + fall * 3.5;
-    mesh.bevel_box(
-        Point3::new(0.0, 0.0, 15.3),
-        Point3::new(19.0, 10.0, 10.5),
-        0.65,
-        Point3::default(),
-        CLAY,
-    );
-    mesh.cuboid(
-        Point3::new(-0.25, -0.3, 20.57),
-        Point3::new(16.9, 8.0, 0.22),
-        CLAY,
-    );
-    for side in [-1.0, 1.0] {
-        mesh.bevel_box(
-            Point3::new(side * 4.3, 5.04, 15.6),
-            Point3::new(2.15, 0.42, 5.0),
-            0.18,
-            Point3::default(),
-            ARMOR,
-        );
-        mesh.cuboid(
-            Point3::new(side * 4.3, 5.30, 15.6),
-            Point3::new(1.5, 0.16, 4.2),
-            PORCELAIN,
-        );
-        for x in [2.6, 7.6] {
-            mesh.bevel_box(
-                Point3::new(side * x, 3.5, 9.5),
-                Point3::new(2.0, 2.9, 2.6),
-                0.25,
-                Point3::default(),
-                CLAY,
-            );
-        }
-    }
-    for ix in 0..8 {
-        let a = ix as f32 * TAU / 8.0;
-        let b = (ix + 1) as f32 * TAU / 8.0;
-        let shift = Point3::new((a + PI / 8.0).cos().signum() * split, 0.0, -fall * 2.0);
-        let top = |angle: f32| Point3::new(angle.cos() * 5.8, angle.sin() * 4.2, 10.1).add(shift);
-        let tip = Point3::new(shift.x * 0.65, 0.5, 1.4 - fall * 1.5);
-        let rim =
-            Point3::new((a + PI / 8.0).cos() * 3.6, (a + PI / 8.0).sin() * 3.0, 6.0).add(shift);
-        mesh.quad([top(b), top(a), rim, rim], CLAY);
-        mesh.quad([rim, top(a), tip, tip], ARMOR);
-        mesh.quad([top(b), rim, tip, tip], ARMOR);
-    }
-    mesh.crystal(
-        Point3::new(0.0, 3.7, 6.3),
-        Point3::new(0.28 + open * 1.2, 0.6, 2.7 + open * 0.5),
-        LUMINOUS,
-    );
-}
+/// Twelve uneven, club-ended rays around a nucleus, after the Claude spark:
+/// angular jitter and relative length.
+const RAYS: [(f32, f32); 12] = [
+    (0.00, 1.00),
+    (0.04, 0.74),
+    (-0.03, 0.92),
+    (0.05, 0.68),
+    (-0.03, 1.00),
+    (0.02, 0.80),
+    (0.00, 0.95),
+    (-0.04, 0.70),
+    (0.03, 0.98),
+    (-0.02, 0.78),
+    (0.04, 0.90),
+    (-0.03, 0.72),
+];
 
-fn ground_point(boss: &Boss, ground: Vec2, height: f32) -> Point3 {
-    let p = ground.minus(boss.position);
-    Point3::new(p.x, p.y / 0.62, height)
-}
-
-pub(super) fn tentacle(frame: &mut Raster, boss: &Boss, ix: usize, fallen: f32) {
-    let fall = smoothstep(fallen / 1.5);
-    let (ground, root_height) = boss.tentacle_root(ix);
-    let root = ground_point(boss, ground, root_height - fall * 4.0);
-    let tip = ground_point(
-        boss,
-        boss.tentacles[ix],
-        boss.tentacle_heights[ix] * (1.0 - fall),
-    );
-    let side = if ix.is_multiple_of(2) { -1.0 } else { 1.0 };
-    let curl =
-        Point3::new(side * 3.4, if ix < 2 { -1.4 } else { 1.2 }, 0.0).rotate(boss.yaw, 0.0, 0.0);
-    let joint = root.lerp(tip, 0.72);
-    let path = [
-        root,
-        root.lerp(tip, 0.18)
-            .add(curl.scale(0.55))
-            .add(Point3::new(0.0, 0.0, 0.9)),
-        root.lerp(tip, 0.38)
-            .add(curl)
-            .add(Point3::new(0.0, 0.0, -0.1)),
-        root.lerp(tip, 0.57)
-            .add(curl.scale(0.85))
-            .add(Point3::new(0.0, 0.0, 0.35)),
-        joint,
-        root.lerp(tip, 0.89)
-            .sub(curl.scale(0.35))
-            .add(Point3::new(0.0, 0.0, -1.0)),
-        tip,
-    ];
-    let cut = boss.severed & (1 << ix) != 0;
-    let mut mesh = Mesh::new();
-    let length = if cut { 5 } else { 7 };
-    mesh.tube(
-        &path[..length],
-        &[2.3, 2.3, 1.95, 1.55, 1.08, 0.62, 0.16][..length],
-        0.86,
-        CLAY,
-    );
-    let tangent = path[4].sub(path[3]).normalized();
-    mesh.beam(
-        joint.sub(tangent.scale(0.24)),
-        joint.add(tangent.scale(0.24)),
-        1.28,
-        if cut || boss.tentacle_vulnerable(ix) {
-            ENERGY
-        } else {
-            ARMOR
-        },
-    );
-    if cut {
-        mesh.crystal(joint, Point3::new(0.62, 0.56, 0.58), LUMINOUS);
-    }
-    mesh.draw(
-        frame,
-        boss.position,
-        Point3::default(),
-        0.0,
-        Point3::default(),
-    );
-}
-
-pub(super) fn hand(frame: &mut Raster, boss: &Boss, ix: usize, fallen: f32) {
-    let side = if ix == 0 { -1.0 } else { 1.0 };
-    let fall = smoothstep(fallen / 1.5);
-    let height = boss.hand_heights[ix] * (1.0 - fall);
-    let shoulder = Point3::new(side * 11.0, -0.8, 12.0)
-        .rotate(boss.yaw, 0.0, 0.0)
-        .add(Point3::new(0.0, 0.0, boss.height));
-    let wrist = ground_point(boss, boss.hands[ix], height + 3.0);
-    let mut mesh = Mesh::new();
-    for (start, end, radius) in [(0.08, 0.31, 1.8), (0.44, 0.72, 2.25)] {
-        mesh.beam(
-            shoulder.lerp(wrist, start),
-            shoulder.lerp(wrist, end),
-            radius,
+/// `heart` is `Some(bare)` for the carrier; split sparks have none.
+fn spark(
+    mesh: &mut Mesh,
+    size: f32,
+    squash: f32,
+    spin: f32,
+    heart: Option<bool>,
+    time: f32,
+    fall: f32,
+) {
+    let center = p3(0.0, 0.0, spark_height(size, squash));
+    let (wide, tall) = (1.0 + 0.2 * squash, 1.0 - 0.25 * squash);
+    let reach = 8.4 * size * (1.0 - fall * 0.65);
+    for (ix, (jitter, length)) in RAYS.into_iter().enumerate() {
+        let angle = ix as f32 * TAU / 12.0 + jitter + spin;
+        let direction = p3(angle.cos() * wide, 0.0, angle.sin() * tall);
+        let depth = if ix % 2 == 0 { 0.45 } else { -0.45 } * size;
+        let at = |r: f32| center.add(direction.scale(r)).add(p3(0.0, depth, 0.0));
+        let l = reach * length;
+        let w = size * (0.75 + 0.25 * length);
+        mesh.tube(
+            &[
+                at(0.9 * size),
+                at(l * 0.35),
+                at(l * 0.68),
+                at(l * 0.9),
+                at(l),
+            ],
+            &[0.35 * w, 0.7 * w, 0.85 * w, 0.65 * w, 0.15 * w],
+            0.6,
             CLAY,
         );
     }
-    mesh.beam(
-        shoulder.lerp(wrist, 0.30),
-        shoulder.lerp(wrist, 0.45),
-        0.30,
-        PORCELAIN,
+    mesh.sphere(
+        center,
+        p3(2.5 * size * wide, 1.8 * size, 2.5 * size * tall),
+        6,
+        10,
+        |_| ARMOR,
     );
-    mesh.group(
-        wrist,
-        Point3::new(0.06 + height * 0.012, side * fall * 0.6, boss.yaw * 0.55),
-        |mesh| {
-            mesh.bevel_box(
-                Point3::new(0.0, -0.6, 0.0),
-                Point3::new(6.4, 4.7, 4.9),
-                0.5,
-                Point3::default(),
-                CLAY,
-            );
-            for finger in 0..4 {
-                let x = -2.3 + finger as f32 * 1.5;
-                mesh.bevel_box(
-                    Point3::new(x, 2.0, -0.8),
-                    Point3::new(1.30, 2.9, 3.1),
-                    0.27,
-                    Point3::default(),
-                    CLAY,
-                );
-                mesh.cuboid(
-                    Point3::new(x, 2.0, 0.83),
-                    Point3::new(0.8, 1.7, 0.13),
-                    ARMOR,
-                );
-            }
-            mesh.bevel_box(
-                Point3::new(-side * 3.45, 0.9, -0.8),
-                Point3::new(1.9, 2.8, 2.1),
-                0.3,
-                Point3::new(0.0, -side * 0.3, 0.0),
-                CLAY,
-            );
-            mesh.frame(
-                Point3::new(0.0, 1.86, 0.15),
-                Point3::new(2.4, 0.2, 2.0),
-                0.35,
-                PORCELAIN,
-            );
-            if boss.seals & (1 << ix) != 0 {
-                mesh.beam(
-                    Point3::new(-3.6, 0.0, -2.7),
-                    Point3::new(3.6, 0.0, -2.7),
-                    0.20,
-                    LUMINOUS,
-                );
-            }
-        },
-    );
+    if let Some(bare) = heart {
+        let beat = 1.0 + (time * TAU * 1.4).sin().max(0.0) * 0.18;
+        let r = if bare { 1.7 } else { (1.3 * size).max(0.8) } * beat;
+        mesh.sphere(
+            center.add(p3(0.0, 1.6 * size + 0.2, 0.0)),
+            p3(r, r * 0.75, r * 1.05),
+            4,
+            8,
+            |_| if bare { LUMINOUS } else { ENERGY },
+        );
+    }
+}
+
+pub(super) fn shard(frame: &mut Raster, shard: &Shard, time: f32) {
+    let mut mesh = Mesh::new();
+    spark(&mut mesh, shard.size, 0.0, shard.spin, None, time, 0.0);
     mesh.draw(
         frame,
-        boss.position,
+        shard.position,
         Point3::default(),
-        0.0,
-        Point3::default(),
+        shard.height,
+        p3(0.0, 0.0, spark_height(shard.size, 0.0)),
     );
 }
 
-fn codex(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
-    let opened = if boss.exposed > 0.0 {
-        1.0
-    } else {
-        boss.strain * 0.7
-    };
-    let split = opened * 3.8 + fall * 8.0;
-    let rotation = if boss.attack == Attack::Barrage && boss.state == BossState::Striking {
-        boss.progress() * TAU
-    } else {
-        0.0
-    };
+fn knot(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
+    let open = boss.unravel;
+    let split = open * 6.5 + fall * 8.0;
+    let orbit = open * time * 0.9;
     for strand in 0..6 {
-        let angle = strand as f32 * TAU / 6.0 + rotation;
-        let origin = Point3::new(angle.cos() * split, 0.0, 11.0 + angle.sin() * split);
-        mesh.group(origin, Point3::new(0.0, -angle, 0.0), |mesh| {
+        let angle = strand as f32 * TAU / 6.0 + orbit;
+        let origin = p3(angle.cos() * split, 0.0, 11.0 + angle.sin() * split);
+        mesh.group(origin, p3(open * 0.35, -angle, 0.0), |mesh| {
             let corners = [
-                Point3::new(1.7, -2.1, 2.95),
-                Point3::new(5.3, -2.1, 5.0),
-                Point3::new(9.0, -0.6, 2.85),
-                Point3::new(9.0, 2.1, -2.85),
-                Point3::new(5.3, 2.1, -5.0),
-                Point3::new(1.7, 2.1, -2.95),
+                p3(1.7, -2.1, 2.95),
+                p3(5.3, -2.1, 5.0),
+                p3(9.0, -0.6, 2.85),
+                p3(9.0, 2.1, -2.85),
+                p3(5.3, 2.1, -5.0),
+                p3(1.7, 2.1, -2.95),
             ];
             let mut path = Vec::with_capacity(10);
             path.push(corners[0]);
@@ -715,532 +592,353 @@ fn codex(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
                 (8.95, 3.45, -1.4, 1.6),
                 (4.3, 3.43, -4.45, 0.65),
             ] {
-                mesh.cuboid(Point3::new(x, y, z), Point3::new(0.22, 0.13, tall), METAL);
-                mesh.cuboid(
-                    Point3::new(x + 0.37, y, z - tall * 0.3),
-                    Point3::new(0.6, 0.13, 0.16),
-                    METAL,
-                );
+                mesh.cuboid(p3(x, y, z), p3(0.22, 0.13, tall), METAL);
+                mesh.cuboid(p3(x + 0.37, y, z - tall * 0.3), p3(0.6, 0.13, 0.16), METAL);
             }
         });
     }
-    let core = Point3::new(0.0, 0.0, 11.0);
+    let core = p3(0.0, 0.0, 11.0);
+    let bare = boss.exposed > 0.0;
+    let shielded = boss.cube_shielded();
+    let size = if bare { 3.3 } else { 2.6 };
+    let turn = if bare { time * 1.7 } else { 0.0 };
     mesh.bevel_box(
         core,
-        Point3::new(2.7, 2.7, 2.7),
-        0.20,
-        Point3::new(0.0, 0.0, PI * 0.25),
-        LUMINOUS,
+        p3(size, size, size),
+        0.22,
+        p3(turn * 0.6, 0.0, PI * 0.25 + turn),
+        if shielded { ENERGY } else { LUMINOUS },
     );
-    for ix in 0..6 {
-        let a = ix as f32 * TAU / 6.0 + time * TAU / 12.0;
-        let radius = 13.4 + fall * 6.0;
-        let center = Point3::new(a.cos() * radius, a.sin() * 4.8, 11.0 + a.sin() * 11.0);
-        mesh.bevel_box(
-            center,
-            Point3::new(0.9, 1.1, 2.4 + (ix % 2) as f32),
-            0.18,
-            Point3::new(0.0, a * 0.25, 0.0),
-            CLAY,
-        );
-        mesh.cuboid(
-            center.add(Point3::new(0.0, 0.05, -2.6)),
-            Point3::new(0.18, 0.23, 1.8),
-            ENERGY,
-        );
-    }
-}
-
-fn pi(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
-    // Four rows keep the two separated stems and the square through-aperture
-    // legible at every size; the masonry has actual side and rear planes.
-    for (row, mask) in [0b1110u8, 0b1010, 0b1101, 0b1001].into_iter().enumerate() {
-        for col in 0..4 {
-            if mask & (1 << (3 - col)) == 0 {
-                continue;
+    if shielded {
+        // A wire cage marks the closed beat of the shield.
+        let h = 2.9;
+        for axis in 0..3 {
+            for (a, b) in [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+                let corner = |end: f32| {
+                    let mut p = [0.0; 3];
+                    p[axis] = end * h;
+                    p[(axis + 1) % 3] = a * h;
+                    p[(axis + 2) % 3] = b * h;
+                    core.add(p3(p[0], p[1], p[2]))
+                };
+                mesh.beam(corner(-1.0), corner(1.0), 0.2, ENERGY);
             }
-            let drift = Point3::new(
-                (col as f32 - 1.5) * fall * 4.0,
-                (col as f32 - row as f32) * fall,
-                -fall * (3.0 + row as f32 * 2.0),
-            );
-            let center =
-                Point3::new(-7.8 + col as f32 * 5.2, 0.0, 22.2 - row as f32 * 5.2).add(drift);
-            mesh.group(
-                center,
-                Point3::new(fall * 0.20, (col as f32 - 1.5) * fall * 0.16, 0.0),
-                |mesh| {
-                    mesh.bevel_box(
-                        Point3::default(),
-                        Point3::new(5.16, 6.4, 5.16),
-                        0.24,
-                        Point3::default(),
-                        CLAY,
-                    );
-                    mesh.cuboid(
-                        Point3::new(0.0, 3.23, 0.10),
-                        Point3::new(4.85, 0.10, 0.15),
-                        DARK,
-                    );
-                    for (x, z) in [(-0.80, 1.3), (0.95, -1.25)] {
-                        mesh.cuboid(Point3::new(x, 3.23, z), Point3::new(0.14, 0.11, 2.05), DARK);
-                    }
-                    mesh.cuboid(
-                        Point3::new(2.61, 0.0, -0.12),
-                        Point3::new(0.1, 5.8, 0.16),
-                        DARK,
-                    );
-                    mesh.cuboid(
-                        Point3::new(-2.61, 0.0, 0.10),
-                        Point3::new(0.1, 5.8, 0.16),
-                        DARK,
-                    );
-                },
-            );
         }
     }
-    let core = Point3::new(-2.6, -0.6, 17.0);
-    mesh.bevel_box(
-        core,
-        Point3::new(if boss.exposed > 0.0 { 3.5 } else { 2.9 }, 0.8, 3.5),
-        0.10,
-        Point3::default(),
-        PORCELAIN,
-    );
-    for (ix, side) in [-1.0, 1.0].into_iter().enumerate() {
-        if boss.seals & (1 << ix) == 0 {
-            mesh.box_rotated(
-                core.add(Point3::new(side * 0.86, 2.4, 0.0)),
-                Point3::new(0.65, 0.85, 4.1),
-                Point3::new(0.0, side * 0.30, 0.0),
-                CLAY,
-            );
-        }
-    }
-    for (ix, (x, y, z, size)) in [
-        (-12.8, -3.0, 23.0, 1.8),
-        (13.3, -1.0, 22.0, 1.9),
-        (-13.2, 2.0, 7.0, 1.2),
-        (12.5, -4.0, 14.0, 1.4),
-        (-4.5, 0.0, 0.6, 2.1),
-        (5.5, 1.0, 1.3, 1.7),
-        (-9.5, -3.5, 28.0, 1.25),
-        (10.6, -2.0, 3.8, 1.2),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let phase = time * TAU / 6.0 + ix as f32 * PI / 4.0;
-        let center = Point3::new(
-            x * (1.0 + fall * 0.3),
-            y,
-            z + phase.sin() * 0.45 - fall * 5.0,
-        );
-        mesh.bevel_box(
-            center,
-            Point3::new(size, size * 1.15, size * 1.3),
-            0.18,
-            Point3::new(phase.sin() * 0.12, ix as f32 * 0.13 + fall, 0.0),
-            CLAY,
-        );
-        if ix == 4 || ix == 5 {
-            mesh.cuboid(
-                center.add(Point3::new(0.0, 0.0, -size * 0.9)),
-                Point3::new(0.18, 0.25, 0.9),
-                PORCELAIN,
-            );
-        }
-    }
+    let squash = boss.squash_scale();
+    let bulge = 1.0 + 0.15 * boss.squash;
+    mesh.deform(|p| p3(p.x * bulge, p.y, p.z * squash));
 }
 
-fn terminal(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
-    let open = if boss.exposed > 0.0 {
-        1.0
-    } else if boss.is_inhaling() {
-        0.55
-    } else {
-        0.0
-    };
-    let peel = boss.tether.max(open) + fall;
-    for side in [-1.0, 1.0] {
-        mesh.bevel_box(
-            Point3::new(side * (6.55 + fall * 4.0), 0.0, 9.0),
-            Point3::new(3.9, 11.0, 18.0),
-            0.35,
-            Point3::new(0.0, side * fall * 0.25, 0.0),
-            CLAY,
-        );
-        mesh.bevel_box(
-            Point3::new(0.0, 0.0, 9.0 + side * (7.1 + fall * 3.5)),
-            Point3::new(9.25, 11.0, 3.8),
-            0.28,
-            Point3::new(fall * 0.18, 0.0, 0.0),
-            CLAY,
-        );
-        mesh.cuboid(
-            Point3::new(side * (6.85 + fall * 4.0), 5.66, 9.0),
-            Point3::new(2.9, 0.82, 17.1),
-            PORCELAIN,
-        );
-        mesh.cuboid(
-            Point3::new(0.0, 5.66, 9.0 + side * (7.05 + fall * 3.5)),
-            Point3::new(10.8, 0.82, 3.0),
-            PORCELAIN,
-        );
-        mesh.box_rotated(
-            Point3::new(side * (2.0 + peel * 3.7), 2.8 - peel * 1.1, 9.0),
-            Point3::new(3.9, 1.5, 10.4),
-            Point3::new(0.0, 0.0, -side * peel * 0.70),
-            ARMOR,
-        );
-        for z in [4.0, 9.0, 14.0] {
-            mesh.cuboid(
-                Point3::new(side * (8.54 + fall * 4.0), 0.0, z),
-                Point3::new(0.15, 9.3, 0.18),
-                DARK,
-            );
-        }
-    }
-    mesh.cuboid(
-        Point3::new(0.0, -5.4, 9.0),
-        Point3::new(9.5, 0.5, 11.8),
-        DARK,
-    );
-    mesh.frame(
-        Point3::new(0.0, 3.2, 9.0),
-        Point3::new(9.5, 0.3, 11.9),
-        0.40,
-        ARMOR,
-    );
-    if open > 0.0 || boss.tether > 0.0 {
-        mesh.bevel_box(
-            Point3::new(0.0, 5.7, 9.0),
-            Point3::new(1.0 + open * 1.8, 0.5, 1.0 + open * 1.8),
-            0.18,
-            Point3::default(),
-            LUMINOUS,
-        );
-    }
-    for (ix, (x, y, z)) in [
-        (-12.0, -2.0, 12.0),
-        (12.0, -1.0, 10.0),
-        (-10.5, 3.0, 3.0),
-        (10.5, 2.0, 20.0),
-        (1.0, -4.0, 22.0),
-        (-1.0, 1.0, -2.5),
+fn glyph(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
+    // The block letter at 1.6 logo units: the slab, the column right of the
+    // aperture and the step beneath it. Both stems are separate actors.
+    for (ix, (x0, x1, z0, z1)) in [
+        (-11.2, 6.03, 16.8, 22.4),
+        (0.29, 6.03, 11.2, 16.8),
+        (-5.46, 0.29, 5.6, 11.2),
     ]
     .into_iter()
     .enumerate()
     {
-        let phase = time * TAU / 6.0 + ix as f32 * PI / 3.0;
-        let size = if ix < 4 {
-            Point3::new(2.8, 1.4, 5.4)
-        } else {
-            Point3::new(5.0, 2.3, 1.8)
-        };
+        let spread = ix as f32 - 1.0;
+        let center = p3(
+            (x0 + x1) * 0.5 + fall * spread * 2.5,
+            0.0,
+            (z0 + z1) * 0.5 - fall * (4.0 + ix as f32 * 3.0),
+        );
+        let size = p3(x1 - x0, 6.0, z1 - z0);
         mesh.group(
-            Point3::new(
-                x * (1.0 + fall * 0.45),
-                y + phase.cos() * 0.6,
-                z + phase.sin() * 0.45,
-            ),
-            Point3::new(0.0, phase.sin() * 0.13 + fall * 0.25, 0.12),
+            center,
+            p3(fall * 0.15 * (ix as f32 + 1.0), -fall * 0.2 * spread, 0.0),
             |mesh| {
-                mesh.frame(Point3::default(), size, 0.58, CLAY);
-                mesh.cuboid(
-                    Point3::new(-size.x * 0.5 + 0.22, size.y * 0.5 + 0.1, 0.0),
-                    Point3::new(0.32, 0.16, size.z - 0.5),
-                    PORCELAIN,
-                );
+                mesh.bevel_box(Point3::default(), size, 0.4, Point3::default(), CLAY);
+                // Masonry joints on the carved front.
+                let joints = (size.x / 5.6).round().max(1.0) as usize;
+                for n in 1..joints {
+                    let x = -size.x * 0.5 + size.x * n as f32 / joints as f32;
+                    mesh.cuboid(p3(x, 3.02, 0.0), p3(0.14, 0.1, size.z - 0.9), DARK);
+                }
+                if ix == 0 {
+                    mesh.cuboid(p3(-0.4, 3.04, 0.6), p3(size.x - 2.6, 0.1, 0.32), RUNE);
+                }
             },
         );
     }
+    // The aperture holds the eye.
+    let open = boss.exposed > 0.0;
+    mesh.cuboid(p3(-2.59, -2.2, 14.0), p3(5.6, 0.3, 5.5), DARK);
+    mesh.cuboid(p3(-2.59, 0.0, 11.28), p3(5.7, 6.0, 0.12), DARK);
+    let r = if open { 2.4 } else { 2.0 };
+    mesh.sphere(p3(-2.6, 0.5, 14.0), p3(r, r * 0.8, r), 5, 10, |_| {
+        if open { LUMINOUS } else { ENERGY }
+    });
+    mesh.sphere(
+        p3(-2.6, 0.5 + r * 0.8, 14.0),
+        p3(0.8, 0.35, 0.95),
+        3,
+        8,
+        |_| DARK,
+    );
+    for ix in 0..4 {
+        let a = time * TAU / 9.0 + ix as f32 * TAU / 4.0;
+        let center = p3(
+            a.cos() * (14.5 + fall * 4.0),
+            a.sin() * 4.0,
+            20.0 + (time * 1.3 + ix as f32).sin() * 1.2 - fall * 12.0,
+        );
+        mesh.bevel_box(center, p3(1.6, 1.6, 1.9), 0.25, p3(a * 0.5, 0.3, a), CLAY);
+    }
+}
+
+pub(super) fn stem(frame: &mut Raster, boss: &Boss, ix: usize, fallen: f32) {
+    let fall = smoothstep(fallen / 1.5);
+    let (width, length) = STEMS[ix];
+    let lift = boss.hand_heights[ix] * (1.0 - fall);
+    let mut mesh = Mesh::new();
+    mesh.bevel_box(
+        p3(0.0, 0.0, length * 0.5),
+        p3(width, 6.0, length),
+        0.4,
+        Point3::default(),
+        CLAY,
+    );
+    let joints = (length / 5.6).round() as usize;
+    for n in 1..joints {
+        let z = length * n as f32 / joints as f32;
+        mesh.cuboid(p3(0.0, 3.02, z), p3(width - 0.9, 0.1, 0.14), DARK);
+    }
+    // A carved rune that kindles while the stem is raised to strike.
+    let glow = if lift > 3.0 { ENERGY } else { RUNE };
+    mesh.cuboid(p3(0.0, 3.05, length * 0.25), p3(0.35, 0.1, 2.2), glow);
+    mesh.cuboid(p3(0.0, 3.05, length * 0.25), p3(1.6, 0.1, 0.35), glow);
+    let side = if ix == 0 { -1.0 } else { 1.0 };
+    mesh.draw(
+        frame,
+        boss.hands[ix],
+        p3(0.0, side * fall * 0.5, boss.yaw),
+        lift - fall * 3.0,
+        p3(0.0, 0.0, length * 0.5),
+    );
+}
+
+fn chest(mesh: &mut Mesh, boss: &Boss, fall: f32) {
+    let open = boss.exposed > 0.0;
+    let lid = (boss.lid + fall * 0.5).clamp(0.0, 1.4);
+    // Lower jaw: the logo's light frame around its filled lower window.
+    mesh.bevel_box(
+        p3(0.0, 0.0, 4.0),
+        p3(12.0, 9.0, 8.0),
+        0.6,
+        Point3::default(),
+        FRAME,
+    );
+    mesh.bevel_box(
+        p3(0.0, 4.4, 5.45),
+        p3(6.0, 0.5, 4.9),
+        0.15,
+        Point3::default(),
+        ARMOR,
+    );
+    mesh.cuboid(p3(0.0, -0.2, 8.04), p3(10.8, 8.0, 0.1), DARK);
+    for n in 0..4 {
+        mesh.crystal(
+            p3(-2.7 + n as f32 * 1.8, 3.6, 8.1),
+            p3(0.45, 0.4, 0.9),
+            PORCELAIN,
+        );
+    }
+    for side in [-1.0, 1.0] {
+        for z in [2.0, 6.0] {
+            mesh.cuboid(p3(side * 6.05, 2.5, z), p3(0.2, 0.8, 0.8), DARK);
+        }
+    }
+    // The gem is both the eye glinting through the slot and the heart.
+    let gem = if open { 1.6 } else { 1.15 };
+    mesh.sphere(p3(0.0, 1.5, 9.0), p3(gem, gem * 0.8, gem), 4, 8, |_| {
+        if open { LUMINOUS } else { EMBER }
+    });
+    // Upper jaw hinged on the back edge; its window slot is the mouth.
+    mesh.group(p3(0.0, -4.5, 8.0), p3(lid * 1.15, 0.0, 0.0), |mesh| {
+        for side in [-1.0, 1.0] {
+            mesh.bevel_box(
+                p3(side * 4.5, 4.5, 3.0),
+                p3(3.0, 9.0, 6.0),
+                0.5,
+                Point3::default(),
+                FRAME,
+            );
+        }
+        mesh.bevel_box(
+            p3(0.0, 4.5, 4.5),
+            p3(6.2, 9.0, 3.0),
+            0.4,
+            Point3::default(),
+            FRAME,
+        );
+        mesh.cuboid(p3(0.0, 2.0, 1.5), p3(6.2, 4.0, 3.0), DARK);
+        mesh.cuboid(p3(0.0, 4.5, -0.05), p3(11.6, 8.8, 0.1), DARK);
+        for n in 0..3 {
+            mesh.crystal(
+                p3(-1.8 + n as f32 * 1.8, 8.2, -0.3),
+                p3(0.45, 0.4, 0.8),
+                PORCELAIN,
+            );
+        }
+        mesh.beam(p3(-5.5, 0.2, 0.2), p3(5.5, 0.2, 0.2), 0.5, METAL);
+    });
+    let squash = boss.squash_scale();
+    let bulge = 1.0 + 0.2 * boss.squash;
+    mesh.deform(|p| p3(p.x * bulge, p.y, p.z * squash));
 }
 
 fn whale(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
-    let center = Point3::new(0.0, 1.2, 8.2);
-    let size = Point3::new(10.2, 10.8, 8.2);
-    mesh.ellipsoid(center, size.scale(0.985), ARMOR);
-    for lat in 0..8 {
-        for lon in 0..16 {
-            let point = |lat: usize, lon: usize| {
-                let a = lat as f32 / 8.0 * PI - PI * 0.5;
-                let b = (lon as f32 + if lat.is_multiple_of(2) { 0.0 } else { 0.35 }) * TAU / 16.0;
-                center.add(Point3::new(
-                    a.cos() * b.cos() * size.x,
-                    a.cos() * b.sin() * size.y,
-                    a.sin() * size.z,
-                ))
-            };
-            let points = [
-                point(lat, lon),
-                point(lat, lon + 1),
-                point(lat + 1, lon + 1),
-                point(lat + 1, lon),
-            ];
-            let middle = points
-                .iter()
-                .fold(Point3::default(), |sum, p| sum.add(*p))
-                .scale(0.25);
-            let ramp = if middle.z < 7.7 && middle.y > -5.5 {
-                BONE
-            } else {
-                CLAY
-            };
-            mesh.quad(points.map(|p| middle.lerp(p, 0.963)), ramp);
+    let swim = (time * TAU / 1.5).sin();
+    // Round body, head forward; lower faces take the paler belly.
+    mesh.sphere(p3(0.0, 2.0, 7.5), p3(7.6, 9.8, 7.2), 8, 14, |n| {
+        if n.z < -0.3 && n.y > -0.7 {
+            BELLY
+        } else {
+            SKIN
         }
-    }
-    let swim = (time * TAU / 3.0).sin() * 0.45;
+    });
+    // The tail tapers from the back and rises behind it, as in the logo.
     mesh.tube(
         &[
-            Point3::new(0.0, -6.0, 7.4),
-            Point3::new(0.0, -10.0, 7.8),
-            Point3::new(0.0, -14.0, 10.8),
-            Point3::new(0.0, -15.5, 15.0),
+            p3(0.0, -6.0, 7.2),
+            p3(0.0, -10.0, 8.6),
+            p3(0.0, -12.6, 12.0),
+            p3(0.0, -13.4, 15.6),
+            p3(0.0, -13.0, 18.5),
         ],
-        &[4.6, 3.3, 2.2, 1.45],
+        &[4.4, 3.2, 2.2, 1.6, 1.2],
         1.0,
-        CLAY,
+        SKIN,
     );
     for side in [-1.0, 1.0] {
+        let flick = swim * 0.4 * side;
         mesh.tube(
             &[
-                Point3::new(0.0, -15.5, 15.0),
-                Point3::new(side * 3.6, -16.8, 16.9 + swim * side),
-                Point3::new(side * 6.4, -17.0, 20.0 + swim * side),
-                Point3::new(side * 6.8, -16.1, 22.5 + swim * side),
+                p3(0.0, -13.0, 18.5),
+                p3(side * 2.4, -12.4, 20.0 + flick),
+                p3(side * 4.8, -11.6, 20.6 + flick),
+                p3(side * 5.8, -10.8, 19.8 + flick),
             ],
-            &[1.25, 1.75, 1.3, 0.10],
-            0.48,
-            CLAY,
+            &[1.1, 1.3, 0.9, 0.12],
+            0.4,
+            SKIN,
+        );
+        let eye = p3(side * 5.4, 8.6, 9.4);
+        mesh.sphere(eye, p3(1.25, 1.25, 1.25), 4, 8, |_| PORCELAIN);
+        mesh.sphere(
+            eye.add(p3(side * 0.35, 0.75, 0.15)),
+            p3(0.62, 0.62, 0.62),
+            3,
+            6,
+            |_| DARK,
+        );
+        // The pale smile line from the logo's inner curve.
+        mesh.tube(
+            &[
+                p3(side * 6.6, 9.0, 5.6),
+                p3(side * 7.5, 5.5, 4.6),
+                p3(side * 7.6, 1.5, 4.9),
+            ],
+            &[0.28, 0.3, 0.12],
+            1.0,
+            PORCELAIN,
         );
         mesh.tube(
             &[
-                Point3::new(side * 8.1, 3.5, 5.8),
-                Point3::new(side * 10.4, 1.5, 4.5 + swim * side),
-                Point3::new(side * 12.5, -1.8, 4.3 + swim * side + fall),
+                p3(side * 6.8, 3.5, 3.8),
+                p3(side * 9.6, 1.8, 2.6 + flick),
+                p3(side * 11.4, -0.8, 2.4 + flick * 1.5 - fall),
             ],
-            &[1.65, 1.40, 0.10],
-            0.40,
-            CLAY,
-        );
-        let eye = Point3::new(side * 8.15, 6.9, 10.6);
-        mesh.ellipsoid(eye, Point3::new(0.9, 0.7, 0.85), DARK);
-        mesh.ellipsoid(
-            eye.add(Point3::new(0.0, 0.4, 0.12)),
-            Point3::new(0.48, 0.40, 0.48),
-            LUMINOUS,
-        );
-        mesh.beam(
-            Point3::new(side * 8.5, 5.9, 11.4),
-            Point3::new(side * 9.0, 3.9, 11.8),
-            0.20,
-            ENERGY,
-        );
-        mesh.beam(
-            Point3::new(side * 9.0, 3.9, 11.8),
-            Point3::new(side * 9.6, 1.7, 10.9),
-            0.22,
-            ENERGY,
+            &[1.4, 1.0, 0.1],
+            0.38,
+            ARMOR,
         );
     }
-    mesh.tube(
-        &[
-            Point3::new(0.0, -1.0, 15.2),
-            Point3::new(0.0, -4.0, 18.1),
-            Point3::new(0.0, -6.0, 14.8),
-        ],
-        &[1.1, 0.75, 0.05],
-        0.75,
-        CLAY,
-    );
-    let opened = boss.exposed > 0.0;
-    mesh.hoop(
-        Point3::new(0.0, -15.5, 15.0),
-        Point3::new(1.72, 0.7, 1.72),
-        0.55,
-        if opened { BONE } else { CLAY },
-    );
-    if opened {
-        mesh.crystal(
-            Point3::new(0.0, -15.5, 15.0),
-            Point3::new(1.05, 0.8, 1.2),
-            LUMINOUS,
-        );
-    }
+    let open = boss.exposed > 0.0;
+    let r = if open { 1.9 } else { 1.4 };
+    mesh.sphere(p3(0.0, -13.0, 18.5), p3(r, r, r), 4, 8, |_| {
+        if open { LUMINOUS } else { EMBER }
+    });
 }
 
 fn copilot(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
-    let charged = boss.attack == Attack::VisorBeam
+    let open = boss.exposed > 0.0;
+    let throwing = boss.attack == Attack::Volley
         && matches!(boss.state, BossState::Windup | BossState::Striking);
-    let opened = boss.exposed > 0.0;
-    mesh.ellipsoid(
-        Point3::new(0.0, 0.0, 12.2),
-        Point3::new(9.3, 6.7, 7.5),
-        CLAY,
-    );
+    mesh.sphere(p3(0.0, 0.0, 11.0), p3(9.4, 7.6, 7.8), 8, 14, |_| CLAY);
+    // Face plate with the two vertical eye slots.
     mesh.bevel_box(
-        Point3::new(0.0, 5.75, 9.0),
-        Point3::new(14.3, 2.0, 6.7),
-        1.0,
+        p3(0.0, 5.6, 8.6),
+        p3(12.4, 3.6, 7.2),
+        1.6,
         Point3::default(),
-        ARMOR,
-    );
-    mesh.bevel_box(
-        Point3::new(0.0, 6.22, 9.15),
-        Point3::new(13.4, 1.40, 5.75),
-        0.7,
-        Point3::default(),
-        BONE,
+        DARK,
     );
     for side in [-1.0, 1.0] {
         mesh.bevel_box(
-            Point3::new(side * 2.20, 7.0, 9.1),
-            Point3::new(1.25, 0.42, 2.5),
-            0.22,
-            Point3::default(),
-            DARK,
-        );
-        mesh.cuboid(
-            Point3::new(side * 2.2, 7.24, 9.35),
-            Point3::new(0.70, 0.14, 0.42),
-            GLASS,
-        );
-        let lens = Point3::new(side * 4.4, 5.9, 14.2);
-        mesh.hoop(lens, Point3::new(3.95, 0.90, 3.65), 0.62, DARK);
-        mesh.hoop(
-            lens.add(Point3::new(0.0, 0.90, 0.0)),
-            Point3::new(3.60, 0.36, 3.32),
-            0.38,
-            BONE,
-        );
-        mesh.ellipsoid(
-            lens.add(Point3::new(0.0, 0.92, 0.0)),
-            Point3::new(3.12, 0.78, 2.86),
-            GLASS,
-        );
-        mesh.box_rotated(
-            lens.add(Point3::new(-0.92, 1.68, 1.42)),
-            Point3::new(1.25, 0.11, 0.42),
-            Point3::new(0.0, -0.40, 0.0),
-            PORCELAIN,
-        );
-        if charged {
-            mesh.crystal(
-                lens.add(Point3::new(0.0, 1.75, 0.0)),
-                Point3::new(0.65, 0.32, 0.65),
-                LUMINOUS,
-            );
-        }
-        mesh.ellipsoid(
-            Point3::new(side * 10.0, 0.0, 10.9),
-            Point3::new(1.6, 2.6, 3.0),
-            ARMOR,
-        );
-        mesh.ellipsoid(
-            Point3::new(side * 10.5, 0.7, 10.9),
-            Point3::new(1.3, 2.25, 2.5),
-            CLAY,
-        );
-        mesh.ellipsoid(
-            Point3::new(side * 10.85, 1.2, 10.9),
-            Point3::new(0.6, 1.0, 1.1),
-            GLASS,
-        );
-        let hand = Point3::new(
-            side * (6.1 + if charged { 0.6 } else { 0.0 }),
-            1.5,
-            3.45 - fall,
-        );
-        mesh.beam(Point3::new(side * 3.8, 0.0, 4.7), hand, 0.52, ARMOR);
-        mesh.bevel_box(
-            hand,
-            Point3::new(2.4, 2.6, 2.5),
+            p3(side * 2.4, 7.35, 8.6),
+            p3(1.6, 0.4, 3.8),
             0.5,
-            Point3::new(0.0, side * 0.25, 0.0),
-            CLAY,
-        );
-        mesh.ellipsoid(
-            hand.add(Point3::new(0.0, 1.35, 0.0)),
-            Point3::new(0.7, 0.35, 0.7),
+            Point3::default(),
             GLASS,
         );
-        mesh.bevel_box(
-            Point3::new(side * (2.0 + if opened { 1.9 } else { 0.0 }), 2.2, 3.8),
-            Point3::new(1.3, 3.5, 3.8),
-            0.3,
-            Point3::new(0.0, side * if opened { 0.45 } else { 0.0 }, 0.0),
-            CLAY,
+        // Goggles pushed up on the brow.
+        let lens = p3(side * 4.3, 5.4, 14.6);
+        mesh.hoop(lens, p3(3.3, 0.7, 2.6), 0.75, ARMOR);
+        mesh.sphere(
+            lens.add(p3(0.0, 0.5, 0.0)),
+            p3(2.6, 0.7, 2.0),
+            4,
+            10,
+            |_| GLASS,
         );
-        mesh.bevel_box(
-            Point3::new(side * 1.55, 0.4, 0.95),
-            Point3::new(2.1, 2.4, 1.6),
-            0.20,
-            Point3::default(),
-            ARMOR,
-        );
-        let exhaust = (2.0 + (time * TAU / 0.75).sin() * 0.35) * (1.0 - fall);
-        mesh.tube(
-            &[
-                Point3::new(side * 1.55, 0.4, 0.4),
-                Point3::new(side * 1.55, 0.4, -0.7),
-                Point3::new(side * 1.55, 0.4, -exhaust - 0.9),
-            ],
-            &[0.65, 0.5, 0.04],
-            0.8,
-            ENERGY,
+        mesh.sphere(p3(side * 9.6, 0.0, 10.6), p3(1.8, 2.8, 3.2), 4, 8, |_| {
+            ARMOR
+        });
+        mesh.sphere(p3(side * 10.6, 0.4, 10.6), p3(1.0, 1.7, 2.0), 3, 8, |_| {
+            GLASS
+        });
+        // Small hovering hands; the throwing hand rises.
+        let raise = if throwing && side > 0.0 { 5.0 } else { 0.0 };
+        let bob = (time * 3.0 + side).sin() * 0.5;
+        mesh.sphere(
+            p3(side * 8.0, 3.0, 4.0 + bob + raise - fall * 2.0),
+            p3(1.7, 1.7, 1.6),
+            4,
+            8,
+            |_| CLAY,
         );
     }
-    mesh.bevel_box(
-        Point3::new(0.0, 6.8, 14.2),
-        Point3::new(1.5, 0.75, 1.1),
-        0.18,
-        Point3::default(),
+    mesh.beam(p3(-1.2, 6.0, 14.8), p3(1.2, 6.0, 14.8), 0.5, ARMOR);
+    // Rear jet: the weak point glows hot while the guardian is stunned.
+    mesh.tube(
+        &[
+            p3(0.0, -6.0, 10.2),
+            p3(0.0, -8.0, 10.0),
+            p3(0.0, -9.2, 10.0),
+        ],
+        &[2.6, 2.3, 2.0],
+        1.0,
         ARMOR,
     );
-    mesh.bevel_box(
-        Point3::new(0.0, 1.6, 3.8),
-        Point3::new(4.3, 3.5, 3.9),
-        0.45,
-        Point3::default(),
-        ARMOR,
-    );
-    mesh.hoop(
-        Point3::new(0.0, 3.65, 3.8),
-        Point3::new(1.65, 0.45, 1.65),
-        0.42,
-        GLASS,
-    );
-    mesh.crystal(
-        Point3::new(0.0, 4.2, 3.8),
-        Point3::new(
-            if opened { 1.32 } else { 0.87 },
-            0.6,
-            if opened { 1.32 } else { 0.87 },
-        ),
-        LUMINOUS,
-    );
-    mesh.ellipsoid(
-        Point3::new(0.0, -6.55, 11.9),
-        Point3::new(2.8, 0.9, 2.8),
-        ARMOR,
-    );
-    mesh.ellipsoid(
-        Point3::new(0.0, -7.2, 11.9),
-        Point3::new(1.9, 0.45, 1.9),
-        GLASS,
-    );
-    if charged && !opened {
-        for ix in 0..4 {
-            let a = boss.shield_angle + ix as f32 * PI * 0.5;
-            mesh.bevel_box(
-                Point3::new(a.cos() * 12.6, a.sin() * 5.0, 12.0 + a.sin() * 8.4),
-                Point3::new(3.7, 0.7, 1.4),
-                0.24,
-                Point3::new(0.0, -a - PI * 0.5, 0.0),
-                GLASS,
-            );
-        }
+    mesh.hoop(p3(0.0, -9.2, 10.0), p3(2.1, 0.4, 2.1), 0.6, METAL);
+    let r = if open { 1.9 } else { 1.4 };
+    mesh.sphere(p3(0.0, -8.6, 10.0), p3(r, r, r), 4, 8, |_| {
+        if open { LUMINOUS } else { EMBER }
+    });
+    if !open && fall <= 0.0 {
+        let flame = 2.4 + (time * TAU / 0.3).sin() * 0.6;
+        mesh.tube(
+            &[p3(0.0, -9.6, 10.0), p3(0.0, -9.6 - flame, 10.0)],
+            &[1.1, 0.1],
+            1.0,
+            ENERGY,
+        );
     }
 }
 

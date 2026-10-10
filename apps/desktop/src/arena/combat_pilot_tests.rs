@@ -1,9 +1,19 @@
 use super::*;
-use crate::arena::map::{ISLANDS, SEALS};
+use crate::arena::map::{ISLANDS, PLATES, THRONE};
+
+/// What the pilot wants this frame, read from visible state only.
+struct Plan {
+    goal: Vec2,
+    target: Option<Vec2>,
+    /// Keep drawing without releasing yet.
+    hold: bool,
+    charge: f32,
+    sprint: bool,
+}
 
 #[derive(Default)]
 struct Pilot {
-    flying_frames: usize,
+    flying: f32,
 }
 
 impl Pilot {
@@ -12,128 +22,376 @@ impl Pilot {
             arena.tick(Controls::default());
             return;
         }
-        let boss = arena.boss;
+        let plan = plan(arena);
         let player = arena.player.position;
-        let outward = player.minus(boss.position).normalized();
-        let mut goal = boss.position.plus(outward.scale(28.0));
-        let mut target = (boss.exposed > 0.6).then_some(boss.core);
-        match boss.guardian {
-            Guardian::Claude if target.is_none() => {
-                target = (0..6)
-                    .filter(|ix| boss.tentacle_vulnerable(*ix))
-                    .map(|ix| boss.tentacle_joint(ix))
+        let mut controls = Controls {
+            movement: steer(arena, plan.goal),
+            ..Controls::default()
+        };
+        let escape = escape(arena, plan.goal);
+        if let Some((direction, urgent)) = escape {
+            controls.movement = direction;
+            if urgent && arena.player.roll_cooldown <= 0.0 && !arena.player.swimming {
+                arena.roll(direction);
+            }
+        } else {
+            controls.sprint = plan.sprint || plan.goal.minus(player).length() > 14.0;
+        }
+        match arena.arrow.state {
+            ArrowState::Ready => {
+                self.flying = 0.0;
+                let shot = plan
+                    .target
+                    .filter(|target| escape.is_none() && clear_shot(arena, *target));
+                if let Some(target) = shot {
+                    controls.aim = Some(target);
+                    controls.shoot = true;
+                    controls.movement = Vec2::default();
+                    if !plan.hold && arena.player.charge >= plan.charge {
+                        arena.release_shot(Some(target));
+                        controls.shoot = false;
+                    }
+                } else if arena.player.charge > 0.0 {
+                    // Letting go: a short draw looses nothing.
+                    arena.release_shot(plan.target);
+                }
+            }
+            ArrowState::Flying => {
+                self.flying += STEP;
+                controls.recall = self.flying > 0.8;
+            }
+            _ => controls.recall = escape.is_none() || arena.player.swimming,
+        }
+        arena.tick(controls);
+    }
+}
+
+fn plan(arena: &Arena) -> Plan {
+    let boss = &arena.boss;
+    let player = arena.player.position;
+    let charge = MIN_CHARGE + 0.04;
+    let speed = 100.0 + charge * 45.0;
+    let draw = (charge - arena.player.charge).max(0.0);
+    let arrival = |point: Vec2| draw + point.minus(player).length() / speed;
+    let around = |center: Vec2, distance: f32| {
+        let outward = player.minus(center);
+        let outward = if outward.length() < 1.0 {
+            CENTER.minus(center).normalized()
+        } else {
+            outward.normalized()
+        };
+        arena
+            .map
+            .move_body(center, center.plus(outward.scale(distance)), 2.0)
+    };
+    let mut plan = Plan {
+        goal: around(boss.position, 26.0),
+        target: None,
+        hold: false,
+        charge,
+        sprint: false,
+    };
+    match boss.guardian {
+        Guardian::Claude => {
+            plan.goal = around(boss.position, 20.0);
+            let grounded = match boss.state {
+                BossState::Watching => boss.duration - boss.time + 0.22,
+                BossState::Windup => boss.duration - boss.time,
+                _ => 0.0,
+            };
+            let height =
+                |size: f32| Vec2::new(0.0, -crate::arena::guardian::spark_height(size, 0.0));
+            let center = if boss.generation >= 4 {
+                boss.core
+            } else {
+                boss.body_center()
+            };
+            let landing = boss.target.plus(height(boss.scale()));
+            if grounded > arrival(center) + 0.03 {
+                plan.target = Some(center);
+            } else if boss.state == BossState::Striking
+                && boss.target.minus(player).length() > boss.impact_radius() + 4.0
+            {
+                // Draw while it flies; loose as it lands.
+                plan.target = Some(landing);
+                plan.hold = true;
+            } else {
+                plan.target = boss
+                    .shards
+                    .iter()
+                    .filter(|s| {
+                        s.alive
+                            && !s.airborne
+                            && s.position.minus(player).length() < 30.0
+                            && s.duration - s.time > arrival(s.center()) + 0.03
+                    })
+                    .map(|s| s.center())
                     .min_by(|a, b| {
                         a.minus(player)
                             .length()
                             .total_cmp(&b.minus(player).length())
                     });
             }
-            Guardian::Pi => {
-                if target.is_some() {
-                    goal = CENTER.plus(Vec2::new(0.0, 18.0));
-                } else {
-                    let ix = usize::from(boss.seals & 1 != 0);
-                    goal = SEALS[ix];
-                    let correct = (ix == 0 && boss.attack == Attack::LeftFist)
-                        || (ix == 1 && boss.attack == Attack::RightFist);
-                    if correct
-                        && boss.state == BossState::Windup
-                        && boss.progress() > 0.6
-                        && boss.target.minus(SEALS[ix]).length() < 5.0
-                    {
-                        goal = if boss.seals == 0 {
-                            SEALS[1]
-                        } else {
-                            CENTER.plus(Vec2::new(0.0, 18.0))
-                        };
-                    }
-                }
-            }
-            Guardian::OpenCode => {
-                if boss.is_inhaling() || target.is_some() {
-                    goal = boss.core.plus(boss.direction.scale(27.0));
-                    if player.minus(boss.core).dot(boss.direction) > 8.0 && boss.is_inhaling() {
-                        target = Some(boss.core);
-                    }
-                }
-            }
-            Guardian::DeepSeek => {
-                let island = ISLANDS
-                    .iter()
-                    .enumerate()
-                    .filter(|(ix, _)| {
-                        arena.map.sunken & (1 << ix) == 0 || arena.map.sunken == 0b1111
-                    })
-                    .min_by(|(_, a), (_, b)| {
-                        a.0.minus(player)
-                            .length()
-                            .total_cmp(&b.0.minus(player).length())
-                    })
-                    .map(|(_, island)| *island)
-                    .unwrap();
-                let returning_to_land = boss.attack == Attack::Pulse
-                    || boss.state == BossState::Recovery
-                    || boss.state == BossState::Striking
-                    || boss.state == BossState::Windup && boss.progress() >= 0.55;
-                goal = if returning_to_land {
-                    island.0
-                } else {
-                    island
-                        .0
-                        .plus(CENTER.minus(island.0).normalized().scale(island.1 + 13.0))
+        }
+        Guardian::Codex => {
+            if boss.exposed > 0.0 {
+                plan.goal = around(boss.position, 22.0);
+                let grounded = match boss.state {
+                    BossState::Watching => boss.duration - boss.time + 0.5,
+                    BossState::Windup => boss.duration - boss.time,
+                    _ => 0.0,
                 };
-                if !arena.map.on_island(player) {
-                    target = None;
+                let arrive = arrival(boss.core);
+                let pulse = (boss.shield + arrive).rem_euclid(1.5);
+                if grounded > arrive + 0.04
+                    && (0.62..1.42).contains(&pulse)
+                    && boss.exposed > arrive
+                {
+                    plan.target = Some(boss.core);
                 }
-            }
-            Guardian::Copilot if target.is_none() => {
-                target = arena
-                    .projectiles
+            } else if arena.brazier_lit() {
+                // Line up flame and knot, then shoot through the fire.
+                let knot = boss.body_center();
+                let flame = flame_center();
+                let spot = flame.plus(flame.minus(knot).normalized().scale(8.0));
+                plan.goal = spot;
+                plan.sprint = true;
+                if player.minus(spot).length() < 1.5 {
+                    plan.target = Some(knot);
+                    plan.charge = 0.3;
+                }
+            } else {
+                // Bait the leap onto the forge plate the knot can reach.
+                let knot = boss.position;
+                plan.goal = *PLATES
                     .iter()
-                    .find(|p| p.kind == ProjectileKind::ChargedOrb)
-                    .map(|p| p.position);
+                    .min_by(|a, b| a.minus(knot).length().total_cmp(&b.minus(knot).length()))
+                    .unwrap();
+                plan.sprint = true;
+            }
+        }
+        Guardian::Pi => {
+            let gate = 99.0;
+            let active = 1 - boss.guard;
+            let across = if active == 0 { 1.0 } else { -1.0 };
+            let (guard_point, _) = boss.guard_point(boss.guard);
+            let bare = boss.hand_heights[boss.guard] >= 10.0
+                || boss.hands[boss.guard].minus(guard_point).length() > 5.0;
+            if boss.exposed > 0.0 && bare {
+                plan.goal = player;
+                if boss.exposed > arrival(boss.core) + 0.03 {
+                    plan.target = Some(boss.core);
+                    plan.charge = MIN_CHARGE;
+                }
+            } else if arena.arrow.state == ArrowState::Ready && boss.exposed <= 0.0 {
+                // Crossing the midline forces the stems to trade places.
+                plan.goal = Vec2::new(THRONE.x + across * 9.0, gate);
+            } else {
+                plan.goal = Vec2::new(THRONE.x - across * 9.0, gate);
+            }
+        }
+        Guardian::OpenCode => {
+            plan.goal = around(boss.position, 27.0);
+            let front = player.minus(boss.core).dot(boss.direction) > 4.0;
+            if boss.exposed > arrival(boss.core) + 0.05 && front {
+                plan.target = Some(boss.core);
+            }
+        }
+        Guardian::DeepSeek => {
+            let intact: Vec<(Vec2, f32)> = ISLANDS
+                .iter()
+                .enumerate()
+                .filter(|(ix, _)| arena.map.sunken & (1 << ix) == 0)
+                .map(|(_, island)| *island)
+                .collect();
+            let floes = if intact.is_empty() {
+                ISLANDS.to_vec()
+            } else {
+                intact
+            };
+            let (floe, radius) = floes
+                .into_iter()
+                .min_by(|a, b| {
+                    a.0.minus(player)
+                        .length()
+                        .total_cmp(&b.0.minus(player).length())
+                })
+                .unwrap();
+            let on = arena.map.on_island(player);
+            plan.goal = floe;
+            match (boss.state, boss.attack) {
+                (BossState::Submerged, Attack::Breach) if !boss.target_locked() => {
+                    // Bait the eruption into open water beside the floe.
+                    let out = CENTER.minus(floe).normalized();
+                    plan.goal = arena
+                        .map
+                        .move_body(floe, floe.plus(out.scale(radius + 18.0)), 1.0);
+                }
+                (BossState::Striking, Attack::Breach) if on && boss.progress() > 0.5 => {
+                    let mut landed = *boss;
+                    landed.position = boss.target;
+                    landed.height = 0.0;
+                    landed.pitch = 0.0;
+                    landed.update_core();
+                    plan.target = Some(landed.core);
+                    plan.hold = true;
+                }
+                (BossState::Recovery, _) if on && boss.exposed > arrival(boss.core) + 0.03 => {
+                    plan.goal = player;
+                    plan.target = Some(boss.core);
+                }
+                _ => {}
+            }
+        }
+        Guardian::Copilot => {
+            if boss.exposed > 0.0 {
+                plan.goal = arena.map.move_body(
+                    boss.position,
+                    boss.position.minus(boss.direction.scale(20.0)),
+                    2.0,
+                );
+                let behind = player.minus(boss.core).dot(boss.direction) < -2.0;
+                if behind && boss.exposed > arrival(boss.core) + 0.03 {
+                    plan.target = Some(boss.core);
+                }
+            } else {
+                plan.goal = CENTER.lerp(around(boss.position, 26.0), 0.5);
+            }
+        }
+    }
+    plan
+}
+
+fn clear_shot(arena: &Arena, target: Vec2) -> bool {
+    let player = arena.player.position;
+    let distance = target.minus(player).length();
+    let near = target.minus(target.minus(player).normalized().scale(CORE_RADIUS + 0.1));
+    (3.0..95.0).contains(&distance)
+        && !arena.map.cover_hit(player, near)
+        && (arena.boss.guardian != Guardian::DeepSeek || arena.map.on_island(player))
+}
+
+/// Committed landing point and radius of the current strike, if any.
+fn strike(arena: &Arena) -> Option<(Vec2, f32)> {
+    let boss = &arena.boss;
+    if !boss.target_locked() {
+        return None;
+    }
+    let radius = boss.impact_radius();
+    let aerial = matches!(boss.state, BossState::Windup | BossState::Striking);
+    match (boss.guardian, boss.attack) {
+        (Guardian::Claude, _) if aerial => Some((boss.target, radius)),
+        (Guardian::Codex | Guardian::OpenCode, Attack::Leap) if aerial => {
+            Some((boss.target, radius))
+        }
+        (Guardian::Pi, Attack::LeftFist | Attack::RightFist) if aerial => {
+            Some((boss.target, radius))
+        }
+        (Guardian::OpenCode, Attack::Bite) if aerial => {
+            Some((boss.target.plus(boss.direction.scale(3.0)), radius))
+        }
+        (Guardian::OpenCode, Attack::Ambush)
+            if matches!(boss.state, BossState::Submerged | BossState::Striking) =>
+        {
+            Some((boss.target, radius + 3.5))
+        }
+        (Guardian::DeepSeek, Attack::Breach)
+            if matches!(boss.state, BossState::Submerged | BossState::Striking) =>
+        {
+            Some((boss.target, radius))
+        }
+        _ => None,
+    }
+}
+
+/// Committed rolling or dashing route, if any.
+fn route(arena: &Arena) -> Option<(Vec2, Vec2, f32)> {
+    let boss = &arena.boss;
+    let committed =
+        boss.state == BossState::Rushing || boss.state == BossState::Windup && boss.target_locked();
+    match (boss.guardian, boss.attack) {
+        (Guardian::Codex, Attack::Rush) if committed => Some((
+            boss.position,
+            arena.map.beam_end(boss.position, boss.direction),
+            boss.radius(),
+        )),
+        (Guardian::Copilot, Attack::Dash) if committed => {
+            Some((boss.position, boss.target, boss.radius()))
+        }
+        _ => None,
+    }
+}
+
+/// Visible danger at a ground point.
+fn threat(arena: &Arena, q: Vec2) -> f32 {
+    let boss = &arena.boss;
+    let mut score = 0.0;
+    if let Some((point, radius)) = strike(arena)
+        && q.minus(point).length() < radius + PLAYER_RADIUS + 1.5
+    {
+        score += 10.0;
+    }
+    if let Some((from, to, radius)) = route(arena)
+        && segment_distance(q, from, to) < radius + PLAYER_RADIUS + 1.8
+    {
+        score += 10.0;
+    }
+    if boss.guardian != Guardian::Pi
+        && !boss.airborne()
+        && q.minus(boss.position).length() < boss.radius() + 3.0
+    {
+        score += 10.0;
+    }
+    if boss.guardian == Guardian::OpenCode
+        && !boss.airborne()
+        && q.minus(boss.position).length() < 19.0
+    {
+        score += 3.0;
+    }
+    for shard in boss.shards.iter().filter(|s| s.alive) {
+        let close = if shard.airborne {
+            q.minus(shard.target).length() < 2.0 + 4.0 * shard.size + PLAYER_RADIUS + 1.5
+        } else {
+            q.minus(shard.position).length() < shard.radius() + 2.0
+        };
+        if close {
+            score += 10.0;
+        }
+    }
+    for h in &arena.hazards {
+        let distance = q.minus(h.position).length();
+        match h.kind {
+            HazardKind::Goo if distance < h.radius => score += 0.4,
+            HazardKind::Drop | HazardKind::Icicle
+                if h.time < h.delay + 0.02 && distance < h.radius + PLAYER_RADIUS + 1.2 =>
+            {
+                score += 10.0
             }
             _ => {}
         }
-        let mut movement = steer(arena, goal);
-        let mut controls = Controls::default();
-        let dodge = danger_direction(arena, goal);
-        if let Some(direction) = dodge {
-            movement = direction;
-            if arena.player.roll_cooldown <= 0.0 {
-                arena.roll(direction);
-            }
-        }
-        if arena.arrow.state == ArrowState::Ready {
-            self.flying_frames = 0;
-            if let Some(target) = target {
-                let distance = target.minus(player).length();
-                let near = target.minus(target.minus(player).normalized().scale(CORE_RADIUS + 0.1));
-                if dodge.is_none()
-                    && distance < 65.0
-                    && distance > 3.0
-                    && player.minus(boss.position).length() > boss.radius() + 3.0
-                    && !arena.map.cover_hit(player, near)
-                    && arena.player.roll_remaining <= 0.0
-                {
-                    controls.aim = Some(target);
-                    controls.shoot = true;
-                    movement = Vec2::default();
-                    if arena.player.charge >= 0.34 {
-                        arena.release_shot(Some(target));
-                        controls.shoot = false;
-                    }
-                }
-            }
-        } else if arena.arrow.state == ArrowState::Flying {
-            self.flying_frames += 1;
-            controls.recall = self.flying_frames > 65;
-        } else {
-            controls.recall = dodge.is_none();
-        }
-        controls.movement = movement;
-        arena.tick(controls);
     }
+    for wave in &arena.waves {
+        if wave.kind == WaveKind::Water && arena.map.on_island(q) {
+            continue;
+        }
+        let distance = q.minus(wave.position).length();
+        let gap = distance - wave.radius;
+        if distance < wave.maximum + PLAYER_RADIUS + 0.6 && gap > -1.6 && gap < 4.0 {
+            score += 6.0;
+        }
+    }
+    for p in &arena.projectiles {
+        let r = q.minus(p.position);
+        let v = p.velocity;
+        let t = (r.dot(v) / v.dot(v).max(0.001)).clamp(0.0, 0.6);
+        if r.minus(v.scale(t)).length() < 1.7 + PLAYER_RADIUS + 1.0 {
+            score += 8.0;
+        }
+    }
+    if boss.guardian == Guardian::Copilot && !arena.map.inside(q, 9.0) {
+        score += 1.0;
+    }
+    score
 }
 
 fn steer(arena: &Arena, goal: Vec2) -> Vec2 {
@@ -146,17 +404,11 @@ fn steer(arena: &Arena, goal: Vec2) -> Vec2 {
         .map(|ix| {
             let direction = Vec2::from_angle(desired + ix as f32 * TAU / 16.0);
             let target = player.plus(direction.scale(4.0));
-            let projected = arena.map.move_body(player, target, PLAYER_RADIUS);
+            let projected = arena.map.walk(player, target, PLAYER_RADIUS);
             let blocked = target.minus(projected).length() * 8.0;
-            let separation = projected.minus(arena.boss.position).length();
-            let contact = if arena.boss.airborne() {
-                0.0
-            } else {
-                (arena.boss.radius() + 5.0 - separation).max(0.0) * 4.0
-            };
             (
                 direction,
-                projected.minus(goal).length() + blocked + contact,
+                projected.minus(goal).length() + blocked + threat(arena, projected) * 4.0,
             )
         })
         .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -164,111 +416,83 @@ fn steer(arena: &Arena, goal: Vec2) -> Vec2 {
         .0
 }
 
-fn danger_direction(arena: &Arena, goal: Vec2) -> Option<Vec2> {
+/// The safest nearby direction when standing in visible danger, and
+/// whether the danger is serious enough to roll.
+fn escape(arena: &Arena, goal: Vec2) -> Option<(Vec2, bool)> {
     let player = arena.player.position;
-    for wave in &arena.waves {
-        if wave.kind == WaveKind::Water && arena.map.on_island(player) {
-            continue;
-        }
-        let gap = player.minus(wave.position).length() - wave.radius;
-        if (-2.0..5.0).contains(&gap) {
-            return Some(wave.position.minus(player).normalized());
-        }
+    let here = threat(arena, player);
+    if here < 1.0 {
+        return None;
     }
-    for hazard in &arena.hazards {
-        if hazard.kind == HazardKind::Gravity || hazard.time < hazard.delay - 0.2 {
-            continue;
-        }
-        if segment_distance(player, hazard.position, hazard.end) < hazard.radius + 3.0 {
-            let direction = hazard
-                .end
-                .minus(hazard.position)
-                .normalized()
-                .perpendicular();
-            let side = if direction.dot(goal.minus(player)) < 0.0 {
-                -1.0
-            } else {
-                1.0
-            };
-            return Some(direction.scale(side));
-        }
-    }
-    for p in &arena.projectiles {
-        if p.kind == ProjectileKind::ChargedOrb && p.age < 1.0 {
-            continue;
-        }
-        if segment_distance(player, p.position, p.position.plus(p.velocity.scale(0.24))) < 2.6 {
-            let direction = p.velocity.normalized().perpendicular();
-            let side = if direction.dot(goal.minus(player)) < 0.0 {
-                -1.0
-            } else {
-                1.0
-            };
-            return Some(direction.scale(side));
-        }
-    }
-    let b = arena.boss;
-    if b.state == BossState::Windup
-        && b.progress() > 0.56
-        && matches!(b.attack, Attack::Sweep | Attack::VisorBeam)
-        && segment_distance(player, b.attack_origin(), b.beam_end) < 4.0
-    {
-        return Some(b.direction.perpendicular());
-    }
-    if b.state == BossState::Rushing && player.minus(b.position).length() < 18.0 {
-        return Some(b.direction.perpendicular());
-    }
-    let tells =
-        (b.state == BossState::Windup && b.progress() > 0.67) || b.state == BossState::Striking;
-    if tells
-        && matches!(
-            b.attack,
-            Attack::LeftFist | Attack::RightFist | Attack::Leap | Attack::Stomp | Attack::Dash
-        )
-        && player.minus(b.target).length() < b.impact_radius() + 7.0
-    {
-        let away = player.minus(b.target);
-        return Some(if away.length() < 1.0 {
-            goal.minus(player).normalized()
-        } else {
-            away.normalized()
-        });
-    }
-    if tells && b.attack == Attack::TendrilSweep {
-        for ix in b.ward as usize * 2..b.ward as usize * 2 + 2 {
-            if b.severed & (1 << ix) == 0
-                && player.minus(b.tentacles[ix]).length() < b.impact_radius() + 4.0
-            {
-                return Some(player.minus(b.tentacles[ix]).normalized());
-            }
-        }
-    }
-    None
+    let rolling = !arena.player.swimming && arena.player.roll_cooldown <= 0.0;
+    let reach = if rolling { 14.0 } else { 6.0 };
+    let (direction, _) = (0..24)
+        .map(|ix| {
+            let direction = Vec2::from_angle(ix as f32 * TAU / 24.0);
+            let mid = arena.map.walk(
+                player,
+                player.plus(direction.scale(reach * 0.5)),
+                PLAYER_RADIUS,
+            );
+            let end = arena
+                .map
+                .walk(player, player.plus(direction.scale(reach)), PLAYER_RADIUS);
+            let score = threat(arena, end) * 1.5
+                + threat(arena, mid) * 0.5
+                + end.minus(goal).length() * 0.02
+                - end.minus(player).length() * 0.1;
+            (direction, score)
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap();
+    Some((direction, here >= 6.0))
 }
 
 /// The pilot reads visible tells and sends ordinary input only. It never
 /// changes positions, timers, armor, health, phase, damage or the random seed.
-#[test]
-fn every_guardian_is_winnable_through_ordinary_inputs_across_spawn_seeds() {
-    for guardian in Guardian::ALL {
-        for seed in [1, 17, 127] {
-            let mut arena = Arena::from_preview(Boss::new(guardian), 0.0, seed);
-            let mut pilot = Pilot::default();
-            for _ in 0..24_000 {
-                if arena.phase == Phase::Victory {
-                    break;
-                }
-                pilot.tick(&mut arena);
+fn winnable(guardian: Guardian) {
+    for seed in [1, 17, 127] {
+        let mut arena = Arena::from_preview(Boss::new(guardian), 0.0, seed);
+        let mut pilot = Pilot::default();
+        for _ in 0..(300.0 / STEP) as usize {
+            if arena.phase == Phase::Victory {
+                break;
             }
-            assert_eq!(
-                arena.phase,
-                Phase::Victory,
-                "{guardian:?} seed {seed}: deaths={} player={:?} boss={:?} arrow={:?}",
-                arena.deaths,
-                arena.player.position,
-                arena.boss,
-                arena.arrow
-            );
+            pilot.tick(&mut arena);
         }
+        assert_eq!(
+            arena.phase,
+            Phase::Victory,
+            "{guardian:?} seed {seed}: deaths={} player={:?} boss={:?} arrow={:?}",
+            arena.deaths,
+            arena.player.position,
+            arena.boss,
+            arena.arrow
+        );
     }
+}
+
+#[test]
+fn the_spark_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::Claude);
+}
+#[test]
+fn the_knot_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::Codex);
+}
+#[test]
+fn the_glyph_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::Pi);
+}
+#[test]
+fn the_chest_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::OpenCode);
+}
+#[test]
+fn the_whale_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::DeepSeek);
+}
+#[test]
+fn the_helmet_is_winnable_through_ordinary_inputs() {
+    winnable(Guardian::Copilot);
 }

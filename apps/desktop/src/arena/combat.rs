@@ -1,23 +1,31 @@
 //! Fixed-step, local combat. Rendering and GPUI never decide a collision.
 
+use super::geometry::circle_hit;
 pub(super) use super::geometry::{HEIGHT, Vec2, WIDTH, segment_distance, smoothstep};
-use super::geometry::{circle_hit, segments_distance};
-pub(super) use super::guardian::{Attack, Boss, BossState, Guardian};
-use super::map::{CENTER, Map, ScarKind};
+pub(super) use super::guardian::{Attack, Boss, BossState, Guardian, STEMS, Shard};
+use super::map::{BRAZIER, CENTER, FLAME_RADIUS, Map, ScarKind};
 use std::f32::consts::{PI, TAU};
 
-pub(super) const STEP: f32 = 1.0 / 60.0;
+pub(super) const STEP: f32 = 1.0 / 120.0;
 pub(super) const INTRO_DURATION: f32 = 1.4;
 pub(super) const VICTORY_DURATION: f32 = 3.3;
-pub(super) const MIN_CHARGE: f32 = 0.30;
+pub(super) const MIN_CHARGE: f32 = 0.20;
+pub(super) const MAX_CHARGE: f32 = 0.8;
 pub(super) const MAX_PROJECTILES: usize = 48;
 pub(super) const MAX_EFFECTS: usize = 64;
 pub(super) const MAX_WAVES: usize = 8;
 pub(super) const MAX_HAZARDS: usize = 16;
-const PLAYER_RADIUS: f32 = 0.9;
-const CORE_RADIUS: f32 = 1.8;
-pub(super) const ROLL_DURATION: f32 = 0.28;
+pub(super) const PLAYER_RADIUS: f32 = 0.9;
+pub(super) const CORE_RADIUS: f32 = 1.8;
+pub(super) const ROLL_DURATION: f32 = 0.24;
+const ROLL_COOLDOWN: f32 = 0.32;
 const INPUT_BUFFER: f32 = 0.12;
+const WALK_SPEED: f32 = 30.0;
+const SPRINT: f32 = 1.45;
+const GOO_SLOW: f32 = 0.55;
+/// A knockback still this fast when it meets a wall crushes the archer.
+const CRUSH_SPEED: f32 = 18.0;
+pub(super) const KNOCKBACK: f32 = 58.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Phase {
@@ -34,7 +42,6 @@ pub(super) enum ArrowState {
     Flying,
     Lodged,
     Returning,
-    Tethered,
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Controls {
@@ -42,6 +49,7 @@ pub(super) struct Controls {
     pub shoot: bool,
     pub recall: bool,
     pub aim: Option<Vec2>,
+    pub sprint: bool,
 }
 #[derive(Clone, Debug)]
 pub(super) struct Player {
@@ -54,8 +62,12 @@ pub(super) struct Player {
     pub stride: f32,
     pub moving: bool,
     pub swimming: bool,
+    pub sprinting: bool,
+    pub slowed: bool,
+    pub knockback: Vec2,
     roll_direction: Vec2,
     buffered_roll: Option<(Vec2, f32)>,
+    dust: f32,
 }
 impl Player {
     fn new(position: Vec2) -> Self {
@@ -69,9 +81,16 @@ impl Player {
             stride: 0.0,
             moving: false,
             swimming: false,
+            sprinting: false,
+            slowed: false,
+            knockback: Vec2::default(),
             roll_direction: Vec2::default(),
             buffered_roll: None,
+            dust: 0.0,
         }
+    }
+    pub fn knocked(&self) -> bool {
+        self.knockback.length() > 6.0
     }
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -79,13 +98,14 @@ pub(super) struct Arrow {
     pub state: ArrowState,
     pub position: Vec2,
     pub velocity: Vec2,
+    /// Seconds of flame left after passing through the lit brazier.
+    pub burning: f32,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ProjectileKind {
+    /// Pushes the archer away instead of killing outright.
     Orb,
-    ChargedOrb,
     Block,
-    Segment,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Projectile {
@@ -110,16 +130,17 @@ pub(super) struct Wave {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HazardKind {
-    Beam,
-    Geyser,
-    Scorch,
-    Gravity,
+    /// Harmless ember slime that slows the archer.
+    Goo,
+    /// A falling code block that stays behind as an obstacle.
+    Drop,
+    /// A falling shard from the terrace canopy.
+    Icicle,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Hazard {
     pub kind: HazardKind,
     pub position: Vec2,
-    pub end: Vec2,
     pub time: f32,
     pub delay: f32,
     pub duration: f32,
@@ -137,16 +158,16 @@ pub(super) enum EffectKind {
     Catch,
     Roll,
     Shot,
-    Cross,
-    Sweep,
     Victory,
     Defeat,
     Wake,
     Rubble,
     Steam,
-    Sever,
-    Overload,
-    Seal,
+    Burst,
+    Spark,
+    Dust,
+    Ignite,
+    Flash,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Effect {
@@ -189,7 +210,7 @@ impl Arena {
         let map = Map::new(boss.guardian);
         let mut seed = seed.max(1);
         let intro_target = if boss.guardian == Guardian::Pi {
-            CENTER.plus(Vec2::new(0.0, -18.0))
+            super::map::THRONE
         } else if map.is_clear(boss.position, boss.radius() + 1.0) {
             boss.position
         } else {
@@ -240,13 +261,9 @@ impl Arena {
             _ => 1.0,
         }
     }
-    /// Both the radial windup and its live beams use these clipped rays.
-    pub fn spokes(&self) -> [(Vec2, Vec2); 6] {
-        std::array::from_fn(|ix| {
-            let direction = Vec2::from_angle(self.boss.yaw + ix as f32 * TAU / 6.0);
-            let from = self.boss.core.plus(direction.scale(9.0));
-            (from, self.map.beam_end(from, direction))
-        })
+    /// The brazier burns only while the knot holds a forge plate down.
+    pub fn brazier_lit(&self) -> bool {
+        self.boss.guardian == Guardian::Codex && self.boss.plate.is_some()
     }
     pub fn tick(&mut self, controls: Controls) {
         if !self.needs_tick() {
@@ -261,37 +278,12 @@ impl Arena {
         let camera_target = self
             .player
             .position
-            .lerp(self.boss.position, 0.10)
-            .plus(controls.movement.scale(3.0));
-        self.camera = self.camera.lerp(camera_target, 1.0 - (-STEP * 5.5).exp());
+            .lerp(self.boss.position, 0.12)
+            .plus(controls.movement.scale(4.0));
+        self.camera = self.camera.lerp(camera_target, 1.0 - (-STEP * 6.5).exp());
         match self.phase {
             Phase::Awakening => {
-                // Keep the measured pose at t=0, then settle roaming into a safe
-                // encounter position before any attack becomes possible.
-                self.boss.position = self.intro.position.lerp(
-                    self.intro_target,
-                    smoothstep(self.phase_time / INTRO_DURATION),
-                );
-                self.boss.face(self.player.position, STEP * 1.8);
-                let transition = smoothstep(self.phase_time / INTRO_DURATION);
-                let pitch_delta = (-self.intro.pitch + PI).rem_euclid(TAU) - PI;
-                self.boss.pitch = self.intro.pitch + pitch_delta * transition;
-                self.boss.height = self.intro.height
-                    + (self.boss.hover_height(self.visual_time) - self.intro.height) * transition;
-                if self.boss.guardian == Guardian::OpenCode {
-                    self.boss.height = Boss::rolling_height(self.boss.pitch);
-                }
-                self.boss.bank = self.intro.bank * (1.0 - transition);
-                self.boss.stride += STEP * 2.0;
-                self.boss.rest_hands();
-                self.boss.rest_tentacles();
-                self.boss.update_core();
-                self.boss.previous_core = self.boss.core;
-                if self.phase_time >= INTRO_DURATION {
-                    self.phase = Phase::Battle;
-                    self.phase_time = 0.0;
-                    self.boss.enter(BossState::Watching, 0.75);
-                }
+                self.awaken();
                 return;
             }
             Phase::Defeat => {
@@ -321,7 +313,7 @@ impl Arena {
         self.player.invulnerable = (self.player.invulnerable - STEP).max(0.0);
         self.player.roll_cooldown = (self.player.roll_cooldown - STEP).max(0.0);
         if let Some((direction, remaining)) = self.player.buffered_roll {
-            if self.player.roll_cooldown <= 0.0 {
+            if self.player.roll_cooldown <= 0.0 && !self.player.knocked() {
                 self.start_roll(direction);
             } else {
                 self.player.buffered_roll =
@@ -334,63 +326,158 @@ impl Arena {
         {
             self.fire_arrow(direction, charge);
         }
+        let from = self.player.position;
+        self.move_player(controls);
+        let recalling = self.player.roll_remaining <= 0.0
+            && self.arrow.state != ArrowState::Ready
+            && (controls.recall || controls.shoot);
+        self.tick_boss();
+        if self.phase != Phase::Battle {
+            return;
+        }
+        self.body_contact(from);
+        if self.phase == Phase::Battle {
+            self.tick_arrow(recalling);
+        }
+        if self.phase == Phase::Battle {
+            self.tick_threats(from);
+        }
+    }
+    /// Keep the measured pose at t=0, then settle roaming into a safe
+    /// encounter pose before any attack becomes possible.
+    fn awaken(&mut self) {
+        let transition = smoothstep(self.phase_time / INTRO_DURATION);
+        self.boss.position = self.intro.position.lerp(self.intro_target, transition);
+        self.boss.face(self.player.position, STEP * 1.8);
+        let upright = |angle: f32| angle + ((-angle + PI).rem_euclid(TAU) - PI) * transition;
+        self.boss.pitch = upright(self.intro.pitch);
+        self.boss.bank = upright(self.intro.bank);
+        self.boss.height = self.intro.height
+            + (self.boss.hover_height(self.visual_time) - self.intro.height) * transition;
+        self.boss.squash = self.intro.squash * (1.0 - transition);
+        self.boss.lid = self.intro.lid * (1.0 - transition);
+        self.boss.stride += STEP * 2.0;
+        for ix in 0..2 {
+            self.boss.hands[ix] = self.intro.hands[ix].lerp(self.boss.resting_hand(ix), transition);
+            self.boss.hand_heights[ix] = self.intro.hand_heights[ix] * (1.0 - transition);
+        }
+        self.boss.update_core();
+        self.boss.previous_core = self.boss.core;
+        if self.phase_time >= INTRO_DURATION {
+            let wrap = |angle: f32| (angle + PI).rem_euclid(TAU) - PI;
+            self.boss.pitch = wrap(self.boss.pitch);
+            self.boss.bank = wrap(self.boss.bank);
+            self.phase = Phase::Battle;
+            self.phase_time = 0.0;
+            self.boss.enter(BossState::Watching, 0.6);
+        }
+    }
+    fn move_player(&mut self, controls: Controls) {
         self.player.moving = false;
+        self.player.sprinting = false;
         let from = self.player.position;
         self.player.swimming =
             self.boss.guardian == Guardian::DeepSeek && !self.map.on_island(from);
+        self.player.slowed = self.hazards.iter().any(|h| {
+            h.kind == HazardKind::Goo && h.active() && h.position.minus(from).length() < h.radius
+        });
         let rolling = self.player.roll_remaining > 0.0;
-        let recalling = !rolling
-            && self.arrow.state != ArrowState::Ready
-            && (controls.recall || controls.shoot);
         let drawing = !rolling
+            && !self.player.knocked()
             && !self.player.swimming
             && controls.shoot
             && self.arrow.state == ArrowState::Ready;
-        if rolling {
+        let recalling = !rolling
+            && self.arrow.state != ArrowState::Ready
+            && (controls.recall || controls.shoot);
+        if self.player.knocked() {
+            let step = self.player.knockback.scale(STEP);
+            let target = from.plus(step);
+            let moved = self.map.walk(from, target, PLAYER_RADIUS);
+            self.player.position = moved;
+            if target.minus(moved).length() > step.length() * 0.35
+                && self.player.knockback.length() > CRUSH_SPEED
+            {
+                self.player.knockback = Vec2::default();
+                self.effect(EffectKind::Impact, moved, 0.6, 3.5);
+                self.hurt();
+                return;
+            }
+            self.player.knockback = self.player.knockback.scale((-STEP * 6.0).exp());
+            self.player.charge = 0.0;
+        } else if rolling {
             let progress = 1.0 - self.player.roll_remaining / ROLL_DURATION;
-            let speed = 36.0 + (1.0 - progress).powi(2) * 46.0;
-            self.player.position = self.map.move_body(
+            let speed = 48.0 + (1.0 - progress).powi(2) * 60.0;
+            self.player.position = self.map.walk(
                 from,
                 from.plus(self.player.roll_direction.scale(speed * STEP)),
                 PLAYER_RADIUS,
             );
             self.player.roll_remaining = (self.player.roll_remaining - STEP).max(0.0);
         } else if drawing {
-            self.player.charge = (self.player.charge + STEP).min(0.9);
+            self.player.charge = (self.player.charge + STEP).min(MAX_CHARGE);
             self.player.facing = self.aim_direction(controls.aim);
         } else if !recalling && controls.movement.length() > 0.0 {
             let direction = controls.movement.normalized();
-            let speed = 20.0 * self.map.speed(from);
-            self.player.position = self.map.move_body(
+            self.player.sprinting = controls.sprint && !self.player.swimming;
+            let speed = WALK_SPEED
+                * self.map.speed(from)
+                * if self.player.slowed { GOO_SLOW } else { 1.0 }
+                * if self.player.sprinting { SPRINT } else { 1.0 };
+            self.player.position = self.map.walk(
                 from,
                 from.plus(direction.scale(speed * STEP)),
                 PLAYER_RADIUS,
             );
             self.player.facing = direction;
             self.player.moving = self.player.position != from;
-            self.player.stride += STEP * 10.0;
+            self.player.stride += STEP * speed / 3.0;
         }
         if self.player.swimming {
             self.player.charge = 0.0;
         }
-        self.tick_boss();
-        if self.phase != Phase::Battle {
-            return;
+        if self.player.moving || rolling {
+            self.player.dust -= STEP;
+            if self.player.dust <= 0.0 {
+                self.player.dust = if self.player.sprinting || rolling {
+                    0.07
+                } else {
+                    0.16
+                };
+                let kind = if self.player.swimming {
+                    EffectKind::Wake
+                } else {
+                    EffectKind::Dust
+                };
+                self.effect(kind, from, 0.4, 1.6);
+            }
         }
-        if !self.boss.airborne()
+    }
+    fn body_contact(&mut self, from: Vec2) {
+        let player = self.player.position;
+        // The glyph floats above its dais, which the archer cannot enter.
+        if self.boss.guardian != Guardian::Pi
+            && !self.boss.airborne()
             && segment_distance(
                 Vec2::default(),
                 from.minus(self.boss.previous_position),
-                self.player.position.minus(self.boss.position),
+                player.minus(self.boss.position),
             ) < self.boss.radius() + PLAYER_RADIUS
         {
             self.hurt();
+            return;
         }
-        if self.phase == Phase::Battle {
-            self.tick_arrow(recalling);
-        }
-        if self.phase == Phase::Battle {
-            self.tick_threats(from);
+        let crushed = self.boss.shards.iter().any(|shard| {
+            shard.alive
+                && shard.height < 2.5
+                && segment_distance(
+                    Vec2::default(),
+                    from.minus(shard.previous),
+                    player.minus(shard.position),
+                ) < shard.radius() * 0.8 + PLAYER_RADIUS
+        });
+        if crushed {
+            self.hurt();
         }
     }
     pub fn respawn(&mut self) {
@@ -400,23 +487,30 @@ impl Arena {
             self.boss.guardian == Guardian::DeepSeek && !self.map.on_island(position);
         self.arrow = Arrow::default();
         self.clear_threats();
-        self.boss.exposed = 0.0;
-        self.boss.height = 0.0;
-        self.boss.pitch = 0.0;
-        self.boss.bank = 0.0;
-        self.boss.rest_hands();
-        self.boss.rest_tentacles();
-        self.boss.severed = 0;
-        self.boss.seals = 0;
-        self.boss.seal_time = [0.0; 2];
-        self.boss.strain = 0.0;
-        self.boss.tether = 0.0;
-        self.boss.attacks = 0;
+        self.map.blocks.clear();
+        let boss = &mut self.boss;
+        boss.exposed = 0.0;
+        boss.height = 0.0;
+        boss.pitch = 0.0;
+        boss.bank = 0.0;
+        boss.squash = 0.0;
+        boss.lid = 0.0;
+        boss.fade = 1.0;
+        boss.unravel = 0.0;
+        boss.plate = None;
+        boss.shield = 0.0;
+        boss.dashes = 0;
+        boss.flash = 0.0;
+        boss.generation = 0;
+        boss.shards = [Shard::default(); 4];
+        boss.guard = 1;
+        boss.attacks = 0;
+        boss.rest_hands();
+        boss.enter(BossState::Watching, 1.1);
+        boss.update_core();
+        boss.previous_core = boss.core;
         self.buffered_shot = None;
         self.hit_pause = 0.0;
-        self.boss.enter(BossState::Watching, 1.1);
-        self.boss.update_core();
-        self.boss.previous_core = self.boss.core;
         self.phase = Phase::Rebirth;
         self.phase_time = 0.0;
         self.deaths = self.deaths.saturating_add(1);
@@ -427,37 +521,16 @@ impl Arena {
             .minus(self.player.position)
             .normalized()
     }
+    /// Keyboard aim follows the weak point once it is open, the lit flame
+    /// before the knot is melted, and otherwise the body.
     pub fn aim_target(&self) -> Vec2 {
-        if self.boss.exposed <= 0.0 {
-            if self.boss.guardian == Guardian::Claude
-                && let Some(ix) = (0..6)
-                    .filter(|ix| self.boss.tentacle_vulnerable(*ix))
-                    .min_by(|a, b| {
-                        self.boss
-                            .tentacle_joint(*a)
-                            .minus(self.player.position)
-                            .length()
-                            .total_cmp(
-                                &self
-                                    .boss
-                                    .tentacle_joint(*b)
-                                    .minus(self.player.position)
-                                    .length(),
-                            )
-                    })
-            {
-                return self.boss.tentacle_joint(ix);
-            }
-            if self.boss.guardian == Guardian::Copilot
-                && let Some(projectile) = self
-                    .projectiles
-                    .iter()
-                    .find(|p| p.kind == ProjectileKind::ChargedOrb)
-            {
-                return projectile.position;
-            }
+        if self.boss.exposed > 0.0 {
+            self.boss.core
+        } else if self.brazier_lit() && self.arrow.burning <= 0.0 {
+            flame_center()
+        } else {
+            self.boss.body_center()
         }
-        self.boss.core
     }
     pub fn release_shot(&mut self, aim: Option<Vec2>) {
         if self.phase == Phase::Battle
@@ -480,7 +553,8 @@ impl Arena {
         self.arrow = Arrow {
             state: ArrowState::Flying,
             position: self.player.position.plus(direction.scale(1.6)),
-            velocity: direction.scale(86.0 + charge * 28.0),
+            velocity: direction.scale(100.0 + charge * 45.0),
+            burning: 0.0,
         };
         self.player.facing = direction;
         self.effect(EffectKind::Shot, self.arrow.position, 0.18, 2.0);
@@ -495,10 +569,10 @@ impl Arena {
         }
     }
     pub fn roll(&mut self, movement: Vec2) {
-        if self.phase != Phase::Battle {
+        if self.phase != Phase::Battle || self.player.swimming {
             return;
         }
-        if self.player.roll_cooldown > 0.0 {
+        if self.player.roll_cooldown > 0.0 || self.player.knocked() {
             if self.player.roll_cooldown <= INPUT_BUFFER {
                 self.player.buffered_roll = Some((movement, INPUT_BUFFER));
             }
@@ -515,62 +589,34 @@ impl Arena {
         };
         self.player.facing = self.player.roll_direction;
         self.player.roll_remaining = ROLL_DURATION;
-        self.player.roll_cooldown = 0.50;
-        self.player.invulnerable = 0.30;
-        self.effect(EffectKind::Roll, self.player.position, 0.38, 2.0);
+        self.player.roll_cooldown = ROLL_COOLDOWN;
+        self.player.invulnerable = self.player.invulnerable.max(0.26);
+        self.effect(EffectKind::Roll, self.player.position, 0.3, 2.0);
     }
     fn accepts_core_hit(&self, from: Vec2) -> bool {
         if self.boss.exposed <= 0.0 {
             return false;
         }
         match self.boss.guardian {
-            Guardian::Claude | Guardian::Codex | Guardian::Pi | Guardian::Copilot => true,
+            Guardian::Claude => self.boss.generation >= 4,
+            Guardian::Codex => !self.boss.cube_shielded(),
+            Guardian::Pi | Guardian::DeepSeek => true,
             Guardian::OpenCode => from.minus(self.boss.core).dot(self.boss.direction) > 0.0,
-            Guardian::DeepSeek => {
-                self.boss.state == BossState::Recovery || self.boss.state == BossState::Striking
-            }
+            Guardian::Copilot => from.minus(self.boss.core).dot(self.boss.direction) < 0.0,
         }
     }
     fn tick_arrow(&mut self, recalling: bool) {
         if self.arrow.state == ArrowState::Ready {
             self.arrow.position = self.player.position;
+            self.arrow.burning = 0.0;
             return;
         }
-        if self.arrow.state == ArrowState::Tethered {
-            self.arrow.position = self.boss.core;
-            if !self.boss.is_inhaling() {
-                self.arrow.state = ArrowState::Lodged;
-                self.arrow.position = self.boss.core.plus(self.boss.direction.scale(9.0));
-                self.boss.tether = 0.0;
-            } else if recalling {
-                self.boss.tether = (self.boss.tether + STEP / 0.62).min(1.0);
-                self.boss.position = self.map.move_body(
-                    self.boss.position,
-                    self.boss.position.plus(
-                        self.player
-                            .position
-                            .minus(self.boss.position)
-                            .normalized()
-                            .scale(5.0 * STEP),
-                    ),
-                    self.boss.radius(),
-                );
-                if self.boss.tether >= 1.0 {
-                    self.boss.opening(4.8);
-                    self.hazards.retain(|h| h.kind != HazardKind::Gravity);
-                    self.arrow.state = ArrowState::Returning;
-                    self.arrow.velocity = Vec2::default();
-                    self.effect(EffectKind::Rubble, self.boss.core, 1.2, 9.0);
-                    self.hit_pause = 0.05;
-                }
-            }
-            return;
-        }
+        self.arrow.burning = (self.arrow.burning - STEP).max(0.0);
         if recalling {
             let speed = if self.arrow.state == ArrowState::Returning {
-                (self.arrow.velocity.length() + STEP * 200.0).clamp(38.0, 116.0)
+                (self.arrow.velocity.length() + STEP * 260.0).clamp(48.0, 130.0)
             } else {
-                38.0
+                48.0
             };
             self.arrow.state = ArrowState::Returning;
             self.arrow.velocity = self
@@ -583,7 +629,7 @@ impl Arena {
             self.arrow.state = ArrowState::Lodged;
         }
         if self.arrow.state == ArrowState::Lodged {
-            if self.arrow.position.minus(self.player.position).length() < 2.0 {
+            if self.arrow.position.minus(self.player.position).length() < 2.2 {
                 self.catch_arrow();
             }
             return;
@@ -591,13 +637,19 @@ impl Arena {
         let from = self.arrow.position;
         let to = from.plus(self.arrow.velocity.scale(STEP));
         let returning = self.arrow.state == ArrowState::Returning;
+        if self.brazier_lit() && segment_distance(flame_center(), from, to) < FLAME_RADIUS {
+            if self.arrow.burning <= 0.0 {
+                self.effect(EffectKind::Ignite, flame_center(), 0.5, 4.0);
+            }
+            self.arrow.burning = 4.0;
+        }
         enum Contact {
             Cover,
             Core,
             Armor,
-            Mouth,
-            Tentacle(usize),
-            Drone(usize),
+            Carrier,
+            Shard(usize),
+            Knot,
         }
         let mut contact: Option<(f32, Contact)> = self
             .map
@@ -610,53 +662,70 @@ impl Arena {
                 contact = Some((time, kind));
             }
         };
-        if self.accepts_core_hit(from) {
+        let boss = self.boss;
+        let open = self.accepts_core_hit(from);
+        if open {
             consider(
                 circle_hit(
                     Vec2::default(),
-                    from.minus(self.boss.previous_core),
-                    to.minus(self.boss.core),
+                    from.minus(boss.previous_core),
+                    to.minus(boss.core),
                     CORE_RADIUS,
                 ),
                 Contact::Core,
             );
         }
-        let swallowing = self.boss.guardian == Guardian::OpenCode
-            && self.boss.is_inhaling()
-            && from.minus(self.boss.core).dot(self.boss.direction) > 0.0;
-        if swallowing {
-            consider(circle_hit(self.boss.core, from, to, 3.2), Contact::Mouth);
-        }
-        for ix in 0..6 {
-            if self.boss.tentacle_vulnerable(ix) {
+        let visible = boss.state != BossState::Submerged && boss.fade > 0.5;
+        if boss.guardian == Guardian::Claude {
+            if boss.generation < 4 {
                 consider(
-                    circle_hit(self.boss.tentacle_joint(ix), from, to, 2.4),
-                    Contact::Tentacle(ix),
+                    circle_hit(boss.body_center(), from, to, boss.radius() * 0.8),
+                    Contact::Carrier,
                 );
             }
-        }
-        for (ix, projectile) in self.projectiles.iter().enumerate() {
-            if projectile.kind == ProjectileKind::ChargedOrb {
-                consider(
-                    circle_hit(
-                        Vec2::default(),
-                        from.minus(projectile.position),
-                        to.minus(projectile.position.plus(projectile.velocity.scale(STEP))),
-                        2.7,
-                    ),
-                    Contact::Drone(ix),
-                );
+            for (ix, shard) in boss.shards.iter().enumerate() {
+                if shard.alive {
+                    consider(
+                        circle_hit(shard.center(), from, to, shard.radius() * 0.8),
+                        Contact::Shard(ix),
+                    );
+                }
             }
-        }
-        if !returning
-            && !swallowing
-            && self.boss.state != BossState::Submerged
-            && !self.accepts_core_hit(from)
+        } else if boss.guardian == Guardian::Codex
+            && self.arrow.burning > 0.0
+            && boss.exposed <= 0.0
         {
+            consider(circle_hit(boss.body_center(), from, to, 8.5), Contact::Knot);
+        }
+        if !returning && visible && !open && boss.guardian != Guardian::Claude {
+            let radius = if boss.guardian == Guardian::Codex && boss.exposed > 0.0 {
+                3.5
+            } else {
+                boss.radius() * 0.75
+            };
             consider(
-                circle_hit(self.boss.core, from, to, self.boss.radius() * 0.7),
+                circle_hit(boss.body_center(), from, to, radius),
                 Contact::Armor,
             );
+            // A closed weak point is armor too, wherever it sits on the body.
+            consider(
+                circle_hit(boss.core, from, to, CORE_RADIUS + 0.7),
+                Contact::Armor,
+            );
+        }
+        if !returning && boss.guardian == Guardian::Pi {
+            // Stems near the ground are stone in the arrow's path; a raised
+            // stem passes overhead.
+            for (ix, (width, length)) in STEMS.into_iter().enumerate() {
+                if boss.hand_heights[ix] >= 10.0 {
+                    continue;
+                }
+                for part in 0..3 {
+                    let rise = boss.hand_heights[ix] + length * (part as f32 + 0.5) / 3.0;
+                    let point = boss.hands[ix].plus(Vec2::new(0.0, -rise));
+                    consider(circle_hit(point, from, to, width * 0.5), Contact::Armor);
+                }
+            }
         }
         if let Some((time, contact)) = contact {
             let position = from.lerp(to, time);
@@ -665,54 +734,39 @@ impl Arena {
                     self.win();
                     return;
                 }
-                Contact::Mouth => {
-                    self.arrow.state = ArrowState::Tethered;
-                    self.arrow.position = self.boss.core;
-                    self.arrow.velocity = Vec2::default();
-                    self.boss.tether = 0.0;
-                    self.effect(EffectKind::Catch, self.boss.core, 0.4, 4.0);
+                Contact::Carrier => {
+                    self.split_spark(self.arrow.velocity.normalized());
+                    self.lodge(position);
                     return;
                 }
-                Contact::Tentacle(ix) => {
-                    self.boss.severed |= 1 << ix;
-                    self.arrow.state = ArrowState::Lodged;
-                    self.arrow.position = position;
-                    self.effect(EffectKind::Sever, self.boss.tentacle_joint(ix), 1.2, 7.0);
-                    self.hit_pause = 0.06;
-                    if self.boss.severed.count_ones() >= 2 {
-                        self.boss.opening(4.4);
-                        self.effect(EffectKind::Steam, self.boss.core, 1.4, 8.0);
+                Contact::Shard(ix) => {
+                    let shard = self.boss.shards[ix];
+                    self.boss.shards[ix].alive = false;
+                    self.effect(
+                        EffectKind::Burst,
+                        shard.center(),
+                        0.7,
+                        5.0 + shard.size * 4.0,
+                    );
+                    if !returning {
+                        self.lodge(position);
+                        return;
                     }
-                    return;
                 }
-                Contact::Drone(ix) => {
-                    let origin = self.projectiles[ix].position;
-                    self.projectiles.retain(|p| {
-                        !matches!(p.kind, ProjectileKind::Orb | ProjectileKind::ChargedOrb)
-                    });
-                    self.hazards.retain(|h| h.kind != HazardKind::Beam);
-                    self.boss.opening(4.8);
-                    self.arrow.state = ArrowState::Lodged;
-                    self.arrow.position = position;
-                    self.effect(EffectKind::Overload, origin, 1.0, 10.0);
-                    self.effect(EffectKind::Overload, self.boss.core, 0.8, 7.0);
-                    self.hit_pause = 0.07;
+                Contact::Knot => {
+                    self.unravel_knot();
+                    self.lodge(position);
                     return;
                 }
                 Contact::Cover if returning => {}
                 Contact::Cover | Contact::Armor => {
-                    self.arrow.state = ArrowState::Lodged;
-                    self.arrow.position = position;
+                    if matches!(contact, Contact::Armor) {
+                        self.boss.flash = self.boss.flash.max(0.06);
+                    }
+                    self.lodge(position);
                     self.effect(EffectKind::Armor, position, 0.35, 2.5);
                     return;
                 }
-            }
-        }
-        for hazard in &mut self.hazards {
-            if hazard.kind == HazardKind::Scorch
-                && segments_distance(from, to, hazard.position, hazard.end) < hazard.radius
-            {
-                hazard.duration = 0.0;
             }
         }
         self.arrow.position = to.clamped(2.0);
@@ -722,10 +776,16 @@ impl Arena {
             self.arrow.state = ArrowState::Lodged;
         }
     }
+    fn lodge(&mut self, position: Vec2) {
+        self.arrow.state = ArrowState::Lodged;
+        self.arrow.position = position;
+        self.arrow.burning = 0.0;
+    }
     fn catch_arrow(&mut self) {
         self.arrow.state = ArrowState::Ready;
         self.arrow.position = self.player.position;
         self.arrow.velocity = Vec2::default();
+        self.arrow.burning = 0.0;
         self.effect(EffectKind::Catch, self.player.position, 0.3, 3.0);
     }
     fn clear_threats(&mut self) {
@@ -738,10 +798,16 @@ impl Arena {
         self.phase_time = 0.0;
         self.arrow.position = self.boss.core;
         self.arrow.state = ArrowState::Lodged;
+        self.arrow.burning = 0.0;
         self.clear_threats();
         self.effects.clear();
+        for shard in &mut self.boss.shards {
+            shard.alive = false;
+        }
+        self.boss.exposed = 0.0;
         self.boss.enter(BossState::Fallen, VICTORY_DURATION);
         self.cancel_input();
+        self.effect(EffectKind::Flash, self.boss.core, 0.35, 30.0);
         self.effect(EffectKind::Victory, self.boss.core, 2.7, 16.0);
     }
     fn hurt(&mut self) {
@@ -750,130 +816,112 @@ impl Arena {
         }
         self.phase = Phase::Defeat;
         self.phase_time = 0.0;
+        self.player.knockback = Vec2::default();
         self.cancel_input();
         self.clear_threats();
         self.effect(EffectKind::Defeat, self.player.position, 0.9, 5.0);
     }
     fn tick_threats(&mut self, player_from: Vec2) {
         let mut hit = false;
-        for hazard in &self.hazards {
-            if hazard.kind == HazardKind::Gravity
-                && hazard.active()
-                && self.player.roll_remaining <= 0.0
-            {
-                let toward = hazard.position.minus(self.player.position);
-                if toward.length() < hazard.radius && toward.length() > 10.0 {
-                    self.player.position = self.map.move_body(
-                        self.player.position,
-                        self.player
-                            .position
-                            .plus(toward.normalized().scale(STEP * 5.0)),
-                        PLAYER_RADIUS,
-                    );
-                }
-            }
-        }
-        let broken_before = self.map.broken;
+        let player = self.player.position;
+        let shielded = self.player.invulnerable > 0.0;
+        let mut pushes = Vec::new();
         for projectile in &mut self.projectiles {
             let from = projectile.position;
             projectile.previous_position = from;
             projectile.age += STEP;
-            if projectile.kind == ProjectileKind::Orb && projectile.age < 1.4 {
-                let direction = self.player.position.minus(from).normalized();
+            if projectile.kind == ProjectileKind::Orb && projectile.age < 0.9 {
+                let toward = player.minus(from).normalized();
+                let speed = projectile.velocity.length();
                 projectile.velocity = projectile
                     .velocity
                     .normalized()
-                    .lerp(direction, STEP * 1.1)
+                    .lerp(toward, STEP * 1.6)
                     .normalized()
-                    .scale(23.0);
-            }
-            if projectile.kind == ProjectileKind::ChargedOrb {
-                if projectile.age < 1.0 {
-                    projectile.velocity = Vec2::default();
-                } else {
-                    let direction = self.player.position.minus(from).normalized();
-                    projectile.velocity = if projectile.velocity.length() < f32::EPSILON {
-                        direction
-                    } else {
-                        projectile
-                            .velocity
-                            .normalized()
-                            .lerp(direction, STEP * 1.8)
-                            .normalized()
-                    }
-                    .scale(12.0);
-                }
+                    .scale(speed);
             }
             projectile.position = from.plus(projectile.velocity.scale(STEP));
             projectile.remaining -= STEP;
-            if let Some((ix, _)) = self.map.cover_contact(from, projectile.position) {
-                if matches!(
-                    projectile.kind,
-                    ProjectileKind::Block | ProjectileKind::Segment
-                ) {
-                    self.map.broken |= 1 << ix;
-                }
+            if self.map.cover_hit(from, projectile.position) {
                 projectile.remaining = 0.0;
                 continue;
             }
             let radius = match projectile.kind {
-                ProjectileKind::ChargedOrb => 2.0,
-                ProjectileKind::Block => 1.6,
-                ProjectileKind::Orb | ProjectileKind::Segment => 1.0,
+                ProjectileKind::Orb => 1.7,
+                ProjectileKind::Block => 1.5,
             };
             if segment_distance(
                 Vec2::default(),
                 player_from.minus(from),
-                self.player.position.minus(projectile.position),
+                player.minus(projectile.position),
             ) < PLAYER_RADIUS + radius
-                && (projectile.kind != ProjectileKind::ChargedOrb || projectile.age >= 1.0)
             {
-                hit = true;
                 projectile.remaining = 0.0;
-            }
-        }
-        for ix in 0..self.map.pillars().len() {
-            if (self.map.broken ^ broken_before) & (1 << ix) != 0 {
-                let position = self.map.pillars()[ix].position;
-                self.effect(EffectKind::Rubble, position, 1.3, 9.0);
-                self.map.scar(position, 6.0, ScarKind::Crack);
+                match projectile.kind {
+                    ProjectileKind::Block => hit = true,
+                    ProjectileKind::Orb if !shielded => {
+                        pushes.push(projectile.velocity.normalized());
+                    }
+                    ProjectileKind::Orb => {}
+                }
             }
         }
         self.projectiles
             .retain(|p| p.remaining > 0.0 && p.position == p.position.clamped(1.0));
+        for push in pushes {
+            self.player.knockback = push.scale(KNOCKBACK);
+            self.player.charge = 0.0;
+            self.player.roll_remaining = 0.0;
+            self.effect(EffectKind::Spark, player, 0.4, 4.0);
+            self.hit_pause = self.hit_pause.max(0.04);
+        }
         for wave in &mut self.waves {
             let before = player_from.minus(wave.position).length() - wave.radius;
             wave.radius += STEP
                 * match wave.kind {
-                    WaveKind::Stone => 23.0,
-                    WaveKind::Water => 18.0,
+                    WaveKind::Stone => 26.0,
+                    WaveKind::Water => 55.0,
                 };
-            let after = self.player.position.minus(wave.position).length() - wave.radius;
+            let after = player.minus(wave.position).length() - wave.radius;
             if before.min(after) < PLAYER_RADIUS + 0.45
                 && before.max(after) > -PLAYER_RADIUS - 0.45
-                && !(wave.kind == WaveKind::Water && self.map.on_island(self.player.position))
+                && !(wave.kind == WaveKind::Water && self.map.on_island(player))
             {
                 hit = true;
             }
         }
         self.waves.retain(|w| w.radius < w.maximum);
+        let mut landings = Vec::new();
         for hazard in &mut self.hazards {
             let was_active = hazard.active();
             hazard.time += STEP;
-            if !was_active && !hazard.active() {
+            if !hazard.active() {
                 continue;
             }
-            let distance = segments_distance(
-                player_from,
-                self.player.position,
-                hazard.position,
-                hazard.end,
-            );
-            if hazard.kind != HazardKind::Gravity && distance < hazard.radius + PLAYER_RADIUS {
+            if !was_active {
+                landings.push((hazard.kind, hazard.position, hazard.radius));
+            }
+            if hazard.kind != HazardKind::Goo
+                && segment_distance(hazard.position, player_from, player)
+                    < hazard.radius + PLAYER_RADIUS
+            {
                 hit = true;
             }
         }
         self.hazards.retain(|h| h.time < h.delay + h.duration);
+        for (kind, position, radius) in landings {
+            match kind {
+                HazardKind::Drop => {
+                    self.map.drop_block(position);
+                    self.effect(EffectKind::Impact, position, 0.5, radius + 1.0);
+                }
+                HazardKind::Icicle => {
+                    self.effect(EffectKind::Rubble, position, 0.7, radius + 2.0);
+                    self.map.scar(position, radius, ScarKind::Crack);
+                }
+                HazardKind::Goo => {}
+            }
+        }
         if hit {
             self.hurt();
         }
@@ -894,32 +942,40 @@ impl Arena {
                 position,
                 previous_position: position,
                 velocity,
-                remaining: 6.0,
+                remaining: 4.0,
                 kind,
                 age: 0.0,
             });
         }
     }
-    fn hazard(
+    pub(super) fn hazard(
         &mut self,
         kind: HazardKind,
         position: Vec2,
-        end: Vec2,
         delay: f32,
         duration: f32,
         radius: f32,
     ) {
-        if self.phase == Phase::Battle && self.hazards.len() < MAX_HAZARDS {
-            self.hazards.push(Hazard {
-                kind,
-                position,
-                end,
-                time: 0.0,
-                delay,
-                duration,
-                radius,
-            });
+        if self.phase != Phase::Battle {
+            return;
         }
+        if self.hazards.len() == MAX_HAZARDS {
+            // Old slime yields before a live threat is ever dropped.
+            match self.hazards.iter().position(|h| h.kind == HazardKind::Goo) {
+                Some(ix) => {
+                    self.hazards.remove(ix);
+                }
+                None => return,
+            }
+        }
+        self.hazards.push(Hazard {
+            kind,
+            position,
+            time: 0.0,
+            delay,
+            duration,
+            radius,
+        });
     }
     fn effect(&mut self, kind: EffectKind, position: Vec2, duration: f32, radius: f32) {
         if self.effects.len() < MAX_EFFECTS {
@@ -932,9 +988,13 @@ impl Arena {
             });
         }
     }
+    /// A heavy landing: scars, breaks columns and crushes blocks in reach.
     fn impact(&mut self, position: Vec2, radius: f32) {
+        self.impact_with(position, radius, 0.03);
+    }
+    fn impact_with(&mut self, position: Vec2, radius: f32, pause: f32) {
         self.effect(EffectKind::Impact, position, 0.85, radius);
-        self.hit_pause = 0.055;
+        self.hit_pause = self.hit_pause.max(pause);
         if self.boss.guardian != Guardian::DeepSeek {
             self.map.scar(position, radius, ScarKind::Crack);
         }
@@ -947,9 +1007,24 @@ impl Arena {
                 self.effect(EffectKind::Rubble, pillar.position, 1.3, 9.0);
             }
         }
+        for block in self.map.crush_blocks(position, radius) {
+            self.effect(EffectKind::Rubble, block, 0.9, 4.0);
+        }
         if self.player.position.minus(position).length() < radius + PLAYER_RADIUS {
             self.hurt();
         }
+    }
+    fn break_pillar(&mut self, ix: usize) {
+        self.map.broken |= 1 << ix;
+        let p = self.map.pillars()[ix].position;
+        self.effect(EffectKind::Rubble, p, 1.4, 12.0);
+        self.map.scar(p, 8.0, ScarKind::Crack);
+    }
+    fn random(&mut self) -> u32 {
+        self.seed ^= self.seed << 13;
+        self.seed ^= self.seed >> 17;
+        self.seed ^= self.seed << 5;
+        self.seed
     }
     pub fn impact_strength(&self) -> f32 {
         self.effects
@@ -961,11 +1036,11 @@ impl Arena {
                         | EffectKind::Victory
                         | EffectKind::Defeat
                         | EffectKind::Rubble
-                        | EffectKind::Sever
-                        | EffectKind::Overload
+                        | EffectKind::Burst
+                        | EffectKind::Flash
                 )
             })
-            .map(|e| ((e.remaining / e.duration - 0.65) / 0.35).max(0.0))
+            .map(|e| ((e.remaining / e.duration - 0.6) / 0.4).max(0.0) * (e.radius / 8.0).min(1.5))
             .fold(0.0, f32::max)
     }
     pub fn shake(&self) -> Vec2 {
@@ -973,8 +1048,13 @@ impl Arena {
             (self.visual_time * TAU * 17.0).sin(),
             (self.visual_time * TAU * 13.0).cos(),
         )
-        .scale(self.impact_strength() * 0.65)
+        .scale(self.impact_strength() * 1.1)
     }
+}
+
+/// Aim-plane center of the brazier flame, which rises above its bowl.
+pub(super) fn flame_center() -> Vec2 {
+    BRAZIER.plus(Vec2::new(0.0, -3.0))
 }
 
 #[path = "encounters.rs"]

@@ -7,6 +7,8 @@ use super::{
 
 pub(super) const CENTER: Vec2 = Vec2::new(WIDTH * 0.5, HEIGHT * 0.5);
 pub(super) const MAX_SCARS: usize = 48;
+pub(super) const MAX_BLOCKS: usize = 10;
+pub(super) const BLOCK_RADIUS: f32 = 2.3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ScarKind {
@@ -36,6 +38,8 @@ pub(super) struct Map {
     pub broken: u8,
     pub sunken: u8,
     pub scars: Vec<Scar>,
+    /// Spat code blocks: they stop the archer but not arrows or the chest.
+    pub blocks: Vec<Vec2>,
 }
 
 const GARDEN: [Pillar; 4] = pillars(
@@ -48,7 +52,7 @@ const COURT: [Pillar; 4] = pillars(
     3.6,
     12.0,
 );
-const OBSERVATORY: [Pillar; 3] = pillars([(88.0, 22.0), (44.0, 83.0), (132.0, 83.0)], 2.5, 10.0);
+const OBSERVATORY: [Pillar; 2] = pillars([(44.0, 83.0), (132.0, 83.0)], 2.5, 10.0);
 const FOUNDRY: [Pillar; 4] = pillars(
     [(51.0, 37.0), (125.0, 37.0), (51.0, 82.0), (125.0, 82.0)],
     4.0,
@@ -61,13 +65,21 @@ pub(super) const ISLANDS: [(Vec2, f32); 4] = [
     (Vec2::new(104.0, 83.0), 10.0),
     (Vec2::new(66.0, 89.0), 6.0),
 ];
-pub(super) const DAIS: [Vec2; 3] = [
-    Vec2::new(88.0, 35.0),
-    Vec2::new(53.0, 76.0),
-    Vec2::new(123.0, 76.0),
+/// Where the glyph stands; its stems reach this far from it.
+pub(super) const THRONE: Vec2 = Vec2::new(88.0, 32.0);
+pub(super) const REACH: f32 = 54.0;
+pub(super) const DAIS_RADIUS: f32 = 9.5;
+/// Forge plates around the court. The knot pressing one lights the brazier.
+pub(super) const PLATES: [Vec2; 4] = [
+    Vec2::new(88.0, 24.0),
+    Vec2::new(140.0, 58.0),
+    Vec2::new(88.0, 92.0),
+    Vec2::new(36.0, 58.0),
 ];
-pub(super) const SEALS: [Vec2; 2] = [Vec2::new(57.0, 64.0), Vec2::new(119.0, 64.0)];
-pub(super) const SEAL_RADIUS: f32 = 5.5;
+pub(super) const PLATE_RADIUS: f32 = 6.5;
+pub(super) const BRAZIER: Vec2 = CENTER;
+pub(super) const BOWL_RADIUS: f32 = 3.0;
+pub(super) const FLAME_RADIUS: f32 = 3.5;
 
 const fn pillars<const N: usize>(
     positions: [(f32, f32); N],
@@ -94,6 +106,7 @@ impl Map {
             broken: 0,
             sunken: 0,
             scars: Vec::with_capacity(MAX_SCARS),
+            blocks: Vec::with_capacity(MAX_BLOCKS),
         }
     }
 
@@ -143,21 +156,51 @@ impl Map {
     }
 
     pub fn move_body(&self, from: Vec2, to: Vec2, radius: f32) -> Vec2 {
+        self.slide(from, to, |p| self.is_clear(p, radius))
+    }
+
+    /// The archer also collides with spat blocks. A block that landed on
+    /// the archer never traps them.
+    pub fn walk(&self, from: Vec2, to: Vec2, radius: f32) -> Vec2 {
+        let reach = radius + BLOCK_RADIUS;
+        let solid = |block: &Vec2| from.minus(*block).length() > reach;
+        self.slide(from, to, |p| {
+            self.standable(p, radius)
+                && self
+                    .blocks
+                    .iter()
+                    .filter(|block| solid(block))
+                    .all(|block| p.minus(*block).length() > reach)
+        })
+    }
+
+    /// Ground the archer may occupy: clear terrain off the glyph's dais and
+    /// out of the brazier bowl.
+    pub fn standable(&self, p: Vec2, radius: f32) -> bool {
+        self.is_clear(p, radius)
+            && match self.guardian {
+                Guardian::Pi => p.minus(THRONE).length() > radius + DAIS_RADIUS,
+                Guardian::Codex => p.minus(BRAZIER).length() > radius + BOWL_RADIUS,
+                _ => true,
+            }
+    }
+
+    fn slide(&self, from: Vec2, to: Vec2, clear: impl Fn(Vec2) -> bool) -> Vec2 {
         let delta = to.minus(from);
         let steps = (delta.length() / 0.6).ceil().max(1.0) as usize;
         let step = delta.scale(1.0 / steps as f32);
         let mut p = from;
         for _ in 0..steps {
             let next = p.plus(step);
-            if self.is_clear(next, radius) {
+            if clear(next) {
                 p = next;
             } else {
                 let x = Vec2::new(next.x, p.y);
-                if self.is_clear(x, radius) {
+                if clear(x) {
                     p = x;
                 }
                 let y = Vec2::new(p.x, next.y);
-                if self.is_clear(y, radius) {
+                if clear(y) {
                     p = y;
                 }
             }
@@ -281,10 +324,30 @@ impl Map {
 
     pub fn speed(&self, p: Vec2) -> f32 {
         if self.guardian == Guardian::DeepSeek && !self.on_island(p) {
-            0.82
+            0.7
         } else {
             1.0
         }
+    }
+
+    pub fn drop_block(&mut self, position: Vec2) {
+        if self.blocks.len() == MAX_BLOCKS {
+            self.blocks.remove(0);
+        }
+        self.blocks.push(position);
+    }
+
+    /// Removes blocks crushed by a landing; returns their positions.
+    pub fn crush_blocks(&mut self, position: Vec2, radius: f32) -> Vec<Vec2> {
+        let mut crushed = Vec::new();
+        self.blocks.retain(|block| {
+            let hit = block.minus(position).length() < radius + BLOCK_RADIUS;
+            if hit {
+                crushed.push(*block);
+            }
+            !hit
+        });
+        crushed
     }
 
     pub fn spawn(&self, seed: &mut u32, avoid: Vec2) -> Vec2 {
@@ -312,7 +375,7 @@ impl Map {
             let x = 22.0 + (*seed & 0xffff) as f32 / 65535.0 * 132.0;
             let y = 19.0 + (*seed >> 16) as f32 / 65535.0 * 78.0;
             let p = Vec2::new(x, y);
-            if !self.is_clear(p, 3.0) {
+            if !self.standable(p, 3.0) {
                 continue;
             }
             let d = p.minus(avoid).length();

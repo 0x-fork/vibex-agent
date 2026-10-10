@@ -1,36 +1,63 @@
 use super::*;
-use crate::arena::map::{CENTER, ISLANDS};
+use crate::arena::map::{CENTER, ISLANDS, THRONE};
+
+pub(super) fn ticks(arena: &mut Arena, count: usize, controls: Controls) {
+    for _ in 0..count {
+        arena.tick(controls);
+    }
+}
+/// Advances by simulated seconds at the fixed step.
+pub(super) fn seconds(arena: &mut Arena, duration: f32, controls: Controls) {
+    ticks(arena, (duration / STEP).round() as usize, controls);
+}
+pub(super) fn battle(guardian: Guardian) -> Arena {
+    let mut arena = Arena::new(guardian, 0.0);
+    wait_out_intro(&mut arena);
+    arena
+}
+fn wait_out_intro(arena: &mut Arena) {
+    for _ in 0..(3.0 / STEP) as usize {
+        if arena.phase == Phase::Battle {
+            return;
+        }
+        arena.tick(Controls::default());
+    }
+    panic!("intro did not end");
+}
+fn moving(direction: Vec2) -> Controls {
+    Controls {
+        movement: direction,
+        ..Controls::default()
+    }
+}
 
 #[test]
-fn flight_entry_and_takeoff_keep_height_continuous_and_terminal_turns_finish_upright() {
-    for guardian in [Guardian::Copilot, Guardian::OpenCode] {
+fn entry_and_state_changes_keep_height_continuous_and_spins_finish_upright() {
+    for guardian in Guardian::ALL {
         let mut arena = Arena::from_preview(Boss::idle(guardian, 3.7, false), 3.7, 17);
-        arena.player.invulnerable = 120.0;
-        let mut landings = 0;
-        for _ in 0..2400 {
+        arena.player.invulnerable = f32::INFINITY;
+        for frame in 0..(24.0 / STEP) as usize {
             let before = arena.boss;
             let phase = arena.phase;
-            arena.tick(Controls::default());
-            if guardian == Guardian::Copilot && phase == Phase::Awakening {
-                assert!((arena.boss.height - before.height).abs() < 0.25);
+            arena.tick(moving(Vec2::from_angle(frame as f32 * 0.004)));
+            let jump = (arena.boss.height - before.height).abs();
+            if phase == Phase::Awakening {
+                assert!(jump < 0.25, "{guardian:?} entry");
             }
-            if before.state != arena.boss.state {
+            if phase == Phase::Battle && before.state != arena.boss.state {
                 assert!(
-                    (arena.boss.height - before.height).abs() < 2.0,
+                    jump < 2.0,
                     "{guardian:?}: {:?} -> {:?}",
                     before.state,
                     arena.boss.state
                 );
-                if guardian == Guardian::OpenCode && before.state == BossState::Striking {
-                    let angular_step = (arena.boss.pitch - before.pitch).sin().abs();
-                    assert!(angular_step < 0.25);
-                    assert!((arena.boss.pitch - before.pitch).cos() > 0.9);
-                    landings += 1;
-                }
             }
-        }
-        if guardian == Guardian::OpenCode {
-            assert!(landings >= 4);
+            if arena.boss.state == BossState::Watching && arena.boss.time > 0.4 {
+                assert!(
+                    arena.boss.bank.abs() < 0.5 && arena.boss.pitch.abs() < 0.5,
+                    "{guardian:?} is not upright while watching"
+                );
+            }
         }
     }
 }
@@ -44,28 +71,8 @@ fn entry_spawn_avoids_where_the_guardian_will_settle() {
         let mut arena = Arena::from_preview(boss, 0.0, seed);
         wait_out_intro(&mut arena);
         assert!(arena.player.position.minus(arena.boss.position).length() > 29.0);
+        assert!(arena.map.standable(arena.player.position, 0.9));
     }
-}
-
-pub(super) fn ticks(arena: &mut Arena, count: usize, controls: Controls) {
-    for _ in 0..count {
-        arena.tick(controls);
-    }
-}
-pub(super) fn battle(guardian: Guardian) -> Arena {
-    let mut arena = Arena::new(guardian, 0.0);
-    ticks(&mut arena, 86, Controls::default());
-    assert_eq!(arena.phase, Phase::Battle);
-    arena
-}
-fn wait_out_intro(arena: &mut Arena) {
-    for _ in 0..180 {
-        if arena.phase == Phase::Battle {
-            return;
-        }
-        arena.tick(Controls::default());
-    }
-    panic!("intro did not end");
 }
 
 #[test]
@@ -94,13 +101,14 @@ fn entry_keeps_the_measured_roaming_pose_and_rejects_gameplay_until_awake() {
         assert_eq!(arena.boss.height, boss.height);
         assert_eq!(arena.visual_time, 8.4);
         let start = arena.player.position;
-        for _ in 0..45 {
+        for _ in 0..90 {
             arena.roll(Vec2::new(1.0, 0.0));
             arena.tick(Controls {
                 movement: Vec2::new(1.0, 0.0),
                 shoot: true,
                 recall: true,
-                aim: None,
+                sprint: true,
+                ..Controls::default()
             });
             arena.release_shot(None);
         }
@@ -110,38 +118,31 @@ fn entry_keeps_the_measured_roaming_pose_and_rejects_gameplay_until_awake() {
         assert!(arena.hazards.is_empty());
         wait_out_intro(&mut arena);
         assert!(arena.map.is_clear(arena.boss.position, arena.boss.radius()));
+        assert_eq!(arena.boss.squash, 0.0);
+        assert_eq!(arena.boss.lid, 0.0);
     }
 }
 #[test]
 fn one_arrow_needs_a_full_draw_and_can_always_be_recalled() {
-    let mut arena = battle(Guardian::Pi);
-    arena.boss.enter(BossState::Watching, 10.0);
-    ticks(
-        &mut arena,
-        8,
-        Controls {
-            shoot: true,
-            ..Controls::default()
-        },
-    );
+    let mut arena = battle(Guardian::Codex);
+    arena.player.invulnerable = f32::INFINITY;
+    arena.boss.enter(BossState::Watching, 30.0);
+    let draw = Controls {
+        shoot: true,
+        ..Controls::default()
+    };
+    seconds(&mut arena, MIN_CHARGE * 0.5, draw);
     arena.release_shot(None);
     assert_eq!(arena.arrow.state, ArrowState::Ready);
-    ticks(
-        &mut arena,
-        22,
-        Controls {
-            shoot: true,
-            ..Controls::default()
-        },
-    );
+    seconds(&mut arena, MIN_CHARGE + 0.02, draw);
     arena.release_shot(Some(Vec2::new(170.0, 110.0)));
     assert_eq!(arena.arrow.state, ArrowState::Flying);
     let arrow = arena.arrow.position;
     arena.release_shot(None);
     assert_eq!(arena.arrow.position, arrow);
-    ticks(
+    seconds(
         &mut arena,
-        90,
+        2.0,
         Controls {
             recall: true,
             ..Controls::default()
@@ -152,11 +153,11 @@ fn one_arrow_needs_a_full_draw_and_can_always_be_recalled() {
 #[test]
 fn drawing_and_recalling_hold_position_and_roll_cancels_the_draw() {
     let mut arena = battle(Guardian::Claude);
-    arena.boss.enter(BossState::Watching, 10.0);
+    arena.boss.enter(BossState::Watching, 30.0);
     let start = arena.player.position;
-    ticks(
+    seconds(
         &mut arena,
-        24,
+        0.2,
         Controls {
             movement: Vec2::new(1.0, 0.0),
             shoot: true,
@@ -168,13 +169,13 @@ fn drawing_and_recalling_hold_position_and_roll_cancels_the_draw() {
     assert_eq!(arena.player.charge, 0.0);
     arena.release_shot(None);
     assert_eq!(arena.arrow.state, ArrowState::Ready);
-    ticks(&mut arena, 30, Controls::default());
+    seconds(&mut arena, 0.25, Controls::default());
     arena.arrow.state = ArrowState::Lodged;
-    arena.arrow.position = Vec2::new(165.0, 104.0);
+    arena.arrow.position = Vec2::new(150.0, 100.0);
     let start = arena.player.position;
     ticks(
         &mut arena,
-        4,
+        8,
         Controls {
             recall: true,
             movement: Vec2::new(0.0, 1.0),
@@ -186,13 +187,36 @@ fn drawing_and_recalling_hold_position_and_roll_cancels_the_draw() {
     assert_eq!(arena.arrow.state, ArrowState::Lodged);
 }
 #[test]
-fn movement_slides_along_terrain_without_crossing_columns_or_the_rim() {
+fn walking_is_brisk_and_holding_the_roll_key_sprints() {
+    let mut arena = battle(Guardian::Copilot);
+    arena.player.invulnerable = f32::INFINITY;
+    arena.boss.enter(BossState::Watching, 30.0);
+    arena.player.position = CENTER.minus(Vec2::new(30.0, 20.0));
+    let start = arena.player.position;
+    seconds(&mut arena, 0.5, moving(Vec2::new(1.0, 0.0)));
+    let walked = arena.player.position.x - start.x;
+    assert!((walked - 15.0).abs() < 0.5, "walked {walked}");
+    let start = arena.player.position;
+    seconds(
+        &mut arena,
+        0.5,
+        Controls {
+            movement: Vec2::new(1.0, 0.0),
+            sprint: true,
+            ..Controls::default()
+        },
+    );
+    assert!(arena.player.position.x - start.x > walked * 1.4);
+    assert!(arena.player.sprinting);
+}
+#[test]
+fn movement_slides_along_terrain_without_crossing_columns_the_rim_or_props() {
     for guardian in Guardian::ALL {
         let map = Map::new(guardian);
-        let mut p = CENTER;
+        let mut p = CENTER.plus(Vec2::new(0.0, 20.0));
         for _ in 0..300 {
-            p = map.move_body(p, p.plus(Vec2::new(1.0, 0.7)), 0.9);
-            assert!(map.is_clear(p, 0.9));
+            p = map.walk(p, p.plus(Vec2::new(1.0, 0.7)), 0.9);
+            assert!(map.standable(p, 0.9));
         }
         for pillar in map.pillars() {
             let from = pillar.position.minus(Vec2::new(12.0, 0.0));
@@ -201,161 +225,152 @@ fn movement_slides_along_terrain_without_crossing_columns_or_the_rim() {
             assert!(result.x < pillar.position.x);
         }
     }
+    let mut map = Map::new(Guardian::OpenCode);
+    let block = CENTER.plus(Vec2::new(0.0, 20.0));
+    map.drop_block(block);
+    let stopped = map.walk(
+        block.minus(Vec2::new(8.0, 0.0)),
+        block.plus(Vec2::new(8.0, 0.0)),
+        0.9,
+    );
+    assert!(stopped.x < block.x - 3.0);
+    // A block that lands on the archer never traps them.
+    let free = map.walk(block, block.plus(Vec2::new(6.0, 0.0)), 0.9);
+    assert!(free.x > block.x + 5.0);
+    let map = Map::new(Guardian::Pi);
+    let below = THRONE.plus(Vec2::new(0.0, 20.0));
+    assert!(map.walk(below, THRONE, 0.9).y > THRONE.y + 10.0);
 }
 #[test]
 fn every_attack_commits_its_target_before_the_strike() {
-    for g in Guardian::ALL {
-        let mut arena = battle(g);
-        arena.player.position = Vec2::new(94.0, 83.0);
-        arena.boss.prepare(arena.player.position);
-        arena.boss.time = arena.boss.duration * 0.73;
-        let target = arena.boss.target;
-        arena.player.position = Vec2::new(42.0, 68.0);
-        arena.tick_boss();
-        assert_eq!(arena.boss.target, target, "{g:?}");
-    }
-}
-#[test]
-fn independent_hands_must_pin_opposite_seals_before_the_glyph_opens() {
-    let mut arena = battle(Guardian::Pi);
-    arena.player.position = crate::arena::map::SEALS[0];
-    arena.boss.prepare(arena.player.position);
-    arena.boss.time = 0.6;
-    arena.tick_boss();
-    assert!(arena.boss.hand_heights[0] > arena.boss.hand_heights[1] + 5.0);
-    assert_ne!(arena.boss.hands[0], arena.boss.hands[1]);
-    assert_eq!(arena.boss.exposed, 0.0);
-    arena.boss.time = arena.boss.duration;
-    arena.tick_boss();
-    arena.boss.time = arena.boss.duration;
-    arena.player.position = Vec2::new(45.0, 50.0);
-    arena.tick_boss();
-    assert_eq!(arena.boss.seals, 1);
-    assert_eq!(arena.boss.exposed, 0.0);
-    let locked = arena.boss.hands[0];
-    arena.player.position = crate::arena::map::SEALS[1];
-    arena.boss.prepare(arena.player.position);
-    arena.boss.time = arena.boss.duration;
-    arena.tick_boss();
-    assert_eq!(arena.boss.hands[0], locked);
-    arena.boss.time = arena.boss.duration;
-    arena.player.position = Vec2::new(88.0, 78.0);
-    arena.tick_boss();
-    assert_eq!(arena.boss.seals, 3);
-    assert!(arena.boss.exposed > 4.0);
-}
-#[test]
-fn the_rolling_knot_breaks_cover_and_perimeter_impacts_keep_it_beatable() {
-    let mut arena = battle(Guardian::Codex);
-    let pillar = arena.map.pillars()[0];
-    arena.boss.position = pillar.position.minus(Vec2::new(10.4, 0.0));
-    arena.boss.direction = Vec2::new(1.0, 0.0);
-    arena.boss.attack = Attack::Rush;
-    arena.boss.enter(BossState::Rushing, 3.0);
-    arena.tick_boss();
-    assert!(!arena.map.intact(0));
-    assert!(arena.boss.exposed > 2.5);
-    assert_eq!(arena.boss.core, arena.boss.local(0.0, 0.0, 11.0));
-    assert_eq!(arena.boss.strain, 1.0);
-    arena.map.broken = 0xff;
-    arena.boss.position = Vec2::new(146.0, 58.0);
-    arena.boss.exposed = 0.0;
-    arena.boss.enter(BossState::Rushing, 3.0);
-    for _ in 0..60 {
-        arena.tick_boss();
-        if arena.boss.exposed > 0.0 {
-            break;
+    for guardian in Guardian::ALL {
+        let mut arena = battle(guardian);
+        arena.player.invulnerable = f32::INFINITY;
+        let mut locked: Option<(u32, BossState, Attack, Vec2)> = None;
+        let mut checked = 0;
+        for frame in 0..(30.0 / STEP) as usize {
+            arena.tick(moving(Vec2::from_angle(frame as f32 * 0.01)));
+            let boss = arena.boss;
+            let tracking = matches!(boss.state, BossState::Windup | BossState::Submerged);
+            if tracking && boss.target_locked() {
+                if let Some((attacks, state, attack, target)) = locked
+                    && (attacks, state, attack) == (boss.attacks, boss.state, boss.attack)
+                {
+                    assert_eq!(boss.target, target, "{guardian:?} {attack:?}");
+                    checked += 1;
+                }
+                locked = Some((boss.attacks, boss.state, boss.attack, boss.target));
+            } else {
+                locked = None;
+            }
         }
+        assert!(checked > 20, "{guardian:?} committed only {checked} frames");
     }
-    assert!(arena.boss.exposed > 0.0);
 }
 #[test]
-fn the_glyph_accepts_a_precise_shot_after_the_hands_unlock_its_aperture() {
-    let mut arena = battle(Guardian::Pi);
-    arena.boss.position = CENTER;
-    arena.boss.height = 0.0;
-    arena.boss.opening(2.0);
-    arena.boss.update_core();
-    let core = arena.boss.core;
-    arena.arrow = Arrow {
-        state: ArrowState::Flying,
-        position: core.plus(Vec2::new(0.0, 4.0)),
-        velocity: Vec2::new(0.0, -300.0),
-    };
-    arena.tick_arrow(false);
-    assert_eq!(arena.phase, Phase::Victory);
+fn landing_strikes_hit_exactly_their_telegraphed_radius() {
+    let mut arena = battle(Guardian::Codex);
+    arena.player.invulnerable = 0.0;
+    arena.boss.attack = Attack::Leap;
+    let landing = CENTER.plus(Vec2::new(-30.0, 20.0));
+    arena.boss.target = landing;
+    let radius = arena.boss.impact_radius();
+    arena.player.position = landing.plus(Vec2::new(radius + PLAYER_RADIUS + 0.2, 0.0));
+    arena.impact(landing, radius);
+    assert_eq!(arena.phase, Phase::Battle);
+    arena.player.position = landing.plus(Vec2::new(radius + PLAYER_RADIUS - 0.2, 0.0));
+    arena.impact(landing, radius);
+    assert_eq!(arena.phase, Phase::Defeat);
 }
 #[test]
-fn open_armor_still_requires_hitting_the_specific_core() {
+fn a_closed_weak_point_glances_the_arrow_off_without_consuming_it() {
+    for guardian in Guardian::ALL {
+        let mut arena = battle(guardian);
+        arena.boss.enter(BossState::Watching, 30.0);
+        arena.boss.exposed = 0.0;
+        arena.boss.update_core();
+        let core = arena.boss.core;
+        arena.arrow = Arrow {
+            state: ArrowState::Flying,
+            position: core.plus(Vec2::new(0.0, 5.0)),
+            velocity: Vec2::new(0.0, -1200.0),
+            burning: 0.0,
+        };
+        arena.tick_arrow(false);
+        assert_eq!(arena.phase, Phase::Battle, "{guardian:?}");
+        assert_eq!(arena.arrow.state, ArrowState::Lodged, "{guardian:?}");
+    }
+}
+#[test]
+fn a_bare_weak_point_still_requires_hitting_it_precisely() {
     let mut arena = battle(Guardian::Claude);
-    arena.boss.opening(2.0);
+    arena.boss.generation = 4;
+    arena.boss.exposed = 1.0;
+    arena.boss.update_core();
+    arena.boss.previous_core = arena.boss.core;
     let core = arena.boss.core;
     arena.arrow = Arrow {
         state: ArrowState::Flying,
         position: core.plus(Vec2::new(3.5, -1.0)),
-        velocity: Vec2::new(0.0, 120.0),
+        velocity: Vec2::new(0.0, 240.0),
+        burning: 0.0,
     };
     arena.tick_arrow(false);
     assert_eq!(arena.phase, Phase::Battle);
     arena.arrow = Arrow {
         state: ArrowState::Flying,
         position: core.plus(Vec2::new(0.0, -1.0)),
-        velocity: Vec2::new(0.0, 120.0),
+        velocity: Vec2::new(0.0, 240.0),
+        burning: 0.0,
     };
     arena.tick_arrow(false);
     assert_eq!(arena.phase, Phase::Victory);
 }
 #[test]
-fn shutter_beams_stop_at_physical_cover_and_the_opening_is_directional() {
+fn the_gaping_mouth_opens_to_the_front_and_the_jet_to_the_rear() {
     let mut arena = battle(Guardian::OpenCode);
-    let origin = Vec2::new(51.0, 20.0);
-    let end = arena.map.beam_end(origin, Vec2::new(0.0, 1.0));
-    assert!(end.y < 34.0);
-    arena.player.invulnerable = 0.0;
-    arena.player.position = Vec2::new(51.0, 55.0);
-    arena.hazard(HazardKind::Beam, origin, end, 0.0, 1.0, 1.4);
-    arena.tick_threats(arena.player.position);
-    assert_eq!(arena.phase, Phase::Battle);
-    arena.player.position = Vec2::new(51.0, 24.0);
-    arena.tick_threats(arena.player.position);
-    assert_eq!(arena.phase, Phase::Defeat);
-    let mut arena = battle(Guardian::OpenCode);
-    arena.boss.opening(2.0);
+    arena.boss.exposed = 1.0;
     arena.boss.direction = Vec2::new(0.0, 1.0);
     assert!(arena.accepts_core_hit(arena.boss.core.plus(Vec2::new(0.0, 8.0))));
     assert!(!arena.accepts_core_hit(arena.boss.core.minus(Vec2::new(0.0, 8.0))));
+    let mut arena = battle(Guardian::Copilot);
+    arena.boss.exposed = 1.0;
+    arena.boss.direction = Vec2::new(0.0, 1.0);
+    assert!(!arena.accepts_core_hit(arena.boss.core.plus(Vec2::new(0.0, 8.0))));
+    assert!(arena.accepts_core_hit(arena.boss.core.minus(Vec2::new(0.0, 8.0))));
 }
 #[test]
-fn water_islands_are_cover_from_waves_but_not_from_a_breach() {
+fn water_floes_are_cover_from_the_discharge_but_not_from_a_breach() {
     let mut arena = battle(Guardian::DeepSeek);
-    let island = ISLANDS[0].0;
-    arena.player.position = island;
+    let floe = ISLANDS[0].0;
+    arena.player.position = floe;
     arena.player.invulnerable = 0.0;
     arena.wave(
-        island.minus(Vec2::new(10.0, 0.0)),
+        floe.minus(Vec2::new(10.0, 0.0)),
         10.0,
         35.0,
         WaveKind::Water,
     );
-    arena.tick_threats(island);
+    arena.tick_threats(floe);
     assert_eq!(arena.phase, Phase::Battle);
-    arena.impact(island, 7.0);
+    arena.impact(floe, 7.0);
     assert_eq!(arena.phase, Phase::Defeat);
 }
 #[test]
-fn fast_blocks_use_swept_collision_and_telegraphs_are_safe() {
-    let mut arena = battle(Guardian::Copilot);
-    arena.player.position = CENTER;
+fn fast_blocks_use_swept_collision_and_falling_tells_are_safe() {
+    let mut arena = battle(Guardian::OpenCode);
+    arena.player.position = CENTER.plus(Vec2::new(0.0, 25.0));
+    let player = arena.player.position;
     arena.player.invulnerable = 0.0;
-    arena.hazard(HazardKind::Scorch, CENTER, CENTER, 0.5, 0.2, 6.0);
-    arena.tick_threats(CENTER);
+    arena.hazard(HazardKind::Drop, player, 0.5, 0.2, 6.0);
+    arena.tick_threats(player);
     assert_eq!(arena.phase, Phase::Battle);
     arena.projectile(
-        CENTER.minus(Vec2::new(12.0, 0.0)),
-        Vec2::new(1500.0, 0.0),
+        player.minus(Vec2::new(12.0, 0.0)),
+        Vec2::new(3000.0, 0.0),
         ProjectileKind::Block,
     );
-    arena.tick_threats(CENTER);
+    arena.tick_threats(player);
     assert_eq!(arena.phase, Phase::Defeat);
     assert!(arena.hazards.is_empty());
     arena.wave(CENTER, 1.0, 30.0, WaveKind::Stone);
@@ -370,13 +385,14 @@ fn death_automatically_returns_at_random_clear_positions_without_restarting_entr
             arena.player.invulnerable = 0.0;
             arena.hurt();
             assert_eq!(arena.phase, Phase::Defeat);
-            ticks(&mut arena, 62, Controls::default());
+            seconds(&mut arena, 1.02, Controls::default());
             assert_eq!(arena.phase, Phase::Rebirth);
-            assert!(arena.map.is_clear(arena.player.position, 3.0));
+            assert!(arena.map.standable(arena.player.position, 3.0));
             assert!(arena.player.position.minus(arena.boss.position).length() > 29.0);
             assert_eq!(arena.arrow.state, ArrowState::Ready);
+            assert!(arena.map.blocks.is_empty());
             positions.push(arena.player.position);
-            ticks(&mut arena, 44, Controls::default());
+            seconds(&mut arena, 0.75, Controls::default());
             assert_eq!(arena.phase, Phase::Battle);
             assert!(arena.player.invulnerable > 0.0);
         }
@@ -391,14 +407,15 @@ fn victory_has_a_finite_departure_and_clears_all_live_threats() {
     arena.wave(CENTER, 1.0, 50.0, WaveKind::Stone);
     arena.win();
     assert!(arena.projectiles.is_empty() && arena.waves.is_empty() && arena.hazards.is_empty());
-    ticks(&mut arena, 140, Controls::default());
+    assert!(arena.effects.iter().any(|e| e.kind == EffectKind::Flash));
+    seconds(&mut arena, 2.4, Controls::default());
     assert!(!arena.outcome_ready());
-    ticks(&mut arena, 70, Controls::default());
+    seconds(&mut arena, 1.0, Controls::default());
     assert!(arena.outcome_ready());
     assert!(!arena.needs_tick());
     assert_eq!(arena.home_opacity(), 1.0);
     let time = arena.visual_time;
-    ticks(&mut arena, 120, Controls::default());
+    seconds(&mut arena, 1.0, Controls::default());
     assert_eq!(arena.visual_time, time);
 }
 #[test]
@@ -408,20 +425,10 @@ fn camera_follows_continuously_and_roaming_is_not_a_stationary_breathing_loop() 
     arena.player.position = CENTER;
     arena.camera = CENTER;
     let before = arena.camera;
-    arena.tick(Controls {
-        movement: Vec2::new(1.0, 0.0),
-        ..Controls::default()
-    });
+    arena.tick(moving(Vec2::new(1.0, 0.0)));
     assert!(arena.camera.minus(before).length() < 0.5);
     let start = arena.camera;
-    ticks(
-        &mut arena,
-        75,
-        Controls {
-            movement: Vec2::new(1.0, 0.0),
-            ..Controls::default()
-        },
-    );
+    seconds(&mut arena, 1.25, moving(Vec2::new(1.0, 0.0)));
     assert!(arena.camera.x > start.x + 10.0);
     for g in Guardian::ALL {
         let a = Boss::idle(g, 2.0, false);
@@ -434,25 +441,25 @@ fn camera_follows_continuously_and_roaming_is_not_a_stationary_breathing_loop() 
 fn long_running_encounters_bound_effects_and_keep_all_coordinates_finite() {
     for guardian in Guardian::ALL {
         let mut arena = Arena::new(guardian, 0.0);
-        for frame in 0..9000 {
-            let direction = Vec2::from_angle(frame as f32 * 0.025);
-            if frame % 37 == 0 {
+        for frame in 0..(150.0 / STEP) as usize {
+            let direction = Vec2::from_angle(frame as f32 * 0.0125);
+            if frame % 74 == 0 {
                 arena.roll(direction);
             }
-            arena.tick(Controls {
-                movement: direction,
-                ..Controls::default()
-            });
+            arena.tick(moving(direction));
             assert!(
                 arena.projectiles.len() <= MAX_PROJECTILES
                     && arena.waves.len() <= MAX_WAVES
                     && arena.effects.len() <= MAX_EFFECTS
                     && arena.hazards.len() <= MAX_HAZARDS
+                    && arena.map.blocks.len() <= crate::arena::map::MAX_BLOCKS
             );
             assert!(
                 arena.player.position.x.is_finite()
                     && arena.player.position.y.is_finite()
+                    && arena.player.knockback.length().is_finite()
                     && arena.boss.height.is_finite()
+                    && arena.boss.core.x.is_finite()
             );
             assert!(arena.map.is_clear(arena.player.position, 0.85));
             assert!(

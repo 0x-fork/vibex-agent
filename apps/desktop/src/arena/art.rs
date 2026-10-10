@@ -2,10 +2,12 @@
 
 use super::{
     combat::{
-        Arena, ArrowState, Boss, BossState, Guardian, MIN_CHARGE, Phase, ROLL_DURATION, Vec2,
-        smoothstep,
+        Arena, ArrowState, Attack, Boss, BossState, Guardian, MIN_CHARGE, Phase, ROLL_DURATION,
+        Vec2, smoothstep,
     },
-    raster::{Raster, dither, ink::*},
+    guardian::IDLE_LOOP,
+    map::BRAZIER,
+    raster::{Raster, dither, hash, ink::*},
     scenery, sculpture,
 };
 use std::{
@@ -19,7 +21,7 @@ pub(super) const SCALE: f32 = 4.0;
 pub(super) const WIDTH: usize = 704;
 pub(super) const TOP_PAD: i32 = 128;
 pub(super) const HEIGHT: usize = 464 + TOP_PAD as usize;
-pub(super) const IDLE_PERIOD: f32 = 36.0;
+pub(super) const IDLE_PERIOD: f32 = IDLE_LOOP;
 pub(super) fn pixel(p: Vec2) -> (i32, i32) {
     ((p.x * SCALE).round() as i32, (p.y * SCALE).round() as i32)
 }
@@ -36,24 +38,28 @@ pub(super) fn floor(guardian: Guardian) -> &'static Raster {
 #[derive(Clone, Copy)]
 enum Actor {
     Body,
-    Tentacle(usize),
-    Hand(usize),
+    Stem(usize),
+    Shard(usize),
+    Block(usize),
+    Brazier,
     Hero,
     Pillar(usize),
 }
 
 fn guardian_parts(boss: &Boss) -> Vec<(f32, Actor)> {
-    let mut parts = Vec::with_capacity(12);
+    let mut parts = Vec::with_capacity(8);
     parts.push((boss.position.y, Actor::Body));
     match boss.guardian {
-        Guardian::Claude => {
-            for (ix, position) in boss.tentacles.iter().enumerate() {
-                parts.push((position.y, Actor::Tentacle(ix)));
-            }
-        }
         Guardian::Pi => {
             for (ix, position) in boss.hands.iter().enumerate() {
-                parts.push((position.y, Actor::Hand(ix)));
+                parts.push((position.y, Actor::Stem(ix)));
+            }
+        }
+        Guardian::Claude => {
+            for (ix, shard) in boss.shards.iter().enumerate() {
+                if shard.alive {
+                    parts.push((shard.position.y, Actor::Shard(ix)));
+                }
             }
         }
         _ => {}
@@ -64,133 +70,134 @@ fn guardian_parts(boss: &Boss) -> Vec<(f32, Actor)> {
 fn draw_part(frame: &mut Raster, boss: &Boss, part: Actor, time: f32, fallen: f32, reduced: bool) {
     match part {
         Actor::Body => guardian(frame, boss, time, fallen, reduced),
-        Actor::Tentacle(ix) if fallen < 2.1 => sculpture::tentacle(frame, boss, ix, fallen),
-        Actor::Hand(ix) if fallen < 2.1 => sculpture::hand(frame, boss, ix, fallen),
+        Actor::Stem(ix) if fallen < 2.1 => sculpture::stem(frame, boss, ix, fallen),
+        Actor::Shard(ix) => sculpture::shard(frame, &boss.shards[ix], time),
         _ => {}
     }
 }
 
 fn shadow(frame: &mut Raster, boss: &Boss) {
-    let (x, y) = pixel(boss.position);
-    let height = boss.height.max(0.0);
-    let width = match boss.guardian {
-        Guardian::DeepSeek => 45,
-        Guardian::Claude => 40,
-        Guardian::Pi => 43,
-        _ => 37,
-    };
-    let shrink = (height * 0.42).round() as i32;
-    frame.ellipse((x + 3, y + 4), (width - shrink, 11 - shrink / 4), SHADOW);
+    let hidden = boss.fade < 0.5
+        || boss.guardian == Guardian::DeepSeek
+            && (boss.state == BossState::Submerged || boss.height < -0.5);
+    if !hidden {
+        let (x, y) = pixel(boss.position);
+        let width = match boss.guardian {
+            Guardian::Claude => (34.0 * boss.scale()) as i32,
+            Guardian::Codex => 34,
+            Guardian::Pi => 40,
+            Guardian::DeepSeek => 42,
+            Guardian::OpenCode | Guardian::Copilot => 30,
+        };
+        let shrink = (boss.height.max(0.0) * 0.42).round() as i32;
+        frame.ellipse(
+            (x + 2, y + 3),
+            ((width - shrink).max(5), (10 - shrink / 4).max(2)),
+            SHADOW,
+        );
+    }
     if boss.guardian == Guardian::Pi {
         for ix in 0..2 {
             let p = pixel(boss.hands[ix]);
-            let r = 13 - (boss.hand_heights[ix] * 0.15) as i32;
-            frame.ellipse((p.0 + 2, p.1 + 2), (r, 5), SHADOW);
+            let r = (13.0 - boss.hand_heights[ix] * 0.3).max(5.0) as i32;
+            frame.ellipse((p.0 + 2, p.1 + 2), (r, (r / 2).max(2)), SHADOW);
         }
     }
-    if boss.guardian == Guardian::Claude {
-        for (ix, position) in boss.tentacles.iter().enumerate() {
-            if boss.severed & (1 << ix) == 0 {
-                let p = pixel(*position);
-                let r = (8.0 - boss.tentacle_heights[ix] * 0.16).max(2.0) as i32;
-                frame.ellipse((p.0 + 2, p.1 + 2), (r, 3), SHADOW);
-            }
-        }
+    for shard in boss.shards.iter().filter(|s| s.alive) {
+        let p = pixel(shard.position);
+        let r = (30.0 * shard.size - shard.height * 0.4).max(4.0) as i32;
+        frame.ellipse((p.0 + 2, p.1 + 2), (r, (r / 3).max(2)), SHADOW);
     }
 }
+
 fn guardian(frame: &mut Raster, boss: &Boss, time: f32, fallen: f32, reduced: bool) {
-    let visibility = 1.0 - smoothstep((fallen - 1.3) / 1.15);
+    let visibility = (1.0 - smoothstep((fallen - 1.3) / 1.15)) * boss.fade;
     if visibility <= 0.0 {
         return;
     }
-    let submerged = boss.state == BossState::Submerged;
-    let opacity = visibility * if submerged { 0.48 } else { 1.0 };
-    if opacity >= 1.0 {
+    let submerged = boss.guardian == Guardian::DeepSeek
+        && (boss.state == BossState::Submerged
+            || boss.attack == Attack::Discharge && boss.state == BossState::Striking);
+    let opacity = visibility * if submerged { 0.5 } else { 1.0 };
+    let flash = if reduced {
+        0.0
+    } else {
+        (boss.flash / 0.12).clamp(0.0, 1.0)
+    };
+    if opacity >= 1.0 && flash <= 0.0 {
         sculpture::draw(frame, boss, time, fallen, reduced);
     } else {
         let mut body = Raster::with_offset(WIDTH, HEIGHT, 0, TOP_PAD);
         sculpture::draw(&mut body, boss, time, fallen, reduced);
         for (ix, color) in body.pixels.iter().enumerate() {
-            if *color != CLEAR && dither((ix % WIDTH) as i32, (ix / WIDTH) as i32, opacity) {
-                frame.pixels[ix] = if submerged { WATER_DARK } else { *color };
+            let (x, y) = ((ix % WIDTH) as i32, (ix / WIDTH) as i32);
+            if *color != CLEAR && dither(x, y, opacity) {
+                frame.pixels[ix] = if submerged {
+                    WATER_DARK
+                } else if dither(x + 1, y, flash) {
+                    WHITE
+                } else {
+                    *color
+                };
             }
         }
     }
-    if boss.exposed > 0.0 && fallen <= 0.0 {
+    if boss.exposed > 0.0 && fallen <= 0.0 && !submerged {
         weak_point(frame, boss, time, reduced);
     }
 }
 
+/// A readable marker over the weak point while it accepts the arrow.
 fn weak_point(frame: &mut Raster, boss: &Boss, time: f32, reduced: bool) {
     let (x, y) = pixel(boss.core);
     let beat = if reduced {
         0
     } else {
-        (time * 8.0).sin().round() as i32
+        ((time * 9.0).sin() * 1.5).round() as i32
     };
     match boss.guardian {
         Guardian::Claude => {
-            frame.rect(x - 7, y - 6, 15, 13, BODY_SHADOW);
-            for side in [-1, 1] {
-                frame.line((x, y), (x + side * 11, y - 4), CORE_DARK);
-                frame.line((x, y), (x + side * 9, y + 7), CORE);
+            // A bare heart.
+            for (grow, color) in [(1, OUTLINE), (0, CORE)] {
+                frame.ellipse((x - 2, y - 2), (2 + grow, 2 + grow), color);
+                frame.ellipse((x + 2, y - 2), (2 + grow, 2 + grow), color);
+                frame.polygon(
+                    &[
+                        (x - 4 - grow, y - 1),
+                        (x + 4 + grow, y - 1),
+                        (x, y + 4 + grow),
+                    ],
+                    color,
+                );
             }
-            frame.polygon(
-                &[(x, y - 6), (x + 5, y), (x, y + 6), (x - 5, y)],
-                CORE_LIGHT,
-            );
-            frame.rect(x - 1, y - 2, 3, 4, WHITE);
+            frame.rect(x - 3, y - 3, 2, 1, CORE_LIGHT);
+            frame.ring((x, y), (10 + beat, 10 + beat), CORE_LIGHT, true);
         }
         Guardian::Codex => {
-            for strand in 0..6 {
-                let a = strand as f32 * TAU / 6.0;
-                let p = (x + (a.cos() * 10.0) as i32, y + (a.sin() * 8.0) as i32);
-                frame.line(p, (x, y), CORE_DARK);
-                frame.ellipse(p, (3, 2), IVORY);
+            let shielded = boss.cube_shielded();
+            let color = if shielded { CORE_DARK } else { CORE_LIGHT };
+            frame.ring((x, y), (11 + beat, 11 + beat), color, shielded);
+            if !shielded {
+                gleam(frame, (x, y), 7, WHITE);
             }
-            frame.ellipse((x, y), (5 + beat, 5 + beat), CORE_LIGHT);
-            frame.rect(x - 1, y - 2, 2, 3, WHITE);
         }
         Guardian::Pi => {
-            frame.rect(x - 7, y - 7, 15, 15, CORE_DARK);
-            frame.rect(x - 5, y - 5, 11, 11, CORE);
-            frame.rect(x - 3, y - 3, 7, 7, CORE_LIGHT);
-            frame.line((x, y - 10), (x, y + 10), IVORY);
-            frame.line((x - 10, y), (x + 10, y), IVORY);
-            frame.rect(x - 1, y - 1, 3, 3, WHITE);
+            frame.ring((x, y), (12 + beat, 12 + beat), CORE_LIGHT, false);
+            frame.ring((x, y), (15 + beat, 15 + beat), CORE, true);
+            gleam(frame, (x, y), 5, WHITE);
         }
-        Guardian::OpenCode => {
-            frame.rect(x - 8, y - 6, 17, 13, OUTLINE);
-            frame.rect(x - 5, y - 4, 11, 9, FIRE);
-            frame.rect(x - 3, y - 1, 7, 3, IVORY);
-            for side in [-1, 1] {
-                frame.rect(x + side * 10, y - 7, 2, 15, BODY_LIGHT);
-            }
-            frame.rect(x - 2, y - 1, 5, 2, WHITE);
-        }
-        Guardian::DeepSeek => {
-            frame.polygon(
-                &[(x - 8, y), (x, y - 10), (x + 8, y), (x, y + 7)],
-                BODY_SHADOW,
-            );
-            frame.polygon(
-                &[(x - 5, y), (x, y - 7), (x + 5, y), (x, y + 5)],
-                CORE_LIGHT,
-            );
-            frame.line((x - 9, y + 2), (x + 9, y - 2), CORE);
-            frame.line((x, y - 7), (x, y + 5), WHITE);
-            frame.ring((x, y), (10 + beat, 10 + beat), WATER_LIGHT, true);
-        }
-        Guardian::Copilot => {
-            frame.ellipse((x, y), (9, 8), OUTLINE);
-            frame.ring((x, y), (9, 8), IVORY, true);
-            frame.ellipse((x, y), (6 + beat, 5 + beat), CORE);
-            frame.ellipse((x - 1, y - 1), (4, 4), CORE_LIGHT);
-            frame.line((x, y - 10), (x, y + 10), WATER_LIGHT);
-            frame.line((x - 11, y), (x + 11, y), WATER_LIGHT);
-            frame.rect(x - 1, y - 1, 3, 3, WHITE);
+        Guardian::OpenCode | Guardian::DeepSeek | Guardian::Copilot => {
+            frame.ring((x, y), (9 + beat, 9 + beat), CORE_LIGHT, false);
+            frame.ring((x, y), (13 + beat, 13 + beat), CORE, true);
+            gleam(frame, (x, y), 4, WHITE);
         }
     }
+}
+
+fn gleam(frame: &mut Raster, c: (i32, i32), radius: i32, color: u8) {
+    frame.line((c.0 - radius, c.1), (c.0 + radius, c.1), color);
+    frame.line((c.0, c.1 - radius), (c.0, c.1 + radius), color);
+    frame.rect(c.0 - 1, c.1 - 1, 3, 3, WHITE);
 }
 
 #[cfg(test)]
@@ -228,6 +235,12 @@ pub(super) fn battle(arena: &Arena, reduced: bool) -> Raster {
         for (ix, p) in arena.map.pillars().iter().enumerate() {
             order.push((p.position.y, Actor::Pillar(ix)));
         }
+        for (ix, block) in arena.map.blocks.iter().enumerate() {
+            order.push((block.y, Actor::Block(ix)));
+        }
+        if arena.boss.guardian == Guardian::Codex {
+            order.push((BRAZIER.y, Actor::Brazier));
+        }
     }
     order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
     for (_, actor) in order {
@@ -235,6 +248,10 @@ pub(super) fn battle(arena: &Arena, reduced: bool) -> Raster {
             Actor::Hero => hero(&mut frame, arena, reduced),
             Actor::Pillar(ix) => {
                 scenery::pillar(&mut frame, arena.map.pillars()[ix], !arena.map.intact(ix))
+            }
+            Actor::Block(ix) => scenery::block(&mut frame, arena.map.blocks[ix]),
+            Actor::Brazier => {
+                scenery::brazier(&mut frame, arena.brazier_lit(), arena.visual_time, reduced)
             }
             part => draw_part(
                 &mut frame,
@@ -247,22 +264,19 @@ pub(super) fn battle(arena: &Arena, reduced: bool) -> Raster {
         }
     }
     effects::attacks(&mut frame, arena, reduced);
-    arrow(&mut frame, arena);
+    arrow(&mut frame, arena, reduced);
     effects::particles(&mut frame, arena, reduced);
     frame
 }
 
-fn arrow(frame: &mut Raster, arena: &Arena) {
+fn arrow(frame: &mut Raster, arena: &Arena, reduced: bool) {
     if arena.arrow.state == ArrowState::Ready {
         return;
     }
     let p = pixel(arena.arrow.position);
     let d = arena.arrow.velocity.normalized();
     let tail = pixel(arena.arrow.position.minus(d.scale(2.6)));
-    if matches!(
-        arena.arrow.state,
-        ArrowState::Returning | ArrowState::Tethered
-    ) {
+    if arena.arrow.state == ArrowState::Returning {
         let from = pixel(arena.player.position);
         frame.line(from, p, WATER_DARK);
         let direction = arena.arrow.position.minus(arena.player.position);
@@ -272,10 +286,24 @@ fn arrow(frame: &mut Raster, arena: &Arena) {
             let b = arena.player.position.plus(direction.scale(t + 0.025));
             frame.line(pixel(a), pixel(b), WATER_LIGHT);
         }
-        if arena.arrow.state == ArrowState::Tethered {
-            let strain = arena.boss.tether.clamp(0.0, 1.0);
-            frame.ring(p, (7 + (strain * 5.0) as i32, 7), IVORY, true);
-            frame.line((p.0, p.1 - 10), (p.0, p.1 + 10), CORE_LIGHT);
+    }
+    if arena.arrow.state == ArrowState::Flying && !reduced {
+        // A short speed streak behind a loosed arrow.
+        let streak = pixel(arena.arrow.position.minus(d.scale(6.5)));
+        frame.line(streak, tail, DUST);
+    }
+    if arena.arrow.burning > 0.0 && !reduced {
+        let tick = (arena.visual_time * 30.0) as i32;
+        for n in 0..5 {
+            let flicker = (hash(n, tick) % 3) as i32;
+            let q = pixel(arena.arrow.position.minus(d.scale(0.6 + n as f32 * 0.7)));
+            frame.rect(
+                q.0 - 1,
+                q.1 - 2 - flicker,
+                2,
+                2 + flicker,
+                if n % 2 == 0 { FIRE } else { WARN },
+            );
         }
     }
     frame.line((tail.0 + 1, tail.1 + 1), (p.0 + 1, p.1 + 1), OUTLINE);
@@ -358,10 +386,15 @@ fn hero(frame: &mut Raster, arena: &Arena, reduced: bool) {
     }
     frame.ellipse((x + 1, y + 2), (7, 3), SHADOW);
     let dying = arena.phase == Phase::Defeat;
+    let rolling = player.roll_remaining > 0.0;
     let angle = if dying {
         smoothstep(arena.phase_time / 0.4) * PI * 0.5
-    } else if player.roll_remaining > 0.0 {
+    } else if rolling {
         (1.0 - player.roll_remaining / ROLL_DURATION) * TAU
+    } else if player.knocked() {
+        player.knockback.x.signum() * 0.55
+    } else if player.sprinting && !reduced {
+        player.facing.x * 0.18
     } else {
         0.0
     };
@@ -376,12 +409,30 @@ fn hero(frame: &mut Raster, arena: &Arena, reduced: bool) {
         sprite.rect(4, 7, 5, 6, CAPE);
         sprite.rect(5, 8, 2, 4, CAPE_LIGHT);
     }
+    if rolling && !reduced {
+        // Two fading afterimages trace the dodge.
+        let progress = 1.0 - player.roll_remaining / ROLL_DURATION;
+        for (n, visibility) in [(1.0, 0.45), (2.0, 0.22)] {
+            let p = pixel(player.position.minus(player.facing.scale(n * 2.4)));
+            frame.transformed(
+                &sprite,
+                (p.0, p.1 - 7),
+                angle - n * 0.9,
+                visibility * (1.0 - progress * 0.4) * spawn,
+            );
+        }
+    }
     if player.swimming && !dying {
         sprite.rect(0, 11, 13, 5, CLEAR);
         frame.ring((x, y - 1), (10, 4), WATER_LIGHT, true);
         frame.ring((x + 1, y + 1), (15, 5), WATER, true);
     } else if player.moving && !dying && !reduced {
-        let tail = player.position.minus(player.facing.scale(2.0));
+        let tail =
+            player.position.minus(
+                player
+                    .facing
+                    .scale(if player.sprinting { 3.0 } else { 2.0 }),
+            );
         let p = pixel(tail);
         frame.polygon(
             &[
@@ -394,14 +445,14 @@ fn hero(frame: &mut Raster, arena: &Arena, reduced: bool) {
         );
         frame.line((x, y - 8), (p.0, p.1 - 4 + stride), CAPE_LIGHT);
     }
-    if player.roll_remaining > 0.0 && !reduced {
-        let trail = player.position.minus(player.facing.scale(2.8));
-        let p = pixel(trail);
-        frame.ellipse((p.0, p.1 - 3), (4, 2), CLOTH_DARK);
-        frame.line((p.0 - 2, p.1 - 4), (p.0 + 2, p.1 - 4), CAPE);
-    }
     frame.transformed(&sprite, (x, y - 7 + stride), angle, spawn);
-    if !dying && !player.swimming && player.roll_remaining <= 0.0 {
+    if player.slowed && !dying && !reduced {
+        for n in 0..3 {
+            let drip = ((arena.visual_time * 3.0 + n as f32 * 0.33).fract() * 5.0) as i32;
+            frame.rect(x - 4 + n * 4, y - 2 + drip, 2, 2, CORE);
+        }
+    }
+    if !dying && !player.swimming && !rolling && !player.knocked() {
         let aim = player.facing;
         let side = Vec2::new(-aim.y, aim.x);
         let hand = player
@@ -410,7 +461,7 @@ fn hero(frame: &mut Raster, arena: &Arena, reduced: bool) {
             .plus(aim.scale(7.0))
             .plus(Vec2::new(0.0, -6.0));
         let start = hand.plus(side.scale(5.0));
-        let middle = hand.plus(aim.scale(3.0));
+        let middle = hand.plus(aim.scale(3.0 - player.charge * 2.5));
         let end = hand.minus(side.scale(5.0));
         frame.line(
             (start.x as i32, start.y as i32),

@@ -275,6 +275,30 @@ impl Raster {
         }
     }
 
+    /// A one-pixel silhouette around everything a depth pass covered keeps
+    /// each sculpture readable against busy terrain.
+    pub fn outline(&mut self, depth: &DepthBuffer, ink: u8) {
+        let filled = |x: i32, y: i32| {
+            x >= 0
+                && y >= 0
+                && (x as usize) < depth.width
+                && (y as usize) < depth.height
+                && depth.values[y as usize * depth.width + x as usize] > f32::NEG_INFINITY
+        };
+        for y in -1..=depth.height as i32 {
+            for x in -1..=depth.width as i32 {
+                if !filled(x, y)
+                    && (filled(x - 1, y)
+                        || filled(x + 1, y)
+                        || filled(x, y - 1)
+                        || filled(x, y + 1))
+                {
+                    self.put(depth.left + x, depth.top + y, ink);
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn blit(&mut self, sprite: &Self, left: i32, top: i32) {
         for (ix, color) in sprite.pixels.iter().enumerate() {

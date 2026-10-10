@@ -1,27 +1,16 @@
 //! Combat cues use simulation positions and radii. Decorative motion never
-//! changes the footprint of a landing, a beam or an exposed joint.
+//! changes the footprint of a landing, a dash or an exposed weak point.
 
 use super::{SCALE, pixel};
 use crate::arena::{
     combat::{
-        Arena, Attack, Boss, BossState, EffectKind, Guardian, HazardKind, Phase, ProjectileKind,
-        Vec2, WaveKind, smoothstep,
+        Arena, Attack, BossState, EffectKind, Guardian, HazardKind, Phase, ProjectileKind, Vec2,
+        WaveKind, smoothstep,
     },
-    map::{SEAL_RADIUS, SEALS},
+    map::{CENTER, ISLANDS, PLATE_RADIUS, PLATES},
     raster::{Raster, hash, ink::*},
 };
 use std::f32::consts::{PI, TAU};
-
-fn outline(frame: &mut Raster, c: (i32, i32), r: i32, color: u8) {
-    for (a, b) in [
-        ((c.0 - r, c.1 - r), (c.0 + r, c.1 - r)),
-        ((c.0 + r, c.1 - r), (c.0 + r, c.1 + r)),
-        ((c.0 + r, c.1 + r), (c.0 - r, c.1 + r)),
-        ((c.0 - r, c.1 + r), (c.0 - r, c.1 - r)),
-    ] {
-        frame.line(a, b, color);
-    }
-}
 
 fn gleam(frame: &mut Raster, c: (i32, i32), radius: i32, color: u8) {
     frame.line((c.0 - radius, c.1), (c.0 + radius, c.1), color);
@@ -51,12 +40,74 @@ fn route(frame: &mut Raster, from: Vec2, to: Vec2, radius: f32, color: u8) {
     }
 }
 
+/// A committed landing: the solid ring is the exact impact radius and the
+/// dashed ring closes onto it as the strike approaches.
+fn landing(frame: &mut Raster, c: (i32, i32), r: i32, color: u8, progress: f32) {
+    frame.ring(c, (r, r), color, false);
+    frame.ring(c, (r - 2, r - 2), WARN_DARK, true);
+    let closing = r + ((1.0 - progress.clamp(0.0, 1.0)) * 18.0) as i32;
+    frame.ring(c, (closing, closing), IVORY, true);
+    for side in [-1, 1] {
+        frame.line(
+            (c.0 + side * (r + 3), c.1),
+            (c.0 + side * (r + 8), c.1),
+            color,
+        );
+        frame.line(
+            (c.0, c.1 + side * (r + 3)),
+            (c.0, c.1 + side * (r + 8)),
+            color,
+        );
+    }
+}
+
 pub(super) fn ground(frame: &mut Raster, arena: &Arena, reduced: bool) {
     if arena.ground_visibility() <= 0.0 {
         return;
     }
-    if arena.boss.guardian == Guardian::Pi {
-        seals(frame, &arena.boss, reduced);
+    if arena.boss.guardian == Guardian::Codex {
+        plates(frame, arena, reduced);
+    }
+    for h in &arena.hazards {
+        let c = pixel(h.position);
+        let r = (h.radius * SCALE).round() as i32;
+        match h.kind {
+            HazardKind::Goo => {
+                let left = h.delay + h.duration - h.time;
+                let r = (r as f32 * (0.55 + 0.45 * (left / 0.8).min(1.0))) as i32;
+                frame.ellipse(c, (r, r), CORE_DARK);
+                for n in 0..5 {
+                    let seed = hash(n, c.0 + c.1 * 5);
+                    let a = n as f32 * TAU / 5.0 + (seed % 7) as f32 * 0.1;
+                    let p = (
+                        c.0 + (a.cos() * r as f32 * 0.55) as i32,
+                        c.1 + (a.sin() * r as f32 * 0.55) as i32,
+                    );
+                    frame.ellipse(p, (r / 3 + 1, r / 4 + 1), CORE);
+                }
+                frame.ring(c, (r, r), CORE, false);
+                if !reduced {
+                    let bubble = (h.time * 1.7 + (c.0 % 7) as f32 * 0.13).fract();
+                    let p = (c.0 + r / 3, c.1 - r / 4);
+                    frame.ring(
+                        p,
+                        ((bubble * 4.0) as i32 + 1, (bubble * 3.0) as i32 + 1),
+                        CORE_LIGHT,
+                        false,
+                    );
+                }
+                frame.rect(c.0 - r / 2, c.1 - r / 2, 2, 1, CORE_LIGHT);
+            }
+            HazardKind::Drop | HazardKind::Icicle if h.time < h.delay => {
+                // The shadow grows under the falling body.
+                let progress = (h.time / h.delay.max(0.001)).clamp(0.0, 1.0);
+                let shade = (r as f32 * (0.35 + 0.65 * progress)) as i32;
+                frame.ellipse((c.0 + 1, c.1 + 1), (shade, (shade * 2 / 3).max(1)), SHADOW);
+                let urgent = progress > 0.6;
+                frame.ring(c, (r, r), if urgent { WARN } else { WARN_DARK }, !urgent);
+            }
+            _ => {}
+        }
     }
     if arena.phase == Phase::Battle {
         telegraph(frame, arena);
@@ -65,7 +116,6 @@ pub(super) fn ground(frame: &mut Raster, arena: &Arena, reduced: bool) {
         let c = pixel(wave.position);
         let r = (wave.radius * SCALE).round() as i32;
         let (dark, light) = match wave.kind {
-            WaveKind::Stone if arena.boss.guardian == Guardian::Codex => (GOLD_DARK, IVORY),
             WaveKind::Stone => (FLOOR_SHADE, DUST),
             WaveKind::Water => (WATER, WATER_LIGHT),
         };
@@ -73,8 +123,9 @@ pub(super) fn ground(frame: &mut Raster, arena: &Arena, reduced: bool) {
         frame.ring(c, (r + 2, r + 2), dark, false);
         frame.ring(c, (r, r), light, false);
         frame.ring(c, (r - 2, r - 2), dark, true);
-        for n in 0..16 {
-            let a = n as f32 * TAU / 16.0;
+        let count = if wave.kind == WaveKind::Water { 28 } else { 16 };
+        for n in 0..count {
+            let a = n as f32 * TAU / count as f32;
             let p = (
                 c.0 + (a.cos() * r as f32) as i32,
                 c.1 + (a.sin() * r as f32) as i32,
@@ -83,129 +134,48 @@ pub(super) fn ground(frame: &mut Raster, arena: &Arena, reduced: bool) {
                 frame.rect(p.0, p.1 - 3, 3, 3, WALL);
                 frame.put(p.0, p.1 - 3, DUST);
             } else {
-                frame.line(p, (p.0 + 3, p.1 - 4), light);
-            }
-        }
-    }
-    for h in &arena.hazards {
-        let c = pixel(h.position);
-        let r = (h.radius * SCALE).ceil() as i32;
-        let active = h.active();
-        match h.kind {
-            HazardKind::Gravity => {
-                frame.ring(c, (r, r), CORE_DARK, true);
-                frame.ring(c, (r - 2, r - 2), BODY_LIGHT, true);
-                for n in 0..12 {
-                    let a = n as f32 * TAU / 12.0;
-                    let flow = if reduced {
-                        0.5
-                    } else {
-                        (h.time * 0.65 + n as f32 * 0.17).fract()
-                    };
-                    let p = h
-                        .position
-                        .plus(Vec2::from_angle(a).scale(h.radius * (1.0 - flow)));
-                    let q = p.lerp(h.position, 0.1);
-                    frame.line(pixel(p), pixel(q), IVORY);
-                }
-            }
-            HazardKind::Geyser => {
-                frame.ring(c, (r, r), if active { WATER_LIGHT } else { WATER }, !active);
-                if !active {
-                    let progress = (h.time / h.delay.max(0.001)).clamp(0.0, 1.0);
-                    frame.ring(
-                        c,
-                        ((r as f32 * (1.35 - progress * 0.35)) as i32, r),
-                        WATER_LIGHT,
-                        true,
-                    );
-                    for n in [-1, 1] {
-                        frame.ellipse((c.0 + n * r / 3, c.1 - n * 2), (2, 1), WATER_LIGHT);
-                    }
-                }
-            }
-            HazardKind::Beam => {
-                if !active {
-                    route(frame, h.position, h.end, h.radius, WARN_DARK);
-                }
-            }
-            HazardKind::Scorch => {
-                let direction = h.end.minus(h.position).normalized();
-                let count = (h.end.minus(h.position).length() * 2.0)
-                    .ceil()
-                    .clamp(3.0, 32.0) as i32;
-                for n in 0..count {
-                    let p = h.position.lerp(h.end, n as f32 / (count - 1) as f32);
-                    let q = h.position.lerp(h.end, (n + 1) as f32 / (count - 1) as f32);
-                    let d = direction.perpendicular().scale(if n % 2 == 0 {
-                        h.radius * 0.65
-                    } else {
-                        -h.radius * 0.65
-                    });
-                    frame.line(
-                        pixel(p.plus(d)),
-                        pixel(q.minus(d)),
-                        if active { WARN } else { SEAM },
-                    );
-                    if active {
-                        let c = pixel(p);
-                        let flicker = if reduced {
-                            2
-                        } else {
-                            ((h.time * 15.0 + n as f32).sin() * 3.0) as i32
-                        };
-                        let height = (r + 4 + flicker).max(3);
-                        frame.ellipse(c, (r.max(2), 2), CORE_DARK);
-                        frame.polygon(
-                            &[
-                                (c.0 - 3, c.1),
-                                (c.0 - 1, c.1 - height),
-                                (c.0 + 3, c.1 - 3),
-                                (c.0 + 2, c.1),
-                            ],
-                            FIRE,
-                        );
-                        frame.line(c, (c.0, c.1 - height / 2), WARN);
-                    }
-                }
+                // Electrified water: crackling arcs ride the ring.
+                let jag = if reduced {
+                    0
+                } else {
+                    (hash(n, r) % 5) as i32 - 2
+                };
+                frame.line(p, (p.0 + 3 + jag, p.1 - 5), WHITE);
+                frame.line((p.0 + 3 + jag, p.1 - 5), (p.0 + 1, p.1 - 9), CORE_LIGHT);
             }
         }
     }
 }
 
-fn seals(frame: &mut Raster, boss: &Boss, reduced: bool) {
-    for (ix, position) in SEALS.into_iter().enumerate() {
-        let c = pixel(position);
-        let r = (SEAL_RADIUS * SCALE) as i32;
-        let locked = boss.seals & (1 << ix) != 0;
-        let color = if locked { CORE_LIGHT } else { GOLD_DARK };
-        frame.ellipse((c.0, c.1 + 2), (r + 4, r + 2), FLOOR_SHADE);
-        frame.ring(c, (r, r), color, false);
-        frame.ring(c, (r - 4, r - 4), if locked { CORE } else { SEAM }, false);
-        outline(frame, c, 7, color);
-        frame.rect(
-            c.0 - 2,
-            c.1 - 2,
-            5,
-            5,
-            if locked { IVORY } else { FLOOR_LIGHT },
+fn plates(frame: &mut Raster, arena: &Arena, reduced: bool) {
+    let lit = arena.boss.plate;
+    for (ix, plate) in PLATES.iter().enumerate() {
+        let c = pixel(*plate);
+        let r = (PLATE_RADIUS * SCALE) as i32;
+        let pressed = lit == Some(ix);
+        frame.ring(c, (r, r), if pressed { FIRE } else { GOLD_DARK }, false);
+        frame.ring(c, (r - 4, r - 4), if pressed { WARN } else { SEAM }, false);
+        // A flame glyph marks every plate.
+        let color = if pressed { WARN } else { GOLD_DARK };
+        frame.polygon(
+            &[(c.0 - 5, c.1 + 4), (c.0, c.1 - 7), (c.0 + 5, c.1 + 4)],
+            color,
         );
-        for side in [-1, 1] {
-            frame.line((c.0 + side * 10, c.1), (c.0 + side * (r - 5), c.1), color);
-        }
-        if locked {
+        frame.polygon(
+            &[(c.0 - 2, c.1 + 4), (c.0, c.1 - 1), (c.0 + 2, c.1 + 4)],
+            if pressed { WHITE } else { SEAM },
+        );
+        if pressed {
+            // Embers run along the channel toward the brazier.
+            let flow = if reduced {
+                0.5
+            } else {
+                (arena.visual_time * 1.6).fract()
+            };
             for n in 0..6 {
-                let a = n as f32 * TAU / 6.0;
-                let t = if reduced {
-                    0.5
-                } else {
-                    (boss.time * 0.6 + n as f32 / 6.0).fract()
-                };
-                let p = (
-                    c.0 + (a.cos() * r as f32) as i32,
-                    c.1 + (a.sin() * r as f32) as i32,
-                );
-                frame.line(p, (p.0, p.1 - (t * 15.0) as i32), color);
+                let t = (n as f32 / 6.0 + flow / 6.0).min(1.0);
+                let p = pixel(plate.lerp(CENTER, t));
+                frame.rect(p.0 - 1, p.1 - 1, 3, 2, if n % 2 == 0 { FIRE } else { WARN });
             }
         }
     }
@@ -213,9 +183,14 @@ fn seals(frame: &mut Raster, boss: &Boss, reduced: bool) {
 
 fn telegraph(frame: &mut Raster, arena: &Arena) {
     let boss = &arena.boss;
+    for shard in boss.shards.iter().filter(|s| s.alive && s.airborne) {
+        let r = ((2.0 + 4.0 * shard.size) * SCALE) as i32;
+        let progress = shard.time / shard.duration;
+        landing(frame, pixel(shard.target), r, WARN_DARK, progress);
+    }
     if !matches!(
         boss.state,
-        BossState::Windup | BossState::Striking | BossState::Rushing
+        BossState::Windup | BossState::Striking | BossState::Rushing | BossState::Submerged
     ) {
         return;
     }
@@ -223,281 +198,180 @@ fn telegraph(frame: &mut Raster, arena: &Arena) {
     let color = if locked { WARN } else { WARN_DARK };
     let c = pixel(boss.target);
     let r = (boss.impact_radius() * SCALE).ceil() as i32;
-    match boss.attack {
-        Attack::LeftFist | Attack::RightFist => {
-            if boss.state == BossState::Windup || boss.state == BossState::Striking {
-                frame.ring(c, (r, r), color, !locked);
-                frame.line((c.0 - 4, c.1), (c.0 + 4, c.1), color);
-                frame.line((c.0, c.1 - 4), (c.0, c.1 + 4), color);
-            }
+    let progress = boss.progress();
+    let aerial = matches!(boss.state, BossState::Windup | BossState::Striking);
+    match (boss.guardian, boss.attack) {
+        (_, Attack::Hop | Attack::Leap) if aerial => {
+            let closing = if boss.state == BossState::Windup {
+                progress * 0.3
+            } else {
+                0.3 + progress * 0.7
+            };
+            landing(frame, c, r, color, closing);
         }
-        Attack::TendrilSweep => {
-            for ix in 0..6 {
-                if ix / 2 != boss.ward as usize || boss.severed & (1 << ix) != 0 {
-                    continue;
-                }
-                let p = pixel(boss.tentacle_strike(ix, 1.0));
-                frame.ring(p, (r, r), color, !locked);
-            }
-        }
-        Attack::Rush => {
-            if boss.state == BossState::Windup {
-                let end = boss.position.plus(boss.direction.scale(35.0));
-                route(frame, boss.position, end, boss.radius(), color);
-            }
-        }
-        Attack::Dash => {
-            route(frame, boss.from, boss.target, boss.radius(), color);
-            frame.ring(c, (r, r), color, !locked);
-            frame.ring(c, (r + 3, r + 3), IVORY, true);
+        (Guardian::Pi, Attack::LeftFist | Attack::RightFist) if aerial => {
+            landing(frame, c, r, color, progress);
             frame.line((c.0 - 4, c.1), (c.0 + 4, c.1), color);
             frame.line((c.0, c.1 - 4), (c.0, c.1 + 4), color);
         }
-        Attack::Leap | Attack::Stomp => {
-            if boss.attack == Attack::Stomp {
-                outline(frame, c, r, color);
-                outline(frame, c, r - 3, WARN_DARK);
+        (Guardian::Codex, Attack::Rush) if boss.state == BossState::Windup => {
+            let end = arena.map.beam_end(boss.position, boss.direction);
+            route(frame, boss.position, end, boss.radius(), color);
+        }
+        (Guardian::Copilot, Attack::Dash) if boss.state != BossState::Striking => {
+            let from = if boss.state == BossState::Rushing {
+                boss.position
             } else {
-                frame.ring(c, (r, r), color, !locked);
-            }
-            let ring = if boss.state == BossState::Windup {
-                r + ((1.0 - boss.progress()) * 16.0) as i32
-            } else {
-                r
+                boss.from
             };
-            frame.ring(
-                c,
-                (ring, ring),
-                if locked { IVORY } else { WARN_DARK },
-                true,
-            );
-            for side in [-1, 1] {
+            route(frame, from, boss.target, boss.radius(), color);
+            landing(frame, c, r, color, progress);
+        }
+        (Guardian::OpenCode, Attack::Ambush) if boss.state == BossState::Submerged => {
+            // The vanished chest still casts the shadow of its return.
+            let shade = (r as f32 * (0.5 + 0.5 * progress)) as i32;
+            frame.ellipse((c.0 + 2, c.1 + 3), (shade, (shade / 3).max(2)), SHADOW);
+            landing(frame, c, r, color, progress);
+        }
+        (Guardian::OpenCode, Attack::Bite) if aerial => {
+            let bite = pixel(boss.target.plus(boss.direction.scale(3.0)));
+            landing(frame, bite, r, color, progress);
+        }
+        (Guardian::OpenCode, Attack::Gape) if boss.state == BossState::Windup => {
+            let origin = boss.attack_origin();
+            let aim = arena.player.position.minus(origin).angle();
+            for n in 0..5 {
+                let a = aim + (n as f32 - 2.0) * 0.25;
+                let tip = origin.plus(Vec2::from_angle(a).scale(14.0 + progress * 10.0));
                 frame.line(
-                    (c.0 + side * (r + 4), c.1),
-                    (c.0 + side * (r + 9), c.1),
+                    pixel(origin.plus(Vec2::from_angle(a).scale(6.0))),
+                    pixel(tip),
                     color,
                 );
             }
         }
-        Attack::Sweep | Attack::VisorBeam => {
-            if boss.state == BossState::Windup {
-                route(
-                    frame,
-                    boss.attack_origin(),
-                    boss.beam_end,
-                    boss.beam_radius(),
-                    color,
-                );
-                let origin = pixel(boss.attack_origin());
-                let r = 3 + (boss.progress() * 6.0) as i32;
-                frame.ring(origin, (r, r), color, false);
+        (Guardian::DeepSeek, Attack::Breach) => {
+            if boss.state == BossState::Submerged && !locked {
+                // Tracking: the eruption follows the archer until it locks.
+                frame.ring(pixel(arena.player.position), (r, r), WARN_DARK, true);
+            } else if boss.state == BossState::Submerged {
+                landing(frame, c, r, WARN, progress);
+                // Where it will burst from the water.
+                frame.ring(pixel(boss.position), (20, 20), WATER_LIGHT, true);
+            } else if boss.state == BossState::Striking {
+                landing(frame, c, r, WARN, progress);
             }
         }
-        Attack::Pulse => {
-            let c = pixel(boss.pulse_origin());
-            frame.ring(c, (29, 29), color, true);
-            frame.ring(c, (36, 36), WARN_DARK, true);
-            for n in 0..8 {
-                let a = n as f32 * TAU / 8.0;
-                let p = (c.0 + (a.cos() * 37.0) as i32, c.1 + (a.sin() * 37.0) as i32);
-                frame.rect(p.0 - 1, p.1 - 1, 3, 3, color);
-            }
-        }
-        Attack::Spokes => {
-            if boss.state == BossState::Windup {
-                for (from, end) in arena.spokes() {
-                    route(frame, from, end, boss.beam_radius(), color);
+        (Guardian::DeepSeek, Attack::Discharge) => {
+            // Dry floes are the only shelter from the coming discharge.
+            for (ix, (position, radius)) in ISLANDS.iter().enumerate() {
+                if arena.map.sunken & (1 << ix) == 0 {
+                    let p = pixel(*position);
+                    let rr = (*radius * SCALE) as i32 + 3;
+                    frame.ring(p, (rr, rr * 2 / 3), IVORY, false);
                 }
             }
-        }
-        Attack::Inhale => {
-            let c = pixel(boss.attack_origin());
-            frame.ring(c, (12, 12), IVORY, true);
-            for n in 0..8 {
-                let a = n as f32 * TAU / 8.0;
-                let distance = 12.0 + (1.0 - boss.progress()) * 16.0;
-                let p = (
-                    c.0 + (a.cos() * distance) as i32,
-                    c.1 + (a.sin() * distance) as i32,
-                );
-                frame.line(
-                    p,
-                    (c.0 + (a.cos() * 10.0) as i32, c.1 + (a.sin() * 10.0) as i32),
-                    BODY_LIGHT,
-                );
+            if boss.state == BossState::Striking && boss.time < 1.0 {
+                let r = (8.0 + (1.0 - boss.time) * 30.0) as i32;
+                frame.ring(pixel(CENTER), (r, r), WATER_LIGHT, true);
             }
         }
-        Attack::Volley | Attack::Barrage => {
-            let c = pixel(boss.attack_origin());
-            for side in [-1, 1] {
-                outline(frame, (c.0 + side * 12, c.1 - 4), 3, color);
-            }
+        (Guardian::Copilot, Attack::Volley) if boss.state == BossState::Windup => {
+            let p = pixel(boss.attack_origin());
+            let r = 3 + (progress * 6.0) as i32;
+            frame.ring(p, (r, r), color, false);
         }
+        _ => {}
     }
 }
 
 pub(super) fn attacks(frame: &mut Raster, arena: &Arena, reduced: bool) {
-    if arena.boss.guardian == Guardian::Claude && arena.phase == Phase::Battle {
-        for ix in 0..6 {
-            if arena.boss.tentacle_vulnerable(ix) {
-                let c = pixel(arena.boss.tentacle_joint(ix));
-                frame.ring(c, (7, 7), CORE_DARK, false);
-                frame.ring(c, (5, 5), CORE_LIGHT, true);
-                gleam(frame, c, 3, CORE);
-            }
-        }
-    }
     for h in &arena.hazards {
-        if !h.active() {
+        if h.time >= h.delay || !matches!(h.kind, HazardKind::Drop | HazardKind::Icicle) {
             continue;
         }
+        let progress = (h.time / h.delay.max(0.001)).clamp(0.0, 1.0);
+        let fall = ((1.0 - progress * progress) * 70.0) as i32;
         let c = pixel(h.position);
-        let r = (h.radius * SCALE).ceil() as i32;
-        if h.kind == HazardKind::Beam {
-            let side = h.end.minus(h.position).normalized().perpendicular();
-            for offset in -r..=r {
-                let delta = side.scale(offset as f32 / SCALE);
-                frame.line(
-                    pixel(h.position.plus(delta)),
-                    pixel(h.end.plus(delta)),
-                    if offset.abs() < r / 3 {
-                        WHITE
-                    } else if offset.abs() < r - 1 {
-                        CORE_LIGHT
-                    } else {
-                        CORE
-                    },
-                );
-            }
-            gleam(frame, c, r + 5, CORE_LIGHT);
-            let end = pixel(h.end);
-            frame.ellipse(end, (r + 3, r + 1), CORE);
-            gleam(frame, end, r + 4, IVORY);
-            if !reduced {
-                for n in 0..5 {
-                    let a = n as f32 * TAU / 5.0 + h.time;
-                    let d = 5.0 + (h.time * 30.0 + n as f32 * 2.0).rem_euclid(12.0);
-                    frame.line(
-                        end,
-                        (end.0 + (a.cos() * d) as i32, end.1 + (a.sin() * d) as i32),
-                        CORE_LIGHT,
-                    );
-                }
-            }
-        } else if h.kind == HazardKind::Geyser {
-            let t = ((h.time - h.delay) / h.duration).clamp(0.0, 1.0);
-            let height = ((t * PI).sin() * 58.0).round() as i32;
-            let width = (r / 2).max(3);
-            frame.polygon(
-                &[
-                    (c.0 - width, c.1),
-                    (c.0 - width / 2, c.1 - height),
-                    (c.0 + width / 2, c.1 - height),
-                    (c.0 + width, c.1),
-                ],
-                WATER,
-            );
-            frame.ellipse((c.0, c.1 - height), (width / 2 + 2, 3), WATER_LIGHT);
-            for n in -2..=2 {
-                let x = c.0 + n * width / 3;
-                frame.line(
-                    (x, c.1),
-                    (x + n, c.1 - height + n.abs() * 3),
-                    if n == 0 { IVORY } else { WATER_LIGHT },
-                );
-            }
-            frame.ring(c, (r, r), WATER_LIGHT, false);
+        let (x, y) = (c.0, c.1 - fall);
+        if h.kind == HazardKind::Drop {
+            code_block(frame, (x, y - 4));
+        } else {
+            frame.polygon(&[(x - 4, y - 12), (x + 4, y - 12), (x, y + 2)], WATER_LIGHT);
+            frame.polygon(&[(x - 4, y - 12), (x, y - 12), (x, y + 2)], WHITE);
+            frame.line((x - 4, y - 12), (x + 4, y - 12), WATER);
         }
     }
     for p in &arena.projectiles {
         let c = pixel(p.position);
         let direction = p.velocity.normalized();
-        let tail = pixel(p.position.minus(direction.scale(3.2)));
-        let color = match p.kind {
-            ProjectileKind::Orb | ProjectileKind::ChargedOrb => WATER_LIGHT,
-            ProjectileKind::Block => BODY_LIGHT,
-            ProjectileKind::Segment => GOLD,
-        };
-        frame.line(
-            tail,
-            c,
-            if p.kind == ProjectileKind::Block {
-                BODY_DARK
-            } else {
-                CORE_DARK
-            },
-        );
         match p.kind {
-            ProjectileKind::Orb | ProjectileKind::ChargedOrb => {
-                let charged = p.kind == ProjectileKind::ChargedOrb;
-                let r = if charged { 8 } else { 4 };
-                frame.ellipse(c, (r, r), WATER_DARK);
-                frame.ring(c, (r, r), color, false);
-                frame.ellipse(c, (r - 2, r - 2), WATER);
-                frame.ellipse((c.0 - 1, c.1 - 1), ((r - 3).max(1), (r - 3).max(1)), IVORY);
-                if charged {
-                    // Four open brackets make the interceptable charge distinct
-                    // from ordinary round shots without relying on color alone.
-                    for side in [-1, 1] {
-                        frame.line(
-                            (c.0 + side * 11, c.1 - 4),
-                            (c.0 + side * 11, c.1 + 4),
-                            CORE_LIGHT,
-                        );
-                        frame.line(
-                            (c.0 - 4, c.1 + side * 11),
-                            (c.0 + 4, c.1 + side * 11),
-                            CORE_LIGHT,
+            ProjectileKind::Orb => {
+                if !reduced {
+                    for n in 1..4 {
+                        let trail = pixel(p.position.minus(direction.scale(n as f32 * 1.5)));
+                        frame.ellipse(
+                            trail,
+                            (4 - n, 4 - n),
+                            if n == 1 { WATER } else { WATER_DARK },
                         );
                     }
                 }
+                let pulse = if reduced {
+                    0
+                } else {
+                    ((p.age * 18.0).sin() * 1.2) as i32
+                };
+                frame.ellipse(c, (7 + pulse, 7 + pulse), WATER_DARK);
+                frame.ellipse(c, (5 + pulse, 5 + pulse), WATER);
+                frame.ellipse((c.0 - 1, c.1 - 1), (3, 3), WATER_LIGHT);
+                frame.rect(c.0 - 2, c.1 - 3, 2, 2, WHITE);
+                frame.ring(c, (9 + pulse, 9 + pulse), WATER_LIGHT, true);
             }
             ProjectileKind::Block => {
+                let tail = pixel(p.position.minus(direction.scale(3.2)));
+                frame.line(tail, c, BODY_DARK);
                 frame.ellipse((c.0 + 2, c.1 + 6), (5, 2), SHADOW);
-                frame.polygon(
-                    &[
-                        (c.0 - 4, c.1 - 3),
-                        (c.0 + 1, c.1 - 6),
-                        (c.0 + 5, c.1 - 3),
-                        (c.0, c.1),
-                    ],
-                    BODY_LIGHT,
-                );
-                frame.polygon(
-                    &[
-                        (c.0 - 4, c.1 - 3),
-                        (c.0, c.1),
-                        (c.0, c.1 + 6),
-                        (c.0 - 4, c.1 + 3),
-                    ],
-                    BODY,
-                );
-                frame.polygon(
-                    &[
-                        (c.0, c.1),
-                        (c.0 + 5, c.1 - 3),
-                        (c.0 + 5, c.1 + 3),
-                        (c.0, c.1 + 6),
-                    ],
-                    BODY_SHADOW,
-                );
-                frame.line((c.0 - 2, c.1), (c.0 - 2, c.1 + 3), IVORY);
-            }
-            ProjectileKind::Segment => {
-                let side = direction.perpendicular().scale(0.9);
-                frame.polygon(
-                    &[
-                        c,
-                        pixel(p.position.minus(direction.scale(3.8)).plus(side)),
-                        tail,
-                        pixel(p.position.minus(side)),
-                    ],
-                    color,
-                );
-                frame.line(tail, c, IVORY);
+                code_block(frame, c);
             }
         }
     }
+    if arena.boss.guardian == Guardian::DeepSeek
+        && arena.boss.attack == Attack::Discharge
+        && arena.boss.state == BossState::Striking
+        && !reduced
+    {
+        // Arcs leap off the submerged body while the charge builds.
+        let c = pixel(arena.boss.position);
+        let tick = (arena.visual_time * 20.0) as i32;
+        for n in 0..6 {
+            let seed = hash(n, tick);
+            let a = n as f32 * TAU / 6.0 + (seed % 11) as f32 * 0.1;
+            let length = 16.0 + (seed % 17) as f32;
+            let mid = (
+                c.0 + (a.cos() * length * 0.5) as i32 + (seed % 5) as i32 - 2,
+                c.1 + (a.sin() * length * 0.3) as i32 - 6,
+            );
+            let end = (
+                c.0 + (a.cos() * length) as i32,
+                c.1 + (a.sin() * length * 0.6) as i32 - 2,
+            );
+            frame.line((c.0, c.1 - 8), mid, WHITE);
+            frame.line(mid, end, WATER_LIGHT);
+        }
+    }
+}
+
+/// A small code block: a lit cube face marked with angle brackets.
+fn code_block(frame: &mut Raster, c: (i32, i32)) {
+    frame.rect(c.0 - 5, c.1 - 5, 11, 11, OUTLINE);
+    frame.rect(c.0 - 4, c.1 - 4, 9, 4, BODY_LIGHT);
+    frame.rect(c.0 - 4, c.1, 9, 4, BODY);
+    frame.rect(c.0 - 4, c.1 + 4, 9, 1, BODY_DARK);
+    frame.line((c.0 - 1, c.1 - 3), (c.0 - 3, c.1 - 1), BODY_SHADOW);
+    frame.line((c.0 - 3, c.1 - 1), (c.0 - 1, c.1 + 1), BODY_SHADOW);
+    frame.line((c.0 + 1, c.1 - 3), (c.0 + 3, c.1 - 1), BODY_SHADOW);
+    frame.line((c.0 + 3, c.1 - 1), (c.0 + 1, c.1 + 1), BODY_SHADOW);
 }
 
 pub(super) fn particles(frame: &mut Raster, arena: &Arena, reduced: bool) {
@@ -520,6 +394,9 @@ pub(super) fn particles(frame: &mut Raster, arena: &Arena, reduced: bool) {
             EffectKind::Impact | EffectKind::Rubble => {
                 let r = (radius * (0.35 + t * 1.1)) as i32;
                 frame.ring(c, (r, r / 2), if t < 0.12 { IVORY } else { DUST }, true);
+                if t < 0.1 {
+                    frame.ellipse(c, ((radius * 0.5) as i32, (radius * 0.25) as i32), IVORY);
+                }
                 if !reduced && t < 0.14 {
                     for n in 0..8 {
                         let a = n as f32 * TAU / 8.0;
@@ -531,37 +408,94 @@ pub(super) fn particles(frame: &mut Raster, arena: &Arena, reduced: bool) {
                     }
                 }
             }
-            EffectKind::Sever => {
-                frame.ring(
-                    c,
-                    ((7.0 + t * 15.0) as i32, (4.0 + t * 7.0) as i32),
-                    CORE,
-                    true,
-                );
-                if t < 0.3 {
-                    frame.line((c.0 - 12, c.1 + 7), (c.0 + 12, c.1 - 7), IVORY);
+            EffectKind::Burst => {
+                let r = (radius * smoothstep(t * 1.6)) as i32;
+                frame.ring(c, (r, r), CORE_LIGHT, t > 0.4);
+                if t < 0.35 {
+                    for n in 0..10 {
+                        let a = n as f32 * TAU / 10.0 + 0.2;
+                        let inner = radius * 0.2;
+                        let outer = radius * (0.5 + t * 1.4);
+                        frame.line(
+                            (
+                                c.0 + (a.cos() * inner) as i32,
+                                c.1 + (a.sin() * inner) as i32,
+                            ),
+                            (
+                                c.0 + (a.cos() * outer) as i32,
+                                c.1 + (a.sin() * outer) as i32,
+                            ),
+                            if n % 2 == 0 { WHITE } else { CORE_LIGHT },
+                        );
+                    }
                 }
             }
-            EffectKind::Overload => {
-                let r = (radius * smoothstep(t * 2.0)) as i32;
-                frame.ring(c, (r, r), WATER_LIGHT, true);
-                for n in 0..6 {
-                    let a = n as f32 * TAU / 6.0;
-                    let p = (
-                        c.0 + (a.cos() * r as f32) as i32,
-                        c.1 + (a.sin() * r as f32) as i32,
-                    );
-                    let q = (
-                        c.0 + (a.cos() * r as f32 * 0.6) as i32 + 3,
-                        c.1 + (a.sin() * r as f32 * 0.6) as i32 - 4,
-                    );
-                    frame.line(c, q, CORE);
-                    frame.line(q, p, CORE_LIGHT);
+            EffectKind::Spark => {
+                if !reduced {
+                    let tick = (arena.visual_time * 24.0) as i32;
+                    for n in 0..4 {
+                        let seed = hash(n, tick + c.0);
+                        let a = n as f32 * TAU / 4.0 + (seed % 13) as f32 * 0.12;
+                        let length = radius * (0.5 + (seed % 7) as f32 * 0.07) * (1.0 - t * 0.5);
+                        let mid = (
+                            c.0 + (a.cos() * length * 0.5) as i32 + (seed % 5) as i32 - 2,
+                            c.1 + (a.sin() * length * 0.5) as i32 - (seed % 3) as i32,
+                        );
+                        let end = (
+                            c.0 + (a.cos() * length) as i32,
+                            c.1 + (a.sin() * length) as i32,
+                        );
+                        frame.line(c, mid, WHITE);
+                        frame.line(mid, end, WATER_LIGHT);
+                    }
                 }
             }
-            EffectKind::Seal => {
-                let r = (radius * (1.0 - t)) as i32;
-                frame.ring(c, (r, r / 2), CORE_LIGHT, true);
+            EffectKind::Dust => {
+                if !reduced {
+                    for n in 0..3 {
+                        let seed = hash(n, c.0 * 3 + c.1);
+                        let drift = (n as f32 - 1.0) * radius * 0.5 * t;
+                        let rise = (t * 6.0) as i32;
+                        let size = (2.0 + radius * 0.25 * (1.0 - t)) as i32;
+                        frame.ellipse(
+                            (c.0 + drift as i32 + (seed % 3) as i32 - 1, c.1 - rise),
+                            (size, (size * 2 / 3).max(1)),
+                            if t < 0.5 { FLOOR_LIGHT } else { DUST },
+                        );
+                    }
+                }
+            }
+            EffectKind::Ignite => {
+                let tick = (arena.visual_time * 30.0) as i32;
+                for n in 0..7 {
+                    let seed = hash(n, tick + c.1);
+                    let x = c.0 + ((n as f32 - 3.0) * radius * 0.18) as i32;
+                    let height = ((radius * 0.9 + (seed % 6) as f32) * (1.0 - t)) as i32;
+                    frame.polygon(
+                        &[(x - 2, c.1), (x, c.1 - height), (x + 2, c.1)],
+                        if n % 2 == 0 { FIRE } else { WARN },
+                    );
+                }
+                frame.rect(c.0 - 1, c.1 - (radius * 0.5) as i32, 2, 3, WHITE);
+            }
+            EffectKind::Flash => {
+                let r = (radius * (0.2 + t * 1.3)) as i32;
+                frame.ring(c, (r, r), WHITE, false);
+                frame.ring(c, (r + 3, r + 3), CORE_LIGHT, t > 0.3);
+                if t < 0.5 {
+                    for n in 0..12 {
+                        let a = n as f32 * TAU / 12.0;
+                        let outer = radius * (0.6 + t * 1.6);
+                        frame.line(
+                            c,
+                            (
+                                c.0 + (a.cos() * outer) as i32,
+                                c.1 + (a.sin() * outer) as i32,
+                            ),
+                            WHITE,
+                        );
+                    }
+                }
             }
             EffectKind::Steam => {
                 if !reduced {
@@ -617,16 +551,18 @@ pub(super) fn particles(frame: &mut Raster, arena: &Arena, reduced: bool) {
                     frame.ring(spirit, (3, 4), IVORY, false);
                 }
             }
-            EffectKind::Roll | EffectKind::Cross | EffectKind::Sweep => {}
+            EffectKind::Roll => {}
         }
         if reduced {
             continue;
         }
         let count = match effect.kind {
             EffectKind::Victory => 24,
-            EffectKind::Rubble | EffectKind::Sever => 18,
-            EffectKind::Impact | EffectKind::Overload => 14,
+            EffectKind::Rubble | EffectKind::Burst => 18,
+            EffectKind::Impact | EffectKind::Flash => 14,
+            EffectKind::Ignite | EffectKind::Spark => 8,
             EffectKind::Roll | EffectKind::Shot | EffectKind::Catch => 4,
+            EffectKind::Dust | EffectKind::Wake => 0,
             _ => 8,
         };
         for n in 0..count {
@@ -634,10 +570,7 @@ pub(super) fn particles(frame: &mut Raster, arena: &Arena, reduced: bool) {
             let a = n as f32 * TAU / count as f32 + (seed % 13) as f32 * 0.025;
             let travel =
                 radius * (0.1 + (1.0 - (1.0 - t).powi(2)) * (0.7 + (seed % 9) as f32 * 0.06));
-            let debris = matches!(
-                effect.kind,
-                EffectKind::Rubble | EffectKind::Impact | EffectKind::Sever
-            );
+            let debris = matches!(effect.kind, EffectKind::Rubble | EffectKind::Impact);
             let z = if effect.kind == EffectKind::Victory {
                 t * 58.0
             } else {
@@ -652,7 +585,7 @@ pub(super) fn particles(frame: &mut Raster, arena: &Arena, reduced: bool) {
             let ground = c.1 + (a.sin() * travel * 0.62) as i32;
             let y = ground - z as i32;
             let color = match effect.kind {
-                EffectKind::Victory | EffectKind::Catch | EffectKind::Seal => {
+                EffectKind::Victory | EffectKind::Catch | EffectKind::Flash => {
                     if n % 2 == 0 {
                         WHITE
                     } else {
@@ -661,9 +594,21 @@ pub(super) fn particles(frame: &mut Raster, arena: &Arena, reduced: bool) {
                 }
                 EffectKind::Defeat => CAPE,
                 EffectKind::Armor | EffectKind::Shot => GOLD,
-                EffectKind::Wake | EffectKind::Overload => WATER_LIGHT,
-                EffectKind::Cross => CORE,
-                EffectKind::Sever => BODY_LIGHT,
+                EffectKind::Spark => WATER_LIGHT,
+                EffectKind::Burst => {
+                    if n % 3 == 0 {
+                        WHITE
+                    } else {
+                        CORE
+                    }
+                }
+                EffectKind::Ignite => {
+                    if n % 2 == 0 {
+                        FIRE
+                    } else {
+                        WARN
+                    }
+                }
                 _ => {
                     if n % 3 == 0 {
                         FLOOR_LIGHT
@@ -675,21 +620,9 @@ pub(super) fn particles(frame: &mut Raster, arena: &Arena, reduced: bool) {
             if debris {
                 let size = 2 + (seed % 3) as i32;
                 frame.ellipse((x + 2, ground), (size + 1, 1), SHADOW);
-                frame.rect(
-                    x,
-                    y,
-                    size + 1,
-                    size,
-                    if effect.kind == EffectKind::Sever {
-                        BODY_DARK
-                    } else {
-                        WALL
-                    },
-                );
+                frame.rect(x, y, size + 1, size, WALL);
                 frame.rect(x, y, size + 1, 1, color);
                 frame.put(x, y + size, OUTLINE);
-            } else if effect.kind == EffectKind::Wake {
-                frame.line((x, y), (x + 1, y + 4), color);
             } else {
                 frame.rect(x, y, if t < 0.45 { 2 } else { 1 }, 2, color);
             }

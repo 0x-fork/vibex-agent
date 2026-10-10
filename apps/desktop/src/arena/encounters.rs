@@ -9,15 +9,11 @@ impl Arena {
         self.boss.previous_core = self.boss.core;
         self.boss.exposed = (self.boss.exposed - STEP).max(0.0);
         self.boss.time += STEP;
-        self.boss.shield_angle += STEP * if self.boss.exposed > 0.0 { 0.25 } else { 1.5 };
-        for ix in 0..2 {
-            if self.boss.exposed <= 0.0 {
-                self.boss.seal_time[ix] = (self.boss.seal_time[ix] - STEP).max(0.0);
-                if self.boss.seal_time[ix] <= 0.0 {
-                    self.boss.seals &= !(1 << ix);
-                }
-            }
+        if self.boss.squash > 0.0 {
+            self.boss.squash = (self.boss.squash - STEP * 4.0).max(0.0);
         }
+        self.boss.flash = (self.boss.flash - STEP).max(0.0);
+        self.boss.spin = self.boss.spin.rem_euclid(TAU);
         match self.boss.guardian {
             Guardian::Claude => self.tick_claude(),
             Guardian::Codex => self.tick_codex(),
@@ -29,63 +25,65 @@ impl Arena {
         self.boss.update_core();
     }
 
-    fn follow_target(&mut self) {
-        if !self.boss.target_locked() {
-            self.boss.target = self.player.position;
-            if matches!(
-                self.boss.attack,
-                Attack::Leap | Attack::Stomp | Attack::Dash
-            ) {
-                self.boss.target = self.map.move_body(
-                    self.boss.position,
-                    self.player.position,
-                    self.boss.radius(),
-                );
+    /// Tracks the archer until the windup locks, keeping the landing on clear
+    /// terrain and within the given reach.
+    fn follow_target(&mut self, reach: f32) {
+        if self.boss.target_locked() {
+            return;
+        }
+        let from = self.boss.position;
+        let delta = self.player.position.minus(from);
+        let goal = if delta.length() > reach {
+            from.plus(delta.normalized().scale(reach))
+        } else {
+            self.player.position
+        };
+        self.boss.target = self.map.move_body(from, goal, self.boss.radius());
+        self.boss.direction = self.boss.target.minus(from).normalized();
+    }
+
+    /// A ballistic arc from `from` to `target`; returns true on landing.
+    fn arc(&mut self, peak: f32) -> bool {
+        let t = self.boss.progress();
+        self.boss.position = self.boss.from.lerp(self.boss.target, t);
+        self.boss.height = (t * PI).sin() * peak + self.boss.from_height * (1.0 - t);
+        self.boss.squash = -0.3 * (t * PI).sin();
+        if t >= 1.0 {
+            self.boss.height = 0.0;
+            self.boss.squash = 1.0;
+            return true;
+        }
+        false
+    }
+
+    /// Rolls or dashes along the committed direction; returns the collision
+    /// point when the body meets the rim or an intact column.
+    fn charge(&mut self, speed: f32) -> Option<Vec2> {
+        let before = self.boss.position;
+        let next = before.plus(self.boss.direction.scale(speed * STEP));
+        let radius = self.boss.radius();
+        let pillar = self.map.pillar_hit(before, next, radius);
+        if pillar.is_none() && self.map.inside(next, radius + 0.5) {
+            self.boss.position = next;
+            if ((self.boss.time / 0.06) as u32) > self.boss.fired {
+                self.boss.fired = (self.boss.time / 0.06) as u32;
+                self.effect(EffectKind::Dust, before, 0.5, 3.0);
             }
-            self.boss.face(self.player.position, STEP * 3.2);
+            return None;
         }
+        if let Some(ix) = pillar {
+            self.break_pillar(ix);
+        }
+        let contact = before.plus(self.boss.direction.scale(radius));
+        self.boss.position =
+            self.map
+                .move_body(before, before.minus(self.boss.direction.scale(4.0)), radius);
+        Some(contact)
     }
 
-    fn rest_or_prepare(&mut self) {
-        if self.boss.time >= self.boss.duration {
-            self.boss.prepare(self.player.position);
-            if self.boss.guardian == Guardian::DeepSeek && self.boss.attack == Attack::Pulse {
-                self.boss.duration = 1.65;
-            }
-        }
-    }
-
-    fn beam_tell(&mut self) {
-        let origin = self.boss.attack_origin();
-        if !self.boss.target_locked() {
-            self.boss.direction = self.boss.target.minus(origin).normalized();
-        }
-        self.boss.beam_end = self.map.beam_end(origin, self.boss.direction);
-    }
-
-    fn beam_strike(&mut self) {
-        let origin = self.boss.attack_origin();
-        self.boss.beam_end = self.map.beam_end(origin, self.boss.direction);
-        self.hazards
-            .retain(|hazard| hazard.kind != HazardKind::Beam);
-        self.hazard(
-            HazardKind::Beam,
-            origin,
-            self.boss.beam_end,
-            0.0,
-            STEP * 2.0,
-            self.boss.beam_radius(),
-        );
-        if self.boss.fired == 0 {
-            self.boss.fired = 1;
-            self.effect(EffectKind::Sweep, origin, 0.6, 5.0);
-        }
-    }
-
-    fn recover(&mut self, duration: f32) {
-        self.hazards
-            .retain(|hazard| hazard.kind != HazardKind::Beam && hazard.kind != HazardKind::Gravity);
-        self.boss.enter(BossState::Recovery, duration);
+    fn rotate_yaw(&mut self, desired: f32, rate: f32) {
+        let delta = (desired - self.boss.yaw + PI).rem_euclid(TAU) - PI;
+        self.boss.yaw += delta.clamp(-rate, rate);
     }
 }
 

@@ -1,107 +1,119 @@
 use super::*;
+use crate::arena::map::{PLATE_RADIUS, PLATES};
+
+const RUSH_SPEED: f32 = 62.0;
 
 impl Arena {
     pub(super) fn tick_codex(&mut self) {
         let t = self.boss.progress();
+        if self.boss.exposed > 0.0 {
+            self.boss.shield += STEP;
+            self.boss.unravel = (self.boss.unravel + STEP * 4.0).min(1.0);
+            if self.boss.exposed <= STEP {
+                self.effect(EffectKind::Burst, self.boss.core, 0.8, 12.0);
+            }
+        } else {
+            self.boss.unravel = (self.boss.unravel - STEP * 2.5).max(0.0);
+            self.boss.shield = 0.0;
+        }
         match self.boss.state {
             BossState::Watching => {
-                self.boss.face(self.player.position, STEP * 1.6);
-                self.boss.spin += STEP * 0.3;
-                self.rest_or_prepare();
+                self.boss.height = 0.0;
+                self.boss.face(self.player.position, STEP * 4.0);
+                self.boss.spin += STEP * 0.6;
+                if self.boss.time >= self.boss.duration {
+                    if self.boss.exposed > 0.0 {
+                        self.boss.begin(Attack::Leap, self.player.position, 0.5);
+                    } else {
+                        self.boss.dashes = 3;
+                        self.boss.begin(Attack::Rush, self.player.position, 0.5);
+                    }
+                }
+            }
+            BossState::Windup if self.boss.attack == Attack::Rush => {
+                // The knot turns onto its rim, revs, then rolls at the archer.
+                if !self.boss.target_locked() {
+                    self.boss.direction =
+                        self.player.position.minus(self.boss.position).normalized();
+                    self.boss.target = self.boss.position.plus(self.boss.direction.scale(40.0));
+                }
+                self.rotate_yaw(self.boss.direction.angle(), STEP * 9.0);
+                self.boss.spin += STEP * 14.0 * t;
+                if t >= 1.0 {
+                    self.boss.from = self.boss.position;
+                    self.boss.enter(BossState::Rushing, 2.5);
+                }
             }
             BossState::Windup => {
-                self.follow_target();
-                self.boss.spin -= STEP * 0.75;
+                self.follow_target(46.0);
+                self.boss.face(self.player.position, STEP * 5.0);
+                self.boss.squash = smoothstep(t) * 0.5;
                 if t >= 1.0 {
-                    let rushing = self.boss.attack == Attack::Rush;
-                    self.boss.enter(
-                        if rushing {
-                            BossState::Rushing
-                        } else {
-                            BossState::Striking
-                        },
-                        if rushing { 3.5 } else { 1.1 },
-                    );
+                    self.boss.from = self.boss.position;
+                    let flight = if self.boss.exposed > 0.0 { 0.7 } else { 0.85 };
+                    self.boss.enter(BossState::Striking, flight);
                 }
             }
             BossState::Rushing => {
-                let before = self.boss.position;
-                let next = before.plus(self.boss.direction.scale(51.0 * STEP));
-                self.boss.spin += STEP * 7.4;
-                let pillar = self.map.pillar_hit(before, next, self.boss.radius());
-                if pillar.is_some() || !self.map.inside(next, self.boss.radius() + 0.5) {
-                    if let Some(ix) = pillar {
-                        self.map.broken |= 1 << ix;
-                        let p = self.map.pillars()[ix].position;
-                        self.effect(EffectKind::Rubble, p, 1.4, 12.0);
-                        self.map.scar(p, 8.0, ScarKind::Crack);
+                self.boss.spin += RUSH_SPEED * STEP / 9.0;
+                if let Some(contact) = self.charge(RUSH_SPEED) {
+                    self.impact(contact, 6.0);
+                    self.boss.dashes = self.boss.dashes.saturating_sub(1);
+                    if self.boss.dashes > 0 {
+                        self.boss.begin(Attack::Rush, self.player.position, 0.42);
+                    } else {
+                        self.boss.begin(Attack::Leap, self.player.position, 0.55);
                     }
-                    self.boss.position = self.map.move_body(
-                        before,
-                        before.minus(self.boss.direction.scale(1.0)),
-                        self.boss.radius(),
-                    );
-                    self.impact(self.boss.position, 6.0);
-                    self.boss.strain = 1.0;
-                    self.boss.opening(3.8);
-                    self.effect(EffectKind::Overload, self.boss.core, 0.6, 8.0);
                 } else if t >= 1.0 {
-                    // A timeout is merely recovery. Only an actual collision
-                    // can unravel the knot, including the indestructible rim.
-                    self.recover(0.6);
-                } else {
-                    self.boss.position = next;
-                    if ((self.boss.time / STEP) as u32).is_multiple_of(7) {
-                        self.effect(EffectKind::Roll, before, 0.6, 4.0);
-                    }
+                    self.boss.begin(Attack::Leap, self.player.position, 0.55);
                 }
             }
             BossState::Striking => {
-                self.boss.spin += STEP * 1.2;
-                if self.boss.fired == 0 {
-                    self.boss.fired = 1;
-                    match self.boss.attack {
-                        Attack::Pulse => {
-                            self.wave(self.boss.pulse_origin(), 10.0, 56.0, WaveKind::Stone)
+                self.boss.spin += STEP * 3.0;
+                let peak = if self.boss.exposed > 0.0 { 18.0 } else { 28.0 };
+                if self.arc(peak) {
+                    let position = self.boss.position;
+                    self.impact(position, self.boss.impact_radius());
+                    self.wave(position, 6.0, 30.0, WaveKind::Stone);
+                    let plate = PLATES
+                        .iter()
+                        .position(|p| p.minus(position).length() < PLATE_RADIUS + 1.0);
+                    match plate {
+                        Some(ix) if self.boss.exposed <= 0.0 => {
+                            self.boss.position = PLATES[ix];
+                            self.boss.plate = Some(ix);
+                            self.effect(EffectKind::Ignite, flame_center(), 0.9, 7.0);
+                            self.boss.enter(BossState::Recovery, 3.0);
                         }
-                        Attack::Spokes => {
-                            for (from, end) in self.spokes() {
-                                self.hazard(
-                                    HazardKind::Beam,
-                                    from,
-                                    end,
-                                    0.45,
-                                    0.32,
-                                    self.boss.beam_radius(),
-                                );
-                            }
+                        _ if self.boss.exposed > 0.0 => {
+                            self.boss.enter(BossState::Watching, 0.35);
                         }
-                        Attack::Barrage => {
-                            for ix in 0..6 {
-                                let angle = self.boss.yaw + ix as f32 * TAU / 6.0;
-                                let direction = Vec2::from_angle(angle);
-                                self.projectile(
-                                    self.boss.core.plus(direction.scale(11.0)),
-                                    Vec2::from_angle(angle + 0.28).scale(22.0),
-                                    ProjectileKind::Segment,
-                                );
-                            }
-                        }
-                        _ => {}
+                        _ => self.boss.enter(BossState::Recovery, 0.5),
                     }
-                }
-                if t >= 1.0 {
-                    self.recover(0.55);
                 }
             }
             BossState::Recovery => {
-                self.boss.strain = (self.boss.exposed / 0.7).clamp(0.0, 1.0);
-                self.boss.spin += STEP * (1.0 - smoothstep(self.boss.time / 0.4));
+                self.boss.face(self.player.position, STEP * 2.0);
                 if t >= 1.0 {
-                    self.boss.enter(BossState::Watching, 0.6);
+                    self.boss.plate = None;
+                    self.boss.enter(BossState::Watching, 0.45);
                 }
             }
             _ => {}
         }
+    }
+
+    /// A burning arrow melts the knot open; the bare cube keeps leaping.
+    pub(in crate::arena::combat) fn unravel_knot(&mut self) {
+        self.boss.exposed = 7.5;
+        self.boss.shield = 0.0;
+        self.boss.plate = None;
+        self.boss.update_core();
+        self.boss.previous_core = self.boss.core;
+        self.boss.enter(BossState::Watching, 0.4);
+        self.effect(EffectKind::Burst, self.boss.core, 1.0, 14.0);
+        self.effect(EffectKind::Ignite, self.boss.core, 0.8, 8.0);
+        self.hit_pause = 0.08;
+        self.boss.flash = 0.12;
     }
 }

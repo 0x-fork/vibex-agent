@@ -1,7 +1,7 @@
 use super::*;
 use crate::arena::{
-    combat::{Attack, Controls},
-    map::{CENTER, ISLANDS, Map},
+    combat::{Attack, Controls, HazardKind},
+    map::{CENTER, ISLANDS, Map, PLATES},
 };
 
 fn windup(guardian: Guardian, attack: Attack) -> Arena {
@@ -19,79 +19,98 @@ fn cues(arena: &Arena, reduced: bool) -> Raster {
     frame
 }
 
+fn marked(frame: &Raster, p: Vec2, inks: &[u8]) -> bool {
+    let (x, y) = pixel(p);
+    (-1..=1).any(|dy| (-1..=1).any(|dx| inks.contains(&frame.get(x + dx, y + dy))))
+}
+
 #[test]
-fn a_jet_dash_warns_its_full_path_and_landing_through_flight() {
+fn a_spin_dash_warns_its_full_route_and_wall_impact_through_flight() {
     let mut arena = windup(Guardian::Copilot, Attack::Dash);
     arena.boss.from = Vec2::new(40.0, 45.0);
     arena.boss.position = arena.boss.from;
-    arena.boss.target = Vec2::new(125.0, 78.0);
-    arena.boss.direction = arena.boss.target.minus(arena.boss.from).normalized();
-    let target = pixel(arena.boss.target);
-    let radius = (arena.boss.impact_radius() * SCALE).ceil() as i32;
-    for state in [BossState::Windup, BossState::Rushing] {
-        arena.boss.state = state;
-        for reduced in [false, true] {
-            let frame = cues(&arena, reduced);
-            assert_eq!(frame.get(target.0 + radius, target.1), WARN);
-            let halfway = pixel(arena.boss.from.lerp(arena.boss.target, 0.5));
-            assert_eq!(frame.get(halfway.0, halfway.1), WARN);
-        }
-        arena.boss.position = arena.boss.from.lerp(arena.boss.target, 0.8);
+    arena.boss.target = Vec2::new(140.0, 45.0);
+    arena.boss.direction = Vec2::new(1.0, 0.0);
+    let windup = cues(&arena, false);
+    arena.boss.enter(BossState::Rushing, 3.0);
+    arena.boss.position = Vec2::new(90.0, 45.0);
+    let flight = cues(&arena, false);
+    for frame in [&windup, &flight] {
+        let (x, y) = pixel(arena.boss.target);
+        let r = (arena.boss.impact_radius() * SCALE).ceil() as i32;
+        assert!((-2..=2).any(|d| frame.get(x + r + d, y) == WARN));
+        assert!(marked(
+            frame,
+            Vec2::new(120.0, 45.0 - arena.boss.radius()),
+            &[WARN]
+        ));
     }
 }
 
 #[test]
-fn a_water_pulse_warns_the_actual_wave_origin_away_from_the_whale() {
-    let mut arena = windup(Guardian::DeepSeek, Attack::Pulse);
-    arena.boss.position = Vec2::new(44.0, 82.0);
-    let frame = cues(&arena, true);
-    for _ in 0..3 {
-        arena.tick(Controls::default());
-    }
-    let wave = arena.waves.first().expect("the pulse creates a water wave");
-    assert_eq!(wave.position, CENTER);
-    assert_ne!(wave.position, arena.boss.position);
-    let origin = pixel(wave.position);
-    assert_eq!(frame.get(origin.0 + 29, origin.1), WARN);
-}
-
-#[test]
-fn radial_warning_marks_follow_the_same_rays_as_the_clipped_beams() {
-    for yaw in [0.0, 0.73, 2.1] {
-        let mut arena = windup(Guardian::Codex, Attack::Spokes);
-        arena.boss.position = CENTER;
-        arena.boss.yaw = yaw;
-        arena.boss.update_core();
-        for reduced in [false, true] {
-            let frame = cues(&arena, reduced);
-            for (from, end) in arena.spokes() {
-                let midpoint = pixel(from.lerp(end, 0.5));
-                assert_eq!(frame.get(midpoint.0, midpoint.1), WARN, "yaw {yaw}");
-            }
-        }
+fn hop_and_leap_landings_mark_the_exact_impact_ring_before_the_body_arrives() {
+    for (guardian, attack) in [
+        (Guardian::Claude, Attack::Hop),
+        (Guardian::Codex, Attack::Leap),
+        (Guardian::OpenCode, Attack::Leap),
+    ] {
+        let mut arena = windup(guardian, attack);
+        arena.boss.target = CENTER.plus(Vec2::new(20.0, 10.0));
+        let frame = cues(&arena, false);
+        let (x, y) = pixel(arena.boss.target);
+        let r = (arena.boss.impact_radius() * SCALE).ceil() as i32;
+        assert!(
+            (-1..=1).any(|d| frame.get(x + r + d, y) == WARN),
+            "{guardian:?}"
+        );
     }
 }
 
 #[test]
-fn tentacle_warnings_mark_the_final_impact_before_the_limbs_arrive() {
-    let mut arena = windup(Guardian::Claude, Attack::TendrilSweep);
-    arena.boss.target = Vec2::new(88.0, 84.0);
-    arena.boss.direction = Vec2::new(0.0, 1.0);
-    let radius = (arena.boss.impact_radius() * SCALE).ceil() as i32;
-    for pair in 0..3 {
-        arena.boss.ward = pair;
-        let frame = cues(&arena, true);
-        for ix in pair as usize * 2..pair as usize * 2 + 2 {
-            let landing = arena.boss.tentacle_strike(ix, 1.0);
-            assert!(landing.minus(arena.boss.tentacles[ix]).length() > 5.0);
-            let center = pixel(landing);
-            assert_eq!(frame.get(center.0 + radius, center.1), WARN);
-        }
+fn the_discharge_marks_every_dry_floe_as_shelter() {
+    let mut arena = windup(Guardian::DeepSeek, Attack::Discharge);
+    arena.boss.enter(BossState::Submerged, 1.0);
+    arena.map.sunken = 0b0010;
+    let frame = cues(&arena, false);
+    for (ix, (position, radius)) in ISLANDS.iter().enumerate() {
+        let edge = position.plus(Vec2::new(radius + 0.75, 0.0));
+        assert_eq!(
+            marked(&frame, edge, &[IVORY]),
+            ix != 1,
+            "floe {ix} shelter marking"
+        );
     }
 }
 
 #[test]
-fn submerged_islands_erase_walkable_art_without_changing_the_cached_floor() {
+fn a_pressed_forge_plate_is_drawn_lit_and_the_others_dark() {
+    let mut arena = Arena::new(Guardian::Codex, 0.0);
+    arena.phase = Phase::Battle;
+    arena.boss.plate = Some(2);
+    let frame = cues(&arena, false);
+    for (ix, plate) in PLATES.iter().enumerate() {
+        let r = crate::arena::map::PLATE_RADIUS;
+        let edge = plate.plus(Vec2::new(r, 0.0));
+        assert_eq!(marked(&frame, edge, &[FIRE]), ix == 2, "plate {ix}");
+    }
+}
+
+#[test]
+fn falling_blocks_and_icicles_grow_a_shadow_before_they_land() {
+    let mut arena = Arena::new(Guardian::Copilot, 0.0);
+    arena.phase = Phase::Battle;
+    let spot = CENTER.plus(Vec2::new(10.0, 20.0));
+    arena.hazard(HazardKind::Icicle, spot, 0.6, 0.1, 3.0);
+    let early = cues(&arena, false);
+    arena.hazards[0].time = 0.5;
+    let late = cues(&arena, false);
+    let shade = |frame: &Raster| frame.pixels.iter().filter(|c| **c == SHADOW).count();
+    assert!(shade(&late) > shade(&early));
+    assert!(marked(&late, spot.plus(Vec2::new(3.0, 0.0)), &[WARN]));
+}
+
+#[test]
+fn submerged_floes_erase_walkable_art_without_changing_the_cached_floor() {
     let intact = Map::new(Guardian::DeepSeek);
     let mut map = intact.clone();
     map.sunken = 0b1111;
@@ -120,4 +139,17 @@ fn submerged_islands_erase_walkable_art_without_changing_the_cached_floor() {
     let mut restored = Raster::with_offset(WIDTH, HEIGHT, 0, TOP_PAD);
     scenery::damage(&mut restored, &map);
     assert!(restored.pixels.iter().all(|ink| *ink == CLEAR));
+}
+
+#[test]
+fn a_hit_flashes_the_model_white_and_the_flash_fades() {
+    let mut arena = Arena::new(Guardian::Codex, 0.0);
+    arena.phase = Phase::Battle;
+    arena.boss.flash = 0.12;
+    let lit = battle(&arena, false);
+    arena.boss.flash = 0.0;
+    let plain = battle(&arena, false);
+    let white = |frame: &Raster| frame.pixels.iter().filter(|c| **c == WHITE).count();
+    assert!(white(&lit) > white(&plain) + 100);
+    arena.tick(Controls::default());
 }

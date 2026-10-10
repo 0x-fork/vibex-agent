@@ -1,146 +1,130 @@
 use super::*;
 
+const REST: [f32; 5] = [0.35, 0.3, 0.25, 0.2, 0.18];
+const FLIGHT: [f32; 5] = [0.62, 0.56, 0.5, 0.46, 0.42];
+
 impl Arena {
     pub(super) fn tick_claude(&mut self) {
+        let generation = self.boss.generation.min(4) as usize;
+        if generation >= 4 {
+            // Four splits leave the heart bare for good.
+            self.boss.exposed = 1.0;
+        }
         let t = self.boss.progress();
         match self.boss.state {
             BossState::Watching => {
-                self.boss.height = self.boss.from_height
-                    + (self.boss.hover_height(self.visual_time) - self.boss.from_height)
-                        * smoothstep(t);
-                self.boss.face(self.player.position, STEP * 1.4);
-                let toward = self.player.position.minus(self.boss.position);
-                if toward.length() > 24.0 {
-                    self.boss.position = self.map.move_body(
-                        self.boss.position,
-                        self.boss
-                            .position
-                            .plus(toward.normalized().scale(STEP * 6.0)),
-                        self.boss.radius(),
-                    );
+                self.boss.height = 0.0;
+                self.boss.spin += STEP * 1.5;
+                self.boss.face(self.player.position, STEP * 4.0);
+                if self.boss.time >= self.boss.duration {
+                    self.boss.begin(Attack::Hop, self.player.position, 0.22);
                 }
-                self.boss.stride += STEP * 3.0;
-                self.boss.rest_tentacles();
-                self.rest_or_prepare();
             }
             BossState::Windup => {
-                self.follow_target();
-                let reach = self.boss.target.minus(self.boss.position);
-                if t < 0.55 && reach.length() > 32.0 {
-                    self.boss.target = self.boss.position.plus(reach.normalized().scale(32.0));
-                }
-                self.boss.rest_tentacles();
-                if self.boss.attack == Attack::TendrilSweep {
-                    for ix in self.boss.ward as usize * 2..self.boss.ward as usize * 2 + 2 {
-                        self.boss.tentacles[ix] = self
-                            .boss
-                            .resting_tentacle(ix)
-                            .lerp(self.boss.tentacle_strike(ix, 0.0), smoothstep(t));
-                        self.boss.tentacle_heights[ix] = 2.0 + smoothstep(t) * 13.0;
-                    }
-                } else if self.boss.attack == Attack::Rush {
-                    for ix in 0..6 {
-                        self.boss.tentacles[ix] = self.boss.tentacles[ix].lerp(
-                            self.boss.position.minus(self.boss.direction.scale(12.0)),
-                            t * 0.3,
-                        );
-                    }
-                } else {
-                    for ix in 0..6 {
-                        self.boss.tentacle_heights[ix] =
-                            self.boss.tentacle_rest_height(ix) + t * 4.0;
-                    }
-                }
+                self.follow_target(30.0 + 2.0 * generation as f32);
+                self.boss.squash = smoothstep(t) * 0.6;
+                self.boss.spin += STEP * 4.0;
                 if t >= 1.0 {
                     self.boss.from = self.boss.position;
-                    let rushing = self.boss.attack == Attack::Rush;
-                    self.boss.enter(
-                        if rushing {
-                            BossState::Rushing
-                        } else {
-                            BossState::Striking
-                        },
-                        if rushing {
-                            1.1
-                        } else if self.boss.attack == Attack::Inhale {
-                            2.65
-                        } else {
-                            0.48
-                        },
-                    );
-                }
-            }
-            BossState::Striking if self.boss.attack == Attack::TendrilSweep => {
-                for ix in self.boss.ward as usize * 2..self.boss.ward as usize * 2 + 2 {
-                    self.boss.tentacles[ix] = self.boss.tentacle_strike(ix, t);
-                    self.boss.tentacle_heights[ix] = (1.0 - t.powi(3)) * 15.0;
-                }
-                if t >= 1.0 {
-                    for ix in self.boss.ward as usize * 2..self.boss.ward as usize * 2 + 2 {
-                        if self.boss.severed & (1 << ix) == 0 {
-                            self.impact(self.boss.tentacles[ix], self.boss.impact_radius());
-                        }
-                    }
-                    self.boss.enter(BossState::Recovery, 2.05);
+                    self.boss.enter(BossState::Striking, FLIGHT[generation]);
                 }
             }
             BossState::Striking => {
-                // Venting lifts the shell clear of every intact tendon. Waiting
-                // alone never opens the underside; the arrow must cut two.
-                for ix in 0..6 {
-                    let rest = self.boss.resting_tentacle(ix);
-                    self.boss.tentacles[ix] = self
-                        .boss
-                        .position
-                        .plus(rest.minus(self.boss.position).scale(1.35));
-                    self.boss.tentacle_heights[ix] = 2.0 + (t * PI).sin() * 2.5;
-                }
-                let pulse = (self.boss.time / 0.4) as u32;
-                if pulse > self.boss.fired {
-                    self.boss.fired = pulse;
-                    self.effect(EffectKind::Steam, self.boss.core, 0.75, 7.0);
-                }
-                if t >= 1.0 {
-                    self.recover(0.55);
-                }
-            }
-            BossState::Rushing => {
-                let from = self.boss.position;
-                let next = from.plus(self.boss.direction.scale(47.0 * STEP));
-                let moved = self.map.move_body(from, next, self.boss.radius());
-                self.boss.position = moved;
-                self.boss.rest_tentacles();
-                let marks = (self.boss.time / 0.10) as u32;
-                if marks > self.boss.fired {
-                    self.boss.fired = marks;
-                    let end = from.minus(self.boss.direction.scale(7.0));
-                    let start = end.minus(self.boss.direction.scale(5.0));
-                    self.hazard(HazardKind::Scorch, start, end, 0.15, 3.4, 1.7);
-                    self.map.scar(end, 3.0, ScarKind::Scorch);
-                    self.effect(EffectKind::Steam, end, 0.45, 3.0);
-                }
-                if t >= 1.0 || moved.minus(next).length() > 0.2 {
-                    self.impact(self.boss.position, 5.0);
-                    self.recover(0.8);
-                }
-            }
-            BossState::Recovery => {
-                self.boss.settle();
-                if self.boss.attack != Attack::TendrilSweep || self.boss.exposed > 0.0 {
-                    for ix in 0..6 {
-                        self.boss.tentacles[ix] = self.boss.tentacles[ix]
-                            .lerp(self.boss.resting_tentacle(ix), STEP * 2.0);
-                    }
-                }
-                if t >= 1.0 {
-                    if self.boss.severed.count_ones() >= 2 {
-                        self.boss.severed = 0;
-                        self.effect(EffectKind::Steam, self.boss.core, 0.7, 5.0);
-                    }
-                    self.boss.enter(BossState::Watching, 0.65);
+                self.boss.spin += STEP * 10.0;
+                if self.arc(16.0 - generation as f32 * 1.5) {
+                    let position = self.boss.position;
+                    let scale = self.boss.scale();
+                    self.impact(position, self.boss.impact_radius());
+                    self.hazard(HazardKind::Goo, position, 0.0, 5.5, 2.0 + 4.5 * scale);
+                    self.effect(EffectKind::Dust, position, 0.6, 6.0 * scale + 2.0);
+                    self.boss.enter(BossState::Watching, REST[generation]);
                 }
             }
             _ => {}
+        }
+        self.tick_shards();
+    }
+
+    /// Split sparks hop on their own rhythm straight at the archer.
+    fn tick_shards(&mut self) {
+        for ix in 0..self.boss.shards.len() {
+            let mut shard = self.boss.shards[ix];
+            if !shard.alive {
+                continue;
+            }
+            shard.previous = shard.position;
+            shard.time += STEP;
+            shard.spin += STEP * if shard.airborne { 10.0 } else { 1.5 };
+            let mut landed = false;
+            if shard.airborne {
+                let t = (shard.time / shard.duration).min(1.0);
+                shard.position = shard.from.lerp(shard.target, t);
+                shard.height = (t * PI).sin() * 10.0;
+                if t >= 1.0 {
+                    shard.airborne = false;
+                    shard.height = 0.0;
+                    shard.time = 0.0;
+                    shard.duration = 0.6 + ix as f32 * 0.15;
+                    landed = true;
+                }
+            } else if shard.time >= shard.duration {
+                let delta = self.player.position.minus(shard.position);
+                let goal = if delta.length() > 24.0 {
+                    shard.position.plus(delta.normalized().scale(24.0))
+                } else {
+                    self.player.position
+                };
+                shard.from = shard.position;
+                shard.target = self.map.move_body(shard.position, goal, shard.radius());
+                shard.airborne = true;
+                shard.time = 0.0;
+                shard.duration = 0.55;
+            }
+            self.boss.shards[ix] = shard;
+            if landed {
+                self.impact_with(shard.position, 2.0 + 4.0 * shard.size, 0.0);
+            }
+        }
+    }
+
+    /// The arrow splits the carrier: a heartless spark bursts away on one
+    /// side while the smaller heart-bearer recoils to the other.
+    pub(in crate::arena::combat) fn split_spark(&mut self, direction: Vec2) {
+        let side = direction.perpendicular();
+        let origin = self.boss.position;
+        let center = self.boss.body_center();
+        self.boss.generation = (self.boss.generation + 1).min(4);
+        let size = self.boss.scale();
+        if let Some(slot) = self.boss.shards.iter().position(|s| !s.alive) {
+            let target = self
+                .map
+                .move_body(origin, origin.plus(side.scale(16.0)), 7.5 * size);
+            self.boss.shards[slot] = Shard {
+                alive: true,
+                position: origin,
+                previous: origin,
+                from: origin,
+                target,
+                height: 0.0,
+                time: 0.0,
+                duration: 0.42,
+                airborne: true,
+                size,
+                spin: self.boss.spin,
+            };
+        }
+        self.boss.attack = Attack::Hop;
+        self.boss.from = origin;
+        self.boss.target =
+            self.map
+                .move_body(origin, origin.minus(side.scale(16.0)), self.boss.radius());
+        self.boss.enter(BossState::Striking, 0.42);
+        self.effect(EffectKind::Burst, center, 0.8, 10.0 * size + 3.0);
+        self.hit_pause = 0.07;
+        self.boss.flash = 0.12;
+        if self.boss.generation >= 4 {
+            self.boss.exposed = 1.0;
+            self.effect(EffectKind::Steam, center, 1.0, 6.0);
         }
     }
 }

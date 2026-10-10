@@ -8,40 +8,40 @@ pub(super) fn entry_label(guardian: Guardian) -> String {
 }
 pub(super) fn entry_help(guardian: Guardian) -> String {
     let controls = text(
-        "WASD / arrows move · Hold J / left mouse, release to shoot · K / right mouse recall · Space roll · P pause · Esc return",
-        "WASD / 方向键移动 · J / 鼠标左键蓄力，松开射箭 · K / 右键召回 · 空格翻滚 · P 暂停 · Esc 返回",
-        "WASD / 方向鍵移動 · J / 滑鼠左鍵蓄力，鬆開射箭 · K / 右鍵召回 · 空格翻滾 · P 暫停 · Esc 返回",
+        "WASD / arrows move · Hold J / left mouse, release to shoot · K / right mouse recall · Space roll, hold to sprint · P pause · Esc return",
+        "WASD / 方向键移动 · J / 鼠标左键蓄力，松开射箭 · K / 右键召回 · 空格翻滚，按住冲刺 · P 暂停 · Esc 返回",
+        "WASD / 方向鍵移動 · J / 滑鼠左鍵蓄力，鬆開射箭 · K / 右鍵召回 · 空格翻滾，按住衝刺 · P 暫停 · Esc 返回",
     );
     let hint = match guardian {
         Guardian::Claude => text(
-            "Sever two glowing tendons, then strike the exposed underside.",
-            "射断两处发光的触手关节，再击中腹部核心。",
-            "射斷兩處發光的觸手關節，再擊中腹部核心。",
+            "Every hit splits the spark. Keep striking the one that carries the heart; after four splits the heart lies bare.",
+            "每次命中都会让火花分裂。紧盯带着心脏的那一个，分裂四次后心脏裸露，一击制胜。",
+            "每次命中都會讓火花分裂。緊盯帶著心臟的那一個，分裂四次後心臟裸露，一擊制勝。",
         ),
         Guardian::Codex => text(
-            "Lure the rush into stone; the impact unfolds the central cube.",
-            "引导冲撞击中石柱或场地边缘，待金环展开后射击中央方核。",
-            "引導衝撞擊中石柱或場地邊緣，待金環展開後射擊中央方核。",
+            "Lure its leap onto a forge plate. While the brazier burns, shoot through the flame to melt the knot, then hit the cube between shield pulses.",
+            "引它跳压到熔炉踏板上。火盆燃起时让箭穿过火焰，用火箭熔开绳结，再趁护盾间隙射中方核。",
+            "引它跳壓到熔爐踏板上。火盆燃起時讓箭穿過火焰，用火箭熔開繩結，再趁護盾間隙射中方核。",
         ),
         Guardian::Pi => text(
-            "Lure each fist onto its ground seal to unlock the square aperture.",
-            "引导左右拳分别砸中对应地印，解锁方孔中的核心。",
-            "引導左右拳分別砸中對應地印，解鎖方孔中的核心。",
+            "One stem strikes, the other guards the eye. Cross its midline to force a switch, and shoot the bare eye. The south gate is out of reach.",
+            "一根立柱砸击，另一根守护眼睛。穿过它的中线逼它换手，趁眼睛裸露射击。南门边是它够不着的地方。",
+            "一根立柱砸擊，另一根守護眼睛。穿過它的中線逼它換手，趁眼睛裸露射擊。南門邊是它搆不著的地方。",
         ),
         Guardian::OpenCode => text(
-            "Shoot into the inhale, then hold recall to pull the frame apart.",
-            "吸气时射入箭矢，持续召回扯开外框，再射核心。",
-            "吸氣時射入箭矢，持續召回扯開外框，再射核心。",
+            "Keep moving when it vanishes. When it gapes at you and fires blocks, sidestep and shoot into the open mouth from the front.",
+            "它消失时保持移动。当它朝你张开大口喷射代码块时，侧移躲开并从正面射入口中。",
+            "它消失時保持移動。當它朝你張開大口噴射程式碼塊時，側移躲開並從正面射入口中。",
         ),
         Guardian::DeepSeek => text(
-            "Lure breaches away from the islands; shoot the tail crystal from dry ground.",
-            "把跃击引离浮岛，站在干地射击尾部晶体；水中只能召回。",
-            "把躍擊引離浮島，站在乾地射擊尾部晶體；水中只能召回。",
+            "Lure each leap into open water, then shoot the raised tail from a floe. Before the discharge, get onto ice.",
+            "把每次跃扑引到开阔水面，再站上浮冰射击翘起的尾巴。放电前务必回到冰面上。",
+            "把每次躍撲引到開闊水面，再站上浮冰射擊翹起的尾巴。放電前務必回到冰面上。",
         ),
         Guardian::Copilot => text(
-            "Intercept the bracketed energy orb to overload the shield and reveal the reactor.",
-            "射中带四角光标的能量弹，令护盾过载后击中胸口反应堆。",
-            "射中帶四角光標的能量彈，令護盾過載後擊中胸口反應爐。",
+            "Orbs knock you back; a wall behind you is fatal. When its spin dash hits a wall it is stunned: dodge the falling ice and shoot the rear jet.",
+            "能量球会把你击退，背后是墙就会撞死。旋转突进撞墙后它会眩晕：躲开落下的冰锥，射击背后的喷口。",
+            "能量球會把你擊退，背後是牆就會撞死。旋轉突進撞牆後它會暈眩：躲開落下的冰錐，射擊背後的噴口。",
         ),
     };
     format!("{} · {}\n{}", entry_label(guardian), hint, controls)

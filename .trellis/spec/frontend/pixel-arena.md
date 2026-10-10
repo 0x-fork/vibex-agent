@@ -21,19 +21,23 @@ Arena::release_shot(Option<Vec2>)
 Arena::roll(Vec2)
 Arena::respawn()
 Arena::outcome_ready() -> bool
-Arena::spokes() -> [(Vec2, Vec2); 6] // terrain-clipped radial rays
-Boss::idle(Guardian, f32, bool) -> Boss
-Boss::tentacle_joint(usize) -> Vec2
-Boss::tentacle_strike(usize, f32) -> Vec2
+Arena::brazier_lit() -> bool
+Boss::idle(Guardian, f32, bool) -> Boss // each form's own gait
+Boss::articulated(f32, f32, f32) -> Vec2 // model point after pivoted tilt
+Boss::body_center() -> Vec2
 Boss::target_locked() -> bool
-Boss::pulse_origin() -> Vec2
-Boss::beam_radius() -> f32
+Boss::cube_shielded() -> bool
+Boss::guard_point(usize) -> (Vec2, f32)
 Map::move_body(Vec2, Vec2, f32) -> Vec2
+Map::walk(Vec2, Vec2, f32) -> Vec2 // the archer: also blocks, dais, bowl
+Map::standable(Vec2, f32) -> bool
 Map::cover_hit(Vec2, Vec2) -> bool
-Map::beam_end(Vec2, Vec2) -> Vec2
-Map::break_islands(Vec2, f32) -> u8 // newly submerged platform bits
+Map::beam_end(Vec2, Vec2) -> Vec2 // dash routes end at the rim or a column
+Map::break_islands(Vec2, f32) -> u8 // newly submerged floe bits
+Map::drop_block(Vec2); Map::crush_blocks(Vec2, f32) -> Vec<Vec2>
 Map::scar(Vec2, f32, ScarKind)
 Raster::polygon_depth(&[(f32, f32, f32)], u8, &mut DepthBuffer)
+Raster::outline(&DepthBuffer, u8) // one-pixel model silhouette
 Geometry::world(Point<Pixels>) -> Option<Vec2>
 ```
 
@@ -49,7 +53,8 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
   the clock and all input. The existing composer entity and draft survive.
 - `combat.rs`, `guardian.rs`, `encounters.rs`, the six `encounter_*.rs` modules,
   `map.rs`, and `geometry.rs` are independent of GPUI. `encounters.rs` owns shared
-  targeting and beam behavior; each encounter module owns its choreography.
+  targeting, ballistic arcs and rolling/dash collisions; each encounter module
+  owns its choreography.
   `sculpture.rs` authors spatial meshes; `scenery.rs` authors terrain; `art.rs`
   composes actors and the `effects.rs` cues. `raster.rs` owns integer primitives,
   depth rasterization, and rectangle merging; `palette.rs` owns artwork materials;
@@ -70,8 +75,12 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
   Unsupported Agents have no substitute guardian.
 - Preview draws the same model and material colors as combat, with its shadow
   and idle articulation. It has no floor, archer, arrow, attack simulation, or
-  gameplay clock. The 36-second roaming loop runs at most 24 FPS; reduced motion
-  freezes every part. Dialogs freeze preview, and inactive windows follow the
+  gameplay clock. The 36-second roaming loop runs at most 30 FPS; reduced motion
+  freezes every part. Each form roams in its own gait: the spark hops with
+  squash and spin, the knot rolls on its rim, the glyph strides on its stems,
+  the chest hops and chomps, the whale swims and breaches, and the helmet
+  strafes, banks and barrel-rolls. Every loop starts in the upper half of the
+  home, clear of the composer. Dialogs freeze preview, and inactive windows follow the
   existing ambient-animation appearance preference.
 - `scene::Entry` measures the current raster and positions a native ghost
   `Button` around the visible model, excluding its shadow. The Button owns
@@ -84,8 +93,8 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
 - The 1.4-second `Awakening` phase keeps the first model frame identical, fades
   home content out, reveals terrain, materializes the archer, and interpolates
   into the following camera. No gameplay input or damage runs during entry.
-  Flight height remains continuous; rolling models settle through the nearest
-  upright rotation. Reduced motion skips camera travel.
+  Flight height remains continuous; rolls, banks, squash and an open lid settle
+  through the nearest upright pose. Reduced motion skips camera travel.
 - Battle fills the home area and remains clipped to it. There is no dialog,
   title/header/footer, visible instruction panel, selector, control button, or
   result card. Workbench navigation remains available. Keyboard/mouse instructions
@@ -94,8 +103,9 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
 - Death plays for one second, chooses a random clear spawn at a safe distance
   from the guardian, then materializes the archer for 0.7 seconds. It clears
   threats and input and starts a fresh opening delay without replaying entry.
-  Broken columns and impact scars survive rebirth. Submerged platforms remain
-  submerged until the next water pulse restores them.
+  Broken columns and impact scars survive rebirth; spat blocks and split sparks
+  are cleared and the spark regains its full form. Sunken floes stay sunken
+  until the next discharge restores them.
 - Victory has a finite 3.3-second departure: the guardian collapses, unravels,
   rises, splits, submerges, or folds according to its form. The final 0.7 seconds
   fade the field away and restore home content. `DismissEvent` drops the battle,
@@ -106,44 +116,50 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
 
 ### Combat and input
 
-- Simulate at fixed 60 Hz. Each clock wake accepts at most 100 ms of elapsed
-  time, so suspension cannot replay a lethal backlog. Bound projectiles to 48,
-  effects to 64, waves to 8, hazards to 16, and persistent terrain scars to 48.
+- Simulate at fixed 120 Hz on an 8 ms clock. Each clock wake accepts at most
+  100 ms of elapsed time, so suspension cannot replay a lethal backlog. Bound
+  projectiles to 48, effects to 64, waves to 8, hazards to 16, spat blocks to
+  10, and persistent terrain scars to 48. Old slime yields its hazard slot
+  before a live threat is ever dropped.
 - Focus loss, window deactivation, pause, and close release held keys, mouse
   buttons, pointer aim, charging, and recall, and cancel the clock. Combat always
   pauses on deactivation. Resume resets elapsed time and retains one clock.
 - WASD/arrows move; hold J or left mouse then release to shoot; K or right mouse
-  recalls; Space rolls; P pauses; Enter or a field click resumes; R respawns;
+  recalls; Space rolls and holding it sprints (×1.45); P pauses; Enter or a field click resumes; R respawns;
   Escape returns. Keyboard attacks restore assisted weak-point aim after pointer
   use. Pointer aim uses the last displayed camera, including shake.
-- The archer has one arrow and one life. Drawing requires 0.30 seconds. Drawing
-  and recalling hold position. A roll cancels drawing, moves for 0.28 seconds,
-  protects for 0.30 seconds, and cools down for 0.50 seconds. A 120 ms roll buffer
+- The archer has one arrow and one life and walks at 30 units per second.
+  Drawing requires 0.20 seconds (capped at 0.8); arrows fly at 100 + 45 ×
+  charge. Drawing and recalling hold position. A roll cancels drawing, moves
+  for 0.24 seconds, protects for 0.26 seconds, and cools down for 0.32 seconds. A 120 ms roll buffer
   bridges the end of cooldown; releasing a charged shot during hit pause fires
   on resumption. Input cancellation clears both pending actions.
-- Keyboard aim assists the current puzzle target: an exposed tendon or charged
-  energy orb before the core opens. Explicit pointer aim remains exact. In the
-  lagoon, swimming slows movement and prevents drawing or shooting; recall
-  remains available, and dry platforms enable shooting.
+- Keyboard aim targets the open weak point, the lit brazier flame before the
+  knot melts, and otherwise the body. Explicit pointer aim remains exact. In
+  the lagoon, swimming slows movement and prevents rolling, drawing and
+  shooting; recall remains available, and dry floes enable shooting. Ember
+  slime slows walking to 55% and never harms. An energy orb knocks the archer
+  back; meeting a wall while the push is still fast kills.
 - Each choreography commits its target during windup. Aerial landing targets
   must be clear terrain positions before the tell locks. Landing tells remain
-  visible during flight and share the impact radius used by collision. A dash
-  shows its complete committed route and final impact circle; a tentacle's tell
-  marks its final landing while the limb is still rising.
-- Projectile/body collisions sweep relative motion to avoid tunneling. Beam
-  rendering and damage share the origin and terrain-clipped endpoint.
-  Telegraphs cannot cause damage. Victory/death clear live threats before
+  visible during flight and share the impact radius used by collision; a
+  dashed ring closes onto it. A roll or dash shows its complete committed route
+  to the rim or column it will strike. A vanished chest casts the shadow of its
+  return, and a breach marks its landing before the whale surfaces.
+- Projectile/body collisions sweep relative motion to avoid tunneling.
+  Telegraphs and falling shadows cannot cause damage. Victory/death clear live threats before
   subsequent attacks can spawn additional hazards.
-- Target lock, beam radius, pulse origin, and radial rays come from the shared
-  combat geometry helpers. Do not derive a second direction from a visual spin
-  or use a boss-local warning for a wave whose origin is the center of the map.
+- Target lock, impact radius, routes and weak-point anchors come from the
+  shared combat helpers. Do not derive a second direction from a visual spin,
+  or a weak point from art that collision does not share.
 - An arrow must intersect the exposed weak point, not merely the body. Core
   coordinates are aim-plane points distinct from the grounded body footprint.
   Moving cores and interceptable projectiles use relative swept collisions;
-  the earliest applicable cover/armor/joint/core contact wins. Flying arrows
-  stop at cover; returning arrows pass through cover and closed armor to remain
-  retrievable. Closed armor never grants a win. A tethered arrow is a distinct
-  state, cannot become a second arrow, and ejects if its inhale window expires.
+  the earliest applicable cover/armor/spark/core contact wins. Flying arrows
+  stop at cover and at closed weak points; returning arrows pass through cover
+  and armor to remain retrievable, though they still split a carrier spark or
+  shatter a split one. Closed armor never grants a win. An arrow that passes
+  through the lit brazier burns for four seconds.
 
 ### Six encounters
 
@@ -153,22 +169,23 @@ rebirth, without a damage override.
 
 | Guardian | Form and choreography | Terrain and opening |
 | --- | --- | --- |
-| Claude | Broad orange square head, pale vertical eyes, pointed underside, six independent curling tentacles; paired sweeps, a scorch-trailing rush, and a venting stance | Cut two distinct glowing tendons during recovery or venting to open the underside. A failed opening regrows the severed limbs. Scorched paths can be cleared with the arrow. |
-| Codex | Bronze and gold six-loop knot around a suspended cube; expanding pulses, radial beams, detached segments, and a committed rolling rush | Actual pillar or perimeter collision unfolds the knot for 3.8 seconds. Broken pillars leave rubble and cracks; the perimeter preserves future opportunities. |
-| Pi | Black masonry glyph with a square aperture and separate right stem, floating stones, and independent fists; alternating slams, stone barrage, and glyph beam | Lure each fist onto its corresponding ground seal. Each seal stays latched for 13 seconds; both unlock the aperture for 4.4 seconds. An ordinary precise shot can finish the encounter. |
-| OpenCode | Hollow dark rectangular construct with an ivory front rim and floating frames; shutter beam, frame barrage, gravity inhale, and frame slam | Shoot into the inhale and hold recall for 0.62 seconds to pull the frame apart. The core opens for 4.8 seconds and must be hit from the front. A missed pull ejects the arrow. |
-| DeepSeek | Rounded blue armored whale, ivory belly, luminous cracks, two-sided fins, and raised forked tail; three breaches followed by a water pulse | Breaches destroy nearby platforms and leave delayed water columns. Shoot the tail crystal from a surviving island during descent or the 2.9-second landing recovery. The pulse restores all islands, which protect from the water wave. |
-| Copilot | Teal domed helmet, blue goggles, ivory face with two dark slots, ear pods, small hands, and a chest jet reactor; energy volleys, visor beam, and jet dash | Intercept the larger orb with four visible brackets to overload the rotating shield and open the chest reactor for 4.8 seconds. Ordinary orbs and passive waiting never unlock it. |
+| Claude | Terracotta spark of twelve uneven, club-ended rays around a glowing heart; relentless hops whose landings shake the ground and leave slowing ember slime | Every hit splits it: the smaller heart carrier recoils while a heartless spark bursts away and hunts on its own rhythm. After four splits the heart lies bare and one hit wins. Split sparks shatter when hit. |
+| Codex | Bronze six-loop knot around a cube; three rolling rushes, then a heavy leap with a shock ring | Four forge plates surround a central brazier that burns only while the knot presses a plate it landed on. A burning arrow melts the knot; the bare cube keeps leaping for 7.5 seconds behind a shield closed 0.55 of every 1.5 seconds. Rushes break columns. |
+| Pi | Black block glyph on a dais at the north edge; its left leg and separate right stem are its fists | The stem on the archer's side slams while the other guards the square aperture. Crossing the midline forces a switch that bares the eye for 1.3 seconds. The stems reach 54 units; the south gate is out of reach, but distant archers draw a stone barrage. |
+| OpenCode | Light-grey chest after the logo frame, its window a hinged mouth; spit, vanish-and-bite, two leaps, then a gaping block volley | A close archer is bitten on reflex. Spat code blocks fall, stay as obstacles for the archer, and are crushed by landings. The open mouth accepts a hit from the front during the 1.6-second gape. |
+| DeepSeek | Blue whale after the logo: round head, white eyes, pale smile and a tail curled over its back; three breaches, then a dive and an electric discharge | Breaches dive onto the archer and shatter floes where they erupt and land. The raised tail opens as the whale falls and for 0.7 seconds after landing. Shooting needs a dry floe; the discharge kills anyone in the water and then restores every floe. |
+| Copilot | Teal helmet with goggles, a dark face plate with two slots, ear pods and a rear jet; energy orbs and one to three spin dashes | Orbs knock the archer back, fatally into a wall. A dash into the rim or a column stuns it facing the wall for 1.4 seconds with the rear jet bare, while a telegraphed row of ice falls across the archer's line. The jet accepts a hit only from behind. |
 
-- Keep identity readable in preview: upright forms sway within a frontal
-  three-quarter view; the whale turns along its swimming route. Preserve Pi's
-  glyph negative space and Copilot's goggle/face separation through articulation.
-- Claude's cut collar is the same 72%-along-the-limb point returned by
-  `tentacle_joint`; the sculpted curve must pass through it. Core-centered pitch
-  and bank preserve each model's exact projected weak point.
-- Terrain damage is combat state (`Map::broken`, `sunken`, and `scars`). Paint it
-  over the immutable floor cache; submerged islands must lose all walkable art
-  and ambient island rings until restored. Decorative debris never adds a
+- Keep identity readable: models follow the Agent logos — the spark's uneven
+  rays, the knot's six loops, Pi's aperture and separate stem, the chest's
+  frame and window, the whale's eye and curled tail, Copilot's goggles and face
+  slots. Every model carries a dark one-pixel silhouette.
+- Weak points use `Boss::articulated`, the same pivoted pitch and bank as the
+  sculpture, so the drawn and the collided point agree in every pose.
+- Terrain damage is combat state (`Map::broken`, `sunken`, `scars`, `blocks`).
+  Paint it over the immutable floor cache; sunken floes lose all walkable art
+  and ambient rings until restored. Spat blocks are the only prop that blocks
+  the archer, and they are drawn as actors. Decorative debris never adds a
   hidden collision obstacle.
 
 ### Raster and camera
@@ -182,10 +199,11 @@ rebirth, without a damage override.
   model, so interwoven surfaces occlude correctly even when whole-face sorting
   cannot order them. Larger depth is nearer; raster top offsets apply equally
   to the color and depth surfaces. Thin fins/plates render both sides.
-- Body, independent tentacles/fists, archer, and pillars sort by ground depth.
-  Preview and combat use the same ordering, including a limb behind the torso.
-  Opaque bodies draw directly into the actor raster; only submerged or departing
-  bodies need a temporary raster for their visibility mask.
+- Body, Pi's stems, split sparks, spat blocks, the brazier, archer and pillars
+  sort by ground depth. Preview and combat use the same ordering, including a
+  stem behind the glyph. Opaque bodies draw directly into the actor raster;
+  only submerged, vanishing, flashing or departing bodies need a temporary
+  raster for their mask.
 - The camera smoothly follows the archer with a small guardian/look-ahead bias,
   clamps near world edges, and leaves overhead room. It does not fit the whole
   map into a fixed box. Resolve scale from rem and viewport coverage; never add
@@ -212,23 +230,25 @@ rebirth, without a damage override.
 | Reduced motion | Static preview; no camera travel, shake, or decorative particles; essential tells remain |
 | Charge released early / arrow away | No arrow / no second arrow |
 | Closed armor or wrong weak-point direction | No victory; arrow remains retrievable |
-| All breakable pillars destroyed | Perimeter impacts still provide an opening |
-| One tendon cut / one seal latched | No core opening; the remaining puzzle action is required |
-| Inhale missed or recall released | No free opening; the arrow remains recoverable |
-| Ordinary energy orb intercepted | No shield overload; the bracketed orb is required |
-| Platform destroyed under a charging archer | Cancel drawing, show swimming, and preserve recall |
-| Water pulse after all platforms sink | Restore every platform and its visible dry surface |
-| Dash in flight / radial beam release | Keep the committed landing / preserve the warning's rays |
+| Spark hit before four splits / split spark hit | Split and recoil / shatter it; no victory |
+| Ordinary arrow on the knot / shielded cube | Glance off; only a burning arrow melts it, only a shield gap wins |
+| Waiting without play | No encounter opens its weak point by itself |
+| Guarding stem in front of Pi's eye | The arrow stops; the eye opens only on a switch |
+| Floe destroyed under a charging archer | Cancel drawing, show swimming, and preserve recall |
+| Discharge after all floes sink | Restore every floe and its visible dry surface |
+| Orb push into a wall / open ground | Death / displacement only |
+| Committed landing or dash | Keep the committed target and route after the lock |
 | Window or focus changes | Pause immediately and clear input |
 | Archer dies | Clear threats; random safe rebirth; no result card |
 | Guardian defeated | Finite departure, restored draft/focus, hidden preview until Agent changes |
 
 ## 5. Good / Base / Bad Cases
 
-- Good: lure a rush into a pillar, avoid its impact, and hit the revealed cube;
-  a later perimeter collision remains valid if that attempt misses.
-- Good: cut two exposed tendons, recover the single arrow, and strike the
-  underside; or pin both fists to ground seals before aiming through the glyph.
+- Good: bait the knot onto a forge plate, shoot through the flame, then time
+  the bare cube between shield pulses; a miss leaves the next plate landing.
+- Good: split the spark four times while dodging its hops and the split
+  sparks, then hit the bare heart; or cross Pi's midline and shoot the eye
+  during the switch.
 - Base: click a roaming model, play across a scrolling field, then Escape and
   type game-key letters into the unchanged draft.
 - Bad: shift the composer to reserve preview space, reset the entry pose,
@@ -237,21 +257,23 @@ rebirth, without a damage override.
 
 ## 6. Required Tests and Checks
 
-- Combat: entry/input exclusion, minimum draw, single arrow/retrieval, armor,
-  directional weak points, distinct tendon cuts, sustained tether pulls, charged
-  orb interception, latched fist seals, committed targets, swept collisions,
-  cover, terrain breakage/restoration, island protection, swimming, random rebirth,
-  threat cleanup, finite victory, continuous flight/turn transitions, bounded
-  long runs, input buffering/cancellation, and normal-input wins for all six
-  guardians across spawn seeds. Gameplay pilots must not override damage,
+- Combat: entry/input exclusion, minimum draw, sprint, single arrow/retrieval,
+  closed and directional weak points, spark splitting, brazier ignition and
+  shield gaps, stem switches and reach, block obstacles, ambush lock, breach
+  floe damage, discharge shelter, orb knockback and wall crush, wall stun,
+  committed targets, swept collisions, cover, random rebirth, threat cleanup,
+  finite victory, continuous transitions, bounded long runs, input
+  buffering/cancellation, and normal-input wins for all six guardians across
+  spawn seeds. Gameplay pilots must not override damage,
   position, puzzle state, or encounter timers.
 - Raster/camera: distinct maps, exact quad reconstruction and bounded count,
   preview without an archer, identical preview/first combat frame, joining idle
   loops, reduced motion, moving model bounds, two-sided fins, raised geometry,
   following camera, pointer mapping, and entry projection endpoints. Pin logo
-  negative space, goggles/face slots, tendon/core alignment, per-pixel occlusion
-  independent of face order, final landing tells, clipped radial warnings,
-  water-pulse origin, and the removal of submerged-platform art.
+  features (spark rays, Pi's aperture and stems, the chest frame, the whale's
+  eye and tail, goggles/face slots), drawn weak points at their collision
+  anchors, silhouettes, per-pixel occlusion independent of face order, landing
+  and route tells, floe shelter marks, and the removal of sunken-floe art.
 - GPUI integration: native pointer/keyboard entry, no dialogs/chrome, full-home
   bounds at narrow sizes and rem zoom, composer hit testing, retained draft/focus,
   navigation and pending-focus cancellation, Agent switching, victory hiding,
@@ -260,7 +282,9 @@ rebirth, without a damage override.
 - Run `cargo test -p vibex-desktop --lib arena:: --locked`,
   `cargo test -p vibex-desktop-model --locked`, formatting, and scoped Clippy.
   Measure dynamic rasterization and rectangle counts after artwork changes;
-  CPU raster timings alone do not establish end-to-end UI frame rate.
+  CPU raster timings alone do not establish end-to-end UI frame rate. Baseline:
+  release battle frames rasterize in under 1 ms with at most ~3.3k merged
+  rectangles per guardian.
 
 ## 7. Wrong vs Correct
 

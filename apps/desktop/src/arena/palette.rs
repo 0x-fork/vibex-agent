@@ -13,11 +13,11 @@ const MATERIALS: [u32; ink::COUNT] = [
 pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
     let mut colors = MATERIALS.map(|value| rgb(value).into());
     let body = match guardian {
-        Guardian::Claude => [0x582c3d, 0x993b38, 0xd55b39, 0xf7884d, 0xffbd76],
+        Guardian::Claude => [0x52262c, 0x9a4834, 0xd97757, 0xeea083, 0xffd0b5],
         Guardian::Codex => [0x2c2927, 0x564b3d, 0x8f7958, 0xc3aa79, 0xecdaa3],
         Guardian::Pi => [0x0c1119, 0x1a222a, 0x303a42, 0x4d5860, 0x747d80],
-        Guardian::OpenCode => [0x141420, 0x292938, 0x444555, 0x676a78, 0x94979f],
-        Guardian::DeepSeek => [0x142854, 0x253f8d, 0x385ac4, 0x5588e3, 0x89c6f4],
+        Guardian::OpenCode => [0x37474f, 0x607d8b, 0x90a4ae, 0xcfd8dc, 0xeef3f5],
+        Guardian::DeepSeek => [0x1b2370, 0x2f3fb8, 0x4d6bfe, 0x7d94ff, 0xb9c6ff],
         Guardian::Copilot => [0x11393e, 0x155958, 0x228e80, 0x5ac8a4, 0xa3e8bd],
     };
     for (ix, value) in body.into_iter().enumerate() {
@@ -37,7 +37,7 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
             0x202733, 0x3b4a58, 0x50606b, 0x607782, 0x293b46, 0x30444c, 0x8ba1a4,
         ],
         Guardian::DeepSeek => [
-            0x142f3d, 0x516c69, 0x7c9180, 0xa6b49a, 0x385c59, 0x335457, 0x9cad94,
+            0x0f2233, 0x9fbccb, 0xcfe3ea, 0xeef8fb, 0x87a9ba, 0x6f93a8, 0xb7d3df,
         ],
         Guardian::Copilot => [
             0x2d3a4f, 0x687b89, 0x8a9ba1, 0xb0bbb4, 0x4b606f, 0x425768, 0xb6c4bc,
@@ -58,12 +58,12 @@ pub(super) fn material_colors(guardian: Guardian) -> [Hsla; ink::COUNT] {
         colors[ix as usize] = rgb(color).into();
     }
     let core = match guardian {
-        Guardian::Claude => [0xa34837, 0xffb951, 0xffe7ac],
+        Guardian::Claude => [0x9e2b25, 0xff6b4a, 0xffd2b0],
         Guardian::Codex => [0x9c7944, 0xffd58a, 0xffefc5],
-        Guardian::Pi => [0x8c8a77, 0xeee5c7, 0xfffae8],
-        Guardian::OpenCode => [0x747384, 0xdcdbe9, 0xfffff4],
-        Guardian::DeepSeek => [0x275dc4, 0x59c7ff, 0xc5f8ff],
-        Guardian::Copilot => [0x1460a5, 0x42bbef, 0xc2f5ff],
+        Guardian::Pi => [0x9a7b3c, 0xffd36e, 0xfff6d8],
+        Guardian::OpenCode => [0xa0522d, 0xffb347, 0xfff1c9],
+        Guardian::DeepSeek => [0xb07a1a, 0xffd04a, 0xfff4c2],
+        Guardian::Copilot => [0x9b2c2c, 0xff7a45, 0xffe0b0],
     };
     for (ix, value) in core.into_iter().enumerate() {
         colors[ink::CORE_DARK as usize + ix] = rgb(value).into();

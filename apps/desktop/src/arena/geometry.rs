@@ -93,22 +93,3 @@ pub(super) fn circle_hit(point: Vec2, from: Vec2, to: Vec2, radius: f32) -> Opti
     let time = (-b - discriminant.sqrt()) / a;
     (0.0..=1.0).contains(&time).then_some(time)
 }
-
-pub(super) fn segments_distance(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> f32 {
-    let cross = |u: Vec2, v: Vec2| u.x * v.y - u.y * v.x;
-    let ab = b.minus(a);
-    let cd = d.minus(c);
-    let determinant = cross(ab, cd);
-    if determinant.abs() > f32::EPSILON {
-        let offset = c.minus(a);
-        let t = cross(offset, cd) / determinant;
-        let u = cross(offset, ab) / determinant;
-        if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
-            return 0.0;
-        }
-    }
-    segment_distance(a, c, d)
-        .min(segment_distance(b, c, d))
-        .min(segment_distance(c, a, b))
-        .min(segment_distance(d, a, b))
-}

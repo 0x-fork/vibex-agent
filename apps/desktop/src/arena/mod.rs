@@ -238,7 +238,7 @@ fn banner(state: &Entity<HomeArena>, window: &mut Window, cx: &mut App) -> AnyEl
             "unbound-vignette",
             Animation::new(Duration::from_secs_f32(art::IDLE_PERIOD))
                 .repeat()
-                .with_max_fps(24.0),
+                .with_max_fps(30.0),
             move |this, phase| {
                 this.child(scene::Entry::new(
                     scene::PreviewSample::at(guardian, seed + phase * art::IDLE_PERIOD, false),
@@ -317,6 +317,7 @@ impl ArenaView {
                 .pointer
                 .and_then(|p| self.world_position(p))
                 .or(self.aim),
+            sprint: self.keys.contains("space"),
         }
     }
     fn clear_input(&mut self) {
@@ -377,7 +378,7 @@ impl ArenaView {
             let mut last = Instant::now();
             let mut accumulated = 0.0;
             loop {
-                executor.timer(Duration::from_millis(16)).await;
+                executor.timer(Duration::from_millis(8)).await;
                 let now = Instant::now();
                 accumulated += now.duration_since(last).as_secs_f32().min(0.1);
                 last = now;
@@ -427,8 +428,10 @@ impl ArenaView {
         }
         cx.stop_propagation();
     }
+    /// A press rolls; holding Space afterwards sprints. Key repeats of the
+    /// held key never queue further rolls.
     fn roll(&mut self, _: &Roll, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.paused {
+        if !self.paused && self.keys.insert("space".to_owned()) {
             self.arena.roll(self.controls().movement);
             cx.notify();
         }
