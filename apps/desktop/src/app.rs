@@ -69630,18 +69630,45 @@ impl FoundationSettings {
             .borrow_mut()
             .take();
         if section == SettingsSection::Data {
-            self.start_storage_usage_probe(cx);
+            self.request_storage_usage_probe(cx);
         }
         if section == SettingsSection::About {
             self.request_about_update_check(cx);
         }
         if section == SettingsSection::Archived {
-            // The archived list is loaded on demand: it is the one session list
-            // that only grows, so the sidebar's own overview never carries it.
-            let _ = self
-                .workbench
-                .update(cx, |this, cx| this.load_archived_sessions(cx));
+            self.request_archived_sessions_load(cx);
         }
+    }
+
+    /// Starts the storage-usage probe once the workbench is off the stack.
+    ///
+    /// The probe reads the workbench for the home directory it measures, and a
+    /// section can be activated while that entity is already being updated: the
+    /// command palette switches sections from inside
+    /// `VibexWorkbench::update`. Reading or updating an entity from its own
+    /// update panics, so the hand-off waits for the next effect cycle instead;
+    /// the page still renders its loading state, one tick later.
+    fn request_storage_usage_probe(&mut self, cx: &mut Context<Self>) {
+        let settings = cx.entity();
+        cx.defer(move |cx| {
+            let _ = settings.update(cx, |settings, cx| settings.start_storage_usage_probe(cx));
+        });
+    }
+
+    /// Reloads the archived page once the workbench is off the stack.
+    ///
+    /// The archived list is loaded on demand: it is the one session list that
+    /// only grows, so the sidebar's own overview never carries it. The load is
+    /// deferred for the same reason as [`Self::request_storage_usage_probe`]:
+    /// the sidebar's More menu and the General page's own Manage button both
+    /// open the page from inside `VibexWorkbench::update`, and updating that
+    /// entity from its own update panics with "cannot update
+    /// `vibex_desktop::app::VibexWorkbench` while it is already being updated".
+    fn request_archived_sessions_load(&mut self, cx: &mut Context<Self>) {
+        let workbench = self.workbench.clone();
+        cx.defer(move |cx| {
+            let _ = workbench.update(cx, |workbench, cx| workbench.load_archived_sessions(cx));
+        });
     }
 
     /// About checks for a newer release as soon as it is opened.
@@ -93393,6 +93420,52 @@ mod tests {
             .expect("update settings entry should remain inspectable");
         assert!(open_update_settings.contains("activate_settings_section(SettingsSection::About"));
         assert!(open_update_settings.contains("highlighted_title"));
+    }
+
+    /// Activating a section must not reach back into the workbench from inside
+    /// its own update.
+    ///
+    /// The sidebar's More menu, the General page's own Manage button and the
+    /// command palette all activate a section while the workbench entity is
+    /// leased. The archived page loads its list through that entity and the
+    /// Data page reads it for the home directory it measures, so both hand the
+    /// work off to the next effect cycle; reaching back synchronously panics
+    /// with "cannot update `vibex_desktop::app::VibexWorkbench` while it is
+    /// already being updated".
+    #[gpui::test]
+    fn settings_sections_activate_while_the_workbench_is_leased(cx: &mut TestAppContext) {
+        struct LeasedWorkbenchProbe {
+            workbench: Entity<VibexWorkbench>,
+        }
+
+        impl Render for LeasedWorkbenchProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let (probe, cx) = cx.add_window_view(|window, cx| {
+            let workbench = cx.new(|cx| {
+                let mut ui_state = DesktopUiStateV1::default();
+                ui_state.appearance.locale = LocaleMode::En;
+                VibexWorkbench::with_initial_state(None, ui_state, None, window, cx)
+            });
+            LeasedWorkbenchProbe { workbench }
+        });
+        let workbench = probe.read_with(cx, |probe, _| probe.workbench.clone());
+
+        for section in [SettingsSection::Archived, SettingsSection::Data] {
+            workbench.update(cx, |workbench, cx| {
+                workbench.settings_view.update(cx, |settings, cx| {
+                    settings.activate_settings_section(section, cx);
+                });
+            });
+            let active = workbench.read_with(cx, |workbench, cx| {
+                workbench.settings_view.read(cx).active_section
+            });
+            assert_eq!(active, section, "the section still has to become active");
+        }
     }
 
     #[test]

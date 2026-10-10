@@ -183,6 +183,19 @@ cx.defer(move |cx| {
 Keep local state mutations inside the active callback; only the hand-off to a
 currently-updating entity needs to be deferred.
 
+The direction matters less than the lease: a view handing work back to the
+workbench hits the same panic when the workbench is the entity already on the
+stack. `FoundationSettings::activate_settings_section` is reached from callbacks
+that run inside `VibexWorkbench::update` (the sidebar's More menu opens the
+archived page, the General page's Manage button does the same, and the command
+palette switches sections), so every section that touches the workbench defers
+that touch instead of performing it inline: the archived list loads through
+`request_archived_sessions_load`, the storage probe through
+`request_storage_usage_probe`, and the About update check through
+`request_about_update_check`. A reading call is not exempt — a leased entity
+panics on `read_with` too, and `WeakEntity::read_with(..).ok()` does not turn
+that panic into an `Err`.
+
 ### GPUI Dialog Input Lifetime
 
 A `window.open_dialog` builder is evaluated again on every repaint of the view
