@@ -990,6 +990,76 @@ async fn team_root_listing_and_worker_updates_keep_automatic_archive_off_unloade
 }
 
 #[gpui::test]
+fn team_background_page_refresh_never_borrows_the_loading_row(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 4);
+    cx.update(|_, cx| {
+        workbench.update(cx, |workbench, cx| {
+            // Ownership pages only load on an authority that can read the tree.
+            workbench
+                .backend
+                .as_ref()
+                .expect("fixture backend")
+                .replace_capabilities(BackendCapabilitySnapshot::desktop_native_v1());
+            workbench.delegated_pages.insert(
+                None,
+                DelegatedBranchPage {
+                    session_ids: vec![session(1).id.to_string()],
+                    next_cursor: Some("cursor_1".into()),
+                    ..Default::default()
+                },
+            );
+
+            // The periodic pass fetches silently: the sidebar's "Loading
+            // sessions" row belongs to a reader who asked for the page, not to
+            // a poll that runs every few seconds.
+            workbench.load_delegated_page(None, false, DelegatedPageLoad::Background, cx);
+            let page = &workbench.delegated_pages[&None];
+            assert!(!page.loading, "a background pass must not claim the row");
+            assert!(page.in_flight, "the pass still dedupes against itself");
+
+            // An explicit load keeps the row it always had.
+            workbench.delegated_pages.get_mut(&None).unwrap().in_flight = false;
+            workbench.load_delegated_page(None, false, DelegatedPageLoad::Interactive, cx);
+            assert!(workbench.delegated_pages[&None].loading);
+
+            // A failed background pass over rows that are already on screen
+            // stays quiet: alternating retry and data every few seconds is the
+            // flicker this split exists to remove. An empty page and an
+            // explicit load may still claim the retry row.
+            workbench.delegated_pages.get_mut(&None).unwrap().in_flight = false;
+            workbench.record_delegated_page_failure(
+                &None,
+                DelegatedPageLoad::Background,
+                "offline".into(),
+            );
+            assert!(workbench.delegated_pages[&None].error.is_none());
+            workbench.record_delegated_page_failure(
+                &None,
+                DelegatedPageLoad::Interactive,
+                "offline".into(),
+            );
+            assert_eq!(
+                workbench.delegated_pages[&None].error.as_deref(),
+                Some("offline")
+            );
+            let empty = workbench.delegated_pages.get_mut(&None).unwrap();
+            empty.error = None;
+            empty.session_ids.clear();
+            workbench.record_delegated_page_failure(
+                &None,
+                DelegatedPageLoad::Background,
+                "offline".into(),
+            );
+            assert_eq!(
+                workbench.delegated_pages[&None].error.as_deref(),
+                Some("offline"),
+                "a branch with nothing to show still reports its failure"
+            );
+        });
+    });
+}
+
+#[gpui::test]
 fn team_hidden_tabs_materialize_only_the_four_live_conversations(cx: &mut TestAppContext) {
     let (workbench, cx, receiver) = fixture(cx, 64);
     workbench.update(cx, |workbench, cx| {

@@ -7372,8 +7372,26 @@ struct ComposerDelegationSubmission {
 struct DelegatedBranchPage {
     session_ids: Vec<String>,
     next_cursor: Option<String>,
+    /// A fetch of this page is on the wire. It dedupes requests and is never
+    /// rendered on its own; `loading` is the state the reader can see.
+    in_flight: bool,
     loading: bool,
     error: Option<String>,
+}
+
+/// Why a delegated page is being fetched.
+///
+/// The periodic metadata refresh runs every few seconds. It used to share the
+/// interactive path, so every pass flipped the visible loading flag and the
+/// sidebar's session list grew and dropped a "loading" row on each tick. A
+/// background pass now stays invisible: it uploads data, not state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DelegatedPageLoad {
+    /// The reader asked for this page: expanding a branch, locating a session
+    /// or pressing the page action.
+    Interactive,
+    /// The periodic refresh, or a refresh triggered by an arriving event.
+    Background,
 }
 
 pub struct VibexWorkbench {
@@ -14662,7 +14680,7 @@ impl VibexWorkbench {
                 },
             ));
         }
-        self.load_delegated_page(None, false, cx);
+        self.load_delegated_page(None, false, DelegatedPageLoad::Background, cx);
         let parents: Vec<String> = self
             .delegated_pages
             .keys()
@@ -14698,7 +14716,7 @@ impl VibexWorkbench {
             );
         }
         for parent in refresh {
-            self.load_delegated_page(Some(parent), false, cx);
+            self.load_delegated_page(Some(parent), false, DelegatedPageLoad::Background, cx);
         }
     }
 
@@ -14773,7 +14791,18 @@ impl VibexWorkbench {
         });
     }
 
-    fn load_delegated_page(&mut self, parent: Option<String>, more: bool, cx: &mut Context<Self>) {
+    /// Fetches one page of a branch, deduped by the branch itself.
+    ///
+    /// `trigger` decides only what the reader sees. A background pass never
+    /// claims the loading row or rewrites a visible error, because it runs on a
+    /// timer rather than because somebody asked.
+    fn load_delegated_page(
+        &mut self,
+        parent: Option<String>,
+        more: bool,
+        trigger: DelegatedPageLoad,
+        cx: &mut Context<Self>,
+    ) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
@@ -14784,7 +14813,7 @@ impl VibexWorkbench {
             || self
                 .delegated_pages
                 .get(&parent)
-                .is_some_and(|page| page.loading)
+                .is_some_and(|page| page.in_flight)
         {
             return;
         }
@@ -14821,8 +14850,11 @@ impl VibexWorkbench {
                 .max(DELEGATED_TREE_PAGE_SIZE)
         };
         let page = self.delegated_pages.entry(parent.clone()).or_default();
-        page.loading = true;
-        page.error = None;
+        page.in_flight = true;
+        if trigger == DelegatedPageLoad::Interactive {
+            page.loading = true;
+            page.error = None;
+        }
         let mut request = vibex_core::SessionTreeRequest {
             parent_session_id: parent
                 .as_ref()
@@ -14866,17 +14898,44 @@ impl VibexWorkbench {
                     let Some(page) = this.delegated_pages.get_mut(&parent) else {
                         return;
                     };
+                    page.in_flight = false;
                     page.loading = false;
                     match outcome {
                         Ok(Ok(result)) => this.apply_delegated_page(parent, more, result, cx),
-                        Ok(Err(error)) => page.error = Some(error.message),
-                        Err(error) => page.error = Some(error.to_string()),
+                        Ok(Err(error)) => {
+                            this.record_delegated_page_failure(&parent, trigger, error.message)
+                        }
+                        Err(error) => this.record_delegated_page_failure(
+                            &parent,
+                            trigger,
+                            error.to_string(),
+                        ),
                     }
                     cx.notify();
                 });
             },
         )
         .detach();
+    }
+
+    /// Keeps a failed fetch from rewriting what the reader is looking at.
+    ///
+    /// An explicit load owns the retry row, and so does a branch that has never
+    /// produced a row — that is the only case where "nothing here" would
+    /// otherwise be a lie. A background pass over rows that are already on
+    /// screen drops the failure instead of alternating between a retry row and
+    /// the data every few seconds.
+    fn record_delegated_page_failure(
+        &mut self,
+        parent: &Option<String>,
+        trigger: DelegatedPageLoad,
+        message: String,
+    ) {
+        if let Some(page) = self.delegated_pages.get_mut(parent)
+            && (trigger == DelegatedPageLoad::Interactive || page.session_ids.is_empty())
+        {
+            page.error = Some(message);
+        }
     }
 
     fn apply_delegated_page(
@@ -15020,7 +15079,12 @@ impl VibexWorkbench {
     fn reveal_delegated_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
         if !self.delegated_tree.contains_key(session_id) {
             self.delegated_reveal_target = Some(session_id.to_string());
-            self.load_delegated_page(Some(session_id.to_string()), false, cx);
+            self.load_delegated_page(
+                Some(session_id.to_string()),
+                false,
+                DelegatedPageLoad::Interactive,
+                cx,
+            );
             return;
         }
         let mut current = self
@@ -15040,7 +15104,12 @@ impl VibexWorkbench {
                 self.queue_ui_state();
             }
             if !self.delegated_pages.contains_key(&Some(id.clone())) {
-                self.load_delegated_page(Some(id.clone()), false, cx);
+                self.load_delegated_page(
+                    Some(id.clone()),
+                    false,
+                    DelegatedPageLoad::Interactive,
+                    cx,
+                );
             }
             current = self
                 .delegated_tree
@@ -15058,7 +15127,12 @@ impl VibexWorkbench {
                 .delegated_pages
                 .contains_key(&Some(session_id.to_string()))
             {
-                self.load_delegated_page(Some(session_id.to_string()), false, cx);
+                self.load_delegated_page(
+                    Some(session_id.to_string()),
+                    false,
+                    DelegatedPageLoad::Interactive,
+                    cx,
+                );
             }
         } else {
             self.delegated_collapsed_ids.insert(session_id.to_string());
@@ -15179,7 +15253,12 @@ impl VibexWorkbench {
                     .label(label)
                     .disabled(loading)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.load_delegated_page(parent.clone(), more, cx)
+                        this.load_delegated_page(
+                            parent.clone(),
+                            more,
+                            DelegatedPageLoad::Interactive,
+                            cx,
+                        )
                     })),
                 )
                 .into_any_element(),
