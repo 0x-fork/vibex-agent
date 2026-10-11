@@ -228,3 +228,32 @@ fn the_companion_window_holds_every_idle_pose_without_touching_its_edge() {
         }
     }
 }
+
+/// A companion sizes its model by the ordinary standing pose, so the recorded
+/// height has to stay the median of the loop the companion actually draws.
+#[test]
+fn the_companion_height_is_the_median_idle_pose() {
+    for guardian in Guardian::ALL {
+        let mut heights = Vec::new();
+        let mut time = 0.0;
+        while time < crate::arena::guardian::IDLE_LOOP {
+            let boss = Boss::idle(guardian, time, false);
+            let frame = companion(&boss, time, false);
+            let rows = (0..frame.height)
+                .filter(|row| {
+                    frame.pixels[row * frame.width..(row + 1) * frame.width]
+                        .iter()
+                        .any(|ink| *ink != CLEAR)
+                })
+                .collect::<Vec<_>>();
+            heights.push((rows.last().unwrap() - rows.first().unwrap() + 1) as i32);
+            time += 0.5;
+        }
+        heights.sort_unstable();
+        let median = heights[heights.len() / 2];
+        assert!(
+            (median - companion_height(guardian)).abs() <= 3,
+            "{guardian:?} stands {median} raster pixels tall"
+        );
+    }
+}

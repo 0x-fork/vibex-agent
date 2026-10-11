@@ -224,6 +224,14 @@ pub(super) const COMPANION_BOXES: [(i32, i32, i32, i32); 6] = [
 pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
     COMPANION_BOXES[guardian as usize]
 }
+/// The height, in raster pixels, of each guardian's ordinary idle pose: the
+/// median over its loop. The window above also has to hold the loop's
+/// extremes, so it is a poor measure of how large the model reads; a companion
+/// sizes the model by this instead.
+pub(super) const COMPANION_HEIGHTS: [i32; 6] = [65, 96, 110, 85, 106, 82];
+pub(super) fn companion_height(guardian: Guardian) -> i32 {
+    COMPANION_HEIGHTS[guardian as usize]
+}
 
 /// One idle frame, cropped to [`companion_box`] around the anchor the model
 /// currently stands on.

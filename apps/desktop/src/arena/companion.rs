@@ -1,12 +1,14 @@
 //! The reward a won encounter unlocks: that Agent's guardian rides the strip
-//! above its session composer while the turn runs, and dives into the input box
-//! when the session stops. Double-clicking it opens the same duel the home page
+//! on top of its session composer while the turn runs, and dives into the
+//! composer when the session stops. Double-clicking it opens the same duel the home page
 //! offers, over the session page instead of the new-session page.
 
 use super::{
     ArenaView, Awakened, art,
     combat::{Boss, Guardian, Phase, smoothstep},
-    copy, motion, palette,
+    copy,
+    map::CENTER,
+    motion, palette,
     raster::{PixelRect, ink},
     scene::{Geometry, PreviewSample, PreviewViewport},
 };
@@ -23,23 +25,25 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The strip a companion travels in, in screen pixels.
+/// The height a guardian's ordinary standing pose is drawn at, in screen
+/// pixels. Every guardian reads at about this size, whatever its proportions.
 ///
-/// This is a lane above the input box, not a stage: the model is small enough
-/// to read as a passenger of the composer rather than as the home page's
-/// guardian, and the lane clips it so a dive vanishes at the input box's edge.
-const LANE_HEIGHT: f32 = 42.0;
-/// One full left-right pass.
-const ROAM_PERIOD: f32 = 8.4;
+/// This is a lane on top of the composer, not a stage: the model is small
+/// enough to read as a passenger of the composer rather than as the home page's
+/// guardian, yet large enough that its pixels still resolve into a figure.
+const MODEL_HEIGHT: f32 = 40.0;
+/// The tallest lane a companion may reserve. A guardian whose loop reaches far
+/// above its standing pose — the whale's breach — is drawn smaller instead.
+const MAX_LANE: f32 = 72.0;
+/// How far the home page's route reaches either side of the arena's centre, in
+/// world units. The lane maps that reach onto its own width, so the companion
+/// keeps each guardian's own gait — hops, rolls, strides — at its own pace.
+const ROUTE_REACH: f32 = 72.0;
 /// The dive into the composer.
 const LEAP_DURATION: f32 = 0.62;
 /// Idle poses are rebuilt at this rate. The pixel art does not read faster, and
 /// every rebuild rasterizes the whole sculpture.
 const FRAME_RATE: f32 = 12.0;
-/// The tallest screen pixels per world unit a companion may be drawn at.
-const MAX_UNIT: f32 = 1.35;
-/// The fraction of the lane's height a model may occupy.
-const FILL: f32 = 0.86;
 /// The clear margin kept at both ends of the travel.
 const INSET: f32 = 12.0;
 
@@ -48,11 +52,13 @@ const INSET: f32 = 12.0;
 enum Stage {
     /// No companion is mounted: no reward, no running turn, or a duel is up.
     Idle,
-    /// The session is running; the companion travels its lane.
-    Roaming { started: Instant },
-    /// The turn ended; the companion is diving into the input box from where
-    /// it stood, so the dive continues the pass instead of restarting it.
-    Leaping { started: Instant, from: f32 },
+    /// The session is running; the companion travels its lane. `clock` is the
+    /// pose's own monotonic clock.
+    Roaming { clock: Instant },
+    /// The turn ended; the companion is diving into the composer from where it
+    /// stood, on the same pose clock, so the dive continues the pass instead
+    /// of restarting it.
+    Leaping { clock: Instant, from: f32 },
 }
 
 /// The unlocked guardian that rides above one Agent session's composer.
@@ -66,8 +72,8 @@ pub(crate) struct Companion {
     /// The lane's width, measured by its last prepaint. The travel is resolved
     /// while the tree is laid out, before this frame's bounds exist.
     lane_width: Rc<Cell<Pixels>>,
-    /// How far into the current pass the companion stands, so a dive can start
-    /// from the place the reader last saw it.
+    /// How far across the lane the companion stands, from 0 to 1, so a dive can
+    /// start from the place the reader last saw it.
     roam: Rc<Cell<f32>>,
     /// The pose the companion last painted, handed to the duel it opens as the
     /// entry camera, so the model grows out of the lane it came from.
@@ -121,7 +127,7 @@ impl Companion {
             self.dismiss(cx);
             self.stage = match guardian {
                 Some(_) if running => Stage::Roaming {
-                    started: Instant::now(),
+                    clock: Instant::now(),
                 },
                 _ => Stage::Idle,
             };
@@ -132,7 +138,7 @@ impl Companion {
             (false, Stage::Leaping { .. }) => {}
             (true, _) => {
                 self.stage = Stage::Roaming {
-                    started: Instant::now(),
+                    clock: Instant::now(),
                 };
             }
             (false, Stage::Roaming { .. }) => self.leap(cx),
@@ -147,11 +153,14 @@ impl Companion {
         battle.update(cx, |view, cx| view.close(cx));
         cx.notify();
     }
-    /// The session stopped: the companion dives into the input box and is gone
+    /// The session stopped: the companion dives into the composer and is gone
     /// by the time the dive lands.
     fn leap(&mut self, cx: &mut Context<Self>) {
+        let Stage::Roaming { clock } = self.stage else {
+            return;
+        };
         self.stage = Stage::Leaping {
-            started: Instant::now(),
+            clock,
             from: self.roam.get(),
         };
         self.generation += 1;
@@ -219,40 +228,50 @@ impl Companion {
 /// Where a guardian's crop is drawn in the lane.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Fit {
+    /// The crop resampled to whole screen pixels, one ink each.
+    columns: usize,
+    rows: usize,
     /// Screen pixels per raster pixel.
     pixel: f32,
-    width: f32,
-    height: f32,
-    /// The distance from the lane's top to the crop's top.
-    top: f32,
+}
+impl Fit {
+    fn width(self) -> f32 {
+        self.columns as f32
+    }
+    /// The lane is exactly as tall as the crop: the crop already holds every
+    /// pose of the loop, so nothing is sliced and nothing is wasted.
+    fn lane(self) -> f32 {
+        self.rows as f32
+    }
 }
 fn fit(guardian: Guardian) -> Fit {
     let (left, top, right, bottom) = art::companion_box(guardian);
     let (box_width, box_height) = ((right - left) as f32, (bottom - top) as f32);
-    // The model is fitted to the lane by height, so every guardian reads at
-    // about the same size whatever its own proportions are.
-    let unit = (LANE_HEIGHT * FILL * art::SCALE / box_height).min(MAX_UNIT);
-    let pixel = unit / art::SCALE;
-    let height = pixel * box_height;
+    let standing = art::companion_height(guardian) as f32;
+    let scale = (MODEL_HEIGHT / standing).min(MAX_LANE / box_height);
+    let rows = (box_height * scale).round().max(1.0);
     Fit {
-        pixel,
-        width: pixel * box_width,
-        height,
-        top: (LANE_HEIGHT - height) / 2.0,
+        columns: (box_width * scale).round().max(1.0) as usize,
+        rows: rows as usize,
+        pixel: rows / box_height,
     }
 }
-/// How far into a left-right pass the companion stands at `phase`, in screen
-/// pixels from the lane's left edge.
-fn roam_at(lane_width: f32, badge_width: f32, phase: f32) -> f32 {
+/// How far across the lane a guardian stands at `time`, from 0 to 1.
+///
+/// This is the home page's own route seen side-on: the guardian walks, hops,
+/// rolls, or swims exactly as it does there, and turns where its route turns.
+fn across(boss: &Boss) -> f32 {
+    ((boss.position.x - CENTER.x) / ROUTE_REACH * 0.5 + 0.5).clamp(0.0, 1.0)
+}
+/// The model's left edge for a place `across` the lane, in whole screen pixels
+/// from the lane's left edge, so every cell lands on a pixel of its own.
+fn lane_x(lane_width: f32, badge_width: f32, across: f32) -> f32 {
     let span = (lane_width - badge_width - INSET * 2.0).max(0.0);
-    // A triangle wave, eased at both ends: the companion walks out to one side,
-    // turns around, and walks back.
-    let wave = 1.0 - (phase.clamp(0.0, 1.0) * 2.0 - 1.0).abs();
-    INSET + smoothstep(wave) * span
+    (INSET + across.clamp(0.0, 1.0) * span).round()
 }
 
-/// The lane above the composer, or nothing when this session has no reward to
-/// show, when its turn is not running, or when motion is reduced.
+/// The lane on top of the composer, or nothing when this session has no reward
+/// to show, when its turn is not running, or when motion is reduced.
 pub(crate) fn lane(
     state: &Entity<Companion>,
     reward: Option<&str>,
@@ -287,8 +306,8 @@ pub(crate) fn lane(
     let measured = lane_width.clone();
     let state = state.clone();
     let geometry = fit(guardian);
-    let badge_width = geometry.width;
-    let badge = move |time: f32, flipped: bool, opacity: f32, x: f32, y: f32| {
+    let badge_width = geometry.width();
+    let badge = move |time: f32, opacity: f32, x: f32, y: f32| {
         div()
             .id("composer-companion")
             .debug_selector(|| "composer-companion".into())
@@ -306,9 +325,8 @@ pub(crate) fn lane(
             .child(Badge {
                 guardian,
                 time,
-                flipped,
                 opacity,
-                pixel: px(geometry.pixel),
+                fit: geometry,
                 window_box: art::companion_box(guardian),
                 frames: frames.clone(),
                 sample: sample.clone(),
@@ -320,56 +338,52 @@ pub(crate) fn lane(
         .relative()
         .w_full()
         .min_w_0()
-        .h(px(LANE_HEIGHT))
+        .h(px(geometry.lane()))
         .flex_none()
         .overflow_hidden()
         .on_prepaint(move |bounds, _, _| measured.set(bounds.size.width));
     match stage {
-        Stage::Roaming { started } => {
-            // The pose's own clock is monotonic: the idle loop is authored to
-            // close on itself, so a pose never cuts back to its first frame in
-            // the middle of the lane the way a per-pass clock would.
-            let travelled = started.elapsed().as_secs_f32();
-            let top = geometry.top;
-            Some(
-                lane.with_animation(
-                    "composer-companion-roam",
-                    Animation::new(Duration::from_secs_f32(ROAM_PERIOD))
-                        .repeat()
-                        .with_max_fps(20.0),
-                    move |this, phase| {
-                        roam.set(phase);
-                        this.child(badge(
-                            travelled,
-                            phase >= 0.5,
-                            1.0,
-                            roam_at(f32::from(lane_width.get()), badge_width, phase),
-                            top,
-                        ))
-                    },
-                )
-                .into_any_element(),
+        Stage::Roaming { clock } => Some(
+            lane.with_animation(
+                "composer-companion-roam",
+                // The animation is only the frame ticker: the pose and the
+                // place both come from the pose's own monotonic clock, so the
+                // authored loop closes on itself and never cuts back to its
+                // first frame in the middle of the lane.
+                Animation::new(Duration::from_secs(60))
+                    .repeat()
+                    .with_max_fps(30.0),
+                move |this, _| {
+                    let time = clock.elapsed().as_secs_f32();
+                    let place = across(&Boss::idle(guardian, time, false));
+                    roam.set(place);
+                    this.child(badge(
+                        time,
+                        1.0,
+                        lane_x(f32::from(lane_width.get()), badge_width, place),
+                        0.0,
+                    ))
+                },
             )
-        }
-        Stage::Leaping { started, from } => {
-            let top = geometry.top;
+            .into_any_element(),
+        ),
+        Stage::Leaping { clock, from } => {
+            let depth = geometry.lane();
             Some(
                 lane.with_animation(
                     "composer-companion-leap",
                     Animation::new(Duration::from_secs_f32(LEAP_DURATION)).with_max_fps(30.0),
                     move |this, delta| {
                         // Up a little, then down past the lane's own edge, where
-                        // the input box's near side swallows it.
+                        // the composer below swallows it.
                         let hop = -(delta * std::f32::consts::PI).sin() * 9.0;
-                        let dive = delta * delta * (LANE_HEIGHT + 18.0);
+                        let dive = delta * delta * (depth + 18.0);
                         let opacity = 1.0 - smoothstep((delta - 0.55) / 0.45);
-                        let x = roam_at(f32::from(lane_width.get()), badge_width, from);
                         this.child(badge(
-                            started.elapsed().as_secs_f32(),
-                            false,
+                            clock.elapsed().as_secs_f32(),
                             opacity,
-                            x,
-                            top + hop + dive,
+                            lane_x(f32::from(lane_width.get()), badge_width, from),
+                            (hop + dive).round(),
                         ))
                     },
                 )
@@ -435,7 +449,7 @@ pub(crate) fn session_surface(
 /// same pose costs nothing beyond the quads it paints.
 #[derive(Default)]
 struct FrameCache {
-    key: Option<(Guardian, u64)>,
+    key: Option<(Guardian, u64, usize, usize)>,
     rectangles: Vec<PixelRect>,
 }
 impl FrameCache {
@@ -443,29 +457,32 @@ impl FrameCache {
         self.key = None;
         self.rectangles.clear();
     }
-    fn rectangles(&mut self, guardian: Guardian, time: f32) -> Vec<PixelRect> {
+    fn rectangles(&mut self, guardian: Guardian, time: f32, fit: Fit) -> Vec<PixelRect> {
         let tick = (time * FRAME_RATE) as u64;
-        if self.key != Some((guardian, tick)) {
-            self.key = Some((guardian, tick));
+        let key = (guardian, tick, fit.columns, fit.rows);
+        if self.key != Some(key) {
+            self.key = Some(key);
             let time = tick as f32 / FRAME_RATE;
             let boss = Boss::idle(guardian, time, false);
-            self.rectangles = art::companion(&boss, time, false).rectangles();
+            self.rectangles = art::companion(&boss, time, false)
+                .resample(fit.columns, fit.rows)
+                .rectangles();
         }
         self.rectangles.clone()
     }
 }
 
-/// One cropped idle frame, painted as merged quads.
+/// One cropped idle frame, resampled to whole screen pixels and painted as
+/// merged quads.
 ///
 /// The element only carries the model's own rectangles; the box it was cropped
-/// from is fixed for the whole loop, so the model never shifts inside it.
+/// from is fixed for the whole loop, so the model never shifts inside it. The
+/// model faces where its route heads, exactly as it does on the home page.
 struct Badge {
     guardian: Guardian,
     time: f32,
-    flipped: bool,
     opacity: f32,
-    /// Screen pixels per raster pixel.
-    pixel: Pixels,
+    fit: Fit,
     /// The crop window in raster pixels: `(left, top, right, bottom)`.
     window_box: (i32, i32, i32, i32),
     frames: Rc<RefCell<FrameCache>>,
@@ -493,10 +510,9 @@ impl Element for Badge {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, ()) {
-        let (left, top, right, bottom) = self.window_box;
         let mut style = Style::default();
-        style.size.width = (self.pixel * (right - left) as f32).into();
-        style.size.height = (self.pixel * (bottom - top) as f32).into();
+        style.size.width = px(self.fit.columns as f32).into();
+        style.size.height = px(self.fit.rows as f32).into();
         (window.request_layout(style, [], cx), ())
     }
     fn prepaint(
@@ -511,8 +527,9 @@ impl Element for Badge {
         let rectangles = self
             .frames
             .borrow_mut()
-            .rectangles(self.guardian, self.time);
+            .rectangles(self.guardian, self.time, self.fit);
         let (left, top, _, _) = self.window_box;
+        let pixel = px(self.fit.pixel);
         let boss = Boss::idle(self.guardian, self.time, false);
         let (x, y) = art::pixel(boss.position);
         // The duel starts from this frame: the same model, in the same pose, at
@@ -525,11 +542,8 @@ impl Element for Badge {
                 bounds,
                 geometry: Geometry {
                     origin: bounds.origin
-                        - point(
-                            self.pixel * (x + left) as f32,
-                            self.pixel * (y + top) as f32,
-                        ),
-                    unit: self.pixel * art::SCALE,
+                        - point(pixel * (x + left) as f32, pixel * (y + top) as f32),
+                    unit: pixel * art::SCALE,
                 },
             }),
         }));
@@ -545,21 +559,16 @@ impl Element for Badge {
         window: &mut Window,
         _: &mut App,
     ) {
-        let pixel = self.pixel;
+        // One cell is one screen pixel; snapping keeps every cell on the device
+        // grid, so the model stays crisp at fractional scale factors too.
         let scale = window.scale_factor();
         let snap = |value: Pixels| px((f32::from(value) * scale).round() / scale);
-        let box_width = (self.window_box.2 - self.window_box.0) as f32;
         let clip = window.content_mask().bounds;
         for rect in rectangles.iter() {
-            let x = if self.flipped {
-                box_width - f32::from(rect.x + rect.width)
-            } else {
-                f32::from(rect.x)
-            };
-            let left = bounds.origin.x + pixel * x;
-            let top = bounds.origin.y + pixel * f32::from(rect.y);
-            let right = left + pixel * f32::from(rect.width);
-            let bottom = top + pixel * f32::from(rect.height);
+            let left = bounds.origin.x + px(f32::from(rect.x));
+            let top = bounds.origin.y + px(f32::from(rect.y));
+            let right = left + px(f32::from(rect.width));
+            let bottom = top + px(f32::from(rect.height));
             let (left, top, right, bottom) = (snap(left), snap(top), snap(right), snap(bottom));
             if right > left
                 && bottom > top

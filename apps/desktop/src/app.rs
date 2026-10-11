@@ -58223,9 +58223,11 @@ impl VibexWorkbench {
             self.render_composer_goal(cx)
         };
         // The reward of a won encounter rides this composer for as long as its
-        // turn runs, on the strip directly above the input box. Only the
-        // composer that owns the keyboard carries it: a pane that merely mirrors
-        // another session's timeline owns no turn for it to ride.
+        // turn runs, on a strip on top of everything the composer stacks above
+        // its input box — status line, queue, goal — so those rows never trap it
+        // underneath them. Only the composer that owns the keyboard carries it:
+        // a pane that merely mirrors another session's timeline owns no turn
+        // for it to ride.
         let companion_focus = composer_input.read(cx).focus_handle(cx);
         let companion_reward = selected_runtime
             .as_ref()
@@ -58399,6 +58401,17 @@ impl VibexWorkbench {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.add_composer_paths(paths, window, cx)
             }))
+            .when_some(composer_companion, |this, companion| {
+                this.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .when_some(content_max_width, |this, max_width| {
+                            this.max_w(px(max_width))
+                        })
+                        .child(companion),
+                )
+            })
             .when_some(self.agent_error.clone(), |this, error| {
                 this.child(
                     h_flex()
@@ -58606,9 +58619,6 @@ impl VibexWorkbench {
                                 .px(px(COMPOSER_QUEUE_HORIZONTAL_INSET))
                                 .child(goal),
                         )
-                    })
-                    .when_some(composer_companion, |this, companion| {
-                        this.child(companion)
                     })
                     .child(
                         v_flex()
@@ -84051,8 +84061,8 @@ mod tests {
     }
 
     /// The reward of a won encounter is wired into the session surface exactly
-    /// where a reader sees it: a lane mounted directly above the input box of
-    /// the composer whose Agent owns it, and a duel that covers the session
+    /// where a reader sees it: a lane mounted on top of every row of the
+    /// composer whose Agent owns it, and a duel that covers the session
     /// page rather than the whole window.
     #[test]
     fn the_session_composer_carries_a_won_companion_reward() {
@@ -84074,9 +84084,15 @@ mod tests {
             composer.contains("crate::arena::reward_key(selection.agent_id.as_str())"),
             "the companion follows the Agent the composer renders"
         );
+        let lane = composer
+            .find(".child(companion)")
+            .expect("the lane is a row of the composer column");
+        let first_row = composer
+            .find(".when_some(self.agent_error.clone()")
+            .expect("the composer still stacks its error row");
         assert!(
-            composer.contains("this.child(companion)"),
-            "the lane is a row of the composer column"
+            lane < first_row,
+            "the lane rides on top of every row the composer stacks"
         );
 
         let page = source

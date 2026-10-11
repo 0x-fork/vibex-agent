@@ -334,6 +334,63 @@ impl Raster {
 
     /// Merge horizontal runs with identical runs on the previous row. Work and
     /// memory stay linear in raster size, including large flat backgrounds.
+    /// The same drawing on a coarser grid of `width` × `height` cells, each one
+    /// still a single palette ink.
+    ///
+    /// Painting a fine raster at well under one screen pixel per raster pixel
+    /// snaps neighbouring quads onto the same pixel or drops them, which breaks
+    /// the model into noise. Resampling first keeps one ink per screen pixel:
+    /// a cell takes the commonest ink of the raster pixels it covers, and stays
+    /// clear unless enough of them are drawn, so the silhouette does not bloat.
+    pub fn resample(&self, width: usize, height: usize) -> Raster {
+        let mut frame = Raster::new(width, height);
+        if width == 0 || height == 0 || self.width == 0 || self.height == 0 {
+            return frame;
+        }
+        let (sx, sy) = (
+            self.width as f32 / width as f32,
+            self.height as f32 / height as f32,
+        );
+        let span = |cell: usize, step: f32, limit: usize| {
+            let start = ((cell as f32 * step).floor() as usize).min(limit - 1);
+            let end = (((cell + 1) as f32 * step).ceil() as usize).clamp(start + 1, limit);
+            start..end
+        };
+        let mut counts = [0u16; ink::COUNT];
+        for cy in 0..height {
+            let rows = span(cy, sy, self.height);
+            for cx in 0..width {
+                let columns = span(cx, sx, self.width);
+                counts.fill(0);
+                let mut drawn = 0u16;
+                for row in rows.clone() {
+                    for &color in &self.pixels
+                        [row * self.width + columns.start..row * self.width + columns.end]
+                    {
+                        if color != ink::CLEAR {
+                            counts[color as usize] += 1;
+                            drawn += 1;
+                        }
+                    }
+                }
+                let total = (rows.len() * columns.len()) as u16;
+                if drawn * 5 < total * 2 {
+                    continue;
+                }
+                // Outlines are what make a small silhouette legible, so they win
+                // a tie against the fill beside them.
+                let mut best = ink::OUTLINE;
+                for (color, &count) in counts.iter().enumerate() {
+                    if count > counts[best as usize] {
+                        best = color as u8;
+                    }
+                }
+                frame.pixels[cy * width + cx] = best;
+            }
+        }
+        frame
+    }
+
     pub fn rectangles(&self) -> Vec<PixelRect> {
         let mut rectangles: Vec<PixelRect> = Vec::with_capacity(self.width * 12);
         let mut previous: Vec<(usize, usize, u8, usize)> = Vec::new();

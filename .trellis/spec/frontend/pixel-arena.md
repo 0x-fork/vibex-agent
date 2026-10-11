@@ -23,7 +23,9 @@ Companion::new() -> Companion
 arena::companion_lane(&Entity<Companion>, Option<&str>, bool, Option<FocusHandle>, bool, &mut App) -> Option<AnyElement>
 arena::session_surface(&Entity<Companion>, impl IntoElement, &mut App) -> AnyElement
 art::companion_box(Guardian) -> (i32, i32, i32, i32) // crop window around the ground anchor
+art::companion_height(Guardian) -> i32 // median idle pose height, in raster pixels
 art::companion(&Boss, f32, bool) -> Raster // one idle frame cropped to that window
+Raster::resample(usize, usize) -> Raster // coarser grid, one ink per cell
 HomeArena::new(FocusHandle) -> HomeArena
 HomeArena::select_agent(Option<&str>, &mut Context<Self>)
 HomeArena::close(&mut Context<Self>)
@@ -150,23 +152,32 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
 - A victory is permanent. The defeated guardian's reward is the companion that
   rides the composer of every session whose Agent resolves to that key; it is
   neither time-limited nor repeatable-earned, and losing later never removes it.
-- The lane is the composer's own strip: one row directly above the input box,
-  inside the composer's content width, `LANE_HEIGHT` tall, clipped, and absent
-  from the tree entirely when no companion is mounted. It reserves nothing when
-  it is not shown, and it must never overlap the timeline or the input box.
+- The lane is the composer's own strip: the first row of the composer column,
+  on top of everything it stacks above the input box (error, statuses, status
+  line, plan, queue, goal), inside the composer's content width, clipped, and
+  absent from the tree entirely when no companion is mounted. It reserves
+  nothing when it is not shown, and it must never overlap the timeline or any
+  composer row. Its height is the guardian's fitted crop, at most `MAX_LANE`.
 - The companion is drawn from `art::companion`: one idle frame cropped to
   `art::companion_box` around the model's ground anchor, without the arena's
   ground shadow. The window holds every pose of the idle loop, reduced pose
-  included, so no frame is ever sliced; the model is fitted to the lane by
-  height, so every guardian reads at about the same size. The crop is painted
-  as merged rectangles, mirrored when the companion travels left, and rebuilt
-  only when the quantized pose changes.
+  included, so no frame is ever sliced. The model is sized so its median pose
+  (`art::companion_height`) stands `MODEL_HEIGHT` screen pixels tall, unless
+  the window would then exceed `MAX_LANE`. The crop is resampled to one ink per
+  screen pixel before it is painted: quads at a fraction of a screen pixel snap
+  onto each other or vanish and the model dissolves into noise. Cells are
+  painted as merged rectangles on whole pixels and rebuilt only when the
+  quantized pose changes. There is no mirroring: the sculpture faces its
+  route's heading exactly as on the home page.
 - Mounting follows the turn. A composer whose Agent has an unlocked guardian and
-  whose turn is running shows the lane; the model travels one eased left-right
-  pass, and its pose clock is monotonic, so the authored loop closes on itself
-  instead of cutting back to a first frame mid-lane.
-- When the turn ends the companion dives: a short hop, a fall past the lane's
-  own bottom edge where the input box swallows it, and a fade. The lane is
+  whose turn is running shows the lane. The companion walks the home page's own
+  route seen side-on — the route's x, `ROUTE_REACH` either side of the centre,
+  mapped onto the lane — so each guardian keeps its gait and pace instead of a
+  pass of its own. Its pose clock is monotonic, so the authored loop closes on
+  itself instead of cutting back to a first frame mid-lane.
+- When the turn ends the companion dives on the same pose clock: a short hop, a
+  fall past the lane's own bottom edge where the composer swallows it, and a
+  fade. The lane is
   removed once the dive lands, and the composer returns to its own height. A
   stage replaced during a dive is never retired by the stale dive's timer.
 - Double-clicking the companion opens the same duel as the home page, over the
@@ -354,8 +365,10 @@ rebirth, without a damage override.
   death/rebirth, held input, pointer release outside, and pause.
 - Companion: the lane appears only for an unlocked guardian of a running
   session and disappears for a locked one, a non-running turn, and reduced
-  motion; the badge stays inside the lane and above the input box at narrow and
-  wide composer widths; the model fits every guardian's lane; a finished turn
+  motion; the badge stays inside the lane, and the lane above every composer
+  row, at narrow and wide composer widths; every guardian stands at a legible
+  height inside its lane; the companion covers the lane over a loop at the
+  home route's pace; the resampled frame keeps the figure's coverage; a finished turn
   dives and retires it, returning the composer to its own height; double-click
   opens a duel that covers the session page and Escape returns; a victory
   reports the unlock; a session switch ends the previous duel. Art tests pin
@@ -381,15 +394,17 @@ let sample = self.preview.get();
 let arena = Arena::from_preview(sample.boss, sample.time, seed);
 let entry_camera = sample.viewport;
 
-// Wrong: a per-pass clock cuts the idle loop every time the companion turns.
+// Wrong: a per-pass clock cuts the idle loop every time the companion turns,
+// and a pass of its own outruns the guardian's gait.
 let time = phase * ROAM_PERIOD;
 
-// Correct: the pose clock is monotonic; the authored loop closes on itself.
-let time = started.elapsed().as_secs_f32();
+// Correct: the pose clock is monotonic; the place is the home route side-on.
+let time = clock.elapsed().as_secs_f32();
+let place = across(&Boss::idle(guardian, time, false));
 
-// Wrong: fitting the companion to the home page's scale covers the composer.
-let unit = window.rem_size() * 0.52;
+// Wrong: painting raster pixels at a third of a screen pixel each.
+let pixel = unit / art::SCALE; // ~0.3px: quads collapse into noise
 
-// Correct: the model is fitted to its lane, above the input box.
-let unit = (LANE_HEIGHT * FILL * art::SCALE / box_height).min(MAX_UNIT);
+// Correct: resample the crop to whole screen pixels, one ink each.
+let frame = art::companion(&boss, time, false).resample(fit.columns, fit.rows);
 ```

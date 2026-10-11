@@ -1,8 +1,9 @@
 //! The companion's own contract: when the lane exists, that it stays inside the
-//! composer column, that a finished turn dives it away, and that the duel it
+//! composer column on top of everything the composer stacks there, that a finished turn dives it away, and that the duel it
 //! opens covers the session page exactly as the home page covers its own.
 
 use super::*;
+use crate::arena::guardian::IDLE_LOOP;
 use crate::arena::init as arena_init;
 use gpui::{
     Focusable as _, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseUpEvent,
@@ -52,7 +53,8 @@ fn press(cx: &mut VisualTestContext, name: &str) {
     draw(cx);
 }
 
-/// A session page with the companion lane mounted above its composer, which is
+/// A session page with the companion lane mounted on top of its composer, above
+/// an extension row the way the app stacks its status line and queue, which is
 /// all the app's own composer column has to provide.
 struct Harness {
     companion: Entity<Companion>,
@@ -115,8 +117,15 @@ impl Render for Harness {
             .children(lane)
             .child(
                 div()
+                    .debug_selector(|| "session-extension".into())
+                    .h(px(28.0))
+                    .flex_none()
+                    .child("queue"),
+            )
+            .child(
+                div()
                     .debug_selector(|| "session-composer".into())
-                    .h(px(64.0))
+                    .h(px(112.0))
                     .flex_none()
                     .child(Input::new(&self.input)),
             );
@@ -152,54 +161,89 @@ fn drive(
 }
 
 /// The model is fitted to the lane, and the lane is the composer's strip: a
-/// guardian as tall as the home page's would cover the conversation.
+/// guardian as tall as the home page's would cover the conversation, and one
+/// drawn at a fraction of a screen pixel per raster pixel dissolves into noise.
 #[test]
-fn every_guardian_fits_inside_the_lane_it_rides() {
+fn every_guardian_fits_inside_the_lane_it_rides_at_a_legible_size() {
     for guardian in Guardian::ALL {
         let fitted = fit(guardian);
+        let (_, top, _, bottom) = art::companion_box(guardian);
         assert!(
-            fitted.height <= LANE_HEIGHT,
-            "{guardian:?} is taller than its lane"
+            fitted.lane() <= MAX_LANE,
+            "{guardian:?} reserves more than the tallest lane"
         );
-        assert_eq!(fitted.top, (LANE_HEIGHT - fitted.height) / 2.0);
-        assert!(fitted.top >= 0.0);
         assert!(
-            fitted.width < 720.0,
-            "{guardian:?} is wider than the composer column it rides"
+            (fitted.rows as f32 - fitted.pixel * (bottom - top) as f32).abs() < 0.001,
+            "{guardian:?}'s whole window fits its lane"
+        );
+        let standing = fitted.pixel * art::companion_height(guardian) as f32;
+        assert!(
+            (32.0..=MODEL_HEIGHT + 0.5).contains(&standing),
+            "{guardian:?} stands {standing}px tall"
+        );
+        assert!(
+            fitted.width() < 280.0,
+            "{guardian:?} is wider than the narrowest composer column it rides"
         );
     }
 }
 
-/// The pass turns around at both ends and never leaves the lane, at any width
-/// the composer column can take.
+/// The companion keeps the home page's own gait and pace: it follows its route
+/// side-on rather than sprinting a pass of its own, reaches both ends of the
+/// lane over a loop, and never leaves it at any width the composer can take.
 #[test]
-fn the_pass_turns_around_inside_a_narrow_and_a_wide_composer() {
-    for lane_width in [280.0f32, 720.0, 1600.0] {
-        let badge_width = fit(Guardian::Pi).width;
-        let span = lane_width - badge_width - INSET * 2.0;
-        let start = roam_at(lane_width, badge_width, 0.0);
-        let end = roam_at(lane_width, badge_width, 1.0);
-        assert_eq!(start, INSET);
-        assert_eq!(end, INSET);
-        let mut widest = start;
-        let mut phase = 0.0;
-        while phase <= 1.0 {
-            let x = roam_at(lane_width, badge_width, phase);
-            assert!(
-                x >= INSET - 0.001 && x <= INSET + span + 0.001,
-                "left the lane at {phase}: {x}"
-            );
-            widest = widest.max(x);
-            phase += 0.01;
+fn the_companion_walks_its_home_route_across_the_lane() {
+    for guardian in Guardian::ALL {
+        let (mut lowest, mut highest, mut travelled) = (1.0f32, 0.0f32, 0.0f32);
+        let mut previous = across(&Boss::idle(guardian, 0.0, false));
+        let mut time = 0.0;
+        while time < IDLE_LOOP {
+            let place = across(&Boss::idle(guardian, time, false));
+            lowest = lowest.min(place);
+            highest = highest.max(place);
+            travelled += (place - previous).abs();
+            previous = place;
+            time += 0.05;
         }
         assert!(
-            (widest - (INSET + span)).abs() < 0.001,
-            "never reached the far end at {lane_width}"
+            lowest < 0.12 && highest > 0.88,
+            "{guardian:?} covers {lowest}..{highest} of the lane"
         );
+        // On a 720px column this is well under a hundred pixels a second.
+        let pace = travelled / IDLE_LOOP;
+        assert!(pace < 0.12, "{guardian:?} crosses {pace} lanes a second");
+    }
+    for lane_width in [280.0f32, 720.0, 1600.0] {
+        let badge_width = fit(Guardian::Pi).width();
+        let span = lane_width - badge_width - INSET * 2.0;
+        assert_eq!(lane_x(lane_width, badge_width, 0.0), INSET);
+        assert_eq!(lane_x(lane_width, badge_width, 1.0), (INSET + span).round());
+        assert_eq!(lane_x(lane_width, badge_width, 0.37).fract(), 0.0);
     }
     // A lane too narrow to travel still keeps the model at its left margin
     // instead of pushing it out of the composer.
-    assert_eq!(roam_at(30.0, 40.0, 0.5), INSET);
+    assert_eq!(lane_x(30.0, 40.0, 0.5), INSET);
+}
+
+/// Resampling keeps one ink per screen pixel and the figure's silhouette: the
+/// coarse frame is neither empty nor bloated past the drawing it came from.
+#[test]
+fn the_resampled_frame_keeps_the_figure() {
+    for guardian in Guardian::ALL {
+        let fitted = fit(guardian);
+        let boss = Boss::idle(guardian, 3.5, false);
+        let fine = art::companion(&boss, 3.5, false);
+        let coarse = fine.resample(fitted.columns, fitted.rows);
+        assert_eq!((coarse.width, coarse.height), (fitted.columns, fitted.rows));
+        let share = |frame: &crate::arena::raster::Raster| {
+            frame.pixels.iter().filter(|ink| **ink != 0).count() as f32 / frame.pixels.len() as f32
+        };
+        let (fine, coarse) = (share(&fine), share(&coarse));
+        assert!(
+            coarse > fine * 0.6 && coarse < fine * 1.4,
+            "{guardian:?} covers {coarse} of its cells, against {fine} of its drawing"
+        );
+    }
 }
 
 #[gpui::test]
@@ -258,16 +302,22 @@ fn reduced_motion_never_mounts_the_companion(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn the_companion_stays_inside_its_lane_and_above_the_input_box(cx: &mut TestAppContext) {
+fn the_companion_rides_on_top_of_every_composer_row(cx: &mut TestAppContext) {
     let (harness, cx) = open(cx);
     let lane = cx.debug_bounds("composer-companion-lane").unwrap();
     let page = cx.debug_bounds("session-page").unwrap();
     let badge = cx.debug_bounds("composer-companion").unwrap();
+    let extension = cx.debug_bounds("session-extension").unwrap();
     let composer = cx.debug_bounds("session-composer").unwrap();
-    assert_eq!(lane.size.height, px(LANE_HEIGHT));
+    assert_eq!(lane.size.height, px(fit(Guardian::Claude).lane()));
     assert!(badge.top() >= lane.top() && badge.bottom() <= lane.bottom());
     assert!(badge.left() >= lane.left() && badge.right() <= lane.right());
-    assert_eq!(lane.bottom(), composer.top());
+    assert_eq!(
+        lane.bottom(),
+        extension.top(),
+        "the lane sits above the rows stacked on the input box, not under them"
+    );
+    assert_eq!(extension.bottom(), composer.top());
     assert_eq!(composer.bottom(), page.bottom());
     assert!(
         badge.size.height < composer.size.height,
@@ -277,7 +327,7 @@ fn the_companion_stays_inside_its_lane_and_above_the_input_box(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn a_finished_turn_dives_the_companion_into_the_input_box_and_retires_it(cx: &mut TestAppContext) {
+fn a_finished_turn_dives_the_companion_into_the_composer_and_retires_it(cx: &mut TestAppContext) {
     let (harness, cx) = open(cx);
     let roaming = cx.debug_bounds("composer-companion-lane").unwrap();
     drive(&harness, Some("claude"), false, cx);
@@ -295,7 +345,7 @@ fn a_finished_turn_dives_the_companion_into_the_input_box_and_retires_it(cx: &mu
     draw(cx);
     assert!(cx.debug_bounds("composer-companion-lane").is_none());
     assert_eq!(
-        cx.debug_bounds("session-composer").unwrap().top(),
+        cx.debug_bounds("session-extension").unwrap().top(),
         roaming.bottom()
     );
 }
