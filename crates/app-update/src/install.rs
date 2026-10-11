@@ -20,6 +20,10 @@ pub enum InstallationKind {
     MacAppStore,
     WindowsInstaller,
     WindowsStore,
+    /// A directly installed Android APK. The system package installer owns the
+    /// replacement; Vibex only downloads and verifies the package and hands the
+    /// staged file to the platform bridge.
+    AndroidApk,
     Unmanaged,
 }
 
@@ -111,11 +115,23 @@ impl Installation {
                 target_path: std::env::current_exe().ok(),
             };
         }
-        Self {
+        #[cfg(target_os = "android")]
+        let installation = Self {
+            // Vibex ships the Android build as a directly installed APK from the
+            // signed GitHub Release, so the package format is the install
+            // identity. A store-distributed build would need its own marker
+            // here, and the store would own the replacement.
+            kind: InstallationKind::AndroidApk,
+            package: "apk".to_string(),
+            target_path: None,
+        };
+        #[cfg(not(target_os = "android"))]
+        let installation = Self {
             kind: InstallationKind::Unmanaged,
             package: "unmanaged".to_string(),
             target_path: std::env::current_exe().ok(),
-        }
+        };
+        installation
     }
 
     pub fn supports(&self, install_mode: InstallMode) -> bool {
@@ -127,9 +143,20 @@ impl Installation {
                     | InstallationKind::Rpm
                     | InstallationKind::MacApp
                     | InstallationKind::WindowsInstaller
+                    | InstallationKind::AndroidApk
             ),
             InstallMode::Store | InstallMode::External => false,
         }
+    }
+
+    /// Whether this installation hands the verified package to a platform
+    /// bridge instead of launching it from this crate.
+    ///
+    /// Android's package installer can only be reached from the app's own JNI
+    /// surface, so the mobile client calls `AppUpdateService::download` and
+    /// hands the staged `UpdateState::Staged` path to that bridge itself.
+    pub fn installs_via_platform_bridge(&self) -> bool {
+        self.kind == InstallationKind::AndroidApk
     }
 
     pub(crate) fn install(
@@ -157,6 +184,12 @@ impl Installation {
                 Ok(InstallOutcome::RestartRequired)
             }
             InstallMode::SystemInstaller => {
+                if self.installs_via_platform_bridge() {
+                    return Err(AppUpdateError::new(
+                        "app_update_install_requires_platform_bridge",
+                        "this installation hands the verified package to the platform installer",
+                    ));
+                }
                 launch_system_installer(staged_path)?;
                 Ok(InstallOutcome::InstallerLaunched)
             }
@@ -627,5 +660,51 @@ mod tests {
 
         assert_eq!(error.code, "app_update_install_marker_target_invalid");
         assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn android_apk_installation_supports_the_system_installer_only() {
+        let installation = Installation {
+            kind: InstallationKind::AndroidApk,
+            package: "apk".to_string(),
+            target_path: None,
+        };
+
+        assert!(installation.supports(InstallMode::SystemInstaller));
+        assert!(!installation.supports(InstallMode::SelfReplace));
+        assert!(!installation.supports(InstallMode::Store));
+        assert!(!installation.supports(InstallMode::External));
+        assert!(installation.installs_via_platform_bridge());
+    }
+
+    #[test]
+    fn android_apk_install_is_left_to_the_platform_bridge() {
+        let directory = tempdir().unwrap();
+        let staged = directory.path().join("vibex-0.2.0-android-arm64.apk");
+        fs::write(&staged, b"apk").unwrap();
+        let installation = Installation {
+            kind: InstallationKind::AndroidApk,
+            package: "apk".to_string(),
+            target_path: None,
+        };
+        let artifact = UpdateArtifact {
+            os: "android".to_string(),
+            arch: "arm64".to_string(),
+            package: "apk".to_string(),
+            install_mode: InstallMode::SystemInstaller,
+            url: url::Url::parse(
+                "https://github.com/vibex-ai/vibex/releases/download/v0.2.0/vibex-0.2.0-android-arm64.apk",
+            )
+            .unwrap(),
+            size: 3,
+            sha256: "0".repeat(64),
+            sha512: None,
+        };
+
+        let error = installation
+            .install(&artifact, &staged, "0.2.0", directory.path())
+            .unwrap_err();
+
+        assert_eq!(error.code, "app_update_install_requires_platform_bridge");
     }
 }

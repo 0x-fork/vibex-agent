@@ -346,6 +346,14 @@ mod tests {
                 "url": "https://github.com/vibex-ai/vibex/releases/download/v0.2.0/vibex-0.2.0-linux-x86_64-appimage.AppImage",
                 "size": 3,
                 "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }, {
+                "os": "android",
+                "arch": "arm64",
+                "package": "apk",
+                "install_mode": "system_installer",
+                "url": "https://github.com/vibex-ai/vibex/releases/download/v0.2.0/vibex-0.2.0-android-arm64.apk",
+                "size": 3,
+                "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             }]
         })
     }
@@ -367,6 +375,12 @@ mod tests {
                 .matching_artifact("linux", "x86_64", "appimage")
                 .is_some()
         );
+        // The Android APK is a directly installed package the system installer
+        // replaces, so one signed manifest serves both product clients.
+        let android = verified
+            .matching_artifact("android", "arm64", "apk")
+            .expect("the Android APK artifact is selected");
+        assert_eq!(android.install_mode, InstallMode::SystemInstaller);
     }
 
     #[test]

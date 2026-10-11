@@ -32,6 +32,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java",
     "apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java",
     "apps/mobile/android/app/src/main/res/values/styles.xml",
+    "apps/mobile/android/app/src/main/res/xml/file_paths.xml",
     "apps/mobile/ios/project.yml",
     "apps/mobile/ios/Vibex/main.m",
     "apps/mobile/ios/Vibex/QRScanner.swift",
@@ -41,7 +42,8 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "apps/mobile/src/android_host.rs",
     "apps/mobile/src/android_insets.rs",
     "apps/mobile/src/platform.rs",
-    "apps/mobile/src/scroll_capture.rs"
+    "apps/mobile/src/scroll_capture.rs",
+    "apps/mobile/src/update.rs"
   ]) {
     assert(exists(path), `native_mobile_file_missing:${path}`);
   }
@@ -62,6 +64,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   const androidActivity = read("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java");
   const androidScanner = read("apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java");
   const androidStyles = read("apps/mobile/android/app/src/main/res/values/styles.xml");
+  const androidUpdatePaths = read("apps/mobile/android/app/src/main/res/xml/file_paths.xml");
   const androidBridge = read("apps/mobile/src/android_bridge.rs");
   const androidHost = read("apps/mobile/src/android_host.rs");
   const androidInsets = read("apps/mobile/src/android_insets.rs");
@@ -70,6 +73,9 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   const iosScanner = read("apps/mobile/ios/Vibex/QRScanner.swift");
   const iosHeader = read("apps/mobile/ios/Headers/vibex_mobile.h");
   const iosModuleMap = read("apps/mobile/ios/Headers/module.modulemap");
+  const updater = read("apps/mobile/src/update.rs");
+  const appUpdateInstall = read("crates/app-update/src/install.rs");
+  const appUpdateSource = read("crates/app-update/src/source.rs");
 
   assert(workspace.includes('"apps/mobile"'), "native_mobile_workspace_member_missing");
   assert(!workspace.includes('"apps/mobile-wasm"'), "legacy_mobile_workspace_member_present");
@@ -308,8 +314,46 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     assert(pairing.includes(marker), `native_pairing_contract_missing:${marker}`);
   }
 
-  const scopedSource = [manifest, entry, app, pairing, scanner, android, androidActivity, androidScanner, androidStyles, iosMain, iosProject, iosScanner, iosHeader].join("\n");
-  for (const forbidden of ["Capacitor", "capacitor", "wasm-bindgen", "mobile-wasm"]) {
+  // Android updates itself from the signed GitHub Release: the same Ed25519
+  // manifest the desktop reads, the APK verified against its pinned digest,
+  // and the system package installer as the only replacement path. Only the
+  // stable channel is offered, so a prerelease build never follows rc or
+  // preview tags.
+  assert(manifest.includes("vibex-app-update"), "android_updater_dependency_missing");
+  assert(updater.includes("UpdateChannel::Stable"), "android_update_channel_not_stable");
+  assert(
+    !updater.includes("UpdateChannel::Preview") && !updater.includes("UpdateChannel::Rc"),
+    "android_prerelease_update_channel_present"
+  );
+  assert(updater.includes('cfg!(target_os = "android")'), "android_update_platform_gate_missing");
+  assert(
+    updater.includes("Java_ai_vibex_mobile_GpuiHostActivity_nativeOnUpdateNotificationActivated"),
+    "android_update_tap_export_missing"
+  );
+  for (const bridge of [
+    "appVersionName",
+    "openExternalUrl",
+    "installUpdatePackage",
+    "showUpdateNotification"
+  ]) {
+    assert(updater.includes(`jni_str!("${bridge}")`), `android_update_jni_call_missing:${bridge}`);
+    assert(androidActivity.includes(bridge), `android_update_host_method_missing:${bridge}`);
+  }
+  assert(
+    androidActivity.includes("nativeOnUpdateNotificationActivated"),
+    "android_update_tap_bridge_missing"
+  );
+  assert(android.includes("REQUEST_INSTALL_PACKAGES"), "android_update_install_permission_missing");
+  assert(android.includes("androidx.core.content.FileProvider"), "android_update_file_provider_missing");
+  assert(
+    android.includes('android:authorities="${applicationId}.updates"'),
+    "android_update_file_authority_missing"
+  );
+  assert(androidUpdatePaths.includes('path="updates/"'), "android_update_shared_path_missing");
+  assert(appUpdateInstall.includes("AndroidApk"), "android_update_install_kind_missing");
+  assert(appUpdateSource.includes(".tls_certs_only(roots)"), "android_update_tls_roots_missing");
+
+  const scopedSource = [manifest, entry, app, pairing, scanner, android, androidActivity, androidScanner, androidStyles, iosMain, iosProject, iosScanner, iosHeader].join("\n");  for (const forbidden of ["Capacitor", "capacitor", "wasm-bindgen", "mobile-wasm"]) {
     assert(!scopedSource.includes(forbidden), `legacy_mobile_technology_present:${forbidden}`);
   }
 }
@@ -332,6 +376,9 @@ function runSelfTest() {
     ["crates/vibex-remote-client/src/transport.rs", source("crates/vibex-remote-client/src/transport.rs")],
     ["apps/mobile/src/platform.rs", source("apps/mobile/src/platform.rs")],
     ["apps/mobile/src/scroll_capture.rs", source("apps/mobile/src/scroll_capture.rs")],
+    ["apps/mobile/src/update.rs", source("apps/mobile/src/update.rs")],
+    ["crates/app-update/src/install.rs", source("crates/app-update/src/install.rs")],
+    ["crates/app-update/src/source.rs", source("crates/app-update/src/source.rs")],
     ["apps/mobile/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf", "font"],
     ["apps/mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc", "font"],
     ["apps/mobile/android/app/src/main/AndroidManifest.xml", source("apps/mobile/android/app/src/main/AndroidManifest.xml")],
@@ -340,6 +387,7 @@ function runSelfTest() {
     ["apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java", source("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java")],
     ["apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java", source("apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java")],
     ["apps/mobile/android/app/src/main/res/values/styles.xml", source("apps/mobile/android/app/src/main/res/values/styles.xml")],
+    ["apps/mobile/android/app/src/main/res/xml/file_paths.xml", source("apps/mobile/android/app/src/main/res/xml/file_paths.xml")],
     ["apps/mobile/ios/project.yml", source("apps/mobile/ios/project.yml")],
     ["apps/mobile/ios/Vibex/main.m", source("apps/mobile/ios/Vibex/main.m")],
     ["apps/mobile/ios/Vibex/LanDiscovery.m", source("apps/mobile/ios/Vibex/LanDiscovery.m")],
@@ -536,6 +584,18 @@ function runSelfTest() {
     "vibex_mobile_pairing_qr_scanned",
     "vibex_mobile_missing_qr_scanned",
     "native_mobile_checker_self_test_accepted_missing_ios_qr_bridge_header"
+  );
+  expectRejected(
+    "apps/mobile/src/update.rs",
+    "UpdateChannel::Stable",
+    "UpdateChannel::Preview",
+    "native_mobile_checker_self_test_accepted_prerelease_update_channel"
+  );
+  expectRejected(
+    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java",
+    "public void installUpdatePackage",
+    "public void installMissingPackage",
+    "native_mobile_checker_self_test_accepted_missing_update_install_bridge"
   );
 }
 

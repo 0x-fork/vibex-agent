@@ -22,5 +22,10 @@ tokio = { workspace = true, features = ["fs", "io-util"] }
 tracing.workspace = true
 url.workspace = true
 
+[target.'cfg(target_os = "android")'.dependencies]
+# Android's platform verifier is replaced with a pinned WebPKI store, matching
+# `vibex-remote-client`'s HTTP client.
+webpki-root-certs.workspace = true
+
 [dev-dependencies]
 tempfile = "3"

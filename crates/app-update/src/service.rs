@@ -102,6 +102,20 @@ pub struct UpdateRelease {
     pub notes: Option<String>,
 }
 
+impl UpdateRelease {
+    /// The URL a user-facing "download" action opens.
+    ///
+    /// The signed artifact is the package itself; a release with no artifact
+    /// for this device still has its page, where the user can read the notes
+    /// and pick a package.
+    pub fn download_url(&self) -> &str {
+        self.artifact
+            .as_ref()
+            .map(|artifact| artifact.url.as_str())
+            .unwrap_or_else(|| self.notes_url.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateState {
     Idle,
@@ -1106,5 +1120,69 @@ mod tests {
 
         assert_eq!(checked, staged);
         assert!(matches!(checked.state, UpdateState::Staged { .. }));
+    }
+
+    /// An Android install selects the APK out of the same signed manifest and
+    /// offers it, so the phone reaches the download the desktop already has.
+    #[tokio::test]
+    async fn android_installation_selects_the_signed_apk_artifact() {
+        let directory = tempdir().unwrap().keep();
+        let bytes = b"verified apk".to_vec();
+        let sha256 = hex_lower(&Sha256::digest(&bytes));
+        let tag = "v0.2.0";
+        let raw = serde_json::to_vec(&json!({
+            "schema": 1,
+            "channel": "stable",
+            "version": "0.2.0",
+            "tag": tag,
+            "published_at": "2026-08-16T00:00:00Z",
+            "minimum_updater_version": "1",
+            "notes_url": format!("https://github.com/vibex-ai/vibex/releases/tag/{tag}"),
+            "artifacts": [{
+                "os": "android",
+                "arch": "arm64",
+                "package": "apk",
+                "install_mode": "system_installer",
+                "url": format!("https://github.com/vibex-ai/vibex/releases/download/{tag}/vibex-0.2.0-android-arm64.apk"),
+                "size": bytes.len(),
+                "sha256": sha256
+            }]
+        }))
+        .unwrap();
+        let key = SigningKey::from_bytes(&[5; 32]);
+        let signature = BASE64_STANDARD.encode(key.sign(&raw).to_bytes());
+        let config = AppUpdateConfig {
+            current_version: Version::parse("0.1.0").unwrap(),
+            channel: UpdateChannel::Stable,
+            os: "android".to_string(),
+            arch: "arm64".to_string(),
+            installation: Installation {
+                kind: crate::InstallationKind::AndroidApk,
+                package: "apk".to_string(),
+                target_path: None,
+            },
+            updates_dir: directory,
+            public_key_base64: Some(BASE64_STANDARD.encode(key.verifying_key().to_bytes())),
+            automatic_checks: false,
+        };
+        let source: Arc<dyn UpdateSource> = Arc::new(FakeSource {
+            signed: SignedManifest {
+                tag: tag.to_string(),
+                manifest: raw,
+                signature_base64: signature,
+            },
+            artifact_bytes: bytes,
+            notes: Ok(None),
+        });
+        let service = AppUpdateService::with_source(config, source).unwrap();
+
+        let checked = service.check(CheckReason::Manual).await.unwrap();
+
+        let UpdateState::Available { release } = &checked.state else {
+            panic!("expected an available update, got {:?}", checked.state);
+        };
+        let artifact = release.artifact.as_ref().expect("the APK artifact");
+        assert_eq!(artifact.install_mode, InstallMode::SystemInstaller);
+        assert!(artifact.url.as_str().ends_with("-android-arm64.apk"));
     }
 }

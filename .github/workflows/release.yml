@@ -285,6 +285,9 @@ jobs:
         env:
           VIBEX_MOBILE_PROFILE: release
           VIBEX_MOBILE_VERSION: ${{ needs.release-meta.outputs.version }}
+          # Baked into the APK so the phone verifies the signed update manifest
+          # it reads from the published release.
+          VIBEX_UPDATE_PUBLIC_KEY: ${{ vars.VIBEX_UPDATE_PUBLIC_KEY }}
         run: bash apps/mobile/scripts/build-android.sh
       - name: Sign Android release artifacts
         env:
@@ -462,6 +465,13 @@ jobs:
             fi
           done
           require_artifact_class '*-windows-*-nsis.exe' 'Windows NSIS installer'
+          # The Android client installs the signed APK straight from the
+          # release, so the phone verifies the same manifest the desktop does.
+          apk="target/publish/vibex-${version}-android-arm64.apk"
+          if [[ -f "${apk}" ]]; then
+            manifest_args+=(--artifact "android|arm64|apk|system_installer|${apk}|${repository_url}/$(basename "${apk}")")
+          fi
+          require_artifact_class '*-android-arm64.apk' 'Android APK'
           generated_key="$(cargo run --release --locked -p vibex-app-update --bin vibex-update-manifest -- "${manifest_args[@]}")"
           test "${generated_key}" = "update_public_key=${VIBEX_UPDATE_PUBLIC_KEY}"
       - name: Generate aggregate checksums

@@ -10079,6 +10079,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "webpki-root-certs",
 ]
 
 [[package]]
@@ -10419,6 +10420,7 @@ dependencies = [
  "log",
  "ndk",
  "rustls-platform-verifier",
+ "semver",
  "serde",
  "serde_json",
  "sys-locale",
@@ -10426,6 +10428,7 @@ dependencies = [
  "tokio",
  "unicode-segmentation",
  "url",
+ "vibex-app-update",
  "vibex-backend",
  "vibex-core",
  "vibex-desktop-model",

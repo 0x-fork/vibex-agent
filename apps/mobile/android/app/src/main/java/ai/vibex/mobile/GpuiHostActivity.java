@@ -35,6 +35,7 @@ import android.view.inputmethod.InputConnectionWrapper;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 
+import androidx.core.content.FileProvider;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowCompat;
@@ -42,6 +43,7 @@ import androidx.core.view.WindowInsetsCompat;
 
 import org.json.JSONObject;
 
+import java.io.File;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
@@ -70,11 +72,16 @@ public final class GpuiHostActivity extends Activity {
     private static final int LOCAL_NETWORK_PERMISSION_REQUEST = 4102;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 4103;
     private static final String AGENT_NOTIFICATION_CHANNEL = "agent_activity";
+    private static final String UPDATE_NOTIFICATION_CHANNEL = "app_updates";
+    private static final String UPDATE_NOTIFICATION_TAG = "vibex_update";
+    private static final int UPDATE_NOTIFICATION_ID = 0x564259;
+    private static final String ACTION_OPEN_APP_UPDATE = "ai.vibex.mobile.OPEN_APP_UPDATE";
     private static final String EXTRA_NOTIFICATION_ID = "vibex.notification.id";
     private static final String EXTRA_NOTIFICATION_LOCATOR = "vibex.notification.locator";
     private static final String NOTIFICATION_PERMISSION_PREFERENCES = "vibex.notifications";
     private static final String NOTIFICATION_PERMISSION_REQUESTED = "permission_requested";
     private static final String VIBEX_SERVICE_TYPE = "_vibex._tcp.";
+    private static final String UPDATE_FILE_AUTHORITY_SUFFIX = ".updates";
 
     static {
         // A plain Activity has no `android.app.lib_name` meta-data to load the
@@ -101,6 +108,7 @@ public final class GpuiHostActivity extends Activity {
     private static native void nativeOnLanDiscoveryEvent(String payload);
     private static native void nativeOnNotificationActivated(
             String notificationId, String opaqueLocator);
+    private static native void nativeOnUpdateNotificationActivated();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -138,6 +146,7 @@ public final class GpuiHostActivity extends Activity {
         });
 
         createAgentNotificationChannel();
+        createUpdateNotificationChannel();
         handleNotificationIntent(getIntent());
         nativeStart(this, getFilesDir().getAbsolutePath());
     }
@@ -501,8 +510,57 @@ public final class GpuiHostActivity extends Activity {
         manager.createNotificationChannel(channel);
     }
 
+    /**
+     * Tells the user a newer Vibex is waiting.
+     *
+     * One tag and one id keep a discovered release to a single notification: a
+     * later check replaces the previous one instead of stacking copies. The tap
+     * only routes into the app — the settings card owns the actual download and
+     * install, and no update payload travels through the notification.
+     */
+    public void showUpdateNotification(String version, String title, String body) {
+        runOnUiThread(() -> {
+            Intent intent = new Intent(this, GpuiHostActivity.class)
+                    .setAction(ACTION_OPEN_APP_UPDATE)
+                    .putExtra(EXTRA_NOTIFICATION_ID, version)
+                    .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            PendingIntent pendingIntent = PendingIntent.getActivity(
+                    this,
+                    UPDATE_NOTIFICATION_ID,
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            Notification notification = new Notification.Builder(this, UPDATE_NOTIFICATION_CHANNEL)
+                    .setSmallIcon(ai.vibex.mobile.R.drawable.ic_launcher_foreground)
+                    .setContentTitle(title)
+                    .setContentText(body)
+                    .setCategory(Notification.CATEGORY_RECOMMENDATION)
+                    .setAutoCancel(true)
+                    .setOnlyAlertOnce(true)
+                    .setContentIntent(pendingIntent)
+                    .build();
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            manager.notify(UPDATE_NOTIFICATION_TAG, UPDATE_NOTIFICATION_ID, notification);
+        });
+    }
+
+    private void createUpdateNotificationChannel() {
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        NotificationChannel channel = new NotificationChannel(
+                UPDATE_NOTIFICATION_CHANNEL,
+                "App updates",
+                NotificationManager.IMPORTANCE_DEFAULT);
+        channel.setDescription("New Vibex versions available for this device");
+        manager.createNotificationChannel(channel);
+    }
+
     private static void handleNotificationIntent(Intent intent) {
         if (intent == null) {
+            return;
+        }
+        if (ACTION_OPEN_APP_UPDATE.equals(intent.getAction())) {
+            intent.setAction(null);
+            intent.removeExtra(EXTRA_NOTIFICATION_ID);
+            nativeOnUpdateNotificationActivated();
             return;
         }
         String notificationId = intent.getStringExtra(EXTRA_NOTIFICATION_ID);
@@ -513,6 +571,72 @@ public final class GpuiHostActivity extends Activity {
             intent.removeExtra(EXTRA_NOTIFICATION_LOCATOR);
             nativeOnNotificationActivated(notificationId, opaqueLocator);
         }
+    }
+
+    // ── application updates ──────────────────────────────────────────────────
+
+    /** The installed package version, which is what an update is compared against. */
+    @SuppressWarnings("deprecation")
+    public String appVersionName() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (PackageManager.NameNotFoundException error) {
+            return "";
+        }
+    }
+
+    /** Opens an https page in whatever browser the device has. */
+    public void openExternalUrl(String url) {
+        runOnUiThread(() -> {
+            Uri uri = Uri.parse(url);
+            if (!"https".equals(uri.getScheme())) {
+                return;
+            }
+            Intent intent = new Intent(Intent.ACTION_VIEW, uri)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            try {
+                startActivity(intent);
+            } catch (ActivityNotFoundException ignored) {
+                // No browser to open the download page with.
+            }
+        });
+    }
+
+    /**
+     * Hands a verified update APK to the system package installer.
+     *
+     * The APK is only ever the staged file the Rust updater verified against
+     * the signed manifest, and this method re-checks that it lives inside the
+     * app's own files directory before exposing it through the FileProvider.
+     * Android itself refuses the install when the package is signed with a
+     * different key than the installed app, so the download cannot replace this
+     * app with anything the release key did not sign.
+     */
+    public void installUpdatePackage(String path) {
+        runOnUiThread(() -> {
+            File file;
+            File filesDir;
+            try {
+                file = new File(path).getCanonicalFile();
+                filesDir = getFilesDir().getCanonicalFile();
+            } catch (Exception error) {
+                return;
+            }
+            if (!file.isFile()
+                    || !file.getPath().startsWith(filesDir.getPath() + File.separator)) {
+                return;
+            }
+            Uri uri = FileProvider.getUriForFile(
+                    this, getPackageName() + UPDATE_FILE_AUTHORITY_SUFFIX, file);
+            Intent intent = new Intent(Intent.ACTION_VIEW)
+                    .setDataAndType(uri, "application/vnd.android.package-archive")
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            try {
+                startActivity(intent);
+            } catch (ActivityNotFoundException ignored) {
+                // No package installer to hand the APK to.
+            }
+        });
     }
 
     // ── background connection service ────────────────────────────────────────

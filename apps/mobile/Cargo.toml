@@ -26,6 +26,7 @@ sys-locale.workspace = true
 unicode-segmentation = "1"
 url.workspace = true
 tokio.workspace = true
+vibex-app-update = { path = "../../crates/app-update" }
 vibex-backend = { path = "../../crates/vibex-backend" }
 vibex-core = { path = "../../crates/core" }
 vibex-desktop-model = { path = "../../crates/desktop-model" }
@@ -58,4 +59,6 @@ rustls-platform-verifier = "0.7"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+# Update fixtures describe the same semver releases the desktop updater reads.
+semver.workspace = true
 tempfile = "3"

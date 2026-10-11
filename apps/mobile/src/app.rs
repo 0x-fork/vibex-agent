@@ -20,6 +20,7 @@ use gpui::{
     Transformation, UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint,
     img, list, percentage, point, prelude::*, px, rgb, svg, uniform_list,
 };
+use vibex_app_update::{UpdateSnapshot, UpdateState};
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendFuture, BackendOperation,
     BackendProjection, BackendResult, ManagementBackend as _, MutationRequest,
@@ -74,7 +75,7 @@ use crate::storage::{
     AppSettings, CredentialStorage, MobileTimelineDisplaySettingsOverride, StoredHostEntry,
 };
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
-use crate::{locale, markdown, notifications, power, scanner, theme};
+use crate::{locale, markdown, notifications, power, scanner, theme, update};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader};
 use gpui_component::input::TextareaState;
@@ -549,6 +550,16 @@ impl MobileOverlay {
                 | MobileOverlay::HostRemove
         )
     }
+
+    /// Whether the pairing page may show this overlay.
+    ///
+    /// Runtime surfaces act on a saved runtime, which is exactly what that page
+    /// lists. Settings belongs there as well: an update notification can arrive
+    /// before the phone is paired, and the About card is where an update is
+    /// installed from.
+    fn is_available_from_pairing(self) -> bool {
+        self.is_host_overlay() || self == Self::Settings
+    }
 }
 
 #[derive(Clone)]
@@ -923,6 +934,7 @@ type TimelineMarkdownViews =
 struct PlatformEventStreams {
     scanner_results: UnboundedReceiver<String>,
     notification_actions: UnboundedReceiver<notifications::NotificationAction>,
+    update_actions: UnboundedReceiver<update::UpdateAction>,
     lan_discovery_events: UnboundedReceiver<LanDiscoveryEvent>,
     lifecycle_events: UnboundedReceiver<MobileLifecycleEvent>,
 }
@@ -932,6 +944,7 @@ impl PlatformEventStreams {
         Self {
             scanner_results: scanner::subscribe(),
             notification_actions: notifications::subscribe_actions(),
+            update_actions: update::subscribe_actions(),
             lan_discovery_events: crate::discovery::subscribe(),
             lifecycle_events: crate::lifecycle::subscribe(),
         }
@@ -942,6 +955,7 @@ impl PlatformEventStreams {
         Self {
             scanner_results: futures_channel::mpsc::unbounded().1,
             notification_actions: futures_channel::mpsc::unbounded().1,
+            update_actions: futures_channel::mpsc::unbounded().1,
             lan_discovery_events: futures_channel::mpsc::unbounded().1,
             lifecycle_events: futures_channel::mpsc::unbounded().1,
         }
@@ -1119,6 +1133,12 @@ pub struct MobileApp {
     /// An in-flight authoritative runtime rename.
     host_rename_task: Option<Task<()>>,
     pending_notification_action: Option<notifications::NotificationAction>,
+    /// The stable-channel update state, or `None` when this platform or build
+    /// has no updater. The settings About section is the only surface.
+    update_snapshot: Option<UpdateSnapshot>,
+    /// The root window, kept so a platform callback (a notification tap) can
+    /// open an overlay without a pointer event.
+    window_handle: gpui::AnyWindowHandle,
     tasks: Vec<Task<()>>,
     /// Ordered by recency: the front is the screen the back key closes first.
     back_stack: Vec<BackScreen>,
@@ -1221,6 +1241,11 @@ impl MobileApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let window_handle = window.window_handle();
+        // The updater is a process-lifetime service. A build without the
+        // release verification key reports `false`, which keeps every update
+        // surface hidden instead of showing one the user cannot act on.
+        let updates_enabled = update::init(&data_dir);
         let storage = CredentialStorage::new(data_dir);
         let stored = storage.load();
         let app_settings = storage
@@ -1459,6 +1484,12 @@ impl MobileApp {
             resume_recovery_task: None,
             host_rename_task: None,
             pending_notification_action: None,
+            update_snapshot: if updates_enabled {
+                update::snapshot()
+            } else {
+                None
+            },
+            window_handle,
             battery_allowlist_ok: power::is_ignoring_battery_optimizations(),
             _battery_allowlist_subscription: battery_allowlist_subscription,
             back_stack: Vec::new(),
@@ -1474,6 +1505,10 @@ impl MobileApp {
         app.start_notification_action_stream(events.notification_actions, cx);
         app.start_lan_discovery_event_stream(events.lan_discovery_events, cx);
         app.start_lifecycle_stream(events.lifecycle_events, cx);
+        if updates_enabled {
+            app.start_update_streams(events.update_actions, cx);
+            update::spawn_checks();
+        }
         app.watch_host_reachability(cx);
         // A phone that starts on the first screen with runtimes already saved
         // has to say which of them answer before the user asks.
@@ -1529,6 +1564,7 @@ impl MobileApp {
             MobileLifecycleEvent::Resumed => {
                 self.app_backgrounded = false;
                 self.refresh_battery_allowlist(cx);
+                update::check_if_stale();
                 if self.is_pairing_visible() {
                     // Nothing was probed while the app was away.
                     self.refresh_host_reachability(cx);
@@ -1703,6 +1739,38 @@ impl MobileApp {
         if let Some(action) = self.pending_notification_action.take() {
             self.handle_notification_action(action, cx);
         }
+    }
+
+    /// Mirrors the updater's snapshot into the settings card and routes a tap
+    /// on the update notification to that card.
+    fn start_update_streams(
+        &mut self,
+        mut actions: UnboundedReceiver<update::UpdateAction>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(mut snapshots) = update::subscribe() {
+            let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+                while snapshots.changed().await.is_ok() {
+                    let snapshot = snapshots.borrow_and_update().clone();
+                    if entity
+                        .update(cx, |this, cx| {
+                            this.update_snapshot = Some(snapshot);
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            self.tasks.push(task);
+        }
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            while actions.next().await.is_some() {
+                cx.update(|cx| open_update_surface(&entity, cx));
+            }
+        });
+        self.tasks.push(task);
     }
 
     fn defer_bundle_install(
@@ -5366,6 +5434,10 @@ impl MobileApp {
     }
 
     fn open_settings(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_settings(window, cx);
+    }
+
+    fn show_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_battery_allowlist(cx);
         self.show_overlay(MobileOverlay::Settings, window, cx);
     }
@@ -6757,7 +6829,8 @@ impl MobileApp {
             // them: the rows here are the same runtime list, so the same
             // actions, rename and remove sheets belong to them.
             .when_some(
-                self.overlay.filter(|overlay| overlay.is_host_overlay()),
+                self.overlay
+                    .filter(|overlay| overlay.is_available_from_pairing()),
                 |page, overlay| page.child(self.render_mobile_overlay(overlay, window, cx)),
             )
     }
@@ -7768,7 +7841,8 @@ impl MobileApp {
                     }),
             )
             .when_some(
-                self.overlay.filter(|overlay| overlay.is_host_overlay()),
+                self.overlay
+                    .filter(|overlay| overlay.is_available_from_pairing()),
                 |root, overlay| root.child(self.render_mobile_overlay(overlay, window, cx)),
             )
     }
@@ -14157,6 +14231,281 @@ fn settings_info_row_base(
         )
 }
 
+/// One action inside the update card.
+///
+/// The primary fills with the accent so the recommended step reads first; the
+/// alternative stays on the card surface. Both keep a full touch target, and
+/// only the primary ever starts work, so a second tap cannot start two
+/// downloads.
+fn update_card_button(id: &'static str, label: String, primary: bool) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .aria_label(label.clone())
+        .debug_selector(move || id.to_string())
+        .flex_1()
+        .min_w_0()
+        .h(px(theme::TOUCH_TARGET - 8.0))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(if primary {
+            theme::accent_blue()
+        } else {
+            theme::border_default()
+        })
+        .bg(if primary {
+            theme::accent_blue()
+        } else {
+            theme::bg_card()
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(px(theme::SPACING_SM))
+        .text_size(px(theme::FONT_BODY))
+        .text_color(if primary {
+            theme::accent_foreground()
+        } else {
+            theme::text_secondary()
+        })
+        .overflow_hidden()
+        .text_ellipsis()
+        .whitespace_nowrap()
+        .active(|style| style.opacity(0.8))
+        .child(label)
+}
+
+/// A thin progress track for the download state.
+fn update_progress_bar(id: &'static str, fraction: f32) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .w_full()
+        .h(px(3.0))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .bg(theme::border_subtle())
+        .child(
+            div()
+                .h_full()
+                .w(gpui::relative(fraction.clamp(0.0, 1.0)))
+                .rounded(px(theme::RADIUS_CONTROL))
+                .bg(theme::accent_blue()),
+        )
+}
+
+fn update_size_label(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= MIB {
+        format!("{:.1} MB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.0} KB", bytes / KIB)
+    } else {
+        format!("{bytes:.0} B")
+    }
+}
+
+/// The work the update card's first button starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UpdateCardAction {
+    /// Download the signed APK, then hand it to the system installer.
+    Download,
+    /// Hand an already verified APK to the system installer again.
+    Install(PathBuf),
+    /// Ask the updater to check again.
+    Retry,
+}
+
+/// Everything the update card renders, derived from one snapshot state.
+///
+/// The card is the only place the whole update workflow is visible, so the
+/// model carries the numbers the user needs to judge it: the version, how much
+/// is left to download, and whether the package is already verified.
+#[derive(Clone, Debug)]
+struct UpdateCardModel {
+    version: String,
+    detail: String,
+    /// The signed package or release page the manual alternative opens.
+    download_url: String,
+    primary: Option<UpdateCardAction>,
+    progress: Option<f32>,
+    accent: gpui::Hsla,
+}
+
+/// The card for a state that carries a release, or `None` while there is
+/// nothing to install.
+fn update_card_model(state: &UpdateState) -> Option<UpdateCardModel> {
+    let release = state.release()?;
+    let version = release.version.to_string();
+    let download_url = release.download_url().to_string();
+    let size = release
+        .artifact
+        .as_ref()
+        .map(|artifact| artifact.size)
+        .unwrap_or_default();
+    let available = || {
+        locale::text(
+            "Signed package from the official release",
+            "来自官方发布的已签名安装包",
+            "來自官方發佈的已簽名安裝包",
+        )
+        .to_string()
+    };
+    match state {
+        UpdateState::Available { .. } => Some(UpdateCardModel {
+            version,
+            detail: if size == 0 {
+                available()
+            } else {
+                format!("{} · {}", available(), update_size_label(size))
+            },
+            download_url,
+            primary: Some(UpdateCardAction::Download),
+            progress: None,
+            accent: theme::accent_blue(),
+        }),
+        UpdateState::Downloading {
+            downloaded_bytes,
+            total_bytes,
+            ..
+        } => Some(UpdateCardModel {
+            version,
+            detail: format!(
+                "{} · {} / {}",
+                locale::text("Downloading", "正在下载", "正在下載"),
+                update_size_label(*downloaded_bytes),
+                update_size_label(*total_bytes)
+            ),
+            download_url,
+            primary: None,
+            progress: Some(if *total_bytes == 0 {
+                0.0
+            } else {
+                *downloaded_bytes as f32 / *total_bytes as f32
+            }),
+            accent: theme::accent_blue(),
+        }),
+        UpdateState::Verifying { .. } => Some(UpdateCardModel {
+            version,
+            detail: locale::text(
+                "Verifying the signed package",
+                "正在校验已签名安装包",
+                "正在校驗已簽名安裝包",
+            )
+            .to_string(),
+            download_url,
+            primary: None,
+            progress: None,
+            accent: theme::accent_blue(),
+        }),
+        UpdateState::Staged { path, .. } => Some(UpdateCardModel {
+            version,
+            detail: locale::text(
+                "Downloaded and verified",
+                "已下载并校验通过",
+                "已下載並校驗通過",
+            )
+            .to_string(),
+            download_url,
+            primary: Some(UpdateCardAction::Install(path.clone())),
+            progress: None,
+            accent: theme::accent_green(),
+        }),
+        UpdateState::Installing { .. } => Some(UpdateCardModel {
+            version,
+            detail: locale::text(
+                "Waiting for the system installer",
+                "正在等待系统安装完成",
+                "正在等待系統安裝完成",
+            )
+            .to_string(),
+            download_url,
+            primary: None,
+            progress: None,
+            accent: theme::accent_green(),
+        }),
+        UpdateState::RestartRequired { .. } => Some(UpdateCardModel {
+            version,
+            detail: locale::text(
+                "Installed. Reopen Vibex to use it.",
+                "已安装，重新打开 Vibex 后生效。",
+                "已安裝，重新開啟 Vibex 後生效。",
+            )
+            .to_string(),
+            download_url,
+            primary: None,
+            progress: None,
+            accent: theme::accent_green(),
+        }),
+        UpdateState::Unsupported { .. } => Some(UpdateCardModel {
+            version,
+            detail: locale::text(
+                "No package matches this device. Open the release page to download it.",
+                "没有适用于此设备的安装包，请前往发布页下载。",
+                "沒有適用於此裝置的安裝包，請前往發佈頁下載。",
+            )
+            .to_string(),
+            download_url,
+            primary: None,
+            progress: None,
+            accent: theme::accent_yellow(),
+        }),
+        UpdateState::Error { .. } => Some(UpdateCardModel {
+            version,
+            detail: locale::text(
+                "The update did not finish. Try again.",
+                "更新未完成，请重试。",
+                "更新未完成，請重試。",
+            )
+            .to_string(),
+            download_url,
+            primary: Some(UpdateCardAction::Retry),
+            progress: None,
+            accent: theme::accent_red(),
+        }),
+        UpdateState::Idle | UpdateState::Checking => None,
+    }
+}
+
+/// Opens the Settings page that holds the update card.
+///
+/// Runs when the platform reports a tap on the update notification, which can
+/// arrive before any pointer event and while the Activity is still resuming,
+/// so the overlay is opened through the root window handle. The window is
+/// updated before the app entity is: re-entering the app from inside an entity
+/// update panics ("already being updated"), and the tap arrives with no window
+/// borrow of its own.
+fn open_update_surface(entity: &WeakEntity<MobileApp>, cx: &mut App) {
+    let Ok(handle) = entity.update(cx, |this, _| this.window_handle) else {
+        return;
+    };
+    let _ = cx.update_window(handle, |_, window, cx| {
+        let _ = entity.update(cx, |this, cx| {
+            this.show_settings(window, cx);
+            // The card sits at the end of the page, under the preferences.
+            this.settings_scroll.scroll_to_bottom();
+        });
+    });
+}
+
+/// The quiet status line the About section shows while no release is waiting.
+fn update_status_detail(state: &UpdateState) -> String {
+    match state {
+        UpdateState::Checking => {
+            locale::text("Checking for updates…", "正在检查更新…", "正在檢查更新…").to_string()
+        }
+        UpdateState::Error { .. } => {
+            locale::text("Update check failed", "检查更新失败", "檢查更新失敗").to_string()
+        }
+        UpdateState::Unsupported { .. } => locale::text(
+            "This build cannot install updates",
+            "此版本无法安装更新",
+            "此版本無法安裝更新",
+        )
+        .to_string(),
+        _ => locale::text("Up to date", "已是最新版本", "已是最新版本").to_string(),
+    }
+}
+
 impl MobileApp {
     fn cycle_new_session_project(
         &mut self,
@@ -14872,17 +15221,278 @@ impl MobileApp {
             .into_any_element()
     }
 
+    /// The About section's version row and the update surface under it.
+    ///
+    /// Without an updater — a build that carries no release verification key,
+    /// or a platform whose store owns replacement — this is exactly the version
+    /// row the app has always shown. With one, the row is followed by either
+    /// the quiet state of the last check or the card for the release waiting to
+    /// be installed.
+    fn render_update_section(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let version_row = || {
+            settings_info_row(
+                "mobile-settings-version",
+                "brand/logo.svg",
+                locale::common("Version").to_string(),
+                update::installed_version(),
+                theme::text_muted(),
+            )
+        };
+        let Some(snapshot) = self.update_snapshot.as_ref() else {
+            return version_row();
+        };
+        let Some(card) = update_card_model(&snapshot.state) else {
+            return div()
+                .flex()
+                .flex_col()
+                .child(version_row())
+                .child(self.render_update_status_row(&snapshot.state, cx))
+                .into_any_element();
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(version_row())
+            .child(self.render_update_card(&card, cx))
+            .into_any_element()
+    }
+
+    /// The manual check, with the state of the last one beside it.
+    ///
+    /// Automatic checks already run at startup, on resume, and every six hours;
+    /// this row exists so a user who wants to know now does not have to wait
+    /// for the next one.
+    fn render_update_status_row(
+        &self,
+        state: &UpdateState,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let accent = match state {
+            UpdateState::Error { .. } => theme::accent_red(),
+            _ => theme::text_muted(),
+        };
+        settings_info_row_base(
+            "mobile-settings-update-check",
+            "icons/refresh.svg",
+            locale::text("Check for updates", "检查更新", "檢查更新").to_string(),
+            update_status_detail(state),
+            accent,
+        )
+        .debug_selector(|| "mobile-settings-update-check".to_string())
+        .aria_label(locale::text("Check for updates", "检查更新", "檢查更新"))
+        .cursor_pointer()
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|_, _, _, cx| {
+                update::check_now();
+                cx.notify();
+            }),
+        )
+        .into_any_element()
+    }
+
+    /// The release waiting to be installed, with both ways to install it.
+    fn render_update_card(
+        &self,
+        card: &UpdateCardModel,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let title = format!(
+            "{} {}",
+            locale::text("Update available", "有新版本可用", "有新版本可用"),
+            card.version
+        );
+        let mut actions = div().flex().gap(px(theme::SPACING_SM));
+        if let Some(action) = card.primary.clone() {
+            let label = match action {
+                UpdateCardAction::Download => {
+                    locale::text("Download & install", "下载并安装", "下載並安裝")
+                }
+                UpdateCardAction::Install(_) => locale::text("Install", "安装", "安裝"),
+                UpdateCardAction::Retry => locale::common("Retry"),
+            };
+            actions = actions.child(
+                update_card_button("mobile-settings-update-install", label.to_string(), true)
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            match &action {
+                                UpdateCardAction::Download => update::download_and_install(),
+                                UpdateCardAction::Install(path) => update::install_staged(path),
+                                UpdateCardAction::Retry => update::check_now(),
+                            }
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        actions = actions.child(
+            update_card_button(
+                "mobile-settings-update-page",
+                locale::text("Open download page", "打开下载页", "開啟下載頁").to_string(),
+                false,
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener({
+                    let url = card.download_url.clone();
+                    move |_, _, _, cx| {
+                        update::open_download_page(&url);
+                        cx.notify();
+                    }
+                }),
+            ),
+        );
+        div()
+            .id("mobile-settings-update-card")
+            .debug_selector(|| "mobile-settings-update-card".to_string())
+            .w_full()
+            .mb(px(theme::SPACING_XS))
+            .rounded(px(theme::RADIUS_CONTROL))
+            .border_1()
+            .border_color(theme::border_subtle())
+            .bg(theme::bg_card_dim())
+            .px(px(theme::SPACING_MD))
+            .py(px(theme::SPACING_SM))
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACING_SM))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        svg()
+                            .path("icons/download.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(card.accent),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(theme::FONT_BODY))
+                                    .text_color(theme::text_primary())
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_color(theme::text_muted())
+                                    .child(card.detail.clone()),
+                            ),
+                    ),
+            )
+            .when_some(card.progress, |body, fraction| {
+                body.child(update_progress_bar(
+                    "mobile-settings-update-progress",
+                    fraction,
+                ))
+            })
+            .child(actions)
+            .into_any_element()
+    }
+
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let host_label = self.active_host_label();
-        let host_url = self.active_host_url();
-        let server_id = self
-            .active_host_id
-            .as_deref()
-            .and_then(|id| self.known_hosts.iter().find(|host| host.id == id))
-            .map(|host| host.bundle.expected_server_id.clone())
-            .unwrap_or_default();
-        let connection_online = self.backend.as_ref().is_some_and(|backend| {
-            backend.connection_state().state == RemoteConnectionState::Online
+        // The pairing page opens Settings too (an update notification can beat
+        // the first pairing), and a phone with no runtime has nothing to say in
+        // the Connection section.
+        let connection_section = self.active_host_entry().is_some().then(|| {
+            let host_label = self.active_host_label();
+            let host_url = self.active_host_url();
+            let server_id = self
+                .active_host_id
+                .as_deref()
+                .and_then(|id| self.known_hosts.iter().find(|host| host.id == id))
+                .map(|host| host.bundle.expected_server_id.clone())
+                .unwrap_or_default();
+            let connection_online = self.backend.as_ref().is_some_and(|backend| {
+                backend.connection_state().state == RemoteConnectionState::Online
+            });
+            div()
+                .flex()
+                .flex_col()
+                .child(overlay_section_heading("Connection"))
+                .child(settings_info_row(
+                    "mobile-settings-host",
+                    "icons/server.svg",
+                    host_label,
+                    if connection_online {
+                        locale::common("Connected").to_string()
+                    } else {
+                        locale::common("Offline").to_string()
+                    },
+                    if connection_online {
+                        theme::accent_green()
+                    } else {
+                        theme::accent_red()
+                    },
+                ))
+                .child(settings_info_row(
+                    "mobile-settings-host-url",
+                    "icons/server.svg",
+                    locale::text("Host", "主机", "主機").to_string(),
+                    host_url,
+                    theme::text_muted(),
+                ))
+                .when(!server_id.is_empty(), |body| {
+                    body.child(settings_info_row(
+                        "mobile-settings-server-id",
+                        "icons/server.svg",
+                        "Server ID".to_string(),
+                        server_id,
+                        theme::text_muted(),
+                    ))
+                })
+                .child(
+                    div()
+                        .id("mobile-settings-switch-host")
+                        .w_full()
+                        .min_h(px(theme::TOUCH_TARGET))
+                        .mb(px(theme::SPACING_XS))
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .border_1()
+                        .border_color(theme::border_default())
+                        .px(px(theme::SPACING_MD))
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::SPACING_SM))
+                        .cursor_pointer()
+                        .active(|style| style.bg(theme::row_pressed_bg()))
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::open_pairing))
+                        .child(
+                            svg()
+                                .path("icons/server.svg")
+                                .size(px(theme::ICON_SM))
+                                .text_color(theme::text_secondary()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(theme::FONT_BODY))
+                                .text_color(theme::text_secondary())
+                                .child(locale::common("Switch host")),
+                        )
+                        .child(
+                            svg()
+                                .path("icons/chevron-right.svg")
+                                .size(px(theme::ICON_SM))
+                                .text_color(theme::text_muted()),
+                        ),
+                )
+                .into_any_element()
         });
         let timeline_settings = self.effective_timeline_display_settings();
         let timeline_override = self.active_timeline_display_override();
@@ -14921,74 +15531,7 @@ impl MobileApp {
                     .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
                     .px(px(theme::SPACING_LG))
                     .py(px(theme::SPACING_MD))
-                    .child(overlay_section_heading("Connection"))
-                    .child(settings_info_row(
-                        "mobile-settings-host",
-                        "icons/server.svg",
-                        host_label,
-                        if connection_online {
-                            locale::common("Connected").to_string()
-                        } else {
-                            locale::common("Offline").to_string()
-                        },
-                        if connection_online {
-                            theme::accent_green()
-                        } else {
-                            theme::accent_red()
-                        },
-                    ))
-                    .child(settings_info_row(
-                        "mobile-settings-host-url",
-                        "icons/server.svg",
-                        locale::text("Host", "主机", "主機").to_string(),
-                        host_url,
-                        theme::text_muted(),
-                    ))
-                    .when(!server_id.is_empty(), |body| {
-                        body.child(settings_info_row(
-                            "mobile-settings-server-id",
-                            "icons/server.svg",
-                            "Server ID".to_string(),
-                            server_id,
-                            theme::text_muted(),
-                        ))
-                    })
-                    .child(
-                        div()
-                            .id("mobile-settings-switch-host")
-                            .w_full()
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .mb(px(theme::SPACING_XS))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_default())
-                            .px(px(theme::SPACING_MD))
-                            .flex()
-                            .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::open_pairing))
-                            .child(
-                                svg()
-                                    .path("icons/server.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_secondary()),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_size(px(theme::FONT_BODY))
-                                    .text_color(theme::text_secondary())
-                                    .child(locale::common("Switch host")),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/chevron-right.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_muted()),
-                            ),
-                    )
+                    .when_some(connection_section, |body, section| body.child(section))
                     .child(overlay_section_heading("Session timeline"))
                     .child(self.render_timeline_boolean_setting_row(
                         timeline_settings.show_agent_generation_status,
@@ -15185,46 +15728,45 @@ impl MobileApp {
                         )
                     })
                     .child(overlay_section_heading("About"))
-                    .child(settings_info_row(
-                        "mobile-settings-version",
-                        "brand/logo.svg",
-                        locale::common("Version").to_string(),
-                        env!("CARGO_PKG_VERSION").to_string(),
-                        theme::text_muted(),
-                    ))
-                    .child(
-                        div()
-                            .id("mobile-settings-disconnect")
-                            .debug_selector(|| "mobile-settings-disconnect".to_string())
-                            .mt(px(theme::SPACING_LG))
-                            .mb(px(theme::SPACING_XL))
-                            .h(px(theme::TOUCH_TARGET))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::accent_red())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(theme::FONT_BODY))
-                            .text_color(theme::accent_red())
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            // The row above switches runtime; this one ends the
-                            // connection. Neither is a deletion: every saved
-                            // runtime keeps its credential, and removing one is
-                            // its own confirmed action on the pairing page.
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, event, window, cx| {
-                                    this.disconnect_host(event, window, cx);
-                                }),
-                            )
-                            .child(locale::text(
-                                "Disconnect desktop",
-                                "断开桌面端",
-                                "中斷桌面版連線",
-                            )),
-                    ),
+                    .child(self.render_update_section(cx))
+                    // Without a runtime there is no connection to end, so the
+                    // pairing page's Settings page stops at About.
+                    .when(self.backend.is_some(), |body| {
+                        body.child(
+                            div()
+                                .id("mobile-settings-disconnect")
+                                .debug_selector(|| "mobile-settings-disconnect".to_string())
+                                .mt(px(theme::SPACING_LG))
+                                .mb(px(theme::SPACING_XL))
+                                .h(px(theme::TOUCH_TARGET))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(theme::accent_red())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(theme::FONT_BODY))
+                                .text_color(theme::accent_red())
+                                .cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                // The row above switches runtime; this one ends
+                                // the connection. Neither is a deletion: every
+                                // saved runtime keeps its credential, and
+                                // removing one is its own confirmed action on
+                                // the pairing page.
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event, window, cx| {
+                                        this.disconnect_host(event, window, cx);
+                                    }),
+                                )
+                                .child(locale::text(
+                                    "Disconnect desktop",
+                                    "断开桌面端",
+                                    "中斷桌面版連線",
+                                )),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -20634,6 +21176,187 @@ mod tests {
         assert!(
             focused,
             "the rename field should own the caret when the sheet opens"
+        );
+    }
+
+    fn update_test_release(artifact: bool) -> vibex_app_update::UpdateRelease {
+        vibex_app_update::UpdateRelease {
+            version: semver::Version::new(0, 2, 0),
+            tag: "v0.2.0".to_string(),
+            published_at: "2026-01-01T00:00:00Z".to_string(),
+            notes_url: url::Url::parse("https://github.com/vibex-ai/vibex/releases/tag/v0.2.0")
+                .expect("release page URL"),
+            artifact: artifact.then(|| vibex_app_update::UpdateArtifact {
+                os: "android".to_string(),
+                arch: "arm64".to_string(),
+                package: "apk".to_string(),
+                install_mode: vibex_app_update::InstallMode::SystemInstaller,
+                url: url::Url::parse(
+                    "https://github.com/vibex-ai/vibex/releases/download/v0.2.0/vibex-0.2.0-android-arm64.apk",
+                )
+                .expect("artifact URL"),
+                size: 12 * 1024 * 1024,
+                sha256: "0".repeat(64),
+                sha512: None,
+            }),
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn update_cards_expose_the_state_the_user_acts_on() {
+        assert!(
+            update_card_model(&UpdateState::Idle).is_none(),
+            "an idle updater has nothing to install"
+        );
+        assert!(
+            update_card_model(&UpdateState::Checking).is_none(),
+            "a check in flight has nothing to install yet"
+        );
+
+        let available = update_card_model(&UpdateState::Available {
+            release: update_test_release(true),
+        })
+        .expect("an available release shows a card");
+        assert_eq!(available.primary, Some(UpdateCardAction::Download));
+        assert!(
+            available.download_url.ends_with("-android-arm64.apk"),
+            "the manual path opens the signed package"
+        );
+        assert_eq!(available.progress, None);
+        assert!(
+            available.detail.contains("12.0 MB"),
+            "the card states the download size: {}",
+            available.detail
+        );
+
+        let downloading = update_card_model(&UpdateState::Downloading {
+            release: update_test_release(true),
+            downloaded_bytes: 3 * 1024 * 1024,
+            total_bytes: 12 * 1024 * 1024,
+        })
+        .expect("a download in flight keeps the card");
+        assert_eq!(downloading.primary, None, "a download cannot be restarted");
+        assert_eq!(downloading.progress, Some(0.25));
+
+        let staged = update_card_model(&UpdateState::Staged {
+            release: update_test_release(true),
+            path: PathBuf::from("/data/files/updates/0.2.0/vibex-0.2.0-android-arm64.apk"),
+        })
+        .expect("a staged package keeps the card");
+        assert_eq!(
+            staged.primary,
+            Some(UpdateCardAction::Install(PathBuf::from(
+                "/data/files/updates/0.2.0/vibex-0.2.0-android-arm64.apk"
+            )))
+        );
+
+        // A manifest without an Android artifact still has a release page, so
+        // the card falls back to it instead of offering a download.
+        let unsupported = update_card_model(&UpdateState::Unsupported {
+            release: update_test_release(false),
+            reason: "no package".to_string(),
+        })
+        .expect("an unsupported release still shows the page");
+        assert_eq!(unsupported.primary, None);
+        assert_eq!(
+            unsupported.download_url,
+            "https://github.com/vibex-ai/vibex/releases/tag/v0.2.0"
+        );
+    }
+
+    #[gpui::test]
+    fn an_available_update_offers_both_install_paths_in_settings(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.update_snapshot = Some(vibex_app_update::UpdateSnapshot {
+                state: UpdateState::Available {
+                    release: update_test_release(true),
+                },
+                ..vibex_app_update::UpdateSnapshot::default()
+            });
+            app.open_settings(&noop_mouse_up(), window, cx);
+            app
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.settings_scroll.scroll_to_bottom();
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // The phone is still on the pairing page: an update must be installable
+        // before the first desktop is paired, which is why Settings renders
+        // there too.
+        for selector in [
+            "mobile-settings-update-card",
+            "mobile-settings-update-install",
+            "mobile-settings-update-page",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} should be visible in About"
+            );
+        }
+        assert_eq!(
+            app.read_with(cx, |app, _| app.update_snapshot.as_ref().map(|snapshot| {
+                matches!(snapshot.state, UpdateState::Available { .. })
+            })),
+            Some(true)
+        );
+        // Both ways out are visible: the in-app install and the browser page.
+        let card = cx
+            .debug_bounds("mobile-settings-update-card")
+            .expect("card bounds");
+        let install = cx
+            .debug_bounds("mobile-settings-update-install")
+            .expect("install button bounds");
+        let page = cx
+            .debug_bounds("mobile-settings-update-page")
+            .expect("download page button bounds");
+        assert!(card.contains(&install.center()));
+        assert!(card.contains(&page.center()));
+    }
+
+    #[gpui::test]
+    fn an_update_notification_tap_opens_the_settings_card(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.update_snapshot = Some(vibex_app_update::UpdateSnapshot {
+                state: UpdateState::Available {
+                    release: update_test_release(true),
+                },
+                ..vibex_app_update::UpdateSnapshot::default()
+            });
+            app
+        });
+        cx.run_until_parked();
+
+        // The platform reports the tap with no window borrow, exactly like the
+        // stream task does.
+        // The platform reports the tap on the foreground executor, exactly like
+        // the stream task does.
+        let entity = app.update(cx, |_, cx| cx.weak_entity());
+        cx.spawn(|cx| async move {
+            cx.update(|cx| open_update_surface(&entity, cx));
+        })
+        .detach();
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.overlay),
+            Some(MobileOverlay::Settings),
+            "the notification tap lands on the update card"
         );
     }
 }

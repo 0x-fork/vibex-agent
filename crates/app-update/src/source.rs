@@ -78,26 +78,7 @@ impl GitHubReleaseSource {
                 "the update feed URL is invalid",
             ));
         }
-        let client = Client::builder()
-            .user_agent(format!("Vibex/{} updater", env!("CARGO_PKG_VERSION")))
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= 5 {
-                    return attempt.error("too many update redirects");
-                }
-                if redirect_host_allowed(attempt.url()) {
-                    attempt.follow()
-                } else {
-                    attempt.error("update redirect left the trusted GitHub boundary")
-                }
-            }))
-            .build()
-            .map_err(|_| {
-                AppUpdateError::new(
-                    "app_update_http_client_unavailable",
-                    "the update network client could not be initialized",
-                )
-            })?;
+        let client = update_http_client()?;
         Ok(Self {
             client,
             feed_url,
@@ -280,6 +261,49 @@ impl UpdateSource for GitHubReleaseSource {
         })?;
         Ok(())
     }
+}
+
+/// Builds the HTTPS client every update request shares.
+///
+/// Android's platform verifier can reject otherwise valid public chains when a
+/// leaf omits an OCSP responder, so the Android build pins the bundled Mozilla
+/// WebPKI store — the same decision the remote client makes for its own HTTP
+/// traffic.
+fn update_http_client() -> AppUpdateResult<Client> {
+    let builder = Client::builder()
+        .user_agent(format!("Vibex/{} updater", env!("CARGO_PKG_VERSION")))
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("too many update redirects");
+            }
+            if redirect_host_allowed(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("update redirect left the trusted GitHub boundary")
+            }
+        }));
+    #[cfg(target_os = "android")]
+    let builder = {
+        let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(|certificate| {
+                reqwest::Certificate::from_der(certificate.as_ref()).map_err(|_| {
+                    AppUpdateError::new(
+                        "app_update_tls_root_certificate_invalid",
+                        "the bundled update TLS root certificate is invalid",
+                    )
+                })
+            })
+            .collect::<AppUpdateResult<Vec<_>>>()?;
+        builder.tls_certs_only(roots)
+    };
+    builder.build().map_err(|_| {
+        AppUpdateError::new(
+            "app_update_http_client_unavailable",
+            "the update network client could not be initialized",
+        )
+    })
 }
 
 fn latest_channel_release(

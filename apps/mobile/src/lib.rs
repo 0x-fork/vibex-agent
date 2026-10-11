@@ -27,6 +27,7 @@ mod selection_menu;
 mod sidebar;
 mod storage;
 mod theme;
+mod update;
 mod workbench;
 
 use std::path::PathBuf;

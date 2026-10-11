@@ -113,7 +113,34 @@ For stable Android releases, configure the repository secret
 `VIBEX_ANDROID_KEYSTORE_BASE64` together with
 `VIBEX_ANDROID_KEYSTORE_PASSWORD`; set `VIBEX_ANDROID_KEY_PASSWORD` when the key
 password differs, and set the `VIBEX_ANDROID_KEY_ALIAS` repository variable when
-the alias is not `vibex`.
+the alias is not `vibex`. Keep one release key for every channel: Android only
+replaces an installed app when the new APK carries the same signing key, so an
+rc installed under the ephemeral CI key cannot be updated in place by a stable
+release.
+
+### Android updates
+
+The Android client has no application store. It installs the signed APK from
+the GitHub Release, and the release manifest carries a matching
+`android | arm64 | apk | system_installer` artifact next to the desktop
+packages. Builds that should check for updates need `VIBEX_UPDATE_PUBLIC_KEY`
+in the Android build environment (the release workflow passes the repository
+variable of the same name), exactly like the desktop updater.
+
+- Only the stable channel is offered. A prerelease install still learns about
+  the stable release it leads up to; this client never follows rc or preview
+  tags.
+- The app verifies the manifest signature and the APK SHA-256 before it hands
+  the staged file to the system package installer through its FileProvider.
+  Android then enforces signing-key continuity.
+- Users can either download and install in the app or open the signed download
+  in a browser; both start from the same verified release metadata.
+- `REQUEST_INSTALL_PACKAGES` and the `${applicationId}.updates` provider are
+  the only new platform surface. Because the app is not distributed through
+  Google Play, the sideload flow carries no store policy constraint; a Play
+  build would have to use Play In-App Updates instead.
+- A build without the verification key stays silent: it shows the installed
+  version and runs no checks.
 
 Updater manifest signing is optional. Set the repository variable
 `VIBEX_UPDATE_SIGNING_ENABLED=true`, `VIBEX_UPDATE_PUBLIC_KEY`, and the
