@@ -5887,6 +5887,7 @@ struct TimelineOlderPrefetch {
     has_older: bool,
     in_flight: usize,
     following_bottom: bool,
+    scrollable: bool,
     loading: bool,
 }
 
@@ -5894,12 +5895,18 @@ struct TimelineOlderPrefetch {
 ///
 /// The trigger is deliberately not the literal top: a page takes a round trip,
 /// so waiting for it would show an empty band. It is also deliberately not
-/// "whenever there is history below": a reader parked at the bottom has no use
-/// for pages they will never scroll to.
+/// "whenever there is history below": a reader parked at the bottom of a
+/// scrollable transcript has no use for pages they will never scroll to.
+///
+/// A transcript that does not fill its viewport is the exception. There is no
+/// scroll for the reader to make, so the window has to extend itself until
+/// there is a screenful to read or the history runs out — otherwise opening a
+/// turn whose rows the projection folds into a handful leaves the reader with
+/// that handful and no way to ask for the rest.
 fn timeline_should_prefetch_older(state: TimelineOlderPrefetch) -> bool {
     !state.loading
         && state.has_older
-        && !state.following_bottom
+        && (!state.following_bottom || !state.scrollable)
         && state.in_flight < AGENT_TIMELINE_OLDER_MAX_IN_FLIGHT
         && state.viewport_height > 0.0
         && state.distance_to_top <= state.viewport_height * AGENT_TIMELINE_OLDER_PREFETCH_SCREENS
@@ -8906,6 +8913,7 @@ impl VibexWorkbench {
             has_older: self.timeline_has_older,
             in_flight: self.timeline_older_in_flight,
             following_bottom: self.timeline_follow.following_bottom,
+            scrollable: self.timeline_scroll.max_offset().y > px(0.0),
             loading: self.agent_loading,
         }) {
             return;
@@ -16437,15 +16445,15 @@ impl VibexWorkbench {
                             "icons/vibex/chevrons-down-up.svg"
                         }))
                         .tooltip(if collapsed {
-                            locale::text("Show delegated sessions", "展开委派会话", "展開委派會話")
+                            locale::text("Show child sessions", "展开子会话", "展開子會話")
                         } else {
-                            locale::text("Hide delegated sessions", "折叠委派会话", "摺疊委派會話")
+                            locale::text("Hide child sessions", "折叠子会话", "摺疊子會話")
                         })
                         .toggled(!collapsed)
                         .accessibility_label(if collapsed {
-                            locale::text("Show delegated sessions", "展开委派会话", "展開委派會話")
+                            locale::text("Show child sessions", "展开子会话", "展開子會話")
                         } else {
-                            locale::text("Hide delegated sessions", "折叠委派会话", "摺疊委派會話")
+                            locale::text("Hide child sessions", "折叠子会话", "摺疊子會話")
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
@@ -16618,10 +16626,20 @@ impl VibexWorkbench {
             })
             .on_click({
                 let focus_handle = focus_handle.clone();
-                move |_, window, cx| {
+                let branch_toggle_session_id = session_id.clone();
+                move |event: &ClickEvent, window, cx| {
                     // Clicking a row puts the keyboard on it, which is what
                     // makes the arrow keys walk the tree from there.
                     window.focus(&focus_handle, cx);
+                    // A double click folds or unfolds the branch this row owns,
+                    // the same gesture its parent row answers to. The first
+                    // click has already selected the row.
+                    if event.click_count() > 1 && has_children {
+                        let _ = entity.update(cx, |this, cx| {
+                            this.toggle_delegated_branch(&branch_toggle_session_id, cx);
+                        });
+                        return;
+                    }
                     let Some(session_id) = click_session.clone() else {
                         return;
                     };
@@ -45308,6 +45326,7 @@ impl VibexWorkbench {
         let select_session_id = session.id.clone();
         let select_session_item = session_item.clone();
         let batch_id = session_id_string.clone();
+        let branch_toggle_session_id = session_id_string.clone();
         let pin_session_id = session.id.clone();
         let rename_session_id = session.id.clone();
         let delete_session_id = session.id.clone();
@@ -45755,6 +45774,16 @@ impl VibexWorkbench {
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         window.focus(&row_focus, cx);
                         this.clear_sidebar_context_menu_target(cx);
+                        // A double click folds or unfolds the branch the way the
+                        // row's trailing toggle does; the first click of the pair
+                        // has already selected the row, so the pair never loses
+                        // the navigation a single click performs.
+                        if event.click_count() > 1
+                            && this.delegated_has_children(&branch_toggle_session_id)
+                        {
+                            this.toggle_delegated_branch(&branch_toggle_session_id, cx);
+                            return;
+                        }
                         if this.sidebar_batch_mode {
                             this.sidebar_state.toggle_selected(batch_id.clone());
                             cx.notify();
@@ -99906,6 +99935,7 @@ mod tests {
             has_older: true,
             in_flight: 0,
             following_bottom: false,
+            scrollable: true,
             loading: false,
         };
         // At the top, and a screen and a half short of it, both ask.
@@ -99930,6 +99960,20 @@ mod tests {
         }));
         assert!(!timeline_should_prefetch_older(TimelineOlderPrefetch {
             following_bottom: true,
+            ..base
+        }));
+        // Unless there is nothing to scroll: a transcript shorter than its
+        // viewport has to extend itself, or a folded turn would leave the
+        // reader with a few rows and no gesture to ask for the rest.
+        assert!(timeline_should_prefetch_older(TimelineOlderPrefetch {
+            following_bottom: true,
+            scrollable: false,
+            ..base
+        }));
+        assert!(!timeline_should_prefetch_older(TimelineOlderPrefetch {
+            following_bottom: true,
+            scrollable: false,
+            has_older: false,
             ..base
         }));
         assert!(!timeline_should_prefetch_older(TimelineOlderPrefetch {

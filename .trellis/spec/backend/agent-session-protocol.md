@@ -2119,13 +2119,20 @@ and `AdapterDiagnosticsRepository`.
 - `FetchTimelineRequest.maxTurns` says where a window *opens*, not which end
   to keep: it opens on a conversational turn boundary — a turn starts at a
   user message — so a page never splits a question from its answer.
-  `FetchTimelineRequest.maxBytes` bounds what the page costs to move, because
-  `limit` counts items and one file operation can outweigh hundreds of
-  messages. Both cut the same end as `limit`, so a page always carries at
-  least one item and always keeps the end the reader is anchored to. An
-  anchored-end page that is short of the session end reports `hasNewer`, and
-  a reader that treats that as "walk forward until it clears" turns opening a
-  session into replaying it.
+- A window that names both its turns and its bytes is bounded by the **bytes**,
+  not by `limit`. One turn is a handful of rows or tens of thousands, so a row
+  count is not a size: `limit` at a page-sized value cuts the newest turn in
+  half, and the reader opens the session onto the tail of a turn — the work and
+  the conclusion, with the question that produced them above the cut. The row
+  count survives only as a safety ceiling against a caller that forgets the
+  budget. A page always carries at least one item and always keeps the end the
+  reader is anchored to; an anchored-end page short of the session end reports
+  `hasNewer`, and a reader that treats that as "walk forward until it clears"
+  turns opening a session into replaying it.
+- A client extends its window on its own when the transcript does not fill the
+  viewport. The reader has no scroll to make in that state, so waiting for a
+  scroll gesture to ask for the next page leaves them with however few rows the
+  projection folded the window into.
 - Timeline reads are projected to `TimelinePayloadDepth::Summary`: file
   snapshots (`oldText`/`newText`/`patch`) and the opened-activity parts of
   `rawExtension` (`contentBlocks`, `rawOutput`, `meta`) are withheld, while the

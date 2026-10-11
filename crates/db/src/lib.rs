@@ -9229,7 +9229,19 @@ impl TimelineRepository {
         max_bytes: Option<u32>,
         depth: TimelinePayloadDepth,
     ) -> VibexResult<TimelinePage> {
-        let limit = limit.clamp(1, 500) as i64;
+        // A row count cannot bound a conversational window: one turn is a few
+        // rows or tens of thousands, and cutting one in half is how a reader
+        // opens a session onto half a question with the answer's conclusion
+        // below it. A window that names its turns and its bytes is bounded by
+        // the bytes; the row count stays as a safety net for a caller that
+        // forgets the budget.
+        let turn_window_budgeted =
+            max_turns.is_some_and(|turns| turns > 0) && max_bytes.is_some_and(|bytes| bytes > 0);
+        let limit = if turn_window_budgeted {
+            TIMELINE_TURN_WINDOW_ITEM_CEILING
+        } else {
+            limit.clamp(1, 500) as i64
+        };
         // The forward cursor wins when both are set, matching `fetch_after`.
         let (mut lower, upper) = match (after_sequence, before_sequence) {
             (Some(after_sequence), _) => (Some(after_sequence.max(0)), None),
@@ -15789,6 +15801,13 @@ fn map_provider_usage_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provid
     })
 }
 
+/// The row ceiling for a turn window that carries a byte budget.
+///
+/// High enough that a window's byte budget is what actually bounds it — a
+/// single turn can be tens of thousands of rows — and low enough that a
+/// malformed request cannot ask the database for a whole session.
+const TIMELINE_TURN_WINDOW_ITEM_CEILING: i64 = 20_000;
+
 /// A merge key for one streamed payload, part of deciding whether two rows
 /// belong to the same segment.
 ///
@@ -20406,8 +20425,8 @@ mod tests {
         );
         assert_eq!(
             page.items.len(),
-            500,
-            "the item limit still bounds the page"
+            968,
+            "the byte budget bounds the window, so all eight turns fit"
         );
         // The window opens on a turn boundary, but a window wider than one
         // page is cut at the anchored end, so the page itself may begin
@@ -20439,7 +20458,9 @@ mod tests {
             page.start_sequence,
             "an older page ends beside the cursor it was asked from"
         );
-        assert!(older.has_older);
+        // It reaches the start of the history, so there is nothing below it.
+        assert_eq!(older.start_sequence, Some(1));
+        assert!(!older.has_older);
 
         // A byte budget cuts the same end: the newest rows survive.
         let squeezed = TimelineRepository::fetch_window(
@@ -20476,6 +20497,144 @@ mod tests {
                 .map(|item| item.sequence)
                 .collect::<Vec<_>>(),
             vec![last_sequence - 2, last_sequence - 1, last_sequence]
+        );
+
+        cleanup_db(temp);
+    }
+
+    /// A window that names its turns and its bytes is bounded by the bytes.
+    ///
+    /// A real session puts a handful of rows in one turn and tens of thousands
+    /// in the next, so a row count is not a size. Capping a turn window at the
+    /// page limit cuts the newest turn in half, and a reader then opens the
+    /// session onto the tail of a turn: the work and the conclusion are there
+    /// but the question that produced them is above the cut.
+    #[test]
+    fn a_turn_window_carries_the_question_however_many_rows_the_turn_has() {
+        let temp = temp_db_path("turn-window-question");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-question",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Long turn".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Initializing,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
+
+        // An older turn with many rows, then the newest turn: one question
+        // followed by 799 streamed updates of a single tool call.
+        TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "earlier question".to_string(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        for row in 0..600 {
+            TimelineRepository::append(
+                &mut conn,
+                &session.id,
+                TimelineSource::Provider,
+                TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+                    tool_call_id: "earlier-call".to_string(),
+                    tool_name: "read_file".to_string(),
+                    status: vibex_core::ToolCallStatus::Progress,
+                    summary: format!("reading {row}"),
+                    input_summary: None,
+                    output_summary: None,
+                    raw_extension: None,
+                }),
+                None,
+                Some("earlier-call"),
+                TimelineRedactionState::None,
+            )
+            .unwrap();
+        }
+        let question = TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "what changed?".to_string(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        let mut last_sequence = question.sequence;
+        for row in 0..799 {
+            last_sequence = TimelineRepository::append(
+                &mut conn,
+                &session.id,
+                TimelineSource::Provider,
+                TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+                    tool_call_id: "final-call".to_string(),
+                    tool_name: "read_file".to_string(),
+                    status: vibex_core::ToolCallStatus::Progress,
+                    summary: format!("reading {row}"),
+                    input_summary: None,
+                    output_summary: None,
+                    raw_extension: None,
+                }),
+                None,
+                Some("final-call"),
+                TimelineRedactionState::None,
+            )
+            .unwrap()
+            .sequence;
+        }
+
+        let page = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            500,
+            Some(8),
+            Some(1_048_576),
+            TimelinePayloadDepth::Summary,
+        )
+        .unwrap();
+        assert_eq!(page.end_sequence, Some(last_sequence));
+        assert!(
+            page.items.len() > 500,
+            "the byte budget bounds the page, not the row count: got {}",
+            page.items.len()
+        );
+        assert!(
+            page.items
+                .iter()
+                .any(|item| item.sequence == question.sequence),
+            "the newest turn's question is inside its own window"
         );
 
         cleanup_db(temp);
