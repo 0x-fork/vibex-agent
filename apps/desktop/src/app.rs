@@ -86017,7 +86017,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
             .map(|(body, _)| body)
             .expect("session row renderer should remain inspectable");
-        assert!(session.contains("self.sidebar_drag_items(&session_item)"));
+        assert!(session.contains(".sidebar_drag_items(&session_item)"));
         assert!(session.contains("self.sidebar_batch_selection(&session_item)"));
         assert!(!session.contains("sidebar_move_selection_order("));
         assert!(!session.contains("sidebar_group_join_candidates_for_sessions("));
