@@ -139,8 +139,17 @@ variable of the same name), exactly like the desktop updater.
   the only new platform surface. Because the app is not distributed through
   Google Play, the sideload flow carries no store policy constraint; a Play
   build would have to use Play In-App Updates instead.
-- A build without the verification key stays silent: it shows the installed
-  version and runs no checks.
+- A build without the verification key still shows the version and the update
+  row, but states that update checks are not enabled and offers no action.
+  Export the key when building locally to exercise the real flow:
+
+  ```bash
+  VIBEX_MOBILE_PROFILE=release VIBEX_UPDATE_PUBLIC_KEY=<repository variable> \
+    bash apps/mobile/scripts/build-android.sh
+  ```
+- Settings reach the update section from the drawer footer and from the
+  top-right entry on the first pairing screen, so an update can be installed
+  before the first desktop is paired.
 
 Updater manifest signing is optional. Set the repository variable
 `VIBEX_UPDATE_SIGNING_ENABLED=true`, `VIBEX_UPDATE_PUBLIC_KEY`, and the

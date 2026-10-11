@@ -1199,8 +1199,14 @@ pub struct MobileApp {
     /// An in-flight authoritative runtime rename.
     host_rename_task: Option<Task<()>>,
     pending_notification_action: Option<notifications::NotificationAction>,
-    /// The stable-channel update state, or `None` when this platform or build
-    /// has no updater. The settings About section is the only surface.
+    /// Whether About carries the update surface at all: the native client
+    /// updates itself on Android and nowhere else.
+    update_supported: bool,
+    /// Whether this build can verify a release. A build without the release
+    /// verification key still names the state, but offers no action.
+    update_available: bool,
+    /// The stable-channel update state, or `None` until a check publishes one.
+    /// The settings About section is the only surface.
     update_snapshot: Option<UpdateSnapshot>,
     /// The root window, kept so a platform callback (a notification tap) can
     /// open an overlay without a pointer event.
@@ -1559,6 +1565,8 @@ impl MobileApp {
             resume_recovery_task: None,
             host_rename_task: None,
             pending_notification_action: None,
+            update_supported: update::supported(),
+            update_available: updates_enabled,
             update_snapshot: if updates_enabled {
                 update::snapshot()
             } else {
@@ -7288,6 +7296,30 @@ impl MobileApp {
                                 .disabled(self.pairing_busy)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.handle_navigate_back(&NavigateBack, window, cx);
+                                })),
+                        ),
+                )
+            })
+            // The first screen has no drawer to hold the settings entry, and
+            // the update card lives on that page, so the page carries its own.
+            .when(first_screen, |page| {
+                page.child(
+                    div()
+                        .debug_selector(|| "pairing-settings".to_string())
+                        .absolute()
+                        .top_0()
+                        .right_2()
+                        .child(
+                            Button::new("pairing-settings")
+                                .ghost()
+                                .size_11()
+                                .min_w(px(theme::TOUCH_TARGET))
+                                .min_h(px(theme::TOUCH_TARGET))
+                                .icon(gpui_component::Icon::default().path("icons/settings.svg"))
+                                .tooltip(locale::common("Settings"))
+                                .disabled(self.pairing_busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.show_settings(window, cx);
                                 })),
                         ),
                 )
@@ -14973,21 +15005,29 @@ fn open_update_surface(entity: &WeakEntity<MobileApp>, cx: &mut App) {
 }
 
 /// The quiet status line the About section shows while no release is waiting.
-fn update_status_detail(state: &UpdateState) -> String {
+fn update_status_detail(state: Option<&UpdateState>) -> String {
     match state {
-        UpdateState::Checking => {
+        // A build without the release verification key cannot verify what it
+        // would download, so it never checks.
+        None => locale::text(
+            "Update checks are not enabled in this build",
+            "此构建未启用更新检查",
+            "此構建未啟用更新檢查",
+        )
+        .to_string(),
+        Some(UpdateState::Checking) => {
             locale::text("Checking for updates…", "正在检查更新…", "正在檢查更新…").to_string()
         }
-        UpdateState::Error { .. } => {
+        Some(UpdateState::Error { .. }) => {
             locale::text("Update check failed", "检查更新失败", "檢查更新失敗").to_string()
         }
-        UpdateState::Unsupported { .. } => locale::text(
+        Some(UpdateState::Unsupported { .. }) => locale::text(
             "This build cannot install updates",
             "此版本无法安装更新",
             "此版本無法安裝更新",
         )
         .to_string(),
-        _ => locale::text("Up to date", "已是最新版本", "已是最新版本").to_string(),
+        Some(_) => locale::text("Up to date", "已是最新版本", "已是最新版本").to_string(),
     }
 }
 
@@ -15715,23 +15755,38 @@ impl MobileApp {
     /// be installed.
     fn render_update_section(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let version_row = || {
-            settings_info_row(
+            settings_info_row_base(
                 "mobile-settings-version",
                 "brand/logo.svg",
                 locale::common("Version").to_string(),
                 update::installed_version(),
                 theme::text_muted(),
             )
+            .debug_selector(|| "mobile-settings-version".to_string())
+            .into_any_element()
         };
-        let Some(snapshot) = self.update_snapshot.as_ref() else {
+        // Only Android updates itself; the version row is the whole section
+        // everywhere else.
+        if !self.update_supported {
             return version_row();
+        }
+        let Some(snapshot) = self.update_snapshot.as_ref() else {
+            // A build without the release verification key cannot check, but the
+            // section still says so: an empty About is indistinguishable from a
+            // missing feature.
+            return div()
+                .flex()
+                .flex_col()
+                .child(version_row())
+                .child(self.render_update_status_row(None, cx))
+                .into_any_element();
         };
         let Some(card) = update_card_model(&snapshot.state) else {
             return div()
                 .flex()
                 .flex_col()
                 .child(version_row())
-                .child(self.render_update_status_row(&snapshot.state, cx))
+                .child(self.render_update_status_row(Some(&snapshot.state), cx))
                 .into_any_element();
         };
         div()
@@ -15746,34 +15801,38 @@ impl MobileApp {
     ///
     /// Automatic checks already run at startup, on resume, and every six hours;
     /// this row exists so a user who wants to know now does not have to wait
-    /// for the next one.
+    /// for the next one. Without an updater the row is information only, so it
+    /// carries no tap target that would do nothing.
     fn render_update_status_row(
         &self,
-        state: &UpdateState,
+        state: Option<&UpdateState>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let accent = match state {
-            UpdateState::Error { .. } => theme::accent_red(),
+            Some(UpdateState::Error { .. }) => theme::accent_red(),
             _ => theme::text_muted(),
         };
-        settings_info_row_base(
+        let row = settings_info_row_base(
             "mobile-settings-update-check",
             "icons/refresh.svg",
             locale::text("Check for updates", "检查更新", "檢查更新").to_string(),
             update_status_detail(state),
             accent,
         )
-        .debug_selector(|| "mobile-settings-update-check".to_string())
-        .aria_label(locale::text("Check for updates", "检查更新", "檢查更新"))
-        .cursor_pointer()
-        .on_mouse_up(
-            MouseButton::Left,
-            cx.listener(|_, _, _, cx| {
-                update::check_now();
-                cx.notify();
-            }),
-        )
-        .into_any_element()
+        .debug_selector(|| "mobile-settings-update-check".to_string());
+        if !self.update_available {
+            return row.into_any_element();
+        }
+        row.aria_label(locale::text("Check for updates", "检查更新", "檢查更新"))
+            .cursor_pointer()
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    update::check_now();
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
     }
 
     /// The release waiting to be installed, with both ways to install it.
@@ -21982,6 +22041,10 @@ mod tests {
             theme::apply_component_theme(Some(window), cx);
             window.set_rem_size(gpui_component::Theme::global(cx).font_size);
             let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            // The host test runs the Android layout by hand: only Android
+            // carries the updater.
+            app.update_supported = true;
+            app.update_available = true;
             app.update_snapshot = Some(vibex_app_update::UpdateSnapshot {
                 state: UpdateState::Available {
                     release: update_test_release(true),
@@ -22040,6 +22103,8 @@ mod tests {
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
             let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.update_supported = true;
+            app.update_available = true;
             app.update_snapshot = Some(vibex_app_update::UpdateSnapshot {
                 state: UpdateState::Available {
                     release: update_test_release(true),
@@ -22065,6 +22130,63 @@ mod tests {
             app.read_with(cx, |app, _| app.overlay),
             Some(MobileOverlay::Settings),
             "the notification tap lands on the update card"
+        );
+    }
+
+    #[gpui::test]
+    fn about_names_the_update_state_without_a_verification_key(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            // An Android build compiled without the release verification key.
+            app.update_supported = true;
+            app.open_settings(&noop_mouse_up(), window, cx);
+            app
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.settings_scroll.scroll_to_bottom();
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        for selector in ["mobile-settings-version", "mobile-settings-update-check"] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} should be visible in About"
+            );
+        }
+        assert!(
+            cx.debug_bounds("mobile-settings-update-card").is_none(),
+            "a build that cannot verify a release shows no card"
+        );
+    }
+
+    #[gpui::test]
+    fn the_pairing_first_screen_opens_settings_from_its_top_right_button(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(app.read_with(cx, |app, _| app.mode), RootMode::Pairing);
+
+        click_mobile_control(cx, "pairing-settings");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.overlay),
+            Some(MobileOverlay::Settings),
+            "the first pairing screen carries the settings entry"
         );
     }
 }

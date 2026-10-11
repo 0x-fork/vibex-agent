@@ -132,6 +132,14 @@ pub fn installed_version() -> String {
     platform::installed_version().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
 }
 
+/// Whether this build and platform can actually check for updates.
+///
+/// An Android build without the release verification key reports `false`: the
+/// settings surface still names the state, but offers nothing to act on.
+pub fn available() -> bool {
+    current().is_some()
+}
+
 pub fn snapshot() -> Option<UpdateSnapshot> {
     current().map(|state| state.service.snapshot())
 }
