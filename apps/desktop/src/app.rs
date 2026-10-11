@@ -4581,6 +4581,80 @@ struct SidebarProjectionCache {
     groups: Rc<Vec<SidebarProjectProjection>>,
 }
 
+/// Where one sidebar session row belongs, for the move-selection comparisons.
+///
+/// Two rows may be moved together when both halves agree: the project scope the
+/// sidebar projection places them in, and the project the session itself belongs
+/// to. The comparison runs once per candidate row of every selected row, so it
+/// reads a map built once instead of rebuilding the projection each time.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SidebarRowScope {
+    project_scope: Option<String>,
+    project_id: ProjectId,
+}
+
+/// One project's slice of a shift/ctrl multi-selection.
+///
+/// The slice is what a drag from one of the project's rows carries, and what the
+/// batch commands of its row menus act on. Both answers are the same for every
+/// row of the project, so the slice is resolved once and shared for the rest of
+/// the frame.
+struct SidebarSelectionSlice {
+    /// The rows a drag from this project carries, in sidebar order.
+    items: Vec<SidebarOrganizationItem>,
+    /// The sessions among them, in the same order.
+    session_ids: Rc<Vec<String>>,
+    /// The groups the sessions could join, when they share one Worktree.
+    group_candidates: Vec<(String, String)>,
+    /// Whether any of the sessions already belongs to a group.
+    has_group_members: bool,
+    /// Whether every one of them is already being deleted.
+    deletion_pending: bool,
+    /// Whether every one of them is already being archived.
+    archive_pending: bool,
+    /// Whether every one of them has auto continue on.
+    auto_continue_enabled: bool,
+    /// Whether any of them has auto continue paused.
+    auto_continue_paused: bool,
+    /// Whether every one of them is pinned.
+    pinned: bool,
+}
+
+/// The shift/ctrl multi-selection resolved for the rows of one frame.
+///
+/// Resolving a slice walks the placement tree and the session list for every
+/// candidate row, and the sidebar asks for one on every row it paints. With a
+/// large selection that cost `rows × selection × projection` in a single frame,
+/// which is what took the frame rate to single digits the moment a
+/// multi-selection was made. One frame resolves each project once and shares the
+/// answer with the rest of its rows.
+#[derive(Default)]
+struct SidebarSelectionIndex {
+    /// The selection the entries describe, so a change made between frames
+    /// rebuilds them instead of serving a stale answer.
+    selection: BTreeSet<SidebarOrganizationItem>,
+    /// The session the workbench shows, which joins the selection while one is
+    /// on screen.
+    current_session: Option<String>,
+    /// Whether the resolved entries below belong to this index.
+    built: bool,
+    /// Session id → the scope its row is compared by.
+    scopes: BTreeMap<String, SidebarRowScope>,
+    /// The selection as the sidebar paints it: the move set plus the open
+    /// session's row, in the order a drag lists them.
+    effective: Vec<SidebarOrganizationItem>,
+    /// The same rows, for membership tests.
+    effective_members: BTreeSet<SidebarOrganizationItem>,
+    /// The selected sessions, for the group the selection could become.
+    selected_sessions: BTreeSet<String>,
+    /// The selection as one group; `Some(None)` is a resolved "it cannot".
+    group_creation: Option<Option<(String, String, Vec<String>)>>,
+    /// One project's slice, by the scope its rows share.
+    slices: HashMap<SidebarRowScope, Rc<SidebarSelectionSlice>>,
+    /// The slice of a selection of project rows.
+    project_slice: Option<Rc<SidebarSelectionSlice>>,
+}
+
 /// Inputs that `conversation_turns` depends on. Timeline identity/content fields
 /// also let the cache prove that a change was append-only before reusing its
 /// completed prefix.
@@ -7765,6 +7839,8 @@ pub struct VibexWorkbench {
     sidebar_batch_mode: bool,
     sidebar_move_selected_items: BTreeSet<SidebarOrganizationItem>,
     sidebar_move_selection_anchor: Option<SidebarOrganizationItem>,
+    /// The shift/ctrl multi-selection resolved for the rows of one frame.
+    sidebar_selection_index: SidebarSelectionIndex,
     sidebar_rename_target: Option<SidebarRenameTarget>,
     sidebar_rename_error: Option<String>,
     sidebar_project_drag_state: Option<SidebarProjectDragState>,
@@ -8885,6 +8961,7 @@ impl VibexWorkbench {
             sidebar_batch_mode: false,
             sidebar_move_selected_items: BTreeSet::new(),
             sidebar_move_selection_anchor: None,
+            sidebar_selection_index: SidebarSelectionIndex::default(),
             sidebar_rename_target: None,
             sidebar_rename_error: None,
             sidebar_project_drag_state: None,
@@ -15856,16 +15933,20 @@ impl VibexWorkbench {
     /// The multi-select a plain click builds is the same selection the drag
     /// gesture carries, so a right click on it can offer the group directly
     /// instead of sending the user through batch mode first.
-    fn sidebar_move_group_creation_candidates(&self) -> Option<(String, String, Vec<String>)> {
-        let selected = self
-            .sidebar_move_selected_items
-            .iter()
-            .filter_map(|item| match item {
-                SidebarOrganizationItem::Session(session_id) => Some(session_id.clone()),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        self.sidebar_group_creation_candidates_for(&selected)
+    fn sidebar_move_group_creation_candidates(&mut self) -> Option<(String, String, Vec<String>)> {
+        if self.sidebar_move_selected_items.is_empty() {
+            return None;
+        }
+        self.refresh_sidebar_selection_index();
+        if let Some(resolved) = self.sidebar_selection_index.group_creation.clone() {
+            return resolved;
+        }
+        // A group holds one Worktree, so the walk runs once for the frame
+        // instead of once per row that offers the item.
+        let selected = self.sidebar_selection_index.selected_sessions.clone();
+        let candidates = self.sidebar_group_creation_candidates_for(&selected);
+        self.sidebar_selection_index.group_creation = Some(candidates.clone());
+        candidates
     }
 
     fn sidebar_group_creation_candidates_for(
@@ -16125,31 +16206,11 @@ impl VibexWorkbench {
     /// only one session joined or left a group.
     fn sidebar_move_selection_scope_matches(
         &self,
+        project_scopes: &BTreeMap<String, SidebarRowScope>,
         left: &SidebarOrganizationItem,
         right: &SidebarOrganizationItem,
     ) -> bool {
-        match (left, right) {
-            (SidebarOrganizationItem::Project(_), SidebarOrganizationItem::Project(_)) => true,
-            (
-                SidebarOrganizationItem::Session(left_id),
-                SidebarOrganizationItem::Session(right_id),
-            ) => {
-                let project_scopes = self.sidebar_session_project_scopes();
-                let left = self
-                    .sessions
-                    .iter()
-                    .find(|session| session.id.as_str() == left_id);
-                let right = self
-                    .sessions
-                    .iter()
-                    .find(|session| session.id.as_str() == right_id);
-                left.zip(right).is_some_and(|(left, right)| {
-                    project_scopes.get(left_id) == project_scopes.get(right_id)
-                        && left.project_id == right.project_id
-                })
-            }
-            _ => false,
-        }
+        sidebar_items_share_move_scope(project_scopes, left, right)
     }
 
     fn collect_sidebar_move_selection_items(
@@ -16204,20 +16265,11 @@ impl VibexWorkbench {
     fn sidebar_move_selection_order(
         &self,
         target: &SidebarOrganizationItem,
+        groups: &[SidebarProjectProjection],
+        project_scopes: &BTreeMap<String, SidebarRowScope>,
     ) -> Vec<SidebarOrganizationItem> {
         let (kind, available) = match target {
             SidebarOrganizationItem::Project(_) => {
-                let groups = sidebar_project_projections_with_workspace_order(
-                    &self.workspaces,
-                    &self.sessions,
-                    &self.workspace_contexts,
-                    &self.ui_state.sidebar.project_order,
-                    &self.sidebar_state.row_order,
-                    self.ui_state.sidebar.session_order_anchored_at_ms,
-                    &self.ui_state.sidebar.workspace_order,
-                    &self.sidebar_state.pinned_ids,
-                    "",
-                );
                 let mut available = self
                     .ui_state
                     .sidebar
@@ -16233,29 +16285,13 @@ impl VibexWorkbench {
                 (SidebarMoveSelectionKind::Project, available)
             }
             SidebarOrganizationItem::Session(session_id) => {
-                let Some(session) = self
-                    .sessions
-                    .iter()
-                    .find(|session| session.id.as_str() == session_id)
-                else {
+                let Some(scope) = project_scopes.get(session_id) else {
                     return vec![target.clone()];
                 };
-                let project_scopes = self.sidebar_session_project_scopes();
-                let project_id = project_scopes
-                    .get(session_id)
-                    .map(String::as_str)
-                    .unwrap_or(session.project_id.as_str());
-                let groups = sidebar_project_projections_with_workspace_order(
-                    &self.workspaces,
-                    &self.sessions,
-                    &self.workspace_contexts,
-                    &self.ui_state.sidebar.project_order,
-                    &self.sidebar_state.row_order,
-                    self.ui_state.sidebar.session_order_anchored_at_ms,
-                    &self.ui_state.sidebar.workspace_order,
-                    &self.sidebar_state.pinned_ids,
-                    "",
-                );
+                let project_id = scope
+                    .project_scope
+                    .as_deref()
+                    .unwrap_or(scope.project_id.as_str());
                 let Some(group) = groups
                     .iter()
                     .find(|group| group.project.id.as_str() == project_id)
@@ -16286,18 +16322,7 @@ impl VibexWorkbench {
                 else {
                     return vec![target.clone()];
                 };
-                let projections = sidebar_project_projections_with_workspace_order(
-                    &self.workspaces,
-                    &self.sessions,
-                    &self.workspace_contexts,
-                    &self.ui_state.sidebar.project_order,
-                    &self.sidebar_state.row_order,
-                    self.ui_state.sidebar.session_order_anchored_at_ms,
-                    &self.ui_state.sidebar.workspace_order,
-                    &self.sidebar_state.pinned_ids,
-                    "",
-                );
-                let Some(projection) = projections
+                let Some(projection) = groups
                     .iter()
                     .find(|group| group.project.id.as_str() == project_id)
                 else {
@@ -16386,32 +16411,6 @@ impl VibexWorkbench {
         items
     }
 
-    /// The sessions a right click inside a shift/ctrl selection acts on.
-    ///
-    /// The rows are read through [`Self::sidebar_drag_items`], so a command and
-    /// the drag gesture never disagree about what the selection holds. `None`
-    /// keeps the per-session menu for a right click on a row outside it, so a
-    /// batch command never appears for a selection the user cannot see.
-    fn sidebar_context_menu_session_ids(
-        &self,
-        primary: &SidebarOrganizationItem,
-    ) -> Option<Vec<String>> {
-        if self.sidebar_move_selected_items.len() < 2
-            || !self.sidebar_move_selected_items.contains(primary)
-        {
-            return None;
-        }
-        let session_ids = self
-            .sidebar_drag_items(primary)
-            .into_iter()
-            .filter_map(|item| match item {
-                SidebarOrganizationItem::Session(session_id) => Some(session_id),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        (session_ids.len() > 1).then_some(session_ids)
-    }
-
     /// The items a drag carries: the whole selection, in sidebar order.
     ///
     /// The order comes from the placement tree, which does not list every row the
@@ -16422,29 +16421,215 @@ impl VibexWorkbench {
     /// started on, so only one session joined or left the group. Anything the
     /// order does not know is appended instead.
     fn sidebar_drag_items(
-        &self,
+        &mut self,
         primary: &SidebarOrganizationItem,
     ) -> Vec<SidebarOrganizationItem> {
         if !self.sidebar_row_is_move_selected(primary) {
             return vec![primary.clone()];
         }
+        self.sidebar_selection_slice(primary).items.clone()
+    }
+
+    /// Rebuilds the frame's selection index when the selection it describes
+    /// changed, and resolves the parts every row reads.
+    ///
+    /// The index is the frame's answer to what the selection covers: the scope of
+    /// every session row, the rows the sidebar paints as selected, and the group
+    /// the shift/ctrl selection could become. Resolving any of them walks the
+    /// session list, so they are resolved once instead of once per painted row.
+    fn refresh_sidebar_selection_index(&mut self) {
+        let current_session = self
+            .selected_session_id
+            .as_ref()
+            .map(|session_id| session_id.as_str().to_string());
+        if self.sidebar_selection_index.selection != self.sidebar_move_selected_items
+            || self.sidebar_selection_index.current_session != current_session
+        {
+            self.sidebar_selection_index = SidebarSelectionIndex {
+                selection: self.sidebar_move_selected_items.clone(),
+                current_session,
+                ..SidebarSelectionIndex::default()
+            };
+        }
+        if self.sidebar_selection_index.built {
+            return;
+        }
+        let groups = self.sidebar_workspace_groups("");
+        let scopes = self.sidebar_row_scopes(&groups);
         let selected = self.sidebar_move_selection_items();
+        let members = selected.iter().cloned().collect::<BTreeSet<_>>();
+        let selected_sessions = members
+            .iter()
+            .filter_map(|item| match item {
+                SidebarOrganizationItem::Session(session_id) => Some(session_id.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let index = &mut self.sidebar_selection_index;
+        index.scopes = scopes;
+        index.effective = selected;
+        index.effective_members = members;
+        index.selected_sessions = selected_sessions;
+        index.built = true;
+    }
+
+    /// The multi-selection as it applies to `primary`, resolved once per project.
+    ///
+    /// Every row of one project asks the same question — which selected rows a
+    /// drag from here carries, and what its batch commands act on — so the answer
+    /// is resolved on the first row of the project and reused by the remaining
+    /// rows for the rest of the frame.
+    fn sidebar_selection_slice(
+        &mut self,
+        primary: &SidebarOrganizationItem,
+    ) -> Rc<SidebarSelectionSlice> {
+        self.refresh_sidebar_selection_index();
+        let groups = self.sidebar_workspace_groups("");
+        match primary {
+            SidebarOrganizationItem::Session(session_id) => {
+                let Some(scope) = self.sidebar_selection_index.scopes.get(session_id).cloned()
+                else {
+                    return Rc::new(self.build_sidebar_selection_slice(primary, &groups));
+                };
+                if let Some(slice) = self.sidebar_selection_index.slices.get(&scope).cloned() {
+                    return slice;
+                }
+                let slice = Rc::new(self.build_sidebar_selection_slice(primary, &groups));
+                self.sidebar_selection_index
+                    .slices
+                    .insert(scope, slice.clone());
+                slice
+            }
+            SidebarOrganizationItem::Project(_) => {
+                if let Some(slice) = self.sidebar_selection_index.project_slice.clone() {
+                    return slice;
+                }
+                let slice = Rc::new(self.build_sidebar_selection_slice(primary, &groups));
+                self.sidebar_selection_index.project_slice = Some(slice.clone());
+                slice
+            }
+            _ => Rc::new(self.build_sidebar_selection_slice(primary, &groups)),
+        }
+    }
+
+    /// Resolves one project's slice of the multi-selection.
+    ///
+    /// The slice is the effective selection, in sidebar order, restricted to the
+    /// rows that can move with `primary`; the batch commands read the same set, so
+    /// the menu and the drag gesture never disagree about what is selected.
+    fn build_sidebar_selection_slice(
+        &self,
+        primary: &SidebarOrganizationItem,
+        groups: &[SidebarProjectProjection],
+    ) -> SidebarSelectionSlice {
+        let project_scopes = &self.sidebar_selection_index.scopes;
         let mut items = self
-            .sidebar_move_selection_order(primary)
+            .sidebar_move_selection_order(primary, groups, project_scopes)
             .into_iter()
             .filter(|item| {
-                selected.contains(item) && self.sidebar_move_selection_scope_matches(primary, item)
+                self.sidebar_selection_index
+                    .effective_members
+                    .contains(item)
+                    && sidebar_items_share_move_scope(project_scopes, primary, item)
             })
             .collect::<Vec<_>>();
-        for item in &selected {
-            if !items.contains(item) && self.sidebar_move_selection_scope_matches(primary, item) {
+        for item in &self.sidebar_selection_index.effective {
+            if !items.contains(item)
+                && sidebar_items_share_move_scope(project_scopes, primary, item)
+            {
                 items.push(item.clone());
             }
         }
         if !items.iter().any(|item| item == primary) {
             items.insert(0, primary.clone());
         }
-        items
+        let session_ids = Rc::new(
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    SidebarOrganizationItem::Session(session_id) => Some(session_id.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        );
+        SidebarSelectionSlice {
+            group_candidates: self.sidebar_group_join_candidates_for_sessions(&session_ids),
+            has_group_members: self.sidebar_selection_has_group_members(&session_ids),
+            deletion_pending: !session_ids.is_empty()
+                && session_ids
+                    .iter()
+                    .all(|session_id| self.pending_session_deletion_ids.contains(session_id)),
+            archive_pending: !session_ids.is_empty()
+                && session_ids
+                    .iter()
+                    .all(|session_id| self.pending_session_archive_ids.contains(session_id)),
+            auto_continue_enabled: session_ids
+                .iter()
+                .all(|session_id| self.auto_continue_enabled_for(session_id)),
+            auto_continue_paused: session_ids
+                .iter()
+                .any(|session_id| self.auto_continue_paused_session_ids.contains(session_id)),
+            pinned: session_ids
+                .iter()
+                .all(|session_id| self.sidebar_state.pinned_ids.contains(session_id)),
+            items,
+            session_ids,
+        }
+    }
+
+    /// The batch commands a row's menu offers while it is part of a selection.
+    ///
+    /// A right click inside a shift/ctrl selection makes the whole selection the
+    /// target of every command the menu offers. `None` keeps the per-session menu
+    /// for a right click on a row outside it, so a batch command never appears
+    /// for a selection the user cannot see.
+    fn sidebar_batch_selection(
+        &mut self,
+        primary: &SidebarOrganizationItem,
+    ) -> Option<Rc<SidebarSelectionSlice>> {
+        if self.sidebar_move_selected_items.len() < 2
+            || !self.sidebar_move_selected_items.contains(primary)
+        {
+            return None;
+        }
+        let slice = self.sidebar_selection_slice(primary);
+        (slice.session_ids.len() > 1).then_some(slice)
+    }
+
+    /// Every session row's move scope, resolved from one sidebar projection.
+    ///
+    /// The map is what makes the scope test cheap: without it the projection was
+    /// rebuilt for every candidate row of every selected row. A session the
+    /// projection does not list keeps no scope of its own and only matches a row
+    /// of the same project.
+    fn sidebar_row_scopes(
+        &self,
+        groups: &[SidebarProjectProjection],
+    ) -> BTreeMap<String, SidebarRowScope> {
+        let mut project_scopes = BTreeMap::new();
+        for group in groups {
+            let project_id = group.project.id.as_str();
+            for session in &group.compact_sessions {
+                project_scopes
+                    .entry(session.id.as_str())
+                    .or_insert(project_id);
+            }
+        }
+        self.sessions
+            .iter()
+            .map(|session| {
+                let session_id = session.id.as_str();
+                (
+                    session_id.to_string(),
+                    SidebarRowScope {
+                        project_scope: project_scopes
+                            .get(session_id)
+                            .map(|scope| (*scope).to_string()),
+                        project_id: session.project_id.clone(),
+                    },
+                )
+            })
+            .collect()
     }
 
     fn update_sidebar_move_selection(
@@ -16455,17 +16640,26 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> bool {
         let selection_only = shift || toggle;
+        // A click that does not extend the selection replaces it outright, so
+        // only an extending click pays for the scope maps the range needs.
+        let (groups, project_scopes) = if selection_only {
+            let groups = self.sidebar_workspace_groups("");
+            let project_scopes = self.sidebar_row_scopes(&groups);
+            (groups, project_scopes)
+        } else {
+            (Rc::new(Vec::new()), BTreeMap::new())
+        };
         if shift {
             let anchor = self.sidebar_move_selection_anchor.clone();
-            let compatible = anchor
-                .as_ref()
-                .is_some_and(|anchor| self.sidebar_move_selection_scope_matches(anchor, &item));
+            let compatible = anchor.as_ref().is_some_and(|anchor| {
+                self.sidebar_move_selection_scope_matches(&project_scopes, anchor, &item)
+            });
             if !compatible {
                 self.sidebar_move_selected_items.clear();
                 self.sidebar_move_selected_items.insert(item.clone());
                 self.sidebar_move_selection_anchor = Some(item);
             } else if let Some(anchor) = anchor {
-                let order = self.sidebar_move_selection_order(&item);
+                let order = self.sidebar_move_selection_order(&item, &groups, &project_scopes);
                 let Some(anchor_index) = order.iter().position(|candidate| candidate == &anchor)
                 else {
                     self.sidebar_move_selected_items.clear();
@@ -16489,11 +16683,9 @@ impl VibexWorkbench {
                     .extend(range.iter().cloned());
             }
         } else if toggle {
-            if self
-                .sidebar_move_selected_items
-                .iter()
-                .any(|selected| !self.sidebar_move_selection_scope_matches(selected, &item))
-            {
+            if self.sidebar_move_selected_items.iter().any(|selected| {
+                !self.sidebar_move_selection_scope_matches(&project_scopes, selected, &item)
+            }) {
                 self.sidebar_move_selected_items.clear();
             }
             if !self.sidebar_move_selected_items.remove(&item) {
@@ -17888,7 +18080,7 @@ impl VibexWorkbench {
     /// primary has to be one of the rows the sidebar paints as selected —
     /// otherwise the drag carries the row it started on alone, and a selection
     /// the user made elsewhere can never follow a row it never covered.
-    fn dragged_group_session_ids(&self, payload_ids: &[String]) -> Vec<String> {
+    fn dragged_group_session_ids(&mut self, payload_ids: &[String]) -> Vec<String> {
         let Some(primary) = payload_ids.first() else {
             return Vec::new();
         };
@@ -17896,13 +18088,19 @@ impl VibexWorkbench {
         if !self.sidebar_row_is_move_selected(&primary_item) {
             return payload_ids.to_vec();
         }
+        let groups = self.sidebar_workspace_groups("");
+        let project_scopes = self.sidebar_row_scopes(&groups);
         let mut ids = payload_ids.to_vec();
         for selected in self.sidebar_move_selection_items() {
             let SidebarOrganizationItem::Session(session_id) = &selected else {
                 continue;
             };
             if !ids.iter().any(|id| id == session_id)
-                && self.sidebar_move_selection_scope_matches(&primary_item, &selected)
+                && self.sidebar_move_selection_scope_matches(
+                    &project_scopes,
+                    &primary_item,
+                    &selected,
+                )
             {
                 ids.push(session_id.clone());
             }
@@ -38359,6 +38557,10 @@ impl VibexWorkbench {
 
     fn render_agent_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.sidebar_visible_session_ids.clear();
+        // The selection index answers questions the rows ask while they are
+        // painted, so it belongs to this pass: the next one resolves the
+        // selection again against whatever changed in between.
+        self.sidebar_selection_index = SidebarSelectionIndex::default();
         let strings = self.strings();
         let groups = self.sidebar_workspace_groups("");
         let reorder_enabled = !self.sidebar_batch_mode;
@@ -43669,7 +43871,7 @@ impl VibexWorkbench {
         // the target of every command the menu offers; a right click on a row
         // outside it keeps the per-session menu, so a batch command never
         // appears for a selection the user cannot see.
-        let selected_session_ids = self.sidebar_context_menu_session_ids(&session_item);
+        let batch_selection = self.sidebar_batch_selection(&session_item);
         // The selection is the same set the drag gesture carries, so the group
         // item names the rows the menu would put in one group — when they share
         // a Worktree, because a group only holds one.
@@ -43808,38 +44010,36 @@ impl VibexWorkbench {
         // shift/ctrl selection when the right click landed inside one, and this
         // row alone otherwise. A batch reads its own state, so a check mark, a
         // pin verb, or a disabled item is never borrowed from the clicked row.
-        let batch_session_ids = selected_session_ids.clone();
+        let batch_session_ids = batch_selection
+            .as_ref()
+            .map(|slice| slice.session_ids.as_ref().clone());
         let batch_session_count = batch_session_ids.as_ref().map_or(0, Vec::len);
         let batch_label = |label: &str| match batch_session_count {
             0 => label.to_string(),
             count => sidebar_batch_menu_label(resolved_locale, label, count),
         };
-        let batch_group_candidates = batch_session_ids
+        let batch_group_candidates = batch_selection
             .as_ref()
-            .map(|session_ids| self.sidebar_group_join_candidates_for_sessions(session_ids))
+            .map(|slice| slice.group_candidates.clone())
             .unwrap_or_default();
-        let batch_has_group_members = batch_session_ids
+        let batch_has_group_members = batch_selection
             .as_ref()
-            .is_some_and(|session_ids| self.sidebar_selection_has_group_members(session_ids));
+            .is_some_and(|slice| slice.has_group_members);
         let mutation_pending = self.agent_action_pending;
         let session_deletion_pending = self
             .pending_session_deletion_ids
             .contains(session.id.as_str());
-        let batch_deletion_pending = batch_session_ids.as_ref().is_some_and(|session_ids| {
-            session_ids
-                .iter()
-                .all(|session_id| self.pending_session_deletion_ids.contains(session_id))
-        });
+        let batch_deletion_pending = batch_selection
+            .as_ref()
+            .is_some_and(|slice| slice.deletion_pending);
         // An archive already in flight has nothing to do with a second click, so
         // the item follows the clicked row and the selection it stands for.
         let session_archive_pending = self
             .pending_session_archive_ids
             .contains(session.id.as_str());
-        let batch_archive_pending = batch_session_ids.as_ref().is_some_and(|session_ids| {
-            session_ids
-                .iter()
-                .all(|session_id| self.pending_session_archive_ids.contains(session_id))
-        });
+        let batch_archive_pending = batch_selection
+            .as_ref()
+            .is_some_and(|slice| slice.archive_pending);
         let archive_pending = session_archive_pending || batch_archive_pending;
         // A fork holds the same window-wide action lock every other Agent
         // mutation does, and a row already being deleted has nothing worth
@@ -43848,17 +44048,12 @@ impl VibexWorkbench {
             || self.fork_session_pending
             || session_deletion_pending
             || batch_deletion_pending;
-        let auto_continue_enabled = match batch_session_ids.as_ref() {
-            Some(session_ids) => session_ids
-                .iter()
-                .all(|session_id| self.auto_continue_enabled_for(session_id)),
+        let auto_continue_enabled = match batch_selection.as_ref() {
+            Some(slice) => slice.auto_continue_enabled,
             None => self.auto_continue_enabled(&session.id),
         };
-        let auto_continue_paused = match batch_session_ids.as_ref() {
-            Some(session_ids) => session_ids.iter().any(|session_id| {
-                self.auto_continue_paused_session_ids
-                    .contains(session_id.as_str())
-            }),
+        let auto_continue_paused = match batch_selection.as_ref() {
+            Some(slice) => slice.auto_continue_paused,
             None => self
                 .auto_continue_paused_session_ids
                 .contains(session.id.as_str()),
@@ -43878,12 +44073,9 @@ impl VibexWorkbench {
         let pin_label = {
             // The selection's own pin state decides the verb: a batch that is
             // not entirely pinned offers "Pin" and pins the rest with it.
-            let pinned = match batch_session_ids.as_ref() {
-                Some(session_ids) => session_ids
-                    .iter()
-                    .all(|session_id| self.sidebar_state.pinned_ids.contains(session_id)),
-                None => pinned,
-            };
+            let pinned = batch_selection
+                .as_ref()
+                .map_or(pinned, |slice| slice.pinned);
             if pinned {
                 strings.sidebar_unpin
             } else {
@@ -63009,6 +63201,35 @@ fn sidebar_drag_count_badge(count: usize, cx: &App) -> AnyElement {
         .text_color(cx.theme().primary_foreground)
         .child(count.to_string())
         .into_any_element()
+}
+
+/// Whether two sidebar rows may be moved together.
+///
+/// Only the project has to agree: a move is a placement inside one project, and
+/// the pinned band is an order the sidebar paints rather than a boundary a move
+/// cannot cross. Project rows always match, because a selection of them is a
+/// reorder of the sidebar itself. Two session rows match when the project scope
+/// the sidebar places them in and the project they belong to are both the same;
+/// a row the projection does not know never matches. The comparison runs for
+/// every candidate row of every selected row, so it reads a map built once per
+/// frame instead of rebuilding the projection for each candidate.
+fn sidebar_items_share_move_scope(
+    project_scopes: &BTreeMap<String, SidebarRowScope>,
+    left: &SidebarOrganizationItem,
+    right: &SidebarOrganizationItem,
+) -> bool {
+    match (left, right) {
+        (SidebarOrganizationItem::Project(_), SidebarOrganizationItem::Project(_)) => true,
+        (SidebarOrganizationItem::Session(left_id), SidebarOrganizationItem::Session(right_id)) => {
+            let left = project_scopes.get(left_id);
+            let right = project_scopes.get(right_id);
+            left.zip(right).is_some_and(|(left, right)| {
+                project_scopes.get(left_id) == project_scopes.get(right_id)
+                    && left.project_id == right.project_id
+            })
+        }
+        _ => false,
+    }
 }
 
 fn sidebar_selection_state(
@@ -83375,7 +83596,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("session row renderer should remain inspectable");
 
-        assert!(session.contains("self.sidebar_context_menu_session_ids(&session_item)"));
+        assert!(session.contains("self.sidebar_batch_selection(&session_item)"));
 
         for batch_command in [
             "set_auto_continue_enabled_for_sessions(",
@@ -85579,7 +85800,7 @@ mod tests {
             .find("let selected = self.sidebar_move_selection_items();")
             .expect("the payload should start from the rows the sidebar paints");
         let order_filter = drag_items
-            .find(".sidebar_move_selection_order(primary)")
+            .find(".sidebar_move_selection_order(primary, groups, project_scopes)")
             .expect("the payload should follow the sidebar order");
         assert!(union < order_filter);
         assert!(drag_items.contains("items.push(item.clone());"));
@@ -85614,14 +85835,61 @@ mod tests {
     fn sidebar_move_selection_scope_ignores_the_pinned_band() {
         let source = include_str!("app.rs");
         let scope = source
-            .split_once("    fn sidebar_move_selection_scope_matches(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn collect_sidebar_move_selection_items("))
+            .split_once("fn sidebar_items_share_move_scope(")
+            .and_then(|(_, tail)| tail.split_once("\nfn sidebar_selection_state("))
             .map(|(body, _)| body)
             .expect("selection scope should remain inspectable");
 
         assert!(scope.contains("project_scopes.get(left_id) == project_scopes.get(right_id)"));
         assert!(scope.contains("left.project_id == right.project_id"));
         assert!(!scope.contains("pinned_ids"));
+    }
+
+    /// A multi-selection must not cost a projection per painted row.
+    ///
+    /// Resolving a drag payload and the batch commands walks the placement tree
+    /// and the session list, and the sidebar asks for both on every row it
+    /// paints. With a large shift/ctrl selection that cost `rows × selection ×
+    /// projection` in one frame and took the frame rate to single digits, so one
+    /// resolution per project is shared by the rest of its rows instead.
+    #[test]
+    fn a_multi_selection_resolves_once_per_project() {
+        let source = include_str!("app.rs");
+        let render = source
+            .split_once("    fn render_agent_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_root_children("))
+            .map(|(body, _)| body)
+            .expect("the sidebar renderer should remain inspectable");
+        assert!(
+            render.contains("self.sidebar_selection_index = SidebarSelectionIndex::default();")
+        );
+
+        let session = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("session row renderer should remain inspectable");
+        assert!(session.contains("self.sidebar_drag_items(&session_item)"));
+        assert!(session.contains("self.sidebar_batch_selection(&session_item)"));
+        assert!(!session.contains("sidebar_move_selection_order("));
+        assert!(!session.contains("sidebar_group_join_candidates_for_sessions("));
+
+        let slice = source
+            .split_once("    fn sidebar_selection_slice(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Resolves one project's slice"))
+            .map(|(body, _)| body)
+            .expect("the slice resolver should remain inspectable");
+        assert!(slice.contains("self.sidebar_selection_index.slices.get(&scope)"));
+        assert!(slice.contains(".insert(scope, slice.clone());"));
+
+        // The map every scope test reads is built once, from one projection.
+        let scopes = source
+            .split_once("    fn sidebar_row_scopes(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn update_sidebar_move_selection("))
+            .map(|(body, _)| body)
+            .expect("the scope map should remain inspectable");
+        assert!(scopes.contains("let mut project_scopes = BTreeMap::new();"));
+        assert!(!scopes.contains("sidebar_project_projections_with_workspace_order("));
     }
 
     #[test]
@@ -96649,10 +96917,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("group drop resolution should remain inspectable");
         assert!(resolver.contains("for selected in self.sidebar_move_selection_items() {"));
-        assert!(
-            resolver
-                .contains("self.sidebar_move_selection_scope_matches(&primary_item, &selected)")
-        );
+        assert!(resolver.contains("let project_scopes = self.sidebar_row_scopes(&groups);"));
+        assert!(resolver.contains("self.sidebar_move_selection_scope_matches("));
+        assert!(resolver.contains("&primary_item,"));
+        assert!(resolver.contains("&selected,"));
 
         let finish = source
             .split_once("    fn finish_sidebar_session_drag(")
