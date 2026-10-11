@@ -5475,6 +5475,10 @@ impl MobileApp {
         self.start_drawer_snap(DrawerPage::Workbench.open_offset(), Some(window), cx);
     }
 
+    /// Ends the live connection and returns to the pairing page, leaving every
+    /// stored pairing alone: the runtimes this lands on keep their credentials,
+    /// so their own cards are what connect again. Deleting a credential is the
+    /// runtime action sheet's separate, confirmed Remove.
     fn disconnect_host(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.teardown_active_connection(cx);
         self.mode = RootMode::Pairing;
@@ -6411,54 +6415,6 @@ impl MobileApp {
         self.refresh_sessions(cx);
         self.refresh_timeline_display_settings(cx);
         self.reload_selected_session(cx);
-    }
-
-    fn forget_desktop(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.stop_connection_tasks();
-        self.backend = None;
-        crate::background_connection::disconnect();
-        let _ = self.storage.clear();
-        let _ = self.storage.clear_hosts();
-        if let Some(workbench) = self.workbench.take() {
-            workbench.update(cx, |workbench, _| workbench.suspend());
-        }
-        self.controller = None;
-        self.team_controller = None;
-        self.team_busy = false;
-        self.timeline_markdown_views.borrow_mut().clear();
-        self.mode = RootMode::Pairing;
-        self.timeline_turns = Arc::new(Vec::new());
-        self.pending_user_message = None;
-        self.timeline_metadata_tip = None;
-        self.attachment_preview = None;
-        self.attachment_preview_loading = None;
-        self.timeline_list.reset(0);
-        self.reset_drawers();
-        self.pending_workbench_surface = None;
-        self.clear_overlay();
-        self.workspaces.clear();
-        self.workspace_summaries.clear();
-        self.reset_sidebar_ui();
-        self.known_hosts.clear();
-        self.active_host_id = None;
-        self.desktop_timeline_display_settings = AgentTimelineDisplaySettings::default();
-        self.timeline_display_settings_sync_busy = false;
-        self.fork_session_busy = false;
-        self.timeline_display_settings_overrides.clear();
-        let _ = self.storage.clear_timeline_display_settings_overrides();
-        self.expanded_process.clear();
-        self.expanded_timeline_rows.clear();
-        self.collapsed_timeline_rows.clear();
-        self.full_reasoning_rows.clear();
-        self.expanded_approval.clear();
-        self.elicitation_request_id = None;
-        self.elicitation_inputs.clear();
-        self.elicitation_draft = None;
-        self.reset_runtime_options();
-        self.notice = None;
-        self.error = None;
-        self.back_stack.clear();
-        cx.notify();
     }
 
     /// Drives the full-page side drawers from the platform touch-pan stream.
@@ -7761,6 +7717,7 @@ impl MobileApp {
                             .child(
                                 div()
                                     .id("disconnect-unavailable-desktop")
+                                    .debug_selector(|| "disconnect-unavailable-desktop".to_string())
                                     .h(px(theme::TOUCH_TARGET))
                                     .px(px(theme::SPACING_MD))
                                     .flex()
@@ -7769,9 +7726,16 @@ impl MobileApp {
                                     .text_color(theme::text_muted())
                                     .cursor_pointer()
                                     .active(|style| style.opacity(0.7))
+                                    // Disconnecting drops the transport, not
+                                    // the pairing: the page this returns to
+                                    // still lists the runtime, and its own card
+                                    // is what connects again. Only an explicit
+                                    // Remove deletes a stored credential.
                                     .on_mouse_up(
                                         MouseButton::Left,
-                                        cx.listener(Self::forget_desktop),
+                                        cx.listener(|this, event, window, cx| {
+                                            this.disconnect_host(event, window, cx);
+                                        }),
                                     )
                                     .child(locale::common("Disconnect")),
                             )
@@ -15248,6 +15212,7 @@ impl MobileApp {
                     .child(
                         div()
                             .id("mobile-settings-disconnect")
+                            .debug_selector(|| "mobile-settings-disconnect".to_string())
                             .mt(px(theme::SPACING_LG))
                             .mb(px(theme::SPACING_XL))
                             .h(px(theme::TOUCH_TARGET))
@@ -15261,7 +15226,16 @@ impl MobileApp {
                             .text_color(theme::accent_red())
                             .cursor_pointer()
                             .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::forget_desktop))
+                            // The row above switches runtime; this one ends the
+                            // connection. Neither is a deletion: every saved
+                            // runtime keeps its credential, and removing one is
+                            // its own confirmed action on the pairing page.
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, event, window, cx| {
+                                    this.disconnect_host(event, window, cx);
+                                }),
+                            )
                             .child(locale::text(
                                 "Disconnect desktop",
                                 "断开桌面端",
@@ -18723,6 +18697,119 @@ mod tests {
             assert_eq!(app.known_hosts.len(), 2);
         });
         assert!(cx.debug_bounds("pairing-back").is_none());
+    }
+
+    /// The unavailable-connection screen's Disconnect ends the connection
+    /// attempt, not the pairing. The runtime keeps its stored credential, so the
+    /// first screen this returns to still lists it — the reported bug was that
+    /// the button deleted the runtime out from under that list.
+    #[gpui::test]
+    fn disconnecting_an_unreachable_desktop_keeps_the_saved_runtime(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let mut bundle = host_bundle("runtime-a", "studio");
+        bundle.route = Some(crate::pairing::MobileRemoteRouteBundle {
+            local_network: None,
+            direct_candidates: vec![bundle.record.server_url.clone()],
+            relay: None,
+        });
+        let backend = bundle.backend().expect("valid saved runtime");
+        let host_id = bundle.host_id().to_string();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.remember_host(&bundle, RemoteServerKind::Desktop);
+            app.persist_known_hosts();
+            app.backend = Some(backend);
+            // The state a launch-time auto-connect leaves behind when the
+            // desktop cannot be reached.
+            app.mode = RootMode::Connecting;
+            app.error = Some(BackendError::offline(
+                "remote_transport_unreachable",
+                "no route to host",
+            ));
+            app
+        });
+        cx.run_until_parked();
+
+        click_mobile_control(cx, "disconnect-unavailable-desktop");
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.mode, RootMode::Pairing);
+            assert!(app.backend.is_none());
+            assert!(app.controller.is_none());
+            assert!(app.error.is_none());
+            // Still saved and still the runtime the phone was on, so the list
+            // about to paint leads with it while it probes whether it answers.
+            assert_eq!(app.known_hosts.len(), 1);
+            assert_eq!(app.known_hosts[0].id, host_id);
+            assert_eq!(app.active_host_id.as_deref(), Some(host_id.as_str()));
+            assert_eq!(
+                app.host_reachability.get(&host_id),
+                Some(&HostReachability::Probing)
+            );
+            // The credential is what a wrong handler would have deleted.
+            let stored = app.storage.load_hosts().expect("stored hosts file");
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].bundle.expected_server_id, "runtime-a");
+        });
+    }
+
+    /// Settings' Disconnect is the same contract as the unavailable screen's:
+    /// it ends the connection and keeps every saved runtime, including the ones
+    /// it was not connected to. Deleting one stays the runtime action sheet's
+    /// separate, confirmed Remove.
+    #[gpui::test]
+    fn disconnecting_from_settings_keeps_every_saved_runtime(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let routed = |server_id: &str, display_name: &str| {
+            let mut bundle = host_bundle(server_id, display_name);
+            bundle.route = Some(crate::pairing::MobileRemoteRouteBundle {
+                local_network: None,
+                direct_candidates: vec![bundle.record.server_url.clone()],
+                relay: None,
+            });
+            bundle
+        };
+        let bundle = routed("runtime-a", "studio");
+        let backend = bundle.backend().expect("valid saved runtime");
+        let other = routed("runtime-b", "cloud");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app.remember_host(&bundle, RemoteServerKind::Desktop);
+            app.known_hosts.push(MobileHostEntry::from_bundle(
+                &other,
+                RemoteServerKind::Headless,
+            ));
+            app.persist_known_hosts();
+            app.backend = Some(backend);
+            app.open_settings(&noop_mouse_up(), window, cx);
+            app
+        });
+        cx.run_until_parked();
+        // The row sits at the bottom of the page, so make sure it is on screen
+        // whatever size the test window has.
+        app.update(cx, |app, cx| {
+            app.settings_scroll.scroll_to_bottom();
+            cx.notify();
+        });
+
+        click_mobile_control(cx, "mobile-settings-disconnect");
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.mode, RootMode::Pairing);
+            assert!(app.backend.is_none());
+            assert!(app.overlay.is_none(), "disconnecting closes Settings");
+            assert_eq!(app.known_hosts.len(), 2);
+            // Both credentials survive, not just the runtime the phone was on.
+            let stored = app.storage.load_hosts().expect("stored hosts file");
+            assert_eq!(stored.len(), 2);
+        });
     }
 
     #[gpui::test]

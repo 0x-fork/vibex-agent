@@ -469,6 +469,12 @@ insert a separate runtime-list page before it.
 - Disconnect/retry/connect remain in the active runtime's action sheet. Removing
   another runtime returns to the pairing list without losing its parent page;
   removing the active runtime retains the existing fallback-selection behavior.
+- Disconnect never deletes a saved runtime. Every Disconnect surface — the
+  active runtime's action sheet, the unavailable-connection screen, and
+  Settings — drops the transport through `MobileApp::disconnect_host` and
+  returns to the pairing page with the credential, the runtime list, and the
+  active selection untouched. Delete only through the runtime action sheet's
+  confirmed Remove, which names the credential it erases.
 
 ```text
 Footer -> pairing -> runtime actions -> details -> Back -> actions -> Back -> pairing -> Back -> footer
