@@ -9250,12 +9250,15 @@ impl TimelineRepository {
                 turns,
             )?);
         }
-        // Without a forward cursor the read starts from the tail: a `before`
-        // cursor takes the window that ends just below it, and no cursor at all
-        // is "before everything", which is the newest window. Only an explicit
-        // forward cursor — or a turn floor, which names where its window opens —
-        // walks from the oldest row upward.
-        let read_backward = after_sequence.is_none() && turn_window.is_none();
+        // A page is anchored at one end of its span and has to be cut at the
+        // other, or the reader is handed the wrong end of the conversation.
+        // Without a forward cursor the anchor is the newest row the span
+        // reaches: a cold open lands where the session ended, and an older
+        // page has to stay adjacent to the cursor the reader already holds or
+        // the timeline grows a hole. A turn floor only says where the span
+        // *opens*; it does not move the anchor. Only an explicit forward
+        // cursor walks upward from where the reader already is.
+        let read_backward = after_sequence.is_none();
         let order = if read_backward { "DESC" } else { "ASC" };
 
         let mut items = Vec::new();
@@ -9300,12 +9303,12 @@ impl TimelineRepository {
             }
         }
 
-        // Rows stay in scan order until the page is cut. A backward scan starts
-        // at the newest row, so dropping the overfetched tail of the scan keeps
-        // the newest rows; a forward scan drops the rows that sit above its
-        // limit the same way. The extra row only proves the limit was reached;
-        // whether anything sits above the window is answered by the existence
-        // probe below.
+        // Rows stay in scan order until the page is cut, and the cut always
+        // keeps the anchored end: a backward scan starts at the newest row, so
+        // dropping its overfetched tail keeps the newest rows, while a forward
+        // scan drops the rows above its limit and keeps the oldest. The extra
+        // row only proves the limit was reached; whether anything sits beyond
+        // the page is answered by the existence probes below.
         let over_limit = items.len() as i64 > limit;
         if over_limit {
             items.truncate(limit as usize);
@@ -9329,8 +9332,8 @@ impl TimelineRepository {
             }
             // Whatever the budget dropped stays reported by the existence
             // probe below, so a reader still learns the window was cut short.
-            // The budget spends the front of the scan, which is the newest
-            // rows of a tail window.
+            // The budget spends the front of the scan, which is the anchored
+            // end of the page in either direction.
             items.truncate(kept.max(1).min(items.len()));
         }
 
@@ -20297,6 +20300,183 @@ mod tests {
         };
         assert_eq!(delta.text_delta, "chunk0chunk1chunk2chunk3chunk4");
         assert_eq!(delta.chunk_index, 4);
+
+        cleanup_db(temp);
+    }
+
+    /// A cold open has to land where the session ended, however long the
+    /// newest turns are.
+    ///
+    /// `maxTurns` names where the window *opens*, not which end of it to keep.
+    /// Reading that window from its floor upward spends both the item limit
+    /// and the byte budget on the oldest rows of the window, so the page ends
+    /// in the middle of the conversation: the reader sees a replay of an old
+    /// stretch of turns, the completion probe judges the session from a turn
+    /// that never finished, and the client walks forward one page at a time to
+    /// reach the end it should have started at.
+    #[test]
+    fn a_turn_window_lands_on_the_end_of_the_session_not_its_floor() {
+        let temp = temp_db_path("turn-window-anchor");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-anchor",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Long session".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Initializing,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
+        // Twelve turns of 121 rows: far more than one page of eight turns, so
+        // both the item limit and the byte budget have to cut something.
+        let mut last_sequence = 0;
+        for turn in 0..12 {
+            last_sequence = TimelineRepository::append(
+                &mut conn,
+                &session.id,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: format!("question {turn}"),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                TimelineRedactionState::None,
+            )
+            .unwrap()
+            .sequence;
+            for row in 0..120 {
+                last_sequence = TimelineRepository::append(
+                    &mut conn,
+                    &session.id,
+                    TimelineSource::Agent,
+                    TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                        text_delta: format!("turn {turn} chunk {row}"),
+                        chunk_index: row,
+                        phase: None,
+                    }),
+                    None,
+                    Some(&format!("message-{turn}")),
+                    TimelineRedactionState::None,
+                )
+                .unwrap()
+                .sequence;
+            }
+        }
+
+        let page = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            500,
+            Some(8),
+            Some(1_048_576),
+            TimelinePayloadDepth::Summary,
+        )
+        .unwrap();
+        assert_eq!(
+            page.end_sequence,
+            Some(last_sequence),
+            "a cold open must end where the session ended"
+        );
+        assert!(!page.has_newer, "nothing sits above the window");
+        assert!(page.has_older);
+        assert_eq!(
+            page.items.last().map(|item| item.sequence),
+            Some(last_sequence)
+        );
+        assert_eq!(
+            page.items.len(),
+            500,
+            "the item limit still bounds the page"
+        );
+        // The window opens on a turn boundary, but a window wider than one
+        // page is cut at the anchored end, so the page itself may begin
+        // mid-turn. The rows above it are what the reader pulls next, which is
+        // why the page still reports older history.
+        assert!(page.items[0].sequence > 1);
+        assert!(
+            page.items
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence),
+            "the page is ordered oldest first"
+        );
+
+        // An older page must stay adjacent to the cursor the reader holds, or
+        // the timeline would grow a hole between the two pages.
+        let older = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            page.start_sequence,
+            500,
+            Some(8),
+            Some(1_048_576),
+            TimelinePayloadDepth::Summary,
+        )
+        .unwrap();
+        assert_eq!(
+            older.end_sequence.map(|sequence| sequence + 1),
+            page.start_sequence,
+            "an older page ends beside the cursor it was asked from"
+        );
+        assert!(older.has_older);
+
+        // A byte budget cuts the same end: the newest rows survive.
+        let squeezed = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            500,
+            Some(8),
+            Some(2_048),
+            TimelinePayloadDepth::Summary,
+        )
+        .unwrap();
+        assert_eq!(squeezed.end_sequence, Some(last_sequence));
+        assert!(squeezed.has_older);
+        assert!(squeezed.items.len() < 500);
+
+        // A forward cursor is the one read that walks upward from where the
+        // reader already is, and it must stay contiguous from there.
+        let tail = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            Some(last_sequence - 3),
+            None,
+            500,
+            None,
+            None,
+            TimelinePayloadDepth::Summary,
+        )
+        .unwrap();
+        assert_eq!(
+            tail.items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![last_sequence - 2, last_sequence - 1, last_sequence]
+        );
 
         cleanup_db(temp);
     }

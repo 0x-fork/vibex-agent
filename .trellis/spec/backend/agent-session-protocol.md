@@ -2109,13 +2109,23 @@ and `AdapterDiagnosticsRepository`.
   window and may set `hasOlder = true`. Opening a session reads this window
   rather than the whole archive, so the wait is not proportional to how long
   the conversation has run.
-- `FetchTimelineRequest.maxTurns` ends the window on a conversational turn
-  boundary — a turn starts at a user message — so a page never splits a
-  question from its answer. `FetchTimelineRequest.maxBytes` bounds what the
-  page costs to move, because `limit` counts items and one file operation can
-  outweigh hundreds of messages. A page always carries at least one item so a
-  reader can still make progress; an unbounded `limit` alone is no longer
-  sufficient for a caller that cares about latency.
+- A page is anchored at one end of its span and is cut at the other, and
+  which end that is follows the cursor rather than the request's shape. With
+  no `afterSequence` the anchor is the newest row the span reaches: a cold
+  open must end where the session ended, and an older page must end beside the
+  cursor the reader already holds or the timeline grows a hole. Only an
+  explicit forward cursor walks upward from where the reader already is, and
+  it must stay contiguous from there.
+- `FetchTimelineRequest.maxTurns` says where a window *opens*, not which end
+  to keep: it opens on a conversational turn boundary — a turn starts at a
+  user message — so a page never splits a question from its answer.
+  `FetchTimelineRequest.maxBytes` bounds what the page costs to move, because
+  `limit` counts items and one file operation can outweigh hundreds of
+  messages. Both cut the same end as `limit`, so a page always carries at
+  least one item and always keeps the end the reader is anchored to. An
+  anchored-end page that is short of the session end reports `hasNewer`, and
+  a reader that treats that as "walk forward until it clears" turns opening a
+  session into replaying it.
 - Timeline reads are projected to `TimelinePayloadDepth::Summary`: file
   snapshots (`oldText`/`newText`/`patch`) and the opened-activity parts of
   `rawExtension` (`contentBlocks`, `rawOutput`, `meta`) are withheld, while the
@@ -2128,6 +2138,10 @@ and `AdapterDiagnosticsRepository`.
   snapshots, including a one-sided change (a file created or deleted), whose
   patch is synthesized. The durable timeline therefore stays proportional to
   the change rather than to the files it touched.
+- A cached prefix is resumed only while patching it is cheaper than opening
+  the session again. Past `AGENT_TIMELINE_RESUME_MAX_ITEMS` the client drops
+  the prefix and reads the newest window, because the cost of resuming must
+  not grow with how long the reader was away.
 - Streamed `AgentMessageDelta` and `Reasoning` rows are appended one per
   provider chunk so the live stream can deliver each the moment it arrives.
   When the turn settles they are collapsed: rows that are adjacent in sequence

@@ -593,6 +593,11 @@ const AGENT_SESSION_VIEW_ALLOCATION_OVERHEAD: usize = 3;
 const AGENT_TIMELINE_TURN_WINDOW: u32 = 8;
 /// Upper bound on the payload cost of one window or history page.
 const AGENT_TIMELINE_WINDOW_BYTES: u32 = 1_048_576;
+/// How much a resumed load may pull before re-opening beats patching.
+///
+/// Resuming from a view a long background run left far behind would make the
+/// wait grow with the session again, which a windowed open exists to avoid.
+const AGENT_TIMELINE_RESUME_MAX_ITEMS: usize = 2_000;
 /// How many older pages may be outstanding at once.
 ///
 /// Prefetch keeps the next page on the way while the reader is still moving
@@ -1943,7 +1948,7 @@ async fn fetch_timeline_tail(
     runtime: Arc<DesktopRuntime>,
     session_id: VibexSessionId,
     after_sequence: i64,
-) -> vibex_core::VibexResult<Vec<vibex_core::TimelineItem>> {
+) -> vibex_core::VibexResult<Option<Vec<vibex_core::TimelineItem>>> {
     let mut items = Vec::new();
     let mut cursor = after_sequence.max(0);
     loop {
@@ -1970,8 +1975,13 @@ async fn fetch_timeline_tail(
             ));
         }
         items.extend(page.items);
+        if items.len() > AGENT_TIMELINE_RESUME_MAX_ITEMS {
+            // The prefix is too far behind to patch; the caller re-opens the
+            // newest window instead of walking history nobody is reading.
+            return Ok(None);
+        }
         if !page.has_newer {
-            return Ok(items);
+            return Ok(Some(items));
         }
         let Some(next) = page.end_sequence.filter(|next| *next > cursor) else {
             return Err(vibex_core::VibexError::storage(
@@ -1988,7 +1998,7 @@ async fn fetch_timeline_tail_via_backend(
     backend: BackendFacade,
     session_id: VibexSessionId,
     after_sequence: i64,
-) -> vibex_core::VibexResult<Vec<vibex_core::TimelineItem>> {
+) -> vibex_core::VibexResult<Option<Vec<vibex_core::TimelineItem>>> {
     let mut items = Vec::new();
     let mut cursor = after_sequence.max(0);
     loop {
@@ -2016,8 +2026,11 @@ async fn fetch_timeline_tail_via_backend(
             ));
         }
         items.extend(page.items);
+        if items.len() > AGENT_TIMELINE_RESUME_MAX_ITEMS {
+            return Ok(None);
+        }
         if !page.has_newer {
-            return Ok(items);
+            return Ok(Some(items));
         }
         let Some(next) = page.end_sequence.filter(|next| *next > cursor) else {
             return Err(vibex_core::VibexError::storage(
@@ -21519,16 +21532,26 @@ impl VibexWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let (items, timeline_has_older) = match resume {
                 Some(resume) => {
-                    let tail = fetch_timeline_tail_via_backend(
-                        backend,
+                    match fetch_timeline_tail_via_backend(
+                        backend.clone(),
                         request_session_id.clone(),
                         resume.after_sequence,
                     )
-                    .await?;
-                    (
-                        resume.prefix.into_iter().chain(tail).collect(),
-                        resume.timeline_has_older,
-                    )
+                    .await?
+                    {
+                        Some(tail) => (
+                            resume.prefix.into_iter().chain(tail).collect(),
+                            resume.timeline_has_older,
+                        ),
+                        None => {
+                            let page = fetch_timeline_window_via_backend(
+                                backend,
+                                request_session_id.clone(),
+                            )
+                            .await?;
+                            (page.items, page.has_older)
+                        }
+                    }
                 }
                 None => {
                     let page =
@@ -21606,16 +21629,26 @@ impl VibexWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let (items, timeline_has_older) = match resume {
                 Some(resume) => {
-                    let tail = fetch_timeline_tail(
-                        runtime,
+                    match fetch_timeline_tail(
+                        runtime.clone(),
                         request_session_id.clone(),
                         resume.after_sequence,
                     )
-                    .await?;
-                    (
-                        resume.prefix.into_iter().chain(tail).collect(),
-                        resume.timeline_has_older,
-                    )
+                    .await?
+                    {
+                        Some(tail) => (
+                            resume.prefix.into_iter().chain(tail).collect(),
+                            resume.timeline_has_older,
+                        ),
+                        // Nothing above the prefix is worth patching, so open
+                        // the session again rather than replay the history
+                        // between where the view stopped and where it is.
+                        None => {
+                            let page =
+                                fetch_timeline_window(runtime, request_session_id.clone()).await?;
+                            (page.items, page.has_older)
+                        }
+                    }
                 }
                 None => {
                     let page = fetch_timeline_window(runtime, request_session_id.clone()).await?;

@@ -47,6 +47,13 @@ pub const AGENT_TIMELINE_PAGE_BYTES: u32 = 1_048_576;
 /// top does not mean waiting.
 pub const AGENT_TIMELINE_OLDER_MAX_IN_FLIGHT: usize = 2;
 pub const AGENT_TIMELINE_MAX_ITEMS: usize = 20_000;
+/// How much a resumed load may pull before re-opening beats patching.
+///
+/// The point of a windowed open is that what a reader waits for does not grow
+/// with the session. Resuming from a prefix that a long background run left
+/// far behind would do exactly that, so past this bound the prefix is dropped
+/// and the newest window is read again.
+pub const AGENT_TIMELINE_RESUME_MAX_ITEMS: usize = 2_000;
 /// Bounded LRU over previously loaded sessions. Switching back to a cached
 /// session renders its stored authoritative prefix immediately and refreshes
 /// only the newer tail instead of re-paginating the whole timeline.
@@ -981,9 +988,22 @@ impl AgentWorkflowController {
                     let page = load_timeline_window(backend.as_ref(), &ticket.session_id).await?;
                     (page.items, page.has_older)
                 }
-                // Resuming a restored prefix only needs what arrived above it.
+                // Resuming a restored prefix only needs what arrived above it,
+                // and only while that is cheaper than opening the session
+                // again. A prefix left behind by a long background run is
+                // replaced by a fresh window rather than patched.
                 TimelineLoadKind::Tail(after_sequence) => {
-                    load_timeline_tail(backend.as_ref(), &ticket.session_id, after_sequence).await?
+                    match load_timeline_tail(backend.as_ref(), &ticket.session_id, after_sequence)
+                        .await
+                    {
+                        Ok(resumed) => resumed,
+                        Err(error) if error.code == "agent_timeline_resume_too_far_behind" => {
+                            let page =
+                                load_timeline_window(backend.as_ref(), &ticket.session_id).await?;
+                            (page.items, page.has_older)
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             };
             // Runtime metadata is a best-effort sibling query. The
@@ -1952,10 +1972,14 @@ pub async fn load_timeline_tail(
                 by_sequence.insert(item.sequence, item);
             }
         }
-        if by_sequence.len() > AGENT_TIMELINE_MAX_ITEMS {
+        if by_sequence.len() > AGENT_TIMELINE_RESUME_MAX_ITEMS {
+            // A prefix this far behind is not worth patching: the reader is
+            // looking at the end of the conversation, and walking the history
+            // between the two is exactly the wait a windowed open exists to
+            // avoid. The caller re-opens the newest window instead.
             return Err(BackendError::failed(
-                "agent_timeline_limit_exceeded",
-                "the complete Agent timeline exceeds the bounded client projection",
+                "agent_timeline_resume_too_far_behind",
+                "the cached Agent timeline is too far behind to resume",
             ));
         }
         if !page.has_newer {
@@ -2515,6 +2539,45 @@ mod tests {
             .replace_authoritative(session.id.clone(), sequenced_items(&session.id, sequences));
         controller.state.timeline_has_older = has_older;
         controller
+    }
+
+    /// A cached prefix a long background run left behind is replaced, not
+    /// patched.
+    ///
+    /// Patching it means walking every row between where the view stopped and
+    /// where the session is, which is the wait a windowed open exists to
+    /// remove — and it grows with how long the reader was away. Past the bound
+    /// the resume is abandoned and the newest window is read instead.
+    #[tokio::test]
+    async fn a_prefix_left_too_far_behind_is_reopened_instead_of_replayed() {
+        let session = session();
+        let beyond_resume = AGENT_TIMELINE_RESUME_MAX_ITEMS as i64 + 200;
+        let backend = Arc::new(MockAgentBackend::new(
+            session.clone(),
+            sequenced_items(&session.id, 1..=beyond_resume),
+        ));
+        let controller = AgentWorkflowController::new(backend, capabilities());
+
+        let ticket = AgentSessionLoadTicket {
+            generation: WorkflowViewGeneration::default(),
+            session_id: session.id.clone(),
+            load: TimelineLoadKind::Tail(1),
+        };
+        let snapshot = controller
+            .load_session(ticket)
+            .await
+            .expect("a stale prefix must not fail the open");
+
+        // The answer is one bounded window, not the whole history.
+        assert!(
+            snapshot.timeline.len() <= AGENT_TIMELINE_PAGE_LIMIT as usize,
+            "the reopened window is one page, got {}",
+            snapshot.timeline.len()
+        );
+        assert!(
+            snapshot.timeline.len() < beyond_resume as usize,
+            "the resume was abandoned rather than walked to the end"
+        );
     }
 
     #[tokio::test]
