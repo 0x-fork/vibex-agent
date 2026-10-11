@@ -1038,6 +1038,81 @@ fn team_capacity_rejected_transfers_keep_source_group_ownership(cx: &mut TestApp
     });
 }
 
+/// The Archived page has to answer the question an empty list raises: is the
+/// inactivity window running at all, and how far is the oldest session from
+/// it? The pass is silent by design, so the page reads the window's own
+/// report — including the batch a narrowed window retires in one go.
+#[gpui::test]
+fn auto_archive_status_explains_the_window_and_the_last_check(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 3);
+    workbench.update(cx, |workbench, cx| {
+        let now_ms = 40 * AUTO_ARCHIVE_MILLIS_PER_DAY;
+        let mut oldest = session(0);
+        oldest.created_at_ms = 0;
+        oldest.last_message_at_ms = 0;
+        let mut recent = session(1);
+        recent.created_at_ms = 38 * AUTO_ARCHIVE_MILLIS_PER_DAY;
+        recent.last_message_at_ms = recent.created_at_ms;
+        let mut pinned = session(2);
+        pinned.last_message_at_ms = 0;
+        let mut sessions = vec![oldest, recent, pinned.clone()];
+        for index in 3..15 {
+            let mut aged = session(index);
+            aged.created_at_ms = 0;
+            aged.last_message_at_ms = 0;
+            sessions.push(aged);
+        }
+        workbench.sessions = sessions;
+        workbench.sidebar_state.pinned_ids = BTreeSet::from([pinned.id.to_string()]);
+
+        // Nothing to report while the window is off.
+        assert_eq!(workbench.auto_archive_status(now_ms), None);
+
+        // A pinned session is a deliberate keep, so it is not what the window
+        // reports as waiting: the line names the oldest session the window can
+        // still act on, which is what tells the reader the window has simply
+        // not been reached yet.
+        workbench.ui_state.session.auto_archive_after_days = Some(30);
+        let status = workbench
+            .auto_archive_status(now_ms)
+            .expect("an on window reports");
+        assert_eq!(
+            status,
+            AutoArchiveStatus {
+                window_days: 30,
+                eligible_sessions: 14,
+                oldest_idle_days: Some(40),
+                last_pass: None,
+            }
+        );
+        let label = auto_archive_status_label(&status);
+        assert!(label.contains("40") && label.contains("30"), "{label}");
+
+        // Narrowing the window retires the backlog in one pass, and the page
+        // names that batch instead of leaving the reader to notice the rows.
+        workbench.ui_state.session.auto_archive_after_days = Some(7);
+        assert!(workbench.apply_auto_archive_sessions(now_ms, cx));
+        let status = workbench
+            .auto_archive_status(now_ms)
+            .expect("an on window reports");
+        assert_eq!(
+            status.last_pass.map(|pass| (pass.window_days, pass.archived)),
+            Some((7, 13))
+        );
+        let label = auto_archive_status_label(&status);
+        assert!(label.contains("13") && label.contains('7'), "{label}");
+
+        // The batch belongs to the window that produced it: a reader who
+        // widens the window again is back to "nothing archived yet" rather
+        // than reading a count that no longer describes this policy.
+        workbench.ui_state.session.auto_archive_after_days = Some(14);
+        let status = workbench
+            .auto_archive_status(now_ms)
+            .expect("an on window reports");
+        assert_eq!(status.last_pass, None);
+    });
+}
+
 #[gpui::test]
 async fn team_root_listing_and_worker_updates_keep_automatic_archive_off_unloaded_workers(
     cx: &mut TestAppContext,

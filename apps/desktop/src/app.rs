@@ -7816,6 +7816,13 @@ pub struct VibexWorkbench {
     /// reloads the overview — consuming this flag is what keeps that reload
     /// from retrying the same session in a loop.
     auto_archive_pass_pending: bool,
+    /// What the most recent automatic pass retired, and under which window.
+    ///
+    /// The pass runs without asking and without a receipt: it archives at
+    /// launch, on the hour, and the moment the window changes. Keeping the
+    /// last batch lets the Archived page say that the window moved sessions
+    /// instead of leaving the reader to discover an emptied sidebar.
+    auto_archive_last_pass: Option<AutoArchivePassReport>,
     optimistically_removed_project_ids: BTreeSet<String>,
     pending_project_deletion_ids: BTreeSet<String>,
     pending_worktree_rename_ids: BTreeSet<String>,
@@ -8946,6 +8953,7 @@ impl VibexWorkbench {
             archived_sessions_error: None,
             archived_sessions_generation: 0,
             auto_archive_pass_pending: true,
+            auto_archive_last_pass: None,
             optimistically_removed_project_ids: BTreeSet::new(),
             pending_project_deletion_ids: BTreeSet::new(),
             pending_worktree_rename_ids: BTreeSet::new(),
@@ -10568,6 +10576,14 @@ impl VibexWorkbench {
             eprintln!("vibex-fonts: {error}");
         }
         self.ui_state = state;
+        // The window is only known once the saved state is in memory, and the
+        // overview load that applies it can already have finished — a remote
+        // authority boots before this file is read. Re-arm the launch pass so
+        // the first check runs under the window the reader saved, not under
+        // the default the previous load happened to see.
+        if self.ui_state.session.auto_archive_after_days.is_some() {
+            self.auto_archive_pass_pending = true;
+        }
         // The pre-send queue is the one part of the shell state that must be
         // back in memory before the first frame: a message the reader already
         // committed to sending cannot wait for a session list to be shown again.
@@ -33758,11 +33774,7 @@ impl VibexWorkbench {
     /// A pinned session is a deliberate keep, a session with a live turn is
     /// still working, and a delegated child belongs to its parent's timeline —
     /// none of them are candidates.
-    fn auto_archive_candidates(&self, now_ms: i64) -> Vec<VibexSessionId> {
-        let Some(days) = self.ui_state.session.auto_archive_after_days else {
-            return Vec::new();
-        };
-        let cutoff_ms = now_ms.saturating_sub(i64::from(days) * AUTO_ARCHIVE_MILLIS_PER_DAY);
+    fn auto_archive_eligible_sessions(&self) -> impl Iterator<Item = &AgentSession> {
         self.sessions
             .iter()
             .filter(|session| session.archived_at_ms.is_none() && session.deleted_at_ms.is_none())
@@ -33778,6 +33790,15 @@ impl VibexWorkbench {
                     .pending_agent_turn_session_ids
                     .contains(session.id.as_str())
             })
+    }
+
+    /// The eligible sessions that have already passed the window.
+    fn auto_archive_candidates(&self, now_ms: i64) -> Vec<VibexSessionId> {
+        let Some(days) = self.ui_state.session.auto_archive_after_days else {
+            return Vec::new();
+        };
+        let cutoff_ms = now_ms.saturating_sub(i64::from(days) * AUTO_ARCHIVE_MILLIS_PER_DAY);
+        self.auto_archive_eligible_sessions()
             .filter(|session| session.last_message_at_ms.max(session.created_at_ms) <= cutoff_ms)
             .map(|session| session.id.clone())
             .collect()
@@ -33790,10 +33811,51 @@ impl VibexWorkbench {
         if candidates.is_empty() {
             return false;
         }
+        let archived = candidates.len();
         for session_id in candidates {
             self.archive_session(session_id, cx);
         }
+        // Remembered for the page a reader is most likely to be looking at: a
+        // window that was just narrowed retires its whole backlog at once, and
+        // a bare list of fresh rows does not say the window is what moved them.
+        if let Some(window_days) = self.ui_state.session.auto_archive_after_days {
+            self.auto_archive_last_pass = Some(AutoArchivePassReport {
+                window_days,
+                archived,
+                at_ms: now_ms,
+            });
+        }
         true
+    }
+
+    /// What the inactivity window is doing right now: the days it covers, how
+    /// old the oldest session it can act on is, and what the last pass retired.
+    ///
+    /// The pass is silent by design, so an empty Archived page is otherwise
+    /// indistinguishable from a window that never runs. The page reads this
+    /// instead of leaving the reader to guess.
+    fn auto_archive_status(&self, now_ms: i64) -> Option<AutoArchiveStatus> {
+        let window_days = self.ui_state.session.auto_archive_after_days?;
+        let mut eligible_sessions = 0usize;
+        let mut oldest_idle_days: Option<i64> = None;
+        for session in self.auto_archive_eligible_sessions() {
+            eligible_sessions += 1;
+            let activity_ms = session.last_message_at_ms.max(session.created_at_ms);
+            let idle_days = now_ms.saturating_sub(activity_ms) / AUTO_ARCHIVE_MILLIS_PER_DAY;
+            oldest_idle_days =
+                Some(oldest_idle_days.map_or(idle_days, |oldest| oldest.max(idle_days)));
+        }
+        Some(AutoArchiveStatus {
+            window_days,
+            eligible_sessions,
+            oldest_idle_days,
+            // A report describes the window that produced it, and nothing
+            // else: a reader who has since widened the window is back to
+            // "nothing archived yet" rather than reading an older batch.
+            last_pass: self
+                .auto_archive_last_pass
+                .filter(|pass| pass.window_days == window_days),
+        })
     }
 
     /// Deletes every session the archived page is holding.
@@ -65577,6 +65639,75 @@ fn auto_archive_window_label(days: Option<u8>) -> String {
     }
 }
 
+/// What one automatic pass retired, kept so the Archived page can account for
+/// a batch that appeared without the reader pressing anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AutoArchivePassReport {
+    window_days: u8,
+    archived: usize,
+    at_ms: i64,
+}
+
+/// The inactivity window's current effect, as the Archived page reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AutoArchiveStatus {
+    window_days: u8,
+    /// Sessions the window can still act on, and so the ones it can report on.
+    eligible_sessions: usize,
+    /// Whole days the oldest eligible session has been idle.
+    oldest_idle_days: Option<i64>,
+    last_pass: Option<AutoArchivePassReport>,
+}
+
+/// A day count in a sentence: "1 day" / "7 days".
+fn auto_archive_days_label(days: i64) -> String {
+    match days {
+        0 => locale::text("less than a day", "不到 1 天", "不到 1 天").to_string(),
+        1 => locale::text("1 day", "1 天", "1 天").to_string(),
+        days => format!("{days} {}", locale::text("days", "天", "天")),
+    }
+}
+
+/// The supporting line under the window control.
+///
+/// A pass that ran under the current window is the most direct evidence the
+/// reader can get that automatic archiving is alive, so it leads the line.
+/// While nothing has been retired yet the line answers the other question an
+/// empty list raises — how far the oldest session still is from the window.
+fn auto_archive_status_label(status: &AutoArchiveStatus) -> String {
+    let window = auto_archive_days_label(i64::from(status.window_days));
+    if let Some(pass) = status.last_pass {
+        let archived = match pass.archived {
+            1 => locale::text("1 session", "1 个会话", "1 個會話").to_string(),
+            count => format!("{count} {}", locale::text("sessions", "个会话", "個會話")),
+        };
+        return format!(
+            "{} {archived} ({} {window}) · {}",
+            locale::text("Last check archived", "上次检查已归档", "上次檢查已封存"),
+            locale::text("idle over", "空闲超过", "閒置超過"),
+            relative_time_label(pass.at_ms),
+        );
+    }
+    match status.oldest_idle_days {
+        Some(oldest_idle_days) => format!(
+            "{} {} · {} {window}",
+            locale::text(
+                "Oldest idle session:",
+                "最久空闲的会话：",
+                "最久閒置的會話：",
+            ),
+            auto_archive_days_label(oldest_idle_days),
+            locale::text("window:", "窗口：", "視窗："),
+        ),
+        None => locale::text(
+            "No sessions to check yet.",
+            "还没有可检查的会话。",
+            "還沒有可檢查的會話。",
+        )
+        .to_string(),
+    }
+}
+
 /// A muted line in the archived list: an empty state, a load failure or a note.
 fn archived_page_note(text: String, cx: &App) -> AnyElement {
     div()
@@ -73191,6 +73322,14 @@ impl FoundationSettings {
             .read_with(cx, |this, _| this.ui_state.session.auto_archive_after_days)
             .ok()
             .flatten();
+        // The window's own report: whether the last pass retired anything and
+        // how close the oldest live session is to the deadline. An empty list
+        // is otherwise the same picture whether the pass runs or not.
+        let auto_archive_status = self
+            .workbench
+            .read_with(cx, |this, _| this.auto_archive_status(unix_timestamp_ms()))
+            .ok()
+            .flatten();
         let archived = self
             .workbench
             .read_with(cx, |this, _| this.archived_sessions.clone())
@@ -73216,17 +73355,27 @@ impl FoundationSettings {
                 )
             })
             .collect::<Vec<_>>();
+        let auto_archive_description = v_flex()
+            .gap_1()
+            .child(div().child(locale::text(
+                "Archive a session once it has been idle for this long. The check runs at launch and hourly, and a shorter window archives the sessions already past it. Pinned sessions and sessions with a running turn are never archived.",
+                "会话空闲超过这个时间后自动归档。启动时与每小时各检查一次；把窗口调短会同时归档已经超过该时长的会话。置顶会话和正在运行的会话不会被归档。",
+                "會話閒置超過這個時間後自動封存。啟動時與每小時各檢查一次；把視窗調短會同時封存已經超過該時長的會話。置頂會話與正在執行的會話不會被封存。",
+            )))
+            .when_some(auto_archive_status, |this, status| {
+                this.child(
+                    div()
+                        .debug_selector(|| "auto-archive-status".to_string())
+                        .child(auto_archive_status_label(&status)),
+                )
+            });
         let auto_archive_row = setting_row(
             locale::text(
                 "Auto-archive idle sessions",
                 "自动归档空闲会话",
                 "自動封存閒置會話",
             ),
-            locale::text(
-                "Move a session here once it has been inactive for this long. Pinned sessions and sessions with a running turn are never archived.",
-                "会话空闲超过这个时间后自动移到这里；置顶会话和正在运行的会话不会被归档。",
-                "會話閒置超過這個時間後自動移到這裡；置頂會話與正在執行的會話不會被封存。",
-            ),
+            auto_archive_description,
             settings_segmented_control("auto-archive-window", auto_archive_options),
             stacked,
             cx,
