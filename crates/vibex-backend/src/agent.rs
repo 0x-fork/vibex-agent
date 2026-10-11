@@ -11,13 +11,13 @@ use vibex_core::{
     AgentSession, AgentSessionRuntimeSelectionEvent, AgentSessionRuntimeSelectionState,
     AgentTimelineDisplaySettings, AgentTokenUsage, AgentUsageStatistics,
     AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
-    CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
-    GetMessageSubmissionRequest, MessageSubmissionState, ProviderConfiguredModel, ProviderProfile,
-    RemoteDeepLinkResolution, RenameAgentSessionRequest, ReplaceUserMessagePayload,
-    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeSessionEvent,
-    SendAgentMessageRequest, SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest,
-    SteerAgentMessageRequest, SteerAgentMessageResult, TimelineItem, TimelineLiveEvent,
-    TimelinePage, VibexSessionId,
+    CreateAgentSessionRequest, FetchTimelineItemRequest, FetchTimelineRequest,
+    ForkAgentSessionRequest, GetMessageSubmissionRequest, MessageSubmissionState,
+    ProviderConfiguredModel, ProviderProfile, RemoteDeepLinkResolution, RenameAgentSessionRequest,
+    ReplaceUserMessagePayload, ResolveElicitationRequest, ResolvePermissionRequest,
+    RuntimeSessionEvent, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
+    SetDesiredAgentSessionRuntimeRequest, SteerAgentMessageRequest, SteerAgentMessageResult,
+    TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId,
 };
 
 use crate::{BackendBound, BackendFuture, BackendResult, MutationRequest};
@@ -204,6 +204,25 @@ pub trait AgentBackend: BackendBound {
     ) -> BackendFuture<'_, AgentSession>;
 
     fn fetch_timeline(&self, request: FetchTimelineRequest) -> BackendFuture<'_, TimelinePage>;
+
+    /// Reads one timeline item back at full payload depth.
+    ///
+    /// Pages and live events carry summary payloads, so a reader that opens a
+    /// tool activity asks for the single item it is about to render. A backend
+    /// that has no detail to offer answers with the summary item it already
+    /// served, which keeps the call total rather than fallible.
+    fn fetch_timeline_item(
+        &self,
+        request: FetchTimelineItemRequest,
+    ) -> BackendFuture<'_, TimelineItem> {
+        let _ = request;
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_timeline_item_unavailable",
+                "Tool detail is unavailable on this backend",
+            ))
+        })
+    }
 
     /// Reads the desktop-owned timeline presentation preferences. Mobile uses
     /// this as the inherited base for its local overrides.

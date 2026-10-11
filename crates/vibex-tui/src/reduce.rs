@@ -64,10 +64,10 @@ impl App {
     /// Apply one intent.
     pub fn perform(&mut self, intent: Intent) -> Outcome {
         let mut outcome = self.perform_intent(intent);
-        // Scrolling up to the very top is the asking gesture for older
-        // history; `LoadOlderHistory` is the explicit one. The controller
-        // refuses while a page is in flight, so holding a scroll key down
-        // cannot fire a request per repeat.
+        // Approaching the top is the asking gesture for older history;
+        // `LoadOlderHistory` is the explicit one. The controller refuses once
+        // two pages are in flight — and once the history is exhausted — so
+        // holding a scroll key down cannot fire a request per repeat.
         if matches!(
             intent,
             Intent::ScrollPageUp
@@ -80,14 +80,9 @@ impl App {
         outcome
     }
 
-    /// Queue an older-page fetch when the transcript is parked at its top.
+    /// Queue an older-page fetch when the reader is close to the top.
     fn request_older_history_at_top(&mut self, outcome: &mut Outcome) {
-        // While the dock owns the list keys, `k` is moving its cursor, not
-        // scrolling the transcript it happens to be sitting above.
-        if self.dock_is_focused() || !self.at_transcript_top() {
-            return;
-        }
-        if let Some(effect) = self.load_older_history() {
+        if let Some(effect) = self.prefetch_older_history() {
             outcome.effects.push(effect);
             outcome.dirty = true;
         }
@@ -574,8 +569,12 @@ impl App {
                     self.toast(Toast::info(
                         self.strings.toast_action_unavailable().to_string(),
                     ));
+                } else {
+                    // An activity opens onto output a summary page withheld,
+                    // so the expand is what asks for the read.
+                    self.note_block_detail(index);
                 }
-                Outcome::effects(vec![])
+                Outcome::effects(self.take_timeline_detail_effects())
             }
             Intent::ToggleAllBlocksExpanded => {
                 let expand = !self.transcript.all_expanded();
@@ -586,7 +585,10 @@ impl App {
                 {
                     self.set_selection(Scope::Agent, index);
                 }
-                Outcome::effects(vec![])
+                if expand {
+                    self.note_all_block_details();
+                }
+                Outcome::effects(self.take_timeline_detail_effects())
             }
             Intent::ToggleReasoningExpanded => {
                 self.transcript.toggle_reasoning();
@@ -3650,6 +3652,7 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: vibex_core::TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload: vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
                 text: format!("message {sequence}"),
                 attachments: Vec::new(),
@@ -5467,6 +5470,10 @@ mod tests {
             [history_item(&session_id, 3), history_item(&session_id, 4)],
         );
         app.agent.state.timeline_has_older = true;
+        app.sync_transcript();
+        // A band shorter than the loaded window, so scrolling up parks at the
+        // top instead of deciding the tail is the bottom.
+        app.transcript_band_rows = 1;
 
         // No scrolling intent, no request.
         assert!(app.perform(Intent::ScrollPageDown).effects.is_empty());
@@ -5483,11 +5490,18 @@ mod tests {
         assert_eq!(ticket.session_id, session_id);
         assert_eq!(ticket.before_sequence, 3);
 
-        // Scrolling to the top while that request is in flight must not stack
-        // a second one.
+        // Approaching the top admits one more page — the reader is about to
+        // read into the first one and should not have to wait for the second —
+        // and the controller's in-flight limit refuses the one after that, so
+        // a position parked near the top cannot queue a request per keypress.
         app.scroll.follow = false;
         app.scroll.offset = 0;
         assert!(app.at_transcript_top());
+        let prefetch = app.perform(Intent::ScrollHalfPageUp);
+        let [Effect::LoadOlder { ticket: prefetched }] = prefetch.effects.as_slice() else {
+            panic!("expected a prefetched page, got {:?}", prefetch.effects);
+        };
+        assert_eq!(prefetched.before_sequence, 3);
         assert!(app.perform(Intent::ScrollHalfPageUp).effects.is_empty());
 
         // An empty page means the history is exhausted, so the trigger stops.
@@ -5507,6 +5521,44 @@ mod tests {
         );
         assert!(!app.at_transcript_top());
         assert!(app.perform(Intent::ScrollHalfPageUp).effects.is_empty());
+    }
+
+    #[test]
+    fn approaching_the_top_prefetches_before_the_reader_asks() {
+        let mut app = capable_app();
+        let session_id = VibexSessionId::new();
+        app.navigate_to(Page::Agent);
+        app.agent.state.selected_session_id = Some(session_id.clone());
+        app.agent.state.timeline.replace_authoritative(
+            session_id.clone(),
+            (1..=12)
+                .map(|sequence| history_item(&session_id, sequence))
+                .collect::<Vec<_>>(),
+        );
+        app.agent.state.timeline_has_older = true;
+        app.sync_transcript();
+        // A band shorter than the loaded window, so scrolling up inside it
+        // parks the viewport instead of deciding the tail is the bottom.
+        app.transcript_band_rows = 10;
+        app.scroll.follow = false;
+        // Inside the head start of a screen and a half, but not at the top.
+        app.scroll.offset = 12;
+        assert!(!app.at_transcript_top());
+
+        let outcome = app.perform(Intent::ScrollPageUp);
+        let [Effect::LoadOlder { ticket }] = outcome.effects.as_slice() else {
+            panic!("expected a prefetch, got {:?}", outcome.effects);
+        };
+        assert_eq!(ticket.before_sequence, 1);
+
+        // The second slot is the prefetch depth; the ask after that is refused
+        // even though the reader has not moved.
+        assert!(app.prefetch_older_history().is_some());
+        assert!(app.prefetch_older_history().is_none());
+
+        // Far from the top a scroll is just a scroll.
+        app.scroll.offset = 400;
+        assert!(app.prefetch_older_history().is_none());
     }
 
     #[test]

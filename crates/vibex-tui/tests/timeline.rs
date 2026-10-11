@@ -67,6 +67,7 @@ fn app(payloads: Vec<TimelinePayload>, state: AgentSessionState) -> App {
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
         })
         .collect::<Vec<_>>();

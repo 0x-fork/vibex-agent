@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use vibex_backend::{BackendError, BackendResult};
-use vibex_core::{AgentTimelineReasoningDisplayMode, RemoteServerKind};
+use vibex_core::{
+    AgentTimelineReasoningDisplayMode, RemoteServerKind, TimelineItem, VibexSessionId,
+};
 use vibex_remote_client::ClientDeviceIdentity;
 
 use crate::pairing::MobileCredentialBundle;
@@ -29,6 +31,24 @@ const MAX_TIMELINE_DISPLAY_SETTINGS_HOST_ID_BYTES: usize = 256;
 const APP_SETTINGS_FILE: &str = "app-settings.json";
 const APP_SETTINGS_SCHEMA_VERSION: &str = "vibex-native-mobile-app-settings.v1";
 const MAX_APP_SETTINGS_BYTES: u64 = 4 * 1024;
+/// The summary window of the sessions this phone opened last, kept so a cold
+/// start paints the conversation before the network answers. One file rather
+/// than one per session: the set is small and bounded, and eviction has to see
+/// every record to drop the oldest.
+const SESSION_TIMELINES_FILE: &str = "session-timelines.json";
+const SESSION_TIMELINES_SCHEMA_VERSION: &str = "vibex-native-mobile-session-timelines.v1";
+/// At most four conversations: a reader reopens the handful they were last in,
+/// and everything here is re-fetchable.
+const MAX_SESSION_TIMELINES: usize = 4;
+/// A hard cap on the whole file. A window is one page or a few, so this bounds
+/// the cache well above the common case while keeping a runaway projection
+/// from filling the phone.
+const MAX_SESSION_TIMELINES_BYTES: u64 = 6 * 1024 * 1024;
+/// The newest items of one session's window that are worth keeping. A cold open
+/// only shows the tail; older items would be re-fetched on the same gesture
+/// that scrolls to them.
+pub const MAX_SESSION_TIMELINE_ITEMS: usize = 512;
+const MAX_SESSION_TIMELINE_ID_BYTES: usize = 256;
 /// The install-wide device identity a pairing presents. It is separate from
 /// the per-host credential bundles because it outlives any single pairing and
 /// is what lets the desktop recognise a re-pairing as the same client.
@@ -142,6 +162,34 @@ pub struct MobileTimelineDisplaySettingsOverride {
 struct StoredTimelineDisplaySettingsOverrides {
     schema_version: String,
     overrides: BTreeMap<String, MobileTimelineDisplaySettingsOverride>,
+}
+
+/// The newest summary window of one runtime session.
+///
+/// Only summary payloads are held here: tool detail is the large part of a
+/// timeline and is read back one item at a time, which is exactly what makes a
+/// cache of whole conversations small enough to keep on a phone.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoredSessionTimeline {
+    /// The paired runtime that produced the window. Session ids are minted per
+    /// runtime, so the pair is the key — never the session id alone.
+    pub host_id: String,
+    pub session_id: VibexSessionId,
+    /// When this window was last written, in Unix milliseconds. Eviction is
+    /// oldest-first, so this is the record's whole age signal.
+    pub saved_at_ms: i64,
+    /// Whether the runtime reported history below this window. Kept beside the
+    /// items because it describes them, not the client that reads them back.
+    pub has_older: bool,
+    pub items: Vec<TimelineItem>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredSessionTimelines {
+    schema_version: String,
+    sessions: Vec<StoredSessionTimeline>,
 }
 
 #[derive(Clone, Debug)]
@@ -417,6 +465,118 @@ impl CredentialStorage {
         }
     }
 
+    pub fn session_timelines_path(&self) -> PathBuf {
+        self.data_dir.join(SESSION_TIMELINES_FILE)
+    }
+
+    /// The cached window for one runtime session, if this phone stored one.
+    ///
+    /// Only a record whose runtime and session both match is returned, so a
+    /// window written for another desktop can never be painted into a session
+    /// that merely reused the id. A record that fails validation is treated as
+    /// absent rather than partially applied.
+    pub fn load_session_timeline(
+        &self,
+        host_id: &str,
+        session_id: &VibexSessionId,
+    ) -> BackendResult<Option<StoredSessionTimeline>> {
+        Ok(self
+            .load_stored_session_timelines()?
+            .into_iter()
+            .find(|record| {
+                record.host_id == host_id
+                    && record.session_id == *session_id
+                    && session_timeline_record_is_valid(record)
+            }))
+    }
+
+    /// Remembers one session's newest window, evicting the oldest records to
+    /// stay within the record count and the file's byte cap.
+    ///
+    /// A window too large to fit on its own is rejected instead of trimming
+    /// the payload: the caller would rather re-fetch than show a conversation
+    /// with a hole in it.
+    pub fn save_session_timeline(&self, record: &StoredSessionTimeline) -> BackendResult<()> {
+        let mut record = record.clone();
+        // Detail is what a reader opens an activity to fetch; storing it would
+        // undo the point of the summary pages that filled this window.
+        record.items = std::mem::take(&mut record.items)
+            .into_iter()
+            .map(TimelineItem::into_summary)
+            .collect();
+        if !session_timeline_record_is_valid(&record) {
+            return Err(storage_error("mobile_session_timelines_invalid"));
+        }
+        // A corrupt file reads as no records at all: it is data this build
+        // already refused to apply, and the write below replaces it wholesale.
+        let mut sessions = self.load_stored_session_timelines().unwrap_or_default();
+        sessions.retain(|existing| {
+            existing.host_id != record.host_id || existing.session_id != record.session_id
+        });
+        sessions.push(record);
+        sessions.sort_by_key(|record| std::cmp::Reverse(record.saved_at_ms));
+        sessions.truncate(MAX_SESSION_TIMELINES);
+
+        let mut stored = StoredSessionTimelines {
+            schema_version: SESSION_TIMELINES_SCHEMA_VERSION.to_string(),
+            sessions,
+        };
+        loop {
+            let encoded = serde_json::to_vec(&stored)
+                .map_err(|_| storage_error("mobile_session_timelines_encode_failed"))?;
+            if encoded.is_empty() {
+                return Err(storage_error("mobile_session_timelines_invalid"));
+            }
+            if encoded.len() as u64 <= MAX_SESSION_TIMELINES_BYTES {
+                fs::create_dir_all(&self.data_dir)
+                    .map_err(|_| storage_error("mobile_session_timelines_write_failed"))?;
+                return write_atomic(
+                    &self.session_timelines_path(),
+                    &encoded,
+                    "mobile_session_timelines_write_failed",
+                );
+            }
+            // Over the cap: the oldest conversation is the one a cold start is
+            // least likely to reopen, so it goes first.
+            if stored.sessions.len() <= 1 {
+                return Err(storage_error("mobile_session_timelines_invalid"));
+            }
+            stored.sessions.pop();
+        }
+    }
+
+    pub fn clear_session_timelines(&self) -> BackendResult<()> {
+        match fs::remove_file(self.session_timelines_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(storage_error("mobile_session_timelines_clear_failed")),
+        }
+    }
+
+    fn load_stored_session_timelines(&self) -> BackendResult<Vec<StoredSessionTimeline>> {
+        let path = self.session_timelines_path();
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => return Err(storage_error("mobile_session_timelines_read_failed")),
+        };
+        if metadata.len() == 0 || metadata.len() > MAX_SESSION_TIMELINES_BYTES {
+            return self.reject_invalid_session_timelines(&path);
+        }
+        let bytes =
+            fs::read(&path).map_err(|_| storage_error("mobile_session_timelines_read_failed"))?;
+        let stored: StoredSessionTimelines = match serde_json::from_slice(&bytes) {
+            Ok(stored) => stored,
+            Err(_) => return self.reject_invalid_session_timelines(&path),
+        };
+        if stored.schema_version != SESSION_TIMELINES_SCHEMA_VERSION
+            || stored.sessions.len() > MAX_SESSION_TIMELINES
+        {
+            return self.reject_invalid_session_timelines(&path);
+        }
+        Ok(stored.sessions)
+    }
+
     pub fn app_settings_path(&self) -> PathBuf {
         self.data_dir.join(APP_SETTINGS_FILE)
     }
@@ -614,6 +774,39 @@ impl CredentialStorage {
             Err(_) => Err(storage_error("mobile_timeline_settings_clear_failed")),
         }
     }
+
+    fn reject_invalid_session_timelines(
+        &self,
+        path: &Path,
+    ) -> BackendResult<Vec<StoredSessionTimeline>> {
+        match fs::remove_file(path) {
+            Ok(()) => Err(storage_error("mobile_session_timelines_invalid")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(storage_error("mobile_session_timelines_invalid"))
+            }
+            Err(_) => Err(storage_error("mobile_session_timelines_clear_failed")),
+        }
+    }
+}
+
+/// Whether one cached window may be painted into the session it names.
+///
+/// The whole record is judged at once: a window is either the conversation it
+/// claims to be or it is dropped, never kept up to the point something looked
+/// wrong.
+fn session_timeline_record_is_valid(record: &StoredSessionTimeline) -> bool {
+    let named = |id: &str| {
+        !id.is_empty()
+            && id.len() <= MAX_SESSION_TIMELINE_ID_BYTES
+            && !id.chars().any(char::is_control)
+    };
+    named(&record.host_id)
+        && record.saved_at_ms >= 0
+        && record.items.len() <= MAX_SESSION_TIMELINE_ITEMS
+        && record
+            .items
+            .iter()
+            .all(|item| item.session_id == record.session_id)
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -1232,5 +1425,312 @@ mod tests {
         let error = storage.save(&fixture()).unwrap_err();
         assert_eq!(error.code, "mobile_credentials_write_failed");
         assert!(!temporary_path(&storage.path()).exists());
+    }
+
+    fn timeline_item(session_id: &VibexSessionId, sequence: i64) -> TimelineItem {
+        let payload = vibex_core::TimelinePayload::UserMessage(Default::default());
+        TimelineItem {
+            id: vibex_core::TimelineItemId::parse(format!("timeline_mobile_{sequence}")).unwrap(),
+            session_id: session_id.clone(),
+            sequence,
+            timestamp_ms: sequence,
+            source: vibex_core::TimelineSource::Agent,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: vibex_core::TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
+            payload,
+        }
+    }
+
+    fn session_timeline(
+        host_id: &str,
+        session_id: &VibexSessionId,
+        saved_at_ms: i64,
+    ) -> StoredSessionTimeline {
+        StoredSessionTimeline {
+            host_id: host_id.to_string(),
+            session_id: session_id.clone(),
+            saved_at_ms,
+            has_older: true,
+            items: vec![timeline_item(session_id, 1), timeline_item(session_id, 2)],
+        }
+    }
+
+    #[test]
+    fn session_timelines_round_trip_and_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        let session = VibexSessionId::new();
+        let record = session_timeline("desktop-primary", &session, 1_700_000_000_000);
+        assert!(
+            storage
+                .load_session_timeline("desktop-primary", &session)
+                .unwrap()
+                .is_none()
+        );
+
+        storage.save_session_timeline(&record).unwrap();
+        let loaded = storage
+            .load_session_timeline("desktop-primary", &session)
+            .unwrap()
+            .expect("a saved window should load again");
+        assert_eq!(loaded.session_id, session);
+        assert!(loaded.has_older);
+        assert_eq!(
+            loaded
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        storage.clear_session_timelines().unwrap();
+        assert!(
+            storage
+                .load_session_timeline("desktop-primary", &session)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Session ids are minted per runtime, so only the pair the record was
+    /// written under may read it back.
+    #[test]
+    fn a_session_timeline_is_never_returned_for_another_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        let session = VibexSessionId::new();
+        storage
+            .save_session_timeline(&session_timeline("desktop-primary", &session, 1))
+            .unwrap();
+
+        assert!(
+            storage
+                .load_session_timeline("desktop-secondary", &session)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .load_session_timeline("desktop-primary", &VibexSessionId::new())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_timelines_keep_only_the_newest_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        let sessions = (0..MAX_SESSION_TIMELINES + 1)
+            .map(|_| VibexSessionId::new())
+            .collect::<Vec<_>>();
+        for (index, session) in sessions.iter().enumerate() {
+            storage
+                .save_session_timeline(&session_timeline(
+                    "desktop-primary",
+                    session,
+                    1_700_000_000_000 + index as i64,
+                ))
+                .unwrap();
+        }
+
+        for session in &sessions[1..] {
+            assert!(
+                storage
+                    .load_session_timeline("desktop-primary", session)
+                    .unwrap()
+                    .is_some(),
+                "the newer windows should survive"
+            );
+        }
+        assert!(
+            storage
+                .load_session_timeline("desktop-primary", &sessions[0])
+                .unwrap()
+                .is_none(),
+            "the oldest window is the one evicted"
+        );
+    }
+
+    /// The file's byte cap evicts oldest-first even when the record count
+    /// alone would allow the write.
+    #[test]
+    fn session_timelines_evict_by_bytes_too() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        let oversized = "x".repeat(MAX_SESSION_TIMELINES_BYTES as usize / 2 + 1024);
+        let older_session = VibexSessionId::new();
+        let mut older = session_timeline("desktop-primary", &older_session, 1);
+        older.items = vec![timeline_item(&older_session, 1)];
+        older.items[0].payload =
+            vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                text: oversized.clone(),
+                ..Default::default()
+            });
+        let newest_session = VibexSessionId::new();
+        let mut newest = session_timeline("desktop-primary", &newest_session, 2);
+        newest.items = vec![timeline_item(&newest_session, 1)];
+        newest.items[0].payload =
+            vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                text: oversized,
+                ..Default::default()
+            });
+
+        storage.save_session_timeline(&older).unwrap();
+        storage.save_session_timeline(&newest).unwrap();
+
+        assert!(
+            storage
+                .load_session_timeline("desktop-primary", &older_session)
+                .unwrap()
+                .is_none(),
+            "the older window is dropped to fit the cap"
+        );
+        let loaded = storage
+            .load_session_timeline("desktop-primary", &newest_session)
+            .unwrap()
+            .expect("the newer window should survive");
+        assert_eq!(loaded.items.len(), 1);
+    }
+
+    /// The window is stored at summary depth: detail is the large part of a
+    /// timeline and is re-read one item at a time when a reader opens it.
+    #[test]
+    fn stored_session_timelines_carry_no_tool_detail() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        let session = VibexSessionId::new();
+        let mut record = session_timeline("desktop-primary", &session, 1);
+        record.items[0].payload =
+            vibex_core::TimelinePayload::FileOperation(vibex_core::FileOperationPayload {
+                operation: vibex_core::FileOperationKind::Edit,
+                path: "/work/vibex/src/main.rs".to_string(),
+                summary: "edited main.rs".to_string(),
+                old_text: Some("x".repeat(4096)),
+                new_text: Some("y".repeat(4096)),
+                patch: None,
+                raw_extension: None,
+            });
+        assert!(record.items[0].has_complete_payload());
+
+        storage.save_session_timeline(&record).unwrap();
+
+        let written = fs::read_to_string(storage.session_timelines_path()).unwrap();
+        assert!(!written.contains(&"x".repeat(4096)));
+        let stored: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(stored["sessions"][0]["items"][0]["payloadDepth"], "summary");
+        let loaded = storage
+            .load_session_timeline("desktop-primary", &session)
+            .unwrap()
+            .expect("a saved window should load again");
+        assert!(!loaded.items[0].has_complete_payload());
+    }
+
+    /// A window naming another session is not this session's conversation, so
+    /// the record is dropped whole instead of painted.
+    #[test]
+    fn a_session_timeline_holding_another_sessions_items_is_discarded() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        let session = VibexSessionId::new();
+        let mut record = session_timeline("desktop-primary", &session, 1);
+        record.items[0] = timeline_item(&VibexSessionId::new(), 1);
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(
+            storage.session_timelines_path(),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": SESSION_TIMELINES_SCHEMA_VERSION,
+                "sessions": [record],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            storage
+                .load_session_timeline("desktop-primary", &session)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_oversized_session_timeline_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        let session = VibexSessionId::new();
+        let mut record = session_timeline("desktop-primary", &session, 1);
+        record.items = (0..MAX_SESSION_TIMELINE_ITEMS as i64 + 1)
+            .map(|sequence| timeline_item(&session, sequence))
+            .collect();
+
+        let error = storage.save_session_timeline(&record).unwrap_err();
+        assert_eq!(error.code, "mobile_session_timelines_invalid");
+        assert!(!storage.session_timelines_path().exists());
+    }
+
+    #[test]
+    fn malformed_session_timelines_are_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(storage.session_timelines_path(), b"not-json").unwrap();
+
+        let error = storage
+            .load_session_timeline("desktop-primary", &VibexSessionId::new())
+            .unwrap_err();
+        assert_eq!(error.code, "mobile_session_timelines_invalid");
+        assert!(!storage.session_timelines_path().exists());
+    }
+
+    #[test]
+    fn unknown_session_timelines_schema_is_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(
+            storage.session_timelines_path(),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": "vibex-native-mobile-session-timelines.v2",
+                "sessions": [],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = storage
+            .load_session_timeline("desktop-primary", &VibexSessionId::new())
+            .unwrap_err();
+        assert_eq!(error.code, "mobile_session_timelines_invalid");
+        assert!(!storage.session_timelines_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_timelines_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        storage
+            .save_session_timeline(&session_timeline(
+                "desktop-primary",
+                &VibexSessionId::new(),
+                1,
+            ))
+            .unwrap();
+        assert_eq!(
+            fs::metadata(storage.session_timelines_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }

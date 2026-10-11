@@ -72,7 +72,8 @@ use crate::sidebar::{
     folder_guides, press_is_on_trailing_actions, row_at_position, sidebar_rows, workspace_cards,
 };
 use crate::storage::{
-    AppSettings, CredentialStorage, MobileTimelineDisplaySettingsOverride, StoredHostEntry,
+    AppSettings, CredentialStorage, MAX_SESSION_TIMELINE_ITEMS,
+    MobileTimelineDisplaySettingsOverride, StoredHostEntry, StoredSessionTimeline,
 };
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{locale, markdown, notifications, power, scanner, theme, update};
@@ -84,6 +85,12 @@ use gpui_component::shimmer::ShimmerText;
 use gpui_component::{Disableable as _, StyledExt as _};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
+/// How close to the top the reader has to be for older history to be fetched.
+///
+/// One and a half screens: the page is already there when the reader arrives,
+/// and reaching the very top never waits on a request. The unit is turns, the
+/// list's own, because that is what its scroll handler reports.
+const TIMELINE_OLDER_PREFETCH_SCREENS: f32 = 1.5;
 const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
 const TIMELINE_TURN_ESTIMATED_HEIGHT_PX: f32 = 180.0;
 const TIMELINE_ACTION_BUTTON_SIZE_PX: f32 = 32.0;
@@ -141,6 +148,43 @@ fn timeline_list_state(turn_count: usize) -> ListState {
         px(TIMELINE_LIST_OVERDRAW_PX),
     )
     .with_uniform_item_height(px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX))
+}
+
+/// Points the timeline list's scroll reports at the view.
+///
+/// Older history is prefetched from them. The handler runs while the list
+/// state is mutably borrowed, so it only hands the viewport to the view; every
+/// list call happens on the view's turn.
+fn install_timeline_scroll_handler(state: &ListState, owner: WeakEntity<MobileApp>) {
+    state.set_scroll_handler(move |event, _window, cx| {
+        let viewport = TimelineViewport {
+            first_visible: event.visible_range.start,
+            visible: event
+                .visible_range
+                .end
+                .saturating_sub(event.visible_range.start),
+        };
+        let _ = owner.update(cx, |app, cx| {
+            app.timeline_viewport = Some(viewport);
+            app.prefetch_older_history_if_near_top(cx);
+        });
+    });
+}
+
+/// The reader's place in the timeline, as the list last reported it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TimelineViewport {
+    first_visible: usize,
+    visible: usize,
+}
+
+/// Whether a reported viewport sits within the older-history prefetch band.
+///
+/// The unit is turns because that is what the list reports; a turn can be
+/// taller than a screen, so this is deliberately generous — fetching early
+/// costs a page that the reader was about to want anyway.
+fn timeline_viewport_is_near_top(first_visible: usize, visible: usize) -> bool {
+    visible > 0 && first_visible as f32 <= visible as f32 * TIMELINE_OLDER_PREFETCH_SCREENS
 }
 
 fn should_present_agent_notification(
@@ -420,6 +464,7 @@ impl PendingMobileUserMessage {
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
         });
         Some(items)
@@ -998,6 +1043,22 @@ pub struct MobileApp {
     timeline_display_settings_overrides: BTreeMap<String, MobileTimelineDisplaySettingsOverride>,
     timeline_display_settings_sync_busy: bool,
     timeline_list: ListState,
+    /// The window read from disk, drawn until the controller's projection has
+    /// a session to draw instead.
+    ///
+    /// A stand-in, but a real projection: display settings, the optimistic
+    /// pending message, and mutation feedback all fold into it exactly as they
+    /// do into the controller's, which is why it is kept as a model rather
+    /// than as finished turns.
+    timeline_cache_timeline: Option<TimelineModel>,
+    /// The reader's last reported viewport. The list's scroll handler runs
+    /// while its state is borrowed, so the prefetch path reads this instead of
+    /// asking the list where it is.
+    timeline_viewport: Option<TimelineViewport>,
+    /// The rows that have already had their detail read back, and the ones
+    /// being read now. Opening the same activity twice pays for one read.
+    timeline_detail_ready: BTreeSet<i64>,
+    timeline_detail_in_flight: BTreeSet<i64>,
     drawer_scroll: UniformListScrollHandle,
     settings_scroll: ScrollHandle,
     sidebar_search_input: Entity<InputState>,
@@ -1330,7 +1391,15 @@ impl MobileApp {
             desktop_timeline_display_settings: AgentTimelineDisplaySettings::default(),
             timeline_display_settings_overrides,
             timeline_display_settings_sync_busy: false,
-            timeline_list: timeline_list_state(0),
+            timeline_list: {
+                let state = timeline_list_state(0);
+                install_timeline_scroll_handler(&state, cx.weak_entity());
+                state
+            },
+            timeline_cache_timeline: None,
+            timeline_viewport: None,
+            timeline_detail_ready: BTreeSet::new(),
+            timeline_detail_in_flight: BTreeSet::new(),
             drawer_scroll: UniformListScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
             sidebar_search_input,
@@ -1807,6 +1876,9 @@ impl MobileApp {
         server_kind: RemoteServerKind,
         cx: &mut Context<Self>,
     ) {
+        // The controller this connection replaces is about to be dropped; its
+        // window is kept for the next cold start first.
+        self.persist_active_session_timeline();
         crate::discovery::stop();
         self.stop_connection_tasks();
         self.reset_runtime_options();
@@ -1815,7 +1887,20 @@ impl MobileApp {
         self.nearby_pairing_state = NearbyPairingState::Idle;
         match bundle.backend() {
             Ok(backend) => {
+                let previous_host_id = self.active_host_id.clone();
                 self.remember_host(&bundle, server_kind);
+                // A cached conversation belongs to the runtime that produced
+                // it. Switching runtimes drops the cache rather than leaving
+                // another desktop's windows on disk; a first connect keeps it,
+                // because that is the cold start the cache exists for.
+                if previous_host_id
+                    .as_deref()
+                    .is_some_and(|previous| Some(previous) != self.active_host_id.as_deref())
+                {
+                    let _ = self.storage.clear_session_timelines();
+                    self.timeline_cache_timeline = None;
+                    self.timeline_viewport = None;
+                }
                 if let Some(workbench) = self.workbench.take() {
                     workbench.update(cx, |workbench, _| workbench.suspend());
                 }
@@ -4152,10 +4237,18 @@ impl MobileApp {
         self.sidebar_state
             .selected_ids
             .insert(session_id.as_str().to_string());
+        // Switching away is the last chance to keep this conversation for the
+        // next cold start: the controller drops its projection on the way out.
+        let switching_session = self.controller.as_ref().is_some_and(|controller| {
+            controller.state.selected_session_id.as_ref() != Some(&session_id)
+        });
+        if switching_session {
+            self.persist_active_session_timeline();
+        }
         let Some(controller) = self.controller.as_mut() else {
             return;
         };
-        let ticket = match controller.begin_session_load(session_id) {
+        let ticket = match controller.begin_session_load(session_id.clone()) {
             Ok(ticket) => ticket,
             Err(error) => {
                 self.error = Some(error);
@@ -4192,24 +4285,45 @@ impl MobileApp {
         self.full_reasoning_rows.clear();
         self.expanded_approval.clear();
         self.timeline_markdown_views.borrow_mut().clear();
+        self.timeline_detail_ready.clear();
+        self.timeline_detail_in_flight.clear();
+        self.timeline_viewport = None;
+        // The window written by the last visit, when there is one. The
+        // in-memory cache is richer (it already holds this process's detail
+        // reads), so disk is only read when that one missed.
+        let cached_window = (!restored_from_cache)
+            .then(|| self.load_cached_session_window(&session_id))
+            .flatten();
         if restored_from_cache {
+            self.timeline_cache_timeline = None;
             self.rebuild_timeline_turns();
             self.timeline_list.scroll_to_end();
         } else {
+            self.timeline_cache_timeline = None;
             self.timeline_turns = Arc::new(Vec::new());
             self.timeline_list.reset(0);
+            if let Some(record) = cached_window {
+                self.paint_cached_session_window(record);
+            }
         }
         if let Some(workspace_id) = restored_workspace_id {
             self.ensure_workbench(workspace_id, cx);
         }
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
+            let failed = outcome.is_err();
             let _ = entity.update(cx, |this, cx| {
                 if let Some(controller) = this.controller.as_mut()
                     && controller.apply_session_snapshot(&ticket, outcome)
+                    && !failed
                 {
+                    // The authoritative answer is the conversation now; a
+                    // cached window is only ever a stand-in for it.
+                    this.timeline_cache_timeline = None;
                     this.rebuild_timeline_turns();
                     this.timeline_list.scroll_to_end();
+                    this.timeline_viewport = None;
+                    this.persist_active_session_timeline();
                     let workspace_id = this
                         .controller
                         .as_ref()
@@ -4224,6 +4338,70 @@ impl MobileApp {
         });
         self.tasks.push(task);
         cx.notify();
+    }
+
+    /// The persisted window of a session about to be opened, if this phone has
+    /// one for the runtime that is connected.
+    fn load_cached_session_window(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> Option<StoredSessionTimeline> {
+        let host_id = self.active_host_id.as_deref()?;
+        // The cache is an optimization: a file this build cannot read loses
+        // the head start, it does not keep the session from opening.
+        self.storage
+            .load_session_timeline(host_id, session_id)
+            .ok()
+            .flatten()
+    }
+
+    /// Paints the cached window while the fetch that replaces it runs.
+    fn paint_cached_session_window(&mut self, record: StoredSessionTimeline) {
+        if record.items.is_empty() {
+            return;
+        }
+        self.timeline_cache_timeline = Some(TimelineModel {
+            session_id: Some(record.session_id),
+            items: record.items,
+            ..Default::default()
+        });
+        self.rebuild_timeline_turns();
+        self.timeline_list.scroll_to_end();
+    }
+
+    /// Writes the open session's window, so the next cold start paints the
+    /// conversation before the network answers.
+    ///
+    /// Best effort on purpose: the cache is an optimization, and a full or
+    /// read-only data dir must not surface an error for it.
+    fn persist_active_session_timeline(&mut self) {
+        let Some(host_id) = self.active_host_id.clone() else {
+            return;
+        };
+        let Some(controller) = self.controller.as_ref() else {
+            return;
+        };
+        let Some(session_id) = controller.state.selected_session_id.clone() else {
+            return;
+        };
+        if controller.state.timeline.session_id.as_ref() != Some(&session_id) {
+            return;
+        }
+        let items = &controller.state.timeline.items;
+        // A cold open shows the tail; everything above it is one page fetch
+        // away, so only the newest items are worth the bytes on disk.
+        let oldest = items.len().saturating_sub(MAX_SESSION_TIMELINE_ITEMS);
+        if oldest >= items.len() {
+            return;
+        }
+        let record = StoredSessionTimeline {
+            host_id,
+            session_id,
+            saved_at_ms: unix_timestamp_ms(),
+            has_older: controller.state.timeline_has_older,
+            items: items[oldest..].to_vec(),
+        };
+        let _ = self.storage.save_session_timeline(&record);
     }
 
     /// Pulls the Desktop's sidebar tree. The phone never invents folders or
@@ -5353,6 +5531,9 @@ impl MobileApp {
     /// Drops the live connection without touching any stored pairing, so the
     /// runtime stays listed and can be switched back to.
     fn teardown_active_connection(&mut self, cx: &mut Context<Self>) {
+        // The projection is about to be dropped; keep its window for the next
+        // cold start before it goes.
+        self.persist_active_session_timeline();
         self.stop_connection_tasks();
         crate::background_connection::disconnect();
         self.backend = None;
@@ -5369,6 +5550,10 @@ impl MobileApp {
         self.workspace_summaries.clear();
         self.reset_sidebar_ui();
         self.timeline_turns = Arc::new(Vec::new());
+        self.timeline_cache_timeline = None;
+        self.timeline_viewport = None;
+        self.timeline_detail_ready.clear();
+        self.timeline_detail_in_flight.clear();
         self.pending_user_message = None;
         self.timeline_metadata_tip = None;
         self.attachment_preview = None;
@@ -5411,8 +5596,10 @@ impl MobileApp {
         self.active_host_id = None;
         // The single-credential file mirrors the active runtime, so it must not
         // keep pointing at the credential just deleted; whichever runtime takes
-        // over rewrites it.
+        // over rewrites it. The cached conversations belonged to that runtime
+        // too, and only it could ever have used them.
         let _ = self.storage.clear();
+        let _ = self.storage.clear_session_timelines();
         self.mode = RootMode::Pairing;
         match self.fallback_host_id() {
             Some(next_id) => {
@@ -5642,15 +5829,19 @@ impl MobileApp {
         let runner = gpui_tokio::Tokio::spawn(cx, controller.load_session(ticket.clone()));
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
+            let failed = outcome.is_err();
             let _ = entity.update(cx, |this, cx| {
                 if let Some(controller) = this.controller.as_mut()
                     && controller.apply_session_snapshot(&ticket, outcome)
+                    && !failed
                 {
+                    this.timeline_cache_timeline = None;
                     this.rebuild_timeline_turns();
                     this.timeline_list.remeasure();
                     if should_follow {
                         this.timeline_list.scroll_to_end();
                     }
+                    this.persist_active_session_timeline();
                 }
                 cx.notify();
             });
@@ -6384,15 +6575,85 @@ impl MobileApp {
     }
 
     fn toggle_timeline_row(&mut self, id: String, cx: &mut Context<Self>) {
-        if self.collapsed_timeline_rows.remove(&id) {
-            self.expanded_timeline_rows.insert(id);
+        let expanded = if self.collapsed_timeline_rows.remove(&id) {
+            self.expanded_timeline_rows.insert(id.clone());
+            true
         } else if self.expanded_timeline_rows.remove(&id) {
-            self.collapsed_timeline_rows.insert(id);
+            self.collapsed_timeline_rows.insert(id.clone());
+            false
         } else {
-            self.expanded_timeline_rows.insert(id);
+            self.expanded_timeline_rows.insert(id.clone());
+            true
+        };
+        if expanded {
+            self.ensure_timeline_row_detail(&id, cx);
         }
         self.timeline_list.remeasure();
         cx.notify();
+    }
+
+    /// Reads back the tool detail behind a row the reader just opened.
+    ///
+    /// Pages ship summary payloads, so the row on screen already carries
+    /// everything the conversation needs; only the activity's output and file
+    /// snapshots are missing, and the runtime is asked for exactly the item
+    /// behind this row. The row keeps rendering its summary while the read is
+    /// in flight, so expanding never blanks the row it opened.
+    fn ensure_timeline_row_detail(&mut self, row_id: &str, cx: &mut Context<Self>) {
+        let Some(sequence) = self.summary_row_sequence(row_id) else {
+            return;
+        };
+        if self.timeline_detail_ready.contains(&sequence)
+            || !self.timeline_detail_in_flight.insert(sequence)
+        {
+            return;
+        }
+        let Some(controller) = self.controller.as_mut() else {
+            self.timeline_detail_in_flight.remove(&sequence);
+            return;
+        };
+        let Ok(ticket) = controller.begin_timeline_item(sequence) else {
+            self.timeline_detail_in_flight.remove(&sequence);
+            return;
+        };
+        let runner = gpui_tokio::Tokio::spawn(cx, controller.load_timeline_item(ticket.clone()));
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.timeline_detail_in_flight.remove(&sequence);
+                let applied = this.controller.as_mut().is_some_and(|controller| {
+                    controller
+                        .apply_timeline_item(&ticket, outcome)
+                        .unwrap_or(false)
+                });
+                if applied {
+                    // Remember it across a refresh too: the controller keys
+                    // detail by sequence, and a summary page that replaces the
+                    // item restores it from there.
+                    this.timeline_detail_ready.insert(sequence);
+                    this.rebuild_timeline_turns();
+                    this.timeline_list.remeasure();
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+    }
+
+    /// The sequence whose detail an expanded row is missing.
+    ///
+    /// A row with no summary item behind it — a group header, a projected
+    /// local message, an item already at full depth — has nothing to fetch.
+    fn summary_row_sequence(&self, row_id: &str) -> Option<i64> {
+        let row = self.timeline_turns.iter().find_map(|turn| {
+            turn.user_row
+                .iter()
+                .chain(turn.process_rows.iter())
+                .chain(turn.conclusion_row.iter())
+                .find(|row| row.id == row_id)
+        })?;
+        let item = self.timeline_row_item(row)?;
+        (!item.has_complete_payload()).then_some(item.sequence)
     }
 
     fn toggle_approval_details(&mut self, id: String, cx: &mut Context<Self>) {
@@ -6409,21 +6670,183 @@ impl MobileApp {
         ) <= TIMELINE_NEAR_BOTTOM_PX
     }
 
+    /// Whether the reader is close enough to the top to want history above it.
+    fn timeline_is_near_top(&self) -> bool {
+        self.timeline_viewport.is_some_and(|viewport| {
+            timeline_viewport_is_near_top(viewport.first_visible, viewport.visible)
+        })
+    }
+
     fn sync_timeline_list(&mut self, turn_count: usize) {
         let current_count = self.timeline_list.item_count();
         if current_count == turn_count {
             return;
         }
         if current_count == 0 || current_count > turn_count {
-            self.timeline_list = timeline_list_state(turn_count);
+            // Reset in place rather than swapping in a fresh state: the list
+            // carries the scroll handler that prefetches older history. The
+            // uniform height is what a fresh state used to give the extent
+            // before the offscreen turns are measured.
+            self.timeline_list
+                .reset_with_uniform_height(turn_count, px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX));
         } else {
             self.timeline_list
                 .splice(current_count..current_count, turn_count - current_count);
         }
     }
 
-    fn rebuild_timeline_turns(&mut self) {
-        let reasoning_display_mode = match self
+    /// Starts an older-history fetch when the reader is near the top.
+    ///
+    /// The controller is the admission check: it knows whether history exists
+    /// below the window and how many pages may be outstanding. Firing on every
+    /// scroll report is deliberate — each report re-checks, and the cap keeps
+    /// a reader parked at the top from queueing a request per gesture.
+    fn prefetch_older_history_if_near_top(&mut self, cx: &mut Context<Self>) {
+        if !self.timeline_is_near_top() {
+            return;
+        }
+        let Some(controller) = self.controller.as_mut() else {
+            return;
+        };
+        if !controller.can_load_older() {
+            return;
+        }
+        let Ok(ticket) = controller.begin_timeline_before() else {
+            return;
+        };
+        let runner = gpui_tokio::Tokio::spawn(cx, controller.load_timeline_before(ticket.clone()));
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                let applied = this.controller.as_mut().is_some_and(|controller| {
+                    controller
+                        .apply_timeline_before(&ticket, outcome)
+                        .unwrap_or(false)
+                });
+                if applied {
+                    this.prepend_timeline_turns();
+                }
+                // A page landing frees a slot; if the reader is still parked
+                // near the top the next one goes out now.
+                this.prefetch_older_history_if_near_top(cx);
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+    }
+
+    /// Rebuilds the turns after a page arrived above the window.
+    ///
+    /// The page is spliced in at the head, which moves the list's logical
+    /// anchor by the same count: the turn under the reader's finger stays
+    /// there instead of the transcript jumping to wherever an append-shaped
+    /// splice would have left it.
+    fn prepend_timeline_turns(&mut self) {
+        let previous_count = self.timeline_turns.len();
+        let turns = self.build_timeline_turns();
+        let added = turns.len().saturating_sub(previous_count);
+        if turns.len() >= previous_count && added > 0 {
+            self.timeline_list.splice(0..0, added);
+            if let Some(viewport) = self.timeline_viewport.as_mut() {
+                viewport.first_visible = viewport.first_visible.saturating_add(added);
+            }
+        } else if turns.len() < previous_count {
+            // The projection's item budget dropped the newest turns to make
+            // room for the page. The window is no longer a superset, so there
+            // is no anchor to preserve.
+            self.timeline_list
+                .reset_with_uniform_height(turns.len(), px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX));
+            self.timeline_viewport = None;
+        }
+        self.timeline_turns = Arc::new(turns);
+    }
+
+    /// The turns the projection on screen renders right now.
+    ///
+    /// The controller's projection wins as soon as it has one; until then a
+    /// window read from disk stands in, so the conversation is painted for the
+    /// whole round trip that opens it.
+    fn build_timeline_turns(&mut self) -> Vec<TimelineConversationTurn> {
+        let reasoning_display_mode = self.timeline_reasoning_display_mode();
+        let pending_confirmed = self.display_timeline().is_some_and(|timeline| {
+            self.pending_user_message
+                .as_ref()
+                .is_some_and(|pending| pending.is_confirmed_by(timeline))
+        });
+        if pending_confirmed {
+            self.pending_user_message = None;
+        }
+        let Some(controller) = self.controller.as_ref() else {
+            return Vec::new();
+        };
+        if controller.state.timeline.session_id.is_none() {
+            let Some(timeline) = self.timeline_cache_timeline.as_ref() else {
+                return Vec::new();
+            };
+            if let Some(pending) = self
+                .pending_user_message
+                .as_ref()
+                .filter(|pending| !pending.is_confirmed_by(timeline))
+                && let Some(items) = pending.projected_items(timeline)
+            {
+                let mut projected = timeline.clone();
+                projected.items = items;
+                return projected.conversation_turns_with_reasoning_mode(
+                    Some(AgentSessionState::Running),
+                    true,
+                    reasoning_display_mode,
+                );
+            }
+            // Nothing read from disk can be live: liveness is the runtime's
+            // own answer, and the snapshot that carries it has not arrived.
+            return timeline.conversation_turns_with_reasoning_mode(
+                None,
+                false,
+                reasoning_display_mode,
+            );
+        }
+        if let Some(pending) = self
+            .pending_user_message
+            .as_ref()
+            .filter(|pending| !pending.is_confirmed_by(&controller.state.timeline))
+            && let Some(items) = pending.projected_items(&controller.state.timeline)
+        {
+            let mut projected = controller.state.timeline.clone();
+            projected.items = items;
+            return projected.conversation_turns_with_reasoning_mode(
+                Some(AgentSessionState::Running),
+                true,
+                reasoning_display_mode,
+            );
+        }
+        match reasoning_display_mode {
+            ReasoningDisplayMode::LatestAtBottom => controller.state.conversation_turns(),
+            ReasoningDisplayMode::Timeline => controller
+                .state
+                .conversation_turns_with_reasoning_mode(reasoning_display_mode),
+        }
+    }
+
+    /// The projection the timeline draws from, whichever it is.
+    fn display_timeline(&self) -> Option<&TimelineModel> {
+        let controller = self.controller.as_ref()?;
+        if controller.state.timeline.session_id.is_some() {
+            return Some(&controller.state.timeline);
+        }
+        self.timeline_cache_timeline.as_ref()
+    }
+
+    /// Whether the timeline is drawing the window read from disk.
+    fn timeline_is_using_cached_window(&self) -> bool {
+        self.timeline_cache_timeline.is_some()
+            && self
+                .controller
+                .as_ref()
+                .is_none_or(|controller| controller.state.timeline.session_id.is_none())
+    }
+
+    fn timeline_reasoning_display_mode(&self) -> ReasoningDisplayMode {
+        match self
             .effective_timeline_display_settings()
             .reasoning_display_mode
         {
@@ -6431,41 +6854,11 @@ impl MobileApp {
                 ReasoningDisplayMode::LatestAtBottom
             }
             AgentTimelineReasoningDisplayMode::Timeline => ReasoningDisplayMode::Timeline,
-        };
-        let pending_confirmed = self.controller.as_ref().is_some_and(|controller| {
-            self.pending_user_message
-                .as_ref()
-                .is_some_and(|pending| pending.is_confirmed_by(&controller.state.timeline))
-        });
-        if pending_confirmed {
-            self.pending_user_message = None;
         }
-        let turns = self
-            .controller
-            .as_ref()
-            .map(|controller| {
-                if let Some(pending) = self
-                    .pending_user_message
-                    .as_ref()
-                    .filter(|pending| !pending.is_confirmed_by(&controller.state.timeline))
-                    && let Some(items) = pending.projected_items(&controller.state.timeline)
-                {
-                    let mut projected = controller.state.timeline.clone();
-                    projected.items = items;
-                    return projected.conversation_turns_with_reasoning_mode(
-                        Some(AgentSessionState::Running),
-                        true,
-                        reasoning_display_mode,
-                    );
-                }
-                match reasoning_display_mode {
-                    ReasoningDisplayMode::LatestAtBottom => controller.state.conversation_turns(),
-                    ReasoningDisplayMode::Timeline => controller
-                        .state
-                        .conversation_turns_with_reasoning_mode(reasoning_display_mode),
-                }
-            })
-            .unwrap_or_default();
+    }
+
+    fn rebuild_timeline_turns(&mut self) {
+        let turns = self.build_timeline_turns();
         self.sync_timeline_list(turns.len());
         self.timeline_turns = Arc::new(turns);
     }
@@ -9868,7 +10261,13 @@ impl MobileApp {
         self.render_thought_process_row(&row, cx)
     }
 
-    fn timeline_row_latest_payload(&self, row: &TimelineRow) -> Option<&TimelinePayload> {
+    /// The newest item a row draws.
+    ///
+    /// A row aggregates items and carries its own bounds; the newest one is
+    /// what the row renders. `last_sequence` is the fast path, and the id check
+    /// keeps a compacted row from claiming an item that merely reuses the
+    /// sequence it ended on.
+    fn timeline_row_item(&self, row: &TimelineRow) -> Option<&TimelineItem> {
         let items = &self.controller.as_ref()?.state.timeline.items;
         // Authoritative history and streamed inserts are sequence-sorted.
         // Summarizing a long activity group must not scan the entire history
@@ -9876,13 +10275,16 @@ impl MobileApp {
         if let Ok(index) = items.binary_search_by_key(&row.last_sequence, |item| item.sequence)
             && row.item_ids.iter().any(|id| id == items[index].id.as_str())
         {
-            return Some(&items[index].payload);
+            return Some(&items[index]);
         }
         items
             .iter()
             .filter(|item| row.item_ids.iter().any(|id| id == item.id.as_str()))
             .max_by_key(|item| item.sequence)
-            .map(|item| &item.payload)
+    }
+
+    fn timeline_row_latest_payload(&self, row: &TimelineRow) -> Option<&TimelinePayload> {
+        self.timeline_row_item(row).map(|item| &item.payload)
     }
 
     fn timeline_row_user_attachments(&self, row: &TimelineRow) -> Vec<MessageAttachment> {
@@ -20612,6 +21014,30 @@ mod tests {
             state.max_offset_for_scrollbar().y,
             px(10.0 * TIMELINE_TURN_ESTIMATED_HEIGHT_PX)
         );
+
+        // The view resets the count in place rather than swapping in a fresh
+        // state, because the state carries the older-history scroll handler.
+        // The uniform height has to survive that for the extent to stay right.
+        state.reset_with_uniform_height(4, px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX));
+        assert_eq!(state.item_count(), 4);
+        assert_eq!(
+            state.max_offset_for_scrollbar().y,
+            px(4.0 * TIMELINE_TURN_ESTIMATED_HEIGHT_PX)
+        );
+    }
+
+    /// Older history is wanted before the reader reaches the top, so the page
+    /// is already there; parking at the very top must not be what triggers it.
+    #[test]
+    fn older_history_is_prefetched_within_a_screen_and_a_half_of_the_top() {
+        // Twelve visible turns put the band at eighteen.
+        assert!(timeline_viewport_is_near_top(0, 12));
+        assert!(timeline_viewport_is_near_top(18, 12));
+        assert!(!timeline_viewport_is_near_top(19, 12));
+        // Two screens down is well past the band.
+        assert!(!timeline_viewport_is_near_top(24, 12));
+        // A report that saw nothing cannot say where the reader is.
+        assert!(!timeline_viewport_is_near_top(0, 0));
     }
 
     #[test]

@@ -847,6 +847,8 @@ mod tests {
                 after_sequence: Some(0),
                 before_sequence: None,
                 limit: 100,
+                max_turns: None,
+                max_bytes: None,
             })
             .await
             .unwrap();

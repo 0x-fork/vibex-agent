@@ -48,6 +48,7 @@ fn item(sequence: i64, payload: TimelinePayload) -> TimelineItem {
         provider_correlation_id: None,
         redaction_state: TimelineRedactionState::None,
         execution_attribution: None,
+        payload_depth: vibex_core::TimelinePayloadDepth::Detail,
         payload,
     }
 }
@@ -484,4 +485,180 @@ fn reasoning_tracks_the_tail_and_preserves_explicit_full_or_collapsed_choices(
         cx.debug_bounds(body_selector.clone().leak()).is_none(),
         "explicit collapse survives the next tool"
     );
+}
+
+/// A window read from disk is a stand-in projection: it paints the
+/// conversation before the load that replaces it answers, and the controller's
+/// projection takes over the moment it exists.
+#[gpui::test]
+fn a_cached_window_paints_until_the_controller_has_a_projection(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (app, _, cx) = open_timeline(cx, data_dir.path(), vec![]);
+    let session_id = VibexSessionId::parse("session_mobile_timeline").unwrap();
+    app.update(cx, |app, cx| {
+        // A cold load is still in flight, so the controller has no projection
+        // and the cached window is what the reader sees.
+        app.controller.as_mut().unwrap().state.timeline = TimelineModel::default();
+        app.timeline_cache_timeline = Some(TimelineModel {
+            session_id: Some(session_id.clone()),
+            items: vec![item(
+                1,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "from disk".into(),
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        });
+        app.rebuild_timeline_turns();
+        assert_eq!(app.timeline_turns.len(), 1);
+        assert_eq!(app.timeline_turns[0].item_count, 1);
+        assert!(app.timeline_turns[0].conclusion_row.is_none());
+        assert!(app.timeline_is_using_cached_window());
+
+        // The authoritative answer is the conversation now.
+        app.controller
+            .as_mut()
+            .unwrap()
+            .state
+            .timeline
+            .replace_authoritative(
+                session_id,
+                vec![
+                    item(
+                        1,
+                        TimelinePayload::UserMessage(UserMessagePayload {
+                            text: "from disk".into(),
+                            ..Default::default()
+                        }),
+                    ),
+                    item(
+                        2,
+                        TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                            text: "answered".into(),
+                            is_final: true,
+                        }),
+                    ),
+                ],
+            );
+        app.rebuild_timeline_turns();
+        assert_eq!(app.timeline_turns.len(), 1);
+        assert_eq!(app.timeline_turns[0].item_count, 2);
+        assert!(app.timeline_turns[0].conclusion_row.is_some());
+        assert!(!app.timeline_is_using_cached_window());
+        cx.notify();
+    });
+    draw(cx);
+}
+
+/// Pages ship summary payloads, so an opened activity asks for exactly the
+/// item behind its row — and only when that item is missing detail.
+#[gpui::test]
+fn opening_a_row_resolves_the_summary_item_it_needs(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (app, _, cx) = open_timeline(
+        cx,
+        data_dir.path(),
+        vec![read(
+            "src/lib.rs",
+            ToolCallStatus::Completed,
+            "pub mod app;",
+        )],
+    );
+    let row_id = app.read_with(cx, |app, _| {
+        app.timeline_turns[0].process_rows[0].id.clone()
+    });
+    app.update(cx, |app, _| {
+        // The fixture item is stored at full depth, so there is nothing to
+        // fetch and expanding it must not ask the runtime for anything.
+        assert_eq!(app.summary_row_sequence(&row_id), None);
+
+        let items = &mut app.controller.as_mut().unwrap().state.timeline.items;
+        items[1] = items[1].clone().into_summary();
+        assert_eq!(app.summary_row_sequence(&row_id), Some(2));
+        // A row the client projects itself has no item behind it.
+        assert_eq!(app.summary_row_sequence("pending-user-message"), None);
+    });
+}
+
+/// The open window is what the next cold start paints, and it is keyed by the
+/// runtime that produced it.
+#[gpui::test]
+fn the_open_window_is_written_for_the_runtime_that_produced_it(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (app, _, cx) = open_timeline(cx, data_dir.path(), vec![]);
+    let session_id = VibexSessionId::parse("session_mobile_timeline").unwrap();
+    app.update(cx, |app, _| {
+        app.active_host_id = Some("desktop-primary".to_string());
+        app.persist_active_session_timeline();
+        let record = app
+            .load_cached_session_window(&session_id)
+            .expect("the open window should be cached");
+        assert_eq!(record.session_id, session_id);
+        assert_eq!(record.items.len(), 1);
+
+        // Session ids are minted per runtime, so another one never reads it.
+        app.active_host_id = Some("desktop-secondary".to_string());
+        assert!(app.load_cached_session_window(&session_id).is_none());
+    });
+}
+
+/// Older history arrives above the window: the turns are spliced in at the
+/// head so the list's anchor moves with them and the reader keeps their place,
+/// and the prefetch band moves with the reader.
+#[gpui::test]
+fn an_older_page_prepends_without_moving_the_reader(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (app, _, cx) = open_timeline(cx, data_dir.path(), vec![]);
+    app.update(cx, |app, cx| {
+        let first_visible_before = 1;
+        app.timeline_viewport = Some(TimelineViewport {
+            first_visible: first_visible_before,
+            visible: 4,
+        });
+        let session_id = app
+            .controller
+            .as_ref()
+            .unwrap()
+            .state
+            .timeline
+            .session_id
+            .clone()
+            .unwrap();
+        // The page the runtime answered with sits below the loaded window.
+        app.controller
+            .as_mut()
+            .unwrap()
+            .state
+            .timeline
+            .replace_authoritative(
+                session_id,
+                vec![
+                    item(
+                        0,
+                        TimelinePayload::UserMessage(UserMessagePayload {
+                            text: "earlier question".into(),
+                            ..Default::default()
+                        }),
+                    ),
+                    item(
+                        1,
+                        TimelinePayload::UserMessage(UserMessagePayload {
+                            text: "Review the implementation".into(),
+                            ..Default::default()
+                        }),
+                    ),
+                ],
+            );
+        app.prepend_timeline_turns();
+        assert_eq!(app.timeline_turns.len(), 2);
+        assert_eq!(app.timeline_list.item_count(), 2);
+        assert_eq!(
+            app.timeline_viewport.unwrap().first_visible,
+            first_visible_before + 1,
+            "the viewport follows the content under the reader"
+        );
+        cx.notify();
+    });
+    draw(cx);
 }

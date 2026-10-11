@@ -157,6 +157,8 @@ async fn session_reads_do_not_bundle_every_timeline(pinned_lan: bool) {
             after_sequence: None,
             before_sequence: None,
             limit: 50,
+            max_turns: None,
+            max_bytes: None,
         })
         .await
         .unwrap();

@@ -92,6 +92,11 @@ pub enum AppMessage {
         ticket: vibex_ui::AgentTimelineBeforeTicket,
         result: BackendResult<vibex_core::TimelinePage>,
     },
+    /// The full payload behind one activity the reader opened.
+    TimelineItem {
+        ticket: vibex_ui::AgentTimelineItemTicket,
+        result: BackendResult<vibex_core::TimelineItem>,
+    },
     TimelineRefreshed(BackendResult<i64>),
     RuntimeOptions(BackendResult<vibex_core::SessionRuntimeOptionCatalog>),
     SessionCreated {
@@ -395,6 +400,8 @@ impl Dispatch {
                     after_sequence: None,
                     before_sequence: None,
                     limit: AUTO_CONTINUE_PROBE_LIMIT,
+                    max_turns: None,
+                    max_bytes: None,
                 };
                 let page = self.facade.agent().fetch_timeline(request).await;
                 let ended_normally = page.ok().and_then(|page| {
@@ -451,19 +458,36 @@ impl Dispatch {
                     .map(|_| ());
                 self.send(AppMessage::TeamMutated { session_id, result });
             }
-            Effect::OpenSession { session_id, ticket } => {
-                let result = self.load_session(session_id, ticket.after_sequence).await;
+            Effect::OpenSession { ticket, .. } => {
+                let result = self.load_session(ticket.clone()).await;
                 self.send(AppMessage::SessionOpened { ticket, result });
             }
             Effect::LoadOlder { ticket } => {
-                let request = vibex_core::FetchTimelineRequest {
-                    session_id: ticket.session_id.clone(),
-                    after_sequence: None,
-                    before_sequence: Some(ticket.before_sequence),
-                    limit: vibex_ui::AGENT_TIMELINE_PAGE_LIMIT,
-                };
-                let result = self.facade.agent().fetch_timeline(request).await;
+                // One gesture, one bounded page: the cursor the ticket pinned
+                // is what decides where the reader lands, and the shared
+                // helper is what keeps the page turn-aligned and byte-capped.
+                let result = vibex_ui::load_timeline_before(
+                    self.facade.agent().as_ref(),
+                    &ticket.session_id,
+                    ticket.before_sequence,
+                )
+                .await;
                 self.send(AppMessage::OlderTimeline { ticket, result });
+            }
+            Effect::LoadTimelineItem { ticket } => {
+                // A page carries summaries, so this is the read that puts an
+                // opened activity's output back. The ticket pins the sequence:
+                // an answer that arrives after the reader navigated away is
+                // dropped by the controller instead of drawn over another item.
+                let result = self
+                    .facade
+                    .agent()
+                    .fetch_timeline_item(vibex_core::FetchTimelineItemRequest {
+                        session_id: ticket.session_id.clone(),
+                        sequence: ticket.sequence,
+                    })
+                    .await;
+                self.send(AppMessage::TimelineItem { ticket, result });
             }
             Effect::RefreshTimeline => {
                 // The reducer re-issues an open for the current session; the
@@ -1108,30 +1132,34 @@ impl Dispatch {
 
     async fn load_session(
         &self,
-        session_id: VibexSessionId,
-        after_sequence: i64,
+        ticket: vibex_ui::AgentSessionLoadTicket,
     ) -> BackendResult<vibex_ui::AgentSessionSnapshot> {
+        let session_id = ticket.session_id.clone();
         let session = self.facade.agent().open_session(session_id.clone()).await?;
         // Hydration is a bounded window rather than the whole archive: the
-        // newest page on a cold open, the tail after a restored cached window
-        // otherwise. Older pages are fetched on demand as the reader scrolls
-        // up, which is what keeps a 100 000-item session usable.
-        let timeline = self
-            .facade
-            .agent()
-            .fetch_timeline(vibex_core::FetchTimelineRequest {
-                session_id: session_id.clone(),
-                after_sequence: (after_sequence > 0).then_some(after_sequence),
-                before_sequence: None,
-                limit: vibex_ui::AGENT_TIMELINE_PAGE_LIMIT,
-            })
-            .await?;
-        if timeline.session_id != session_id
-            || timeline.items.iter().any(|item| {
-                item.session_id != session_id
-                    || (after_sequence > 0 && item.sequence <= after_sequence)
-            })
-        {
+        // newest turn-aligned window on a cold open, the tail after a restored
+        // cached window otherwise. Older pages are fetched on demand as the
+        // reader scrolls up, which is what keeps a 100 000-item session usable.
+        // The window bounds live in the shared helpers so the TUI cannot page
+        // the archive back in.
+        let (timeline, timeline_has_older) = match ticket.load {
+            vibex_ui::TimelineLoadKind::Cold | vibex_ui::TimelineLoadKind::Before(_) => {
+                let page =
+                    vibex_ui::load_timeline_window(self.facade.agent().as_ref(), &session_id)
+                        .await?;
+                (page.items, page.has_older)
+            }
+            // Resuming a restored prefix only needs what arrived above it.
+            vibex_ui::TimelineLoadKind::Tail(after_sequence) => {
+                vibex_ui::load_timeline_tail(
+                    self.facade.agent().as_ref(),
+                    &session_id,
+                    after_sequence,
+                )
+                .await?
+            }
+        };
+        if timeline.iter().any(|item| item.session_id != session_id) {
             return Err(BackendError::failed(
                 "agent_timeline_page_invalid",
                 "the backend returned an invalid Agent timeline page",
@@ -1157,9 +1185,9 @@ impl Dispatch {
         };
         Ok(vibex_ui::AgentSessionSnapshot {
             session,
-            timeline: timeline.items,
+            timeline,
             runtime_selection,
-            timeline_has_older: timeline.has_older,
+            timeline_has_older,
         })
     }
 

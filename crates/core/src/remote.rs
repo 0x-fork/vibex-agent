@@ -3,6 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+use crate::FetchTimelineItemRequest;
 use crate::agent::{
     AgentSession, AgentSessionSummary, AgentTimelineDisplaySettings, ContinueAgentTurnRequest,
     CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
@@ -545,6 +546,7 @@ pub enum RemoteAgentOperationKind {
     DeleteSession,
     ForkSession,
     FetchTimeline,
+    FetchTimelineItem,
     GetTimelineDisplaySettings,
     ResolveOpaqueLocator,
     ListRuntimeOptions,
@@ -716,6 +718,24 @@ pub struct RemoteAgentTimelineFetchRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentTimelineFetchResponse {
     pub page: TimelinePage,
+}
+
+/// Reads one timeline item at full payload depth over Remote v2.
+///
+/// A page carries summary payloads, so a paired client that opens a tool
+/// activity asks for exactly the item it is about to render instead of
+/// re-reading the window with every snapshot in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentTimelineItemFetchRequest {
+    pub auth: RemoteAuthProof,
+    pub request: FetchTimelineItemRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentTimelineItemFetchResponse {
+    pub item: TimelineItem,
 }
 
 /// The desktop resolves a push/deep-link locator after the client has
@@ -1402,6 +1422,7 @@ pub enum RemoteAgentRequest {
     UnarchiveSession(RemoteAgentSessionActionRequest),
     DeleteSession(RemoteAgentSessionActionRequest),
     FetchTimeline(RemoteAgentTimelineFetchRequest),
+    FetchTimelineItem(RemoteAgentTimelineItemFetchRequest),
     GetTimelineDisplaySettings(RemoteAgentTimelineDisplaySettingsRequest),
     ResolveOpaqueLocator(RemoteAgentDeepLinkResolveRequest),
     ListRuntimeOptions(RemoteAgentRuntimeOptionsRequest),
@@ -1466,6 +1487,7 @@ impl RemoteAgentRequest {
             Self::UnarchiveSession(_) => RemoteAgentOperationKind::UnarchiveSession,
             Self::DeleteSession(_) => RemoteAgentOperationKind::DeleteSession,
             Self::FetchTimeline(_) => RemoteAgentOperationKind::FetchTimeline,
+            Self::FetchTimelineItem(_) => RemoteAgentOperationKind::FetchTimelineItem,
             Self::GetTimelineDisplaySettings(_) => {
                 RemoteAgentOperationKind::GetTimelineDisplaySettings
             }
@@ -4969,6 +4991,8 @@ mod tests {
                 after_sequence: Some(3),
                 before_sequence: None,
                 limit: 20,
+                max_turns: None,
+                max_bytes: None,
             },
         });
 

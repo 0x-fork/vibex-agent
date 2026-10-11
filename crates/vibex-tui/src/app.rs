@@ -12,7 +12,7 @@
 //! the TUI cannot invent a second interpretation of sessions, approvals or
 //! capability gating.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use vibex_backend::DomainCapabilities;
 use vibex_backend::{BackendCapabilitySnapshot, BackendFacade, BackendOperation};
@@ -90,6 +90,21 @@ impl Page {
 /// days cannot grow the history without bound, and it is deeper than any path a
 /// reader walks in one sitting.
 const PAGE_HISTORY_LIMIT: usize = 64;
+
+/// How much of a head start older-history prefetch gives the reader, in half
+/// screens.
+///
+/// A page is turn-aligned and can be shorter than the band it lands in, so the
+/// distance is measured in screens rather than pages: a screen and a half is
+/// what keeps "I scrolled to the top" from meaning "I waited for a round trip".
+const OLDER_HISTORY_PREFETCH_HALF_SCREENS: usize = 3;
+
+/// How many activity details one pass may ask for.
+///
+/// Expanding a whole run of tools opens hundreds of blocks at once and each
+/// read is a round trip, so a small batch keeps one gesture from burying the
+/// worker's queue. What is left is asked for again as the answers land.
+const TIMELINE_DETAIL_BATCH: usize = 4;
 
 /// A page the reader left, and the pane that owned the keyboard on it.
 ///
@@ -715,6 +730,17 @@ pub struct App {
     pub auto_continue: crate::auto_continue::AutoContinue,
     pub transcript: Transcript,
     pub scroll: ScrollState,
+    /// Activity details the transcript wants, recorded where the block was
+    /// opened or rebuilt and issued by the event loop, which is the only part
+    /// of the client allowed to start I/O.
+    pending_timeline_details: BTreeSet<i64>,
+    /// Activity details already on their way, keyed by the generation their
+    /// ticket was issued for.
+    ///
+    /// The generation is part of the key so an answer that arrives after the
+    /// projection was replaced cannot retire the read a rebuilt block just
+    /// started for the same sequence.
+    timeline_details_in_flight: BTreeSet<(vibex_ui::WorkflowViewGeneration, i64)>,
 
     pub composer: ComposerBuffer,
     pub history: ComposerHistory,
@@ -1371,6 +1397,8 @@ impl App {
             preferences_path: options.preferences_path,
             transcript: Transcript::new(),
             scroll: ScrollState::default(),
+            pending_timeline_details: BTreeSet::new(),
+            timeline_details_in_flight: BTreeSet::new(),
             composer: ComposerBuffer::default(),
             history: ComposerHistory::new(64),
             completion: None,
@@ -3893,6 +3921,11 @@ impl App {
             .value
             .as_ref()
             .map(|session| session.workspace_root.as_str());
+        // Which activity rows the projection is only showing a summary of.
+        // Recorded while the payload is at hand: a block cannot tell a stripped
+        // payload from a complete one, and a page that just landed arrived
+        // summarized.
+        let mut summarized = BTreeSet::new();
         let blocks: Vec<Block> = rows
             .iter()
             .filter(|row| row_is_rendered(row))
@@ -3907,12 +3940,12 @@ impl App {
                         | vibex_desktop_model::TimelineRowKind::Collaboration
                         | vibex_desktop_model::TimelineRowKind::ImageGeneration
                 ) {
-                    let payload = row
+                    let newest = row
                         .item_ids
                         .iter()
                         .filter_map(|id| items.get(id.as_str()))
-                        .max_by_key(|item| item.sequence)
-                        .map(|item| &item.payload);
+                        .max_by_key(|item| item.sequence);
+                    let payload = newest.map(|item| &item.payload);
                     let activity =
                         vibex_ui::timeline::Activity::project(row, payload, self.strings.locale);
                     block.failed = activity.is_failed();
@@ -3923,6 +3956,9 @@ impl App {
                         workspace,
                         self.strings.locale,
                     );
+                    if newest.is_some_and(|item| !item.has_complete_payload()) {
+                        summarized.insert(block.sequence);
+                    }
                 }
                 block
             })
@@ -3948,6 +3984,21 @@ impl App {
             None
         };
         let change = self.transcript.set_blocks(blocks);
+        // An activity left open across a rebuild is still waiting for its
+        // output: a refresh can put a summary back under it, and a page that
+        // just landed above the window arrives summarized. Expansion survives
+        // the rebuild by block id, so the ask has to survive it too.
+        if !summarized.is_empty() {
+            let open = self
+                .transcript
+                .blocks()
+                .iter()
+                .filter(|block| block.expanded && !block.group.is_hidden())
+                .map(|block| block.sequence)
+                .filter(|sequence| summarized.contains(sequence))
+                .collect::<Vec<_>>();
+            self.pending_timeline_details.extend(open);
+        }
         if let Some(index) = selected_id
             .as_deref()
             .and_then(|id| self.transcript.index_of_block(id))
@@ -4094,21 +4145,137 @@ impl App {
     /// Ask for one more page of older history, if there is one to ask for.
     ///
     /// The controller refuses when nothing is selected, when the projection
-    /// already starts at sequence 0, or when an older page is already in
-    /// flight, so a caller may offer this on every scroll gesture.
+    /// already starts at sequence 0, or when two pages are already in flight,
+    /// so a caller may offer this on every scroll gesture.
     pub fn load_older_history(&mut self) -> Option<Effect> {
         let ticket = self.agent.begin_timeline_before().ok()?;
         Some(Effect::LoadOlder { ticket })
     }
 
+    /// Keep the page above the reader coming while they are close to the top.
+    ///
+    /// Prefetch is a head start, not a second trigger: the reader crosses the
+    /// threshold a screen before they run out of loaded history, so the page
+    /// they are about to ask for is usually already on the wire. The refusal
+    /// is the controller's, which is what keeps a scroll position that stays
+    /// near the top from queueing a request per keypress.
+    pub fn prefetch_older_history(&mut self) -> Option<Effect> {
+        // While the dock owns the list keys, `k` is moving its cursor, not
+        // scrolling the transcript it happens to be sitting above.
+        if self.dock_is_focused() || !self.near_transcript_top() {
+            return None;
+        }
+        self.load_older_history()
+    }
+
+    /// Whether the reader is within about a screen and a half of the top.
+    ///
+    /// Separate from [`Self::at_transcript_top`] because the two answer
+    /// different questions: prefetch wants the approach, while the exact
+    /// parked position is what says the reader has nothing left above them.
+    pub fn near_transcript_top(&self) -> bool {
+        if self.page != Page::Agent
+            || self.overlay.is_some()
+            || self.filtering
+            || self.scroll.follow
+        {
+            return false;
+        }
+        let threshold = self
+            .transcript_band_rows
+            .saturating_mul(OLDER_HISTORY_PREFETCH_HALF_SCREENS)
+            / 2;
+        self.scroll.offset <= threshold
+    }
+
     /// Whether the reader is parked at the very top of a scrolled transcript.
     pub fn at_transcript_top(&self) -> bool {
-        self.page == Page::Agent
-            && self.overlay.is_none()
-            && !self.filtering
-            && !self.scroll.follow
-            && self.scroll.offset == 0
-            && self.agent.state.timeline_has_older
+        self.near_transcript_top() && self.scroll.offset == 0 && self.agent.state.timeline_has_older
+    }
+
+    /// Records that an open activity block is showing only a summary.
+    ///
+    /// Called where a block becomes expanded, because that is the gesture that
+    /// asks for its output; the read itself is issued by
+    /// [`Self::take_timeline_detail_effects`], which the event loop drains.
+    pub fn note_block_detail(&mut self, index: usize) {
+        let Some(block) = self.transcript.block(index) else {
+            return;
+        };
+        if !block.expanded || block.group.is_hidden() || block.activity.is_none() {
+            return;
+        }
+        let sequence = block.sequence;
+        if self.timeline_item_is_incomplete(sequence) {
+            self.pending_timeline_details.insert(sequence);
+        }
+    }
+
+    /// Records every open activity the transcript is showing a summary for.
+    ///
+    /// The gesture behind this opens blocks the reader never pointed at, so
+    /// they all have to be looked at rather than only the selected one.
+    pub fn note_all_block_details(&mut self) {
+        for index in 0..self.transcript.len() {
+            self.note_block_detail(index);
+        }
+    }
+
+    /// Retires one activity-detail read that has come back.
+    pub fn finish_timeline_detail(&mut self, ticket: &vibex_ui::AgentTimelineItemTicket) {
+        self.timeline_details_in_flight
+            .remove(&(ticket.generation, ticket.sequence));
+    }
+
+    /// Forgets activity-detail reads the projection has moved past.
+    ///
+    /// Every ticket issued for the replaced generation is stale, so its answer
+    /// can only be dropped; the rebuild asks again for what is still open.
+    pub fn prune_timeline_details(&mut self) {
+        let generation = self.agent.state.generation;
+        self.timeline_details_in_flight
+            .retain(|(issued, _)| *issued == generation);
+    }
+
+    /// The activity details the transcript wants, ready for the worker.
+    ///
+    /// A batch rather than the whole list: expanding a long run of tools can
+    /// open hundreds of blocks at once and every read is a round trip, so the
+    /// rest is asked for as the answers land and the transcript rebuilds.
+    pub fn take_timeline_detail_effects(&mut self) -> Vec<Effect> {
+        let generation = self.agent.state.generation;
+        let pending = std::mem::take(&mut self.pending_timeline_details);
+        let mut effects = Vec::new();
+        for sequence in pending {
+            if effects.len() >= TIMELINE_DETAIL_BATCH {
+                break;
+            }
+            if self
+                .timeline_details_in_flight
+                .contains(&(generation, sequence))
+            {
+                continue;
+            }
+            // A sequence the projection no longer holds cannot be read: there
+            // would be nothing to apply the answer to.
+            let Ok(ticket) = self.agent.begin_timeline_item(sequence) else {
+                continue;
+            };
+            self.timeline_details_in_flight
+                .insert((generation, sequence));
+            effects.push(Effect::LoadTimelineItem { ticket });
+        }
+        effects
+    }
+
+    /// Whether the projection's copy of a sequence is still a summary.
+    fn timeline_item_is_incomplete(&self, sequence: i64) -> bool {
+        self.agent
+            .state
+            .timeline
+            .items
+            .binary_search_by_key(&sequence, |item| item.sequence)
+            .is_ok_and(|index| !self.agent.state.timeline.items[index].has_complete_payload())
     }
 
     /// Open the transcript search bar.
@@ -4162,6 +4329,8 @@ impl App {
         };
         let height = self.viewport.1 as usize / 2;
         self.transcript.reveal_block(block);
+        // Landing on a match opens it, and an activity opens onto its output.
+        self.note_block_detail(block);
         let line = self.transcript.line_of_block(block);
         self.scroll.follow = false;
         self.scroll.offset = line.saturating_sub(height / 3);
@@ -5543,6 +5712,15 @@ pub enum Effect {
     LoadOlder {
         ticket: vibex_ui::AgentTimelineBeforeTicket,
     },
+    /// Read the full payload behind one activity block.
+    ///
+    /// A page carries summaries, so the output and file snapshots an expanded
+    /// activity renders only exist on request. The ticket fixes the sequence,
+    /// which is what lets the controller drop an answer that arrives after the
+    /// reader navigated away instead of drawing it over another item.
+    LoadTimelineItem {
+        ticket: vibex_ui::AgentTimelineItemTicket,
+    },
     ListRuntimeOptions,
     CreateSession {
         request_id: VibexSessionId,
@@ -5742,6 +5920,7 @@ impl Effect {
             Effect::OpenSession { .. } => "open_session",
             Effect::RefreshTimeline => "timeline",
             Effect::LoadOlder { .. } => "older_timeline",
+            Effect::LoadTimelineItem { .. } => "timeline_item",
             Effect::ListRuntimeOptions => "runtime_options",
             Effect::CreateSession { .. } => "create_session",
             Effect::RenameSession { .. } => "rename_session",
@@ -6287,6 +6466,7 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: vibex_core::TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
         };
         vibex_desktop_model::timeline_rows(std::slice::from_ref(&item))
@@ -6351,6 +6531,7 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: vibex_core::TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload: vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
                 text: "what does the retry helper do?".into(),
                 attachments: Vec::new(),

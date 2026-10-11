@@ -68,6 +68,8 @@ impl SessionController {
                 after_sequence: None,
                 before_sequence: None,
                 limit: timeline_limit.max(1),
+                max_turns: None,
+                max_bytes: None,
             })
             .await
         {

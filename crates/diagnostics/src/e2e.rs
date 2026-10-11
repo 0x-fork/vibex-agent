@@ -858,6 +858,8 @@ async fn remote_agent_protocol(root: &Path) -> VibexResult<E2eRegressionCheck> {
                 after_sequence: Some(0),
                 before_sequence: None,
                 limit: 100,
+                max_turns: None,
+                max_bytes: None,
             },
         }),
     )

@@ -35,10 +35,10 @@ use vibex_core::{
     RemoteAgentSessionListResponse, RemoteAgentSessionTokenUsageResponse,
     RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineCursor,
     RemoteAgentTimelineDisplaySettingsResponse, RemoteAgentTimelineFetchResponse,
-    RemoteAgentUnarchiveSessionResponse, RemoteAgentUsageStatisticsResponse, RemoteAuditAction,
-    RemoteAuditOutcome, RemoteAuditRecord, RemoteAuditTargetKind, RemoteAuthContext,
-    RemoteAuthProof, RemoteCapabilitySummary, RemoteClaimPairingCodeRequest,
-    RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
+    RemoteAgentTimelineItemFetchResponse, RemoteAgentUnarchiveSessionResponse,
+    RemoteAgentUsageStatisticsResponse, RemoteAuditAction, RemoteAuditOutcome, RemoteAuditRecord,
+    RemoteAuditTargetKind, RemoteAuthContext, RemoteAuthProof, RemoteCapabilitySummary,
+    RemoteClaimPairingCodeRequest, RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteDeepLinkResolution, RemoteDeepLinkResolutionStatus,
     RemoteDeleteDeviceRequest, RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus,
     RemoteFileCopyResponse, RemoteFileCreateDirectoryResponse, RemoteFileDeleteResponse,
@@ -4767,6 +4767,18 @@ async fn dispatch_agent_request(
             serde_json::to_value(RemoteAgentTimelineFetchResponse { page })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteAgentRequest::FetchTimelineItem(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::ReadAgentSession,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let item = manager.fetch_timeline_item(request.request).await?;
+            serde_json::to_value(RemoteAgentTimelineItemFetchResponse { item })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteAgentRequest::GetTimelineDisplaySettings(request) => {
             authorize_agent_action(
                 &manager,
@@ -7401,6 +7413,8 @@ async fn catch_up_agent_timeline(
                 after_sequence: Some(cursor.after_sequence),
                 before_sequence: None,
                 limit,
+                max_turns: None,
+                max_bytes: None,
             })
             .await?;
         for item in &page.items {
@@ -7468,6 +7482,8 @@ async fn session_timeline_preview(
             after_sequence: None,
             before_sequence: None,
             limit: normalize_timeline_limit(limit),
+            max_turns: None,
+            max_bytes: None,
         })
         .await
 }
@@ -9057,6 +9073,8 @@ mod tests {
                 after_sequence: None,
                 before_sequence: None,
                 limit: 0,
+                max_turns: None,
+                max_bytes: None,
             })
             .await
             .unwrap();

@@ -1096,7 +1096,9 @@ fn auto_archive_status_explains_the_window_and_the_last_check(cx: &mut TestAppCo
             .auto_archive_status(now_ms)
             .expect("an on window reports");
         assert_eq!(
-            status.last_pass.map(|pass| (pass.window_days, pass.archived)),
+            status
+                .last_pass
+                .map(|pass| (pass.window_days, pass.archived)),
             Some((7, 13))
         );
         let label = auto_archive_status_label(&status);

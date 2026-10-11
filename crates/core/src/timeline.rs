@@ -56,6 +56,32 @@ pub enum TimelineRedactionState {
     ContainsRedactions,
 }
 
+/// How much of a timeline item's payload a read carries.
+///
+/// Timeline content is read in two depths. `Summary` is what a page or a live
+/// event ships by default: every field the conversation projection needs, and
+/// none of the unbounded tool detail. `Detail` is the whole payload, fetched
+/// one item at a time when a reader opens a tool activity.
+///
+/// The split exists because the heavy fields are tool detail rather than
+/// conversation: file snapshots (`oldText`/`newText`/`patch`) are as large as
+/// the files they describe and raw extension output is bounded per block but
+/// multiplied across a long turn, while a collapsed activity row only ever
+/// needs the path, action, and bounded input summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelinePayloadDepth {
+    /// Conversation-complete payload with tool detail withheld.
+    Summary,
+    /// The full payload, including tool output and file snapshots.
+    ///
+    /// This is the deserialization default so that a payload read straight out
+    /// of durable storage — which is always complete — is not mistaken for a
+    /// stripped one and re-fetched.
+    #[default]
+    Detail,
+}
+
 const TURN_ATTRIBUTION_LABEL_LIMIT: usize = 160;
 const TURN_ATTRIBUTION_MODEL_ID_LIMIT: usize = 256;
 
@@ -396,6 +422,30 @@ pub struct FileOperationPayload {
 }
 
 impl FileOperationPayload {
+    /// The patch this operation is stored with.
+    ///
+    /// A durable timeline keeps the patch rather than both file snapshots:
+    /// the snapshots are exactly as large as the files they describe, while
+    /// the patch is what a reader renders and is usually a small fraction of
+    /// it. A one-sided change — a file that did not exist before, or was
+    /// removed — has no diff to compute, so its patch is synthesized from the
+    /// side that does exist. Without that, storing patches would silently
+    /// discard the content of every file an Agent created.
+    pub fn canonical_patch(&self) -> Option<FileOperationPatch> {
+        if let Some(patch) = &self.patch {
+            return Some(patch.clone());
+        }
+        let (old_text, new_text) = (self.old_text.as_deref(), self.new_text.as_deref());
+        if old_text.is_some() && new_text.is_some() {
+            return self.generated_patch();
+        }
+        let text = one_sided_patch(old_text.unwrap_or_default(), new_text.unwrap_or_default());
+        (!text.is_empty()).then_some(FileOperationPatch {
+            format: FileOperationPatchFormat::UnifiedDiffV1,
+            text,
+        })
+    }
+
     pub fn generated_patch(&self) -> Option<FileOperationPatch> {
         let (Some(old_text), Some(new_text)) = (self.old_text.as_deref(), self.new_text.as_deref())
         else {
@@ -416,6 +466,34 @@ impl FileOperationPayload {
             text: patch,
         })
     }
+}
+
+/// Builds the unified diff for a change that only has one side.
+///
+/// The result uses the same `old`/`new` header pair as
+/// [`FileOperationPayload::generated_patch`], so a reader parses both the same
+/// way.
+fn one_sided_patch(old_text: &str, new_text: &str) -> String {
+    let added = old_text.is_empty() && !new_text.is_empty();
+    let removed = new_text.is_empty() && !old_text.is_empty();
+    if !added && !removed {
+        return String::new();
+    }
+    let body = if added { new_text } else { old_text };
+    let lines = body.lines().collect::<Vec<_>>();
+    let (from, to) = if added {
+        ("-0,0".to_string(), format!("+1,{}", lines.len()))
+    } else {
+        (format!("-1,{}", lines.len()), "+0,0".to_string())
+    };
+    let marker = if added { '+' } else { '-' };
+    let mut patch = format!("--- old\n+++ new\n@@ {from} {to} @@\n");
+    for line in lines {
+        patch.push(marker);
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    patch
 }
 
 const RAW_EVENT_TEXT_LIMIT: usize = 4_096;
@@ -652,6 +730,23 @@ impl fmt::Debug for AgentEventRawExtension {
 impl AgentEventRawExtension {
     pub fn bounded_text(value: impl Into<String>) -> String {
         bounded_event_value(value, RAW_EVENT_TEXT_LIMIT).0
+    }
+
+    /// Whether this extension holds anything only an opened activity renders.
+    pub fn carries_tool_detail(&self) -> bool {
+        !self.content_blocks.is_empty() || self.raw_output.is_some() || !self.meta.is_empty()
+    }
+
+    /// Keeps the invocation and its locations, drops the opened-activity parts.
+    ///
+    /// `raw_input` and `locations` are what a collapsed activity row uses to
+    /// name its action and target; `content_blocks`, `raw_output`, and `meta`
+    /// are only read after a reader expands the activity.
+    pub fn into_summary(mut self) -> Self {
+        self.content_blocks.clear();
+        self.raw_output = None;
+        self.meta.clear();
+        self
     }
 
     pub fn new(
@@ -995,7 +1090,237 @@ pub struct TimelineItem {
     pub redaction_state: TimelineRedactionState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_attribution: Option<TurnExecutionAttributionView>,
+    /// Which depth `payload` was read at. A `Summary` item still renders the
+    /// whole conversation; only its tool detail is missing, and a reader that
+    /// opens that detail fetches the same item at `Detail` depth.
+    #[serde(default)]
+    pub payload_depth: TimelinePayloadDepth,
     pub payload: TimelinePayload,
+}
+
+impl TimelineItem {
+    /// Whether this item already carries its complete payload.
+    pub fn has_complete_payload(&self) -> bool {
+        self.payload_depth == TimelinePayloadDepth::Detail
+    }
+
+    /// Drops the unbounded tool detail, keeping every conversation field.
+    ///
+    /// Returns `self` unchanged when the payload carries no such detail, so a
+    /// page of ordinary messages is not rewritten item by item.
+    pub fn into_summary(mut self) -> Self {
+        if self.payload_depth == TimelinePayloadDepth::Summary {
+            return self;
+        }
+        if !self.payload.carries_tool_detail() {
+            // Nothing was withheld, so the payload is already complete. Saying
+            // otherwise would make a reader ask for detail that does not
+            // exist, and would hide an activity that genuinely has nothing to
+            // open behind a promise of more.
+            self.payload_depth = TimelinePayloadDepth::Detail;
+            return self;
+        }
+        self.payload = self.payload.into_summary();
+        self.payload_depth = TimelinePayloadDepth::Summary;
+        self
+    }
+}
+
+impl TimelinePayload {
+    /// Whether this payload holds fields that [`Self::into_summary`] removes.
+    pub fn carries_tool_detail(&self) -> bool {
+        match self {
+            Self::ToolCall(tool) => tool
+                .raw_extension
+                .as_ref()
+                .is_some_and(AgentEventRawExtension::carries_tool_detail),
+            Self::Command(command) => command
+                .raw_extension
+                .as_ref()
+                .is_some_and(AgentEventRawExtension::carries_tool_detail),
+            Self::FileOperation(file) => {
+                file.old_text.is_some()
+                    || file.new_text.is_some()
+                    || file.patch.is_some()
+                    || file
+                        .raw_extension
+                        .as_ref()
+                        .is_some_and(AgentEventRawExtension::carries_tool_detail)
+            }
+            Self::WebSearch(search) => search
+                .raw_extension
+                .as_ref()
+                .is_some_and(AgentEventRawExtension::carries_tool_detail),
+            Self::ImageGeneration(image) => image
+                .raw_extension
+                .as_ref()
+                .is_some_and(AgentEventRawExtension::carries_tool_detail),
+            _ => false,
+        }
+    }
+
+    /// Removes the unbounded tool detail from this payload.
+    ///
+    /// What survives is exactly what a collapsed activity row renders: the
+    /// action, its target, the bounded invocation source, and the file path.
+    /// Everything a reader only sees after opening the activity — captured
+    /// output, content blocks, metadata, and file snapshots — is dropped.
+    pub fn into_summary(self) -> Self {
+        match self {
+            Self::ToolCall(mut tool) => {
+                tool.raw_extension = tool.raw_extension.map(AgentEventRawExtension::into_summary);
+                Self::ToolCall(tool)
+            }
+            Self::Command(mut command) => {
+                command.raw_extension = command
+                    .raw_extension
+                    .map(AgentEventRawExtension::into_summary);
+                Self::Command(command)
+            }
+            Self::WebSearch(mut search) => {
+                search.raw_extension = search
+                    .raw_extension
+                    .map(AgentEventRawExtension::into_summary);
+                Self::WebSearch(search)
+            }
+            Self::ImageGeneration(mut image) => {
+                image.raw_extension = image
+                    .raw_extension
+                    .map(AgentEventRawExtension::into_summary);
+                Self::ImageGeneration(image)
+            }
+            Self::FileOperation(mut file) => {
+                file.old_text = None;
+                file.new_text = None;
+                file.patch = None;
+                file.raw_extension = file.raw_extension.map(AgentEventRawExtension::into_summary);
+                Self::FileOperation(file)
+            }
+            other => other,
+        }
+    }
+
+    /// A cheap estimate of the memory and wire cost this payload carries.
+    ///
+    /// String bytes dominate every payload, so summing them (plus a small
+    /// per-value overhead for the surrounding JSON) tracks both the resident
+    /// cost a cache holds and the size a page spends against its byte budget.
+    /// It is deliberately allocation-free: readers call it per item per page.
+    pub fn approximate_bytes(&self) -> usize {
+        /// The JSON scaffolding around one payload value.
+        const ENVELOPE_BYTES: usize = 64;
+        /// The JSON scaffolding around one array element or map entry.
+        const ELEMENT_BYTES: usize = 24;
+        fn text(value: &str) -> usize {
+            value.len()
+        }
+        fn optional(value: &Option<String>) -> usize {
+            value.as_deref().map_or(0, text)
+        }
+        fn raw(extension: &Option<AgentEventRawExtension>) -> usize {
+            extension.as_ref().map_or(0, |extension| {
+                extension.raw_input.as_deref().map_or(0, text)
+                    + extension
+                        .raw_output
+                        .as_ref()
+                        .map_or(0, |output| text(&output.text))
+                    + extension
+                        .content_blocks
+                        .iter()
+                        .map(|block| text(&block.block_type) + text(&block.summary) + ELEMENT_BYTES)
+                        .sum::<usize>()
+                    + extension
+                        .locations
+                        .iter()
+                        .map(|location| text(&location.uri) + ELEMENT_BYTES)
+                        .sum::<usize>()
+                    + extension
+                        .meta
+                        .iter()
+                        .map(|(key, value)| text(key) + text(value) + ELEMENT_BYTES)
+                        .sum::<usize>()
+            })
+        }
+        let body = match self {
+            Self::UserMessage(message) => text(&message.text),
+            Self::AgentMessageDelta(delta) => text(&delta.text_delta),
+            Self::AgentMessage(message) => text(&message.text),
+            Self::Reasoning(reasoning) => text(&reasoning.text),
+            Self::Plan(plan) => {
+                text(&plan.title)
+                    + plan
+                        .steps
+                        .iter()
+                        .map(|step| text(&step.title) + ELEMENT_BYTES)
+                        .sum::<usize>()
+            }
+            Self::Goal(goal) => text(&goal.message.clone().unwrap_or_default()),
+            Self::ToolCall(tool) => {
+                text(&tool.tool_call_id)
+                    + text(&tool.tool_name)
+                    + text(&tool.summary)
+                    + optional(&tool.input_summary)
+                    + optional(&tool.output_summary)
+                    + raw(&tool.raw_extension)
+            }
+            Self::Command(command) => {
+                text(&command.command)
+                    + optional(&command.cwd)
+                    + optional(&command.output_summary)
+                    + raw(&command.raw_extension)
+            }
+            Self::FileOperation(file) => {
+                text(&file.path)
+                    + text(&file.summary)
+                    + optional(&file.old_text)
+                    + optional(&file.new_text)
+                    + file.patch.as_ref().map_or(0, |patch| text(&patch.text))
+                    + raw(&file.raw_extension)
+            }
+            Self::WebSearch(search) => {
+                text(&search.query) + optional(&search.result_summary) + raw(&search.raw_extension)
+            }
+            Self::TodoUpdate(todo) => {
+                text(&todo.title)
+                    + todo
+                        .items
+                        .iter()
+                        .map(|item| text(&item.title) + ELEMENT_BYTES)
+                        .sum::<usize>()
+                    + raw(&todo.raw_extension)
+            }
+            Self::Collaboration(collaboration) => {
+                text(&collaboration.action)
+                    + text(&collaboration.summary)
+                    + optional(&collaboration.agent_label)
+                    + raw(&collaboration.raw_extension)
+            }
+            Self::ImageGeneration(image) => {
+                text(&image.summary)
+                    + optional(&image.mime_type)
+                    + optional(&image.image_reference)
+                    + raw(&image.raw_extension)
+            }
+            Self::GitNotice(notice) => text(&notice.summary),
+            Self::SystemNotice(notice) => text(&notice.message),
+            Self::Error(error) => text(&error.code) + text(&error.message),
+            Self::Retry(retry) => optional(&retry.reason),
+            // Interactive requests carry bounded titles and options; they are
+            // never a page's cost driver.
+            Self::PermissionRequest(_) | Self::ElicitationRequest(_) => 256,
+            Self::PermissionResolution(_) | Self::ElicitationResolution(_) => 0,
+        };
+        body.saturating_add(ENVELOPE_BYTES)
+    }
+
+    /// The bytes [`Self::into_summary`] would remove from this payload.
+    pub fn stripped_tool_detail_bytes(&self) -> usize {
+        let complete = self.approximate_bytes();
+        if !self.carries_tool_detail() {
+            return 0;
+        }
+        complete.saturating_sub(self.clone().into_summary().approximate_bytes())
+    }
 }
 
 /// Returns whether the latest conversational turn has an explicit final Agent
@@ -1087,8 +1412,129 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: crate::TimelinePayloadDepth::Detail,
             payload,
         }
+    }
+
+    #[test]
+    fn a_summary_item_keeps_the_conversation_and_drops_the_tool_detail() {
+        let session_id = VibexSessionId::new();
+        let mut item = TimelineItem {
+            id: TimelineItemId::new(),
+            session_id,
+            sequence: 1,
+            timestamp_ms: 1,
+            source: TimelineSource::Provider,
+            kind: TimelineItemKind::FileOperation,
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: TimelinePayloadDepth::Detail,
+            payload: TimelinePayload::FileOperation(FileOperationPayload {
+                operation: FileOperationKind::Write,
+                path: "src/lib.rs".into(),
+                summary: "Created src/lib.rs".into(),
+                old_text: None,
+                new_text: Some("x".repeat(64 * 1024)),
+                patch: None,
+                raw_extension: Some(AgentEventRawExtension::new(
+                    vec![AgentEventContentBlock::new("text", "block").0],
+                    Some("{\"path\":\"src/lib.rs\"}".into()),
+                    None,
+                    Vec::new(),
+                    BTreeMap::new(),
+                    false,
+                )),
+            }),
+        };
+        let complete_bytes = item.payload.approximate_bytes();
+
+        item = item.into_summary();
+        assert_eq!(item.payload_depth, TimelinePayloadDepth::Summary);
+        assert!(!item.has_complete_payload());
+        assert!(item.payload.approximate_bytes() < complete_bytes / 8);
+        let TimelinePayload::FileOperation(file) = &item.payload else {
+            panic!("the payload kind survives a summary");
+        };
+        assert_eq!(file.path, "src/lib.rs");
+        assert_eq!(file.old_text, None);
+        assert_eq!(file.new_text, None);
+        let extension = file
+            .raw_extension
+            .as_ref()
+            .expect("the invocation survives a summary");
+        assert!(extension.content_blocks.is_empty());
+        assert!(extension.raw_input.is_some());
+    }
+
+    #[test]
+    fn a_payload_with_nothing_to_withhold_stays_complete() {
+        // Messages carry no tool detail, so marking them incomplete would make
+        // a reader fetch detail that does not exist and hide the fact that the
+        // item is already whole.
+        let item = TimelineItem {
+            id: TimelineItemId::new(),
+            session_id: VibexSessionId::new(),
+            sequence: 1,
+            timestamp_ms: 1,
+            source: TimelineSource::Agent,
+            kind: TimelineItemKind::AgentMessage,
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: TimelinePayloadDepth::Detail,
+            payload: TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "done".into(),
+                is_final: true,
+            }),
+        };
+        let summarized = item.into_summary();
+        assert!(summarized.has_complete_payload());
+        assert_eq!(summarized.payload_depth, TimelinePayloadDepth::Detail);
+    }
+
+    #[test]
+    fn a_one_sided_file_change_still_gets_a_rendered_patch() {
+        // Storing patches instead of snapshots must not lose the content of a
+        // file an Agent created: there is no diff to compute against nothing,
+        // so the patch is synthesized from the side that exists.
+        let created = FileOperationPayload {
+            operation: FileOperationKind::Write,
+            path: "src/new.rs".into(),
+            summary: "Created src/new.rs".into(),
+            old_text: None,
+            new_text: Some("fn main() {}\n".into()),
+            patch: None,
+            raw_extension: None,
+        };
+        let patch = created.canonical_patch().expect("a creation renders");
+        assert!(patch.text.contains("+fn main() {}"), "{}", patch.text);
+
+        let deleted = FileOperationPayload {
+            operation: FileOperationKind::Delete,
+            path: "src/old.rs".into(),
+            summary: "Deleted src/old.rs".into(),
+            old_text: Some("fn gone() {}\n".into()),
+            new_text: None,
+            patch: None,
+            raw_extension: None,
+        };
+        let patch = deleted.canonical_patch().expect("a deletion renders");
+        assert!(patch.text.contains("-fn gone() {}"), "{}", patch.text);
+
+        let untouched = FileOperationPayload {
+            operation: FileOperationKind::Edit,
+            path: "src/same.rs".into(),
+            summary: "Read src/same.rs".into(),
+            old_text: None,
+            new_text: None,
+            patch: None,
+            raw_extension: None,
+        };
+        assert!(untouched.canonical_patch().is_none());
     }
 
     #[test]
@@ -1404,6 +1850,7 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,
             execution_attribution: Some(attribution.view()),
+            payload_depth: crate::TimelinePayloadDepth::Detail,
             payload: TimelinePayload::AgentMessage(AgentMessagePayload {
                 text: "done".to_string(),
                 is_final: true,

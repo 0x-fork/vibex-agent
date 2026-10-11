@@ -13,8 +13,8 @@ use vibex_core::{
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
     FetchTimelineRequest, PermissionRequestStatus, RenameAgentSessionRequest,
     ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload,
-    VibexError, VibexResult, VibexSessionId,
+    SessionRuntimeOptionCatalog, TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage,
+    TimelinePayload, TimelinePayloadDepth, VibexError, VibexResult, VibexSessionId,
 };
 use vibex_desktop_model::{
     AgentSidebarRow, ReasoningDisplayMode, SidebarState, TimelineConversationTurn, TimelineModel,
@@ -27,14 +27,41 @@ use crate::{
 };
 
 pub const AGENT_TIMELINE_PAGE_LIMIT: u32 = 500;
+/// How many conversational turns one page covers.
+///
+/// Turns are the unit a reader thinks in, so a page that ends on a turn
+/// boundary never shows half a question-answer pair. Eight covers a screen or
+/// two of ordinary turns while keeping a cold open to a single round trip.
+pub const AGENT_TIMELINE_TURN_LIMIT: u32 = 8;
+/// Upper bound on the payload cost of one page.
+///
+/// Item counts alone cannot bound a page: one file operation snapshot can
+/// outweigh hundreds of messages. A megabyte is roughly a screensful of
+/// rendered conversation and is what makes a cold open over a phone connection
+/// predictable instead of proportional to the session's history.
+pub const AGENT_TIMELINE_PAGE_BYTES: u32 = 1_048_576;
+/// How many older-history pages may be in flight at once.
+///
+/// Two is what prefetch needs: the reader is still scrolling through the page
+/// that just arrived while the next one is already on its way, so reaching the
+/// top does not mean waiting.
+pub const AGENT_TIMELINE_OLDER_MAX_IN_FLIGHT: usize = 2;
 pub const AGENT_TIMELINE_MAX_ITEMS: usize = 20_000;
 /// Bounded LRU over previously loaded sessions. Switching back to a cached
 /// session renders its stored authoritative prefix immediately and refreshes
 /// only the newer tail instead of re-paginating the whole timeline.
-pub const AGENT_SESSION_CACHE_SESSION_LIMIT: usize = 6;
-/// Total cached timeline items across all sessions; timeline item payloads
-/// dominate the memory cost on phones.
-pub const AGENT_SESSION_CACHE_ITEM_BUDGET: usize = 8_192;
+pub const AGENT_SESSION_CACHE_SESSION_LIMIT: usize = 20;
+/// The fewest cached sessions that survive eviction, whatever the byte budget
+/// says. Switching back and forth between a handful of conversations is the
+/// common case, and a byte budget alone would evict all of them for one very
+/// long session.
+pub const AGENT_SESSION_CACHE_MIN_SESSIONS: usize = 3;
+/// Total cached payload bytes across all sessions.
+///
+/// Payload bytes, not item counts, are what a phone actually runs out of:
+/// eight thousand streamed deltas and eight thousand file snapshots are the
+/// same count and three orders of magnitude apart in size.
+pub const AGENT_SESSION_CACHE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 
 fn session_update_is_current(existing: &AgentSession, incoming: &AgentSession) -> bool {
     incoming.updated_at_ms >= existing.updated_at_ms
@@ -246,9 +273,19 @@ pub struct AgentWorkflowState {
     /// its oldest item. Only an authoritative load or an applied older page
     /// updates it, so it never guesses from a gap in the sequence numbers.
     pub timeline_has_older: bool,
-    /// In-flight state of an older-page fetch, which is also the guard that
-    /// keeps a scrolled-to-the-top transcript from firing the request twice.
+    /// In-flight state of an older-page fetch. Prefetch keeps more than one
+    /// page on the way, so this reports whether any is outstanding rather than
+    /// acting as the admission guard itself.
     pub timeline_older_status: AsyncState<()>,
+    /// How many older pages are outstanding right now.
+    pub(crate) timeline_older_in_flight: usize,
+    /// Payloads read back at full depth, keyed by the sequence they belong to.
+    ///
+    /// A summary page replaces its items wholesale, so detail stored on the
+    /// item itself would be lost by the next refresh and an activity the
+    /// reader had opened would close under them. Keying it by sequence keeps
+    /// the opened detail across a refresh.
+    timeline_details: BTreeMap<i64, (TimelineItemId, TimelinePayload)>,
     pending_mutations: BTreeMap<String, AgentMutationKind>,
     pending_permission_resolutions: BTreeSet<String>,
     pending_elicitation_resolutions: BTreeSet<String>,
@@ -269,6 +306,8 @@ impl fmt::Debug for AgentWorkflowState {
             .field("timeline_has_older", &self.timeline_has_older)
             .field("timeline_oldest_sequence", &self.timeline_oldest_sequence())
             .field("timeline_older_phase", &self.timeline_older_status.phase)
+            .field("timeline_older_in_flight", &self.timeline_older_in_flight)
+            .field("timeline_detail_count", &self.timeline_details.len())
             .field("runtime_options_phase", &self.runtime_options.phase)
             .field("runtime_selection_phase", &self.runtime_selection.phase)
             .field("latest_mutation_phase", &self.latest_mutation.phase)
@@ -304,6 +343,8 @@ impl Default for AgentWorkflowState {
             last_runtime_event: None,
             timeline_has_older: false,
             timeline_older_status: AsyncState::default(),
+            timeline_older_in_flight: 0,
+            timeline_details: BTreeMap::new(),
             pending_mutations: BTreeMap::new(),
             pending_permission_resolutions: BTreeSet::new(),
             pending_elicitation_resolutions: BTreeSet::new(),
@@ -501,14 +542,44 @@ impl AgentWorkflowState {
     }
 }
 
+/// What a timeline load is for.
+///
+/// A bare sequence could not say whether a load was rebuilding the whole
+/// projection or resuming a cached one, and the two differ in how their answer
+/// is applied as well as in what they ask for. Naming the kind keeps that
+/// decision at the point the ticket is issued instead of re-deriving it from a
+/// number at every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineLoadKind {
+    /// The newest window: a cold open, or a full rebuild after a gap.
+    Cold,
+    /// Only the tail above this sequence, merged into a restored prefix.
+    Tail(i64),
+    /// The page of history below this sequence.
+    Before(i64),
+}
+
+impl TimelineLoadKind {
+    /// The sequence the fetch resumes after, if it resumes at all.
+    pub const fn after_sequence(self) -> Option<i64> {
+        match self {
+            Self::Cold | Self::Before(_) => None,
+            Self::Tail(sequence) => Some(sequence),
+        }
+    }
+
+    /// Whether the answer merges into an existing projection instead of
+    /// replacing it.
+    pub const fn resumes_prefix(self) -> bool {
+        matches!(self, Self::Tail(_))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSessionLoadTicket {
     pub generation: WorkflowViewGeneration,
     pub session_id: VibexSessionId,
-    /// Sequence the timeline fetch resumes after. `0` rebuilds the complete
-    /// authoritative timeline; a cached complete-prefix end only fetches the
-    /// newer tail.
-    pub after_sequence: i64,
+    pub load: TimelineLoadKind,
 }
 
 /// Identifies one older-history fetch.
@@ -522,6 +593,17 @@ pub struct AgentTimelineBeforeTicket {
     pub session_id: VibexSessionId,
     /// Every item in the answered page must sit strictly below this sequence.
     pub before_sequence: i64,
+}
+
+/// Identifies one tool-detail read.
+///
+/// Pages and live events carry summary payloads, so opening an activity asks
+/// for exactly the item it is about to render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTimelineItemTicket {
+    pub generation: WorkflowViewGeneration,
+    pub session_id: VibexSessionId,
+    pub sequence: i64,
 }
 
 /// Authoritative projection of a previously loaded session. The stored
@@ -541,7 +623,7 @@ struct CachedAgentSession {
 }
 
 /// Most-recently-used-first LRU keyed by session id, bounded by session count
-/// and by the total number of cached timeline items.
+/// and by the total payload bytes it holds.
 #[derive(Clone, Default)]
 struct AgentSessionCache {
     entries: Vec<(VibexSessionId, CachedAgentSession)>,
@@ -554,23 +636,36 @@ impl AgentSessionCache {
     }
 
     fn put(&mut self, entry: CachedAgentSession) {
-        if entry.timeline.len() > AGENT_SESSION_CACHE_ITEM_BUDGET {
+        let entry_bytes = cached_session_bytes(&entry.timeline);
+        if entry_bytes > AGENT_SESSION_CACHE_BYTE_BUDGET {
+            // One session larger than the whole budget would evict every other
+            // session and still not fit. Caching nothing is the honest answer;
+            // switching back pays a refetch, which is what it would have paid
+            // anyway.
             return;
         }
         self.entries.retain(|(id, _)| id != &entry.session.id);
         self.entries.insert(0, (entry.session.id.clone(), entry));
         while self.entries.len() > AGENT_SESSION_CACHE_SESSION_LIMIT
-            || self.entries.len() > 1
+            || self.entries.len() > AGENT_SESSION_CACHE_MIN_SESSIONS
                 && self
                     .entries
                     .iter()
-                    .map(|(_, entry)| entry.timeline.len())
+                    .map(|(_, entry)| cached_session_bytes(&entry.timeline))
                     .sum::<usize>()
-                    > AGENT_SESSION_CACHE_ITEM_BUDGET
+                    > AGENT_SESSION_CACHE_BYTE_BUDGET
         {
             self.entries.pop();
         }
     }
+}
+
+/// The payload cost of one cached session's timeline.
+fn cached_session_bytes(timeline: &[TimelineItem]) -> usize {
+    timeline
+        .iter()
+        .map(|item| item.payload.approximate_bytes())
+        .fold(0_usize, usize::saturating_add)
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -745,14 +840,18 @@ impl AgentWorkflowController {
             self.state.runtime_selection.clear();
             self.state.timeline_has_older = false;
             self.state.timeline_older_status.clear();
+            self.state.timeline_older_in_flight = 0;
+            // Opened tool detail belongs to the session that was on screen.
+            self.state.timeline_details.clear();
         }
         if let Some(cached) = cached {
-            // Restoring a cached complete prefix keeps the conversation
-            // visible while only the newer tail refreshes.
+            // Restoring a cached prefix keeps the conversation visible while
+            // only the newer tail refreshes.
             self.state.active_session.resolve(cached.session);
+            let restored = self.restore_timeline_details(cached.timeline);
             self.state
                 .timeline
-                .replace_authoritative(session_id.clone(), cached.timeline);
+                .replace_authoritative(session_id.clone(), restored);
             self.state.timeline_has_older = cached.timeline_has_older;
             if let Some(runtime_selection) = cached.runtime_selection {
                 self.state.runtime_selection.resolve(runtime_selection);
@@ -774,24 +873,64 @@ impl AgentWorkflowController {
             self.state.pending_elicitation_resolutions.clear();
         }
         self.state.last_runtime_event = None;
-        // Only a restored cache prefix may resume past sequence 0; a
-        // same-session recovery reload must always rebuild the whole
-        // authoritative timeline so dropped-event gaps are repaired.
-        let after_sequence = if switching_session {
+        // Only a restored cache prefix resumes; a same-session recovery reload
+        // must always rebuild the authoritative window so dropped-event gaps
+        // are repaired. A restored prefix that is already the whole history
+        // has nothing above it, and asking from its end still answers with an
+        // empty tail rather than a second window.
+        let load = if switching_session {
             self.state
                 .timeline
                 .items
                 .last()
-                .map(|item| item.sequence)
-                .unwrap_or(0)
+                .map(|item| TimelineLoadKind::Tail(item.sequence))
+                .unwrap_or(TimelineLoadKind::Cold)
         } else {
-            0
+            TimelineLoadKind::Cold
         };
         AgentSessionLoadTicket {
             generation,
             session_id,
-            after_sequence,
+            load,
         }
+    }
+
+    /// Re-applies tool detail the reader already opened.
+    ///
+    /// A summary page replaces its items wholesale, so without this an
+    /// activity that was open would close on the next refresh and its output
+    /// would have to be fetched again.
+    fn restore_timeline_details(&mut self, items: Vec<TimelineItem>) -> Vec<TimelineItem> {
+        if self.state.timeline_details.is_empty() {
+            return items;
+        }
+        let mut present = BTreeSet::new();
+        let restored = items
+            .into_iter()
+            .map(|item| {
+                present.insert(item.sequence);
+                if item.has_complete_payload() {
+                    return item;
+                }
+                let Some((id, payload)) = self.state.timeline_details.get(&item.sequence) else {
+                    return item;
+                };
+                if id != &item.id {
+                    // The sequence carries a different item now, so the stored
+                    // detail describes something that is gone.
+                    return item;
+                }
+                TimelineItem {
+                    payload: payload.clone(),
+                    payload_depth: TimelinePayloadDepth::Detail,
+                    ..item
+                }
+            })
+            .collect();
+        self.state
+            .timeline_details
+            .retain(|sequence, _| present.contains(sequence));
+        restored
     }
 
     /// Preserves the outgoing session's authoritative projection so switching
@@ -810,9 +949,7 @@ impl AgentWorkflowController {
         let Some(session) = self.state.active_session.value.clone() else {
             return;
         };
-        if session.id != session_id
-            || self.state.timeline.items.len() > AGENT_SESSION_CACHE_ITEM_BUDGET
-        {
+        if session.id != session_id {
             return;
         }
         self.session_cache.put(CachedAgentSession {
@@ -837,12 +974,18 @@ impl AgentWorkflowController {
                     "the backend returned a different Agent session",
                 ));
             }
-            // An empty cached prefix still resumes from 0 and refetches the
-            // complete timeline, so the same paginated loader serves both the
-            // cold and the incremental path.
-            let (timeline, timeline_has_older) =
-                load_timeline_after(backend.as_ref(), &ticket.session_id, ticket.after_sequence)
-                    .await?;
+            let (timeline, timeline_has_older) = match ticket.load {
+                // A cold open reads the newest window only. Older history is
+                // a reader gesture, not part of opening a session.
+                TimelineLoadKind::Cold | TimelineLoadKind::Before(_) => {
+                    let page = load_timeline_window(backend.as_ref(), &ticket.session_id).await?;
+                    (page.items, page.has_older)
+                }
+                // Resuming a restored prefix only needs what arrived above it.
+                TimelineLoadKind::Tail(after_sequence) => {
+                    load_timeline_tail(backend.as_ref(), &ticket.session_id, after_sequence).await?
+                }
+            };
             // Runtime metadata is a best-effort sibling query. The
             // authoritative timeline must still render when a provider or
             // remote device cannot expose runtime-selection details.
@@ -904,18 +1047,50 @@ impl AgentWorkflowController {
                 "the Agent timeline starts at the beginning of the history",
             ));
         }
-        if self.state.timeline_older_status.phase == AsyncPhase::Loading {
+        if self.state.timeline_older_in_flight >= AGENT_TIMELINE_OLDER_MAX_IN_FLIGHT {
             return Err(BackendError::conflict(
                 "agent_timeline_older_pending",
-                "an older Agent timeline page is already being fetched",
+                "the older Agent timeline pages already being fetched are enough",
             ));
         }
+        self.state.timeline_older_in_flight += 1;
         self.state.timeline_older_status.begin();
         Ok(AgentTimelineBeforeTicket {
             generation: self.state.generation,
             session_id,
             before_sequence,
         })
+    }
+
+    /// Whether the reader may ask for older history right now.
+    ///
+    /// Clients use this to decide when to prefetch: a reader who is within a
+    /// page of the top should have the next page already on the way, and one
+    /// who is parked at the top must not queue a request per keypress.
+    pub fn can_load_older(&self) -> bool {
+        self.state.timeline_has_older
+            && self.state.timeline_older_in_flight < AGENT_TIMELINE_OLDER_MAX_IN_FLIGHT
+    }
+
+    /// Retires one outstanding older-history fetch.
+    ///
+    /// The display state only settles once nothing is outstanding, and it
+    /// settles as a failure when the page that ended the batch was rejected,
+    /// so a reader still learns that the history below them is unreachable.
+    fn finish_older_fetch(&mut self, error: Option<BackendError>) {
+        self.state.timeline_older_in_flight = self.state.timeline_older_in_flight.saturating_sub(1);
+        if self.state.timeline_older_in_flight > 0 {
+            return;
+        }
+        match error {
+            Some(error) => self.state.timeline_older_status.reject(error),
+            None => self.state.timeline_older_status.resolve(()),
+        }
+    }
+
+    /// The sequence of the oldest item the projection holds.
+    pub fn timeline_oldest_sequence(&self) -> Option<i64> {
+        self.state.timeline_oldest_sequence()
     }
 
     /// Prepends the page an older-history fetch produced.
@@ -933,12 +1108,13 @@ impl AgentWorkflowController {
         if self.state.generation != ticket.generation
             || self.state.selected_session_id.as_ref() != Some(&ticket.session_id)
         {
+            self.finish_older_fetch(None);
             return Ok(false);
         }
         let page = match result {
             Ok(page) => page,
             Err(error) => {
-                self.state.timeline_older_status.reject(error.clone());
+                self.finish_older_fetch(Some(error.clone()));
                 return Err(error);
             }
         };
@@ -949,10 +1125,11 @@ impl AgentWorkflowController {
             // would return the same newest page forever, so the projection
             // stops claiming to have older history.
             self.state.timeline_has_older = false;
-            self.state.timeline_older_status.reject(error.clone());
+            self.finish_older_fetch(Some(error.clone()));
             return Err(error);
         }
         self.prepend_timeline_page(&ticket.session_id, page);
+        self.finish_older_fetch(None);
         Ok(true)
     }
 
@@ -977,6 +1154,7 @@ impl AgentWorkflowController {
         if merged.len() > AGENT_TIMELINE_MAX_ITEMS {
             merged.truncate(AGENT_TIMELINE_MAX_ITEMS);
         }
+        let merged = self.restore_timeline_details(merged);
         self.state
             .timeline
             .replace_authoritative(session_id.clone(), merged);
@@ -985,7 +1163,11 @@ impl AgentWorkflowController {
         // there, and trusting `has_older` instead would re-ask for the same
         // cursor on every scroll gesture.
         self.state.timeline_has_older = has_older && added_history;
-        self.state.timeline_older_status.resolve(());
+    }
+
+    /// How many older pages are outstanding right now.
+    pub fn timeline_older_in_flight(&self) -> usize {
+        self.state.timeline_older_in_flight
     }
 
     pub fn apply_session_snapshot(
@@ -1010,10 +1192,10 @@ impl AgentWorkflowController {
                     return true;
                 }
                 self.state.active_session.resolve(snapshot.session);
-                if ticket.after_sequence > 0 {
-                    // Merge the refreshed tail into the restored complete
-                    // prefix; sequence normalization deduplicates items that
-                    // live events already applied while the refresh ran. The
+                if ticket.load.resumes_prefix() {
+                    // Merge the refreshed tail into the restored prefix;
+                    // sequence normalization deduplicates items that live
+                    // events already applied while the refresh ran. The
                     // restored window keeps the older-history knowledge it was
                     // cached with: this page is above it, not below.
                     let merged = self
@@ -1024,17 +1206,20 @@ impl AgentWorkflowController {
                         .cloned()
                         .chain(snapshot.timeline)
                         .collect::<Vec<_>>();
+                    let merged = self.restore_timeline_details(merged);
                     self.state
                         .timeline
                         .replace_authoritative(ticket.session_id.clone(), merged);
                 } else {
+                    let restored = self.restore_timeline_details(snapshot.timeline);
                     self.state
                         .timeline
-                        .replace_authoritative(ticket.session_id.clone(), snapshot.timeline);
+                        .replace_authoritative(ticket.session_id.clone(), restored);
                     self.state.timeline_has_older = snapshot.timeline_has_older;
                 }
                 self.state.timeline_status.resolve(());
                 self.state.timeline_older_status.clear();
+                self.state.timeline_older_in_flight = 0;
                 if let Some(runtime_selection) = snapshot.runtime_selection {
                     self.state.runtime_selection.resolve(runtime_selection);
                 } else if self.state.runtime_selection.phase == AsyncPhase::Loading {
@@ -1062,9 +1247,108 @@ impl AgentWorkflowController {
                 // still in flight is already dead; its status must not stay
                 // `Loading` and block the next request.
                 self.state.timeline_older_status.clear();
+                self.state.timeline_older_in_flight = 0;
             }
         }
         true
+    }
+
+    /// Reserves the read that opens one activity's tool detail.
+    ///
+    /// A page carries summary payloads, so this is how the output and file
+    /// snapshots behind a collapsed activity come back. The ticket pins the
+    /// sequence, so a detail that arrives after the reader navigated away is
+    /// recognized as stale instead of applied to the wrong session.
+    pub fn begin_timeline_item(&mut self, sequence: i64) -> BackendResult<AgentTimelineItemTicket> {
+        self.require(BackendOperation::AgentFetchTimelineItem)?;
+        let Some(session_id) = self.state.selected_session_id.clone() else {
+            return Err(BackendError::conflict(
+                "agent_timeline_session_missing",
+                "no Agent session is selected",
+            ));
+        };
+        if self.state.timeline.session_id.as_ref() != Some(&session_id) {
+            return Err(BackendError::conflict(
+                "agent_timeline_empty",
+                "the Agent timeline has not loaded yet",
+            ));
+        }
+        if !self
+            .state
+            .timeline
+            .items
+            .iter()
+            .any(|item| item.sequence == sequence)
+        {
+            return Err(BackendError::conflict(
+                "agent_timeline_item_missing",
+                "the requested Agent timeline item is not loaded",
+            ));
+        }
+        Ok(AgentTimelineItemTicket {
+            generation: self.state.generation,
+            session_id,
+            sequence,
+        })
+    }
+
+    pub fn load_timeline_item(
+        &self,
+        ticket: AgentTimelineItemTicket,
+    ) -> BackendFuture<'static, TimelineItem> {
+        let backend = self.backend.clone();
+        Box::pin(async move {
+            backend
+                .fetch_timeline_item(vibex_core::FetchTimelineItemRequest {
+                    session_id: ticket.session_id,
+                    sequence: ticket.sequence,
+                })
+                .await
+        })
+    }
+
+    /// Installs the full payload an activity read produced.
+    ///
+    /// `Ok(true)` means the detail was applied, `Ok(false)` that the ticket is
+    /// stale and the caller should drop the result.
+    pub fn apply_timeline_item(
+        &mut self,
+        ticket: &AgentTimelineItemTicket,
+        result: BackendResult<TimelineItem>,
+    ) -> BackendResult<bool> {
+        if self.state.generation != ticket.generation
+            || self.state.selected_session_id.as_ref() != Some(&ticket.session_id)
+        {
+            return Ok(false);
+        }
+        let item = result?;
+        if item.session_id != ticket.session_id || item.sequence != ticket.sequence {
+            return Err(BackendError::failed(
+                "agent_timeline_item_invalid",
+                "the backend returned a different Agent timeline item",
+            ));
+        }
+        // Remember the detail even when the projection no longer holds the
+        // sequence: a reader who reopened the same activity right after a
+        // refresh should not pay for the read twice.
+        self.state
+            .timeline_details
+            .insert(item.sequence, (item.id.clone(), item.payload.clone()));
+        let Ok(index) = self
+            .state
+            .timeline
+            .items
+            .binary_search_by_key(&item.sequence, |existing| existing.sequence)
+        else {
+            return Ok(true);
+        };
+        if self.state.timeline.items[index].id != item.id {
+            return Ok(true);
+        }
+        self.state.timeline.items[index].payload = item.payload;
+        self.state.timeline.items[index].payload_depth = TimelinePayloadDepth::Detail;
+        self.state.timeline.revision = self.state.timeline.revision.wrapping_add(1);
+        Ok(true)
     }
 
     pub fn create_session(
@@ -1608,7 +1892,37 @@ impl AgentWorkflowController {
     }
 }
 
-async fn load_timeline_after(
+/// Fetches the newest turn-aligned window of a session.
+///
+/// One request, one bounded answer. Opening a session used to mean paging the
+/// whole archive in 500-item chunks, which made the wait proportional to the
+/// session's history; the window is what makes it constant, and older history
+/// is a reader gesture from here on.
+pub async fn load_timeline_window(
+    backend: &dyn AgentBackend,
+    session_id: &VibexSessionId,
+) -> BackendResult<TimelinePage> {
+    let page = backend
+        .fetch_timeline(FetchTimelineRequest {
+            session_id: session_id.clone(),
+            after_sequence: None,
+            before_sequence: None,
+            limit: AGENT_TIMELINE_PAGE_LIMIT,
+            max_turns: Some(AGENT_TIMELINE_TURN_LIMIT),
+            max_bytes: Some(AGENT_TIMELINE_PAGE_BYTES),
+        })
+        .await?;
+    validate_timeline_window(session_id, &page)?;
+    Ok(page)
+}
+
+/// Fetches only what arrived above a restored prefix.
+///
+/// A cache hit already holds a contiguous prefix, so the refresh is the tail
+/// above it. The tail can span several pages when a session streamed while the
+/// reader was elsewhere, so this one loops — and stops at the same hard bound
+/// the full projection has always had.
+pub async fn load_timeline_tail(
     backend: &dyn AgentBackend,
     session_id: &VibexSessionId,
     after_sequence: i64,
@@ -1623,6 +1937,8 @@ async fn load_timeline_after(
                 after_sequence: Some(after_sequence),
                 before_sequence: None,
                 limit: AGENT_TIMELINE_PAGE_LIMIT,
+                max_turns: None,
+                max_bytes: None,
             })
             .await?;
         validate_timeline_page(session_id, after_sequence, &page)?;
@@ -1658,8 +1974,10 @@ async fn load_timeline_after(
 /// Fetches exactly one page below `before_sequence`.
 ///
 /// Older history is loaded a screenful at a time as the reader scrolls up, so
-/// this deliberately does not loop: one gesture, one bounded request.
-async fn load_timeline_before(
+/// this deliberately does not loop: one gesture, one bounded request. The page
+/// ends on a turn boundary and respects the byte budget, so prefetching the
+/// next one costs a predictable amount of work and traffic.
+pub async fn load_timeline_before(
     backend: &dyn AgentBackend,
     session_id: &VibexSessionId,
     before_sequence: i64,
@@ -1670,10 +1988,33 @@ async fn load_timeline_before(
             after_sequence: None,
             before_sequence: Some(before_sequence),
             limit: AGENT_TIMELINE_PAGE_LIMIT,
+            max_turns: Some(AGENT_TIMELINE_TURN_LIMIT),
+            max_bytes: Some(AGENT_TIMELINE_PAGE_BYTES),
         })
         .await?;
     validate_timeline_before_page(session_id, before_sequence, &page)?;
     Ok(page)
+}
+
+/// Validates a windowed answer that carries no cursor of its own.
+fn validate_timeline_window(session_id: &VibexSessionId, page: &TimelinePage) -> BackendResult<()> {
+    if page.session_id != *session_id {
+        return Err(BackendError::failed(
+            "agent_timeline_session_mismatch",
+            "the Agent timeline page belongs to another session",
+        ));
+    }
+    if page
+        .items
+        .iter()
+        .any(|item| item.session_id != *session_id || item.sequence < 0)
+    {
+        return Err(BackendError::failed(
+            "agent_timeline_page_invalid",
+            "the Agent timeline page contains an invalid item",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_timeline_page(
@@ -2081,6 +2422,7 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
         }
     }
@@ -2189,8 +2531,13 @@ mod tests {
             AsyncPhase::Loading
         );
 
-        // A second request while the first is in flight is refused, which is
-        // what keeps a transcript parked at the top from firing per keypress.
+        // Prefetch keeps a second page on the way while the reader is still
+        // moving through the first, so the wait never lands on them. A third
+        // is refused, which is what keeps a transcript parked at the top from
+        // firing a request per keypress.
+        let second = controller.begin_timeline_before().unwrap();
+        assert_eq!(second.before_sequence, 5);
+        assert_eq!(controller.timeline_older_in_flight(), 2);
         let pending = controller.begin_timeline_before().unwrap_err();
         assert_eq!(pending.code, "agent_timeline_older_pending");
 
@@ -2218,6 +2565,25 @@ mod tests {
             (1..=8).collect::<Vec<_>>()
         );
         assert!(!controller.state.timeline_has_older);
+        // The prefetched sibling is still outstanding, so the display state
+        // has not settled yet.
+        assert_eq!(
+            controller.state.timeline_older_status.phase,
+            AsyncPhase::Loading
+        );
+        let empty = vibex_core::TimelinePage {
+            session_id: session.id.clone(),
+            items: Vec::new(),
+            start_sequence: None,
+            end_sequence: None,
+            has_older: false,
+            has_newer: false,
+        };
+        assert!(
+            controller
+                .apply_timeline_before(&second, Ok(empty))
+                .unwrap()
+        );
         assert_eq!(
             controller.state.timeline_older_status.phase,
             AsyncPhase::Ready
@@ -2283,6 +2649,8 @@ mod tests {
                 after_sequence: None,
                 before_sequence: Some(5),
                 limit: AGENT_TIMELINE_PAGE_LIMIT,
+                max_turns: None,
+                max_bytes: None,
             })
             .await
             .unwrap();
@@ -2706,7 +3074,7 @@ mod tests {
         let backend = Arc::new(MockAgentBackend::new(session.clone(), items));
         let mut controller = AgentWorkflowController::new(backend.clone(), capabilities());
         let first = controller.begin_session_load(session.id.clone()).unwrap();
-        assert_eq!(first.after_sequence, 0);
+        assert_eq!(first.load, TimelineLoadKind::Cold);
         let snapshot = controller.load_session(first.clone()).await.unwrap();
         assert!(controller.apply_session_snapshot(&first, Ok(snapshot)));
 
@@ -2726,7 +3094,7 @@ mod tests {
             .expect("switching away should start");
 
         let back = controller.begin_session_load(session.id.clone()).unwrap();
-        assert_eq!(back.after_sequence, 2);
+        assert_eq!(back.load, TimelineLoadKind::Tail(2));
         assert_eq!(controller.state.active_session.phase, AsyncPhase::Loading);
         assert_eq!(
             controller.state.active_session.value.as_ref().unwrap().id,
@@ -2827,7 +3195,7 @@ mod tests {
             .expect("switching away should start");
 
         let back = controller.begin_session_load(session.id.clone()).unwrap();
-        assert_eq!(back.after_sequence, 1);
+        assert_eq!(back.load, TimelineLoadKind::Tail(1));
         assert_eq!(
             controller
                 .state
@@ -2863,7 +3231,7 @@ mod tests {
     }
 
     #[test]
-    fn session_cache_evicts_least_recently_used_and_respects_item_budget() {
+    fn session_cache_evicts_least_recently_used_and_respects_byte_budget() {
         fn put_entry(cache: &mut AgentSessionCache, timeline_len: usize) -> VibexSessionId {
             let session = session();
             cache.put(CachedAgentSession {
@@ -2879,6 +3247,25 @@ mod tests {
                     );
                     timeline_len
                 ],
+                runtime_selection: None,
+                timeline_has_older: false,
+            });
+            session.id
+        }
+
+        /// One cached item that costs roughly `bytes` payload bytes.
+        fn put_sized_entry(cache: &mut AgentSessionCache, bytes: usize) -> VibexSessionId {
+            let session = session();
+            cache.put(CachedAgentSession {
+                session: session.clone(),
+                timeline: vec![timeline_item(
+                    &session.id,
+                    1,
+                    TimelinePayload::AgentMessage(AgentMessagePayload {
+                        text: "x".repeat(bytes),
+                        is_final: true,
+                    }),
+                )],
                 runtime_selection: None,
                 timeline_has_older: false,
             });
@@ -2905,16 +3292,26 @@ mod tests {
         assert!(cache.entries.iter().any(|(id, _)| *id == oldest));
         assert!(cache.entries.iter().any(|(id, _)| *id == fresh));
 
-        // A single oversized snapshot is never cached.
-        let oversized = put_entry(&mut cache, AGENT_SESSION_CACHE_ITEM_BUDGET + 1);
+        // A single snapshot larger than the whole budget is never cached: it
+        // would evict every other session and still not fit.
+        let oversized = put_sized_entry(&mut cache, AGENT_SESSION_CACHE_BYTE_BUDGET + 1);
         assert!(!cache.entries.iter().any(|(id, _)| *id == oversized));
+
+        // Byte pressure evicts down to the floor, never below it, even when
+        // each entry is large enough that two of them exceed the budget.
+        let mut pressured = AgentSessionCache::default();
+        for _ in 0..6 {
+            put_sized_entry(&mut pressured, AGENT_SESSION_CACHE_BYTE_BUDGET / 3);
+        }
+        assert!(pressured.entries.len() >= AGENT_SESSION_CACHE_MIN_SESSIONS);
+        assert!(pressured.entries.len() < 6);
         assert!(
-            cache
+            pressured
                 .entries
                 .iter()
-                .map(|(_, entry)| entry.timeline.len())
+                .map(|(_, entry)| cached_session_bytes(&entry.timeline))
                 .sum::<usize>()
-                <= AGENT_SESSION_CACHE_ITEM_BUDGET
+                <= AGENT_SESSION_CACHE_BYTE_BUDGET * 2
         );
     }
 

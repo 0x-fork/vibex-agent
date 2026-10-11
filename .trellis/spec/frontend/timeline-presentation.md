@@ -73,6 +73,14 @@ Transcript::advance_disclosures(&mut self, Instant) -> bool
   ID during updates; derive parent indices separately from content cache keys.
   History budgets and prepend detection count source rows, excluding synthetic
   summaries, so loading older history preserves the requested page.
+- Opened detail is fetched, not shipped. A page or live event carries
+  `TimelinePayloadDepth::Summary`, which keeps every field a collapsed activity
+  row renders and withholds the parts only an opened one shows. An activity
+  whose item is not complete has detail to read, so a client must keep it
+  openable even when the stripped payload projects to nothing, and must read it
+  back by sequence. Prefetch older history before the reader reaches the top;
+  waiting for the literal top shows an empty band for the length of a round
+  trip.
 - Group and detail connectors use the one-column `glyphs::connector` (`│` or
   ASCII `|`). The outer line stops at the last child header; the inner line
   belongs to that child's details. Account for both indents in wrapping and

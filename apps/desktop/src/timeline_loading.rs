@@ -17,6 +17,12 @@ pub(super) struct PreparedTimeline {
     state: Option<AgentSessionState>,
     pending: bool,
     reasoning: ReasoningDisplayMode,
+    /// Whether history exists below the prepared window.
+    ///
+    /// Carried with the snapshot because only the read that produced it knows:
+    /// a resumed load refreshes the tail above a prefix and must not overwrite
+    /// what that prefix already knew about the history below it.
+    timeline_has_older: bool,
 }
 
 /// Only the request owns this buffer. Its weak view reference expires on
@@ -67,9 +73,22 @@ impl PreparedTimeline {
         }
     }
 
+    /// Prepares a window the caller knows nothing about the history of.
+    #[cfg(test)]
     pub(super) async fn prepare(
         session_id: VibexSessionId,
         items: Vec<TimelineItem>,
+        state: Option<AgentSessionState>,
+        pending: bool,
+        reasoning: ReasoningDisplayMode,
+    ) -> VibexResult<Self> {
+        Self::prepare_with_older(session_id, items, false, state, pending, reasoning).await
+    }
+
+    pub(super) async fn prepare_with_older(
+        session_id: VibexSessionId,
+        items: Vec<TimelineItem>,
+        timeline_has_older: bool,
         state: Option<AgentSessionState>,
         pending: bool,
         reasoning: ReasoningDisplayMode,
@@ -84,6 +103,7 @@ impl PreparedTimeline {
                 state,
                 pending,
                 reasoning,
+                timeline_has_older,
             }
         })
         .await
@@ -158,6 +178,7 @@ impl VibexWorkbench {
             self.timeline.needs_authoritative_refetch =
                 prepared.timeline.needs_authoritative_refetch;
         }
+        self.timeline_has_older = prepared.timeline_has_older;
         self.reconcile_optimistic_user_message();
         true
     }
@@ -284,6 +305,7 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
         }
     }

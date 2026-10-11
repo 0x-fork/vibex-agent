@@ -28,7 +28,10 @@ impl MobileApp {
     fn set_row_expanded(&mut self, id: String, expanded: bool, cx: &mut Context<Self>) {
         if expanded {
             self.collapsed_timeline_rows.remove(&id);
-            self.expanded_timeline_rows.insert(id);
+            self.expanded_timeline_rows.insert(id.clone());
+            // Pages carry summary payloads; the output and file snapshots
+            // behind an activity are read when the reader opens it.
+            self.ensure_timeline_row_detail(&id, cx);
         } else {
             self.expanded_timeline_rows.remove(&id);
             self.collapsed_timeline_rows.insert(id);
@@ -38,9 +41,13 @@ impl MobileApp {
     }
 
     fn row_turn_live(&self, row: &TimelineRow) -> bool {
-        self.controller
-            .as_ref()
-            .is_some_and(|controller| controller.state.is_turn_live())
+        // A window read from disk has no live turn: liveness is the runtime's
+        // answer, and the snapshot that carries it has not arrived.
+        !self.timeline_is_using_cached_window()
+            && self
+                .controller
+                .as_ref()
+                .is_some_and(|controller| controller.state.is_turn_live())
             && self.timeline_turns.last().is_some_and(|turn| {
                 row.turn_id.as_deref() == Some(turn.id.as_str()) && !turn_finished(turn)
             })

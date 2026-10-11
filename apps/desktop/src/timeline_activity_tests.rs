@@ -18,6 +18,7 @@ fn item(sequence: i64, payload: TimelinePayload) -> TimelineItem {
         provider_correlation_id: None,
         redaction_state: TimelineRedactionState::None,
         execution_attribution: None,
+        payload_depth: vibex_core::TimelinePayloadDepth::Detail,
         payload,
     }
 }

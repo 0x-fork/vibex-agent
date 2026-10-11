@@ -579,11 +579,32 @@ const AGENT_CONTENT_STANDARD_MAX_WIDTH: f32 = 1024.0;
 /// those are not part of the resident estimate. A dozen views let a long
 /// browsing session hold several hundred megabytes; six still covers the
 /// working set of switching back and forth between two conversations.
-const AGENT_SESSION_VIEW_CACHE_LIMIT: usize = 6;
+const AGENT_SESSION_VIEW_CACHE_LIMIT: usize = 20;
+/// The fewest views that survive eviction whatever the byte budget says.
+///
+/// Alternating between a handful of conversations is the common case, and a
+/// byte budget alone would evict all of them to keep one very long session.
+const AGENT_SESSION_VIEW_CACHE_MIN_VIEWS: usize = 3;
 const AGENT_SESSION_VIEW_CACHE_BYTES: usize = 128 * 1024 * 1024;
 /// Multiplier applied to a view's estimated bytes to cover what the estimate
 /// cannot see: allocator overhead per allocation and the derived caches.
 const AGENT_SESSION_VIEW_ALLOCATION_OVERHEAD: usize = 3;
+/// How many conversational turns the newest window covers.
+const AGENT_TIMELINE_TURN_WINDOW: u32 = 8;
+/// Upper bound on the payload cost of one window or history page.
+const AGENT_TIMELINE_WINDOW_BYTES: u32 = 1_048_576;
+/// How many older pages may be outstanding at once.
+///
+/// Prefetch keeps the next page on the way while the reader is still moving
+/// through the one that just arrived, so reaching the top is not a wait.
+const AGENT_TIMELINE_OLDER_MAX_IN_FLIGHT: usize = 2;
+/// How many tool-detail reads may be outstanding at once.
+const AGENT_TIMELINE_DETAIL_MAX_IN_FLIGHT: usize = 2;
+/// Start fetching older history once the reader is this close to the top.
+///
+/// Measured in viewport heights: a page takes long enough to arrive that
+/// waiting for the literal top would show the reader an empty band.
+const AGENT_TIMELINE_OLDER_PREFETCH_SCREENS: f32 = 1.5;
 /// Snapshotted Markdown sources kept for the rows of one expanded turn.
 ///
 /// A turn that ran for hours holds hundreds of rows, and an expanded turn
@@ -1838,33 +1859,7 @@ fn next_authoritative_timeline_cursor(
         .ok_or(TimelineRestoreError::PaginationStalled)
 }
 
-async fn fetch_authoritative_timeline(
-    runtime: Arc<DesktopRuntime>,
-    session_id: VibexSessionId,
-) -> vibex_core::VibexResult<Vec<vibex_core::TimelineItem>> {
-    let mut items = Vec::new();
-    let mut after_sequence = 0_i64;
-    loop {
-        let page = runtime
-            .agent()
-            .fetch_timeline(FetchTimelineRequest {
-                session_id: session_id.clone(),
-                after_sequence: Some(after_sequence),
-                before_sequence: None,
-                limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
-            })
-            .await?;
-        let next_cursor = next_authoritative_timeline_cursor(&session_id, after_sequence, &page)
-            .map_err(TimelineRestoreError::into_vibex_error)?;
-        items.extend(page.items);
-        let Some(next_cursor) = next_cursor else {
-            return Ok(items);
-        };
-        after_sequence = next_cursor;
-    }
-}
-
-/// Authority-agnostic twin of [`fetch_authoritative_timeline`].
+/// Reads a child Agent's whole timeline through the backend facade.
 ///
 /// Child-Agent timelines are read by the parent session view, which must work
 /// the same way whether the workbench owns the runtime or is paired with a
@@ -1883,6 +1878,8 @@ async fn fetch_authoritative_timeline_via_backend(
                 after_sequence: Some(after_sequence),
                 before_sequence: None,
                 limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
+                max_turns: None,
+                max_bytes: None,
             })
             .await
             .map_err(remote_error_into_vibex)?;
@@ -1894,6 +1891,191 @@ async fn fetch_authoritative_timeline_via_backend(
         };
         after_sequence = next_cursor;
     }
+}
+
+/// The newest turn-aligned window of one session.
+///
+/// Opening a session reads this instead of paging the whole archive, so the
+/// wait stops being proportional to how long the conversation has been
+/// running. Older history is a reader gesture from here on.
+async fn fetch_timeline_window(
+    runtime: Arc<DesktopRuntime>,
+    session_id: VibexSessionId,
+) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
+    runtime
+        .agent()
+        .fetch_timeline(FetchTimelineRequest {
+            session_id,
+            after_sequence: None,
+            before_sequence: None,
+            limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
+            max_turns: Some(AGENT_TIMELINE_TURN_WINDOW),
+            max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
+        })
+        .await
+}
+
+/// Authority-agnostic twin of [`fetch_timeline_window`].
+async fn fetch_timeline_window_via_backend(
+    backend: BackendFacade,
+    session_id: VibexSessionId,
+) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
+    backend
+        .agent()
+        .fetch_timeline(FetchTimelineRequest {
+            session_id,
+            after_sequence: None,
+            before_sequence: None,
+            limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
+            max_turns: Some(AGENT_TIMELINE_TURN_WINDOW),
+            max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
+        })
+        .await
+        .map_err(remote_error_into_vibex)
+}
+
+/// Everything above `after_sequence`, for a refreshed cached window.
+///
+/// A restored view already holds a contiguous prefix, so only the tail above
+/// it is missing. That tail can span several pages after a session streamed
+/// while the reader was elsewhere, so this one loops.
+async fn fetch_timeline_tail(
+    runtime: Arc<DesktopRuntime>,
+    session_id: VibexSessionId,
+    after_sequence: i64,
+) -> vibex_core::VibexResult<Vec<vibex_core::TimelineItem>> {
+    let mut items = Vec::new();
+    let mut cursor = after_sequence.max(0);
+    loop {
+        let page = runtime
+            .agent()
+            .fetch_timeline(FetchTimelineRequest {
+                session_id: session_id.clone(),
+                after_sequence: Some(cursor),
+                before_sequence: None,
+                limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
+                max_turns: None,
+                max_bytes: None,
+            })
+            .await?;
+        if page.session_id != session_id
+            || page
+                .items
+                .iter()
+                .any(|item| item.session_id != session_id || item.sequence <= cursor)
+        {
+            return Err(vibex_core::VibexError::storage(
+                "timeline_tail_page_invalid",
+                "the Agent timeline tail page is not above the cursor",
+            ));
+        }
+        items.extend(page.items);
+        if !page.has_newer {
+            return Ok(items);
+        }
+        let Some(next) = page.end_sequence.filter(|next| *next > cursor) else {
+            return Err(vibex_core::VibexError::storage(
+                "timeline_tail_stalled",
+                "the Agent timeline tail cursor did not advance",
+            ));
+        };
+        cursor = next;
+    }
+}
+
+/// Authority-agnostic twin of [`fetch_timeline_tail`].
+async fn fetch_timeline_tail_via_backend(
+    backend: BackendFacade,
+    session_id: VibexSessionId,
+    after_sequence: i64,
+) -> vibex_core::VibexResult<Vec<vibex_core::TimelineItem>> {
+    let mut items = Vec::new();
+    let mut cursor = after_sequence.max(0);
+    loop {
+        let page = backend
+            .agent()
+            .fetch_timeline(FetchTimelineRequest {
+                session_id: session_id.clone(),
+                after_sequence: Some(cursor),
+                before_sequence: None,
+                limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
+                max_turns: None,
+                max_bytes: None,
+            })
+            .await
+            .map_err(remote_error_into_vibex)?;
+        if page.session_id != session_id
+            || page
+                .items
+                .iter()
+                .any(|item| item.session_id != session_id || item.sequence <= cursor)
+        {
+            return Err(vibex_core::VibexError::storage(
+                "timeline_tail_page_invalid",
+                "the Agent timeline tail page is not above the cursor",
+            ));
+        }
+        items.extend(page.items);
+        if !page.has_newer {
+            return Ok(items);
+        }
+        let Some(next) = page.end_sequence.filter(|next| *next > cursor) else {
+            return Err(vibex_core::VibexError::storage(
+                "timeline_tail_stalled",
+                "the Agent timeline tail cursor did not advance",
+            ));
+        };
+        cursor = next;
+    }
+}
+
+/// One page of history below `before_sequence`.
+async fn fetch_timeline_page_before(
+    runtime: Arc<DesktopRuntime>,
+    session_id: VibexSessionId,
+    before_sequence: i64,
+) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
+    runtime
+        .agent()
+        .fetch_timeline(FetchTimelineRequest {
+            session_id,
+            after_sequence: None,
+            before_sequence: Some(before_sequence),
+            limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
+            max_turns: Some(AGENT_TIMELINE_TURN_WINDOW),
+            max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
+        })
+        .await
+}
+
+/// Authority-agnostic twin of [`fetch_timeline_page_before`].
+async fn fetch_timeline_page_before_via_backend(
+    backend: BackendFacade,
+    session_id: VibexSessionId,
+    before_sequence: i64,
+) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
+    backend
+        .agent()
+        .fetch_timeline(FetchTimelineRequest {
+            session_id,
+            after_sequence: None,
+            before_sequence: Some(before_sequence),
+            limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
+            max_turns: Some(AGENT_TIMELINE_TURN_WINDOW),
+            max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
+        })
+        .await
+        .map_err(remote_error_into_vibex)
+}
+
+/// What a session load resumes from, when it is not a cold window.
+struct TimelineResume {
+    /// The contiguous projection the view already holds.
+    prefix: Vec<vibex_core::TimelineItem>,
+    after_sequence: i64,
+    /// Whether history exists below the prefix. A resumed load is above it, so
+    /// the refreshed tail must not overwrite what the prefix knew.
+    timeline_has_older: bool,
 }
 
 async fn fetch_child_agent_session_snapshot_via_backend(
@@ -1999,7 +2181,15 @@ fn insert_bounded_session_view_with_pins<T>(
         .map(&weight)
         .fold(0_usize, usize::saturating_add);
     let mut index = 0;
-    while (lru.len() > limit || total_bytes > max_bytes) && index < lru.len() {
+    // The budget is a memory guard, not a directive to empty the store: a
+    // reader alternating between a handful of conversations must not lose all
+    // of them to one very long session. A caller that asks for a smaller limit
+    // than the floor still gets its limit.
+    let floor = AGENT_SESSION_VIEW_CACHE_MIN_VIEWS.min(limit);
+    while index < lru.len() && (lru.len() > limit || total_bytes > max_bytes) {
+        if lru.len() <= floor {
+            break;
+        }
         let candidate = lru[index].clone();
         if pinned.contains(&candidate) || candidate == key {
             index += 1;
@@ -4118,6 +4308,19 @@ pub struct SessionView {
     timeline_item_index: RefCell<TimelineItemIndex>,
     timeline_follow: TimelineFollowState,
     timeline_scroll: VirtualListScrollHandle,
+    /// Whether the backend reported history below this view's oldest item.
+    ///
+    /// Per view, because it describes the window that view holds rather than
+    /// the session in the abstract.
+    timeline_has_older: bool,
+    /// How many older pages this view has outstanding.
+    timeline_older_in_flight: usize,
+    /// Row ids whose tool detail is being read back right now.
+    ///
+    /// There is no "already applied" set beside it: an item that carries a
+    /// complete payload is its own record, so a refresh that replaces it with
+    /// a summary asks for the detail again instead of trusting a stale note.
+    timeline_detail_in_flight: BTreeSet<String>,
     timeline_scroll_to_latest_pending: bool,
     timeline_scroll_anchor_pending: bool,
     timeline_list_padding_top_px: f32,
@@ -4244,6 +4447,9 @@ impl SessionView {
             timeline_item_index: RefCell::new(TimelineItemIndex::default()),
             timeline_follow: TimelineFollowState::default(),
             timeline_scroll: VirtualListScrollHandle::new(),
+            timeline_has_older: false,
+            timeline_older_in_flight: 0,
+            timeline_detail_in_flight: BTreeSet::new(),
             timeline_scroll_to_latest_pending: false,
             timeline_scroll_anchor_pending: false,
             timeline_list_padding_top_px: AGENT_TIMELINE_LIST_PADDING_TOP_PX,
@@ -5599,6 +5805,7 @@ impl OptimisticUserMessage {
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
         });
         Some(items)
@@ -5657,6 +5864,32 @@ fn user_message_edit_action_state(
 
 fn timeline_distance_to_bottom(offset_y: f32, max_offset_y: f32) -> f32 {
     (max_offset_y + offset_y).max(0.0)
+}
+
+/// What the viewport says about prefetching older history.
+#[derive(Clone, Copy)]
+struct TimelineOlderPrefetch {
+    distance_to_top: f32,
+    viewport_height: f32,
+    has_older: bool,
+    in_flight: usize,
+    following_bottom: bool,
+    loading: bool,
+}
+
+/// Whether the reader is close enough to the top to start the next page.
+///
+/// The trigger is deliberately not the literal top: a page takes a round trip,
+/// so waiting for it would show an empty band. It is also deliberately not
+/// "whenever there is history below": a reader parked at the bottom has no use
+/// for pages they will never scroll to.
+fn timeline_should_prefetch_older(state: TimelineOlderPrefetch) -> bool {
+    !state.loading
+        && state.has_older
+        && !state.following_bottom
+        && state.in_flight < AGENT_TIMELINE_OLDER_MAX_IN_FLIGHT
+        && state.viewport_height > 0.0
+        && state.distance_to_top <= state.viewport_height * AGENT_TIMELINE_OLDER_PREFETCH_SCREENS
 }
 
 fn timeline_should_resume_follow_after_scroll_idle(
@@ -8531,6 +8764,321 @@ fn subscribe_composer_input(
 ///
 /// Only genuinely application-scoped state (the session list, the sidebar, the
 /// runtime handles, tasks) stays on `VibexWorkbench` itself.
+impl VibexWorkbench {
+    /// Fetches one page of history above what the view already holds.
+    ///
+    /// The desktop used to read whole histories, so it had no older-history
+    /// path at all; a windowed open needs one. The page is validated against
+    /// the cursor it was asked for, because a backend that predates the cursor
+    /// answers with its newest page and prepending that would move the reader
+    /// to the wrong end of the conversation.
+    fn load_older_agent_timeline(
+        &mut self,
+        session_id: VibexSessionId,
+        before_sequence: i64,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let runtime = self.runtime.clone();
+        let backend = self.backend.clone();
+        if runtime.is_none() && backend.is_none() {
+            return;
+        }
+        let request_session_id = session_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            match runtime {
+                Some(runtime) => {
+                    fetch_timeline_page_before(runtime, request_session_id, before_sequence).await
+                }
+                None => {
+                    let Some(backend) = backend else {
+                        return Err(vibex_core::VibexError::storage(
+                            "timeline_authority_missing",
+                            "no Agent authority is available to read older history",
+                        ));
+                    };
+                    fetch_timeline_page_before_via_backend(
+                        backend,
+                        request_session_id,
+                        before_sequence,
+                    )
+                    .await
+                }
+            }
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = match runner.await {
+                    Ok(outcome) => outcome,
+                    Err(error) => Err(vibex_core::VibexError::storage(
+                        "timeline_read_task_failed",
+                        error.to_string(),
+                    )),
+                };
+                let _ = entity.update(cx, |this, cx| {
+                    this.finish_older_timeline_load(
+                        &session_id,
+                        before_sequence,
+                        generation,
+                        outcome,
+                    );
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
+    /// Merges an older page into the borrowed view.
+    fn finish_older_timeline_load(
+        &mut self,
+        session_id: &VibexSessionId,
+        before_sequence: i64,
+        generation: u64,
+        outcome: vibex_core::VibexResult<vibex_core::TimelinePage>,
+    ) {
+        if self.selected_session_id.as_ref() != Some(session_id)
+            || self.session_generation != generation
+        {
+            return;
+        }
+        self.timeline_older_in_flight = self.timeline_older_in_flight.saturating_sub(1);
+        let page = match outcome {
+            Ok(page) => page,
+            Err(error) => {
+                self.agent_error = Some(format!("{}: {}", error.code, error.message));
+                return;
+            }
+        };
+        if page.session_id != *session_id
+            || page
+                .items
+                .iter()
+                .any(|item| item.session_id != *session_id || item.sequence >= before_sequence)
+        {
+            // The authority answered a cursor it does not understand. Asking
+            // again would return the same page forever, so the projection
+            // stops claiming there is history below it.
+            self.timeline_has_older = false;
+            return;
+        }
+        let added_history = !page.items.is_empty();
+        self.capture_timeline_scroll_anchor();
+        let mut merged = page
+            .items
+            .into_iter()
+            .chain(self.timeline.items.iter().cloned())
+            .collect::<Vec<_>>();
+        merged.sort_by_key(|item| item.sequence);
+        merged.dedup_by_key(|item| item.sequence);
+        self.timeline
+            .replace_authoritative(session_id.clone(), merged);
+        self.timeline_has_older = page.has_older && added_history;
+        self.timeline_item_index.get_mut().invalidate();
+        self.conversation_turns_cache_key = None;
+        self.timeline_scroll_anchor_pending = true;
+        self.rebuild_timeline_sizes();
+    }
+
+    /// Starts an older-history read when the reader is close enough to the top.
+    ///
+    /// Waiting for the literal top would show an empty band while the page
+    /// travelled, so the prefetch starts about a screen and a half early and
+    /// keeps up to two pages in flight.
+    fn prefetch_older_timeline_if_needed(&mut self, cx: &mut Context<Self>) {
+        let viewport = f32::from(self.timeline_scroll.bounds().size.height);
+        if !timeline_should_prefetch_older(TimelineOlderPrefetch {
+            distance_to_top: self.timeline_distance_to_top(),
+            viewport_height: viewport,
+            has_older: self.timeline_has_older,
+            in_flight: self.timeline_older_in_flight,
+            following_bottom: self.timeline_follow.following_bottom,
+            loading: self.agent_loading,
+        }) {
+            return;
+        }
+        let Some(before_sequence) = self.timeline.items.first().map(|item| item.sequence) else {
+            return;
+        };
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return;
+        };
+        self.timeline_older_in_flight += 1;
+        self.load_older_agent_timeline(session_id, before_sequence, self.session_generation, cx);
+    }
+
+    /// Asks for the tool detail of every activity the reader has opened.
+    ///
+    /// Pages carry summary payloads, so an opened activity shows its bounded
+    /// header until its detail arrives. Sweeping the expansion map rather than
+    /// hooking each toggle keeps one place responsible for the read, and the
+    /// map only holds rows a reader actually opened.
+    fn request_expanded_timeline_details(&mut self, cx: &mut Context<Self>) {
+        if self.timeline_detail_in_flight.len() >= AGENT_TIMELINE_DETAIL_MAX_IN_FLIGHT {
+            return;
+        }
+        let candidates = self
+            .timeline_command_expansion
+            .iter()
+            .filter(|(_, expanded)| **expanded)
+            .map(|(row_id, _)| row_id.clone())
+            .filter(|row_id| !self.timeline_detail_in_flight.contains(row_id))
+            .take(AGENT_TIMELINE_DETAIL_MAX_IN_FLIGHT - self.timeline_detail_in_flight.len())
+            .collect::<Vec<_>>();
+        for row_id in candidates {
+            self.request_timeline_detail(&row_id, cx);
+        }
+    }
+
+    /// Reads one activity's full payload back.
+    fn request_timeline_detail(&mut self, row_id: &str, cx: &mut Context<Self>) {
+        let Some(sequence) = self.timeline_row_sequence(row_id) else {
+            return;
+        };
+        let Some(item) = self
+            .timeline
+            .items
+            .iter()
+            .find(|item| item.sequence == sequence)
+        else {
+            return;
+        };
+        if item.has_complete_payload() {
+            return;
+        }
+        let request = vibex_core::FetchTimelineItemRequest {
+            session_id: item.session_id.clone(),
+            sequence,
+        };
+        let runtime = self.runtime.clone();
+        let backend = self.backend.clone();
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return;
+        };
+        let generation = self.session_generation;
+        let row_id = row_id.to_string();
+        self.timeline_detail_in_flight.insert(row_id.clone());
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            match runtime {
+                Some(runtime) => runtime.agent().fetch_timeline_item(request).await,
+                None => {
+                    let Some(backend) = backend else {
+                        return Err(vibex_core::VibexError::storage(
+                            "timeline_authority_missing",
+                            "no Agent authority is available to read tool detail",
+                        ));
+                    };
+                    backend
+                        .agent()
+                        .fetch_timeline_item(request)
+                        .await
+                        .map_err(|error| vibex_core::VibexError::storage(error.code, error.message))
+                }
+            }
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = match runner.await {
+                    Ok(outcome) => outcome,
+                    Err(error) => Err(vibex_core::VibexError::storage(
+                        "timeline_read_task_failed",
+                        error.to_string(),
+                    )),
+                };
+                let _ = entity.update(cx, |this, cx| {
+                    this.finish_timeline_detail(row_id.as_str(), &session_id, generation, outcome);
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
+    /// Installs the full payload an activity read produced.
+    fn finish_timeline_detail(
+        &mut self,
+        row_id: &str,
+        session_id: &VibexSessionId,
+        generation: u64,
+        outcome: vibex_core::VibexResult<vibex_core::TimelineItem>,
+    ) {
+        self.timeline_detail_in_flight.remove(row_id);
+        if self.selected_session_id.as_ref() != Some(session_id)
+            || self.session_generation != generation
+        {
+            return;
+        }
+        let item = match outcome {
+            Ok(item) => item,
+            Err(error) => {
+                self.agent_error = Some(format!("{}: {}", error.code, error.message));
+                return;
+            }
+        };
+        let Ok(index) = self
+            .timeline
+            .items
+            .binary_search_by_key(&item.sequence, |existing| existing.sequence)
+        else {
+            return;
+        };
+        if self.timeline.items[index].id != item.id {
+            return;
+        }
+        self.timeline.items[index].payload = item.payload;
+        self.timeline.items[index].payload_depth = vibex_core::TimelinePayloadDepth::Detail;
+        self.timeline.revision = self.timeline.revision.wrapping_add(1);
+        // Both projections are keyed by the row's sequence, which did not
+        // change, so they would keep answering with the summary they folded
+        // before the detail arrived.
+        self.timeline_tool_card_projections
+            .retain(|_, (sequence, _)| *sequence != item.sequence);
+        self.timeline_file_diff_previews
+            .retain(|_, (sequence, _)| *sequence != item.sequence);
+        self.timeline_item_index.get_mut().invalidate();
+        if let Some(turn_id) = self.timeline_row_turn_id(row_id) {
+            self.invalidate_timeline_turn_measurement(&turn_id);
+        }
+        self.rebuild_timeline_sizes();
+    }
+
+    /// Whether a rendered row's item still has tool detail to read.
+    fn timeline_row_detail_pending(&self, row: &TimelineRow) -> bool {
+        self.timeline_row_latest_item(row)
+            .is_some_and(|item| !item.has_complete_payload())
+    }
+
+    /// The sequence behind a rendered row.
+    fn timeline_row_sequence(&self, row_id: &str) -> Option<i64> {
+        self.conversation_turns_cache.iter().find_map(|turn| {
+            turn.user_row
+                .as_ref()
+                .filter(|row| row.id == row_id)
+                .or_else(|| turn.conclusion_row.as_ref().filter(|row| row.id == row_id))
+                .or_else(|| turn.process_rows.iter().find(|row| row.id == row_id))
+                .map(|row| row.last_sequence)
+        })
+    }
+
+    /// The turn a rendered row belongs to.
+    fn timeline_row_turn_id(&self, row_id: &str) -> Option<String> {
+        self.conversation_turns_cache.iter().find_map(|turn| {
+            let matches = turn.user_row.as_ref().is_some_and(|row| row.id == row_id)
+                || turn
+                    .conclusion_row
+                    .as_ref()
+                    .is_some_and(|row| row.id == row_id)
+                || turn.process_rows.iter().any(|row| row.id == row_id);
+            matches.then(|| turn.id.clone())
+        })
+    }
+
+    /// How far the viewport is from the top of the transcript.
+    fn timeline_distance_to_top(&self) -> f32 {
+        (-f32::from(self.timeline_scroll.offset().y)).max(0.0)
+    }
+}
+
 impl std::ops::Deref for VibexWorkbench {
     type Target = SessionView;
 
@@ -14433,6 +14981,8 @@ impl VibexWorkbench {
                     after_sequence: None,
                     before_sequence: None,
                     limit: 500,
+                    max_turns: None,
+                    max_bytes: None,
                 })
                 .await
         });
@@ -20841,6 +21391,18 @@ impl VibexWorkbench {
             self.agent_loading = true;
         }
         self.refresh_agent_token_usage(&session_id, cx);
+        // A borrowed view already holds a contiguous projection, so the load
+        // only needs what arrived above it. A view that fell behind live
+        // events is not a prefix and must be rebuilt instead.
+        let resume = (had_view
+            && self.timeline.session_id.as_ref() == Some(&session_id)
+            && !self.timeline.needs_authoritative_refetch)
+            .then(|| TimelineResume {
+                prefix: self.timeline.items.clone(),
+                after_sequence: self.timeline.authoritative_end_sequence.unwrap_or(0),
+                timeline_has_older: self.timeline_has_older,
+            })
+            .filter(|resume| resume.after_sequence > 0);
         if navigation_changed {
             self.clear_suggestions();
         } else {
@@ -20873,6 +21435,7 @@ impl VibexWorkbench {
                 session_id.clone(),
                 workspace_id.clone(),
                 generation,
+                resume,
                 cx,
             );
             if let Some(backend) = self.backend.clone() {
@@ -20931,7 +21494,7 @@ impl VibexWorkbench {
             // Remote-client mode: the authoritative timeline arrives over the
             // backend RPC; terminals, the projection cache, and the heartbeat
             // are authority-local concerns.
-            self.load_agent_session_timeline_remote(session_id, generation, cx);
+            self.load_agent_session_timeline_remote(session_id, generation, resume, cx);
         }
     }
 
@@ -20942,6 +21505,7 @@ impl VibexWorkbench {
         &mut self,
         session_id: VibexSessionId,
         generation: u64,
+        resume: Option<TimelineResume>,
         cx: &mut Context<Self>,
     ) {
         let Some(backend) = self.backend.clone() else {
@@ -20953,10 +21517,35 @@ impl VibexWorkbench {
         let pending = self.live_turn_pending();
         let reasoning = self.ui_state.session.reasoning_display_mode;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let items =
-                fetch_authoritative_timeline_via_backend(backend, request_session_id.clone())
+            let (items, timeline_has_older) = match resume {
+                Some(resume) => {
+                    let tail = fetch_timeline_tail_via_backend(
+                        backend,
+                        request_session_id.clone(),
+                        resume.after_sequence,
+                    )
                     .await?;
-            PreparedTimeline::prepare(request_session_id, items, state, pending, reasoning).await
+                    (
+                        resume.prefix.into_iter().chain(tail).collect(),
+                        resume.timeline_has_older,
+                    )
+                }
+                None => {
+                    let page =
+                        fetch_timeline_window_via_backend(backend, request_session_id.clone())
+                            .await?;
+                    (page.items, page.has_older)
+                }
+            };
+            PreparedTimeline::prepare_with_older(
+                request_session_id,
+                items,
+                timeline_has_older,
+                state,
+                pending,
+                reasoning,
+            )
+            .await
         });
         self.agent_load_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -21005,6 +21594,7 @@ impl VibexWorkbench {
         session_id: VibexSessionId,
         workspace_id: Option<vibex_core::WorkspaceId>,
         generation: u64,
+        resume: Option<TimelineResume>,
         cx: &mut Context<Self>,
     ) {
         let poll_runtime = runtime.clone();
@@ -21014,8 +21604,33 @@ impl VibexWorkbench {
         let pending = self.live_turn_pending();
         let reasoning = self.ui_state.session.reasoning_display_mode;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let items = fetch_authoritative_timeline(runtime, request_session_id.clone()).await?;
-            PreparedTimeline::prepare(request_session_id, items, state, pending, reasoning).await
+            let (items, timeline_has_older) = match resume {
+                Some(resume) => {
+                    let tail = fetch_timeline_tail(
+                        runtime,
+                        request_session_id.clone(),
+                        resume.after_sequence,
+                    )
+                    .await?;
+                    (
+                        resume.prefix.into_iter().chain(tail).collect(),
+                        resume.timeline_has_older,
+                    )
+                }
+                None => {
+                    let page = fetch_timeline_window(runtime, request_session_id.clone()).await?;
+                    (page.items, page.has_older)
+                }
+            };
+            PreparedTimeline::prepare_with_older(
+                request_session_id,
+                items,
+                timeline_has_older,
+                state,
+                pending,
+                reasoning,
+            )
+            .await
         });
         self.agent_load_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -21282,7 +21897,7 @@ impl VibexWorkbench {
             if let Some(session_id) = self.selected_session_id.clone() {
                 self.timeline.mark_lagged();
                 let generation = self.session_generation;
-                self.load_agent_session_timeline_remote(session_id, generation, cx);
+                self.load_agent_session_timeline_remote(session_id, generation, None, cx);
             }
             return;
         };
@@ -21295,6 +21910,7 @@ impl VibexWorkbench {
             session_id,
             workspace_id,
             self.session_generation,
+            None,
             cx,
         );
     }
@@ -21518,6 +22134,8 @@ impl VibexWorkbench {
                         after_sequence,
                         before_sequence: None,
                         limit: 500,
+                        max_turns: None,
+                        max_bytes: None,
                     })
                     .await
                 {
@@ -21764,6 +22382,11 @@ impl VibexWorkbench {
             self.apply_child_agent_timeline_events(selected_session_id.as_ref(), &batches, cx);
         let mut timeline_changed = false;
         let mut refetch_pending = false;
+        // Folding a batch into a view is real work — it re-projects rows and
+        // re-measures — and the view store holds many sessions. Only the
+        // sessions somebody is looking at are worth it; the rest record that
+        // they fell behind and are refetched when they are selected again.
+        let visible = self.pinned_session_view_ids();
         for (key, batch) in batches {
             let Ok(session_id) = VibexSessionId::parse(&key) else {
                 continue;
@@ -21771,6 +22394,12 @@ impl VibexWorkbench {
             if !self.session_view_exists(&session_id) {
                 // Nothing on screen shows this session; the sidebar bookkeeping
                 // above is all it needs.
+                continue;
+            }
+            if !visible.contains(session_id.as_str()) {
+                if let Some(view) = self.session_views.get_mut(session_id.as_str()) {
+                    view.timeline.mark_lagged();
+                }
                 continue;
             }
             // The swap is unweighed: weighing a view walks its whole timeline
@@ -45485,8 +46114,7 @@ impl VibexWorkbench {
                                 ),
                             )
                             .children(disclosure),
-                    )
-                    .child(
+                    )                    .child(
                         h_flex()
                             .debug_selector({
                                 let selector =
@@ -49268,6 +49896,8 @@ impl VibexWorkbench {
         // an invalidated size table would otherwise swallow the request because
         // `scroll_timeline_to_latest` skips an empty table.
         self.apply_pending_timeline_scroll();
+        self.prefetch_older_timeline_if_needed(cx);
+        self.request_expanded_timeline_details(cx);
         let turns_summary = self.conversation_turns_summary;
         self.sync_timeline_duration_tick(turns_summary.has_incomplete_turn, cx);
         let rendered_turns = self.conversation_turns_render_cache.clone();
@@ -53453,8 +54083,10 @@ impl VibexWorkbench {
             return projection.clone();
         }
         let projection = {
-            let payload = self.timeline_row_latest_item(row).map(|item| &item.payload);
-            Rc::new(tool_card_projection(row, payload))
+            let item = self.timeline_row_latest_item(row);
+            let mut projection = tool_card_projection(row, item.map(|item| &item.payload));
+            projection.details_pending = item.is_some_and(|item| !item.has_complete_payload());
+            Rc::new(projection)
         };
         insert_bounded_timeline_projection(
             &mut self.timeline_tool_card_projections,
@@ -53862,7 +54494,7 @@ impl VibexWorkbench {
             }
             TimelineRowKind::FileOperation
                 if self.ui_state.session.enhanced_file_operation_display
-                    && matches!(payload, Some(TimelinePayload::FileOperation(operation)) if file_operation_has_diff(operation)) =>
+                    && matches!(payload, Some(TimelinePayload::FileOperation(operation)) if file_operation_has_diff(operation) || self.timeline_row_detail_pending(row)) =>
             {
                 if self
                     .timeline_command_expansion
@@ -53896,7 +54528,7 @@ impl VibexWorkbench {
             | TimelineRowKind::Retry => {
                 let projection = tool_card_projection(row, payload);
                 let mut height = activity_row_height;
-                let expanded = !projection.details.is_empty()
+                let expanded = (!projection.details.is_empty() || projection.details_pending)
                     && self
                         .timeline_command_expansion
                         .get(&row.id)
@@ -55439,7 +56071,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let projection = self.tool_card_projection_cached(row);
-        let has_details = !projection.details.is_empty();
+        let has_details = !projection.details.is_empty() || projection.details_pending;
         let expanded = has_details
             && self
                 .timeline_command_expansion
@@ -62502,6 +63134,13 @@ struct ToolCardProjection {
     locale: locale::ResolvedLocale,
     activity: timeline_activity::Activity,
     details: Vec<ToolCardDetailBlock>,
+    /// Whether the backend still holds detail this projection could not show.
+    ///
+    /// A summary payload strips the parts an opened activity renders, so a
+    /// stripped command can project to nothing at all while still having
+    /// output to show. Without this the row would look like it has nothing to
+    /// open, and the reader could never reach the detail.
+    details_pending: bool,
 }
 
 /// Typed expanded content shared by compact activity rows and enhanced cards.
@@ -63648,6 +64287,9 @@ fn tool_card_projection(
         locale: locale::current_locale(),
         activity,
         details,
+        // Only a caller that can see the item behind the row knows whether
+        // detail was withheld; the projection itself cannot.
+        details_pending: false,
     }
 }
 /// Characters per line a content box `width` pixels wide fits.
@@ -64636,6 +65278,9 @@ fn sidebar_session_run(
                         &build_source.project_scope_id,
                         build_source.reorder_enabled,
                         build_source.show_worktree_identity,
+                        // A run bands the project's own rows; a group's members
+                        // are painted by the group, not by a run.
+                        None,
                         build_source.strings,
                         cx,
                     )
@@ -79323,6 +79968,7 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
         }
     }
@@ -80391,6 +81037,7 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
         };
         let step = |status| PlanStepPayload {
@@ -81096,6 +81743,7 @@ mod tests {
                 provider_correlation_id: None,
                 redaction_state: TimelineRedactionState::None,
                 execution_attribution: None,
+                payload_depth: vibex_core::TimelinePayloadDepth::Detail,
                 payload,
             }
         };
@@ -85381,7 +86029,8 @@ mod tests {
         assert!(!overview.contains("runtime_catalog().list()"));
         assert!(!catalog.contains("runtime_catalog()"));
         assert!(catalog.contains("backend.agent().list_runtime_options().await"));
-        assert!(timeline.contains("fetch_authoritative_timeline("));
+        assert!(timeline.contains("fetch_timeline_window("));
+        assert!(timeline.contains("fetch_timeline_tail("));
         assert!(timeline.contains("this.agent_loading = false"));
         assert!(!timeline.contains(".attach_runtime("));
         assert!(projection.contains(".get_selection_state("));
@@ -96039,6 +96688,7 @@ mod tests {
                     provider_correlation_id: None,
                     redaction_state: TimelineRedactionState::None,
                     execution_attribution: None,
+                    payload_depth: vibex_core::TimelinePayloadDepth::Detail,
                     payload,
                 }
             };
@@ -99213,10 +99863,58 @@ mod tests {
         assert!(!marker.contains("Tooltip::new"));
     }
 
+    /// Older history has to start travelling before the reader arrives, but a
+    /// reader parked at the bottom must not pay for pages they never reach.
+    #[test]
+    fn older_history_prefetches_before_the_top_and_only_near_it() {
+        let base = TimelineOlderPrefetch {
+            distance_to_top: 0.0,
+            viewport_height: 800.0,
+            has_older: true,
+            in_flight: 0,
+            following_bottom: false,
+            loading: false,
+        };
+        // At the top, and a screen and a half short of it, both ask.
+        assert!(timeline_should_prefetch_older(base));
+        assert!(timeline_should_prefetch_older(TimelineOlderPrefetch {
+            distance_to_top: 800.0 * AGENT_TIMELINE_OLDER_PREFETCH_SCREENS - 1.0,
+            ..base
+        }));
+        // Past the trigger, or with two pages already on the way, nothing new
+        // is queued.
+        assert!(!timeline_should_prefetch_older(TimelineOlderPrefetch {
+            distance_to_top: 800.0 * AGENT_TIMELINE_OLDER_PREFETCH_SCREENS + 1.0,
+            ..base
+        }));
+        assert!(!timeline_should_prefetch_older(TimelineOlderPrefetch {
+            in_flight: AGENT_TIMELINE_OLDER_MAX_IN_FLIGHT,
+            ..base
+        }));
+        assert!(!timeline_should_prefetch_older(TimelineOlderPrefetch {
+            has_older: false,
+            ..base
+        }));
+        assert!(!timeline_should_prefetch_older(TimelineOlderPrefetch {
+            following_bottom: true,
+            ..base
+        }));
+        assert!(!timeline_should_prefetch_older(TimelineOlderPrefetch {
+            loading: true,
+            ..base
+        }));
+        // An unlaid-out list has no viewport to measure against.
+        assert!(!timeline_should_prefetch_older(TimelineOlderPrefetch {
+            viewport_height: 0.0,
+            ..base
+        }));
+    }
+
     #[test]
     fn opened_session_view_cache_is_bounded_and_refreshes_recency() {
-        assert_eq!(AGENT_SESSION_VIEW_CACHE_LIMIT, 6);
+        assert_eq!(AGENT_SESSION_VIEW_CACHE_LIMIT, 20);
         assert_eq!(AGENT_SESSION_VIEW_CACHE_BYTES, 128 * 1024 * 1024);
+        const { assert!(AGENT_SESSION_VIEW_CACHE_MIN_VIEWS < AGENT_SESSION_VIEW_CACHE_LIMIT) };
         let pinned = BTreeSet::new();
         let mut cache = BTreeMap::new();
         let mut lru = VecDeque::new();
@@ -99314,9 +100012,12 @@ mod tests {
                 &pinned,
             );
         }
+        // The budget evicts towards the floor but never below it: a reader
+        // alternating between a few conversations must not lose all of them to
+        // one long session.
         assert_eq!(
             lru.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["session_c"]
+            ["session_a", "session_b", "session_c"]
         );
         assert_eq!(cache.get("session_c"), Some(&7));
 
@@ -99332,6 +100033,7 @@ mod tests {
             |bytes| *bytes,
             &pinned,
         );
+        // An entry larger than the whole budget is never stored at all.
         assert!(!cache.contains_key("session_oversized"));
         assert_eq!(cache.get("session_c"), Some(&7));
     }

@@ -654,7 +654,7 @@ fn file_events(input: &AgentEventInput) -> Option<Vec<CanonicalAgentEvent>> {
         deduplicated
             .into_iter()
             .map(|change| {
-                CanonicalAgentEvent::FileOperation(FileOperationPayload {
+                let snapshots = FileOperationPayload {
                     operation: change.operation,
                     summary: format!(
                         "{} {}",
@@ -666,6 +666,19 @@ fn file_events(input: &AgentEventInput) -> Option<Vec<CanonicalAgentEvent>> {
                     new_text: change.new_text,
                     patch: None,
                     raw_extension: extension.clone(),
+                };
+                // The durable timeline keeps the patch, not both snapshots.
+                // A snapshot is exactly as large as the file it describes, and
+                // a page that has to carry them is what makes a long session
+                // unopenable; the patch is what a reader renders and is what a
+                // detail read returns.
+                let patch = snapshots.canonical_patch();
+                CanonicalAgentEvent::FileOperation(FileOperationPayload {
+                    old_text: None,
+                    new_text: None,
+                    patch,
+                    raw_extension: extension.clone(),
+                    ..snapshots
                 })
             })
             .collect(),
@@ -1458,8 +1471,17 @@ mod tests {
         ));
         match &files[1].event {
             CanonicalAgentEvent::FileOperation(file) => {
-                assert_eq!(file.old_text.as_deref(), Some("before"));
-                assert_eq!(file.new_text.as_deref(), Some("after"));
+                // The durable payload carries the rendered patch rather than
+                // both snapshots, so the change stays inspectable without
+                // paying for the whole file on every page.
+                assert_eq!(file.old_text, None);
+                assert_eq!(file.new_text, None);
+                let patch = file
+                    .patch
+                    .as_ref()
+                    .expect("an edit keeps its rendered patch");
+                assert!(patch.text.contains("-before"), "{}", patch.text);
+                assert!(patch.text.contains("+after"), "{}", patch.text);
             }
             other => panic!("expected lossless file operation, got {other:?}"),
         }

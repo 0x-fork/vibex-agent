@@ -5354,6 +5354,7 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
         };
         let user = item(
@@ -5409,6 +5410,7 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload: TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                 text_delta: "x".to_string(),
                 chunk_index: 0,

@@ -1598,6 +1598,7 @@ fn seeded_items(
             provider_correlation_id: None,
             redaction_state: vibex_core::TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload: vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
                 text: format!("history message {sequence}"),
                 attachments: Vec::new(),
@@ -3405,6 +3406,7 @@ fn seeded_item(
         provider_correlation_id: None,
         redaction_state: vibex_core::TimelineRedactionState::None,
         execution_attribution: None,
+        payload_depth: vibex_core::TimelinePayloadDepth::Detail,
         payload,
     }
 }
@@ -7492,6 +7494,7 @@ fn a_session_row_carries_what_it_last_did_under_its_title() {
         provider_correlation_id: None,
         redaction_state: vibex_core::TimelineRedactionState::None,
         execution_attribution: None,
+        payload_depth: vibex_core::TimelinePayloadDepth::Detail,
         payload: vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
             text: "Ran cargo test and it passed".to_string(),
             is_final: true,

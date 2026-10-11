@@ -409,6 +409,30 @@ impl AgentBackend for NativeBackend {
         })
     }
 
+    fn fetch_timeline_item(
+        &self,
+        request: vibex_core::FetchTimelineItemRequest,
+    ) -> BackendFuture<'_, TimelineItem> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .fetch_timeline_item(request)
+                .await
+                .map_err(|error| {
+                    if error.code == "timeline_item_not_found" {
+                        crate::BackendError::conflict(
+                            "agent_timeline_item_missing",
+                            "the Agent timeline item is no longer available",
+                        )
+                    } else {
+                        error.into()
+                    }
+                })
+        })
+    }
+
     fn get_timeline_display_settings(
         &self,
     ) -> BackendFuture<'_, vibex_core::AgentTimelineDisplaySettings> {

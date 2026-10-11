@@ -212,6 +212,16 @@ fn event_loop(
             }
         }
 
+        // ---- activity detail ----------------------------------------------
+        // An open activity whose payload is only a summary is a read the
+        // reader has already asked for. The transcript records it wherever a
+        // block is opened or rebuilt — a refresh can put a summary back under
+        // a block that stayed open — and this is where the client, which is
+        // the only thing that may start I/O, actually starts it.
+        for effect in app.take_timeline_detail_effects() {
+            worker.dispatch(effect);
+        }
+
         // ---- the projected send -------------------------------------------
         // A send stops being projected once the runtime's own copy of it is in
         // the timeline, or once it has waited longer than a send could take.
@@ -1129,11 +1139,9 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             }
             app.scroll_lines(-3);
             // The wheel is the other way to reach the top of the loaded
-            // window; the controller ignores the ask when there is nothing
-            // older or a page is already on its way.
-            if app.at_transcript_top()
-                && let Some(effect) = app.load_older_history()
-            {
+            // window; the controller ignores the ask when the history is
+            // exhausted or two pages are already on their way.
+            if let Some(effect) = app.prefetch_older_history() {
                 worker.dispatch(effect);
             }
             true
@@ -1718,6 +1726,10 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             // is what populates `selected_session_id` and the timeline model,
             // so live events stop being dropped as stale.
             if app.agent.apply_session_snapshot(&ticket, result) {
+                // Details read for the projection this replaces can never be
+                // applied; the rebuild below asks again for whatever the
+                // reader still has open.
+                app.prune_timeline_details();
                 app.sync_transcript();
                 match failure {
                     Some(message) => app.toast(Toast::danger(message)),
@@ -1735,6 +1747,24 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         }
         AppMessage::OlderTimeline { ticket, result } => {
             match app.agent.apply_timeline_before(&ticket, result) {
+                Ok(true) => {
+                    app.sync_transcript();
+                    // The reader was near the top when this page was asked
+                    // for, so they are reading into it now: keep the next one
+                    // on its way until the history runs out or they scroll
+                    // away.
+                    if let Some(effect) = app.prefetch_older_history() {
+                        worker.dispatch(effect);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => app.toast(Toast::warning(error.message)),
+            }
+        }
+        AppMessage::TimelineItem { ticket, result } => {
+            app.finish_timeline_detail(&ticket);
+            match app.agent.apply_timeline_item(&ticket, result) {
+                // The block now renders the output the summary withheld.
                 Ok(true) => app.sync_transcript(),
                 Ok(false) => {}
                 Err(error) => app.toast(Toast::warning(error.message)),
@@ -2557,6 +2587,7 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: vibex_core::TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
         }
     }
@@ -2896,7 +2927,7 @@ mod tests {
         let ticket = vibex_ui::AgentSessionLoadTicket {
             generation: app.agent.state.generation,
             session_id: id.clone(),
-            after_sequence: 0,
+            load: vibex_ui::TimelineLoadKind::Cold,
         };
         apply_message(
             &mut app,
@@ -3723,6 +3754,147 @@ mod tests {
     }
 
     #[test]
+    fn a_landed_history_page_keeps_pulling_while_the_reader_stays_near_the_top() {
+        use vibex_core::{TimelinePage, TimelinePayload, UserMessagePayload};
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        app.resize(100, 30);
+        app.navigate_to(Page::Agent);
+        let id = vibex_core::VibexSessionId::new();
+        app.agent.state.selected_session_id = Some(id.clone());
+        let history = |sequence: i64| {
+            conversation_item(
+                &id,
+                sequence,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: format!("history {sequence}"),
+                    ..Default::default()
+                }),
+            )
+        };
+        app.agent
+            .state
+            .timeline
+            .replace_authoritative(id.clone(), (1..=12).map(history).collect::<Vec<_>>());
+        app.agent.state.timeline_has_older = true;
+        app.sync_transcript();
+        app.transcript_band_rows = 10;
+        app.scroll.follow = false;
+        app.scroll.offset = 0;
+        // The page the reader is reading was asked for from the top.
+        let ticket = app.agent.begin_timeline_before().expect("a first page");
+
+        let page = TimelinePage {
+            session_id: id.clone(),
+            items: vec![history(0)],
+            start_sequence: Some(0),
+            end_sequence: Some(0),
+            has_older: true,
+            has_newer: true,
+        };
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::OlderTimeline {
+                ticket,
+                result: Ok(page),
+            },
+        )
+        .unwrap();
+
+        // The reader has not moved off the head of the new page, so the next
+        // one is already on its way: one more ask is admitted and the one after
+        // that is refused at the controller's limit.
+        assert!(app.load_older_history().is_some());
+        assert!(app.load_older_history().is_none());
+    }
+
+    #[test]
+    fn expanding_a_summarized_activity_reads_its_output() {
+        use crate::action::Intent;
+        use vibex_core::{
+            AgentEventRawExtension, AgentEventRawOutput, AgentEventRawOutputMode, TimelinePayload,
+            ToolCallPayload, ToolCallStatus,
+        };
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        app.resize(100, 30);
+        app.navigate_to(Page::Agent);
+        let id = vibex_core::VibexSessionId::new();
+        app.agent.state.selected_session_id = Some(id.clone());
+        let payload = ToolCallPayload {
+            tool_call_id: "call-1".into(),
+            tool_name: "execute".into(),
+            status: ToolCallStatus::Completed,
+            summary: "ls -la".into(),
+            input_summary: Some(r#"{"command":"ls -la"}"#.into()),
+            output_summary: Some("terminal output".into()),
+            raw_extension: None,
+        };
+        // A page carries the activity summarized, which is what makes opening
+        // it a read rather than a redraw.
+        let mut summary = conversation_item(&id, 1, TimelinePayload::ToolCall(payload.clone()));
+        summary.payload_depth = vibex_core::TimelinePayloadDepth::Summary;
+        app.agent
+            .state
+            .timeline
+            .replace_authoritative(id.clone(), vec![summary.clone()]);
+        app.sync_transcript();
+        app.focus = Focus::Main;
+        app.set_selection(crate::keymap::Scope::Agent, 0);
+
+        let outcome = app.perform(Intent::ToggleBlockExpanded);
+        let [crate::app::Effect::LoadTimelineItem { ticket }] = outcome.effects.as_slice() else {
+            panic!("expected one detail read, got {:?}", outcome.effects);
+        };
+        assert_eq!(ticket.sequence, 1);
+        // The summary is on screen while the read is out: opening an activity
+        // never leaves it blank.
+        let pending = conversation_frame(&mut app, 100, 30);
+        assert!(pending.contains("ls -la"), "{pending}");
+
+        // A rebuild while the read is on its way does not pay for it twice.
+        app.sync_transcript();
+        assert!(app.take_timeline_detail_effects().is_empty());
+
+        let mut full = summary.clone();
+        full.payload_depth = vibex_core::TimelinePayloadDepth::Detail;
+        full.payload = TimelinePayload::ToolCall(ToolCallPayload {
+            raw_extension: Some(AgentEventRawExtension::new(
+                Vec::new(),
+                Some(r#"{"command":"ls -la"}"#.into()),
+                Some(
+                    AgentEventRawOutput::new(
+                        AgentEventRawOutputMode::Snapshot,
+                        r#"{"formatted_output":"total 4\nsrc\n","exit_code":0}"#,
+                    )
+                    .0,
+                ),
+                Vec::new(),
+                Default::default(),
+                false,
+            )),
+            ..payload
+        });
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::TimelineItem {
+                ticket: ticket.clone(),
+                result: Ok(full),
+            },
+        )
+        .unwrap();
+        let loaded = conversation_frame(&mut app, 100, 30);
+        assert!(loaded.contains("total 4"), "{loaded}");
+
+        // The payload is complete now, so reopening the activity asks for
+        // nothing.
+        app.perform(Intent::ToggleBlockExpanded);
+        assert!(app.perform(Intent::ToggleBlockExpanded).effects.is_empty());
+    }
+
+    #[test]
     fn late_open_callback_cannot_leave_draft_or_retarget_picker() {
         use crate::action::Intent;
         let worker = isolation_worker();
@@ -4211,6 +4383,7 @@ mod tests {
                 provider_correlation_id: None,
                 redaction_state: vibex_core::TimelineRedactionState::None,
                 execution_attribution: None,
+                payload_depth: vibex_core::TimelinePayloadDepth::Detail,
                 payload: vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
                     text: "same words".into(),
                     ..Default::default()

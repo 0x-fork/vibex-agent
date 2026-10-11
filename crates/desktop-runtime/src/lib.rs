@@ -950,6 +950,13 @@ impl AgentHandle {
     pub async fn fetch_timeline(&self, request: FetchTimelineRequest) -> VibexResult<TimelinePage> {
         self.manager.fetch_timeline(request).await
     }
+
+    pub async fn fetch_timeline_item(
+        &self,
+        request: vibex_core::FetchTimelineItemRequest,
+    ) -> VibexResult<vibex_core::TimelineItem> {
+        self.manager.fetch_timeline_item(request).await
+    }
 }
 
 #[derive(Clone)]

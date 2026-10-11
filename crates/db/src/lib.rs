@@ -20230,9 +20230,12 @@ mod tests {
         let temp = temp_db_path(label);
         let mut conn = open_database(&temp).unwrap();
         apply_migrations(&mut conn).unwrap();
-        let (_project, workspace) =
-            WorkspaceRepository::ensure(&conn, "/tmp/vibex-db-streamed", WorkspaceMode::CurrentCheckout)
-                .unwrap();
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-streamed",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
         let now = unix_timestamp_ms();
         let session = AgentSession {
             id: VibexSessionId::new(),
@@ -20303,7 +20306,8 @@ mod tests {
         // The reasoning row sits between the first and second chunk, so
         // merging across it would move the answer past the thinking it was
         // interleaved with.
-        let (temp, mut conn, session) = streamed_turn_fixture("compact-split", "message-2", 5, true);
+        let (temp, mut conn, session) =
+            streamed_turn_fixture("compact-split", "message-2", 5, true);
         let removed =
             TimelineRepository::compact_streamed_segments(&mut conn, &session.id, 0, 5).unwrap();
         // Two runs of two chunks collapse; the reasoning row splits them and
@@ -20339,9 +20343,12 @@ mod tests {
         let temp = temp_db_path("turn-window");
         let mut conn = open_database(&temp).unwrap();
         apply_migrations(&mut conn).unwrap();
-        let (_project, workspace) =
-            WorkspaceRepository::ensure(&conn, "/tmp/vibex-db-window", WorkspaceMode::CurrentCheckout)
-                .unwrap();
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-window",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
         let now = unix_timestamp_ms();
         let session = AgentSession {
             id: VibexSessionId::new(),

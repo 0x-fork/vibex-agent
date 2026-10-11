@@ -20,8 +20,8 @@ use vibex_core::{
     CancelAgentDelegationRequest, ContinueAgentTurnRequest, CreateAgentDelegationRequest,
     CreateAgentSessionRequest, DelegationExecution, DelegationRuntimeSummary,
     DelegationTaskEventKind, DelegationTaskPhase, ElicitationRequest, ExecutionOutcome,
-    ExecutionResultRange, FetchTimelineRequest, ForkAgentSessionRequest, GoalChangeKind,
-    GoalPayload, GoalSnapshot, LocalHistoryImportResult, LocalHistoryScanResult,
+    ExecutionResultRange, FetchTimelineItemRequest, FetchTimelineRequest, ForkAgentSessionRequest,
+    GoalChangeKind, GoalPayload, GoalSnapshot, LocalHistoryImportResult, LocalHistoryScanResult,
     LocalHistorySelection, LocalHistoryTimelineEntry, McpSecretTarget, McpServer,
     McpServerSecretReference, McpServerTransportKind, MessageAttachment, MessageProvenance,
     MessageSubmissionId, PermissionRequest, ProjectId, PromptKind, PromptStatus, ProviderBinding,
@@ -33,12 +33,13 @@ use vibex_core::{
     SessionRuntimeSelection, SessionRuntimeSelectionStatus, SteerAgentMessageRequest,
     SteerAgentMessageResult, SteerMessageOutcome, SystemNoticeLevel, SystemNoticePayload,
     TimelineErrorPayload, TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload,
-    TimelineRedactionState, TimelineSource, TransportKind, TurnExecutionAttribution,
-    UsageExecutionId, UserMessageDelivery, UserMessagePayload, VibexError, VibexExecutionId,
-    VibexOperationId, VibexResult, VibexSessionId, VibexUseRef, VibexUseToolHost, WorkspaceId,
-    agent_id_for_provider_kind, agent_session_turn_requires_continuation,
-    builtin_agent_definitions, latest_timeline_turn_ended_normally, normalize_agent_session_title,
-    turn_startup_notice, unix_timestamp_ms,
+    TimelinePayloadDepth, TimelineRedactionState, TimelineSource, TransportKind,
+    TurnExecutionAttribution, UsageExecutionId, UserMessageDelivery, UserMessagePayload,
+    VibexError, VibexExecutionId, VibexOperationId, VibexResult, VibexSessionId, VibexUseRef,
+    VibexUseToolHost, WorkspaceId, agent_id_for_provider_kind,
+    agent_session_turn_requires_continuation, builtin_agent_definitions,
+    latest_timeline_turn_ended_normally, normalize_agent_session_title, turn_startup_notice,
+    unix_timestamp_ms,
 };
 use vibex_db::{
     AgentAuthContextRepository, AgentAuthenticationOperationRepository, AgentConfigRepository,
@@ -2047,12 +2048,44 @@ impl AgentManager {
     }
 
     pub async fn fetch_timeline(&self, request: FetchTimelineRequest) -> VibexResult<TimelinePage> {
-        self.fetch_timeline_page(
-            &request.session_id,
-            request.after_sequence,
-            request.before_sequence,
-            request.limit,
-        )
+        self.fetch_timeline_window(&request)
+    }
+
+    /// Reads one item back at full payload depth.
+    ///
+    /// Pages and live events ship summary payloads, so this is how a reader
+    /// that opens a tool activity gets the output and file snapshots behind it.
+    pub async fn fetch_timeline_item(
+        &self,
+        request: FetchTimelineItemRequest,
+    ) -> VibexResult<TimelineItem> {
+        let mut reader = self
+            .timeline_reader
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reader.is_none() {
+            *reader = Some(self.open_migrated()?);
+        }
+        let conn = reader
+            .as_ref()
+            .expect("the timeline reader was opened just above");
+        let item = TimelineRepository::fetch_item(conn, &request.session_id, request.sequence);
+        match item {
+            Ok(Some(item)) => Ok(item),
+            Ok(None) => {
+                drop(reader);
+                Err(VibexError::validation(
+                    "timeline_item_not_found",
+                    "the requested timeline item no longer exists",
+                ))
+            }
+            Err(error) => {
+                // A connection that cannot serve this read is not worth
+                // keeping; the next call starts from a fresh one.
+                *reader = None;
+                Err(error)
+            }
+        }
     }
 
     /// Runs `f` against the shared streamed-append write connection.
@@ -2086,17 +2119,12 @@ impl AgentManager {
         }
     }
 
-    /// Fetches one timeline page over the shared read connection.
+    /// Fetches one timeline window over the shared read connection.
     ///
-    /// The session-search index reads whole histories page by page, so this
-    /// path opens the database once instead of once per page.
-    fn fetch_timeline_page(
-        &self,
-        session_id: &VibexSessionId,
-        after_sequence: Option<i64>,
-        before_sequence: Option<i64>,
-        limit: u32,
-    ) -> VibexResult<TimelinePage> {
+    /// The client-facing read. It opens the database once per call and returns
+    /// a bounded, turn-aligned window of summary payloads, which is what keeps
+    /// a session with hundreds of thousands of streamed rows openable.
+    fn fetch_timeline_window(&self, request: &FetchTimelineRequest) -> VibexResult<TimelinePage> {
         let mut reader = self
             .timeline_reader
             .lock()
@@ -2107,18 +2135,16 @@ impl AgentManager {
         let conn = reader
             .as_ref()
             .expect("the timeline reader was opened just above");
-        // The forward cursor wins when both are set: a caller that asks for a
-        // page after `a` and before `b` gets the forward window, which is what
-        // the pre-existing single-cursor contract promised.
-        let page = match (after_sequence, before_sequence) {
-            (Some(after_sequence), _) => {
-                TimelineRepository::fetch_after(conn, session_id, Some(after_sequence), limit)
-            }
-            (None, Some(before_sequence)) => {
-                TimelineRepository::fetch_before(conn, session_id, Some(before_sequence), limit)
-            }
-            (None, None) => TimelineRepository::fetch_after(conn, session_id, None, limit),
-        };
+        let page = TimelineRepository::fetch_window(
+            conn,
+            &request.session_id,
+            request.after_sequence,
+            request.before_sequence,
+            request.limit,
+            request.max_turns,
+            request.max_bytes,
+            TimelinePayloadDepth::Summary,
+        );
         match page {
             Ok(page) => Ok(page),
             Err(error) => {
@@ -3463,6 +3489,23 @@ impl AgentManager {
                 execution_attribution.as_ref(),
             );
             return Err(err);
+        }
+        // The turn is over, so its streamed rows have served their purpose:
+        // they carried the answer to the live stream chunk by chunk, and the
+        // projection folds them back into one row anyway. Collapsing them here
+        // keeps the durable timeline proportional to the conversation instead
+        // of to how finely the provider happened to chunk it. A failure only
+        // costs a larger history, so it must never fail the turn.
+        if let (Some(first), Some(last)) = (
+            appended.iter().map(|item| item.sequence).min(),
+            appended.iter().map(|item| item.sequence).max(),
+        ) {
+            let _ = TimelineRepository::compact_streamed_segments(
+                &mut conn,
+                &session.id,
+                first - 1,
+                last,
+            );
         }
         // The turn boundary is the matching `running` -> `idle`/`needs_input`
         // transition for the admission publish above, and it is equally
@@ -7714,6 +7757,8 @@ mod tests {
                 after_sequence: None,
                 before_sequence: None,
                 limit: 100,
+                max_turns: None,
+                max_bytes: None,
             })
             .await
             .unwrap();
@@ -8182,6 +8227,7 @@ mod tests {
             provider_correlation_id: Some(format!("provider-{sequence}")),
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
         };
         let request_id = vibex_core::RequestId::new();
@@ -8274,6 +8320,7 @@ mod tests {
                 provider_correlation_id: correlation.map(str::to_string),
                 redaction_state: TimelineRedactionState::None,
                 execution_attribution: None,
+                payload_depth: vibex_core::TimelinePayloadDepth::Detail,
                 payload,
             };
         let delta = |text: &str| {
@@ -8369,6 +8416,7 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
         };
 
@@ -8389,6 +8437,7 @@ mod tests {
         let payload = TimelinePayload::ElicitationRequest(resolved);
         manager.publish_attention_notification(&TimelineItem {
             kind: payload.kind(),
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
             ..item
         });
@@ -8607,6 +8656,7 @@ mod tests {
             provider_correlation_id: Some(correlation.clone()),
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload: payload.clone(),
         };
         let indices = HashMap::from([(correlation.clone(), 0)]);
@@ -8665,6 +8715,7 @@ mod tests {
             provider_correlation_id: Some(correlation.clone()),
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload: latest_payload,
         };
         let indices = HashMap::from([(correlation.clone(), 0)]);
@@ -8722,6 +8773,7 @@ mod tests {
         ));
 
         let exhausted = TimelineItem {
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload: TimelinePayload::Retry(vibex_core::AgentRetryPayload {
                 kind: vibex_core::RetryKind::ModelRequest,
                 phase: vibex_core::RetryPhase::Exhausted,
@@ -8754,6 +8806,7 @@ mod tests {
             provider_correlation_id: Some(correlation.clone()),
             redaction_state: TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload: TimelinePayload::Retry(vibex_core::AgentRetryPayload {
                 kind: vibex_core::RetryKind::ModelRequest,
                 phase: vibex_core::RetryPhase::Recovered,
@@ -8819,6 +8872,7 @@ mod tests {
             provider_correlation_id: started.provider_correlation_id.clone(),
             redaction_state: started.redaction_state,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload: started.payload.clone(),
         };
         let index = push_or_replace_timeline_item(&mut items, started_item);
@@ -8838,6 +8892,7 @@ mod tests {
             provider_correlation_id: completed.provider_correlation_id.clone(),
             redaction_state: completed.redaction_state,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload: completed.payload.clone(),
         };
         let index = push_or_replace_timeline_item(&mut items, completed_item);
@@ -9083,6 +9138,7 @@ mod tests {
         assert!(matches!(
             timeline.as_slice(),
             [TimelineItem {
+                payload_depth: vibex_core::TimelinePayloadDepth::Detail,
                 payload: TimelinePayload::UserMessage(UserMessagePayload { text, .. }),
                 ..
             }] if text == "hello"
@@ -9329,6 +9385,7 @@ mod tests {
         assert!(matches!(
             timeline.as_slice(),
             [TimelineItem {
+                payload_depth: vibex_core::TimelinePayloadDepth::Detail,
                 payload: TimelinePayload::UserMessage(UserMessagePayload { text, .. }),
                 ..
             }] if text == "hello"
@@ -9831,6 +9888,8 @@ mod tests {
                 after_sequence: None,
                 before_sequence: Some(9),
                 limit: 4,
+                max_turns: None,
+                max_bytes: None,
             })
             .await
             .unwrap();
@@ -9855,6 +9914,8 @@ mod tests {
                 after_sequence: Some(2),
                 before_sequence: Some(9),
                 limit: 4,
+                max_turns: None,
+                max_bytes: None,
             })
             .await
             .unwrap();
@@ -9874,6 +9935,8 @@ mod tests {
                 after_sequence: None,
                 before_sequence: None,
                 limit: 4,
+                max_turns: None,
+                max_bytes: None,
             })
             .await
             .unwrap();

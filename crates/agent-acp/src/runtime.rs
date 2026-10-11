@@ -30801,6 +30801,8 @@ for line in sys.stdin:
                 after_sequence: Some(0),
                 before_sequence: None,
                 limit: 200,
+                max_turns: None,
+                max_bytes: None,
             })
             .await
             .unwrap();
@@ -31508,6 +31510,8 @@ for line in sys.stdin:
                 after_sequence: Some(0),
                 before_sequence: None,
                 limit: 200,
+                max_turns: None,
+                max_bytes: None,
             })
             .await
             .unwrap();
@@ -37556,6 +37560,8 @@ for line in sys.stdin:
                     after_sequence: Some(0),
                     before_sequence: None,
                     limit: 200,
+                    max_turns: None,
+                    max_bytes: None,
                 })
                 .await
                 .unwrap();

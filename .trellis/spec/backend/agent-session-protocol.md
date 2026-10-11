@@ -2018,6 +2018,7 @@ agent_get_session(session_id: VibexSessionId) -> AgentSession
 agent_list_runtime_options() -> SessionRuntimeOptionCatalog
 agent_get_runtime_selection(session_id) -> AgentSessionRuntimeSelectionState
 agent_fetch_timeline(request: FetchTimelineRequest) -> TimelinePage
+agent_fetch_timeline_item(request: FetchTimelineItemRequest) -> TimelineItem
 agent_send_message(request: SendAgentMessageRequest) -> Vec<TimelineItem>
 agent_continue_turn(request: ContinueAgentTurnRequest) -> Vec<TimelineItem>
 agent_execute_command(request: AgentCommandExecuteRequest) -> AgentCommandExecuteResult
@@ -2102,11 +2103,38 @@ and `AdapterDiagnosticsRepository`.
   provider columns from `agent_sessions`. There is no compatibility read path.
 - `FetchTimelineRequest.afterSequence` supports catch-up. `limit` bounds the
   response. `TimelinePage` includes `startSequence`, `endSequence`, `hasOlder`,
-  and `hasNewer`.
+  and `hasNewer`. `hasOlder` and `hasNewer` stay session-wide existence
+  probes, so "the window ended" and "there is more" remain different facts.
 - `FetchTimelineRequest.afterSequence = null` returns only a latest bounded
-  window and may set `hasOlder = true`; UI code may use it for previews, but
-  full conversation restore must use forward pagination so a user/assistant
-  turn is not cut in the middle.
+  window and may set `hasOlder = true`. Opening a session reads this window
+  rather than the whole archive, so the wait is not proportional to how long
+  the conversation has run.
+- `FetchTimelineRequest.maxTurns` ends the window on a conversational turn
+  boundary — a turn starts at a user message — so a page never splits a
+  question from its answer. `FetchTimelineRequest.maxBytes` bounds what the
+  page costs to move, because `limit` counts items and one file operation can
+  outweigh hundreds of messages. A page always carries at least one item so a
+  reader can still make progress; an unbounded `limit` alone is no longer
+  sufficient for a caller that cares about latency.
+- Timeline reads are projected to `TimelinePayloadDepth::Summary`: file
+  snapshots (`oldText`/`newText`/`patch`) and the opened-activity parts of
+  `rawExtension` (`contentBlocks`, `rawOutput`, `meta`) are withheld, while the
+  bounded fields a collapsed activity row renders are kept. An item whose
+  payload carries no such detail is marked `Detail` because nothing was
+  withheld. `agent_fetch_timeline_item` reads one item back at full depth by
+  sequence, which is what an opened activity uses; live events carry full
+  payloads because they are incremental and are what the reader is watching.
+- A file operation is stored as its rendered patch rather than both file
+  snapshots, including a one-sided change (a file created or deleted), whose
+  patch is synthesized. The durable timeline therefore stays proportional to
+  the change rather than to the files it touched.
+- Streamed `AgentMessageDelta` and `Reasoning` rows are appended one per
+  provider chunk so the live stream can deliver each the moment it arrives.
+  When the turn settles they are collapsed: rows that are adjacent in sequence
+  and share a segment merge into the first row, which absorbs the text, and the
+  rest are removed. Adjacency is the safety property — nothing sat between the
+  merged rows, so no other activity changes position relative to the text it
+  was interleaved with.
 - `agent_timeline_items` is append-only except for the atomic latest-user-turn
   replacement above. The repository assigns monotonic per-session sequence
   numbers inside a transaction; replacement reuses the deleted tail sequence

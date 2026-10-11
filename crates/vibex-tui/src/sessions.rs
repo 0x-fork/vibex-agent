@@ -893,6 +893,7 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: vibex_core::TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
         }
     }

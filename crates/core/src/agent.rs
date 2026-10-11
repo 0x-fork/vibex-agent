@@ -721,6 +721,31 @@ pub struct FetchTimelineRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_sequence: Option<i64>,
     pub limit: u32,
+    /// End the window on a conversational turn boundary instead of a raw item
+    /// count. When set, `limit` stops bounding the page and the reader returns
+    /// at most this many turns, so a page never splits a turn in half.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    /// Upper bound on the payload cost of the returned page.
+    ///
+    /// `limit` counts items and one item can be a whole file snapshot, so this
+    /// bounds what a page actually costs to move. A page always carries at
+    /// least one item, so a reader can still make progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u32>,
+}
+
+/// Reads one item back at full payload depth.
+///
+/// Pages and live events carry [`crate::TimelinePayloadDepth::Summary`] items,
+/// which omit the unbounded tool detail. A reader that opens an activity asks
+/// for exactly the item it is about to render.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchTimelineItemRequest {
+    pub session_id: VibexSessionId,
+    /// The sequence of the item to read, as carried by the summary item.
+    pub sequence: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1097,6 +1122,7 @@ mod tests {
             provider_correlation_id: None,
             redaction_state: crate::TimelineRedactionState::None,
             execution_attribution: None,
+            payload_depth: crate::TimelinePayloadDepth::Detail,
             payload,
         };
         let request_id = RequestId::new();
@@ -1142,6 +1168,8 @@ mod tests {
             after_sequence: None,
             before_sequence: None,
             limit: 50,
+            max_turns: None,
+            max_bytes: None,
         };
         let json = serde_json::to_value(&without).unwrap();
         // An absent cursor stays off the wire so older relays never see it.

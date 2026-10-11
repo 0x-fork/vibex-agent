@@ -88,7 +88,8 @@ use vibex_core::{
     RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeRequest,
     RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineDisplaySettingsRequest,
     RemoteAgentTimelineDisplaySettingsResponse, RemoteAgentTimelineFetchRequest,
-    RemoteAgentTimelineFetchResponse, RemoteAgentUnarchiveSessionResponse,
+    RemoteAgentTimelineFetchResponse, RemoteAgentTimelineItemFetchRequest,
+    RemoteAgentTimelineItemFetchResponse, RemoteAgentUnarchiveSessionResponse,
     RemoteAgentVerifyAuthContextRequest, RemoteAuditListRequest, RemoteAuditRecord,
     RemoteAuthProof, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeepLinkResolution,
@@ -1136,6 +1137,30 @@ impl AgentBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<RemoteAgentTimelineFetchResponse>(value)?.page)
+        })
+    }
+
+    fn fetch_timeline_item(
+        &self,
+        request: vibex_core::FetchTimelineItemRequest,
+    ) -> BackendFuture<'_, vibex_core::TimelineItem> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload =
+                RemoteAgentRequest::FetchTimelineItem(RemoteAgentTimelineItemFetchRequest {
+                    auth: this.auth(),
+                    request,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentTimelineItemFetchResponse>(value)?.item)
         })
     }
 
@@ -6798,6 +6823,10 @@ fn remote_capabilities_for_grant(
                 ),
                 (
                     AgentFetchTimeline,
+                    permits(RemoteActionClass::ReadAgentSession),
+                ),
+                (
+                    AgentFetchTimelineItem,
                     permits(RemoteActionClass::ReadAgentSession),
                 ),
                 (

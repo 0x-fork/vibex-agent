@@ -30,6 +30,7 @@ fn live_timeline_item(sequence: i64, payload: TimelinePayload) -> TimelineItem {
         provider_correlation_id: None,
         redaction_state: TimelineRedactionState::None,
         execution_attribution: None,
+        payload_depth: vibex_core::TimelinePayloadDepth::Detail,
         payload,
     }
 }
@@ -1322,6 +1323,7 @@ fn composer_plan_growth_leaves_the_turn_preview_rail_its_lane(cx: &mut TestAppCo
                     provider_correlation_id: None,
                     redaction_state: TimelineRedactionState::None,
                     execution_attribution: None,
+                    payload_depth: vibex_core::TimelinePayloadDepth::Detail,
                     payload,
                 };
             let mut items = Vec::new();
@@ -1666,6 +1668,7 @@ fn rail_item(
         provider_correlation_id: None,
         redaction_state: TimelineRedactionState::None,
         execution_attribution: None,
+        payload_depth: vibex_core::TimelinePayloadDepth::Detail,
         payload,
     }
 }
