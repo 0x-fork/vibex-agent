@@ -508,6 +508,33 @@ const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 40.0;
 /// Session rows, workspace rows and group rows all reserve the same column, so
 /// a count, a spinner and a status dot land on one vertical line.
 const SIDEBAR_STATUS_COLUMN_WIDTH: f32 = 76.0;
+/// The square a session row keeps for its branch toggle.
+///
+/// The toggle holds its slot whether or not the pointer is on the row, so
+/// revealing it never reflows the title beside it.
+const SIDEBAR_BRANCH_TOGGLE_SIZE: f32 = 24.0;
+/// Gap between the children of one delegated session row.
+///
+/// It is the session row's own `gap_2`, and the tree guide measures itself
+/// against it: the elbow crosses the column plus this gap to reach the child's
+/// Agent logo.
+const SIDEBAR_DELEGATED_ROW_GAP: f32 = 8.0;
+/// Width of one level of the ownership tree's guide columns.
+const SIDEBAR_DELEGATED_GUIDE_WIDTH: f32 = 16.0;
+/// Where the trunk runs inside its guide column.
+///
+/// A guide column starts exactly where the parent row's Agent logo starts, so
+/// the trunk's own edge lands on that logo's center: the branch reads as leaving
+/// the logo above it, and the one-pixel line stays on a pixel boundary instead
+/// of blurring across a half pixel.
+const SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET: f32 = SIDEBAR_LOGO_DISPLAY_SIZE / 2.0;
+/// How far the elbow reaches past the trunk.
+///
+/// The trunk has to cross the rest of its own column and the row's gap, which
+/// ends the elbow exactly where the child's Agent logo begins.
+const SIDEBAR_DELEGATED_GUIDE_ELBOW_WIDTH: f32 = SIDEBAR_DELEGATED_GUIDE_WIDTH
+    + SIDEBAR_DELEGATED_ROW_GAP
+    - SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET;
 const SIDEBAR_DRAG_PREVIEW_WIDTH: f32 = 280.0;
 const SIDEBAR_DRAG_HORIZONTAL_SLOP: f32 = 16.0;
 const SIDEBAR_FOLDER_CHILD_INDENT: f32 = 18.0;
@@ -15392,45 +15419,66 @@ impl VibexWorkbench {
         elements
     }
 
-    fn render_delegated_disclosure(
+    /// The slot a session row keeps for its branch toggle, if it owns a branch.
+    ///
+    /// The control is mounted on every frame but painted only while the pointer
+    /// is on its row, and the slot holds the toggle's width either way: the
+    /// title beside it truncates once and never reflows when the pointer
+    /// arrives. Collapsing a branch is not a pointer-only command — the row's
+    /// left and right arrows operate the same disclosure from the keyboard.
+    fn delegated_toggle_slot(
         &mut self,
         session_id: &str,
+        hover_group: &SharedString,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if !self.delegated_has_children(session_id) {
             return None;
         }
         let collapsed = self.delegated_branch_is_collapsed(session_id);
-        let session_id = session_id.to_string();
+        let branch_id = session_id.to_string();
         Some(
-            Button::new(format!("sidebar-delegated-toggle-{session_id}"))
-                .debug_selector({
-                    let id = session_id.clone();
-                    move || format!("sidebar-delegated-toggle-{id}")
-                })
-                .xsmall()
-                .ghost()
-                .compact()
-                .icon(sidebar_icon(if collapsed {
-                    "icons/vibex/chevrons-right.svg"
-                } else {
-                    "icons/vibex/chevrons-down-up.svg"
-                }))
-                .tooltip(if collapsed {
-                    locale::text("Show delegated sessions", "展开委派会话", "展開委派會話")
-                } else {
-                    locale::text("Hide delegated sessions", "折叠委派会话", "摺疊委派會話")
-                })
-                .toggled(!collapsed)
-                .accessibility_label(if collapsed {
-                    locale::text("Show delegated sessions", "展开委派会话", "展開委派會話")
-                } else {
-                    locale::text("Hide delegated sessions", "折叠委派会话", "摺疊委派會話")
-                })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.toggle_delegated_branch(&session_id, cx);
-                }))
+            div()
+                .flex_none()
+                .w(px(SIDEBAR_BRANCH_TOGGLE_SIZE))
+                .h(px(SIDEBAR_BRANCH_TOGGLE_SIZE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .invisible()
+                .group_hover(hover_group, |style| style.visible())
+                .child(
+                    Button::new(format!("sidebar-delegated-toggle-{branch_id}"))
+                        .debug_selector({
+                            let id = branch_id.clone();
+                            move || format!("sidebar-delegated-toggle-{id}")
+                        })
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .w(px(SIDEBAR_BRANCH_TOGGLE_SIZE))
+                        .h(px(SIDEBAR_BRANCH_TOGGLE_SIZE))
+                        .icon(sidebar_icon(if collapsed {
+                            "icons/vibex/chevrons-right.svg"
+                        } else {
+                            "icons/vibex/chevrons-down-up.svg"
+                        }))
+                        .tooltip(if collapsed {
+                            locale::text("Show delegated sessions", "展开委派会话", "展開委派會話")
+                        } else {
+                            locale::text("Hide delegated sessions", "折叠委派会话", "摺疊委派會話")
+                        })
+                        .toggled(!collapsed)
+                        .accessibility_label(if collapsed {
+                            locale::text("Show delegated sessions", "展开委派会话", "展開委派會話")
+                        } else {
+                            locale::text("Hide delegated sessions", "折叠委派会话", "摺疊委派會話")
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_delegated_branch(&branch_id, cx);
+                        })),
+                )
                 .into_any_element(),
         )
     }
@@ -15466,12 +15514,15 @@ impl VibexWorkbench {
             .h_full()
             .flex_none()
             .items_stretch()
-            .children(
-                branches
-                    .into_iter()
-                    .enumerate()
-                    .map(|(ix, continues)| delegated_tree_guide_line(continues, ix == last_ix, cx)),
-            )
+            .children(branches.into_iter().enumerate().map(|(ix, continues)| {
+                delegated_tree_guide_line(
+                    node.session_ref.id.as_str(),
+                    ix,
+                    continues,
+                    ix == last_ix,
+                    cx,
+                )
+            }))
             .into_any_element()
     }
 
@@ -15479,7 +15530,10 @@ impl VibexWorkbench {
     ///
     /// It shows who created this session, which Agent is running it, what it is
     /// working on and whether it needs the user — the four questions a collapsed
-    /// team otherwise hides.
+    /// team otherwise hides. The row is shaped like the session row it hangs
+    /// under: the same height, logo inset, title column and status column, so a
+    /// delegated session reads as the same object one level down rather than a
+    /// different kind of row.
     fn render_delegated_session_row(
         &mut self,
         node: &SessionTreeNode,
@@ -15494,6 +15548,7 @@ impl VibexWorkbench {
             .as_ref()
             .is_some_and(|selected| selected.as_str() == session_id);
         let status = delegation_node_status(node);
+        let attention = status.attention || node.blocked_descendants > 0;
         let summary = if collapsed && (node.active_descendants > 0 || node.blocked_descendants > 0)
         {
             Some(format!(
@@ -15507,7 +15562,11 @@ impl VibexWorkbench {
             None
         };
         let guides = self.render_delegated_guides(node, depth, cx);
-        let disclosure = self.render_delegated_disclosure(&session_id, cx);
+        let hover_group: SharedString = format!("sidebar-delegated-session-{session_id}").into();
+        let disclosure = self.delegated_toggle_slot(&session_id, &hover_group, cx);
+        // The same sentence reports the branch on the parent row and the node on
+        // its own row, so a collapsed branch loses no state on the way down.
+        let status_text = summary.clone().unwrap_or_else(|| status.text.to_string());
         let entity = cx.weak_entity();
         let click_session = VibexSessionId::parse(session_id.clone()).ok();
         // A row carries a stable focus handle so the tree can be walked with the
@@ -15520,17 +15579,43 @@ impl VibexWorkbench {
             .clone();
         let key_entity = entity.clone();
         let key_session = session_id.clone();
+        let session_hover_key = motion::hover_key("sidebar-delegated-session", &session_id);
+        let row_background = if selected {
+            sidebar_selected_session_background(cx.theme().sidebar_accent, cx.theme().is_dark())
+        } else {
+            cx.theme().transparent
+        };
+        let row_foreground = if selected {
+            cx.theme().sidebar_foreground
+        } else {
+            sidebar_unselected_session_foreground(
+                cx.theme().sidebar_foreground,
+                cx.theme().is_dark(),
+            )
+        };
+        let row_hover_tone = if selected {
+            row_background
+        } else {
+            theme::hover_wash(cx.theme().is_dark())
+        };
         let row = div()
             .id(ElementId::Name(
                 format!("sidebar-delegated-{session_id}").into(),
             ))
+            .debug_selector({
+                let selector = format!("sidebar-delegated-row-{session_id}");
+                move || selector.clone()
+            })
             .relative()
-            .h_10()
-            .min_h_10()
+            .h(px(SIDEBAR_SESSION_ROW_HEIGHT))
+            .min_h(px(SIDEBAR_SESSION_ROW_HEIGHT))
             .w_full()
             .min_w_0()
-            .pl_1()
-            .rounded(cx.theme().radius)
+            .pr_2()
+            .rounded(px(8.0))
+            .bg(row_background)
+            .text_color(row_foreground)
+            .group(hover_group.clone())
             .track_focus(&focus_handle)
             .tab_index(0)
             .aria_label(
@@ -15553,17 +15638,9 @@ impl VibexWorkbench {
                     this.delegated_tree_key(&key_session, key, window, cx);
                 });
             })
-            .when(selected, |this| {
-                this.border_1().border_color(cx.theme().border)
-            })
-            .when(selected, |this| {
-                this.bg(sidebar_selected_session_background(
-                    cx.theme().sidebar_accent,
-                    cx.theme().is_dark(),
-                ))
-            })
+            .on_hover(hover_listener(cx.entity_id(), session_hover_key.clone()))
             .map(|row| {
-                let tone = theme::hover_wash(cx.theme().is_dark());
+                let tone = hover_blend(&session_hover_key, row_background, row_hover_tone);
                 row.hover(move |style| style.bg(tone))
             })
             .on_click({
@@ -15582,49 +15659,78 @@ impl VibexWorkbench {
             })
             .child(
                 h_flex()
-                    .w_full()
+                    .flex_1()
                     .min_w_0()
                     .h_full()
-                    .gap_1()
+                    .gap(px(SIDEBAR_DELEGATED_ROW_GAP))
                     .items_center()
+                    .pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))
                     .child(guides)
-                    .children(disclosure)
-                    .when(!has_children, |row| row.child(div().w_4()))
-                    .child(sidebar_agent_logo(
-                        node.agent_id
-                            .as_ref()
-                            .map(AgentId::as_str)
-                            .unwrap_or("agent"),
-                        selected,
-                        cx,
-                    ))
+                    .child(
+                        div()
+                            .debug_selector({
+                                let selector = format!("delegated-logo-{session_id}");
+                                move || selector.clone()
+                            })
+                            .flex_none()
+                            .child(sidebar_agent_logo(
+                                node.agent_id
+                                    .as_ref()
+                                    .map(AgentId::as_str)
+                                    .unwrap_or("agent"),
+                                selected,
+                                cx,
+                            )),
+                    )
                     .child(
                         v_flex()
                             .flex_1()
                             .min_w_0()
                             .child(
-                                div().truncate().text_sm().child(
-                                    node.task_title
-                                        .clone()
-                                        .unwrap_or_else(|| node.title.clone()),
-                                ),
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .when(selected, |this| this.font_semibold())
+                                    .group_hover(&hover_group, |style| {
+                                        style.text_color(cx.theme().sidebar_foreground)
+                                    })
+                                    .child(
+                                        node.task_title
+                                            .clone()
+                                            .unwrap_or_else(|| node.title.clone()),
+                                    ),
                             )
-                            .when_some(node.agent_label.clone(), |this, label| {
-                                this.child(div().truncate().text_xs().opacity(0.6).child(label))
+                            .when_some(summary, |column, summary| {
+                                column.child(
+                                    div()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(summary),
+                                )
                             }),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .when(status.attention || node.blocked_descendants > 0, |this| {
-                                this.text_color(cx.theme().warning)
-                            })
-                            .when(!status.attention && node.blocked_descendants == 0, |this| {
-                                this.opacity(0.75)
-                            })
-                            .child(summary.unwrap_or_else(|| status.text.to_string())),
-                    ),
+                    .children(disclosure),
+            )
+            .child(
+                h_flex()
+                    .debug_selector({
+                        let selector = format!("delegated-status-{session_id}");
+                        move || selector.clone()
+                    })
+                    .w(px(SIDEBAR_STATUS_COLUMN_WIDTH))
+                    .flex_none()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(6.0))
+                    .text_xs()
+                    .text_color(if attention {
+                        cx.theme().warning
+                    } else {
+                        cx.theme().sidebar_foreground.opacity(0.48)
+                    })
+                    .child(div().min_w_0().truncate().child(status_text)),
             );
         row.into_any_element()
     }
@@ -43382,7 +43488,6 @@ impl VibexWorkbench {
         let renaming =
             self.sidebar_rename_target == Some(SidebarRenameTarget::Session(session.id.clone()));
         let session_id_string = session.id.as_str().to_string();
-        let disclosure = self.render_delegated_disclosure(&session_id_string, cx);
         let branch_collapsed = self.delegated_branch_is_collapsed(&session_id_string);
         let branch_summary = self
             .delegated_tree
@@ -43459,6 +43564,10 @@ impl VibexWorkbench {
             cached_desired_agent_id,
         );
         let hover_group: SharedString = format!("sidebar-session-{session_id_string}").into();
+        // The branch toggle owns the row's trailing edge and is painted only
+        // while the pointer is on the row: the left edge belongs to the Agent
+        // logo, and the slot it keeps keeps the title from reflowing on hover.
+        let disclosure = self.delegated_toggle_slot(&session_id_string, &hover_group, cx);
         let context_menu_hovered = self.sidebar_context_menu_target
             == Some(SidebarContextMenuTarget::Session(session_id_string.clone()));
         // The menu offers the click path for group membership, so joining and
@@ -43586,7 +43695,6 @@ impl VibexWorkbench {
                                     ),
                             )
                         })
-                        .children(disclosure)
                         .child(sidebar_agent_logo(sidebar_agent_id.as_str(), selected, cx))
                         .child(
                             Input::new(&self.sidebar_rename_input)
@@ -43869,6 +43977,10 @@ impl VibexWorkbench {
 
         let row = div()
             .id(format!("sidebar-session-row-{session_id_string}"))
+            .debug_selector({
+                let selector = format!("sidebar-session-row-{session_id_string}");
+                move || selector.clone()
+            })
             .track_focus(&row_focus)
             .tab_index(0)
             .focus_visible(|style| style.border_1().border_color(cx.theme().ring))
@@ -44370,9 +44482,13 @@ impl VibexWorkbench {
                                         ),
                                 )
                             })
-                            .children(disclosure)
                             .child(
                                 div()
+                                    .debug_selector({
+                                        let selector =
+                                            format!("sidebar-session-logo-{session_id_string}");
+                                        move || selector.clone()
+                                    })
                                     .flex_none()
                                     .opacity(if selected { 1.0 } else { 0.90 })
                                     .group_hover(&hover_group, |style| style.opacity(1.0))
@@ -44393,10 +44509,16 @@ impl VibexWorkbench {
                                 div().truncate().text_xs().text_color(cx.theme().muted_foreground).child(summary)
                             )),
                                 ),
-                            ),
+                            )
+                            .children(disclosure),
                     )
                     .child(
                         h_flex()
+                            .debug_selector({
+                                let selector =
+                                    format!("sidebar-session-status-{session_id_string}");
+                                move || selector.clone()
+                            })
                             .w(px(SIDEBAR_STATUS_COLUMN_WIDTH))
                             .flex_none()
                             .items_center()
@@ -63744,37 +63866,62 @@ fn delegation_node_status(node: &SessionTreeNode) -> DelegatedNodeStatus {
     }
 }
 
-/// The thin connector that shows a delegated row belongs to the row above it.
+/// One column of the ownership tree's connector.
 ///
-/// It is a real element rather than padding so the line can stop at the last
-/// child of a branch instead of running past unrelated rows.
-fn delegated_tree_guide_line(continues: bool, elbow: bool, cx: &App) -> AnyElement {
+/// The trunk runs down the column's center — the center of the parent row's
+/// Agent logo — and an elbow turns off it into the child's logo, so a branch
+/// reads as one trunk with sessions hanging off it. The column starts one row
+/// gap above its own row so the segments of two consecutive rows meet instead
+/// of leaving the flow gap between them unpainted, and the last child's trunk
+/// stops at its own elbow instead of running past the branch.
+fn delegated_tree_guide_line(
+    session_id: &str,
+    level: usize,
+    continues: bool,
+    elbow: bool,
+    cx: &App,
+) -> AnyElement {
+    let trunk = cx.theme().border.opacity(0.70);
+    // A branch's last child stops its trunk at the elbow; every other column
+    // paints through its whole row so the trunk reaches the next one.
+    let trunk_height = if elbow && !continues {
+        SIDEBAR_SESSION_ROW_HEIGHT / 2.0 + SIDEBAR_SESSION_CONTENT_GAP
+    } else {
+        SIDEBAR_SESSION_ROW_HEIGHT + SIDEBAR_SESSION_CONTENT_GAP
+    };
     div()
         .relative()
         .flex_none()
-        .w_4()
+        .w(px(SIDEBAR_DELEGATED_GUIDE_WIDTH))
         .h_full()
         .when(continues || elbow, |slot| {
             slot.child(
                 div()
+                    .debug_selector({
+                        let selector = format!("delegated-trunk-{session_id}-{level}");
+                        move || selector.clone()
+                    })
                     .absolute()
-                    .left_1()
-                    .top_0()
-                    .h_full()
-                    .border_l_1()
-                    .border_color(cx.theme().border)
-                    .when(elbow && !continues, |line| line.h(gpui::relative(0.5))),
+                    .left(px(SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET))
+                    .top(px(-SIDEBAR_SESSION_CONTENT_GAP))
+                    .w(px(1.0))
+                    .h(px(trunk_height))
+                    .bg(trunk),
             )
         })
         .when(elbow, |slot| {
             slot.child(
                 div()
+                    .debug_selector({
+                        let selector = format!("delegated-elbow-{session_id}-{level}");
+                        move || selector.clone()
+                    })
                     .absolute()
-                    .left_1()
+                    .left(px(SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET))
                     .top(gpui::relative(0.5))
-                    .w_2()
-                    .border_t_1()
-                    .border_color(cx.theme().border),
+                    .w(px(SIDEBAR_DELEGATED_GUIDE_ELBOW_WIDTH))
+                    .h(px(1.0))
+                    .bg(trunk),
             )
         })
         .into_any_element()

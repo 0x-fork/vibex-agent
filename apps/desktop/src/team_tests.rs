@@ -286,6 +286,18 @@ fn draw(cx: &mut VisualTestContext) {
     }
 }
 
+/// Puts the pointer on a row so the branch toggle it keeps hidden is painted.
+///
+/// A session row reveals its disclosure instead of parking it at the left edge,
+/// and an unpainted element takes no hit box: the click that follows only lands
+/// once the row it belongs to is hovered and the frame has been drawn again.
+fn reveal_branch_toggle(cx: &mut VisualTestContext, point: gpui::Point<gpui::Pixels>) {
+    cx.update(|window, cx| {
+        window.simulate_mouse_move(point, cx);
+        let _ = window.draw(cx);
+    });
+}
+
 fn group(workbench: &mut VibexWorkbench, count: usize) {
     let members: Vec<_> = (0..count)
         .map(|index| session(index).id.to_string())
@@ -609,9 +621,20 @@ fn team_tree_collapse_and_keyboard_order_follow_grouped_and_compact_rows(cx: &mu
         workbench.read_with(cx, |workbench, _| workbench.delegated_visible_order()),
         expected
     );
+    // The toggle is painted only while its row is hovered, so the pointer has to
+    // arrive before the button is there to click.
+    let root_row = cx
+        .debug_bounds("sidebar-session-row-session_team_0")
+        .expect("the root session row is rendered");
+    assert!(
+        cx.debug_bounds("sidebar-delegated-toggle-session_team_0")
+            .is_none(),
+        "the branch toggle stays out of the row until the pointer arrives"
+    );
+    reveal_branch_toggle(cx, root_row.center());
     let disclosure = cx
         .debug_bounds("sidebar-delegated-toggle-session_team_0")
-        .expect("root disclosure is rendered");
+        .expect("hovering the row reveals its branch toggle");
     cx.simulate_click(disclosure.center(), Modifiers::none());
     draw(cx);
     assert_eq!(
@@ -653,6 +676,88 @@ fn team_tree_collapse_and_keyboard_order_follow_grouped_and_compact_rows(cx: &mu
             expected
         );
     }
+}
+
+/// A delegated row is the session row's own shape one level down.
+///
+/// The branch's trunk leaves the parent row's Agent logo, its elbow lands on the
+/// child's logo, and the child's status column ends on the parent's right edge —
+/// the three things that make a delegated session read as a session parked under
+/// its parent instead of a different kind of row.
+#[gpui::test]
+fn delegated_rows_branch_from_the_parent_logo_and_share_its_columns(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 3);
+    workbench.update(cx, |workbench, _| {
+        for node in [node(0, None, 2), node(1, Some(0), 0), node(2, Some(0), 0)] {
+            workbench
+                .delegated_tree
+                .insert(node.session_ref.id.clone(), node);
+        }
+        workbench.delegated_pages.insert(
+            Some(session(0).id.to_string()),
+            DelegatedBranchPage {
+                session_ids: vec![session(1).id.to_string(), session(2).id.to_string()],
+                ..Default::default()
+            },
+        );
+    });
+    draw(cx);
+    let parent_logo = cx
+        .debug_bounds("sidebar-session-logo-session_team_0")
+        .expect("the root row draws its Agent logo");
+    let parent_status = cx
+        .debug_bounds("sidebar-session-status-session_team_0")
+        .expect("the root row keeps its status column");
+    let child_logo = cx
+        .debug_bounds("delegated-logo-session_team_1")
+        .expect("the delegated row draws its Agent logo");
+    let child_status = cx
+        .debug_bounds("delegated-status-session_team_1")
+        .expect("the delegated row keeps a status column");
+    let trunk = cx
+        .debug_bounds("delegated-trunk-session_team_1-0")
+        .expect("a child row draws the trunk of its own level");
+    let elbow = cx
+        .debug_bounds("delegated-elbow-session_team_1-0")
+        .expect("a child row draws the elbow into its logo");
+
+    assert!(
+        (trunk.left() - parent_logo.center().x).abs() <= px(0.5),
+        "the trunk leaves the center of the parent row's Agent logo: {trunk:?} vs {parent_logo:?}"
+    );
+    assert!(
+        (elbow.right() - child_logo.left()).abs() <= px(0.5),
+        "the elbow stops where the child's Agent logo begins: {elbow:?} vs {child_logo:?}"
+    );
+    assert!(
+        (elbow.center().y - child_logo.center().y).abs() <= px(1.0),
+        "the elbow meets the child's logo on its own line"
+    );
+    assert!(
+        (child_status.right() - parent_status.right()).abs() <= px(0.5),
+        "both rows end their status on one vertical line: {child_status:?} vs {parent_status:?}"
+    );
+    assert_eq!(
+        child_status.size.width, parent_status.size.width,
+        "a delegated row reserves the session row's status column"
+    );
+
+    // A branch's trunk carries on to the next sibling; the last child's stops at
+    // its own elbow instead of running past the branch.
+    let next_trunk = cx
+        .debug_bounds("delegated-trunk-session_team_2-0")
+        .expect("the last child still draws its elbow's trunk");
+    let next_elbow = cx
+        .debug_bounds("delegated-elbow-session_team_2-0")
+        .expect("the last child draws its elbow");
+    assert!(
+        trunk.size.height > next_trunk.size.height,
+        "the last child stops its trunk at the elbow"
+    );
+    assert!(
+        next_trunk.bottom() <= next_elbow.center().y + px(1.0),
+        "the last trunk never runs past the branch it closes"
+    );
 }
 
 #[gpui::test]
