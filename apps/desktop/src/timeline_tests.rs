@@ -1416,3 +1416,302 @@ fn composer_plan_growth_leaves_the_turn_preview_rail_its_lane(cx: &mut TestAppCo
         "opening the plan panel must not move a tick the reader is aiming at"
     );
 }
+
+/// A child Agent rendered next to a conversation must not evict its Markdown.
+///
+/// The child Agent rail paints whole child timelines through the timeline's own
+/// builders while the parent's view is borrowed. One retention table for both
+/// let the rail's surfaces push the parent's out — the assistant messages the
+/// reader is looking at — and a text view that is re-created is painted again
+/// from scratch: with key-order eviction the surface that sorted first was
+/// dropped on every frame, so a message on screen blinked for as long as the
+/// child was open. The rail's surfaces are kept per child session now, and the
+/// borrowed view's own table keeps the least recently painted surface.
+#[gpui::test]
+fn child_agent_rail_keeps_the_parent_timelines_markdown_surfaces(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let parent_id = VibexSessionId::parse("session_rail_parent").unwrap();
+    let child_id = VibexSessionId::parse("session_rail_child").unwrap();
+    let (probe, cx) = cx.add_window_view(|window, cx| {
+        let mut ui_state = DesktopUiStateV1::default();
+        ui_state.appearance.locale = LocaleMode::En;
+        let workbench = cx.new(|cx| {
+            let mut workbench =
+                VibexWorkbench::with_initial_state(None, ui_state, None, window, cx);
+            workbench.agent_loading = false;
+            workbench.selected_session_id = Some(parent_id.clone());
+            workbench.view_session_id = Some(parent_id.clone());
+            workbench
+                .pending_agent_turn_session_ids
+                .insert(parent_id.to_string());
+            workbench
+                .timeline
+                .replace_authoritative(parent_id.clone(), rail_parent_items(3));
+            workbench.rebuild_timeline_sizes();
+            workbench
+        });
+        let mut child = ChildAgentTimelineState::new(child_id.clone());
+        child
+            .timeline
+            .replace_authoritative(child_id.clone(), rail_child_items(210));
+        child.loaded = true;
+        workbench.update(cx, |workbench, _| {
+            workbench
+                .child_agent_timelines
+                .insert(child_id.to_string(), child);
+            workbench.child_agent_panel_active = true;
+            workbench.child_agent_tabs = vec![child_id.clone()];
+            workbench.child_agent_active_tab = Some(child_id.clone());
+        });
+        ChildRailProbe {
+            workbench,
+            rail: std::rc::Rc::new(std::cell::Cell::new(false)),
+        }
+    });
+    let (workbench, rail) =
+        probe.read_with(cx, |probe, _| (probe.workbench.clone(), probe.rail.clone()));
+
+    fn draw(cx: &mut VisualTestContext, frames: usize) {
+        for _ in 0..frames {
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+        }
+    }
+
+    draw(cx, 4);
+    let parent = workbench.read_with(cx, |workbench, _| {
+        markdown_surface_ids(&workbench.markdown_text_states)
+    });
+    assert_eq!(
+        parent.len(),
+        6,
+        "the parent's own surfaces should be the only ones in its table: {parent:?}"
+    );
+    draw(cx, 2);
+    let settled = workbench.read_with(cx, |workbench, _| {
+        markdown_surface_ids(&workbench.markdown_text_states)
+    });
+    assert_eq!(parent, settled, "a settled conversation must not churn");
+
+    rail.set(true);
+    for frame in 0..5 {
+        draw(cx, 1);
+        let (now, rail_table) = workbench.read_with(cx, |workbench, _| {
+            (
+                markdown_surface_ids(&workbench.markdown_text_states),
+                workbench
+                    .child_agent_markdown_states
+                    .get(child_id.as_str())
+                    .map(markdown_surface_ids)
+                    .unwrap_or_default(),
+            )
+        });
+        for (id, state) in &parent {
+            assert_eq!(
+                now.get(id),
+                Some(state),
+                "frame {frame}: the rail re-created the parent's surface {id}"
+            );
+        }
+        assert!(
+            rail_table.len() <= MARKDOWN_TEXT_STATE_LIMIT,
+            "the rail's own table stays bounded: {}",
+            rail_table.len()
+        );
+        assert!(
+            !rail_table.keys().any(|id| parent.contains_key(id)),
+            "the rail may not keep the parent's surfaces at all"
+        );
+    }
+
+    // Closing the tab drops everything the rail retained for that child.
+    workbench.update(cx, |workbench, cx| {
+        workbench.close_child_agent_tab(&child_id, cx);
+    });
+    draw(cx, 1);
+    workbench.read_with(cx, |workbench, _| {
+        assert!(
+            !workbench
+                .child_agent_markdown_states
+                .contains_key(child_id.as_str()),
+            "a closed child tab must not keep its retained text views"
+        );
+        assert_eq!(workbench.markdown_text_states.len(), 6);
+    });
+}
+
+/// The Markdown table drops the surface its session stopped painting.
+///
+/// Key order was the previous rule, and it is not a recency order: filling the
+/// table then repainting an early surface still evicted that surface, which is
+/// the one thing a retained text view must not do while it is on screen.
+#[gpui::test]
+fn markdown_surface_table_evicts_the_least_recently_painted_surface(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, cx) = markdown_table_fixture(cx);
+    workbench.update(cx, |workbench, cx| {
+        let source: Arc<str> = Arc::from("Body");
+        for index in 0..MARKDOWN_TEXT_STATE_LIMIT {
+            let id = format!("markdown:surface-{index:03}");
+            workbench.markdown_text_state(&id, &source, None, false, cx);
+        }
+        // Repaint the first surface: it is now the most recently painted one,
+        // while `surface-001` is the oldest.
+        workbench.markdown_text_state("markdown:surface-000", &source, None, false, cx);
+        workbench.markdown_text_state("markdown:surface-192", &source, None, false, cx);
+        assert!(
+            workbench
+                .markdown_text_states
+                .contains_key("markdown:surface-000"),
+            "a surface painted this frame must survive the next insertion"
+        );
+        assert!(
+            !workbench
+                .markdown_text_states
+                .contains_key("markdown:surface-001"),
+            "the least recently painted surface is the one that goes"
+        );
+        assert_eq!(
+            workbench.markdown_text_states.len(),
+            MARKDOWN_TEXT_STATE_LIMIT,
+            "the bound still holds"
+        );
+    });
+}
+
+fn markdown_surface_ids(table: &BTreeMap<String, MarkdownTextState>) -> BTreeMap<String, EntityId> {
+    table
+        .iter()
+        .map(|(id, entry)| (id.clone(), entry.state.entity_id()))
+        .collect()
+}
+
+fn rail_parent_items(turns: usize) -> Vec<TimelineItem> {
+    let session_id = VibexSessionId::parse("session_rail_parent").unwrap();
+    let mut items = Vec::new();
+    for turn in 0..turns {
+        items.push(rail_item(
+            &session_id,
+            &format!("timeline_aaa{turn}u"),
+            items.len() as i64 + 1,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("Parent question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(rail_item(
+            &session_id,
+            &format!("timeline_aaa{turn}a"),
+            items.len() as i64 + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: format!("Parent answer {turn} with some body text."),
+                is_final: true,
+            }),
+        ));
+    }
+    items
+}
+
+fn rail_child_items(turns: usize) -> Vec<TimelineItem> {
+    let session_id = VibexSessionId::parse("session_rail_child").unwrap();
+    let mut items = Vec::new();
+    for turn in 0..turns {
+        for (suffix, payload) in [
+            (
+                "u",
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: format!("Child question {turn}"),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "a",
+                TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                    text: format!("Child answer {turn} with some body text."),
+                    is_final: true,
+                }),
+            ),
+        ] {
+            items.push(rail_item(
+                &session_id,
+                &format!("timeline_zzz{turn}{suffix}"),
+                items.len() as i64 + 1,
+                payload,
+            ));
+        }
+    }
+    items
+}
+
+fn rail_item(
+    session_id: &VibexSessionId,
+    id: &str,
+    sequence: i64,
+    payload: TimelinePayload,
+) -> TimelineItem {
+    TimelineItem {
+        id: TimelineItemId::parse(id.to_string()).unwrap(),
+        session_id: session_id.clone(),
+        sequence,
+        timestamp_ms: sequence,
+        source: if matches!(payload, TimelinePayload::UserMessage(_)) {
+            TimelineSource::User
+        } else {
+            TimelineSource::Agent
+        },
+        kind: payload.kind(),
+        correlation_id: None,
+        provider_correlation_id: None,
+        redaction_state: TimelineRedactionState::None,
+        execution_attribution: None,
+        payload,
+    }
+}
+
+struct ChildRailProbe {
+    workbench: Entity<VibexWorkbench>,
+    rail: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl Render for ChildRailProbe {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let rail_open = self.rail.get();
+        let (timeline, rail) = self.workbench.update(cx, |workbench, cx| {
+            let timeline = workbench.render_agent_workbench_for(false, window, cx);
+            let rail = rail_open.then(|| workbench.render_child_agent_timeline_panel(window, cx));
+            (timeline, rail)
+        });
+        div()
+            .flex()
+            .w(px(1200.0))
+            .h(px(700.0))
+            .child(div().w(px(700.0)).h_full().child(timeline))
+            .when_some(rail, |this, rail| {
+                this.child(div().w(px(500.0)).h_full().child(rail))
+            })
+    }
+}
+
+fn markdown_table_fixture(
+    cx: &mut TestAppContext,
+) -> (Entity<VibexWorkbench>, &mut VisualTestContext) {
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let workbench = cx.new(|cx| {
+            VibexWorkbench::with_initial_state(None, DesktopUiStateV1::default(), None, window, cx)
+        });
+        MarkdownTableProbe { workbench }
+    });
+    (view.read_with(cx, |probe, _| probe.workbench.clone()), cx)
+}
+
+struct MarkdownTableProbe {
+    workbench: Entity<VibexWorkbench>,
+}
+
+impl Render for MarkdownTableProbe {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}

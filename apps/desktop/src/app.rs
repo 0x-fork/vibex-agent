@@ -2071,10 +2071,60 @@ struct MarkdownTextState {
     /// The rendered text the highlights were last searched against, so a parse
     /// notification that changed nothing does not search again.
     searched: Option<RenderedText>,
+    /// When this surface was last painted, on [`VibexWorkbench::markdown_surface_clock`].
+    ///
+    /// The table evicts its least recently painted surface. Key order is not a
+    /// recency order: it made the victim whichever surface happened to sort
+    /// first, which can be one the frame is painting right now.
+    last_painted: u64,
 }
 
-/// How many Markdown surfaces keep a retained text view. The timeline clears
-/// the map when the session changes; this bound covers a long single session.
+/// One owner's retained surface, without creating an empty table for it.
+fn markdown_surface_entry<'a>(
+    workbench: &'a mut VibexWorkbench,
+    owner: &MarkdownSurfaceOwner,
+    id: &str,
+) -> Option<&'a mut MarkdownTextState> {
+    match owner {
+        MarkdownSurfaceOwner::BorrowedView => workbench.markdown_text_states.get_mut(id),
+        MarkdownSurfaceOwner::ChildAgent(session_id) => workbench
+            .child_agent_markdown_states
+            .get_mut(session_id)
+            .and_then(|table| table.get_mut(id)),
+    }
+}
+
+/// Which session's timeline owns a Markdown surface.
+///
+/// One borrowed view paints more than its own conversation. The child Agent
+/// rail renders whole child timelines through the timeline's own builders, so
+/// its surfaces used to land in the parent's table and evict the parent's
+/// assistant messages: a text view re-created every frame paints from scratch
+/// every frame, and a document over the synchronous parse size paints empty
+/// until its parse lands. The rail's surfaces now keep their own table per
+/// child session, and the borrowed view keeps the conversation it owns.
+#[derive(Clone, PartialEq, Eq)]
+enum MarkdownSurfaceOwner {
+    /// The conversation of the view currently borrowed for rendering.
+    BorrowedView,
+    /// The timeline of one child Agent, painted by the right rail.
+    ChildAgent(String),
+}
+
+/// How many Markdown surfaces one session keeps a retained text view for.
+///
+/// The bound is per session ([`MarkdownSurfaceOwner`]): the timeline clears its
+/// own table when the session changes, and this covers a long single session.
+/// The victim is the least recently painted surface, so a table at the bound
+/// drops conversation the reader has scrolled away from rather than a row the
+/// frame is painting.
+///
+/// A session that paints more surfaces in one frame than the bound can hold is
+/// the one case this cannot window away: the child Agent rail paints a whole
+/// child timeline in one column, with no virtual list to window it, so a child
+/// timeline longer than the bound has its oldest-painted rows re-created while
+/// it is open. That costs those rows a reparse, not the conversation beside
+/// them, because the rail's surfaces are not in the borrowed view's table.
 const MARKDOWN_TEXT_STATE_LIMIT: usize = 192;
 
 #[derive(Clone)]
@@ -4089,10 +4139,15 @@ pub struct SessionView {
     timeline_load_updates: std::rc::Weak<RefCell<timeline_loading::TimelineLoadUpdates>>,
     timeline_layout_width: Option<f32>,
     timeline_markdown_sources: BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
-    /// The retained text-view state of every Markdown surface the timeline has
-    /// rendered, keyed by view id. Rendering itself belongs to the
-    /// gpui-component text view; this only keeps the parse, the selection and
-    /// the find-bar highlights alive across frames.
+    /// The retained text-view state of every Markdown surface the borrowed
+    /// view's own timeline has rendered, keyed by view id. Rendering itself
+    /// belongs to the gpui-component text view; this only keeps the parse, the
+    /// selection and the find-bar highlights alive across frames.
+    ///
+    /// The child Agent rail paints another session's timeline while this view is
+    /// borrowed, so its surfaces are kept in
+    /// [`VibexWorkbench::child_agent_markdown_states`] instead. See
+    /// [`MarkdownSurfaceOwner`].
     markdown_text_states: BTreeMap<String, MarkdownTextState>,
     timeline_reasoning_summaries: BTreeMap<String, (i64, TimelineReasoningSummarySnapshot)>,
     timeline_tool_card_projections: BTreeMap<String, (i64, Rc<ToolCardProjection>)>,
@@ -7292,6 +7347,46 @@ impl Render for TimelineView {
     }
 }
 
+/// The child Agent rail's own render boundary.
+///
+/// The rail draws whole child timelines with the timeline's own builders, so it
+/// mounts everything a live conversation mounts: the running label's shimmer,
+/// the thinking indicator, the disclosure springs, and the row measurements
+/// those trigger. Every one of those asks for its next frame through
+/// `Window::request_animation_frame`, which notifies the view whose tree holds
+/// the element. Built inline in the workbench's own render, that view was the
+/// workbench — and a workbench notify refreshes the sidebar, the primary
+/// timeline and every group pane, so a child Agent streaming behind an open rail
+/// rebuilt the whole window, main timeline included, on every display refresh.
+/// A rail that owns its element tree re-renders alone. It observes the
+/// workbench, so a workbench notify still refreshes it exactly as the inline
+/// render did.
+struct ChildAgentRailView {
+    workbench: WeakEntity<VibexWorkbench>,
+}
+
+impl ChildAgentRailView {
+    fn new(workbench: &Entity<VibexWorkbench>, cx: &mut Context<Self>) -> Self {
+        // The rail renders workbench state, so a workbench notify has to
+        // refresh it. Dropping the subscription would freeze it on frame one.
+        cx.observe(workbench, |_, _, cx| cx.notify()).detach();
+        Self {
+            workbench: workbench.downgrade(),
+        }
+    }
+}
+
+impl Render for ChildAgentRailView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(workbench) = self.workbench.upgrade() else {
+            return Empty.into_any_element();
+        };
+        workbench.update(cx, |this, cx| {
+            this.render_child_agent_timeline_panel(window, cx)
+        })
+    }
+}
+
 /// Where a session tab would land inside a group workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionGroupPaneDropRegion {
@@ -8151,6 +8246,9 @@ pub struct VibexWorkbench {
     /// The focused timeline's own render boundary, created on first render. See
     /// [`TimelineView`]; `None` only before the first frame.
     timeline_view: Option<Entity<TimelineView>>,
+    /// The child Agent rail's own render boundary, created on first render. See
+    /// [`ChildAgentRailView`]; `None` only before the first frame.
+    child_agent_rail_view: Option<Entity<ChildAgentRailView>>,
     /// Unsent Composer content, one entry per session, kept outside the view
     /// cache.
     ///
@@ -8178,6 +8276,17 @@ pub struct VibexWorkbench {
     /// menu and runtime cascade over another pane.
     pending_composer_geometries: BTreeMap<String, ComposerGeometry>,
     child_agent_timelines: BTreeMap<String, ChildAgentTimelineState>,
+    /// Retained Markdown surfaces of the child Agent timelines the rail paints.
+    ///
+    /// Keyed by child session, then by view id. Kept here rather than in the
+    /// borrowed [`SessionView`] because the rail draws another session's
+    /// conversation: see [`MarkdownSurfaceOwner`].
+    child_agent_markdown_states: BTreeMap<String, BTreeMap<String, MarkdownTextState>>,
+    /// The stamp [`MarkdownTextState::last_painted`] is written from.
+    ///
+    /// One clock for every table: a surface is stamped where it is painted, and
+    /// each table evicts its own oldest stamp, so the two never mix.
+    markdown_surface_clock: u64,
     child_agent_expanded_delegations: BTreeSet<String>,
     child_agent_tabs: Vec<VibexSessionId>,
     child_agent_active_tab: Option<VibexSessionId>,
@@ -9233,10 +9342,13 @@ impl VibexWorkbench {
             session_view_lru: VecDeque::new(),
             sidebar_view: None,
             timeline_view: None,
+            child_agent_rail_view: None,
             composer_drafts: ComposerDraftStore::default(),
             pending_timeline_turn_measurements: BTreeMap::new(),
             pending_composer_geometries: BTreeMap::new(),
             child_agent_timelines: BTreeMap::new(),
+            child_agent_markdown_states: BTreeMap::new(),
+            markdown_surface_clock: 0,
             child_agent_expanded_delegations: BTreeSet::new(),
             child_agent_tabs: Vec::new(),
             child_agent_active_tab: None,
@@ -20597,6 +20709,7 @@ impl VibexWorkbench {
 
     fn clear_child_agent_context(&mut self) {
         self.child_agent_timelines.clear();
+        self.child_agent_markdown_states.clear();
         self.child_agent_expanded_delegations.clear();
         self.child_agent_tabs.clear();
         self.child_agent_active_tab = None;
@@ -28028,7 +28141,10 @@ impl VibexWorkbench {
     ) -> Entity<TextViewState> {
         let query = search.map(|highlight| highlight.query.clone());
         let active = search.is_some_and(|highlight| highlight.active);
-        if let Some(entry) = self.markdown_text_states.get_mut(id) {
+        let owner = self.markdown_surface_owner();
+        let last_painted = self.next_markdown_surface_stamp();
+        if let Some(entry) = markdown_surface_entry(self, &owner, id) {
+            entry.last_painted = last_painted;
             let state = entry.state.clone();
             let query_changed = entry.query != query || entry.active != active;
             if query_changed {
@@ -28055,7 +28171,7 @@ impl VibexWorkbench {
                 // The parse may already have landed (small documents parse on
                 // the spot), so try in the same frame; the observer covers the
                 // documents that land later.
-                self.refresh_markdown_search_highlights(id, cx);
+                self.refresh_markdown_search_highlights(&owner, id, cx);
             }
             return state;
         }
@@ -28065,21 +28181,27 @@ impl VibexWorkbench {
                 .motion(crate::markdown::timeline_text_motion(streaming))
         });
         let key = id.to_string();
+        let observed_owner = owner.clone();
         let observed = cx.observe(&state, move |this, _, cx| {
-            this.refresh_markdown_search_highlights(&key, cx);
+            this.refresh_markdown_search_highlights(&observed_owner, &key, cx);
         });
-        if self.markdown_text_states.len() >= MARKDOWN_TEXT_STATE_LIMIT
-            && let Some(evicted) = self
-                .markdown_text_states
-                .keys()
-                .find(|candidate| candidate.as_str() != id)
-                .cloned()
+        let table = self.markdown_surface_table(&owner);
+        if table.len() >= MARKDOWN_TEXT_STATE_LIMIT
+            && let Some(evicted) = table
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_painted)
+                .map(|(candidate, _)| candidate.clone())
         {
-            // Any bound is arbitrary here: an evicted surface simply reparses
-            // when it scrolls back into the window.
-            self.markdown_text_states.remove(&evicted);
+            // The least recently painted surface goes, because it is the one
+            // this session has stopped drawing. A bound is still arbitrary: an
+            // evicted surface simply reparses when it is painted again. Key
+            // order was neither of those things — it dropped whichever surface
+            // sorted first, which is a row the current frame is painting, and
+            // re-creating its text view every frame is what made the timeline
+            // blink while the child Agent rail was open.
+            table.remove(&evicted);
         }
-        self.markdown_text_states.insert(
+        table.insert(
             id.to_string(),
             MarkdownTextState {
                 state: state.clone(),
@@ -28089,9 +28211,38 @@ impl VibexWorkbench {
                 query,
                 active,
                 searched: None,
+                last_painted,
             },
         );
         state
+    }
+
+    /// The session whose timeline owns the Markdown surfaces being painted now.
+    fn markdown_surface_owner(&self) -> MarkdownSurfaceOwner {
+        match self.child_agent_render_session.as_ref() {
+            Some(session_id) => MarkdownSurfaceOwner::ChildAgent(session_id.as_str().to_string()),
+            None => MarkdownSurfaceOwner::BorrowedView,
+        }
+    }
+
+    /// The table a session's Markdown surfaces are retained in, created on use.
+    fn markdown_surface_table(
+        &mut self,
+        owner: &MarkdownSurfaceOwner,
+    ) -> &mut BTreeMap<String, MarkdownTextState> {
+        match owner {
+            MarkdownSurfaceOwner::BorrowedView => &mut self.markdown_text_states,
+            MarkdownSurfaceOwner::ChildAgent(session_id) => self
+                .child_agent_markdown_states
+                .entry(session_id.clone())
+                .or_default(),
+        }
+    }
+
+    /// A paint stamp for [`MarkdownTextState::last_painted`].
+    fn next_markdown_surface_stamp(&mut self) -> u64 {
+        self.markdown_surface_clock = self.markdown_surface_clock.wrapping_add(1);
+        self.markdown_surface_clock
     }
 
     /// Search one surface's rendered document for the find-bar query and paint
@@ -28099,8 +28250,13 @@ impl VibexWorkbench {
     ///
     /// Runs from the parse observer as well as from a query change, so the
     /// highlights land on the rendered text rather than on the source.
-    fn refresh_markdown_search_highlights(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(entry) = self.markdown_text_states.get_mut(id) else {
+    fn refresh_markdown_search_highlights(
+        &mut self,
+        owner: &MarkdownSurfaceOwner,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = markdown_surface_entry(self, owner, id) else {
             return;
         };
         let Some(query) = entry.query.clone() else {
@@ -36208,6 +36364,10 @@ impl VibexWorkbench {
             return;
         };
         self.child_agent_tabs.remove(index);
+        // The tab's retained text views go with it: nothing paints those
+        // surfaces again until the child is reopened, and a rail that keeps
+        // every child it ever showed pays for timelines nobody reads.
+        self.child_agent_markdown_states.remove(session_id.as_str());
         if self.child_agent_active_tab.as_ref() == Some(session_id) {
             self.child_agent_active_tab = self
                 .child_agent_tabs
@@ -36321,13 +36481,19 @@ impl VibexWorkbench {
             .is_some_and(|context| context.git_available)
     }
 
-    fn render_right_rail_panel(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// The right rail's active panel.
+    ///
+    /// Both panels are cached views of their own, so nothing here runs during
+    /// the workbench's render pass — the panel that owns an element tree also
+    /// owns its frame requests. See [`ChildAgentRailView`].
+    fn render_right_rail_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.child_agent_panel_active {
-            self.render_child_agent_timeline_panel(window, cx)
+            // The rail owns its element tree: see [`ChildAgentRailView`]. It is
+            // embedded here rather than built inline because everything the rail
+            // mounts that animates would otherwise repaint the whole workbench.
+            self.ensure_child_agent_rail_view(cx)
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element()
         } else {
             self.code_right_rail
                 .clone()
@@ -60233,6 +60399,24 @@ impl VibexWorkbench {
         view
     }
 
+    /// The cached view that renders the child Agent rail.
+    ///
+    /// Created on first use and kept, so the rail's element tree survives a
+    /// frame that did not touch it — and so a pump inside the rail notifies this
+    /// view rather than the workbench, which every pane observes.
+    fn ensure_child_agent_rail_view(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Entity<ChildAgentRailView> {
+        if let Some(view) = self.child_agent_rail_view.as_ref() {
+            return view.clone();
+        }
+        let workbench = cx.entity();
+        let view = cx.new(|cx| ChildAgentRailView::new(&workbench, cx));
+        self.child_agent_rail_view = Some(view.clone());
+        view
+    }
+
     /// The focused timeline's render boundary, created on first use.
     fn ensure_timeline_view(&mut self, cx: &mut Context<Self>) -> Entity<TimelineView> {
         if let Some(view) = self.timeline_view.as_ref() {
@@ -61287,7 +61471,7 @@ impl VibexWorkbench {
                 right_rail_width,
                 cx,
             );
-            let panel = self.render_right_rail_panel(window, cx);
+            let panel = self.render_right_rail_panel(cx);
             div()
                 .relative()
                 .flex()
@@ -61328,7 +61512,7 @@ impl VibexWorkbench {
                 right_rail_width,
                 cx,
             );
-            let panel = self.render_right_rail_panel(window, cx);
+            let panel = self.render_right_rail_panel(cx);
             div()
                 .absolute()
                 // Overlay panels start below the floating chrome too.
@@ -96867,6 +97051,89 @@ mod tests {
         assert!(refresh.contains(
             "self.load_delegated_page(None, root_page_has_more, DelegatedPageLoad::Background, cx);"
         ));
+    }
+
+    /// The child Agent rail owns its element tree.
+    ///
+    /// The rail paints whole child timelines with the timeline's own builders,
+    /// so it mounts their animations: the running label's shimmer, the thinking
+    /// indicator, disclosure springs. Built inline in the workbench's render,
+    /// every one of those pumps resolved to the workbench — whose notify
+    /// refreshes the sidebar, the primary timeline and every pane — so a child
+    /// Agent behind an open rail repainted the whole window, main timeline
+    /// included, on every display refresh.
+    #[test]
+    fn the_child_agent_rail_is_its_own_render_boundary() {
+        let source = include_str!("app.rs");
+        let view = source
+            .split_once("struct ChildAgentRailView {")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// Where a session tab would land inside a group workspace.")
+            })
+            .map(|(body, _)| body)
+            .expect("the child Agent rail's view should remain inspectable");
+        assert!(
+            view.contains("cx.observe(workbench, |_, _, cx| cx.notify()).detach();"),
+            "the rail renders workbench state, so it has to observe the workbench"
+        );
+        assert!(view.contains("this.render_child_agent_timeline_panel(window, cx)"));
+
+        let panel = source
+            .split_once(
+                "    fn render_right_rail_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {",
+            )
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The activity bar buttons in the reader's order.")
+            })
+            .map(|(body, _)| body)
+            .expect("the right rail panel should remain inspectable");
+        assert!(panel.contains("self.ensure_child_agent_rail_view(cx)"));
+        assert!(panel.contains(".cached(StyleRefinement::default().size_full())"));
+        // The rail may not be built inside the workbench's own render pass.
+        assert!(!panel.contains("self.render_child_agent_timeline_panel(window, cx)"));
+        let ensure = source
+            .split_once("    fn ensure_child_agent_rail_view(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn ensure_timeline_view("))
+            .map(|(body, _)| body)
+            .expect("the rail's view boundary should remain inspectable");
+        assert!(ensure.contains("self.child_agent_rail_view = Some(view.clone());"));
+    }
+
+    /// A borrowed view keeps its own Markdown surfaces, and evicts the coldest.
+    ///
+    /// The child Agent rail paints another session's timeline through the same
+    /// builders, so its surfaces used to share — and evict from — the parent's
+    /// table. A surface dropped while it is on screen is rebuilt the next frame,
+    /// and rebuilding a text view repaints it from scratch, so the row blinked
+    /// for as long as the rail was open.
+    #[test]
+    fn markdown_surface_owners_and_eviction_are_recency_ordered() {
+        let source = include_str!("app.rs");
+        let state = source
+            .split_once("    fn markdown_text_state(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The session whose timeline owns the Markdown surfaces")
+            })
+            .map(|(body, _)| body)
+            .expect("the Markdown surface store should remain inspectable");
+        assert!(state.contains("let owner = self.markdown_surface_owner();"));
+        assert!(state.contains("markdown_surface_entry(self, &owner, id)"));
+        assert!(state.contains("self.markdown_surface_table(&owner)"));
+        assert!(state.contains(".min_by_key(|(_, entry)| entry.last_painted)"));
+        // Key order is not a recency order: it dropped whatever sorted first.
+        assert!(!state.contains("find(|candidate| candidate.as_str() != id)"));
+
+        let owner = source
+            .split_once("    fn markdown_surface_owner(&self) -> MarkdownSurfaceOwner {")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The table a session's Markdown surfaces")
+            })
+            .map(|(body, _)| body)
+            .expect("the surface owner should remain inspectable");
+        assert!(
+            owner.contains("MarkdownSurfaceOwner::ChildAgent(session_id.as_str().to_string())")
+        );
+        assert!(owner.contains("MarkdownSurfaceOwner::BorrowedView"));
     }
 
     /// Every pane's timeline is its own virtual list.
