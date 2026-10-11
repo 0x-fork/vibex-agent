@@ -33,6 +33,12 @@ NativeBackend/WebRemoteBackend boundary.
   unconditional default: it saves power, but it freezes the window the user
   returns to. Record the preference in `AppearanceUiState` and apply it through
   `theme::apply_appearance`.
+- Per-frame work in a list does not scale with the selection. A derived value the
+  rows share — a drag payload, a batch command's state, a scope comparison — is
+  resolved once for the frame and keyed by the scope those rows share, never once
+  per painted row. A per-row resolution that rebuilds a projection costs
+  `rows × selection × projection` and drops a large multi-selection to
+  single-digit frame rates.
 
 ## Responsive Requirements
 
