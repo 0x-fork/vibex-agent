@@ -14680,7 +14680,16 @@ impl VibexWorkbench {
                 },
             ));
         }
-        self.load_delegated_page(None, false, DelegatedPageLoad::Background, cx);
+        // The root page is ownership metadata for rows the sidebar already
+        // lists, so it advances by itself instead of waiting behind a footer
+        // button: one page per pass keeps the background work flat while the
+        // tree fills in, and no reader has to page a list they can already
+        // see. Once the cursor is spent the pass refreshes the page it holds.
+        let root_page_has_more = self
+            .delegated_pages
+            .get(&None)
+            .is_some_and(|page| page.next_cursor.is_some());
+        self.load_delegated_page(None, root_page_has_more, DelegatedPageLoad::Background, cx);
         let parents: Vec<String> = self
             .delegated_pages
             .keys()
@@ -15158,8 +15167,20 @@ impl VibexWorkbench {
         depth: usize,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        if depth > 16 || self.delegated_branch_is_collapsed(parent_session_id) {
+        if depth > 16 {
             return Vec::new();
+        }
+        if self.delegated_branch_is_collapsed(parent_session_id) {
+            // The branch limit can refuse the branch a reader just asked for.
+            // That refusal is answered under the row that asked, where the
+            // disclosure was clicked; a branch nobody asked about stays silent.
+            if self.delegated_deferred_parent.as_deref() != Some(parent_session_id) {
+                return Vec::new();
+            }
+            return self
+                .render_delegated_page_action(parent_session_id, cx)
+                .into_iter()
+                .collect();
         }
         let children: Vec<SessionTreeNode> = self
             .delegated_children(parent_session_id)
@@ -15188,24 +15209,28 @@ impl VibexWorkbench {
                 elements.extend(self.render_delegated_subtree(&node.session_ref.id, depth + 1, cx));
             }
         }
-        if let Some(action) =
-            self.render_delegated_page_action(Some(parent_session_id.to_string()), cx)
-        {
+        if let Some(action) = self.render_delegated_page_action(parent_session_id, cx) {
             elements.push(action);
         }
         elements
     }
 
+    /// The one row a branch still owes its reader.
+    ///
+    /// A page in flight, a page that failed, a branch with more children to
+    /// read, or the refusal the branch limit produced. It is drawn inside the
+    /// branch it belongs to: root pagination has no row, because the root rows
+    /// are the sidebar's own session list and a footer button paging ownership
+    /// metadata behind them reads as a paged list that does nothing visible
+    /// when clicked.
     fn render_delegated_page_action(
         &self,
-        parent: Option<String>,
+        parent_session_id: &str,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (parent, loading, error, more) = if parent.is_none()
-            && let Some(deferred) = self.delegated_deferred_parent.as_ref()
-        {
+        let parent = Some(parent_session_id.to_string());
+        let (loading, error, more) = if self.delegated_deferred_parent == parent {
             (
-                Some(deferred.clone()),
                 false,
                 Some(
                     locale::text(
@@ -15222,12 +15247,7 @@ impl VibexWorkbench {
             if !page.loading && page.error.is_none() && page.next_cursor.is_none() {
                 return None;
             }
-            (
-                parent,
-                page.loading,
-                page.error.clone(),
-                page.next_cursor.is_some(),
-            )
+            (page.loading, page.error.clone(), page.next_cursor.is_some())
         };
         let label = if loading {
             locale::text("Loading sessions", "正在加载会话", "正在載入會話")
@@ -15248,22 +15268,23 @@ impl VibexWorkbench {
                     )
                 })
                 .child(
-                    Button::new(format!(
-                        "delegated-page-{}",
-                        parent.as_deref().unwrap_or("roots")
-                    ))
-                    .small()
-                    .ghost()
-                    .label(label)
-                    .disabled(loading)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.load_delegated_page(
-                            parent.clone(),
-                            more,
-                            DelegatedPageLoad::Interactive,
-                            cx,
-                        )
-                    })),
+                    Button::new(format!("delegated-page-{parent_session_id}"))
+                        .debug_selector({
+                            let id = parent_session_id.to_string();
+                            move || format!("delegated-page-{id}")
+                        })
+                        .small()
+                        .ghost()
+                        .label(label)
+                        .disabled(loading)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.load_delegated_page(
+                                parent.clone(),
+                                more,
+                                DelegatedPageLoad::Interactive,
+                                cx,
+                            )
+                        })),
                 )
                 .into_any_element(),
         )
@@ -38141,7 +38162,11 @@ impl VibexWorkbench {
                 self.selected_session()
                     .map(|session| session.workspace_id.as_str().to_string())
             });
-        let mut group_elements = self.render_sidebar_root_children(
+        // Ownership pages load in the background, one branch at a time under
+        // the row that owns them. The root page has no row here on purpose:
+        // these rows are the complete session list already, so a footer pager
+        // would page metadata nobody can see rather than more sessions.
+        let group_elements = self.render_sidebar_root_children(
             &groups,
             None,
             selected_workspace_id,
@@ -38150,9 +38175,6 @@ impl VibexWorkbench {
             0,
             cx,
         );
-        if let Some(action) = self.render_delegated_page_action(None, cx) {
-            group_elements.push(action);
-        }
         let selected_count = self.sidebar_state.selected_ids.len();
         let group_creation = self.sidebar_group_creation_candidates();
         let total_count = self.sessions.len();
@@ -95154,6 +95176,34 @@ mod tests {
             .expect("the avatar stack should follow the chevron");
         assert!(chevron < avatars);
         assert!(!group_row.contains(".px_2()\n                    .child(\n                        div().flex_none().size(px(14.0))"));
+    }
+
+    /// The sidebar footer is not an ownership pager.
+    ///
+    /// The root page describes sessions the sidebar already lists, and the
+    /// background pass advances it one page at a time, so the root column has
+    /// nothing to page: a full-width "Load more sessions" button under the
+    /// project list read as a paged session list and did nothing visible when
+    /// clicked. Branch pages keep their row, drawn inside the branch.
+    #[test]
+    fn sidebar_root_column_carries_no_delegated_pager() {
+        let source = include_str!("app.rs");
+        let sidebar = source
+            .split_once("    fn render_agent_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_toolbar_more_menu("))
+            .map(|(body, _)| body)
+            .expect("sidebar renderer should remain inspectable");
+        assert!(!sidebar.contains("render_delegated_page_action"));
+        assert!(sidebar.contains("let group_elements = self.render_sidebar_root_children("));
+
+        let refresh = source
+            .split_once("    fn refresh_delegated_sessions(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn delegated_branch_hidden("))
+            .map(|(body, _)| body)
+            .expect("delegated refresh should remain inspectable");
+        assert!(refresh.contains(
+            "self.load_delegated_page(None, root_page_has_more, DelegatedPageLoad::Background, cx);"
+        ));
     }
 
     /// Every pane's timeline is its own virtual list.

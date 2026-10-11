@@ -1059,6 +1059,104 @@ fn team_background_page_refresh_never_borrows_the_loading_row(cx: &mut TestAppCo
     });
 }
 
+/// The pager is not a sidebar footer.
+///
+/// The root page pages ownership metadata for sessions the sidebar already
+/// lists, so it draws no row of its own: a full-width "Load more sessions"
+/// button under the project list read as a paged session list and did nothing
+/// visible when clicked. A branch still pages under the row that owns it, and
+/// a branch the branch limit refused is answered in the same place.
+#[gpui::test]
+fn team_delegated_pager_stays_under_its_branch(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 4);
+    workbench.update(cx, |workbench, _| {
+        workbench
+            .delegated_tree
+            .insert(session(1).id.to_string(), node(1, Some(0), 0));
+        workbench.delegated_pages.insert(
+            Some(session(0).id.to_string()),
+            DelegatedBranchPage {
+                session_ids: vec![session(1).id.to_string()],
+                next_cursor: Some("cursor_branch".into()),
+                ..Default::default()
+            },
+        );
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("delegated-page-session_team_0").is_some(),
+        "a branch still pages under its own row"
+    );
+
+    // The branch limit refuses a branch by name, and the reader who asked for
+    // it is told under that row instead of in a sidebar footer.
+    workbench.update(cx, |workbench, cx| {
+        workbench
+            .delegated_pages
+            .remove(&Some(session(0).id.to_string()));
+        workbench.delegated_deferred_parent = Some(session(0).id.to_string());
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("delegated-page-session_team_0").is_some(),
+        "the refusal belongs under the row that asked for the branch"
+    );
+}
+
+/// One root page per background pass, with no button to press.
+///
+/// The pass used to re-read page one forever, so a tree with more roots than a
+/// page kept the cursor set and the sidebar kept offering to load rows that
+/// were already on screen. Following the cursor is what retires that row and
+/// what puts the ownership metadata behind the later roots in place.
+#[gpui::test]
+async fn team_root_page_advances_in_the_background_without_a_footer_pager(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, DELEGATED_TREE_PAGE_SIZE + 1);
+    let (runtime, _home) = attach_team_runtime(&workbench, cx).await;
+    let backend = Arc::new(NativeBackend::new(runtime.clone())).facade();
+    workbench.update(cx, |workbench, cx| {
+        workbench.backend = Some(backend);
+        workbench.refresh_delegated_sessions(cx);
+    });
+    let root_page_settled = |workbench: &VibexWorkbench| {
+        workbench
+            .delegated_pages
+            .get(&None)
+            .is_some_and(|page| !page.in_flight && !page.session_ids.is_empty())
+    };
+    cx.condition(&workbench, |workbench, _| root_page_settled(workbench))
+        .await;
+    workbench.read_with(cx, |workbench, _| {
+        let page = &workbench.delegated_pages[&None];
+        assert_eq!(page.session_ids.len(), DELEGATED_TREE_PAGE_SIZE);
+        assert!(page.next_cursor.is_some(), "one root is still unread");
+    });
+    // The state the footer used to speak from: one page in hand, one to go.
+    draw(cx);
+    assert!(
+        cx.debug_bounds("delegated-page-roots").is_none(),
+        "an unspent root cursor draws no sidebar footer"
+    );
+    workbench.update(cx, |workbench, cx| workbench.refresh_delegated_sessions(cx));
+    cx.condition(&workbench, |workbench, _| {
+        root_page_settled(workbench) && workbench.delegated_pages[&None].next_cursor.is_none()
+    })
+    .await;
+    workbench.read_with(cx, |workbench, _| {
+        assert_eq!(
+            workbench.delegated_pages[&None].session_ids.len(),
+            DELEGATED_TREE_PAGE_SIZE + 1,
+            "the next pass reads the page the cursor points at"
+        );
+    });
+    cx.update(|_, cx| {
+        gpui_tokio::Tokio::spawn(cx, async move { runtime.shutdown().await.unwrap() })
+    })
+    .await
+    .unwrap();
+}
+
 #[gpui::test]
 fn team_hidden_tabs_materialize_only_the_four_live_conversations(cx: &mut TestAppContext) {
     let (workbench, cx, receiver) = fixture(cx, 64);

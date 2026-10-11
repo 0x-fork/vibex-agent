@@ -696,6 +696,15 @@ title out of column for a toggle that expanded to nothing. The disclosure
 reappears on the parent's row as soon as the branch loads, which opening any of
 its children already does.
 
+The ownership tree behind those disclosures pages itself, and the sidebar never
+pages it on the reader's behalf. The root page describes sessions the session
+list already holds, so it advances one page per background pass and draws no
+row: a "Load more sessions" button in the footer read as a paged session list
+and did nothing visible when clicked, and it stayed there for as long as the
+tree had more roots than one page. A branch draws its page row — loading, retry,
+more children, or the refusal the branch limit produced — inside the branch,
+under the row the reader asked from.
+
 The running cue also reaches the session title: a sidebar row whose session is
 generating sweeps the title through `ShimmerText` at the shared timeline
 duration and spread, so the pulse in the status column and the light on the text
