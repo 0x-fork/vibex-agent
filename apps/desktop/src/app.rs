@@ -33334,30 +33334,86 @@ impl VibexWorkbench {
     /// page can put it back. The row is dropped optimistically and only
     /// restored when the mutation fails.
     fn archive_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
-        if self
-            .pending_session_archive_ids
-            .contains(session_id.as_str())
-        {
+        self.begin_session_archive(vec![session_id], cx);
+    }
+
+    /// Archives every session a right click or the batch bar selected.
+    ///
+    /// The rows leave the sidebar the way a deletion takes them, so the
+    /// selection those rows were part of stops with them. Archive is
+    /// reversible, so nothing is confirmed here: the archived page is where a
+    /// mistaken archive is undone.
+    fn archive_sessions(&mut self, session_ids: Vec<String>, cx: &mut Context<Self>) {
+        self.sidebar_batch_mode = false;
+        self.sidebar_state.clear_selection();
+        self.clear_sidebar_move_selection();
+        let session_ids = session_ids
+            .into_iter()
+            .filter_map(|session_id| VibexSessionId::parse(&session_id).ok())
+            .collect::<Vec<_>>();
+        self.begin_session_archive(session_ids, cx);
+    }
+
+    /// Archives every session the batch bar holds.
+    fn archive_selected_sessions(&mut self, cx: &mut Context<Self>) {
+        let session_ids = self
+            .sidebar_state
+            .selected_ids
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.archive_sessions(session_ids, cx);
+    }
+
+    /// Archives the named sessions and drops their rows optimistically.
+    ///
+    /// The rows leave before the runtime answers; a failure reconciles the list
+    /// back, and a success refreshes the page that holds what was archived.
+    fn begin_session_archive(&mut self, session_ids: Vec<VibexSessionId>, cx: &mut Context<Self>) {
+        let session_ids = session_ids
+            .into_iter()
+            .filter(|session_id| {
+                !self
+                    .pending_session_archive_ids
+                    .contains(session_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        if session_ids.is_empty() {
+            cx.notify();
             return;
         }
         let Some(backend) = self.backend.clone() else {
+            cx.notify();
             return;
         };
-        let session_ids = BTreeSet::from([session_id.as_str().to_string()]);
+        let session_id_set = session_ids
+            .iter()
+            .map(|session_id| session_id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
         self.pending_session_archive_ids
-            .extend(session_ids.iter().cloned());
-        self.optimistically_remove_sessions(&session_ids);
+            .extend(session_id_set.iter().cloned());
+        self.optimistically_remove_sessions(&session_id_set);
         self.queue_agent_ui_state();
         cx.notify();
         let generation = self.session_generation;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            backend
-                .agent()
-                .archive_session(MutationRequest::new(session_id.clone()))
-                .await
-                .map_err(remote_error_into_vibex)
+            let mut first_error = None;
+            for session_id in session_ids {
+                if let Err(error) = backend
+                    .agent()
+                    .archive_session(MutationRequest::new(session_id))
+                    .await
+                    && first_error.is_none()
+                {
+                    first_error = Some(remote_error_into_vibex(error));
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            Ok::<(), vibex_core::VibexError>(())
         });
-        self.finish_optimistic_session_archive(generation, session_ids, runner, cx);
+        self.finish_optimistic_session_archive(generation, session_id_set, runner, cx);
     }
 
     fn finish_optimistic_session_archive(
@@ -38618,18 +38674,31 @@ impl VibexWorkbench {
                                         })),
                                 )
                                 .child(
-                                    Button::new("sidebar-delete-selected")
+                                    Button::new("sidebar-archive-selected")
                                         .small()
-                                        .danger()
+                                        .secondary()
                                         .flex_1()
                                         .justify_center()
-                                        .icon(sidebar_icon("icons/vibex/trash-2.svg"))
-                                        .label(strings.sidebar_delete_selected)
+                                        .icon(sidebar_icon("icons/vibex/package.svg"))
+                                        .label(strings.sidebar_archive_selected)
                                         .disabled(selected_count == 0)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.confirm_delete_selected_sessions(window, cx)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.archive_selected_sessions(cx)
                                         })),
                                 ),
+                        )
+                        .child(
+                            Button::new("sidebar-delete-selected")
+                                .small()
+                                .danger()
+                                .w_full()
+                                .justify_center()
+                                .icon(sidebar_icon("icons/vibex/trash-2.svg"))
+                                .label(strings.sidebar_delete_selected)
+                                .disabled(selected_count == 0)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_delete_selected_sessions(window, cx)
+                                })),
                         ),
                 )
             })
@@ -43733,6 +43802,7 @@ impl VibexWorkbench {
         let context_pin_id = session.id.clone();
         let context_rename_id = session.id.clone();
         let context_fork_id = session.id.clone();
+        let context_archive_id = session.id.clone();
         let context_delete_id = session.id.clone();
         // Every value below describes the rows the menu would act on: the whole
         // shift/ctrl selection when the right click landed inside one, and this
@@ -43760,6 +43830,17 @@ impl VibexWorkbench {
                 .iter()
                 .all(|session_id| self.pending_session_deletion_ids.contains(session_id))
         });
+        // An archive already in flight has nothing to do with a second click, so
+        // the item follows the clicked row and the selection it stands for.
+        let session_archive_pending = self
+            .pending_session_archive_ids
+            .contains(session.id.as_str());
+        let batch_archive_pending = batch_session_ids.as_ref().is_some_and(|session_ids| {
+            session_ids
+                .iter()
+                .all(|session_id| self.pending_session_archive_ids.contains(session_id))
+        });
+        let archive_pending = session_archive_pending || batch_archive_pending;
         // A fork holds the same window-wide action lock every other Agent
         // mutation does, and a row already being deleted has nothing worth
         // forking, so the item follows both states.
@@ -43792,6 +43873,7 @@ impl VibexWorkbench {
             "恢復自動繼續",
         ));
         let fork_label = batch_label(locale::text("Fork session", "分叉会话", "分支會話"));
+        let archive_label = batch_label(locale::text("Archive", "归档", "封存"));
         let delete_label = batch_label(strings.sidebar_delete);
         let pin_label = {
             // The selection's own pin state decides the verb: a batch that is
@@ -44187,6 +44269,9 @@ impl VibexWorkbench {
                         let fork_entity = context_entity.clone();
                         let fork_id = context_fork_id.clone();
                         let fork_targets = batch_ids.clone();
+                        let archive_entity = context_entity.clone();
+                        let archive_id = context_archive_id.clone();
+                        let archive_targets = batch_ids.clone();
                         let delete_entity = context_entity.clone();
                         let delete_id = context_delete_id.clone();
                         let delete_targets = batch_ids.clone();
@@ -44427,6 +44512,22 @@ impl VibexWorkbench {
                                                     window,
                                                     cx,
                                                 ),
+                                            }
+                                        });
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new(archive_label.clone())
+                                    .icon(sidebar_icon("icons/vibex/package.svg"))
+                                    .disabled(archive_pending)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = archive_entity.update(cx, |this, cx| {
+                                            match archive_targets.clone() {
+                                                Some(session_ids) => {
+                                                    this.archive_sessions(session_ids, cx)
+                                                }
+                                                None => this
+                                                    .archive_session(archive_id.clone(), cx),
                                             }
                                         });
                                     }),
@@ -83237,6 +83338,31 @@ mod tests {
         assert!(context.contains("session_deletion_pending"));
     }
 
+    /// The row menu archives without destroying: the item is the reversible
+    /// half of the delete below it, and a right click inside a shift/ctrl
+    /// selection archives that selection instead of the clicked row alone.
+    #[test]
+    fn sidebar_session_menu_archives_the_row_or_the_selection() {
+        let source = include_str!("app.rs");
+        let session = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("session row renderer should remain inspectable");
+        let archive = session
+            .split_once("PopupMenuItem::new(archive_label")
+            .and_then(|(_, tail)| tail.split_once("PopupMenuItem::new(delete_label"))
+            .map(|(body, _)| body)
+            .expect("the sidebar archive item should remain inspectable");
+
+        assert!(archive.contains(".icon(sidebar_icon(\"icons/vibex/package.svg\"))"));
+        assert!(archive.contains(".disabled(archive_pending)"));
+        assert!(archive.contains("archive_targets.clone()"));
+        assert!(archive.contains("Some(session_ids) => {"));
+        assert!(archive.contains("this.archive_sessions(session_ids, cx)"));
+        assert!(archive.contains(".archive_session(archive_id.clone(), cx)"));
+    }
+
     /// A right click inside a shift/ctrl selection makes every session command
     /// act on the whole selection, and the commands that cannot speak for a
     /// selection leave the menu.
@@ -83256,6 +83382,7 @@ mod tests {
             "resume_auto_continue_for_sessions(",
             ".set_sessions_pinned(",
             "fork_sessions_at(",
+            "archive_sessions(",
             "confirm_delete_sessions(",
         ] {
             assert!(
@@ -92536,6 +92663,29 @@ mod tests {
         assert!(batch.contains(".icon(IconName::Close)"));
         assert!(batch.contains(".tooltip(strings.sidebar_exit_batch)"));
         assert!(batch.contains("this.toggle_sidebar_batch_mode(cx)"));
+    }
+
+    /// The batch bar archives everything the checkboxes hold. The item sits
+    /// with the selection controls, and the destructive lane keeps its own row
+    /// at the bottom of the bar.
+    #[test]
+    fn sidebar_batch_bar_archives_the_selection() {
+        let source = include_str!("app.rs");
+        let sidebar = source
+            .split_once("    fn render_agent_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_toolbar_more_menu("))
+            .map(|(body, _)| body)
+            .expect("sidebar renderer should remain inspectable");
+        let archive = sidebar
+            .split_once("Button::new(\"sidebar-archive-selected\")")
+            .and_then(|(_, tail)| tail.split_once("Button::new(\"sidebar-delete-selected\")"))
+            .map(|(body, _)| body)
+            .expect("the batch bar should offer archiving the selection");
+
+        assert!(archive.contains(".icon(sidebar_icon(\"icons/vibex/package.svg\"))"));
+        assert!(archive.contains(".label(strings.sidebar_archive_selected)"));
+        assert!(archive.contains(".disabled(selected_count == 0)"));
+        assert!(archive.contains("this.archive_selected_sessions(cx)"));
     }
 
     #[test]
