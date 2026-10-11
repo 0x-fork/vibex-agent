@@ -3742,6 +3742,21 @@ fn timeline_virtual_rows_need_rebuild(turn_count: usize, row_size_count: usize) 
     turn_count != row_size_count
 }
 
+/// The timeline item recorded at `sequence`.
+///
+/// Rows name at most the first and last item they folded, and both the
+/// borrowed view and a child Agent's timeline keep their items ordered by
+/// sequence, so a row resolves its payload with a binary search instead of a
+/// scan. Callers that need the item to really be one the row names still have
+/// to check the id.
+fn timeline_item_at_sequence(
+    items: &[vibex_core::TimelineItem],
+    sequence: i64,
+) -> Option<&vibex_core::TimelineItem> {
+    let index = items.partition_point(|item| item.sequence < sequence);
+    items.get(index).filter(|item| item.sequence == sequence)
+}
+
 /// Position lookup for `TimelineModel::items` keyed by item id.
 ///
 /// Row/turn renderers resolve payloads from item ids on every frame; a linear
@@ -3764,6 +3779,53 @@ struct ChildAgentTimelineState {
     loading: bool,
     error: Option<String>,
     load_generation: u64,
+    projection: ChildAgentProjection,
+}
+
+/// The child Agent projections the rail last handed out.
+///
+/// Projecting a child's timeline folds every item it holds — tens of thousands
+/// of them for a long subagent run — and both the rail and a delegation card's
+/// preview used to redo that fold on every frame, including the frames that
+/// changed nothing at all. Each half is kept with the content it was built
+/// from, so a repaint that did not move the timeline reuses it, and a caller
+/// that reads only one half never pays for the other.
+#[derive(Default)]
+struct ChildAgentProjection {
+    rows: Option<(
+        ChildAgentProjectionKey,
+        Rc<Vec<ChildAgentTimelineRowProjection>>,
+    )>,
+    turns: Option<(ChildAgentTurnsKey, Rc<Vec<Rc<TimelineConversationTurn>>>)>,
+}
+
+/// The timeline content a projection was built from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ChildAgentProjectionKey {
+    revision: u64,
+    item_count: usize,
+    end_sequence: Option<i64>,
+}
+
+/// What a turn projection additionally depends on: the session state decides
+/// which turn still streams, and the display mode decides which rows survive.
+#[derive(Clone, PartialEq, Eq)]
+struct ChildAgentTurnsKey {
+    content: ChildAgentProjectionKey,
+    session_state: Option<AgentSessionState>,
+    pending_turn_active: bool,
+    reasoning_display_mode: ReasoningDisplayMode,
+}
+
+/// Which half of a child Agent's projection a caller reads.
+///
+/// The rail renders turns and only falls back to rows when there is no turn to
+/// show; a delegation card's preview renders the newest rows and never looks at
+/// turns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChildAgentSnapshotParts {
+    Rows,
+    Turns,
 }
 
 impl ChildAgentTimelineState {
@@ -3777,7 +3839,101 @@ impl ChildAgentTimelineState {
             loading: false,
             error: None,
             load_generation: 0,
+            projection: ChildAgentProjection::default(),
         }
+    }
+
+    fn projection_key(&self) -> ChildAgentProjectionKey {
+        ChildAgentProjectionKey {
+            revision: self.timeline.revision,
+            item_count: self.timeline.items.len(),
+            end_sequence: self.timeline.authoritative_end_sequence,
+        }
+    }
+
+    fn turns_key(&self, reasoning_display_mode: ReasoningDisplayMode) -> ChildAgentTurnsKey {
+        let session_state = self.session.as_ref().map(|session| session.state);
+        ChildAgentTurnsKey {
+            content: self.projection_key(),
+            session_state,
+            pending_turn_active: matches!(session_state, Some(AgentSessionState::Running)),
+            reasoning_display_mode,
+        }
+    }
+
+    /// The child's rows, folded once per content change.
+    fn rows_projection(&mut self) -> Rc<Vec<ChildAgentTimelineRowProjection>> {
+        let key = self.projection_key();
+        if let Some((cached_key, rows)) = self.projection.rows.as_ref()
+            && *cached_key == key
+        {
+            return rows.clone();
+        }
+        let rows = Rc::new(
+            self.timeline
+                .rows()
+                .into_iter()
+                .map(|row| ChildAgentTimelineRowProjection {
+                    delegation: timeline_row_delegation(&row, &self.timeline.items),
+                    row,
+                })
+                .collect::<Vec<_>>(),
+        );
+        self.projection.rows = Some((key, rows.clone()));
+        rows
+    }
+
+    /// The child's turns, projected once per content, state or display change.
+    fn turns_projection(
+        &mut self,
+        reasoning_display_mode: ReasoningDisplayMode,
+    ) -> Rc<Vec<Rc<TimelineConversationTurn>>> {
+        let key = self.turns_key(reasoning_display_mode);
+        if let Some((cached_key, turns)) = self.projection.turns.as_ref()
+            && *cached_key == key
+        {
+            return turns.clone();
+        }
+        let turns = Rc::new(
+            timeline_conversation_turns_with_reasoning_mode(
+                &self.timeline.items,
+                key.session_state,
+                key.pending_turn_active,
+                key.reasoning_display_mode,
+            )
+            .into_iter()
+            .map(Rc::new)
+            .collect::<Vec<_>>(),
+        );
+        self.projection.turns = Some((key, turns.clone()));
+        turns
+    }
+}
+
+/// Reads one child Agent session as the caller asked for it.
+///
+/// Only [`ChildAgentSnapshotParts::Rows`] or [`ChildAgentSnapshotParts::Turns`]
+/// is projected; the other half is handed back empty. A caller that renders
+/// turns — the rail, on every frame — must not pay for the row fold it never
+/// reads, and a delegation preview must not pay for the turn projection.
+fn child_agent_snapshot_from_state(
+    state: &mut ChildAgentTimelineState,
+    parts: ChildAgentSnapshotParts,
+    reasoning_display_mode: ReasoningDisplayMode,
+) -> ChildAgentTimelineSnapshot {
+    let (rows, turns) = match parts {
+        ChildAgentSnapshotParts::Rows => (state.rows_projection(), Rc::new(Vec::new())),
+        ChildAgentSnapshotParts::Turns => (
+            Rc::new(Vec::new()),
+            state.turns_projection(reasoning_display_mode),
+        ),
+    };
+    ChildAgentTimelineSnapshot {
+        loading: state.loading,
+        loaded: state.loaded,
+        error: state.error.clone(),
+        rows,
+        turns,
     }
 }
 
@@ -3791,8 +3947,11 @@ struct ChildAgentTimelineSnapshot {
     loading: bool,
     loaded: bool,
     error: Option<String>,
-    rows: Vec<ChildAgentTimelineRowProjection>,
-    turns: Vec<TimelineConversationTurn>,
+    /// Empty unless the caller asked for rows.
+    rows: Rc<Vec<ChildAgentTimelineRowProjection>>,
+    /// Empty unless the caller asked for turns; shared with the cache, so a
+    /// frame that changed nothing does not copy the child's conversation.
+    turns: Rc<Vec<Rc<TimelineConversationTurn>>>,
 }
 
 impl TimelineItemIndex {
@@ -20821,35 +20980,25 @@ impl VibexWorkbench {
         ));
     }
 
+    /// What the rail and a delegation preview read of one child Agent session.
+    ///
+    /// Only the half the caller names is projected, and each half is kept with
+    /// the content it was folded from: a long subagent run holds tens of
+    /// thousands of items, and re-folding them on every frame — for a rail that
+    /// often has not moved since the previous one — was the single most
+    /// expensive thing a repaint did. See [`ChildAgentProjection`].
     fn child_agent_timeline_snapshot(
-        &self,
+        &mut self,
         session_id: &VibexSessionId,
+        parts: ChildAgentSnapshotParts,
     ) -> Option<ChildAgentTimelineSnapshot> {
-        self.child_agent_timelines
-            .get(session_id.as_str())
-            .map(|state| {
-                let session_state = state.session.as_ref().map(|session| session.state);
-                ChildAgentTimelineSnapshot {
-                    loading: state.loading,
-                    loaded: state.loaded,
-                    error: state.error.clone(),
-                    rows: state
-                        .timeline
-                        .rows()
-                        .into_iter()
-                        .map(|row| ChildAgentTimelineRowProjection {
-                            delegation: timeline_row_delegation(&row, &state.timeline.items),
-                            row,
-                        })
-                        .collect(),
-                    turns: timeline_conversation_turns_with_reasoning_mode(
-                        &state.timeline.items,
-                        session_state,
-                        matches!(session_state, Some(AgentSessionState::Running)),
-                        self.ui_state.session.reasoning_display_mode,
-                    ),
-                }
-            })
+        let reasoning_display_mode = self.ui_state.session.reasoning_display_mode;
+        let state = self.child_agent_timelines.get_mut(session_id.as_str())?;
+        Some(child_agent_snapshot_from_state(
+            state,
+            parts,
+            reasoning_display_mode,
+        ))
     }
 
     fn ensure_child_agent_timeline(
@@ -52269,7 +52418,9 @@ impl VibexWorkbench {
         let card_id = format!("{surface_id}:delegation-card:{}", row.id);
         let toggle_id = format!("{card_id}:toggle");
         let preview_snapshot = if expanded {
-            self.child_agent_timeline_snapshot(&child_session_id)
+            // The preview reads the newest rows of the child's timeline and
+            // never its turns, so it asks for rows alone.
+            self.child_agent_timeline_snapshot(&child_session_id, ChildAgentSnapshotParts::Rows)
         } else {
             None
         };
@@ -52622,12 +52773,11 @@ impl VibexWorkbench {
         } else {
             Default::default()
         };
-        let rows = snapshot.rows.into_iter().skip(start).collect::<Vec<_>>();
         v_flex()
             .w_full()
             .min_w_0()
             .gap(if compact { px(2.0) } else { px(6.0) })
-            .children(rows.iter().map(|row| {
+            .children(snapshot.rows.iter().skip(start).map(|row| {
                 self.render_child_agent_timeline_row(row, surface_id, compact, nesting, cx)
             }))
             .into_any_element()
@@ -52641,13 +52791,14 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if snapshot.error.is_some() || snapshot.turns.is_empty() {
-            return self.render_child_agent_timeline_content(
-                snapshot,
-                &format!("child-agent-panel:{}", session_id.as_str()),
-                false,
-                0,
-                cx,
-            );
+            // Nothing to render as a turn, so the rail falls back to the rows
+            // it deliberately did not project: a timeline holding only
+            // runtime notices has rows and no turn.
+            let surface_id = format!("child-agent-panel:{}", session_id.as_str());
+            let snapshot = self
+                .child_agent_timeline_snapshot(session_id, ChildAgentSnapshotParts::Rows)
+                .unwrap_or(snapshot);
+            return self.render_child_agent_timeline_content(snapshot, &surface_id, false, 0, cx);
         }
         let turns = snapshot.turns;
         let turn_count = turns.len();
@@ -52678,9 +52829,9 @@ impl VibexWorkbench {
             .clone()
             .filter(|session_id| tabs.contains(session_id))
             .or_else(|| tabs.last().cloned());
-        let active_snapshot = active_session_id
-            .as_ref()
-            .and_then(|session_id| self.child_agent_timeline_snapshot(session_id));
+        let active_snapshot = active_session_id.as_ref().and_then(|session_id| {
+            self.child_agent_timeline_snapshot(session_id, ChildAgentSnapshotParts::Turns)
+        });
         let tab_elements = tabs
             .into_iter()
             .map(|session_id| {
@@ -53292,12 +53443,29 @@ impl VibexWorkbench {
 
     fn timeline_row_latest_item(&self, row: &TimelineRow) -> Option<&vibex_core::TimelineItem> {
         if self.rendering_child_agent_timeline() {
+            // A child Agent's timeline is read through the rail rather than
+            // through a borrowed view, so it has no item index behind it. Its
+            // items are ordered by sequence and a row keeps the sequences of
+            // the two items it can name, so the newest item behind the row is
+            // resolved by binary search instead of by scanning the child's
+            // whole timeline once per row — which is quadratic work on exactly
+            // the long subagent runs the rail exists to show.
             let timeline = self.active_timeline();
-            return row
-                .item_ids
-                .iter()
-                .filter_map(|id| timeline.items.iter().find(|item| item.id.as_str() == id))
-                .max_by_key(|item| item.sequence);
+            let referenced = |item: &&vibex_core::TimelineItem| {
+                row.item_ids.iter().any(|id| id == item.id.as_str())
+            };
+            return timeline_item_at_sequence(&timeline.items, row.last_sequence)
+                .filter(referenced)
+                .or_else(|| {
+                    timeline_item_at_sequence(&timeline.items, row.first_sequence)
+                        .filter(referenced)
+                })
+                .or_else(|| {
+                    row.item_ids
+                        .iter()
+                        .filter_map(|id| timeline.items.iter().find(|item| item.id.as_str() == id))
+                        .max_by_key(|item| item.sequence)
+                });
         }
         self.sync_timeline_item_index();
         let index = self.timeline_item_index.borrow();
@@ -83937,6 +84105,178 @@ mod tests {
         assert!(completion.contains("if should_reconcile {"));
         assert!(!completion.contains("this.agent_action_pending = false;"));
         assert!(completion.contains("this.load_agent_overview(cx);"));
+    }
+
+    fn child_agent_session(session_id: &VibexSessionId, state: AgentSessionState) -> AgentSession {
+        AgentSession {
+            id: session_id.clone(),
+            title: "Child Agent".into(),
+            project_id: ProjectId::new(),
+            workspace_id: WorkspaceId::new(),
+            workspace_root: "/tmp/vibex-child-agent".into(),
+            workspace_mode: WorkspaceMode::CurrentCheckout,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            last_message_at_ms: 2,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        }
+    }
+
+    /// A child Agent's timeline is folded from every item the child holds, and
+    /// a subagent run reaches tens of thousands of them. The rail renders on
+    /// every streamed chunk of every session, so the fold has to be reused
+    /// until the child's own content moves.
+    #[test]
+    fn child_agent_projection_is_reused_until_the_timeline_changes() {
+        let session_id = VibexSessionId::parse("session_child_projection").expect("session id");
+        let mut state = ChildAgentTimelineState::new(session_id.clone());
+        state.session = Some(child_agent_session(&session_id, AgentSessionState::Idle));
+        state.timeline.replace_authoritative(
+            session_id.clone(),
+            [
+                timeline_item_with_payload(
+                    &session_id,
+                    1,
+                    TimelineSource::User,
+                    TimelinePayload::UserMessage(UserMessagePayload {
+                        text: "read the readme".into(),
+                        ..Default::default()
+                    }),
+                ),
+                timeline_item_with_payload(
+                    &session_id,
+                    2,
+                    TimelineSource::Agent,
+                    TimelinePayload::AgentMessage(AgentMessagePayload {
+                        text: "done".into(),
+                        is_final: true,
+                    }),
+                ),
+            ],
+        );
+
+        let first = state.turns_projection(ReasoningDisplayMode::LatestAtBottom);
+        let second = state.turns_projection(ReasoningDisplayMode::LatestAtBottom);
+        assert_eq!(first.len(), 1);
+        assert!(Rc::ptr_eq(&first, &second));
+
+        state.timeline.apply_live(TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: 3,
+            item: timeline_item_with_payload(
+                &session_id,
+                3,
+                TimelineSource::Agent,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "checking".into(),
+                    is_final: false,
+                }),
+            ),
+        });
+        let streamed = state.turns_projection(ReasoningDisplayMode::LatestAtBottom);
+        assert!(!Rc::ptr_eq(&first, &streamed));
+
+        // The rows half answers a different question and keeps its own key, so
+        // a rail that never asked for rows still has none cached.
+        assert!(state.rows_projection().len() >= 2);
+        assert!(state.projection.rows.is_some());
+    }
+
+    /// The rail renders turns and a delegation preview renders rows. Folding
+    /// the other half cost as much as the half being read.
+    #[test]
+    fn child_agent_snapshot_projects_only_the_half_that_was_asked_for() {
+        let session_id = VibexSessionId::parse("session_child_parts").expect("session id");
+        let mut state = ChildAgentTimelineState::new(session_id.clone());
+        state.session = Some(child_agent_session(&session_id, AgentSessionState::Idle));
+        state.timeline.replace_authoritative(
+            session_id.clone(),
+            [timeline_item_with_payload(
+                &session_id,
+                1,
+                TimelineSource::Agent,
+                TimelinePayload::AgentMessage(AgentMessagePayload {
+                    text: "done".into(),
+                    is_final: true,
+                }),
+            )],
+        );
+
+        let turns = child_agent_snapshot_from_state(
+            &mut state,
+            ChildAgentSnapshotParts::Turns,
+            ReasoningDisplayMode::LatestAtBottom,
+        );
+        assert_eq!(turns.turns.len(), 1);
+        assert!(turns.rows.is_empty());
+        assert!(state.projection.rows.is_none());
+
+        let rows = child_agent_snapshot_from_state(
+            &mut state,
+            ChildAgentSnapshotParts::Rows,
+            ReasoningDisplayMode::LatestAtBottom,
+        );
+        assert_eq!(rows.rows.len(), 1);
+        assert!(rows.turns.is_empty());
+    }
+
+    #[test]
+    fn timeline_item_at_sequence_finds_only_the_item_at_that_sequence() {
+        let session_id = VibexSessionId::parse("session_sequence_lookup").expect("session id");
+        let items = [3, 5, 8]
+            .into_iter()
+            .map(|sequence| {
+                timeline_item_with_payload(
+                    &session_id,
+                    sequence,
+                    TimelineSource::Agent,
+                    TimelinePayload::AgentMessage(AgentMessagePayload {
+                        text: format!("item {sequence}"),
+                        is_final: true,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            timeline_item_at_sequence(&items, 5).map(|item| item.sequence),
+            Some(5)
+        );
+        assert!(timeline_item_at_sequence(&items, 4).is_none());
+        assert!(timeline_item_at_sequence(&items, 9).is_none());
+        assert!(timeline_item_at_sequence(&items, 0).is_none());
+    }
+
+    /// The rail must ask for the turns it renders and the preview for the rows
+    /// it renders: reading the wrong half is what made the panel re-fold a
+    /// child's whole timeline on every frame.
+    #[test]
+    fn child_agent_surfaces_request_the_projection_half_they_render() {
+        let source = include_str!("app.rs");
+        let rail = source
+            .split_once("    fn render_child_agent_timeline_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_timeline_row("))
+            .map(|(body, _)| body)
+            .expect("child Agent rail should remain inspectable");
+        assert!(rail.contains("ChildAgentSnapshotParts::Turns"));
+
+        let preview = source
+            .split_once("    fn render_agent_delegation_card(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_child_agent_timeline_row("))
+            .map(|(body, _)| body)
+            .expect("delegation card should remain inspectable");
+        assert!(preview.contains("ChildAgentSnapshotParts::Rows"));
+
+        let fallback = source
+            .split_once("    fn render_child_agent_full_timeline(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_child_agent_timeline_panel("))
+            .map(|(body, _)| body)
+            .expect("child Agent full timeline should remain inspectable");
+        assert!(fallback.contains("ChildAgentSnapshotParts::Rows"));
     }
 
     #[test]

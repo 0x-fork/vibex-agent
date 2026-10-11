@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{
@@ -843,17 +843,21 @@ fn consistent_row_runtime_attribution(rows: &[TimelineRow]) -> Option<String> {
 /// later turn may reuse an id (a provider that numbers its calls from one), so
 /// a row that belongs to a turn is only ever folded with its own.
 fn compact_process_rows(rows: Vec<TimelineRow>, items: &[&TimelineItem]) -> Vec<TimelineRow> {
+    // Both tables are keyed by borrowed text: the projection runs on every
+    // streaming update over a timeline that can hold tens of thousands of
+    // items, and owning a `String` per item per table cost more than the fold
+    // that built the rows in the first place.
     let items_by_id = items
         .iter()
         .copied()
-        .map(|item| (item.id.to_string(), item))
-        .collect::<BTreeMap<_, _>>();
+        .map(|item| (item.id.as_str(), item))
+        .collect::<HashMap<_, _>>();
     let mut compacted = Vec::<TimelineRow>::new();
-    let mut index_by_key = BTreeMap::<(Option<String>, String), usize>::new();
+    let mut index_by_key = HashMap::<(Option<String>, String), usize>::new();
     for mut row in rows {
         let key = row.item_ids.iter().rev().find_map(|item_id| {
             items_by_id
-                .get(item_id)
+                .get(item_id.as_str())
                 .and_then(|item| process_compaction_key(item))
         });
         let Some(key) = key else {
@@ -869,7 +873,7 @@ fn compact_process_rows(rows: Vec<TimelineRow>, items: &[&TimelineItem]) -> Vec<
         let existing = &mut compacted[existing_index];
         let mut item_ids = std::mem::take(&mut existing.item_ids);
         for item_id in std::mem::take(&mut row.item_ids) {
-            record_row_item_id(&mut item_ids, item_id);
+            record_row_item_id(&mut item_ids, item_id.as_str());
         }
         row.id = existing.id.clone();
         row.item_ids = item_ids;
@@ -1052,14 +1056,14 @@ fn is_reconnect_progress_paragraph(paragraph: &str) -> bool {
 
 /// A merged row only needs stable endpoints. The inclusive sequence range
 /// represents intermediate chunks without retaining one heap String per token.
-fn record_row_item_id(item_ids: &mut Vec<String>, item_id: String) {
+fn record_row_item_id(item_ids: &mut Vec<String>, item_id: &str) {
     match item_ids.len() {
-        0 => item_ids.push(item_id),
-        1 if item_ids[0] != item_id => item_ids.push(item_id),
+        0 => item_ids.push(item_id.to_string()),
+        1 if item_ids[0] != item_id => item_ids.push(item_id.to_string()),
         1 => {}
-        _ if item_ids.last() != Some(&item_id) => {
+        _ if item_ids.last().is_none_or(|last| last != item_id) => {
             item_ids.truncate(2);
-            item_ids[1] = item_id;
+            item_ids[1] = item_id.to_string();
         }
         _ => {}
     }
@@ -1071,7 +1075,7 @@ fn record_row_item_id(item_ids: &mut Vec<String>, item_id: String) {
 /// absorbed, and every one of them moves the row's clock to that item: the two
 /// travel together, so they are recorded together.
 fn record_row_item(row: &mut TimelineRow, item: &TimelineItem) {
-    record_row_item_id(&mut row.item_ids, item.id.to_string());
+    record_row_item_id(&mut row.item_ids, item.id.as_str());
     row.last_sequence = item.sequence;
     row.timestamp_ms = item.timestamp_ms;
 }
@@ -1486,6 +1490,18 @@ pub fn timeline_agent_message_count_after_sequence(
         .count()
 }
 
+/// One turn's metadata together with the sequence span its items occupy.
+///
+/// The span is what lets a row find its turn without an item-id lookup table:
+/// a row is stamped with the sequence of its first item, and turns partition
+/// the timeline in order, so the row's turn is the one whose span contains it.
+struct TurnRowSpan {
+    first_sequence: i64,
+    last_sequence: i64,
+    id: String,
+    metadata: TurnRowMetadata,
+}
+
 #[derive(Default)]
 struct TurnRowMetadata {
     item_count: usize,
@@ -1495,9 +1511,7 @@ struct TurnRowMetadata {
 }
 
 fn decorate_turn_metadata(rows: &mut [TimelineRow], items: &[&TimelineItem]) {
-    let mut item_to_turn = BTreeMap::<String, String>::new();
-    let mut turn_metadata = BTreeMap::<String, TurnRowMetadata>::new();
-
+    let mut spans = Vec::<TurnRowSpan>::new();
     for (index, turn) in crate::timeline::timeline_turn_refs(items.iter().copied())
         .into_iter()
         .enumerate()
@@ -1512,41 +1526,49 @@ fn decorate_turn_metadata(rows: &mut [TimelineRow], items: &[&TimelineItem]) {
                     .map(|item| format!("turn:continuation:{}", item.id))
             })
             .unwrap_or_else(|| format!("turn:{index}"));
-        let item_count = usize::from(turn.user_item.is_some()) + turn.response_items.len();
-        if let Some(user_item) = &turn.user_item {
-            item_to_turn.insert(user_item.id.to_string(), turn_id.clone());
-        }
-        for item in &turn.response_items {
-            item_to_turn.insert(item.id.to_string(), turn_id.clone());
-        }
-        turn_metadata.insert(
-            turn_id,
-            TurnRowMetadata {
-                item_count,
+        let Some(first_sequence) = turn
+            .user_item
+            .map(|item| item.sequence)
+            .or_else(|| turn.response_items.first().map(|item| item.sequence))
+        else {
+            continue;
+        };
+        let last_sequence = turn
+            .response_items
+            .last()
+            .map(|item| item.sequence)
+            .unwrap_or(first_sequence);
+        spans.push(TurnRowSpan {
+            first_sequence,
+            last_sequence,
+            id: turn_id,
+            metadata: TurnRowMetadata {
+                item_count: usize::from(turn.user_item.is_some()) + turn.response_items.len(),
                 failed: turn.failed,
                 pending_permission: !turn.pending_permission_ids.is_empty(),
                 conclusion_item_id: turn.conclusion_item_id,
             },
-        );
+        });
     }
 
     for row in rows {
-        let Some(turn_id) = row
-            .item_ids
-            .first()
-            .and_then(|item_id| item_to_turn.get(item_id))
-            .cloned()
-        else {
+        // The row belongs to the turn whose span holds its first item. A row
+        // that starts before every span — an announcement the runtime wrote
+        // ahead of the first request — keeps no turn, exactly as it did when
+        // the association went through an item-id map.
+        let index = spans.partition_point(|span| span.last_sequence < row.first_sequence);
+        let Some(span) = spans.get(index) else {
             continue;
         };
-        let Some(metadata) = turn_metadata.get(&turn_id) else {
+        if row.first_sequence < span.first_sequence {
             continue;
-        };
-        row.turn_id = Some(turn_id);
-        row.turn_item_count = metadata.item_count;
-        row.turn_failed = metadata.failed;
-        row.turn_pending_permission = metadata.pending_permission;
-        row.conclusion = metadata
+        }
+        row.turn_id = Some(span.id.clone());
+        row.turn_item_count = span.metadata.item_count;
+        row.turn_failed = span.metadata.failed;
+        row.turn_pending_permission = span.metadata.pending_permission;
+        row.conclusion = span
+            .metadata
             .conclusion_item_id
             .as_ref()
             .is_some_and(|conclusion_id| row.item_ids.iter().any(|id| id == conclusion_id));
