@@ -46,10 +46,11 @@ use vibex_core::{
     ScheduledTaskRunStatus, ScheduledTaskRunTrigger, ScheduledTaskRunUpdateRequest,
     ScheduledTaskStatus, ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix, SkillCreateRequest,
     SkillId, SkillProviderMatrix, SkillStatus, TerminalId, TerminalSession, TimelineItem,
-    TimelineItemId, TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource,
-    TurnExecutionAttribution, VibexError, VibexExecutionId, VibexResult, VibexSessionId,
-    WorkspaceId, WorkspaceMode, WorkspaceRecord, agent_id_for_provider_kind,
-    legacy_status_for_phase, phase_for_legacy_status, unix_timestamp_ms,
+    TimelineItemId, TimelineItemKind, TimelinePage, TimelinePayload, TimelinePayloadDepth,
+    TimelineRedactionState, TimelineSource, TurnExecutionAttribution, VibexError, VibexExecutionId,
+    VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode, WorkspaceRecord,
+    agent_id_for_provider_kind, legacy_status_for_phase, phase_for_legacy_status,
+    unix_timestamp_ms,
 };
 
 mod remote_v2;
@@ -9155,6 +9156,431 @@ impl TimelineRepository {
         })
     }
 
+    /// Fetches one item at full payload depth.
+    ///
+    /// The read a reader makes when it opens a tool activity: pages and live
+    /// events carry summary payloads, and this is how the detail behind one of
+    /// them comes back.
+    pub fn fetch_item(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        sequence: i64,
+    ) -> VibexResult<Option<TimelineItem>> {
+        let mut stmt = conn
+            .prepare_cached(
+                "
+                SELECT session_id, sequence, timeline_item_id, kind, source, timestamp_ms,
+                    correlation_id, provider_correlation_id, payload_json, redaction_state,
+                    execution_attribution_json
+                FROM agent_timeline_items
+                WHERE session_id = ?1 AND sequence = ?2
+                ",
+            )
+            .map_err(storage_err(
+                "timeline_item_fetch_failed",
+                "failed to prepare timeline item fetch",
+            ))?;
+        let mut rows = stmt
+            .query_map(params![session_id.as_str(), sequence], map_timeline_item)
+            .map_err(storage_err(
+                "timeline_item_fetch_failed",
+                "failed to query the timeline item",
+            ))?;
+        match rows.next() {
+            Some(row) => row.map(Some).map_err(storage_err(
+                "timeline_decode_failed",
+                "failed to decode timeline row",
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Reads one bounded window of a session's timeline in a single pass.
+    ///
+    /// This is the read the clients use. It differs from [`Self::fetch_after`]
+    /// and [`Self::fetch_before`] in three ways that all exist to keep a page
+    /// small enough to move:
+    ///
+    /// - the window can end on a conversational turn boundary, so a page never
+    ///   splits a turn in half;
+    /// - a byte budget stops the page once it has spent what the reader asked
+    ///   for, because one file snapshot can outweigh hundreds of messages;
+    /// - every item is projected to the requested payload depth, so tool
+    ///   detail ships only when a reader asks for it by sequence.
+    ///
+    /// `has_older` and `has_newer` stay session-wide existence probes, which is
+    /// what lets a reader treat "there is more" and "the window ended" as
+    /// different facts.
+    ///
+    /// A window is addressed from one of its edges: `after_sequence` starts
+    /// just above the cursor and reads upward, while `before_sequence` ends
+    /// just below the cursor. With no cursor at all the read is the session's
+    /// newest window, matching [`Self::fetch_after`] and [`Self::fetch_before`]
+    /// — that tail is what a reader samples when it asks what a session last
+    /// did instead of where its history began.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fetch_window(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        after_sequence: Option<i64>,
+        before_sequence: Option<i64>,
+        limit: u32,
+        max_turns: Option<u32>,
+        max_bytes: Option<u32>,
+        depth: TimelinePayloadDepth,
+    ) -> VibexResult<TimelinePage> {
+        let limit = limit.clamp(1, 500) as i64;
+        // The forward cursor wins when both are set, matching `fetch_after`.
+        let (mut lower, upper) = match (after_sequence, before_sequence) {
+            (Some(after_sequence), _) => (Some(after_sequence.max(0)), None),
+            (None, Some(before_sequence)) => (None, Some(before_sequence)),
+            (None, None) => (None, None),
+        };
+        // A turn window opens on the floor of the newest requested turns and is
+        // read upward from there, so the page never splits a turn in half.
+        let turn_window = max_turns
+            .filter(|turns| *turns > 0)
+            .filter(|_| after_sequence.is_none());
+        if let Some(turns) = turn_window {
+            lower = Some(turn_window_floor(
+                conn,
+                session_id,
+                lower.unwrap_or(0),
+                upper,
+                turns,
+            )?);
+        }
+        // Without a forward cursor the read starts from the tail: a `before`
+        // cursor takes the window that ends just below it, and no cursor at all
+        // is "before everything", which is the newest window. Only an explicit
+        // forward cursor — or a turn floor, which names where its window opens —
+        // walks from the oldest row upward.
+        let read_backward = after_sequence.is_none() && turn_window.is_none();
+        let order = if read_backward { "DESC" } else { "ASC" };
+
+        let mut items = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare_cached(&format!(
+                    "
+                    SELECT session_id, sequence, timeline_item_id, kind, source, timestamp_ms,
+                        correlation_id, provider_correlation_id, payload_json, redaction_state,
+                        execution_attribution_json
+                    FROM agent_timeline_items
+                    WHERE session_id = ?1
+                        AND sequence > ?2
+                        AND (?3 IS NULL OR sequence < ?3)
+                    ORDER BY sequence {order}
+                    LIMIT ?4
+                    ",
+                ))
+                .map_err(storage_err(
+                    "timeline_fetch_failed",
+                    "failed to prepare timeline window fetch",
+                ))?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        session_id.as_str(),
+                        lower.unwrap_or(0),
+                        upper,
+                        limit.saturating_add(1)
+                    ],
+                    map_timeline_item,
+                )
+                .map_err(storage_err(
+                    "timeline_fetch_failed",
+                    "failed to query the timeline window",
+                ))?;
+            for row in rows {
+                items.push(row.map_err(storage_err(
+                    "timeline_decode_failed",
+                    "failed to decode timeline row",
+                ))?);
+            }
+        }
+
+        // Rows stay in scan order until the page is cut. A backward scan starts
+        // at the newest row, so dropping the overfetched tail of the scan keeps
+        // the newest rows; a forward scan drops the rows that sit above its
+        // limit the same way. The extra row only proves the limit was reached;
+        // whether anything sits above the window is answered by the existence
+        // probe below.
+        let over_limit = items.len() as i64 > limit;
+        if over_limit {
+            items.truncate(limit as usize);
+        }
+
+        if let Some(budget) = max_bytes.filter(|budget| *budget > 0) {
+            let budget = budget as usize;
+            let mut spent = 0_usize;
+            let mut kept = 0_usize;
+            for item in &items {
+                // A byte budget is measured against what the reader actually
+                // receives, so a stripped file snapshot does not spend the
+                // whole page on detail it never carries.
+                let cost =
+                    item.payload.approximate_bytes() - item.payload.stripped_tool_detail_bytes();
+                if kept > 0 && spent.saturating_add(cost) > budget {
+                    break;
+                }
+                spent = spent.saturating_add(cost);
+                kept += 1;
+            }
+            // Whatever the budget dropped stays reported by the existence
+            // probe below, so a reader still learns the window was cut short.
+            // The budget spends the front of the scan, which is the newest
+            // rows of a tail window.
+            items.truncate(kept.max(1).min(items.len()));
+        }
+
+        if read_backward {
+            items.reverse();
+        }
+
+        if depth == TimelinePayloadDepth::Summary {
+            items = items.into_iter().map(TimelineItem::into_summary).collect();
+        }
+
+        let start_sequence = items.first().map(|item| item.sequence);
+        let end_sequence = items.last().map(|item| item.sequence);
+        let has_older = match start_sequence {
+            Some(start_sequence) => conn
+                .query_row(
+                    "
+                    SELECT EXISTS(
+                        SELECT 1 FROM agent_timeline_items
+                        WHERE session_id = ?1 AND sequence < ?2
+                    )
+                    ",
+                    params![session_id.as_str(), start_sequence],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(storage_err(
+                    "timeline_older_probe_failed",
+                    "failed to inspect older timeline items",
+                ))?,
+            None => false,
+        };
+        let has_newer = match end_sequence {
+            Some(end_sequence) => conn
+                .query_row(
+                    "
+                    SELECT EXISTS(
+                        SELECT 1 FROM agent_timeline_items
+                        WHERE session_id = ?1 AND sequence > ?2
+                    )
+                    ",
+                    params![session_id.as_str(), end_sequence],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(storage_err(
+                    "timeline_newer_probe_failed",
+                    "failed to inspect newer timeline items",
+                ))?,
+            None => false,
+        };
+
+        Ok(TimelinePage {
+            session_id: session_id.clone(),
+            items,
+            start_sequence,
+            end_sequence,
+            has_older,
+            has_newer,
+        })
+    }
+
+    /// Collapses the streamed rows of a settled turn into one row per segment.
+    ///
+    /// A provider streams an answer as chunks, and every chunk is appended as
+    /// its own row so the live stream can deliver it the moment it arrives.
+    /// Once the turn settles that shape is pure cost: the projection folds the
+    /// chunks back into one row, so a reader pays for thousands of rows to
+    /// render one paragraph, and a long session can cross the bounded client
+    /// projection on streamed text alone.
+    ///
+    /// Only rows that are *adjacent in sequence* and belong to the same
+    /// streamed segment merge. Adjacency is what makes this safe: nothing sat
+    /// between the merged rows, so no other activity changes position relative
+    /// to the text it was interleaved with. The first row of a run keeps its
+    /// sequence and absorbs the text; the rest are removed.
+    ///
+    /// Returns how many rows were removed.
+    pub fn compact_streamed_segments(
+        conn: &mut Connection,
+        session_id: &VibexSessionId,
+        from_sequence: i64,
+        through_sequence: i64,
+    ) -> VibexResult<usize> {
+        if through_sequence <= from_sequence {
+            return Ok(0);
+        }
+        let delta_kind = enum_to_db(&TimelineItemKind::AgentMessageDelta)?;
+        let reasoning_kind = enum_to_db(&TimelineItemKind::Reasoning)?;
+        let mut rows = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare_cached(
+                    "
+                    SELECT sequence, kind, source, provider_correlation_id, redaction_state,
+                        execution_attribution_json, payload_json
+                    FROM agent_timeline_items
+                    WHERE session_id = ?1
+                        AND sequence > ?2
+                        AND sequence <= ?3
+                        AND kind IN (?4, ?5)
+                        AND provider_correlation_id IS NOT NULL
+                    ORDER BY sequence ASC
+                    ",
+                )
+                .map_err(storage_err(
+                    "timeline_compaction_scan_failed",
+                    "failed to prepare the streamed segment scan",
+                ))?;
+            let mapped = stmt
+                .query_map(
+                    params![
+                        session_id.as_str(),
+                        from_sequence,
+                        through_sequence,
+                        delta_kind,
+                        reasoning_kind
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, String>(6)?,
+                        ))
+                    },
+                )
+                .map_err(storage_err(
+                    "timeline_compaction_scan_failed",
+                    "failed to scan streamed segments",
+                ))?;
+            for row in mapped {
+                rows.push(row.map_err(storage_err(
+                    "timeline_compaction_scan_failed",
+                    "failed to read a streamed segment row",
+                ))?);
+            }
+        }
+
+        let mut runs: Vec<Vec<usize>> = Vec::new();
+        let mut current: Vec<usize> = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            let continues = match current.last() {
+                None => false,
+                Some(previous) => {
+                    let previous = &rows[*previous];
+                    previous.0 + 1 == row.0
+                        && previous.1 == row.1
+                        && previous.2 == row.2
+                        && previous.3 == row.3
+                        && previous.4 == row.4
+                        && previous.5 == row.5
+                        && streamed_payload_group(&previous.6) == streamed_payload_group(&row.6)
+                }
+            };
+            if continues {
+                current.push(index);
+            } else {
+                if current.len() > 1 {
+                    runs.push(std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
+                current.push(index);
+            }
+        }
+        if current.len() > 1 {
+            runs.push(current);
+        }
+        if runs.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "timeline_compaction_failed",
+                "failed to start the streamed segment compaction",
+            ))?;
+        let mut removed = 0_usize;
+        for run in runs {
+            let head = &rows[run[0]];
+            let mut merged: Option<TimelinePayload> = None;
+            for index in &run {
+                let payload: TimelinePayload =
+                    json_from_db_sql(rows[*index].6.clone()).map_err(storage_err(
+                        "timeline_compaction_failed",
+                        "failed to decode a streamed segment payload",
+                    ))?;
+                merged = Some(match (merged, payload) {
+                    (None, payload) => payload,
+                    (
+                        Some(TimelinePayload::AgentMessageDelta(mut head)),
+                        TimelinePayload::AgentMessageDelta(tail),
+                    ) => {
+                        head.text_delta.push_str(&tail.text_delta);
+                        head.chunk_index = tail.chunk_index;
+                        TimelinePayload::AgentMessageDelta(head)
+                    }
+                    (
+                        Some(TimelinePayload::Reasoning(mut head)),
+                        TimelinePayload::Reasoning(tail),
+                    ) => {
+                        head.text.push_str(&tail.text);
+                        TimelinePayload::Reasoning(head)
+                    }
+                    // The run key already pins the payload shape, so a mismatch
+                    // here means the row changed shape underneath the scan.
+                    // Keep the head rather than merge unlike data.
+                    (Some(head), _) => head,
+                });
+            }
+            let Some(merged) = merged else {
+                continue;
+            };
+            tx.execute(
+                "
+                UPDATE agent_timeline_items
+                SET payload_json = ?3
+                WHERE session_id = ?1 AND sequence = ?2
+                ",
+                params![session_id.as_str(), head.0, timeline_payload_json(&merged)?],
+            )
+            .map_err(storage_err(
+                "timeline_compaction_failed",
+                "failed to write the merged streamed segment",
+            ))?;
+            for index in &run[1..] {
+                tx.execute(
+                    "
+                    DELETE FROM agent_timeline_items
+                    WHERE session_id = ?1 AND sequence = ?2
+                    ",
+                    params![session_id.as_str(), rows[*index].0],
+                )
+                .map_err(storage_err(
+                    "timeline_compaction_failed",
+                    "failed to remove a merged streamed row",
+                ))?;
+                removed += 1;
+            }
+        }
+        tx.commit().map_err(storage_err(
+            "timeline_compaction_failed",
+            "failed to commit the streamed segment compaction",
+        ))?;
+        Ok(removed)
+    }
+
     pub fn fetch_range(
         conn: &Connection,
         session_id: &VibexSessionId,
@@ -13463,6 +13889,7 @@ fn append_timeline_in_transaction(
         provider_correlation_id: provider_correlation_id.map(ToOwned::to_owned),
         redaction_state,
         execution_attribution: execution_attribution.map(TurnExecutionAttribution::view),
+        payload_depth: vibex_core::TimelinePayloadDepth::Detail,
         payload,
     };
 
@@ -15359,6 +15786,80 @@ fn map_provider_usage_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provid
     })
 }
 
+/// A merge key for one streamed payload, part of deciding whether two rows
+/// belong to the same segment.
+///
+/// A provider restarts its assistant segment when the phase changes, so
+/// commentary and the final answer can share a correlation id while being
+/// different segments. Merging across that boundary would fuse two rows the
+/// projection deliberately keeps apart.
+fn streamed_payload_group(payload_json: &str) -> String {
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload_json) else {
+        return String::new();
+    };
+    match payload.get("phase").and_then(serde_json::Value::as_str) {
+        Some(phase) => format!("phase:{phase}"),
+        None => String::new(),
+    }
+}
+
+/// Resolves the inclusive floor of a window that must cover `turns` turns.
+///
+/// A conversational turn starts at a user message, so anchoring the window on
+/// the `turns`-th newest user message at or below the upper bound makes the
+/// page hold whole turns instead of splitting one. A session with fewer turns
+/// than asked for opens all the way to the beginning: the oldest page has to
+/// reach the first item, including any notice that precedes the first message.
+fn turn_window_floor(
+    conn: &Connection,
+    session_id: &VibexSessionId,
+    lower: i64,
+    upper: Option<i64>,
+    turns: u32,
+) -> VibexResult<i64> {
+    let user_message = enum_to_db(&TimelineItemKind::UserMessage)?;
+    let mut stmt = conn
+        .prepare_cached(
+            "
+            SELECT sequence FROM agent_timeline_items
+            WHERE session_id = ?1
+                AND kind = ?2
+                AND sequence > ?3
+                AND (?4 IS NULL OR sequence < ?4)
+            ORDER BY sequence DESC
+            LIMIT ?5
+            ",
+        )
+        .map_err(storage_err(
+            "timeline_turn_window_failed",
+            "failed to prepare the turn window probe",
+        ))?;
+    let rows = stmt
+        .query_map(
+            params![session_id.as_str(), user_message, lower, upper, turns],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(storage_err(
+            "timeline_turn_window_failed",
+            "failed to probe the turn window",
+        ))?;
+    let mut oldest = None;
+    let mut count = 0_u32;
+    for row in rows {
+        oldest = Some(row.map_err(storage_err(
+            "timeline_turn_window_failed",
+            "failed to read the turn window",
+        ))?);
+        count += 1;
+    }
+    if count < turns {
+        // The window reaches past the first turn, so it opens at the session's
+        // very first item rather than at the earliest message.
+        return Ok(0);
+    }
+    Ok(oldest.map_or(lower, |sequence| sequence - 1))
+}
+
 fn map_timeline_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineItem> {
     let execution_attribution = row
         .get::<_, Option<String>>(10)?
@@ -15376,6 +15877,7 @@ fn map_timeline_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineItem> 
             vibex_core::CorrelationId::parse,
         )?,
         provider_correlation_id: row.get(7)?,
+        payload_depth: vibex_core::TimelinePayloadDepth::Detail,
         payload: json_from_db_sql(row.get(8)?)?,
         redaction_state: enum_from_db_sql(row.get(9)?)?,
         execution_attribution: execution_attribution
@@ -19718,6 +20220,329 @@ mod tests {
         cleanup_db(temp);
     }
 
+    /// A session with a settled turn made of `rows` streamed chunks.
+    fn streamed_turn_fixture(
+        label: &str,
+        correlation: &str,
+        rows: usize,
+        interleave_reasoning: bool,
+    ) -> (PathBuf, Connection, AgentSession) {
+        let temp = temp_db_path(label);
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let (_project, workspace) =
+            WorkspaceRepository::ensure(&conn, "/tmp/vibex-db-streamed", WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Streamed session".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Initializing,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
+        for index in 0..rows {
+            let mut payload = TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: format!("chunk{index}"),
+                chunk_index: index as u32,
+                phase: None,
+            });
+            let mut source = TimelineSource::Agent;
+            if interleave_reasoning && index == 2 {
+                source = TimelineSource::Provider;
+                payload = TimelinePayload::Reasoning(vibex_core::ReasoningPayload {
+                    text: "thought".to_string(),
+                    is_final: false,
+                });
+            }
+            TimelineRepository::append(
+                &mut conn,
+                &session.id,
+                source,
+                payload,
+                None,
+                Some(correlation),
+                TimelineRedactionState::None,
+            )
+            .unwrap();
+        }
+        (temp, conn, session)
+    }
+
+    #[test]
+    fn a_settled_turn_collapses_its_adjacent_streamed_rows() {
+        let (temp, mut conn, session) = streamed_turn_fixture("compact", "message-1", 5, false);
+        let removed =
+            TimelineRepository::compact_streamed_segments(&mut conn, &session.id, 0, 5).unwrap();
+        assert_eq!(removed, 4);
+
+        let page = TimelineRepository::fetch_after(&conn, &session.id, None, 10).unwrap();
+        assert_eq!(page.items.len(), 1);
+        let TimelinePayload::AgentMessageDelta(delta) = &page.items[0].payload else {
+            panic!("the merged row keeps its payload kind");
+        };
+        assert_eq!(delta.text_delta, "chunk0chunk1chunk2chunk3chunk4");
+        assert_eq!(delta.chunk_index, 4);
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn streamed_rows_split_by_other_activity_are_not_merged() {
+        // The reasoning row sits between the first and second chunk, so
+        // merging across it would move the answer past the thinking it was
+        // interleaved with.
+        let (temp, mut conn, session) = streamed_turn_fixture("compact-split", "message-2", 5, true);
+        let removed =
+            TimelineRepository::compact_streamed_segments(&mut conn, &session.id, 0, 5).unwrap();
+        // Two runs of two chunks collapse; the reasoning row splits them and
+        // is left exactly where it was.
+        assert_eq!(removed, 2);
+
+        let page = TimelineRepository::fetch_after(&conn, &session.id, None, 10).unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+        let TimelinePayload::AgentMessageDelta(first) = &page.items[0].payload else {
+            panic!("the first row is a chunk run");
+        };
+        assert_eq!(first.text_delta, "chunk0chunk1");
+        let TimelinePayload::Reasoning(second) = &page.items[1].payload else {
+            panic!("the middle row is reasoning");
+        };
+        assert_eq!(second.text, "thought");
+        let TimelinePayload::AgentMessageDelta(third) = &page.items[2].payload else {
+            panic!("the last row is a chunk run");
+        };
+        assert_eq!(third.text_delta, "chunk3chunk4");
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn a_turn_window_starts_on_a_message_and_respects_the_byte_budget() {
+        let temp = temp_db_path("turn-window");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let (_project, workspace) =
+            WorkspaceRepository::ensure(&conn, "/tmp/vibex-db-window", WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Windowed session".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Initializing,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
+        for turn in 0..4 {
+            TimelineRepository::append(
+                &mut conn,
+                &session.id,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: format!("question {turn}"),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                TimelineRedactionState::None,
+            )
+            .unwrap();
+            TimelineRepository::append(
+                &mut conn,
+                &session.id,
+                TimelineSource::Agent,
+                TimelinePayload::AgentMessage(AgentMessagePayload {
+                    text: format!("answer {turn}"),
+                    is_final: true,
+                }),
+                None,
+                None,
+                TimelineRedactionState::None,
+            )
+            .unwrap();
+        }
+
+        // Two turns of the four, ending on the newest turn's boundary.
+        let page = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            500,
+            Some(2),
+            None,
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![5, 6, 7, 8]
+        );
+        assert!(page.has_older);
+        assert!(!page.has_newer);
+
+        // Paging below the window reaches the earlier turns and then stops.
+        let older = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            Some(5),
+            500,
+            Some(2),
+            None,
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(
+            older
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(!older.has_older);
+
+        // A byte budget always lets at least one item through, so a reader can
+        // still make progress against a page that costs more than the budget.
+        let squeezed = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            500,
+            None,
+            Some(1),
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(squeezed.items.len(), 1);
+        assert!(squeezed.has_older);
+
+        // Summary depth strips exactly the tool detail and nothing else, and
+        // a payload that never carried any is left marked complete so a reader
+        // does not ask the authority for detail that does not exist.
+        TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::Agent,
+            TimelinePayload::FileOperation(vibex_core::FileOperationPayload {
+                operation: vibex_core::FileOperationKind::Edit,
+                path: "src/lib.rs".to_string(),
+                summary: "Edited src/lib.rs".to_string(),
+                // The shape the ingest now stores: the rendered patch, never
+                // both file snapshots.
+                old_text: None,
+                new_text: None,
+                patch: Some(vibex_core::FileOperationPatch {
+                    format: vibex_core::FileOperationPatchFormat::UnifiedDiffV1,
+                    text: "--- old\n+++ new\n@@ -1 +1 @@\n-before\n+after\n".to_string(),
+                }),
+                raw_extension: None,
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+
+        let summary = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            Some(8),
+            None,
+            500,
+            None,
+            None,
+            TimelinePayloadDepth::Summary,
+        )
+        .unwrap();
+        assert_eq!(summary.items.len(), 1);
+        assert_eq!(
+            summary.items[0].payload_depth,
+            TimelinePayloadDepth::Summary
+        );
+        let TimelinePayload::FileOperation(file) = &summary.items[0].payload else {
+            panic!("the stripped item keeps its payload kind");
+        };
+        assert_eq!(file.old_text, None);
+        assert_eq!(file.new_text, None);
+        assert_eq!(
+            file.patch, None,
+            "the diff is part of what an opened activity renders"
+        );
+
+        let detail = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            Some(8),
+            None,
+            500,
+            None,
+            None,
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        let TimelinePayload::FileOperation(file) = &detail.items[0].payload else {
+            panic!("the detail item keeps its payload kind");
+        };
+        assert!(file.patch.is_some());
+
+        let conversation = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            Some(9),
+            500,
+            None,
+            None,
+            TimelinePayloadDepth::Summary,
+        )
+        .unwrap();
+        assert!(
+            conversation
+                .items
+                .iter()
+                .all(|item| item.payload_depth == TimelinePayloadDepth::Detail),
+            "messages carry no tool detail, so they are already complete"
+        );
+        assert_eq!(conversation.items.len(), 8);
+
+        cleanup_db(temp);
+    }
+
     #[test]
     fn session_timeline_and_permission_round_trip() {
         let temp = temp_db_path("agent");
@@ -20390,6 +21215,152 @@ mod tests {
             vec![25]
         );
         assert!(clamped.has_older);
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn timeline_window_reads_the_newest_page_without_a_cursor() {
+        let temp = temp_db_path("timeline-window");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-window-test",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Window".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        for index in 1..=12 {
+            TimelineRepository::append(
+                &mut conn,
+                &session.id,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: format!("message-{index}"),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                TimelineRedactionState::None,
+            )
+            .unwrap();
+        }
+
+        // No cursor means the newest window: the completion probe samples this
+        // tail to learn what the latest turn did, so it has to end at the last
+        // item instead of opening at the first one.
+        let newest = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            4,
+            None,
+            None,
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(
+            newest
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![9, 10, 11, 12]
+        );
+        assert_eq!(newest.start_sequence, Some(9));
+        assert_eq!(newest.end_sequence, Some(12));
+        assert!(newest.has_older);
+        assert!(!newest.has_newer);
+
+        // The runtime's own continuation check reads the same tail through
+        // `fetch_after(None, ..)`; a client read that disagreed with it would
+        // start a countdown the authority then refuses.
+        let authority = TimelineRepository::fetch_after(&conn, &session.id, None, 4).unwrap();
+        assert_eq!(newest.items, authority.items);
+
+        // A `before` cursor keeps the window that ends just below it rather
+        // than the first page of history.
+        let below = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            Some(9),
+            4,
+            None,
+            None,
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(
+            below
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![5, 6, 7, 8]
+        );
+        assert!(below.has_older);
+        assert!(below.has_newer);
+
+        // The forward cursor still wins when both cursors are set.
+        let forward = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            Some(2),
+            Some(9),
+            4,
+            None,
+            None,
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(
+            forward
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5, 6]
+        );
+
+        // A byte budget spends a tail window from its newest row, so the page
+        // still ends where the session is.
+        let budgeted = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            4,
+            None,
+            Some(100),
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert!(budgeted.items.len() < 4);
+        assert_eq!(budgeted.end_sequence, Some(12));
+        assert!(budgeted.has_older);
+        assert!(!budgeted.has_newer);
 
         cleanup_db(temp);
     }
