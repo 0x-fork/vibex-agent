@@ -13,7 +13,7 @@ use gpui::{
     InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, Pixels, Point, Style,
     Styled as _, WeakEntity, Window, canvas, fill, point, px, relative, size,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use std::{cell::Cell, rc::Rc, sync::OnceLock};
 
 #[derive(Clone, Copy, Debug)]
@@ -228,10 +228,16 @@ impl Entry {
         measured: Rc<Cell<PreviewSample>>,
         reduced: bool,
         state: WeakEntity<HomeArena>,
+        chrome: ButtonCustomVariant,
     ) -> Self {
+        // The guardian art is the whole control, so the button paints nothing
+        // in any state: a variant that keeps hover and active transparent means
+        // the model never gets a rectangle washed over it, and the pointing
+        // hand stays the only affordance.
         let button = Button::new("open-unbound")
             .debug_selector(|| "unbound-boss-entry".into())
-            .ghost()
+            .custom(chrome)
+            .cursor_pointer()
             .w_full()
             .h_full()
             .p_0()

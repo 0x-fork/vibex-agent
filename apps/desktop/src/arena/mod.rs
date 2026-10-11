@@ -21,7 +21,10 @@ use gpui::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Subscription, Task, Window,
     actions, canvas, div, fill, hsla, point, prelude::*, px, size,
 };
-use gpui_component::{ActiveTheme as _, WindowExt as _, scroll::ScrollableElement as _, v_flex};
+use gpui_component::{
+    ActiveTheme as _, WindowExt as _, button::ButtonCustomVariant, scroll::ScrollableElement as _,
+    v_flex,
+};
 use std::{
     cell::Cell,
     collections::BTreeSet,
@@ -222,6 +225,7 @@ fn banner(state: &Entity<HomeArena>, window: &mut Window, cx: &mut App) -> AnyEl
         .size_full()
         .overflow_hidden();
     let reduced = motion::reduced_motion(cx);
+    let chrome = ButtonCustomVariant::new(cx);
     if window.has_active_dialog(cx)
         || reduced
         || motion::pauses_while_inactive(!window.is_window_active())
@@ -231,7 +235,7 @@ fn banner(state: &Entity<HomeArena>, window: &mut Window, cx: &mut App) -> AnyEl
         } else {
             sample
         };
-        art.child(scene::Entry::new(sample, measured, reduced, state))
+        art.child(scene::Entry::new(sample, measured, reduced, state, chrome))
             .into_any_element()
     } else {
         art.with_animation(
@@ -245,6 +249,7 @@ fn banner(state: &Entity<HomeArena>, window: &mut Window, cx: &mut App) -> AnyEl
                     measured.clone(),
                     false,
                     state.clone(),
+                    chrome,
                 ))
             },
         )
