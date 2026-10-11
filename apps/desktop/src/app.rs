@@ -43450,10 +43450,10 @@ impl VibexWorkbench {
         let row_foreground = if selected || move_selected {
             cx.theme().sidebar_foreground
         } else {
-            // Unselected session titles sit one step below the selected row but
-            // stay legible: match the project/workspace row tint (0.72) rather
-            // than the older, washed-out 0.56.
-            cx.theme().sidebar_foreground.opacity(0.72)
+            sidebar_unselected_session_foreground(
+                cx.theme().sidebar_foreground,
+                cx.theme().is_dark(),
+            )
         };
         let is_dark = cx.theme().is_dark();
         let session_hover_key = motion::hover_key("sidebar-session", &session_id_string);
@@ -63682,6 +63682,16 @@ fn delegated_tree_guide_line(continues: bool, elbow: bool, cx: &App) -> AnyEleme
         .into_any_element()
 }
 
+/// The tint an unselected session row's title reads in.
+///
+/// The row sits one step below the selected one, but the light sidebar is
+/// near-white: at the quiet 0.72 wash a light title composites below the 4.5:1
+/// contrast floor, so light rows take a stronger tint while dark rows keep the
+/// quieter one. The selected row still owns full strength.
+fn sidebar_unselected_session_foreground(foreground: Hsla, is_dark: bool) -> Hsla {
+    foreground.opacity(if is_dark { 0.72 } else { 0.88 })
+}
+
 fn sidebar_selected_session_background(accent: Hsla, is_dark: bool) -> Hsla {
     if is_dark {
         accent.lighten(0.24)
@@ -82532,6 +82542,56 @@ mod tests {
         assert!(dark_selected.l > dark_accent.l);
     }
 
+    /// The unselected title sits one step below the selected row, but it still
+    /// carries the row's name, so it has to clear the WCAG contrast floor on
+    /// the sidebar surface in both appearances.
+    #[test]
+    fn unselected_session_titles_clear_the_contrast_floor() {
+        fn linear(value: f32) -> f32 {
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(rgb: Rgba) -> f32 {
+            0.2126 * linear(rgb.r) + 0.7152 * linear(rgb.g) + 0.0722 * linear(rgb.b)
+        }
+        /// GPUI converts to linear before blending, so the alpha title
+        /// composites against the surface per channel before the ratio.
+        fn ratio(title: Hsla, surface: Hsla) -> f32 {
+            let title = title.to_rgb();
+            let surface = surface.to_rgb();
+            let alpha = title.a;
+            let mixed = |title_channel: f32, surface_channel: f32| {
+                linear(title_channel) * alpha + linear(surface_channel) * (1.0 - alpha)
+            };
+            let foreground = 0.2126 * mixed(title.r, surface.r)
+                + 0.7152 * mixed(title.g, surface.g)
+                + 0.0722 * mixed(title.b, surface.b);
+            let background = luminance(surface);
+            (background.max(foreground) + 0.05) / (background.min(foreground) + 0.05)
+        }
+
+        for dark in [false, true] {
+            let surface = theme::semantic_color("sidebar", dark);
+            let title = sidebar_unselected_session_foreground(
+                theme::semantic_color("sidebar-foreground", dark),
+                dark,
+            );
+            let actual = ratio(title, surface);
+            assert!(
+                actual >= 4.5,
+                "the {} unselected session title is {actual:.2}:1",
+                if dark { "dark" } else { "light" }
+            );
+            // The selected row keeps the strongest treatment, and light mode
+            // must never fall back to the quiet wash dark mode keeps.
+            assert!(title.a < 1.0);
+            assert_eq!(title.a, if dark { 0.72 } else { 0.88 });
+        }
+    }
+
     #[test]
     fn workspace_focus_border_increases_contrast_in_both_themes() {
         let light_accent = theme::semantic_color("sidebar-accent", false);
@@ -86086,7 +86146,8 @@ mod tests {
             "normal and inline-rename rows should preserve the logo inset"
         );
         assert!(sidebar_session.contains(".top(px(8.0))"));
-        assert!(sidebar_session.contains("cx.theme().sidebar_foreground.opacity(0.72)"));
+        assert!(sidebar_session.contains("sidebar_unselected_session_foreground("));
+        assert!(sidebar_session.contains("cx.theme().sidebar_foreground,"));
         assert!(sidebar_session.contains(
             "sidebar_selected_session_background(cx.theme().sidebar_accent, cx.theme().is_dark())"
         ));
