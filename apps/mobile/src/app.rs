@@ -533,7 +533,6 @@ enum MobileOverlay {
     /// The per-runtime removal confirmation.
     HostRemove,
     Settings,
-    Usage,
     NewProject,
     NewSession,
 }
@@ -5369,10 +5368,6 @@ impl MobileApp {
     fn open_settings(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_battery_allowlist(cx);
         self.show_overlay(MobileOverlay::Settings, window, cx);
-    }
-
-    fn open_usage(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_overlay(MobileOverlay::Usage, window, cx);
     }
 
     fn open_new_project(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -12782,25 +12777,6 @@ impl MobileApp {
                                     .text_color(theme::sidebar_text_secondary()),
                             ),
                     )
-                    .child(
-                        div()
-                            .id("mobile-drawer-usage")
-                            .aria_label(locale::common("Usage Statistics"))
-                            .size(px(36.0))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::open_usage))
-                            .child(
-                                svg()
-                                    .path("icons/activity.svg")
-                                    .size(px(17.0))
-                                    .text_color(theme::sidebar_text_secondary()),
-                            ),
-                    )
                     // Leaving the sessions page returns to the conversation, so
                     // the affordance is an exit arrow rather than a dismissal.
                     .child(
@@ -15246,90 +15222,6 @@ impl MobileApp {
             .into_any_element()
     }
 
-    fn render_usage(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let session_count = self
-            .controller
-            .as_ref()
-            .and_then(|controller| controller.state.sessions.value.as_ref())
-            .map_or(0, Vec::len);
-        div()
-            .absolute()
-            .inset_0()
-            .bg(theme::bg_primary())
-            .block_mouse_except_scroll()
-            .flex()
-            .flex_col()
-            .child(self.render_overlay_header("mobile-usage", "Usage Statistics", None, cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .px(px(theme::SPACING_LG))
-                    .py(px(theme::SPACING_XL))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(theme::SPACING_LG))
-                    .child(
-                        div()
-                            .size(px(56.0))
-                            .rounded(px(theme::RADIUS_CARD))
-                            .bg(theme::bg_card_dim())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                svg()
-                                    .path("icons/activity.svg")
-                                    .size(px(theme::ICON_MD))
-                                    .text_color(theme::accent_blue()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme::FONT_HEADING))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_primary())
-                            .child(locale::common("Usage Statistics")),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .rounded(px(theme::RADIUS_CARD))
-                            .border_1()
-                            .border_color(theme::border_subtle())
-                            .bg(theme::bg_card_dim())
-                            .p(px(theme::SPACING_MD))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(theme::FONT_BODY))
-                                    .text_color(theme::text_secondary())
-                                    .child(locale::common("Sessions")),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(theme::FONT_HEADING))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::text_primary())
-                                    .child(session_count.to_string()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme::FONT_BODY))
-                            .text_color(theme::text_muted())
-                            .text_center()
-                            .child(locale::common(
-                                "Usage details are available on the desktop host.",
-                            )),
-                    ),
-            )
-            .into_any_element()
-    }
-
     fn render_mobile_overlay(
         &self,
         overlay: MobileOverlay,
@@ -15351,7 +15243,6 @@ impl MobileApp {
             MobileOverlay::HostRename => self.render_host_rename_sheet(cx),
             MobileOverlay::HostRemove => self.render_host_remove_sheet(cx),
             MobileOverlay::Settings => self.render_settings(cx),
-            MobileOverlay::Usage => self.render_usage(cx),
             MobileOverlay::NewProject => self.render_new_project(cx),
             MobileOverlay::NewSession => self.render_new_session(cx),
         }
@@ -20032,7 +19923,7 @@ mod tests {
         let mut stack = vec![
             BackScreen::SessionsDrawer,
             BackScreen::SessionAction,
-            BackScreen::Overlay(MobileOverlay::Usage),
+            BackScreen::Overlay(MobileOverlay::Settings),
         ];
         let session_action_open = false;
         stack.retain(|screen| match *screen {
@@ -20044,7 +19935,7 @@ mod tests {
             BackScreen::SidebarSearch => false,
             BackScreen::SidebarBatchMode => false,
         });
-        let overlay = Some(MobileOverlay::Usage);
+        let overlay = Some(MobileOverlay::Settings);
         if let Some(overlay) = overlay
             && stack.last() != Some(&BackScreen::Overlay(overlay))
         {
@@ -20054,7 +19945,7 @@ mod tests {
             stack,
             vec![
                 BackScreen::SessionsDrawer,
-                BackScreen::Overlay(MobileOverlay::Usage)
+                BackScreen::Overlay(MobileOverlay::Settings)
             ]
         );
     }

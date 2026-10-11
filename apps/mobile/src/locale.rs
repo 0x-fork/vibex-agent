@@ -209,7 +209,6 @@ pub fn common_for(locale: Locale, en: &'static str) -> &'static str {
         "Open project" => ("打开项目", "開啟專案"),
         "Opening..." => ("打开中…", "開啟中…"),
         "Project added" => ("项目已添加", "專案已新增"),
-        "Usage Statistics" => ("用量统计", "用量統計"),
         "Projects" => ("项目", "專案"),
         "Collapse projects" => ("折叠项目", "摺疊專案"),
         "Expand projects" => ("展开项目", "展開專案"),
@@ -290,10 +289,6 @@ pub fn common_for(locale: Locale, en: &'static str) -> &'static str {
         "File edit cards" => ("文件编辑卡片", "檔案編輯卡片"),
         "About" => ("关于", "關於"),
         "Version" => ("版本", "版本"),
-        "Usage details are available on the desktop host." => (
-            "详细用量统计可在桌面端查看。",
-            "詳細用量統計可在桌面版查看。",
-        ),
         "Pair another host" => ("配对另一台主机", "配對另一台主機"),
         "No hosts paired" => ("尚未配对主机", "尚未配對主機"),
         "Back to hosts" => ("返回主机列表", "返回主機列表"),
