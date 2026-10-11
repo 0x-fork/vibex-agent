@@ -195,36 +195,47 @@ fn melting_the_knot_reveals_the_luminous_cube() {
 }
 
 #[test]
-fn the_whale_has_white_eyes_a_pale_belly_and_a_raised_tail() {
+fn the_whale_reads_as_an_orca_with_dorsal_fin_eye_patch_and_white_belly() {
     let mut boss = front(Guardian::DeepSeek);
     boss.yaw = -PI * 0.5;
     let frame = render(&boss);
-    // The near eye is a white disc with a dark pupil.
-    let eye = boss.local(-5.6, 8.6, 9.4);
+    let white = |c: u8| matches!(c, DUST | IVORY | WHITE);
+    // A dark eye beside a white patch on the near side.
+    let eye = boss.local(-5.25, 8.5, 8.0);
     let (ex, ey) = ((eye.x * 4.0) as i32, (eye.y * 4.0) as i32);
-    let mut white = 0;
+    let mut patch = 0;
     let mut dark = 0;
-    for y in ey - 6..=ey + 6 {
-        for x in ex - 6..=ex + 6 {
+    for y in ey - 10..=ey + 10 {
+        for x in ex - 12..=ex + 4 {
             match frame.get(x, y) {
-                IVORY | WHITE => white += 1,
+                c if white(c) => patch += 1,
                 OUTLINE | SHADOW => dark += 1,
                 _ => {}
             }
         }
     }
-    assert!(white >= 6 && dark >= 2, "eye white {white} dark {dark}");
+    assert!(patch >= 8 && dark >= 2, "eye patch {patch} dark {dark}");
+    let belly = sample(&frame, &boss, -5.0, 0.0, 4.5);
+    assert!(white(belly), "belly {belly}");
     let flank = sample(&frame, &boss, -7.0, 2.0, 8.0);
     assert!(body(flank), "flank {flank}");
-    // The tail rises above the back, behind the head.
-    let tail = sample(&frame, &boss, 0.0, -13.0, 17.0);
-    assert_ne!(tail, CLEAR);
-    let above = boss.local(0.0, 2.0, 18.5);
-    assert_eq!(
-        at(&frame, above),
-        CLEAR,
-        "the back stays lower than the tail"
-    );
+    // A tall dorsal fin rises high above the back; just ahead of it is open air.
+    assert!(body(sample(&frame, &boss, 0.0, -2.0, 18.0)));
+    assert_eq!(sample(&frame, &boss, 0.0, 2.0, 18.5), CLEAR);
+}
+
+#[test]
+fn the_exposed_whale_curls_its_tail_over_its_back_like_the_logo() {
+    let mut boss = front(Guardian::DeepSeek);
+    boss.update_core();
+    let swimming = boss.core;
+    boss.unravel = 1.0;
+    boss.exposed = 1.0;
+    boss.update_core();
+    assert!(boss.core.y < swimming.y - 8.0);
+    // Seen head-on, the raised flukes clear the back and fin.
+    let frame = render(&boss);
+    assert!(matches!(at(&frame, boss.core), CORE | CORE_LIGHT | WHITE));
 }
 
 #[test]

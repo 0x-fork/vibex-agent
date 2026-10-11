@@ -86,7 +86,7 @@ fn shadow(frame: &mut Raster, boss: &Boss) {
             Guardian::Claude => (34.0 * boss.scale()) as i32,
             Guardian::Codex => 34,
             Guardian::Pi => 40,
-            Guardian::DeepSeek => 42,
+            Guardian::DeepSeek => 50,
             Guardian::OpenCode | Guardian::Copilot => 30,
         };
         let shrink = (boss.height.max(0.0) * 0.42).round() as i32;

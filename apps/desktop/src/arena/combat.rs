@@ -356,6 +356,9 @@ impl Arena {
             + (self.boss.hover_height(self.visual_time) - self.intro.height) * transition;
         self.boss.squash = self.intro.squash * (1.0 - transition);
         self.boss.lid = self.intro.lid * (1.0 - transition);
+        if self.boss.guardian == Guardian::DeepSeek {
+            self.boss.unravel = self.intro.unravel * (1.0 - transition);
+        }
         self.boss.stride += STEP * 2.0;
         for ix in 0..2 {
             self.boss.hands[ix] = self.intro.hands[ix].lerp(self.boss.resting_hand(ix), transition);

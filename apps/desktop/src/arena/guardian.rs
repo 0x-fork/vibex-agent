@@ -88,6 +88,16 @@ pub(super) fn spark_height(size: f32, squash: f32) -> f32 {
     11.0 * size * (1.0 - 0.25 * squash)
 }
 
+/// How far the whale's tail rises at body station `y` when curled over its
+/// back like the logo; `curl` runs from 0 (swimming) to 1 (raised).
+pub(super) fn tail_lift(curl: f32, y: f32) -> f32 {
+    if y < -5.0 {
+        curl * 9.0 * ((-5.0 - y) / 9.5).powi(2)
+    } else {
+        0.0
+    }
+}
+
 /// Width and length of Pi's two stems: the glyph's left leg and right stem.
 pub(super) const STEMS: [(f32, f32); 2] = [(5.74, 16.8), (5.17, 12.06)];
 
@@ -345,7 +355,9 @@ impl Boss {
             Guardian::Codex => self.local(0.0, 0.0, 11.0 * squash),
             Guardian::Pi => self.local(-2.6, 0.5, 14.0),
             Guardian::OpenCode => self.articulated(0.0, 1.5, 9.0 * squash),
-            Guardian::DeepSeek => self.articulated(0.0, -13.0, 18.5),
+            Guardian::DeepSeek => {
+                self.articulated(0.0, -15.2, 11.4 + tail_lift(self.unravel, -15.2))
+            }
             Guardian::Copilot => self.articulated(0.0, -8.6, 10.0),
         };
     }
@@ -479,6 +491,7 @@ impl Boss {
                     let a = u / 0.28;
                     boss.height = 1.5 + (a * PI).sin() * 11.0;
                     boss.pitch = (0.5 - a) * (a * PI).sin() * 1.0;
+                    boss.unravel = (a * PI).sin();
                 } else {
                     boss.height = 1.5 + (t * 16.0).sin() * 0.6;
                     boss.pitch = (t * 8.0).sin() * 0.05;
@@ -533,42 +546,42 @@ fn route(guardian: Guardian, s: f32) -> (Vec2, Vec2) {
         Guardian::Claude => {
             let s = s - PI * 0.25;
             (
-                s.sin() * 60.0,
-                (s * 2.0).sin() * 34.0,
-                s.cos() * 60.0,
-                (s * 2.0).cos() * 68.0,
+                s.sin() * 70.0,
+                (s * 2.0).sin() * 38.0,
+                s.cos() * 70.0,
+                (s * 2.0).cos() * 76.0,
             )
         }
         // Every loop starts in the upper half, clear of the composer.
         Guardian::Codex => (
-            s.sin() * 60.0,
+            s.sin() * 70.0,
             -s.cos() * 34.0 + (s * 2.0).sin() * 6.0,
-            s.cos() * 60.0,
+            s.cos() * 70.0,
             s.sin() * 34.0 + (s * 2.0).cos() * 12.0,
         ),
         Guardian::Pi => (
-            s.sin() * 58.0,
-            -s.cos() * 34.0,
-            s.cos() * 58.0,
-            s.sin() * 34.0,
+            s.sin() * 68.0,
+            -s.cos() * 38.0,
+            s.cos() * 68.0,
+            s.sin() * 38.0,
         ),
         Guardian::OpenCode => (
-            s.sin() * 60.0,
-            -s.cos() * 36.0,
-            s.cos() * 60.0,
-            s.sin() * 36.0,
+            s.sin() * 70.0,
+            -s.cos() * 40.0,
+            s.cos() * 70.0,
+            s.sin() * 40.0,
         ),
         Guardian::DeepSeek => (
-            -s.sin() * 58.0,
-            -s.cos() * 34.0,
-            -s.cos() * 58.0,
-            s.sin() * 34.0,
+            -s.sin() * 66.0,
+            -s.cos() * 38.0,
+            -s.cos() * 66.0,
+            s.sin() * 38.0,
         ),
         Guardian::Copilot => (
-            s.sin() * 54.0 + (s * 7.0).sin() * 5.0,
-            -s.cos() * 32.0,
-            s.cos() * 54.0 + (s * 7.0).cos() * 35.0,
-            s.sin() * 32.0,
+            s.sin() * 63.0 + (s * 7.0).sin() * 5.0,
+            -s.cos() * 36.0,
+            s.cos() * 63.0 + (s * 7.0).cos() * 35.0,
+            s.sin() * 36.0,
         ),
     };
     (CENTER.plus(Vec2::new(x, y)), Vec2::new(dx, dy))

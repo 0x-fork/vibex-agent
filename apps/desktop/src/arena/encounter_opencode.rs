@@ -82,7 +82,7 @@ impl Arena {
                         self.effect(EffectKind::Shot, self.boss.attack_origin(), 0.3, 4.0);
                     }
                     if t >= 1.0 {
-                        self.boss.enter(BossState::Watching, 0.45);
+                        self.boss.enter(BossState::Watching, 0.35);
                     }
                 }
                 Attack::Leap => {
@@ -91,7 +91,7 @@ impl Arena {
                         let position = self.boss.position;
                         self.impact(position, self.boss.impact_radius());
                         self.wave(position, 5.0, 26.0, WaveKind::Stone);
-                        self.boss.enter(BossState::Watching, 0.4);
+                        self.boss.enter(BossState::Watching, 0.3);
                     }
                 }
                 Attack::Gape => {
@@ -161,7 +161,7 @@ impl Arena {
             BossState::Recovery => {
                 self.boss.lid = (self.boss.lid - STEP * 4.0).max(0.0);
                 if t >= 1.0 {
-                    self.boss.enter(BossState::Watching, 0.5);
+                    self.boss.enter(BossState::Watching, 0.4);
                 }
             }
             _ => {}

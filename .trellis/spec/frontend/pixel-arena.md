@@ -177,13 +177,13 @@ rebirth, without a damage override.
 | Codex | Bronze six-loop knot around a cube; three rolling rushes, then a heavy leap with a shock ring | Four forge plates surround a central brazier that burns only while the knot presses a plate it landed on. A burning arrow melts the knot; the bare cube keeps leaping for 7.5 seconds behind a shield closed 0.55 of every 1.5 seconds. Rushes break columns. |
 | Pi | Black block glyph on a dais at the north edge; its left leg and separate right stem are its fists | The stem on the archer's side slams while the other guards the square aperture. Crossing the midline forces a switch that bares the eye for 1.3 seconds. The stems reach 54 units; the south gate is out of reach, but distant archers draw a stone barrage. |
 | OpenCode | Light-grey chest after the logo frame, its window a hinged mouth; spit, vanish-and-bite, two leaps, then a gaping block volley | A close archer is bitten on reflex. Spat code blocks fall, stay as obstacles for the archer, and are crushed by landings. The open mouth accepts a hit from the front during the 1.6-second gape. |
-| DeepSeek | Blue whale after the logo: round head, white eyes, pale smile and a tail curled over its back; three breaches, then a dive and an electric discharge | Breaches dive onto the archer and shatter floes where they erupt and land. The raised tail opens as the whale falls and for 0.7 seconds after landing. Shooting needs a dry floe; the discharge kills anyone in the water and then restores every floe. |
+| DeepSeek | Orca in the logo blue: deep navy back, white chin, belly sweep and eye patch, tall dorsal fin, paddle flippers; the tail curls over its back as in the logo when it falls; three breaches, then a dive and an electric discharge | Breaches dive onto the archer and shatter floes where they erupt and land. The raised tail opens as the whale falls and for 0.7 seconds after landing. Shooting needs a dry floe; the discharge kills anyone in the water and then restores every floe. |
 | Copilot | Teal helmet with goggles, a dark face plate with two slots, ear pods and a rear jet; energy orbs and one to three spin dashes | Orbs knock the archer back, fatally into a wall. A dash into the rim or a column stuns it facing the wall for 1.4 seconds with the rear jet bare, while a telegraphed row of ice falls across the archer's line. The jet accepts a hit only from behind. |
 
 - Keep identity readable: models follow the Agent logos — the spark's uneven
   rays, the knot's six loops, Pi's aperture and separate stem, the chest's
-  frame and window, the whale's eye and curled tail, Copilot's goggles and face
-  slots. Every model carries a dark one-pixel silhouette.
+  frame and window, the orca's markings, fin and curled tail, Copilot's
+  goggles and face slots. Every model carries a dark one-pixel silhouette.
 - Weak points use `Boss::articulated`, the same pivoted pitch and bank as the
   sculpture, so the drawn and the collided point agree in every pose.
 - Terrain damage is combat state (`Map::broken`, `sunken`, `scars`, `blocks`).

@@ -4,6 +4,12 @@ use crate::arena::map::ISLANDS;
 impl Arena {
     pub(super) fn tick_deepseek(&mut self) {
         let t = self.boss.progress();
+        let raised = self.boss.exposed > 0.0
+            || self.boss.state == BossState::Striking
+                && self.boss.attack == Attack::Breach
+                && t > 0.35;
+        let curl = if raised { 1.0 } else { 0.0 };
+        self.boss.unravel += (curl - self.boss.unravel).clamp(-STEP * 3.0, STEP * 6.0);
         match self.boss.state {
             BossState::Watching => {
                 self.boss.face(self.player.position, STEP * 3.0);
@@ -117,7 +123,7 @@ impl Arena {
         self.boss.from = self.boss.position;
         self.boss.target = self.boss.position;
         self.boss.exposed = 0.0;
-        self.boss.enter(BossState::Submerged, 1.35);
+        self.boss.enter(BossState::Submerged, 1.22);
     }
 
     /// Erupts a run-up short of the committed spot and dives onto it, so

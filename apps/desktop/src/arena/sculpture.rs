@@ -3,7 +3,9 @@
 
 use super::{
     geometry::{Vec2, smoothstep},
-    guardian::{Attack, Boss, BossState, Guardian, IDLE_LOOP, STEMS, Shard, spark_height},
+    guardian::{
+        Attack, Boss, BossState, Guardian, IDLE_LOOP, STEMS, Shard, spark_height, tail_lift,
+    },
     raster::{DepthBuffer, Raster, ink::*},
 };
 use std::f32::consts::{PI, TAU};
@@ -64,7 +66,8 @@ const ARMOR: [u8; 5] = [BODY_SHADOW, BODY_SHADOW, BODY_DARK, BODY, BODY_LIGHT];
 const FRAME: [u8; 5] = [BODY_DARK, BODY, BODY_LIGHT, BODY_GLEAM, BODY_GLEAM];
 /// Saturated skin whose front faces keep the exact logo tone.
 const SKIN: [u8; 5] = [BODY_SHADOW, BODY_DARK, BODY, BODY, BODY_LIGHT];
-const BELLY: [u8; 5] = [BODY_DARK, BODY, BODY_LIGHT, BODY_GLEAM, BODY_GLEAM];
+/// Deep orca back: the logo blue appears only on lit faces.
+const NAVY: [u8; 5] = [OUTLINE, BODY_SHADOW, BODY_SHADOW, BODY_DARK, BODY];
 const METAL: [u8; 5] = [BODY_SHADOW, GOLD_DARK, GOLD, IVORY, WHITE];
 const DARK: [u8; 5] = [OUTLINE, OUTLINE, SHADOW, BODY_SHADOW, BODY_DARK];
 const GLASS: [u8; 5] = [WATER_DARK, WATER_DARK, WATER, WATER_LIGHT, WHITE];
@@ -792,78 +795,165 @@ fn chest(mesh: &mut Mesh, boss: &Boss, fall: f32) {
     mesh.deform(|p| p3(p.x * bulge, p.y, p.z * squash));
 }
 
+/// Body stations from nose to tail stock: (y, center z, half width, half height).
+const ORCA: [(f32, f32, f32, f32); 11] = [
+    (13.2, 7.0, 0.5, 0.5),
+    (12.2, 7.1, 2.6, 2.4),
+    (10.0, 7.4, 4.6, 4.2),
+    (7.0, 7.6, 6.0, 5.4),
+    (3.0, 7.8, 6.6, 6.0),
+    (-1.0, 7.9, 6.2, 5.6),
+    (-5.0, 8.2, 4.9, 4.5),
+    (-8.0, 8.6, 3.6, 3.4),
+    (-10.6, 9.2, 2.6, 2.6),
+    (-12.8, 9.8, 1.8, 1.9),
+    (-14.6, 10.4, 1.3, 1.3),
+];
+
+/// Orca markings on a deep logo-blue body: white chin, belly and flank
+/// sweep, and a lighter saddle behind the dorsal fin.
+fn orca_skin(y: f32, up: f32) -> [u8; 5] {
+    let belly = up < -0.3 && y > -10.0;
+    let flank = (-9.0..-3.5).contains(&y) && up < 0.05;
+    let chin = y > 9.0 && up < 0.0;
+    if belly || flank || chin {
+        PORCELAIN
+    } else if (-7.5..-3.5).contains(&y) && up > 0.75 {
+        SKIN
+    } else {
+        NAVY
+    }
+}
+
+/// A thin fin triangle with real thickness, so both faces render.
+fn fin(mesh: &mut Mesh, front: Point3, back: Point3, tip: Point3, thickness: f32, ramp: [u8; 5]) {
+    let center = front.add(back).add(tip).scale(1.0 / 3.0);
+    let side = |p: Point3, x: f32| p.add(p3(x, 0.0, 0.0)).sub(center);
+    let (l, r) = (-thickness, thickness);
+    for points in [
+        [side(front, l), side(back, l), side(tip, l), side(tip, l)],
+        [side(front, r), side(back, r), side(tip, r), side(tip, r)],
+        [side(front, l), side(front, r), side(tip, r), side(tip, l)],
+        [side(back, l), side(back, r), side(tip, r), side(tip, l)],
+    ] {
+        mesh.convex_face(points, center, Point3::default(), ramp);
+    }
+}
+
 fn whale(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {
-    let swim = (time * TAU / 1.5).sin();
-    // Round body, head forward; lower faces take the paler belly.
-    mesh.sphere(p3(0.0, 2.0, 7.5), p3(7.6, 9.8, 7.2), 8, 14, |n| {
-        if n.z < -0.3 && n.y > -0.7 {
-            BELLY
-        } else {
-            SKIN
+    let curl = boss.unravel;
+    // Vertical fluke beats while swimming; a raised tail holds still.
+    let beat = (time * TAU / 1.2).sin() * (1.0 - curl) * if boss.exposed > 0.0 { 0.0 } else { 1.0 };
+    let lift = |y: f32| tail_lift(curl, y) + beat * ((-2.0 - y) / 12.5).max(0.0).powi(2) * 1.6;
+    let segments = 20;
+    let ring = |(y, z, w, h): (f32, f32, f32, f32)| -> Vec<Point3> {
+        (0..=segments)
+            .map(|ix| {
+                let a = ix as f32 * TAU / segments as f32;
+                p3(a.cos() * w, y, z + lift(y) + a.sin() * h)
+            })
+            .collect()
+    };
+    let rings: Vec<Vec<Point3>> = ORCA.iter().map(|station| ring(*station)).collect();
+    for (ix, pair) in rings.windows(2).enumerate() {
+        let (y0, z0, ..) = ORCA[ix];
+        let (y1, z1, ..) = ORCA[ix + 1];
+        let axis = p3(
+            0.0,
+            (y0 + y1) * 0.5,
+            (z0 + z1) * 0.5 + lift((y0 + y1) * 0.5),
+        );
+        for j in 0..segments {
+            let mut points = [pair[0][j], pair[0][j + 1], pair[1][j + 1], pair[1][j]];
+            let middle = points
+                .iter()
+                .fold(Point3::default(), |sum, p| sum.add(*p))
+                .scale(0.25);
+            let normal = points[2].sub(points[0]).cross(points[3].sub(points[1]));
+            if normal.dot(middle.sub(axis)) < 0.0 {
+                points.reverse();
+            }
+            let a = (j as f32 + 0.5) * TAU / segments as f32;
+            mesh.quad(points, orca_skin(middle.y, a.sin()));
         }
-    });
-    // The tail tapers from the back and rises behind it, as in the logo.
-    mesh.tube(
-        &[
-            p3(0.0, -6.0, 7.2),
-            p3(0.0, -10.0, 8.6),
-            p3(0.0, -12.6, 12.0),
-            p3(0.0, -13.4, 15.6),
-            p3(0.0, -13.0, 18.5),
-        ],
-        &[4.4, 3.2, 2.2, 1.6, 1.2],
-        1.0,
-        SKIN,
+    }
+    // Rounded nose cap.
+    let nose = p3(0.0, 13.6, 7.0 + lift(13.6));
+    for j in 0..segments {
+        mesh.quad([nose, rings[0][j + 1], rings[0][j], rings[0][j]], NAVY);
+    }
+    // The tall dorsal fin, raked back.
+    fin(
+        mesh,
+        p3(0.0, 2.2, 13.2),
+        p3(0.0, -4.6, 13.4 + lift(-4.6)),
+        p3(0.0, -3.6, 21.2 - fall * 4.0),
+        0.35,
+        NAVY,
     );
     for side in [-1.0, 1.0] {
-        let flick = swim * 0.4 * side;
+        // Paddle flippers.
         mesh.tube(
             &[
-                p3(0.0, -13.0, 18.5),
-                p3(side * 2.4, -12.4, 20.0 + flick),
-                p3(side * 4.8, -11.6, 20.6 + flick),
-                p3(side * 5.8, -10.8, 19.8 + flick),
+                p3(side * 5.2, 6.0, 4.6),
+                p3(side * 7.6, 4.8, 3.2 + beat * 0.3 * side),
+                p3(side * 9.6, 3.0, 2.4 + beat * 0.4 * side),
+                p3(side * 10.6, 1.8, 2.2 - fall),
             ],
-            &[1.1, 1.3, 0.9, 0.12],
-            0.4,
-            SKIN,
+            &[1.4, 1.9, 1.5, 0.3],
+            0.35,
+            NAVY,
         );
-        let eye = p3(side * 5.4, 8.6, 9.4);
-        mesh.sphere(eye, p3(1.25, 1.25, 1.25), 4, 8, |_| PORCELAIN);
+        // Oval white patch behind the eye.
+        mesh.group(
+            p3(side * 5.75, 5.6, 9.0),
+            p3(0.0, 0.0, side * 0.12),
+            |mesh| {
+                mesh.sphere(Point3::default(), p3(0.45, 2.1, 0.95), 4, 10, |_| PORCELAIN);
+            },
+        );
+        // Small dark eye just ahead of the patch, and the mouth line.
         mesh.sphere(
-            eye.add(p3(side * 0.35, 0.75, 0.15)),
+            p3(side * 5.25, 8.5, 8.0),
             p3(0.62, 0.62, 0.62),
             3,
             6,
             |_| DARK,
         );
-        // The pale smile line from the logo's inner curve.
         mesh.tube(
             &[
-                p3(side * 6.6, 9.0, 5.6),
-                p3(side * 7.5, 5.5, 4.6),
-                p3(side * 7.6, 1.5, 4.9),
+                p3(side * 1.6, 12.7, 6.4),
+                p3(side * 3.6, 11.0, 5.9),
+                p3(side * 5.0, 8.8, 6.3),
             ],
-            &[0.28, 0.3, 0.12],
+            &[0.16, 0.18, 0.12],
             1.0,
-            PORCELAIN,
+            DARK,
         );
+        // Horizontal flukes swept back from the tail stock.
+        let root = p3(0.0, -14.6, 10.4 + lift(-14.6));
+        let flex = lift(-17.0) - lift(-14.6);
         mesh.tube(
             &[
-                p3(side * 6.8, 3.5, 3.8),
-                p3(side * 9.6, 1.8, 2.6 + flick),
-                p3(side * 11.4, -0.8, 2.4 + flick * 1.5 - fall),
+                root,
+                p3(side * 2.6, -15.6, root.z + flex * 0.4),
+                p3(side * 5.2, -17.0, root.z + flex * 0.8 + 0.5),
+                p3(side * 6.4, -18.2, root.z + flex + 0.9),
             ],
-            &[1.4, 1.0, 0.1],
-            0.38,
-            ARMOR,
+            &[1.3, 1.8, 1.2, 0.15],
+            0.35,
+            NAVY,
         );
     }
     let open = boss.exposed > 0.0;
-    let r = if open { 1.9 } else { 1.4 };
-    mesh.sphere(p3(0.0, -13.0, 18.5), p3(r, r, r), 4, 8, |_| {
-        if open { LUMINOUS } else { EMBER }
-    });
+    let r = if open { 1.9 } else { 1.3 };
+    mesh.sphere(
+        p3(0.0, -15.2, 11.4 + tail_lift(curl, -15.2)),
+        p3(r, r, r),
+        4,
+        8,
+        |_| if open { LUMINOUS } else { EMBER },
+    );
 }
 
 fn copilot(mesh: &mut Mesh, boss: &Boss, time: f32, fall: f32) {

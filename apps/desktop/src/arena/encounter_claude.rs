@@ -1,6 +1,6 @@
 use super::*;
 
-const REST: [f32; 5] = [0.5, 0.45, 0.4, 0.34, 0.3];
+const REST: [f32; 5] = [0.42, 0.38, 0.32, 0.27, 0.24];
 const FLIGHT: [f32; 5] = [0.62, 0.56, 0.5, 0.46, 0.42];
 
 impl Arena {
@@ -17,7 +17,7 @@ impl Arena {
                 self.boss.spin += STEP * 1.5;
                 self.boss.face(self.player.position, STEP * 4.0);
                 if self.boss.time >= self.boss.duration {
-                    self.boss.begin(Attack::Hop, self.player.position, 0.26);
+                    self.boss.begin(Attack::Hop, self.player.position, 0.24);
                 }
             }
             BossState::Windup => {

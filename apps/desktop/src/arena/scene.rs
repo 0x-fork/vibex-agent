@@ -68,7 +68,7 @@ impl Geometry {
     }
     pub fn preview(bounds: Bounds<Pixels>, rem: Pixels) -> Self {
         let unit = (rem * 0.52)
-            .min(bounds.size.width / 152.0)
+            .min(bounds.size.width / 176.0)
             .min(bounds.size.height / 128.0);
         Self {
             // Reserve room for the winged guardian above its ground anchor.
