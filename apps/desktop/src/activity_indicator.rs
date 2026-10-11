@@ -1,8 +1,8 @@
 //! Activity marks for live timeline labels and compact sidebar rows.
 //!
-//! The timeline's V sweeps a highlight along its strokes; the sidebar paints
-//! the TUI's Braille spinner frames dot by dot. Both use synchronized, bounded
-//! clocks and fixed, rem-sized canvases so motion never reflows adjacent text.
+//! The timeline's V sweeps a highlight along its strokes; the sidebar walks one
+//! around the Braille spinner's dot ring. Both use a synchronized, bounded clock
+//! and a fixed, rem-sized canvas so motion never reflows adjacent text.
 
 use std::f32::consts::{PI, TAU};
 use std::time::Duration;
@@ -17,8 +17,26 @@ use vibex_tui::glyphs::{self, GlyphTier};
 use crate::motion;
 
 const TIMELINE_CYCLE: Duration = Duration::from_millis(2100);
-const TIMELINE_MAX_FPS: f32 = 30.0;
+
+/// Frames per second both marks are sampled at.
+///
+/// The sidebar mark used to step through the TUI's eight spinner frames at
+/// their 100ms cadence. That cap never saved the workbench a frame — a running
+/// row already carries the title `ShimmerText`, which asks for one every display
+/// refresh — but it made the one moving thing in the row arrive on a timer, and
+/// a `with_max_fps` re-render lands some time *after* the interval it waits for.
+/// The phase read on arrival therefore skipped frames, so the rotation dropped
+/// dots and popped. A continuous sweep sampled at the timeline mark's budget
+/// costs the same frames the row was already spending and no longer steps.
+const ACTIVITY_MAX_FPS: f32 = 30.0;
+
+/// How long the TUI holds one of its spinner frames.
 const SIDEBAR_FRAME_DURATION: Duration = Duration::from_millis(100);
+
+/// One lap of the sidebar highlight: the time the TUI takes to walk its frames.
+fn sidebar_cycle() -> Duration {
+    SIDEBAR_FRAME_DURATION * glyphs::spinner_frames(GlyphTier::Full).len() as u32
+}
 
 // Normalized cell centers follow the V from its left tip to its right tip.
 // These are glyph coordinates; the enclosing slot owns the interface scale.
@@ -31,6 +49,15 @@ const TIMELINE_CELLS: [(f32, f32); 7] = [
     (0.74, 0.40),
     (0.86, 0.20),
 ];
+
+/// The painted sidebar mark's dots, as indexes into the Braille cell.
+///
+/// Dots 1-3 run down the left column and 4-6 back up the right one, so the six
+/// form a closed ring around the cell — the path the TUI's frames carry their
+/// lit window along. The mark walks that ring instead of replaying the frames:
+/// the same rotation, with the light moving continuously instead of jumping
+/// 100ms at a time.
+const SIDEBAR_RING: [usize; 6] = [0, 1, 2, 5, 4, 3];
 
 #[derive(Clone, Copy)]
 enum ActivityStyle {
@@ -54,7 +81,7 @@ impl ActivityIndicator {
         }
     }
 
-    /// The TUI's Braille spinner in a fixed sidebar status slot.
+    /// The TUI's spinner dot ring in a fixed sidebar status slot.
     /// The owning row scopes `id` to its session, group, or workspace.
     pub(crate) fn sidebar(id: impl Into<ElementId>) -> Self {
         Self {
@@ -77,13 +104,13 @@ impl RenderOnce for ActivityIndicator {
                 div().size_4(),
                 cx.theme().foreground,
                 TIMELINE_CYCLE,
-                TIMELINE_MAX_FPS,
+                ACTIVITY_MAX_FPS,
             ),
             ActivityStyle::Sidebar => (
                 div().size_5(),
                 cx.theme().primary,
-                SIDEBAR_FRAME_DURATION * glyphs::spinner_frames(GlyphTier::Full).len() as u32,
-                1.0 / SIDEBAR_FRAME_DURATION.as_secs_f32(),
+                sidebar_cycle(),
+                ACTIVITY_MAX_FPS,
             ),
         };
         let slot = slot.flex_none();
@@ -135,11 +162,66 @@ fn timeline_mark(color: Hsla, phase: Option<f32>) -> impl IntoElement {
     .size_full()
 }
 
+/// How far apart two ring positions are, the short way around the loop.
+fn ring_distance(index: f32, head: f32, lap: f32) -> f32 {
+    let offset = (index - head).rem_euclid(lap);
+    offset.min(lap - offset)
+}
+
+/// The sidebar mark: the spinner's dot ring with one highlight walking it.
+///
+/// `phase` is the fraction of a lap travelled by the head, or `None` for the
+/// fully visible still mark reduced motion and the opt-in inactive-window pause
+/// fall back to — the head parked at the lap's start, the pose gpui's own
+/// reduced-motion handling leaves a repeating animation in.
+fn sidebar_mark(color: Hsla, phase: Option<f32>) -> impl IntoElement {
+    let head = phase.unwrap_or(0.0) * SIDEBAR_RING.len() as f32;
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let extent = bounds.size.width.min(bounds.size.height);
+            let center = bounds.center();
+            let diameter = extent * 0.16;
+            let pitch = extent * 0.26;
+            let lap = SIDEBAR_RING.len() as f32;
+            // The frame is painted, not shaped: the reader's code font is free
+            // to lack the Braille block — JetBrains Mono, for one, draws its
+            // replacement box for it — and then the running cue would be that
+            // box instead of a spinner. Each dot sits at its Braille cell
+            // center, so the ring renders in whatever font the workbench is set
+            // to, and only its brightness carries the motion.
+            for (index, dot) in SIDEBAR_RING.iter().copied().enumerate() {
+                let (column, row) = braille_dot_cell(dot);
+                // Brightness is the cosine of the dot's distance from the head
+                // around the ring: the dot under the head is at full contrast,
+                // the one opposite it is at rest, and every dot between rides a
+                // smooth ramp. The same falloff the timeline sweep uses, wrapped
+                // around a circle so one lap closes seamlessly.
+                let distance = ring_distance(index as f32, head, lap);
+                let intensity = 0.5 + 0.5 * (distance / lap * TAU).cos();
+                let origin = point(
+                    center.x + (column - 0.5) * pitch - diameter * 0.5,
+                    center.y + (row - 1.5) * pitch - diameter * 0.5,
+                );
+                window.paint_quad(
+                    fill(
+                        Bounds::new(origin, size(diameter, diameter)),
+                        color.opacity(0.28 + 0.72 * intensity),
+                    )
+                    .corner_radii(diameter * 0.5),
+                );
+            }
+        },
+    )
+    .size_full()
+}
+
 /// The eight Braille dots of one spinner frame, as a bit mask.
 ///
-/// The TUI's frames are the single source of truth for the sidebar mark, so the
-/// dots are read back out of the glyph rather than copied into a second table:
-/// an edit to the frame list moves both surfaces together.
+/// The TUI's frames still name the dots the sidebar ring paints and the pace it
+/// walks them; only the frame-by-frame replay is gone, so the read-back lives
+/// with the tests that hold the two tables together.
+#[cfg(test)]
 fn braille_dots(frame: &str) -> u8 {
     frame
         .chars()
@@ -167,42 +249,6 @@ fn braille_dot_cell(index: usize) -> (f32, f32) {
     }
 }
 
-fn sidebar_mark(color: Hsla, phase: Option<f32>) -> impl IntoElement {
-    let frames = glyphs::spinner_frames(GlyphTier::Full);
-    let step = (phase.unwrap_or(0.0) * frames.len() as f32) as u32;
-    let dots = braille_dots(glyphs::frame_at(frames, step, 1));
-
-    // The frame is painted, not shaped: the reader's code font is free to lack
-    // the Braille block — JetBrains Mono, for one, draws its replacement box for
-    // it — and then the running cue would be that box instead of a spinner. Each
-    // frame occupies the same centered cell and holds at full contrast until the
-    // next discrete step.
-    canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            let extent = bounds.size.width.min(bounds.size.height);
-            let center = bounds.center();
-            let diameter = extent * 0.16;
-            let pitch = extent * 0.26;
-            for index in 0..8 {
-                if dots & (1 << index) == 0 {
-                    continue;
-                }
-                let (column, row) = braille_dot_cell(index);
-                let origin = point(
-                    center.x + (column - 0.5) * pitch - diameter * 0.5,
-                    center.y + (row - 1.5) * pitch - diameter * 0.5,
-                );
-                window.paint_quad(
-                    fill(Bounds::new(origin, size(diameter, diameter)), color)
-                        .corner_radii(diameter * 0.5),
-                );
-            }
-        },
-    )
-    .size_full()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +272,93 @@ mod tests {
     fn non_braille_frames_have_no_dots_to_paint() {
         assert_eq!(braille_dots("|"), 0);
         assert_eq!(braille_dots(""), 0);
+    }
+
+    /// The painted ring carries exactly the dots the TUI's spinner cycles, at
+    /// the pace it cycles them.
+    ///
+    /// The frames are no longer replayed, so this test is what keeps the two
+    /// surfaces the same cue: the desktop may not quietly drop a dot the spinner
+    /// lights, paint one twice, or turn at a speed of its own.
+    #[test]
+    fn the_sidebar_ring_matches_the_tui_spinner() {
+        let frames = glyphs::spinner_frames(GlyphTier::Full);
+        let lit = frames
+            .iter()
+            .map(|frame| braille_dots(frame))
+            .fold(0, |all, dots| all | dots);
+        let ring = SIDEBAR_RING
+            .iter()
+            .map(|index| 1u8 << index)
+            .fold(0, |all, dot| all | dot);
+        assert_eq!(
+            ring, lit,
+            "the ring paints a different dot set than the spinner cycles"
+        );
+        assert_eq!(
+            ring.count_ones() as usize,
+            SIDEBAR_RING.len(),
+            "a dot is painted twice"
+        );
+        assert_eq!(
+            sidebar_cycle(),
+            SIDEBAR_FRAME_DURATION * frames.len() as u32
+        );
+    }
+
+    /// Consecutive ring positions are neighbours in the Braille cell.
+    ///
+    /// This is the "steps missing" regression. The highlight used to be a frame
+    /// index, so a late re-render dropped whole frames and the light jumped
+    /// across the cell; a head that walks neighbouring dots cannot jump.
+    #[test]
+    fn the_sidebar_ring_walks_neighbouring_dots_and_closes() {
+        for step in 0..SIDEBAR_RING.len() {
+            let (column, row) = braille_dot_cell(SIDEBAR_RING[step]);
+            let next = SIDEBAR_RING[(step + 1) % SIDEBAR_RING.len()];
+            let (next_column, next_row) = braille_dot_cell(next);
+            let distance = (column - next_column).abs() + (row - next_row).abs();
+            assert_eq!(distance, 1.0, "ring step {step} jumps");
+        }
+    }
+
+    /// Every dot takes its turn at full brightness at the mark's real sample
+    /// rate, and no frame-to-frame change is large enough to read as a pop.
+    #[test]
+    fn the_sidebar_highlight_lights_every_dot_smoothly() {
+        let lap = SIDEBAR_RING.len() as f32;
+        let brightness = |index: usize, phase: f32| {
+            let distance = ring_distance(index as f32, phase * lap, lap);
+            0.5 + 0.5 * (distance / lap * TAU).cos()
+        };
+        // One lap lasts `sidebar_cycle()` and the animation is sampled at
+        // `ACTIVITY_MAX_FPS`, so this is the sequence a reader actually sees.
+        let samples = (sidebar_cycle().as_secs_f32() * ACTIVITY_MAX_FPS).round() as usize;
+        assert!(
+            samples > glyphs::spinner_frames(GlyphTier::Full).len(),
+            "the mark must be sampled faster than the frames it replaced"
+        );
+        let mut peaks = [0.0_f32; SIDEBAR_RING.len()];
+        let mut previous = [0.0_f32; SIDEBAR_RING.len()];
+        let mut worst_step = 0.0_f32;
+        for sample in 0..=samples {
+            let phase = sample as f32 / samples as f32;
+            for index in 0..SIDEBAR_RING.len() {
+                let value = brightness(index, phase);
+                peaks[index] = peaks[index].max(value);
+                if sample > 0 {
+                    worst_step = worst_step.max((value - previous[index]).abs());
+                }
+                previous[index] = value;
+            }
+        }
+        for (index, peak) in peaks.iter().enumerate() {
+            assert!(*peak > 0.98, "dot {index} only reached {peak}");
+        }
+        // A step under a fifth of the ramp is a ramp, not a flicker.
+        assert!(
+            worst_step < 0.2,
+            "brightness stepped {worst_step} in one frame"
+        );
     }
 }

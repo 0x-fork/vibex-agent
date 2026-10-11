@@ -658,19 +658,29 @@ The fixed rem-sized canvas changes only cell brightness, preserving adjacent
 text and row geometry. Keep the frame budget bounded, and render a fully
 visible static V for reduced motion or the opt-in inactive-window pause.
 Only live turns show the timeline mark. Sidebar session, group, and workspace
-rows use `ActivityIndicator::sidebar(id)`: the TUI's Braille spinner frames,
-directly reusing `vibex_tui::glyphs::spinner_frames(GlyphTier::Full)` and
-`frame_at`. **Paint those frames, never shape them.** The frame is a character
-from the Braille block, and the reader's code font is free to lack it —
-JetBrains Mono has no Braille, so the mark drew that font's replacement box
-instead of a spinner. `braille_dots` reads the dots back out of the frame, and
-the fixed `size_5()` canvas paints them in the two-by-four Braille cell, so the
-frame table stays the single source of truth while the mark renders whatever
-font the workbench is set to. Hold each frame at full contrast for 100ms: the
-eight-frame cycle takes 800ms, with frame requests bounded to the same cadence.
-The timeline keeps its separate 2100ms cycle and 30 fps budget. Scope animation
-IDs under the domain-keyed row, and hold the first spinner frame for reduced
-motion or the opt-in inactive-window pause.
+rows use `ActivityIndicator::sidebar(id)`: the dot ring of the TUI's Braille
+spinner with one highlight walking it. **Paint the dots, never shape them.** The
+frame is a character from the Braille block, and the reader's code font is free
+to lack it — JetBrains Mono has no Braille, so the mark drew that font's
+replacement box instead of a spinner. The fixed `size_5()` canvas paints the
+ring dot by dot at the two-by-four Braille cell centers, so the mark renders in
+whatever font the workbench is set to and only brightness carries the motion.
+
+The mark does not replay the TUI's frames. `SIDEBAR_RING` walks the six spinner
+dots in the order the frames light them, and the animation drives one head
+around that ring with the same cosine falloff the timeline sweep uses: every dot
+takes its turn at full contrast, and none is skipped. Replaying frames under
+`with_max_fps` is what made the old mark stutter — a throttled re-render lands
+some time *after* the interval it waits for, so the phase read on arrival jumps
+whole frames and drops dots. `vibex_tui::glyphs::spinner_frames(GlyphTier::Full)`
+still names the dot set and the pace — one lap lasts the frames' 8 × 100ms — and
+a test holds the ring to both. Sample the mark at the timeline's 30 fps budget:
+a running row already carries the title `ShimmerText`, which requests a frame per
+display refresh, so the old 10 fps cap never bought the row a frame. The timeline
+keeps its separate 2100ms cycle. Scope animation IDs under the domain-keyed row,
+and park the head at the lap's start for reduced motion or the opt-in
+inactive-window pause — the pose gpui's own reduced-motion handling leaves a
+repeating animation in.
 Running marks use the theme's
 `primary`; auto-continue sessions and groups use `success` (green). Workspace
 aggregates keep `primary` because their sessions can have different
