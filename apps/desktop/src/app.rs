@@ -14905,11 +14905,9 @@ impl VibexWorkbench {
                         Ok(Err(error)) => {
                             this.record_delegated_page_failure(&parent, trigger, error.message)
                         }
-                        Err(error) => this.record_delegated_page_failure(
-                            &parent,
-                            trigger,
-                            error.to_string(),
-                        ),
+                        Err(error) => {
+                            this.record_delegated_page_failure(&parent, trigger, error.to_string())
+                        }
                     }
                     cx.notify();
                 });
