@@ -298,6 +298,26 @@ fn reveal_branch_toggle(cx: &mut VisualTestContext, point: gpui::Point<gpui::Pix
     });
 }
 
+/// Sends the mouse-down/up pair a double click on a row produces.
+///
+/// The platform counts the clicks; the test states the count outright so the
+/// gesture does not depend on how fast the harness delivers two clicks.
+fn double_click(cx: &mut VisualTestContext, point: gpui::Point<gpui::Pixels>) {
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: point,
+        modifiers: Modifiers::none(),
+        button: MouseButton::Left,
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui::MouseUpEvent {
+        position: point,
+        modifiers: Modifiers::none(),
+        button: MouseButton::Left,
+        click_count: 2,
+    });
+}
+
 fn group(workbench: &mut VibexWorkbench, count: usize) {
     let members: Vec<_> = (0..count)
         .map(|index| session(index).id.to_string())
@@ -676,6 +696,77 @@ fn team_tree_collapse_and_keyboard_order_follow_grouped_and_compact_rows(cx: &mu
             expected
         );
     }
+}
+
+/// The branch a session row owns answers to a double click on the row itself.
+///
+/// The pair is a toggle rather than a fold-only verb: the same gesture opens the
+/// branch again, and the single click inside the pair still selects the row, so
+/// the gesture never costs the navigation the first click performs.
+#[gpui::test]
+fn double_clicking_a_session_row_toggles_its_branch(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 4);
+    workbench.update(cx, |workbench, _| {
+        for node in [
+            node(0, None, 2),
+            node(1, Some(0), 1),
+            node(2, Some(0), 0),
+            node(3, Some(1), 0),
+        ] {
+            workbench
+                .delegated_tree
+                .insert(node.session_ref.id.clone(), node);
+        }
+        for (parent, children) in [(0, vec![1, 2]), (1, vec![3])] {
+            workbench.delegated_pages.insert(
+                Some(session(parent).id.to_string()),
+                DelegatedBranchPage {
+                    session_ids: children
+                        .into_iter()
+                        .map(|index| session(index).id.to_string())
+                        .collect(),
+                    ..Default::default()
+                },
+            );
+        }
+    });
+    draw(cx);
+    let expected: Vec<_> = [0, 1, 3, 2]
+        .into_iter()
+        .map(|index| session(index).id.to_string())
+        .collect();
+    assert_eq!(
+        workbench.read_with(cx, |workbench, _| workbench.delegated_visible_order()),
+        expected
+    );
+    let root_row = cx
+        .debug_bounds("sidebar-session-row-session_team_0")
+        .expect("the root session row is rendered");
+    double_click(cx, root_row.center());
+    draw(cx);
+    assert_eq!(
+        workbench.read_with(cx, |workbench, _| workbench.delegated_visible_order()),
+        [session(0).id.to_string()],
+        "a double click folds the branch under the row"
+    );
+    double_click(cx, root_row.center());
+    draw(cx);
+    assert_eq!(
+        workbench.read_with(cx, |workbench, _| workbench.delegated_visible_order()),
+        expected,
+        "the same gesture opens the branch again"
+    );
+    // A child row owns a branch of its own, so the gesture reads the same there.
+    let child_row = cx
+        .debug_bounds("sidebar-delegated-row-session_team_1")
+        .expect("the delegated row is rendered");
+    double_click(cx, child_row.center());
+    draw(cx);
+    assert_eq!(
+        workbench.read_with(cx, |workbench, _| workbench.delegated_visible_order()),
+        [0, 1, 2].map(|index| session(index).id.to_string()),
+        "a double click on a child row folds its own children"
+    );
 }
 
 /// A delegated row is the session row's own shape one level down.
