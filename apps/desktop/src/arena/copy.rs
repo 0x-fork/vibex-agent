@@ -26,3 +26,8 @@ pub(super) fn battle_label(guardian: Guardian, paused: bool) -> String {
     };
     format!("{} · {} · {}", title(), guardian.agent(), status)
 }
+/// The unlocked companion riding above an Agent's composer.
+pub(super) fn companion_label(guardian: Guardian) -> String {
+    let action = text("Double-click to challenge", "双击发起挑战", "雙擊發起挑戰");
+    format!("{} · {} · {}", title(), guardian.agent(), action)
+}

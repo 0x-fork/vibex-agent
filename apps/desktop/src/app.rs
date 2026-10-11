@@ -7613,6 +7613,9 @@ pub struct VibexWorkbench {
     image_editor_text_input: Entity<TextareaState>,
     new_session_input: Entity<TextareaState>,
     home_arena: Entity<crate::arena::HomeArena>,
+    /// The reward effect of a won encounter, riding the composer of a session
+    /// whose Agent has one unlocked.
+    session_companion: Entity<crate::arena::Companion>,
     new_session_worktree_name_input: Entity<InputState>,
     new_session_worktree_path_input: Entity<InputState>,
     new_session_project_search: Entity<InputState>,
@@ -8277,6 +8280,7 @@ impl VibexWorkbench {
         });
         let home_arena =
             cx.new(|cx| crate::arena::HomeArena::new(new_session_input.read(cx).focus_handle(cx)));
+        let session_companion = cx.new(|_| crate::arena::Companion::new());
         let new_session_worktree_name_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(locale::text(
                 "Worktree name",
@@ -8317,6 +8321,18 @@ impl VibexWorkbench {
             .and_then(|id| VibexSessionId::parse(id).ok());
         let mut agent_subscriptions = vec![
             cx.observe(&home_arena, |_, _, cx| cx.notify()),
+            cx.observe(&session_companion, |_, _, cx| cx.notify()),
+            // A won encounter unlocks its guardian's companion effect for good:
+            // the victory is recorded the moment the duel ends, whether it was
+            // fought on the home page or over a session.
+            cx.subscribe(
+                &home_arena,
+                |this, _, event: &crate::arena::Awakened, cx| this.unlock_companion(event.key, cx),
+            ),
+            cx.subscribe(
+                &session_companion,
+                |this, _, event: &crate::arena::Awakened, cx| this.unlock_companion(event.key, cx),
+            ),
             cx.subscribe_in(
                 &command_palette_input,
                 window,
@@ -8767,6 +8783,7 @@ impl VibexWorkbench {
             image_editor_text_input,
             new_session_input,
             home_arena,
+            session_companion,
             new_session_worktree_name_input,
             new_session_worktree_path_input,
             new_session_project_search,
@@ -36876,6 +36893,18 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Records a won AI Souls encounter.
+    ///
+    /// The unlock is permanent: it is written once and never removed, so a
+    /// replayed duel only ever re-states a fact the state already holds.
+    fn unlock_companion(&mut self, guardian: &str, cx: &mut Context<Self>) {
+        if !self.ui_state.arena.unlock(guardian) {
+            return;
+        }
+        self.queue_ui_state();
+        cx.notify();
+    }
+
     /// Toggle the power optimization that freezes a backgrounded workbench.
     ///
     /// The gate lives in `motion`, and it is applied directly rather than
@@ -58193,6 +58222,28 @@ impl VibexWorkbench {
         } else {
             self.render_composer_goal(cx)
         };
+        // The reward of a won encounter rides this composer for as long as its
+        // turn runs, on the strip directly above the input box. Only the
+        // composer that owns the keyboard carries it: a pane that merely mirrors
+        // another session's timeline owns no turn for it to ride.
+        let companion_focus = composer_input.read(cx).focus_handle(cx);
+        let companion_reward = selected_runtime
+            .as_ref()
+            .and_then(|selection| crate::arena::reward_key(selection.agent_id.as_str()))
+            .filter(|key| self.ui_state.arena.is_unlocked(key));
+        let reduced_motion = motion::reduced_motion(cx);
+        let composer_companion = if enabled {
+            crate::arena::companion_lane(
+                &self.session_companion,
+                companion_reward,
+                session_running,
+                Some(companion_focus),
+                reduced_motion,
+                cx,
+            )
+        } else {
+            None
+        };
         let composer_extension_visible = composer_queue.is_some() || composer_goal.is_some();
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
@@ -58555,6 +58606,9 @@ impl VibexWorkbench {
                                 .px(px(COMPOSER_QUEUE_HORIZONTAL_INSET))
                                 .child(goal),
                         )
+                    })
+                    .when_some(composer_companion, |this, companion| {
+                        this.child(companion)
                     })
                     .child(
                         v_flex()
@@ -59993,13 +60047,16 @@ impl VibexWorkbench {
     /// The workbench column's own page: the open session group, or the timeline
     /// when no group is in front.
     fn render_column_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if let Some((group_id, group)) = self.active_session_group() {
+        let page = if let Some((group_id, group)) = self.active_session_group() {
             self.render_session_group_workspace(&group_id, &group, cx)
         } else {
             self.ensure_timeline_view(cx)
                 .cached(StyleRefinement::default().size_full())
                 .into_any_element()
-        }
+        };
+        // A duel opened from the composer's companion covers the session page
+        // the way the home page's own duel covers the new-session page.
+        crate::arena::session_surface(&self.session_companion, page, cx)
     }
 
     fn render_shell(
@@ -83991,6 +84048,56 @@ mod tests {
 
         // The workbench column keeps its own chrome reservation.
         assert!(shell.contains(".pt(px(TITLE_BAR_HEIGHT))"));
+    }
+
+    /// The reward of a won encounter is wired into the session surface exactly
+    /// where a reader sees it: a lane mounted directly above the input box of
+    /// the composer whose Agent owns it, and a duel that covers the session
+    /// page rather than the whole window.
+    #[test]
+    fn the_session_composer_carries_a_won_companion_reward() {
+        let source = include_str!("app.rs");
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("the composer should remain inspectable");
+        assert!(
+            composer.contains("crate::arena::companion_lane("),
+            "the composer mounts the companion lane"
+        );
+        assert!(
+            composer.contains("self.ui_state.arena.is_unlocked(key)"),
+            "the lane is only mounted for an unlocked guardian"
+        );
+        assert!(
+            composer.contains("crate::arena::reward_key(selection.agent_id.as_str())"),
+            "the companion follows the Agent the composer renders"
+        );
+        assert!(
+            composer.contains("this.child(companion)"),
+            "the lane is a row of the composer column"
+        );
+
+        let page = source
+            .split_once("    fn render_column_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_shell("))
+            .map(|(body, _)| body)
+            .expect("the column page should remain inspectable");
+        assert!(
+            page.contains("crate::arena::session_surface(&self.session_companion, page, cx)"),
+            "a duel opened from the composer covers the session page"
+        );
+
+        assert!(
+            source
+                .contains("fn unlock_companion(&mut self, guardian: &str, cx: &mut Context<Self>)"),
+            "a victory is recorded through one unlock path"
+        );
+        assert!(
+            source.contains("this.unlock_companion(event.key, cx)"),
+            "both duel surfaces report their victories"
+        );
     }
 
     /// The full screen flip is a sweep, not an open or a close: the panel keeps

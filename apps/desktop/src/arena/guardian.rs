@@ -46,6 +46,21 @@ impl Guardian {
             _ => None,
         }
     }
+    /// The canonical Agent id this guardian is stored and looked up by.
+    ///
+    /// Agent ids have aliases, so a victory has to be recorded against the one
+    /// spelling every surface agrees on; otherwise the same reward could stay
+    /// locked for a session that names its Agent differently.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+            Self::OpenCode => "opencode",
+            Self::DeepSeek => "deepseek",
+            Self::Copilot => "copilot",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

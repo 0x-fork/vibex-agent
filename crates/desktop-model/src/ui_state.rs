@@ -375,6 +375,51 @@ pub struct AppearanceUiState {
     pub theme_selection: ThemeSelection,
 }
 
+/// The AI Souls encounters this user has already won.
+///
+/// A victory is permanent: it unlocks the defeated guardian's reward effect —
+/// the small companion that roams the strip above an Agent session's composer —
+/// and that unlock is never taken back, so re-entering an encounter can only
+/// ever add to this set. Guardians are stored by their canonical Agent key, the
+/// same token a session's Agent id resolves to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArenaUiState {
+    /// Canonical Agent keys whose guardian has been defeated at least once.
+    #[serde(default)]
+    pub unlocked: BTreeSet<String>,
+}
+
+impl ArenaUiState {
+    /// Whether this guardian's reward effect is unlocked.
+    pub fn is_unlocked(&self, guardian: &str) -> bool {
+        self.unlocked.contains(guardian)
+    }
+
+    /// Records a victory. Returns whether the key was newly unlocked, so a
+    /// caller only has to persist the state when something actually changed.
+    pub fn unlock(&mut self, guardian: &str) -> bool {
+        let guardian = guardian.trim();
+        if guardian.is_empty() || guardian.chars().count() > 64 {
+            return false;
+        }
+        self.unlocked.insert(guardian.to_string())
+    }
+
+    fn normalize(&mut self) {
+        // The same bound `unlock` enforces: Agent keys are short, so anything
+        // longer than one is not a key this state ever wrote.
+        self.unlocked = std::mem::take(&mut self.unlocked)
+            .into_iter()
+            .filter_map(|key| {
+                let key = key.trim();
+                (!key.is_empty() && key.chars().count() <= 64).then(|| key.to_string())
+            })
+            .take(16)
+            .collect();
+    }
+}
+
 /// How the desktop runtime resolves the outbound route for its network work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1269,6 +1314,9 @@ pub struct DesktopUiStateV1 {
     pub appearance: AppearanceUiState,
     #[serde(default)]
     pub network_proxy: NetworkProxyUiState,
+    /// AI Souls progress: the guardians whose encounter this user has won.
+    #[serde(default)]
+    pub arena: ArenaUiState,
     pub workbench: WorkbenchUiState,
     pub sidebar: SidebarUiState,
     pub preview: PreviewUiState,
@@ -1322,6 +1370,7 @@ impl Default for DesktopUiStateV1 {
             source_app_version: env!("CARGO_PKG_VERSION").to_string(),
             appearance: AppearanceUiState::default(),
             network_proxy: NetworkProxyUiState::default(),
+            arena: ArenaUiState::default(),
             workbench: WorkbenchUiState::default(),
             sidebar: SidebarUiState::default(),
             preview: PreviewUiState::default(),
@@ -1358,6 +1407,7 @@ impl DesktopUiStateV1 {
         self.source_app_version = bounded_required(&self.source_app_version, 80)
             .ok_or(UiStateError::Validation("source app version is empty"))?;
         self.computer.normalize();
+        self.arena.normalize();
         self.appearance.window_scale_percent = self.appearance.window_scale_percent.clamp(75, 200);
         self.appearance.interface_font.normalize(12);
         self.appearance.code_font.normalize(10);
@@ -3767,6 +3817,60 @@ mod tests {
                 .state
                 .appearance
                 .show_home_arena
+        );
+    }
+
+    /// A won encounter is permanent: the unlock survives a save and load, and a
+    /// repeat victory reports that nothing changed.
+    #[test]
+    fn a_won_encounter_unlocks_its_guardian_permanently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop-ui-state.json");
+        let store = UiStateStore::new(&path);
+
+        let mut state = DesktopUiStateV1::default();
+        assert!(state.arena.unlock("claude"));
+        assert!(
+            !state.arena.unlock("claude"),
+            "a repeat win is not a change"
+        );
+        assert!(state.arena.unlock("deepseek"));
+        assert!(state.arena.is_unlocked("claude"));
+        assert!(!state.arena.is_unlocked("codex"));
+        assert!(!state.arena.unlock("   "), "a blank key is not a victory");
+        store.save(&state).unwrap();
+
+        let loaded = store.load_or_default(2_000).unwrap().state;
+        assert!(loaded.arena.is_unlocked("claude"));
+        assert!(loaded.arena.is_unlocked("deepseek"));
+        assert!(!loaded.arena.is_unlocked("codex"));
+    }
+
+    /// State written before AI Souls victories were recorded must keep loading,
+    /// and must land on "nothing defeated yet".
+    #[test]
+    fn arena_progress_defaults_to_empty_when_state_predates_it() {
+        let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        value
+            .as_object_mut()
+            .expect("ui state should serialize as an object")
+            .remove("arena");
+        let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(decoded.arena.unlocked.is_empty());
+        assert!(!decoded.arena.is_unlocked("claude"));
+    }
+
+    #[test]
+    fn arena_progress_normalizes_its_keys() {
+        let mut state = DesktopUiStateV1::default();
+        state.arena.unlocked.insert("  claude  ".to_string());
+        state.arena.unlocked.insert("   ".to_string());
+        state.arena.unlocked.insert("a".repeat(200));
+        state.normalize().unwrap();
+        assert_eq!(
+            state.arena.unlocked,
+            BTreeSet::from(["claude".to_string()]),
+            "only a bounded, non-empty key survives normalization"
         );
     }
 

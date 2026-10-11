@@ -153,3 +153,78 @@ fn a_hit_flashes_the_model_white_and_the_flash_fades() {
     assert!(white(&lit) > white(&plain) + 100);
     arena.tick(Controls::default());
 }
+
+/// The same model the companion draws, on the arena's own frame: everything
+/// `idle` paints except the ground shadow a companion never stands on.
+fn reference(boss: &Boss, time: f32, reduced: bool) -> Raster {
+    let mut frame = Raster::with_offset(WIDTH, HEIGHT, 0, TOP_PAD);
+    let mut order = guardian_parts(boss);
+    order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    for (_, part) in order {
+        draw_part(&mut frame, boss, part, time, 0.0, reduced);
+    }
+    frame
+}
+
+/// The companion window is a crop of the same drawing, not a second drawing:
+/// every pixel inside it has to agree with the model it came from.
+#[test]
+fn a_companion_frame_is_the_idle_frame_cropped_around_its_anchor() {
+    for guardian in Guardian::ALL {
+        for time in [0.0f32, 3.5, 11.25, 24.0, 35.9] {
+            let boss = Boss::idle(guardian, time, false);
+            let full = reference(&boss, time, false);
+            let crop = companion(&boss, time, false);
+            let (left, top, right, bottom) = companion_box(guardian);
+            let (x, y) = pixel(boss.position);
+            assert_eq!(
+                (crop.width, crop.height),
+                ((right - left) as usize, (bottom - top) as usize),
+                "{guardian:?} window size"
+            );
+            for row in 0..crop.height as i32 {
+                for column in 0..crop.width as i32 {
+                    assert_eq!(
+                        crop.get(x + left + column, y + top + row),
+                        full.get(x + left + column, y + top + row),
+                        "{guardian:?} at {time}s, crop pixel {column},{row}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A window too small slices the model at the extremes of the loop, and a model
+/// that clings to the edge has no margin left for the lane it rides.
+#[test]
+fn the_companion_window_holds_every_idle_pose_without_touching_its_edge() {
+    for guardian in Guardian::ALL {
+        let (left, top, right, bottom) = companion_box(guardian);
+        assert!(right > left && bottom > top, "{guardian:?} needs a window");
+        for reduced in [false, true] {
+            let mut time = 0.0;
+            while time < crate::arena::guardian::IDLE_LOOP {
+                let boss = Boss::idle(guardian, time, reduced);
+                let frame = reference(&boss, time, reduced);
+                let (x, y) = pixel(boss.position);
+                for (ix, ink) in frame.pixels.iter().enumerate() {
+                    if *ink == CLEAR {
+                        continue;
+                    }
+                    let dx = (ix % frame.width) as i32 - x;
+                    let dy = (ix / frame.width) as i32 - (y + TOP_PAD);
+                    assert!(
+                        dx > left && dx < right && dy > top && dy < bottom,
+                        "{guardian:?} at {time}s (reduced: {reduced}) reaches {dx},{dy}, \
+                         outside its window {left},{top},{right},{bottom}"
+                    );
+                }
+                if reduced {
+                    break;
+                }
+                time += 0.2;
+            }
+        }
+    }
+}

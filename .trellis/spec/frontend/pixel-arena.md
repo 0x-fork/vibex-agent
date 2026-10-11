@@ -3,14 +3,27 @@
 ## 1. Scope / Trigger
 
 Read when changing AI Souls (AI 之魂), roaming pixel guardians, local boss
-combat, terrain, camera, input lifecycle, or the home appearance preference.
-The feature lives in `apps/desktop/src/arena/`. It cannot mutate Agent sessions,
-workspaces, runtime state, or network services.
+combat, terrain, camera, input lifecycle, the reward companion that a won
+encounter unlocks on a session composer, or the home appearance preference.
+The feature lives in `apps/desktop/src/arena/` and the arena section of the
+desktop UI state. It cannot mutate Agent sessions, workspaces, runtime state,
+or network services.
 
 ## 2. Signatures and Ownership
 
 ```rust
 AppearanceUiState::show_home_arena: bool
+ArenaUiState::unlocked: BTreeSet<String> // canonical Agent keys of won encounters
+ArenaUiState::is_unlocked(&str) -> bool
+ArenaUiState::unlock(&str) -> bool // true only when the victory was new
+Guardian::key() -> &'static str // canonical Agent id an unlock is stored under
+arena::reward_key(&str) -> Option<&'static str> // Agent id, aliases included, to that key
+arena::Awakened { key: &'static str } // emitted by either duel surface on victory
+Companion::new() -> Companion
+arena::companion_lane(&Entity<Companion>, Option<&str>, bool, Option<FocusHandle>, bool, &mut App) -> Option<AnyElement>
+arena::session_surface(&Entity<Companion>, impl IntoElement, &mut App) -> AnyElement
+art::companion_box(Guardian) -> (i32, i32, i32, i32) // crop window around the ground anchor
+art::companion(&Boss, f32, bool) -> Raster // one idle frame cropped to that window
 HomeArena::new(FocusHandle) -> HomeArena
 HomeArena::select_agent(Option<&str>, &mut Context<Self>)
 HomeArena::close(&mut Context<Self>)
@@ -44,13 +57,27 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
 - `showHomeArena` is the persisted appearance key; absent values default to
   `true`. The existing appearance update path persists changes and closes a
   live battle when disabled.
+- `arena.unlocked` is the persisted record of won encounters, keyed by the
+  canonical Agent id rather than by an alias or a display name. A victory only
+  ever adds to it: replaying a duel, and losing one, never remove an unlock.
+  Both duel surfaces emit `Awakened`, and the workbench writes the unlock
+  through one path.
 - `HomeArena` owns Agent identity, the completed flag, an optional `ArenaView`,
   composer focus, and the last displayed `PreviewSample`. Catalog refresh,
   draft initialization, runtime choice, and Agent choice call
   `sync_home_arena_agent` from update handlers, never from render.
+- `Companion` owns the unlocked reward on a session: the Agent whose guardian
+  rides that composer, its roaming/leaping stage, its frame cache, the lane
+  width measured by the last prepaint, the pose it last painted, and the duel it
+  opened. The composer drives it from the render path through
+  `arena::companion_lane`, which never notifies: every change it makes is read
+  back by the same frame that asked for it. The dive's retire task carries the
+  generation it was scheduled for, so a stage that replaced it is never retired
+  by a stale timer.
 - `ArenaView` owns input, the last measured projection, pause/closed flags,
   home opacity, and one cancellable clock. Closing or navigating away releases
   the clock and all input. The existing composer entity and draft survive.
+  Both surfaces drive the same view; only one of them can hold it at a time.
 - `combat.rs`, `guardian.rs`, `encounters.rs`, the six `encounter_*.rs` modules,
   `map.rs`, and `geometry.rs` are independent of GPUI. `encounters.rs` owns shared
   targeting, ballistic arcs and rolling/dash collisions; each encounter module
@@ -117,6 +144,43 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
 - Escape emits the same dismissal event but resumes preview. Navigation and
   disabling the preference close without redirecting navigation focus. A
   pending first-focus callback must not restart an already closed battle.
+
+### Reward companion
+
+- A victory is permanent. The defeated guardian's reward is the companion that
+  rides the composer of every session whose Agent resolves to that key; it is
+  neither time-limited nor repeatable-earned, and losing later never removes it.
+- The lane is the composer's own strip: one row directly above the input box,
+  inside the composer's content width, `LANE_HEIGHT` tall, clipped, and absent
+  from the tree entirely when no companion is mounted. It reserves nothing when
+  it is not shown, and it must never overlap the timeline or the input box.
+- The companion is drawn from `art::companion`: one idle frame cropped to
+  `art::companion_box` around the model's ground anchor, without the arena's
+  ground shadow. The window holds every pose of the idle loop, reduced pose
+  included, so no frame is ever sliced; the model is fitted to the lane by
+  height, so every guardian reads at about the same size. The crop is painted
+  as merged rectangles, mirrored when the companion travels left, and rebuilt
+  only when the quantized pose changes.
+- Mounting follows the turn. A composer whose Agent has an unlocked guardian and
+  whose turn is running shows the lane; the model travels one eased left-right
+  pass, and its pose clock is monotonic, so the authored loop closes on itself
+  instead of cutting back to a first frame mid-lane.
+- When the turn ends the companion dives: a short hop, a fall past the lane's
+  own bottom edge where the input box swallows it, and a fade. The lane is
+  removed once the dive lands, and the composer returns to its own height. A
+  stage replaced during a dive is never retired by the stale dive's timer.
+- Double-clicking the companion opens the same duel as the home page, over the
+  session page: the session's elements fade out, the arena fills the column
+  page, and Escape returns. `Arena::from_preview` still starts from the pose
+  actually painted, so the model grows out of the lane it stood in. A victory
+  there re-emits `Awakened`; the unlock it was reached through stays unlocked.
+- The companion follows the composer it is rendered for. Switching to another
+  Agent hands the lane to that Agent's guardian without a dive, and ends a duel
+  that was opened over the previous session rather than letting it follow the
+  reader. Reduced motion removes the effect entirely: no lane, no badge, and no
+  dive, while the companion's stage is still retired.
+- Nothing here mutates a session, draft, attachment, queue, or runtime state.
+  The companion is a render-time passenger of a composer.
 
 ### Combat and input
 
@@ -245,6 +309,12 @@ rebirth, without a damage override.
 | Window or focus changes | Pause immediately and clear input |
 | Archer dies | Clear threats; random safe rebirth; no result card |
 | Guardian defeated | Finite departure, restored draft/focus, hidden preview until Agent changes |
+| Won encounter, first time | Persist the unlock under the canonical Agent key; later losses never remove it |
+| Session Agent has no unlocked guardian | No lane, no badge, no reserved row |
+| Session turn not running | No lane; a turn that just ended dives once and then leaves |
+| Companion double-clicked | Duel over the session page, session elements gone, Escape returns |
+| Composer moves to another Agent | Lane hands over instantly; a duel opened over the previous session ends |
+| Reduced motion enabled | No companion lane at all, and nothing left roaming behind the setting |
 
 ## 5. Good / Base / Bad Cases
 
@@ -282,7 +352,17 @@ rebirth, without a damage override.
   bounds at narrow sizes and rem zoom, composer hit testing, retained draft/focus,
   navigation and pending-focus cancellation, Agent switching, victory hiding,
   death/rebirth, held input, pointer release outside, and pause.
+- Companion: the lane appears only for an unlocked guardian of a running
+  session and disappears for a locked one, a non-running turn, and reduced
+  motion; the badge stays inside the lane and above the input box at narrow and
+  wide composer widths; the model fits every guardian's lane; a finished turn
+  dives and retires it, returning the composer to its own height; double-click
+  opens a duel that covers the session page and Escape returns; a victory
+  reports the unlock; a session switch ends the previous duel. Art tests pin
+  the crop to the same drawing, and that no idle pose reaches its window edge.
 - Preference tests retain legacy decoding and persisted opt-out coverage.
+  Progress tests retain "absent state decodes to nothing defeated" and
+  "a repeat win is not a change".
 - Run `cargo test -p vibex-desktop --lib arena:: --locked`,
   `cargo test -p vibex-desktop-model --locked`, formatting, and scoped Clippy.
   Measure dynamic rasterization and rectangle counts after artwork changes;
@@ -300,4 +380,16 @@ let battle = Arena::new(Guardian::Claude, 0.0);
 let sample = self.preview.get();
 let arena = Arena::from_preview(sample.boss, sample.time, seed);
 let entry_camera = sample.viewport;
+
+// Wrong: a per-pass clock cuts the idle loop every time the companion turns.
+let time = phase * ROAM_PERIOD;
+
+// Correct: the pose clock is monotonic; the authored loop closes on itself.
+let time = started.elapsed().as_secs_f32();
+
+// Wrong: fitting the companion to the home page's scale covers the composer.
+let unit = window.rem_size() * 0.52;
+
+// Correct: the model is fitted to its lane, above the input box.
+let unit = (LANE_HEIGHT * FILL * art::SCALE / box_height).min(MAX_UNIT);
 ```

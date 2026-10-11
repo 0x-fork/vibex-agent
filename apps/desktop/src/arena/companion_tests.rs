@@ -1,0 +1,382 @@
+//! The companion's own contract: when the lane exists, that it stays inside the
+//! composer column, that a finished turn dives it away, and that the duel it
+//! opens covers the session page exactly as the home page covers its own.
+
+use super::*;
+use crate::arena::init as arena_init;
+use gpui::{
+    Focusable as _, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseUpEvent,
+    TestAppContext, VisualTestContext, px, size,
+};
+use gpui_component::{
+    Root,
+    input::{Input, InputState},
+};
+use std::time::Duration;
+
+fn draw(cx: &mut VisualTestContext) {
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.simulate_next_frame(cx);
+    });
+}
+fn setup(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        arena_init(cx);
+    });
+}
+fn double_click(cx: &mut VisualTestContext, id: &'static str) {
+    let bounds = cx
+        .debug_bounds(id)
+        .unwrap_or_else(|| panic!("missing {id}"));
+    let position = bounds.center();
+    cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::none());
+    cx.simulate_event(MouseUpEvent {
+        position,
+        modifiers: Modifiers::none(),
+        button: MouseButton::Left,
+        click_count: 2,
+    });
+    draw(cx);
+}
+fn press(cx: &mut VisualTestContext, name: &str) {
+    let keystroke = Keystroke::parse(name).unwrap();
+    cx.simulate_event(KeyDownEvent {
+        keystroke: keystroke.clone(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.simulate_event(KeyUpEvent { keystroke });
+    draw(cx);
+}
+
+/// A session page with the companion lane mounted above its composer, which is
+/// all the app's own composer column has to provide.
+struct Harness {
+    companion: Entity<Companion>,
+    input: Entity<InputState>,
+    reward: Option<&'static str>,
+    running: bool,
+    reduced: bool,
+    awakened: Vec<&'static str>,
+    _observed: Subscription,
+    _awakened: Subscription,
+}
+impl Harness {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let input = cx.new(|cx| InputState::new(window, cx));
+        let companion = cx.new(|_| Companion::new());
+        let observed = cx.observe(&companion, |_, _, cx| cx.notify());
+        let awakened = cx.subscribe(&companion, |this, _, event: &Awakened, cx| {
+            this.awakened.push(event.key);
+            cx.notify();
+        });
+        Self {
+            companion,
+            input,
+            reward: Some("claude"),
+            running: true,
+            reduced: false,
+            awakened: Vec::new(),
+            _observed: observed,
+            _awakened: awakened,
+        }
+    }
+    fn guardian(&self, cx: &App) -> Option<Guardian> {
+        self.companion.read(cx).guardian
+    }
+    fn stage(&self, cx: &App) -> Stage {
+        self.companion.read(cx).stage
+    }
+}
+impl Render for Harness {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let lane = lane(
+            &self.companion,
+            self.reward,
+            self.running,
+            Some(self.input.read(cx).focus_handle(cx)),
+            self.reduced,
+            cx,
+        );
+        let page = v_flex()
+            .id("session-page")
+            .debug_selector(|| "session-page".into())
+            .size_full()
+            .child(
+                div()
+                    .debug_selector(|| "session-timeline".into())
+                    .flex_1()
+                    .min_h_0()
+                    .child("timeline"),
+            )
+            .children(lane)
+            .child(
+                div()
+                    .debug_selector(|| "session-composer".into())
+                    .h(px(64.0))
+                    .flex_none()
+                    .child(Input::new(&self.input)),
+            );
+        session_surface(&self.companion, page, cx)
+    }
+}
+fn open(cx: &mut TestAppContext) -> (Entity<Harness>, &mut VisualTestContext) {
+    setup(cx);
+    let mut harness = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| Harness::new(window, cx));
+        harness = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    cx.update(|window, _| window.activate_window());
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    cx.simulate_resize(size(px(720.0), px(560.0)));
+    draw(cx);
+    (harness.unwrap(), cx)
+}
+fn drive(
+    harness: &Entity<Harness>,
+    reward: Option<&'static str>,
+    running: bool,
+    cx: &mut VisualTestContext,
+) {
+    harness.update(cx, |harness, cx| {
+        harness.reward = reward;
+        harness.running = running;
+        cx.notify();
+    });
+    draw(cx);
+}
+
+/// The model is fitted to the lane, and the lane is the composer's strip: a
+/// guardian as tall as the home page's would cover the conversation.
+#[test]
+fn every_guardian_fits_inside_the_lane_it_rides() {
+    for guardian in Guardian::ALL {
+        let fitted = fit(guardian);
+        assert!(
+            fitted.height <= LANE_HEIGHT,
+            "{guardian:?} is taller than its lane"
+        );
+        assert_eq!(fitted.top, (LANE_HEIGHT - fitted.height) / 2.0);
+        assert!(fitted.top >= 0.0);
+        assert!(
+            fitted.width < 720.0,
+            "{guardian:?} is wider than the composer column it rides"
+        );
+    }
+}
+
+/// The pass turns around at both ends and never leaves the lane, at any width
+/// the composer column can take.
+#[test]
+fn the_pass_turns_around_inside_a_narrow_and_a_wide_composer() {
+    for lane_width in [280.0f32, 720.0, 1600.0] {
+        let badge_width = fit(Guardian::Pi).width;
+        let span = lane_width - badge_width - INSET * 2.0;
+        let start = roam_at(lane_width, badge_width, 0.0);
+        let end = roam_at(lane_width, badge_width, 1.0);
+        assert_eq!(start, INSET);
+        assert_eq!(end, INSET);
+        let mut widest = start;
+        let mut phase = 0.0;
+        while phase <= 1.0 {
+            let x = roam_at(lane_width, badge_width, phase);
+            assert!(
+                x >= INSET - 0.001 && x <= INSET + span + 0.001,
+                "left the lane at {phase}: {x}"
+            );
+            widest = widest.max(x);
+            phase += 0.01;
+        }
+        assert!(
+            (widest - (INSET + span)).abs() < 0.001,
+            "never reached the far end at {lane_width}"
+        );
+    }
+    // A lane too narrow to travel still keeps the model at its left margin
+    // instead of pushing it out of the composer.
+    assert_eq!(roam_at(30.0, 40.0, 0.5), INSET);
+}
+
+#[gpui::test]
+fn the_lane_belongs_to_an_unlocked_guardian_of_a_running_session(cx: &mut TestAppContext) {
+    let (harness, cx) = open(cx);
+    assert!(cx.debug_bounds("composer-companion").is_some());
+    assert_eq!(
+        harness.read_with(cx, |harness, cx| harness.guardian(cx)),
+        Some(Guardian::Claude)
+    );
+
+    // A session that is not working never mounts one: the companion is a sign
+    // of work in flight, not a decoration of the input box.
+    drive(&harness, Some("codex"), false, cx);
+    assert!(cx.debug_bounds("composer-companion-lane").is_none());
+
+    // Neither does an Agent whose guardian has never been beaten.
+    drive(&harness, None, true, cx);
+    assert!(cx.debug_bounds("composer-companion-lane").is_none());
+
+    drive(&harness, Some("deepseek-harness"), true, cx);
+    assert_eq!(
+        harness.read_with(cx, |harness, cx| harness.guardian(cx)),
+        Some(Guardian::DeepSeek),
+        "an Agent alias resolves to the same guardian"
+    );
+    assert!(cx.debug_bounds("composer-companion").is_some());
+}
+
+/// Reduced motion turns the effect off entirely.
+#[gpui::test]
+fn reduced_motion_never_mounts_the_companion(cx: &mut TestAppContext) {
+    let (harness, cx) = open(cx);
+    assert!(cx.debug_bounds("composer-companion-lane").is_some());
+    harness.update(cx, |harness, cx| {
+        harness.reduced = true;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("composer-companion").is_none());
+    cx.background_executor
+        .advance_clock(Duration::from_secs_f32(LEAP_DURATION) + Duration::from_millis(60));
+    draw(cx);
+    draw(cx);
+    assert_eq!(
+        harness.read_with(cx, |harness, cx| harness.stage(cx)),
+        Stage::Idle,
+        "and leaves nothing roaming behind the setting"
+    );
+    harness.update(cx, |harness, cx| {
+        harness.reduced = false;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("composer-companion-lane").is_some());
+}
+
+#[gpui::test]
+fn the_companion_stays_inside_its_lane_and_above_the_input_box(cx: &mut TestAppContext) {
+    let (harness, cx) = open(cx);
+    let lane = cx.debug_bounds("composer-companion-lane").unwrap();
+    let page = cx.debug_bounds("session-page").unwrap();
+    let badge = cx.debug_bounds("composer-companion").unwrap();
+    let composer = cx.debug_bounds("session-composer").unwrap();
+    assert_eq!(lane.size.height, px(LANE_HEIGHT));
+    assert!(badge.top() >= lane.top() && badge.bottom() <= lane.bottom());
+    assert!(badge.left() >= lane.left() && badge.right() <= lane.right());
+    assert_eq!(lane.bottom(), composer.top());
+    assert_eq!(composer.bottom(), page.bottom());
+    assert!(
+        badge.size.height < composer.size.height,
+        "the companion is smaller than the input box it dives into"
+    );
+    let _ = harness;
+}
+
+#[gpui::test]
+fn a_finished_turn_dives_the_companion_into_the_input_box_and_retires_it(cx: &mut TestAppContext) {
+    let (harness, cx) = open(cx);
+    let roaming = cx.debug_bounds("composer-companion-lane").unwrap();
+    drive(&harness, Some("claude"), false, cx);
+    // The dive is a transition, not a cut: the lane is still there while the
+    // model falls out of it.
+    assert!(cx.debug_bounds("composer-companion-lane").is_some());
+    let stage = harness.read_with(cx, |harness, cx| harness.stage(cx));
+    assert!(
+        matches!(stage, Stage::Leaping { .. }),
+        "the companion is diving, not gone: {stage:?}"
+    );
+    cx.background_executor
+        .advance_clock(Duration::from_secs_f32(LEAP_DURATION) + Duration::from_millis(60));
+    draw(cx);
+    draw(cx);
+    assert!(cx.debug_bounds("composer-companion-lane").is_none());
+    assert_eq!(
+        cx.debug_bounds("session-composer").unwrap().top(),
+        roaming.bottom()
+    );
+}
+
+#[gpui::test]
+fn double_clicking_the_companion_opens_its_duel_over_the_session(cx: &mut TestAppContext) {
+    let (harness, cx) = open(cx);
+    let page = cx.debug_bounds("session-page").unwrap();
+    double_click(cx, "composer-companion");
+    let duel = cx.debug_bounds("composer-companion-duel").unwrap();
+    assert_eq!(duel, page, "the duel covers the session page");
+    assert_eq!(
+        cx.debug_bounds("unbound-game"),
+        cx.debug_bounds("composer-companion-duel")
+    );
+    assert!(
+        cx.debug_bounds("session-timeline").is_none(),
+        "the session's own elements are gone while the duel is up"
+    );
+    let battle = harness.read_with(cx, |harness, cx| {
+        harness.companion.read(cx).battle.clone().unwrap()
+    });
+    assert_eq!(
+        battle.read_with(cx, |view, _| view.arena.boss.guardian),
+        Guardian::Claude
+    );
+    press(cx, "escape");
+    assert!(cx.debug_bounds("composer-companion-duel").is_none());
+    assert!(cx.debug_bounds("session-timeline").is_some());
+}
+
+/// A replay ends the same way the first win did: the unlock is reported again,
+/// which is what keeps the reward permanent when the state is re-persisted.
+#[gpui::test]
+fn a_won_duel_reports_the_unlock_it_was_reached_through(cx: &mut TestAppContext) {
+    let (harness, cx) = open(cx);
+    double_click(cx, "composer-companion");
+    let battle = harness.read_with(cx, |harness, cx| {
+        harness.companion.read(cx).battle.clone().unwrap()
+    });
+    battle.update(cx, |view, cx| {
+        view.clock = None;
+        view.arena.phase = Phase::Victory;
+        view.arena.phase_time = 3.2;
+        cx.notify();
+    });
+    for _ in 0..24 {
+        battle.update(cx, |view, cx| view.step(view.controls(), cx));
+        draw(cx);
+    }
+    assert!(battle.read_with(cx, |view, _| view.closed));
+    assert_eq!(
+        harness.read_with(cx, |harness, _| harness.awakened.clone()),
+        vec!["claude"]
+    );
+    assert!(cx.debug_bounds("composer-companion-duel").is_none());
+}
+
+/// The companion belongs to the session whose composer it rides. Switching
+/// sessions hands the lane to that session's own guardian, and a duel opened
+/// over the previous one ends with it instead of following the reader.
+#[gpui::test]
+fn a_duel_ends_when_the_composer_moves_to_another_agent(cx: &mut TestAppContext) {
+    let (harness, cx) = open(cx);
+    double_click(cx, "composer-companion");
+    assert!(cx.debug_bounds("composer-companion-duel").is_some());
+    drive(&harness, Some("codex"), true, cx);
+    draw(cx);
+    assert!(
+        harness.read_with(cx, |harness, cx| harness
+            .companion
+            .read(cx)
+            .battle
+            .is_none()),
+        "the duel stays with the session it was fought over"
+    );
+    assert!(cx.debug_bounds("composer-companion-duel").is_none());
+    assert_eq!(
+        harness.read_with(cx, |harness, cx| harness.guardian(cx)),
+        Some(Guardian::Codex)
+    );
+    assert!(cx.debug_bounds("composer-companion").is_some());
+    assert!(cx.debug_bounds("session-timeline").is_some());
+}

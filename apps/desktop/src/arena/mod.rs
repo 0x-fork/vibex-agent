@@ -3,6 +3,7 @@
 
 mod art;
 mod combat;
+mod companion;
 mod copy;
 mod geometry;
 mod guardian;
@@ -12,6 +13,22 @@ mod raster;
 mod scene;
 mod scenery;
 mod sculpture;
+
+pub(crate) use companion::{Companion, lane as companion_lane, session_surface};
+
+/// A won encounter: the guardian whose reward effect is now unlocked.
+///
+/// It is emitted by every surface that can end a duel, so a victory on the home
+/// page and a victory over a session reach the same persisted state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Awakened {
+    pub key: &'static str,
+}
+
+/// The guardian key an Agent's reward is stored under, if it has one.
+pub(crate) fn reward_key(agent_id: &str) -> Option<&'static str> {
+    combat::Guardian::from_agent(agent_id).map(combat::Guardian::key)
+}
 
 use crate::{locale::text, motion};
 use combat::{Arena, Controls, Guardian, Phase, STEP, Vec2};
@@ -37,9 +54,9 @@ pub(crate) fn setting_title() -> &'static str {
 }
 pub(crate) fn setting_description() -> &'static str {
     text(
-        "Awaken AI Souls. Switch Agent, then click the guardian to challenge it; a win earns its matching effect reward.",
-        "唤醒 AI 之魂，切换 Agent 后点击守卫即可挑战，挑战成功获得对应特效奖励",
-        "喚醒 AI 之魂，切換 Agent 後點擊守衛即可挑戰，挑戰成功獲得對應特效獎勵",
+        "Awaken AI Souls. Switch Agent, then click the guardian to challenge it; a win permanently unlocks that Agent's effect, which rides above its session's input box.",
+        "唤醒 AI 之魂，切换 Agent 后点击守卫即可挑战；挑战成功即永久解锁该 Agent 的特效，它会出现在其会话输入框上方",
+        "喚醒 AI 之魂，切換 Agent 後點擊守衛即可挑戰；挑戰成功即永久解鎖該 Agent 的特效，它會出現在其會話輸入框上方",
     )
 }
 actions!(unbound, [Roll, TogglePause, Retry, Advance, Exit]);
@@ -69,6 +86,7 @@ pub(crate) struct HomeArena {
     agent_id: Option<String>,
     completed: bool,
 }
+impl EventEmitter<Awakened> for HomeArena {}
 impl HomeArena {
     pub(crate) fn new(composer_focus: FocusHandle) -> Self {
         art::prepare();
@@ -118,6 +136,13 @@ impl HomeArena {
             window,
             |this, battle, _: &DismissEvent, window, cx| {
                 this.completed = battle.read(cx).arena.phase == Phase::Victory;
+                if this.completed
+                    && let Some(guardian) = this.selected
+                {
+                    cx.emit(Awakened {
+                        key: guardian.key(),
+                    });
+                }
                 this.close(cx);
                 this.composer_focus.focus(window, cx);
             },

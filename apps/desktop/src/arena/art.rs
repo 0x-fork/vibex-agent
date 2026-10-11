@@ -204,6 +204,49 @@ fn gleam(frame: &mut Raster, c: (i32, i32), radius: i32, color: u8) {
 pub(super) fn preview(guardian: Guardian, time: f32, reduced: bool) -> Raster {
     idle(&Boss::idle(guardian, time, reduced), time, reduced)
 }
+
+/// The raster window a companion crops around a guardian's ground anchor, in
+/// raster pixels relative to that anchor: `(left, top, right, bottom)`.
+///
+/// A companion is one small model riding a lane, so it draws the idle pose into
+/// a window instead of the whole arena-sized frame. The window has to hold
+/// every pose the idle loop reaches — the whale's breach, the knot's roll,
+/// Pi's detached stems — because the companion fits the window, not the pose,
+/// into its lane; a window too small would slice the model at the extremes.
+pub(super) const COMPANION_BOXES: [(i32, i32, i32, i32); 6] = [
+    (-43, -124, 43, -2),
+    (-48, -102, 48, 13),
+    (-67, -111, 67, 33),
+    (-36, -122, 36, 19),
+    (-88, -206, 84, 22),
+    (-55, -133, 56, 6),
+];
+pub(super) fn companion_box(guardian: Guardian) -> (i32, i32, i32, i32) {
+    COMPANION_BOXES[guardian as usize]
+}
+
+/// One idle frame, cropped to [`companion_box`] around the anchor the model
+/// currently stands on.
+///
+/// The crop keeps the articulated parts the arena draws — the stems and shards
+/// that hang off the body — and drops the arena ground, which a companion
+/// never stands on.
+pub(super) fn companion(boss: &Boss, time: f32, reduced: bool) -> Raster {
+    let (left, top, right, bottom) = companion_box(boss.guardian);
+    let (x, y) = pixel(boss.position);
+    let mut frame = Raster::with_offset(
+        (right - left) as usize,
+        (bottom - top) as usize,
+        -(x + left),
+        -(y + top),
+    );
+    let mut order = guardian_parts(boss);
+    order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    for (_, part) in order {
+        draw_part(&mut frame, boss, part, time, 0.0, reduced);
+    }
+    frame
+}
 pub(super) fn idle(boss: &Boss, time: f32, reduced: bool) -> Raster {
     let mut frame = Raster::with_offset(WIDTH, HEIGHT, 0, TOP_PAD);
     shadow(&mut frame, boss);
