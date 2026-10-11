@@ -15752,9 +15752,8 @@ impl VibexWorkbench {
             })
             .child(
                 h_flex()
-                    .flex_1()
+                    .size_full()
                     .min_w_0()
-                    .h_full()
                     .gap(px(SIDEBAR_DELEGATED_ROW_GAP))
                     .items_center()
                     .pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))
@@ -15804,26 +15803,26 @@ impl VibexWorkbench {
                                 )
                             }),
                     )
-                    .children(disclosure),
-            )
-            .child(
-                h_flex()
-                    .debug_selector({
-                        let selector = format!("delegated-status-{session_id}");
-                        move || selector.clone()
-                    })
-                    .w(px(SIDEBAR_STATUS_COLUMN_WIDTH))
-                    .flex_none()
-                    .items_center()
-                    .justify_end()
-                    .gap(px(6.0))
-                    .text_xs()
-                    .text_color(if attention {
-                        cx.theme().warning
-                    } else {
-                        cx.theme().sidebar_foreground.opacity(0.48)
-                    })
-                    .child(div().min_w_0().truncate().child(status_text)),
+                    .children(disclosure)
+                    .child(
+                        h_flex()
+                            .debug_selector({
+                                let selector = format!("delegated-status-{session_id}");
+                                move || selector.clone()
+                            })
+                            .w(px(SIDEBAR_STATUS_COLUMN_WIDTH))
+                            .flex_none()
+                            .items_center()
+                            .justify_end()
+                            .gap(px(6.0))
+                            .text_xs()
+                            .text_color(if attention {
+                                cx.theme().warning
+                            } else {
+                                cx.theme().sidebar_foreground.opacity(0.48)
+                            })
+                            .child(div().min_w_0().truncate().child(status_text)),
+                    ),
             );
         row.into_any_element()
     }
