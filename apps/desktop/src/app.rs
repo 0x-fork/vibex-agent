@@ -16305,6 +16305,10 @@ impl VibexWorkbench {
         Some(
             v_flex()
                 .gap_1()
+                // The page row belongs to a branch, not to a band the user can
+                // rearrange, so it claims the press the same way a child
+                // session's row does and never starts the project drag.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .when_some(error, |view, error| {
                     view.child(
                         div()
@@ -16342,11 +16346,25 @@ impl VibexWorkbench {
             || organization.group_of_session(child) == organization.group_of_session(parent)
     }
 
+    /// Whether the sidebar paints this session under another session's row.
+    ///
+    /// A child session's place in the tree is its parent's branch, not a band of
+    /// its own: it is not a row the user files or reorders, so it is never a
+    /// drag source and never travels in a drag either — a shift range that
+    /// covers it does not turn it into one.
+    fn sidebar_session_is_delegated_child(&self, session_id: &str) -> bool {
+        self.delegated_tree
+            .get(session_id)
+            .is_some_and(|node| node.parent_session_ref.is_some())
+    }
+
     /// The member rows of one group.
     ///
     /// The rows belong to the group's own order, so they are draggable exactly
     /// like the sessions of a project band: a drop inside the group reorders it,
-    /// and a drop anywhere else takes the session out of it.
+    /// and a drop anywhere else takes the session out of it. A member the group
+    /// paints as a child session keeps its parent's place instead and is not
+    /// draggable.
     fn render_group_navigation(
         &mut self,
         group_id: &str,
@@ -16624,6 +16642,14 @@ impl VibexWorkbench {
                 let tone = hover_blend(&session_hover_key, row_background, row_hover_tone);
                 row.hover(move |style| style.bg(tone))
             })
+            // A child session's place in the sidebar is its parent's branch, not
+            // a band of its own, so this row is not a drag source. Claiming the
+            // press is what keeps the gesture from falling through to the
+            // project container behind it and dragging the whole project: with
+            // no pending press of its own the container never starts a drag.
+            // The row's own click is unaffected — its listener is registered
+            // after this one and the bubble phase runs listeners last-first.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click({
                 let focus_handle = focus_handle.clone();
                 let branch_toggle_session_id = session_id.clone();
@@ -19052,12 +19078,17 @@ impl VibexWorkbench {
         }
         let groups = self.sidebar_workspace_groups("");
         let project_scopes = self.sidebar_row_scopes(&groups);
-        let mut ids = payload_ids.to_vec();
+        let mut ids = payload_ids
+            .iter()
+            .filter(|session_id| !self.sidebar_session_is_delegated_child(session_id))
+            .cloned()
+            .collect::<Vec<_>>();
         for selected in self.sidebar_move_selection_items() {
             let SidebarOrganizationItem::Session(session_id) = &selected else {
                 continue;
             };
             if !ids.iter().any(|id| id == session_id)
+                && !self.sidebar_session_is_delegated_child(session_id)
                 && self.sidebar_move_selection_scope_matches(
                     &project_scopes,
                     &primary_item,
@@ -19143,6 +19174,7 @@ impl VibexWorkbench {
         let ids = members
             .into_iter()
             .filter(|id| selected.contains(&SidebarOrganizationItem::Session(id.clone())))
+            .filter(|id| !self.sidebar_session_is_delegated_child(id))
             .collect::<Vec<_>>();
         if ids.iter().any(|id| id == session_id) {
             ids
@@ -45064,6 +45096,7 @@ impl VibexWorkbench {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_sidebar_session(
         &mut self,
         session: &AgentSession,
@@ -87859,13 +87892,16 @@ mod tests {
             .map(|(body, _)| body)
             .expect("session renderer should remain inspectable");
 
-        assert_eq!(project_row.matches(".on_drag_move(").count(), 3);
+        // Each row owns one handler per drag type it accepts: a project row
+        // takes projects, folders, sessions and groups; a folder row takes the
+        // same four, because a group files like a session does.
+        assert_eq!(project_row.matches(".on_drag_move(").count(), 4);
         assert!(!project_container.contains(".on_drag_move("));
         assert_eq!(
             folder
                 .matches("if !event.bounds.contains(&event.event.position)")
                 .count(),
-            3
+            4
         );
         assert!(session.contains("if !inside_target"));
         assert!(session.contains("if !event.bounds.contains(&event.event.position)"));
@@ -98604,6 +98640,69 @@ mod tests {
         assert!(release.contains("remove_sessions_from_group("));
         assert!(release.contains("release_group_session_views("));
         assert!(release.contains("group_of_session(session_id)"));
+    }
+
+    /// A child session's row is not a drag source.
+    ///
+    /// Its place in the sidebar is its parent's branch, so there is nothing for
+    /// a drag to say about it. A row with no drag source of its own used to let
+    /// the press fall through to the project container behind it, which dragged
+    /// the whole project; the row claims the press instead, and the drag never
+    /// carries a child session even when a shift range puts one in the
+    /// selection.
+    #[test]
+    fn child_session_rows_are_not_drag_sources() {
+        let source = include_str!("app.rs");
+
+        let child_row = source
+            .split_once("    fn render_delegated_session_row(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The ownership tree in the order the sidebar draws it.")
+            })
+            .map(|(body, _)| body)
+            .expect("the child session row should remain inspectable");
+        assert!(
+            child_row
+                .contains(".on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())")
+        );
+        assert!(!child_row.contains(".on_drag("));
+        assert!(!child_row.contains("SidebarSessionDrag"));
+
+        // The branch's page row is part of the same band.
+        let page_action = source
+            .split_once("    fn render_delegated_page_action(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn delegated_child_visible_in_branch("))
+            .map(|(body, _)| body)
+            .expect("the page action should remain inspectable");
+        assert!(
+            page_action
+                .contains(".on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())")
+        );
+
+        let helper = source
+            .split_once("    fn sidebar_session_is_delegated_child(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The member rows of one group."))
+            .map(|(body, _)| body)
+            .expect("the child row rule should remain inspectable");
+        assert!(helper.contains(".is_some_and(|node| node.parent_session_ref.is_some())"));
+
+        let drag_ids = source
+            .split_once("    fn sidebar_group_drag_session_ids(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Reorders the members of one group,"))
+            .map(|(body, _)| body)
+            .expect("the group drag payload should remain inspectable");
+        assert!(drag_ids.contains(".filter(|id| !self.sidebar_session_is_delegated_child(id))"));
+
+        let resolver = source
+            .split_once("    fn dragged_group_session_ids(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Takes dragged sessions out of whatever group holds them.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("group drop resolution should remain inspectable");
+        assert!(resolver.contains("&& !self.sidebar_session_is_delegated_child(session_id)"));
     }
 
     /// A session group is a row the user can file like any other.
