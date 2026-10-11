@@ -100,6 +100,12 @@ async fn collaborator_reference_commands(
         .to_lowercase();
     let catalog = vibex_use.runtime_option_catalog().list().await?;
     let mut entries = runtime_reference_commands(&catalog.options, request);
+    // An Agent's own configurations usually fill the tab, and the session
+    // lookup is a database read of its own: only reach for it when the list
+    // still has room.
+    if entries.len() >= limit {
+        return Ok(entries);
+    }
     let mut existing_ids = entries
         .iter()
         .map(|entry| entry.id.clone())

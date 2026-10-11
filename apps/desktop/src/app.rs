@@ -1042,6 +1042,39 @@ impl ComposerTarget {
     }
 }
 
+/// Where one composer discovery runs, and how its outcome is read back.
+///
+/// `@` resolves the workspace file tree and the collaborator catalogue — file
+/// and database work that never asks a provider — so it runs on the background
+/// executor: the async runtime carries the Agents' own I/O and timeline work,
+/// and a popup must not queue its rows behind that. `/` and `$` do ask the
+/// Agent, which needs the runtime.
+enum ComposerDiscovery {
+    Background(Task<vibex_core::VibexResult<vibex_core::AgentCommandDiscovery>>),
+    Async(
+        Task<
+            Result<
+                vibex_core::VibexResult<vibex_core::AgentCommandDiscovery>,
+                gpui_tokio::JoinError,
+            >,
+        >,
+    ),
+}
+
+impl ComposerDiscovery {
+    async fn outcome(self) -> vibex_core::VibexResult<vibex_core::AgentCommandDiscovery> {
+        match self {
+            Self::Background(task) => task.await,
+            Self::Async(task) => task.await.unwrap_or_else(|error| {
+                Err(vibex_core::VibexError::process(
+                    "composer_discovery_task_failed",
+                    error.to_string(),
+                ))
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ComposerSuggestionContext {
     target: ComposerTarget,
@@ -24511,12 +24544,23 @@ impl VibexWorkbench {
             return;
         };
 
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            discover_desktop_composer_commands(backend, request).await
-        });
+        let runner = match trigger_kind {
+            // The `@` lists are the workspace tree and the collaborator
+            // catalogue: no provider is asked, and both are file and database
+            // work. They run on the background executor so the popup cannot be
+            // held behind whatever the async runtime is carrying.
+            AgentCommandTrigger::Mention => {
+                ComposerDiscovery::Background(cx.background_executor().spawn(async move {
+                    discover_desktop_composer_commands(backend, request).await
+                }))
+            }
+            _ => ComposerDiscovery::Async(gpui_tokio::Tokio::spawn(cx, async move {
+                discover_desktop_composer_commands(backend, request).await
+            })),
+        };
         self.suggestion_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let outcome = runner.await;
+                let outcome = runner.outcome().await;
                 let _ = entity.update(cx, |this, cx| {
                     if this.suggestion_request_serial != request_serial
                         || this.suggestion_context.as_ref() != Some(&context)
@@ -24526,12 +24570,12 @@ impl VibexWorkbench {
                     }
                     this.suggestion_loading = false;
                     let (entries, quick_phrases, delegation_entries) = match outcome {
-                        Ok(Ok(discovery)) => (
+                        Ok(discovery) => (
                             discovery.response.entries,
                             discovery.quick_phrases,
                             discovery.delegation_entries,
                         ),
-                        _ => (Vec::new(), Vec::new(), Vec::new()),
+                        Err(_) => (Vec::new(), Vec::new(), Vec::new()),
                     };
                     this.suggestions = entries;
                     this.phrase_suggestions = quick_phrases;
