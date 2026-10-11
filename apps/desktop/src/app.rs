@@ -1098,14 +1098,42 @@ fn composer_suggestion_collection_matches(
         && current.request.trigger == next.request.trigger
 }
 
+/// The second half of a suggestion row: what the entry points at.
+///
+/// A file reference shows the path behind its name. Every other reference shows
+/// the description the authority wrote for it — a collaborator's account and
+/// model, a session's Agent — because those entries have no path, and the
+/// configurations of one Agent are otherwise a column of identical rows.
 fn composer_suggestion_description(entry: &AgentCommandEntry) -> Option<String> {
-    if entry.source_kind == AgentCommandSourceKind::Reference {
-        return entry.reference_path.clone();
+    if entry.source_kind == AgentCommandSourceKind::Reference
+        && let Some(path) = entry.reference_path.as_deref()
+    {
+        return Some(path.to_string());
     }
     entry
         .description
         .clone()
         .filter(|value| !value.trim().is_empty())
+}
+
+/// The icon a suggestion row draws beside its name.
+///
+/// References share one source kind but not one nature: a workspace file, a
+/// collaborator and a conversation all arrive as `Reference`, and the list is
+/// easier to read when each is drawn as what it is. The component icon set has
+/// no conversation glyph, so a referenced conversation borrows the tray that
+/// receives one.
+fn composer_suggestion_icon(entry: &AgentCommandEntry) -> IconName {
+    if entry.source_kind == AgentCommandSourceKind::Reference {
+        let carries = |key: &str| entry.metadata.iter().any(|metadata| metadata.key == key);
+        if carries(vibex_desktop_runtime::COMPOSER_AGENT_REFERENCE_KEY) {
+            return IconName::Bot;
+        }
+        if carries(vibex_desktop_runtime::COMPOSER_SESSION_REFERENCE_KEY) {
+            return IconName::Inbox;
+        }
+    }
+    command_source_icon(entry.source_kind)
 }
 
 /// One row of the composer's `/` popup, without the app-specific handlers the
@@ -1193,7 +1221,7 @@ fn composer_suggestion_row(
                 .items_center()
                 .justify_center()
                 .child(
-                    Icon::new(command_source_icon(entry.source_kind))
+                    Icon::new(composer_suggestion_icon(entry))
                         .small()
                         .text_color(theme.muted_foreground),
                 ),
@@ -56667,7 +56695,10 @@ impl VibexWorkbench {
                 "$",
             ),
             Some(AgentCommandTrigger::Mention) => (
-                locale::text("Workspace files", "工作区文件", "工作區檔案"),
+                // The `@` list is the workspace file index plus the
+                // collaborators and conversations the same trigger offers, so
+                // its title names the references rather than only the files.
+                locale::text("References", "引用", "引用"),
                 IconName::File,
                 "@",
             ),
@@ -81754,6 +81785,50 @@ mod tests {
             composer_suggestion_description(&prompt).as_deref(),
             Some("Review changes")
         );
+        assert!(
+            matches!(composer_suggestion_icon(&reference), IconName::File),
+            "a file reference keeps the file icon"
+        );
+    }
+
+    /// A collaborator and a conversation arrive as references too, and each row
+    /// has to say which one it is: the configurations of one Agent differ only
+    /// in the account and model the row prints beside the name.
+    #[test]
+    fn collaborator_and_session_references_print_their_configuration() {
+        let mut collaborator = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        collaborator.label = "@Codex".into();
+        collaborator.description = Some("Main account · gpt-5".into());
+        collaborator.metadata = vec![vibex_core::ProviderBindingMetadata {
+            key: vibex_desktop_runtime::COMPOSER_AGENT_REFERENCE_KEY.to_string(),
+            value: "codex".into(),
+        }];
+        assert_eq!(
+            composer_suggestion_description(&collaborator).as_deref(),
+            Some("Main account · gpt-5")
+        );
+        assert!(matches!(
+            composer_suggestion_icon(&collaborator),
+            IconName::Bot
+        ));
+
+        let mut conversation = collaborator.clone();
+        conversation.metadata = vec![vibex_core::ProviderBindingMetadata {
+            key: vibex_desktop_runtime::COMPOSER_SESSION_REFERENCE_KEY.to_string(),
+            value: "vibex://session/session_test".into(),
+        }];
+        assert!(matches!(
+            composer_suggestion_icon(&conversation),
+            IconName::Inbox
+        ));
+
+        // An empty description is not a row of blank space.
+        collaborator.description = Some("   ".into());
+        assert_eq!(composer_suggestion_description(&collaborator), None);
     }
 
     #[test]

@@ -8,14 +8,14 @@
 //! authority, so the same assembly serves the native backend and a paired
 //! client instead of each side re-deriving it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use vibex_config_switch::skills::LocalSkillScanRequest;
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandDiscovery,
     AgentCommandEntry, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
-    AgentCommandSourceKind, AgentCommandTrigger, FileTreeEntry, FileTreeRequest,
+    AgentCommandSourceKind, AgentCommandTrigger, AgentId, FileTreeEntry, FileTreeRequest,
     ProviderBindingMetadata, ProviderKind, VibexResult, VibexUseRef,
 };
 
@@ -37,6 +37,17 @@ pub const COMPOSER_SESSION_REFERENCE_KEY: &str = "vibexUseSessionReference";
 /// having to follow a prompt.
 pub const COMPOSER_DELEGATE_NOW_KEY: &str = "vibexUseDelegateNow";
 
+/// Divisor of an `@` list kept for the workspace file index.
+///
+/// The collaborator catalogue can hold every account, model and mode of every
+/// enabled Agent, while the panel has one bound for everything it lists.
+/// Without a floor the catalogue grows past that bound on its own and the file
+/// index the `@` trigger has always offered disappears from the panel, so the
+/// files keep half the list and each source hands back the room it does not
+/// use. Workspace files also lead the list: they are what a reader who opens
+/// `@` and presses Enter without typing has always selected.
+const COMPOSER_FILE_REFERENCE_SHARE_DIVISOR: usize = 2;
+
 /// Resolves one composer discovery request against the authority's state.
 pub async fn discover_composer_commands(
     agent: &AgentHandle,
@@ -48,26 +59,26 @@ pub async fn discover_composer_commands(
     let manager = agent.manager();
     let mut response = manager.discover_commands(request.clone()).await?;
     let capabilities = manager.command_discovery_capabilities(&request)?;
-    if let Some(vibex_use) = vibex_use {
-        // Collaborators come first: a user who typed `@` is far more often
-        // naming an Agent than a file, and the list is bounded either way.
-        let provider_entries = std::mem::take(&mut response.entries);
-        append_collaborator_reference_commands(vibex_use, &request, &mut response).await?;
-        let remaining =
-            (request.limit.unwrap_or(50) as usize).saturating_sub(response.entries.len());
-        let mut existing_ids: HashSet<_> = response
-            .entries
-            .iter()
-            .map(|entry| entry.id.clone())
-            .collect();
-        response.entries.extend(
-            provider_entries
-                .into_iter()
-                .filter(|entry| existing_ids.insert(entry.id.clone()))
-                .take(remaining),
+    if mention_references_are_offered(&request) {
+        let mut collaborators = AgentCommandDiscoverResponse {
+            entries: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        if let Some(vibex_use) = vibex_use {
+            append_collaborator_reference_commands(vibex_use, &request, &mut collaborators).await?;
+        }
+        let mut workspace_files = AgentCommandDiscoverResponse {
+            entries: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        append_file_reference_commands(files, &request, &mut workspace_files)?;
+        response.entries = merge_mention_reference_commands(
+            std::mem::take(&mut response.entries),
+            collaborators.entries,
+            workspace_files.entries,
+            request.limit.unwrap_or(50) as usize,
         );
     }
-    append_file_reference_commands(files, &request, &mut response)?;
     append_workspace_skill_commands(providers, &request, &mut response, capabilities.skills)?;
     let quick_phrases = manager.discover_quick_phrases(&request)?;
     Ok(AgentCommandDiscovery {
@@ -76,6 +87,48 @@ pub async fn discover_composer_commands(
         skills: capabilities.skills,
         quick_phrases,
     })
+}
+
+/// Whether this request resolves the references the `@` trigger offers.
+///
+/// A request without a trigger asks for the unfiltered list, which is the same
+/// list `@` opens on, so it counts as one.
+fn mention_references_are_offered(request: &AgentCommandDiscoverRequest) -> bool {
+    request
+        .trigger
+        .is_none_or(|trigger| trigger == AgentCommandTrigger::Mention)
+}
+
+/// Merges the `@` sources into the one bounded list the panel shows.
+///
+/// The list leads with the workspace files and their reserved share, then the
+/// collaborators, then whatever the Agent's own catalogue contributed. Each
+/// source is only a candidate list: room a source does not use is handed to the
+/// ones after it, so a small workspace still reaches every collaborator, a
+/// query that matches no file still fills the list with collaborators, and a
+/// runtime without the collaborator service shows files exactly as it did
+/// before collaborators existed.
+fn merge_mention_reference_commands(
+    provider_entries: Vec<AgentCommandEntry>,
+    mut collaborator_entries: Vec<AgentCommandEntry>,
+    file_entries: Vec<AgentCommandEntry>,
+    limit: usize,
+) -> Vec<AgentCommandEntry> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let file_reserve = limit.div_ceil(COMPOSER_FILE_REFERENCE_SHARE_DIVISOR);
+    let collaborator_take = collaborator_entries
+        .len()
+        .min(limit.saturating_sub(file_reserve));
+    let mut entries = Vec::with_capacity(limit);
+    entries.extend(file_entries.into_iter().take(limit - collaborator_take));
+    entries.extend(collaborator_entries.drain(..collaborator_take));
+    let room = limit - entries.len();
+    entries.extend(collaborator_entries.drain(..room.min(collaborator_entries.len())));
+    let room = limit - entries.len();
+    entries.extend(provider_entries.into_iter().take(room));
+    entries
 }
 
 /// Offers the enabled Agents and the sessions the user may reference.
@@ -90,10 +143,7 @@ async fn append_collaborator_reference_commands(
     request: &AgentCommandDiscoverRequest,
     response: &mut AgentCommandDiscoverResponse,
 ) -> VibexResult<()> {
-    if request
-        .trigger
-        .is_some_and(|trigger| trigger != AgentCommandTrigger::Mention)
-    {
+    if !mention_references_are_offered(request) {
         return Ok(());
     }
     let limit = request.limit.unwrap_or(50) as usize;
@@ -172,98 +222,125 @@ fn append_runtime_reference_commands(
     // Availability is checked before deduplication, so an unavailable default
     // cannot hide another usable configuration of the same Agent.
     let mut seen_selections = HashSet::new();
+    // One Agent owns as many configurations as it has accounts, models and
+    // modes, so dealt in catalogue order the first Agent fills the list with
+    // itself. The entries are dealt one configuration per Agent per round
+    // instead: every collaborator reaches the list before any Agent offers a
+    // second configuration, and a query still narrows its way to whichever
+    // configuration the reader named.
+    let mut configurations_by_agent = Vec::<Vec<&vibex_core::SessionRuntimeOption>>::new();
+    let mut agent_slots = HashMap::<AgentId, usize>::new();
     for option in options {
-        if remaining == 0 {
-            break;
-        }
-        let agent_id = option.selection.agent_id.clone();
-        if option.availability != vibex_core::RuntimeOptionAvailability::Available {
-            // An Agent that cannot start right now is not offered as if it
-            // could; `vibex_discover` reports why.
-            continue;
-        }
-        let selection_ref = runtime_option_ref(option);
-        if !seen_selections.insert(selection_ref.clone()) {
-            continue;
-        }
-        let entry = AgentCommandEntry {
-            id: format!("reference:agent:{}:{selection_ref}", agent_id.as_str()),
-            trigger: AgentCommandTrigger::Mention,
-            source_kind: AgentCommandSourceKind::Reference,
-            label: format!("@{}", option.agent_label),
-            description: Some(runtime_reference_description(option)),
-            insertion_text: format!("@{} ", option.agent_label),
-            command_name: None,
-            provider_kind: Some(ProviderKind::Acp),
-            prompt_id: None,
-            skill_id: None,
-            reference_path: None,
-            selection_behavior: AgentCommandSelectionBehavior::Insert,
-            execution_behavior: AgentCommandExecutionBehavior::None,
-            destructive: false,
-            metadata: vec![
-                ProviderBindingMetadata {
-                    key: COMPOSER_AGENT_REFERENCE_KEY.to_string(),
-                    value: agent_id.as_str().to_string(),
-                },
-                ProviderBindingMetadata {
-                    key: COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
-                    value: selection_ref.clone(),
-                },
-            ],
-        };
-        if (query.is_empty() || command_entry_matches_query(&entry, &query))
-            && existing_ids.insert(entry.id.clone())
-        {
-            response.entries.push(entry);
+        let slot = *agent_slots
+            .entry(option.selection.agent_id.clone())
+            .or_insert_with(|| {
+                configurations_by_agent.push(Vec::new());
+                configurations_by_agent.len() - 1
+            });
+        configurations_by_agent[slot].push(option);
+    }
+    let rounds = configurations_by_agent
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or_default();
+    'rounds: for round in 0..rounds {
+        for agent_options in &configurations_by_agent {
+            let Some(option) = agent_options.get(round) else {
+                continue;
+            };
+            if remaining == 0 {
+                break 'rounds;
+            }
+            let agent_id = option.selection.agent_id.clone();
+            if option.availability != vibex_core::RuntimeOptionAvailability::Available {
+                // An Agent that cannot start right now is not offered as if it
+                // could; `vibex_discover` reports why.
+                continue;
+            }
+            let selection_ref = runtime_option_ref(option);
+            if !seen_selections.insert(selection_ref.clone()) {
+                continue;
+            }
+            let entry = AgentCommandEntry {
+                id: format!("reference:agent:{}:{selection_ref}", agent_id.as_str()),
+                trigger: AgentCommandTrigger::Mention,
+                source_kind: AgentCommandSourceKind::Reference,
+                label: format!("@{}", option.agent_label),
+                description: Some(runtime_reference_description(option)),
+                insertion_text: format!("@{} ", option.agent_label),
+                command_name: None,
+                provider_kind: Some(ProviderKind::Acp),
+                prompt_id: None,
+                skill_id: None,
+                reference_path: None,
+                selection_behavior: AgentCommandSelectionBehavior::Insert,
+                execution_behavior: AgentCommandExecutionBehavior::None,
+                destructive: false,
+                metadata: vec![
+                    ProviderBindingMetadata {
+                        key: COMPOSER_AGENT_REFERENCE_KEY.to_string(),
+                        value: agent_id.as_str().to_string(),
+                    },
+                    ProviderBindingMetadata {
+                        key: COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
+                        value: selection_ref.clone(),
+                    },
+                ],
+            };
+            if (query.is_empty() || command_entry_matches_query(&entry, &query))
+                && existing_ids.insert(entry.id.clone())
+            {
+                response.entries.push(entry);
+                remaining -= 1;
+            }
+
+            // The direct action, offered beside the reference. The task text is
+            // whatever the reader already wrote, so it is fully visible before
+            // the delegation exists; the entry only decides that it goes to this
+            // collaborator rather than to the main Agent.
+            if remaining == 0 {
+                break 'rounds;
+            }
+            let action = AgentCommandEntry {
+                id: format!("delegate-now:{}:{selection_ref}", agent_id.as_str()),
+                trigger: AgentCommandTrigger::Mention,
+                source_kind: AgentCommandSourceKind::Reference,
+                label: format!("Delegate now to {}", option.agent_label),
+                description: Some(runtime_reference_description(option)),
+                insertion_text: format!("@{} ", option.agent_label),
+                command_name: None,
+                provider_kind: Some(ProviderKind::Acp),
+                prompt_id: None,
+                skill_id: None,
+                reference_path: None,
+                selection_behavior: AgentCommandSelectionBehavior::Insert,
+                execution_behavior: AgentCommandExecutionBehavior::None,
+                destructive: false,
+                metadata: vec![
+                    ProviderBindingMetadata {
+                        key: COMPOSER_DELEGATE_NOW_KEY.to_string(),
+                        value: "1".to_string(),
+                    },
+                    ProviderBindingMetadata {
+                        key: COMPOSER_AGENT_REFERENCE_KEY.to_string(),
+                        value: agent_id.as_str().to_string(),
+                    },
+                    ProviderBindingMetadata {
+                        key: COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
+                        value: selection_ref,
+                    },
+                ],
+            };
+            if !query.is_empty() && !command_entry_matches_query(&action, &query) {
+                continue;
+            }
+            if !existing_ids.insert(action.id.clone()) {
+                continue;
+            }
+            response.entries.push(action);
             remaining -= 1;
         }
-
-        // The direct action, offered beside the reference. The task text is
-        // whatever the reader already wrote, so it is fully visible before the
-        // delegation exists; the entry only decides that it goes to this
-        // collaborator rather than to the main Agent.
-        if remaining == 0 {
-            break;
-        }
-        let action = AgentCommandEntry {
-            id: format!("delegate-now:{}:{selection_ref}", agent_id.as_str()),
-            trigger: AgentCommandTrigger::Mention,
-            source_kind: AgentCommandSourceKind::Reference,
-            label: format!("Delegate now to {}", option.agent_label),
-            description: Some(runtime_reference_description(option)),
-            insertion_text: format!("@{} ", option.agent_label),
-            command_name: None,
-            provider_kind: Some(ProviderKind::Acp),
-            prompt_id: None,
-            skill_id: None,
-            reference_path: None,
-            selection_behavior: AgentCommandSelectionBehavior::Insert,
-            execution_behavior: AgentCommandExecutionBehavior::None,
-            destructive: false,
-            metadata: vec![
-                ProviderBindingMetadata {
-                    key: COMPOSER_DELEGATE_NOW_KEY.to_string(),
-                    value: "1".to_string(),
-                },
-                ProviderBindingMetadata {
-                    key: COMPOSER_AGENT_REFERENCE_KEY.to_string(),
-                    value: agent_id.as_str().to_string(),
-                },
-                ProviderBindingMetadata {
-                    key: COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
-                    value: selection_ref,
-                },
-            ],
-        };
-        if !query.is_empty() && !command_entry_matches_query(&action, &query) {
-            continue;
-        }
-        if !existing_ids.insert(action.id.clone()) {
-            continue;
-        }
-        response.entries.push(action);
-        remaining -= 1;
     }
 }
 
@@ -297,10 +374,7 @@ fn append_file_reference_commands(
     request: &AgentCommandDiscoverRequest,
     response: &mut AgentCommandDiscoverResponse,
 ) -> VibexResult<()> {
-    if request
-        .trigger
-        .is_some_and(|trigger| trigger != AgentCommandTrigger::Mention)
-    {
+    if !mention_references_are_offered(request) {
         return Ok(());
     }
     let Some(workspace_id) = request.workspace_id.clone() else {
@@ -499,13 +573,17 @@ mod tests {
     };
 
     fn option(profile: &str, model: &str) -> SessionRuntimeOption {
+        agent_option("codex", "Codex", profile, model)
+    }
+
+    fn agent_option(agent: &str, label: &str, profile: &str, model: &str) -> SessionRuntimeOption {
         SessionRuntimeOption {
             selection: SessionRuntimeSelection::provider(
-                AgentId::parse("codex").unwrap(),
+                AgentId::parse(agent).unwrap(),
                 ProviderProfileId::parse(profile).unwrap(),
                 model,
             ),
-            agent_label: "Codex".into(),
+            agent_label: label.into(),
             auth_source_label: profile.into(),
             model_label: model.into(),
             reasoning_efforts: Vec::new(),
@@ -513,6 +591,30 @@ mod tests {
             features: Vec::new(),
             availability: RuntimeOptionAvailability::Available,
         }
+    }
+
+    fn named(id: &str) -> AgentCommandEntry {
+        AgentCommandEntry {
+            id: id.to_string(),
+            trigger: AgentCommandTrigger::Mention,
+            source_kind: AgentCommandSourceKind::Reference,
+            label: format!("@{id}"),
+            description: None,
+            insertion_text: format!("@{id} "),
+            command_name: None,
+            provider_kind: Some(ProviderKind::Acp),
+            prompt_id: None,
+            skill_id: None,
+            reference_path: None,
+            selection_behavior: AgentCommandSelectionBehavior::Insert,
+            execution_behavior: AgentCommandExecutionBehavior::None,
+            destructive: false,
+            metadata: Vec::new(),
+        }
+    }
+
+    fn ids(entries: &[AgentCommandEntry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.id.as_str()).collect()
     }
 
     fn entries(
@@ -612,5 +714,94 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(actions[0].id.starts_with("delegate-now:"));
         assert_eq!(entries(&[configured], "", 1).len(), 1);
+    }
+
+    #[test]
+    fn each_collaborator_is_offered_before_any_agent_offers_a_second_configuration() {
+        let commands = entries(
+            &[
+                agent_option("codex", "Codex", "provider_main", "model-a"),
+                agent_option("codex", "Codex", "provider_main", "model-b"),
+                agent_option("claude", "Claude", "provider_main", "model-a"),
+                agent_option("claude", "Claude", "provider_main", "model-b"),
+                agent_option("opencode", "OpenCode", "provider_main", "model-a"),
+                agent_option("opencode", "OpenCode", "provider_main", "model-b"),
+            ],
+            "",
+            6,
+        );
+        // The first round covers every Agent; the second is what the bound cuts.
+        assert_eq!(commands.len(), 6);
+        let labels: Vec<_> = commands.iter().map(|entry| entry.label.clone()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "@Codex",
+                "Delegate now to Codex",
+                "@Claude",
+                "Delegate now to Claude",
+                "@OpenCode",
+                "Delegate now to OpenCode",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_large_collaborator_catalogue_still_shows_the_workspace_file_index() {
+        let collaborators = (0..20)
+            .map(|index| named(&format!("agent:{index}")))
+            .collect();
+        let files = (0..20)
+            .map(|index| named(&format!("file:{index}")))
+            .collect();
+        let merged = merge_mention_reference_commands(Vec::new(), collaborators, files, 10);
+        assert_eq!(
+            ids(&merged),
+            vec![
+                "file:0", "file:1", "file:2", "file:3", "file:4", "agent:0", "agent:1", "agent:2",
+                "agent:3", "agent:4",
+            ]
+        );
+    }
+
+    #[test]
+    fn room_a_source_does_not_use_is_handed_to_the_next_one() {
+        // A small workspace still reaches every collaborator.
+        let merged = merge_mention_reference_commands(
+            Vec::new(),
+            (0..12)
+                .map(|index| named(&format!("agent:{index}")))
+                .collect(),
+            vec![named("file:0"), named("file:1")],
+            10,
+        );
+        assert_eq!(
+            ids(&merged),
+            vec![
+                "file:0", "file:1", "agent:0", "agent:1", "agent:2", "agent:3", "agent:4",
+                "agent:5", "agent:6", "agent:7",
+            ]
+        );
+
+        // A catalogue with nothing to offer leaves the file index the whole list.
+        let merged = merge_mention_reference_commands(
+            Vec::new(),
+            Vec::new(),
+            (0..12)
+                .map(|index| named(&format!("file:{index}")))
+                .collect(),
+            10,
+        );
+        assert_eq!(merged.len(), 10);
+        assert!(merged.iter().all(|entry| entry.id.starts_with("file:")));
+
+        // A single-row list is a file, and only falls back when no file matches.
+        let files = vec![named("file:0")];
+        let merged =
+            merge_mention_reference_commands(Vec::new(), vec![named("agent:0")], files.clone(), 1);
+        assert_eq!(ids(&merged), vec!["file:0"]);
+        let merged =
+            merge_mention_reference_commands(Vec::new(), vec![named("agent:0")], Vec::new(), 1);
+        assert_eq!(ids(&merged), vec!["agent:0"]);
     }
 }
