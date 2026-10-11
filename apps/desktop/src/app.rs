@@ -6678,6 +6678,12 @@ struct SidebarSessionDrag {
     label: SharedString,
     agent_id: String,
     pinned: bool,
+    /// The group whose member row the drag started on, if any.
+    ///
+    /// A group paints its members from its own order, so a drag that starts on
+    /// one of those rows reorders the group rather than the band of rows the
+    /// placement tree puts behind it.
+    group_id: Option<String>,
 }
 
 impl Render for SidebarSessionDrag {
@@ -6732,6 +6738,9 @@ struct SidebarSessionDragState {
     original_ids: Vec<String>,
     preview_ids: Vec<String>,
     flat_preview_enabled: bool,
+    /// The group the drag started in, when it started on one of its member
+    /// rows. Such a drag reorders that group; a drop outside it still leaves.
+    group_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -15461,9 +15470,15 @@ impl VibexWorkbench {
             || organization.group_of_session(child) == organization.group_of_session(parent)
     }
 
+    /// The member rows of one group.
+    ///
+    /// The rows belong to the group's own order, so they are draggable exactly
+    /// like the sessions of a project band: a drop inside the group reorders it,
+    /// and a drop anywhere else takes the session out of it.
     fn render_group_navigation(
         &mut self,
         group_id: &str,
+        reorder_enabled: bool,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let Some(group) = self.ui_state.sidebar.organization.group(group_id) else {
@@ -15501,8 +15516,9 @@ impl VibexWorkbench {
                 elements.push(self.render_sidebar_session(
                     &session,
                     session.project_id.as_str(),
-                    false,
+                    reorder_enabled,
                     true,
+                    Some(group_id),
                     self.strings(),
                     cx,
                 ));
@@ -17770,7 +17786,22 @@ impl VibexWorkbench {
             .map(SidebarOrganizationItem::Session)
             .collect::<Vec<_>>();
         let parent = self.ui_state.sidebar.organization.parent_of(&primary);
-        let (mut original_ids, flat_preview_enabled) = if parent.is_some() {
+        // A member row is painted by its group, so the rows it reorders are the
+        // group's members: the placement band behind it is not the list the user
+        // sees, and a preview computed from it would move rows that are not on
+        // screen. The group's members are always contiguous siblings, so the
+        // whole band is flat.
+        let group_band = drag.group_id.as_deref().and_then(|group_id| {
+            self.ui_state
+                .sidebar
+                .organization
+                .group(group_id)
+                .filter(|group| group.contains(drag.session_id.as_str()))
+                .map(|group| group.member_session_ids.clone())
+        });
+        let (mut original_ids, flat_preview_enabled) = if let Some(member_ids) = group_band {
+            (member_ids, true)
+        } else if parent.is_some() {
             groups
                 .iter()
                 .find(|group| group.project.id.as_str() == drag.project_id)
@@ -17881,6 +17912,7 @@ impl VibexWorkbench {
             preview_ids,
             original_ids,
             flat_preview_enabled,
+            group_id: drag.group_id.clone(),
         });
         self.sidebar_session_drop_target = initial_target.and_then(|(session_id, after)| {
             VibexSessionId::parse(session_id)
@@ -18013,14 +18045,47 @@ impl VibexWorkbench {
                 .group_of_session(session_id)
                 .map(str::to_string)
         });
+        // A drop inside the group the row came from reorders it. The placement
+        // move below answers "where does this session sit among the project's
+        // rows", which is a different question from "where does it sit among the
+        // sessions it shares a group with", and only the second one was asked.
+        if state.group_id.is_some() && keep_group == state.group_id {
+            let target = direct_target
+                .map(|target| (target.session_id.as_str().to_string(), target.after))
+                .or_else(|| {
+                    reorder_target_from_preview_many(
+                        &state.original_ids,
+                        &state.preview_ids,
+                        &state.session_ids,
+                    )
+                });
+            self.sidebar_organization_drop_target = None;
+            self.sidebar_organization_root_drop_target = None;
+            if let Some((target_id, after)) = target {
+                let group_id = state
+                    .group_id
+                    .as_deref()
+                    .expect("a group-scoped drag carries its group");
+                self.reorder_group_members(group_id, &state.session_ids, &target_id, after, cx);
+            } else {
+                cx.notify();
+            }
+            return;
+        }
         let group_ids = self.dragged_group_session_ids(&state.session_ids);
         if self.apply_sidebar_organization_drop(&moving, cx) {
             self.apply_sidebar_session_group_drop(&group_ids, keep_group.as_deref(), cx);
             return;
         }
+        // A drag out of a group previews the group's own order, so the
+        // placement band it would replay that preview against is not the list
+        // the user was dragging in.
         let fallback_target = direct_target
             .map(|target| (target.session_id.as_str().to_string(), target.after))
             .or_else(|| {
+                if state.group_id.is_some() {
+                    return None;
+                }
                 reorder_target_from_preview_many(
                     &state.original_ids,
                     &state.preview_ids,
@@ -18167,6 +18232,70 @@ impl VibexWorkbench {
             self.publish_sidebar_invalidation();
             cx.notify();
         }
+    }
+
+    /// The rows a drag that starts on a group member carries.
+    ///
+    /// A group paints its own members and nothing else, so the rows a member
+    /// drag can reorder are the member rows the sidebar paints as selected, in
+    /// the group's own order. A selection reaching outside the group cannot be
+    /// reordered inside it, and the drag carries the part of it the group's
+    /// order speaks for instead.
+    fn sidebar_group_drag_session_ids(&self, group_id: &str, session_id: &str) -> Vec<String> {
+        let row_alone = vec![session_id.to_string()];
+        if !self
+            .sidebar_row_is_move_selected(&SidebarOrganizationItem::Session(session_id.to_string()))
+        {
+            return row_alone;
+        }
+        let Some(members) = self
+            .ui_state
+            .sidebar
+            .organization
+            .group(group_id)
+            .map(|group| group.member_session_ids.clone())
+        else {
+            return row_alone;
+        };
+        let selected = self.sidebar_move_selection_items();
+        let ids = members
+            .into_iter()
+            .filter(|id| selected.contains(&SidebarOrganizationItem::Session(id.clone())))
+            .collect::<Vec<_>>();
+        if ids.iter().any(|id| id == session_id) {
+            ids
+        } else {
+            row_alone
+        }
+    }
+
+    /// Reorders the members of one group, which is the order its rows paint in.
+    ///
+    /// The placement tree says where a session sits among the project's rows;
+    /// this says where it sits among the sessions it shares a group with. Both
+    /// survive the gesture — a member that later leaves the group returns to the
+    /// project band it was already filed in.
+    fn reorder_group_members(
+        &mut self,
+        group_id: &str,
+        moving_ids: &[String],
+        target_id: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .ui_state
+            .sidebar
+            .organization
+            .reorder_group_members(group_id, moving_ids, target_id, after)
+        {
+            cx.notify();
+            return;
+        }
+        self.sync_user_session_group(group_id);
+        self.queue_ui_state();
+        self.publish_sidebar_invalidation();
+        cx.notify();
     }
 
     fn start_sidebar_folder_drag(&mut self, drag: &SidebarFolderDrag, cx: &mut Context<Self>) {
@@ -39013,6 +39142,10 @@ impl VibexWorkbench {
                                 );
                                 cx.stop_propagation();
                             }))
+                            .on_drop(cx.listener(|this, drag: &SidebarGroupDrag, _, cx| {
+                                this.finish_sidebar_group_drag(&drag.group_id, cx);
+                                cx.stop_propagation();
+                            }))
                             // A group pane's tab dragged onto the sidebar leaves
                             // the group: the sidebar is the surface the group's
                             // members also live on, so dragging a tab out of the
@@ -39731,7 +39864,7 @@ impl VibexWorkbench {
                     let children = if collapsed {
                         Vec::new()
                     } else {
-                        self.render_group_navigation(&group_id, cx)
+                        self.render_group_navigation(&group_id, reorder_enabled, cx)
                     };
                     elements.push(self.render_sidebar_group(
                         group_id,
@@ -39908,7 +40041,7 @@ impl VibexWorkbench {
                     let children = if collapsed {
                         Vec::new()
                     } else {
-                        self.render_group_navigation(&group_id, cx)
+                        self.render_group_navigation(&group_id, reorder_enabled, cx)
                     };
                     elements.push(self.render_sidebar_group(
                         group_id,
@@ -41745,6 +41878,10 @@ impl VibexWorkbench {
             .map(|state| state.session_ids.clone());
         let drop_active = active_session_drag.is_some()
             && drop_position == Some(SidebarOrganizationDropPosition::Into);
+        let active_group_drag = self
+            .sidebar_group_drag_state
+            .as_ref()
+            .is_some_and(|state| cx.has_active_drag() && state.group_id == group_id);
         let rename_error = renaming
             .then(|| self.sidebar_rename_error.clone())
             .flatten();
@@ -41756,6 +41893,7 @@ impl VibexWorkbench {
         let release_group_id = group_id.clone();
         let release_out_group_id = group_id.clone();
         let session_drop_group_id = group_id.clone();
+        let group_drag_target_group_id = group_id.clone();
         let drag_payload = SidebarGroupDrag {
             group_id: group_id.clone(),
             label: group_name.clone().into(),
@@ -41834,6 +41972,30 @@ impl VibexWorkbench {
                     });
                     cx.new(|_| drag.clone())
                 })
+                // Another group is a sibling, so a group dropped on this row
+                // lands before or after it, inside this group's own parent.
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<SidebarGroupDrag>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        let drag_group_id = event.drag(cx).group_id.clone();
+                        if drag_group_id == group_drag_target_group_id {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        this.set_sidebar_organization_drop_target(
+                            vec![SidebarOrganizationItem::Group(drag_group_id)],
+                            SidebarOrganizationItem::Group(group_drag_target_group_id.clone()),
+                            if event.event.position.y >= event.bounds.center().y {
+                                SidebarOrganizationDropPosition::After
+                            } else {
+                                SidebarOrganizationDropPosition::Before
+                            },
+                            cx,
+                        );
+                    },
+                ))
             })
             .on_drop(
                 cx.listener(move |this, drag: &SidebarSessionDrag, window, cx| {
@@ -41851,6 +42013,7 @@ impl VibexWorkbench {
                 this.finish_sidebar_group_drag(&drag.group_id, cx);
                 cx.stop_propagation();
             }))
+            .when(active_group_drag, |this| this.opacity(0.45))
             .when(renaming, |this| {
                 this.on_key_down(cx.listener(Self::on_sidebar_rename_key_down))
             })
@@ -42172,6 +42335,7 @@ impl VibexWorkbench {
         let project_drop_folder_id = folder_id.clone();
         let session_drop_folder_id = folder_id.clone();
         let folder_drop_folder_id = folder_id.clone();
+        let group_drag_target_folder_id = folder_id.clone();
 
         let row = div()
             .id(format!("sidebar-folder-row-{folder_id}"))
@@ -42334,6 +42498,32 @@ impl VibexWorkbench {
                         );
                     },
                 ))
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<SidebarGroupDrag>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        let drag = event.drag(cx);
+                        let position = if event.event.position.y
+                            < event.bounds.top() + px(SIDEBAR_FOLDER_DROP_EDGE_HEIGHT)
+                        {
+                            SidebarOrganizationDropPosition::Before
+                        } else if event.event.position.y
+                            > event.bounds.bottom() - px(SIDEBAR_FOLDER_DROP_EDGE_HEIGHT)
+                        {
+                            SidebarOrganizationDropPosition::After
+                        } else {
+                            SidebarOrganizationDropPosition::Into
+                        };
+                        this.set_sidebar_organization_drop_target(
+                            vec![SidebarOrganizationItem::Group(drag.group_id.clone())],
+                            SidebarOrganizationItem::Folder(group_drag_target_folder_id.clone()),
+                            position,
+                            cx,
+                        );
+                    },
+                ))
             })
             .on_drop(cx.listener(|this, drag: &SidebarProjectDrag, _, cx| {
                 this.finish_sidebar_project_drag(&drag.project_id, cx);
@@ -42345,6 +42535,12 @@ impl VibexWorkbench {
             }))
             .on_drop(cx.listener(|this, drag: &SidebarFolderDrag, _, cx| {
                 this.finish_sidebar_folder_drag(&drag.folder_id, cx);
+                cx.stop_propagation();
+            }))
+            // A folder files a group the way it files a session: the row itself
+            // is the target, so its own drop is what commits the move.
+            .on_drop(cx.listener(|this, drag: &SidebarGroupDrag, _, cx| {
+                this.finish_sidebar_group_drag(&drag.group_id, cx);
                 cx.stop_propagation();
             }))
             .when(active_folder_drag, |this| this.opacity(0.45))
@@ -42917,6 +43113,7 @@ impl VibexWorkbench {
         let drag_target_project_id = project_id_string.clone();
         let folder_drag_target_project_id = project_id_string.clone();
         let session_root_target_project_id = project_id_string.clone();
+        let project_root_target_project_id = project_id_string.clone();
         let project_row = div()
             .id(format!("sidebar-project-row-{project_id_string}"))
             .group(hover_group.clone())
@@ -43021,6 +43218,22 @@ impl VibexWorkbench {
                             .map(SidebarOrganizationItem::Session)
                             .collect(),
                         SidebarOrganizationScope::Project(session_root_target_project_id.clone()),
+                        cx,
+                    );
+                },
+            ))
+            // A group belongs to this project, so the project row is where a
+            // group dropped outside every folder is rooted.
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<SidebarGroupDrag>, _, cx| {
+                    if !event.bounds.contains(&event.event.position) {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    let drag = event.drag(cx);
+                    this.set_sidebar_organization_root_drop_target(
+                        vec![SidebarOrganizationItem::Group(drag.group_id.clone())],
+                        SidebarOrganizationScope::Project(project_root_target_project_id.clone()),
                         cx,
                     );
                 },
@@ -43304,6 +43517,10 @@ impl VibexWorkbench {
             }))
             .on_drop(cx.listener(|this, drag: &SidebarWorkspaceDrag, _, cx| {
                 this.finish_sidebar_workspace_drag(&drag.project_id, &drag.workspace_id, cx);
+                cx.stop_propagation();
+            }))
+            .on_drop(cx.listener(|this, drag: &SidebarGroupDrag, _, cx| {
+                this.finish_sidebar_group_drag(&drag.group_id, cx);
                 cx.stop_propagation();
             }))
             .when(
@@ -43807,6 +44024,7 @@ impl VibexWorkbench {
         project_scope_id: &str,
         reorder_enabled: bool,
         show_worktree_identity: bool,
+        group_id: Option<&str>,
         strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -43858,14 +44076,21 @@ impl VibexWorkbench {
         // A row that moves with the selection is painted like one, so the wash
         // the user sees is exactly the set a drag carries.
         let move_selected = self.sidebar_row_is_move_selected(&session_item);
-        let drag_session_ids = self
-            .sidebar_drag_items(&session_item)
-            .into_iter()
-            .filter_map(|item| match item {
-                SidebarOrganizationItem::Session(id) => Some(id),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        // A member row is painted by its group, so the drag it starts carries
+        // the rows of that group rather than the project band behind it.
+        let drag_session_ids = match group_id {
+            Some(group_id) => {
+                self.sidebar_group_drag_session_ids(group_id, session_id_string.as_str())
+            }
+            None => self
+                .sidebar_drag_items(&session_item)
+                .into_iter()
+                .filter_map(|item| match item {
+                    SidebarOrganizationItem::Session(id) => Some(id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        };
         let worktree_tooltip = (show_worktree_identity
             && session.workspace_mode == WorkspaceMode::VibexWorktree)
             .then(|| {
@@ -44249,6 +44474,7 @@ impl VibexWorkbench {
             label: row_title.clone().into(),
             agent_id: sidebar_agent_id.as_str().to_string(),
             pinned,
+            group_id: group_id.map(str::to_string),
         };
         // The running cue reaches the title itself: while the Agent generates,
         // the label runs the same sweep the timeline's thinking row does, at the
@@ -44295,6 +44521,7 @@ impl VibexWorkbench {
         let drag_target_session_id = session.id.clone();
         let drag_target_project_id = project_scope_id;
         let folder_drag_target_session_id = session.id.as_str().to_string();
+        let group_drag_target_session_id = session.id.as_str().to_string();
         let release_session_id = session.id.clone();
         let release_workspace_id = session.workspace_id.as_str().to_string();
         let release_out_session_id = session.id.clone();
@@ -44442,6 +44669,29 @@ impl VibexWorkbench {
                         );
                     },
                 ))
+                // A group is a leaf like a session, so this row is where a
+                // dragged group lands next to one.
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<SidebarGroupDrag>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        let drag = event.drag(cx);
+                        this.set_sidebar_organization_drop_target(
+                            vec![SidebarOrganizationItem::Group(drag.group_id.clone())],
+                            SidebarOrganizationItem::Session(
+                                group_drag_target_session_id.clone(),
+                            ),
+                            if event.event.position.y >= event.bounds.center().y {
+                                SidebarOrganizationDropPosition::After
+                            } else {
+                                SidebarOrganizationDropPosition::Before
+                            },
+                            cx,
+                        );
+                    },
+                ))
             })
             .on_drop(cx.listener(move |this, drag: &SidebarSessionDrag, _, cx| {
                 this.finish_sidebar_session_drag(
@@ -44454,6 +44704,10 @@ impl VibexWorkbench {
             }))
             .on_drop(cx.listener(|this, drag: &SidebarFolderDrag, _, cx| {
                 this.finish_sidebar_folder_drag(&drag.folder_id, cx);
+                cx.stop_propagation();
+            }))
+            .on_drop(cx.listener(|this, drag: &SidebarGroupDrag, _, cx| {
+                this.finish_sidebar_group_drag(&drag.group_id, cx);
                 cx.stop_propagation();
             }))
             .when(
@@ -96934,6 +97188,111 @@ mod tests {
         assert!(release.contains("remove_sessions_from_group("));
         assert!(release.contains("release_group_session_views("));
         assert!(release.contains("group_of_session(session_id)"));
+    }
+
+    /// A session group is a row the user can file like any other.
+    ///
+    /// The group row is a drag source of its own, but a drag source without a
+    /// target resolves to nothing: every surface a session or a folder can be
+    /// dropped on has to accept a group too, or the gesture silently ends.
+    #[test]
+    fn a_group_drag_is_accepted_by_the_surfaces_that_hold_it() {
+        let source = include_str!("app.rs");
+
+        let folder = source
+            .split_once("    fn render_sidebar_folder(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn render_sidebar_project_appearance_popover(")
+            })
+            .map(|(body, _)| body)
+            .expect("folder renderer should remain inspectable");
+        assert!(folder.contains("DragMoveEvent<SidebarGroupDrag>"));
+        assert!(folder.contains("SidebarOrganizationItem::Group(drag.group_id.clone())"));
+        assert!(folder.contains(".on_drop(cx.listener(|this, drag: &SidebarGroupDrag"));
+
+        // The group row orders itself against other groups, the session row
+        // places it among the sessions of a band, and the project row is the
+        // project's own root.
+        let group_row = source
+            .split_once("    fn render_sidebar_group(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_group_menu("))
+            .map(|(body, _)| body)
+            .expect("sidebar group renderer should remain inspectable");
+        assert!(group_row.contains("DragMoveEvent<SidebarGroupDrag>"));
+
+        let project = source
+            .split_once("    fn render_sidebar_project(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_workspace("))
+            .map(|(body, _)| body)
+            .expect("project renderer should remain inspectable");
+        assert!(project.contains("DragMoveEvent<SidebarGroupDrag>"));
+        assert!(
+            project.contains("SidebarOrganizationScope::Project(project_root_target_project_id")
+        );
+
+        let sidebar = source
+            .split_once("    fn render_agent_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_toolbar_more_menu("))
+            .map(|(body, _)| body)
+            .expect("sidebar renderer should remain inspectable");
+        assert!(sidebar.contains(".on_drop(cx.listener(|this, drag: &SidebarGroupDrag"));
+    }
+
+    /// A group paints its member rows from its own order, so a drag that starts
+    /// on one of them reorders the group — it must not fall through to the
+    /// project row the group sits inside.
+    #[test]
+    fn dragging_a_group_member_reorders_the_group_it_is_painted_in() {
+        let source = include_str!("app.rs");
+
+        let navigation = source
+            .split_once("    fn render_group_navigation(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The slot a session row keeps for its branch toggle")
+            })
+            .map(|(body, _)| body)
+            .expect("group navigation should remain inspectable");
+        // The rows are draggable and know the group they belong to.
+        assert!(navigation.contains("reorder_enabled: bool"));
+        assert!(navigation.contains("reorder_enabled,"));
+        assert!(navigation.contains("Some(group_id),"));
+
+        let drag = source
+            .split_once("struct SidebarSessionDrag {")
+            .and_then(|(_, tail)| tail.split_once("\nimpl Render for SidebarSessionDrag"))
+            .map(|(body, _)| body)
+            .expect("session drag payload should remain inspectable");
+        assert!(drag.contains("group_id: Option<String>"));
+
+        let drag_start = source
+            .split_once("    fn start_sidebar_session_drag(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn preview_sidebar_session_reorder("))
+            .map(|(body, _)| body)
+            .expect("session drag setup should remain inspectable");
+        // The band it previews is the group's own member list.
+        assert!(drag_start.contains("let group_band = drag.group_id.as_deref()"));
+        assert!(drag_start.contains("group.member_session_ids.clone()"));
+        assert!(drag_start.contains("group_id: drag.group_id.clone(),"));
+
+        let finish = source
+            .split_once("    fn finish_sidebar_session_drag(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Applies the group half"))
+            .map(|(body, _)| body)
+            .expect("session drag finish should remain inspectable");
+        // A drop inside the group it came from is an order change; a drop
+        // anywhere else is the leave path the group half already owns.
+        assert!(finish.contains("if state.group_id.is_some() && keep_group == state.group_id {"));
+        assert!(finish.contains(
+            "self.reorder_group_members(group_id, &state.session_ids, &target_id, after, cx);"
+        ));
+
+        let reorder = source
+            .split_once("    fn reorder_group_members(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn start_sidebar_folder_drag("))
+            .map(|(body, _)| body)
+            .expect("group reorder should remain inspectable");
+        assert!(reorder.contains(".reorder_group_members(group_id, moving_ids, target_id, after)"));
+        assert!(reorder.contains("self.sync_user_session_group(group_id);"));
     }
 
     /// The rows the sidebar paints as selected are the rows a move acts on: the

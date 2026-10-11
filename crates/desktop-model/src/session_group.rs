@@ -18,6 +18,7 @@ use vibex_core::{
 };
 
 use crate::SplitDirection;
+use crate::agent_ordering::move_strings_relative;
 
 /// Distinct team outcomes; a finished round is not an accepted task.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1200,6 +1201,24 @@ impl SessionGroupUiState {
         self.member_session_ids = session_ids;
         self.normalize();
         true
+    }
+
+    /// Moves already-joined members relative to one of their own.
+    ///
+    /// Only members move: a session the group does not hold has no place in
+    /// its order, and the member list is not a way to admit one — that is
+    /// [`Self::add_members`]. The order the panes show is left to the layout,
+    /// so reordering the sidebar's member rows rearranges the rows and nothing
+    /// else.
+    pub fn reorder_members(&mut self, moving_ids: &[String], target_id: &str, after: bool) -> bool {
+        if !moving_ids
+            .iter()
+            .all(|session_id| self.contains(session_id))
+            || !self.contains(target_id)
+        {
+            return false;
+        }
+        move_strings_relative(&mut self.member_session_ids, moving_ids, target_id, after)
     }
 
     /// Sessions the group should render with a live view: every session in the

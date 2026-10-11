@@ -839,6 +839,29 @@ impl SidebarOrganizationState {
         true
     }
 
+    /// Reorders the members of one group.
+    ///
+    /// A group paints its members from its own order and nowhere else, so this
+    /// is the whole answer for dragging a member row inside the group: the
+    /// placement tree says where a session sits among the project's rows, this
+    /// says where it sits among the sessions it shares a group with.
+    pub fn reorder_group_members(
+        &mut self,
+        group_id: &str,
+        moving_ids: &[String],
+        target_id: &str,
+        after: bool,
+    ) -> bool {
+        let Some(group) = self.groups.get_mut(group_id) else {
+            return false;
+        };
+        if !group.reorder_members(moving_ids, target_id, after) {
+            return false;
+        }
+        group.normalize();
+        true
+    }
+
     pub fn set_group_members(
         &mut self,
         group_id: &str,
@@ -3223,6 +3246,103 @@ mod tests {
         // The folder's classification goes, but the group is not a folder child
         // record: it becomes unplaced and is restored by the next projection.
         assert!(state.group("group-1").is_some());
+    }
+
+    /// A group is a leaf the user can file, exactly like a session: the folder
+    /// row is the target, and the group's own Worktree travels with it.
+    #[test]
+    fn dragging_a_group_into_a_folder_files_it_there() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("folder-1", "Archive", Some("project-a".to_string()), None));
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a"]),
+            &group_workspaces(),
+            None,
+        ));
+        let moving = [SidebarOrganizationItem::Group("group-1".to_string())];
+        // A root folder is another column's target, so the drop is refused
+        // before anything moves.
+        assert!(state.create_folder("root-folder", "Root", None, None));
+        assert!(!state.can_move_many_into(&moving, "root-folder", &session_projects()));
+        assert!(!state.move_many_into(&moving, "root-folder", &session_projects()));
+
+        assert!(state.can_move_many_into(&moving, "folder-1", &session_projects()));
+        assert!(state.move_many_into(&moving, "folder-1", &session_projects()));
+        assert_eq!(
+            state.parent_of(&SidebarOrganizationItem::Group("group-1".into())),
+            Some("folder-1".to_string())
+        );
+        assert_eq!(
+            state.group("group-1").map(|group| group.name.as_str()),
+            Some("会话组 1")
+        );
+
+        // Dropping it on the project row takes it back out to the project root.
+        assert!(state.move_many_to_scope_root_end(
+            &moving,
+            &SidebarOrganizationScope::Project("project-a".to_string()),
+            &session_projects(),
+        ));
+        assert_eq!(
+            state.parent_of(&SidebarOrganizationItem::Group("group-1".into())),
+            None
+        );
+    }
+
+    /// Dragging a member row inside its group reorders the group, not the
+    /// project: the placement tree is where a session sits when it leaves.
+    #[test]
+    fn reordering_group_members_changes_only_the_group_order() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a", "session-b"]),
+            &group_workspaces(),
+            None,
+        ));
+        let placements = state.placements.clone();
+
+        assert!(state.reorder_group_members(
+            "group-1",
+            &group_members(&["session-a"]),
+            "session-b",
+            true,
+        ));
+        assert_eq!(
+            state
+                .group("group-1")
+                .map(|group| group.member_session_ids.clone()),
+            Some(group_members(&["session-b", "session-a"]))
+        );
+        assert_eq!(state.placements, placements);
+        // The same order is a no-op, and so is moving a session the group does
+        // not hold: membership is not a side effect of ordering.
+        assert!(!state.reorder_group_members(
+            "group-1",
+            &group_members(&["session-a"]),
+            "session-b",
+            true,
+        ));
+        assert!(!state.reorder_group_members(
+            "group-1",
+            &group_members(&["session-c"]),
+            "session-a",
+            true,
+        ));
+        assert!(!state.reorder_group_members(
+            "missing",
+            &group_members(&["session-a"]),
+            "session-b",
+            true
+        ));
+        assert_eq!(state.group_of_session("session-c"), None);
     }
 
     #[test]
