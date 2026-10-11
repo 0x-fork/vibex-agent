@@ -34,9 +34,9 @@ pub(crate) fn setting_title() -> &'static str {
 }
 pub(crate) fn setting_description() -> &'static str {
     text(
-        "Let a pixel guardian roam the new-session home. Select its Agent and click the guardian to play.",
-        "让像素守卫在新建会话首页游走，切换 Agent 后点击对应守卫即可游玩。",
-        "讓像素守衛在新增工作階段首頁遊走，切換 Agent 後點擊對應守衛即可遊玩。",
+        "Awaken AI Souls. Switch Agent, then click the guardian to challenge it; a win earns its matching effect reward.",
+        "唤醒 AI 之魂，切换 Agent 后点击守卫即可挑战，挑战成功获得对应特效奖励",
+        "喚醒 AI 之魂，切換 Agent 後點擊守衛即可挑戰，挑戰成功獲得對應特效獎勵",
     )
 }
 actions!(unbound, [Roll, TogglePause, Retry, Advance, Exit]);
