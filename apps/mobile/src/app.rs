@@ -6639,12 +6639,16 @@ impl MobileApp {
     /// instead of hanging off the bottom edge; the first pairing turns them
     /// back into the row above the thumb.
     ///
+    /// The runtime switcher is this page opened over a live connection, so it
+    /// is not the first screen: it lists the runtimes and pins the same three
+    /// entries to the foot of the page without repeating the product wordmark,
+    /// and the band the wordmark would have taken goes to the list.
+    ///
     /// Nothing here moves when a fallback opens: `render_pairing_sheet` lays the
     /// panel over the page instead of taking room in it, so an entry keeps the
     /// exact place the finger just left.
     fn render_pairing(
         &self,
-        runtimes_max_height: Pixels,
         sheet_max_height: Pixels,
         window: &Window,
         cx: &mut Context<Self>,
@@ -6652,6 +6656,8 @@ impl MobileApp {
         let scan_busy = self.pairing_action == Some(PairingAction::Scan);
         let scan_enabled = !self.pairing_busy;
         let saved_runtimes = !self.known_hosts.is_empty();
+        let first_screen = !self.is_pairing_overlay_open();
+        let runtimes_max_height = pairing_runtimes_max_height(window, first_screen);
         let error_here = (self.pairing_panel != PairingPanel::Manual)
             .then(|| self.pairing_error_line())
             .flatten();
@@ -6683,7 +6689,12 @@ impl MobileApp {
                                     .flex()
                                     .flex_col()
                                     .pt(px(PAIRING_PAGE_TOP_PAD))
-                                    .child(self.render_pairing_brand())
+                                    // The switcher opens over a live
+                                    // connection and names the runtimes below,
+                                    // so it carries no wordmark.
+                                    .when(first_screen, |page| {
+                                        page.child(self.render_pairing_brand())
+                                    })
                                     .child(self.render_pairing_runtimes(runtimes_max_height, cx))
                                     .when_some(error_here, |page, line| {
                                         page.child(div().mb(px(theme::SPACING_MD)).child(line))
@@ -6761,6 +6772,7 @@ impl MobileApp {
     fn render_pairing_brand(&self) -> impl IntoElement {
         let scale = PAIRING_WORDMARK_FONT / 42.0;
         div()
+            .debug_selector(|| "pairing-brand".to_string())
             .flex()
             .items_center()
             .justify_center()
@@ -12699,7 +12711,6 @@ impl MobileApp {
         let host_status = self
             .active_host_status()
             .unwrap_or_else(RuntimeStatusView::inactive);
-        let host_status_label = host_status.label();
 
         div()
             .absolute()
@@ -13254,68 +13265,7 @@ impl MobileApp {
                     .flex()
                     .items_center()
                     .gap(px(theme::SPACING_SM))
-                    .child(
-                        div()
-                            .id("mobile-host-switcher")
-                            .debug_selector(|| "mobile-host-switcher".to_string())
-                            // The state belongs in the accessible name too: a
-                            // screen reader must not have to infer it from a dot.
-                            .aria_label(format!("{host_label} · {host_status_label}"))
-                            .h(px(theme::TOUCH_TARGET))
-                            .flex_1()
-                            .min_w_0()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .px(px(theme::SPACING_MD))
-                            .flex()
-                            .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::open_pairing))
-                            .child(
-                                div()
-                                    .size(px(theme::ICON_STATUS))
-                                    .flex_shrink_0()
-                                    .rounded_full()
-                                    .bg(host_status.status.dot_color()),
-                            )
-                            // Two lines in one 44px target: the runtime the phone
-                            // is on, and the state it is in. The dot alone never
-                            // carries the state — the second line spells it out.
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(1.0))
-                                    .child(
-                                        div()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .text_size(px(theme::FONT_BODY))
-                                            .text_color(theme::sidebar_text_secondary())
-                                            .child(host_label),
-                                    )
-                                    .child(
-                                        div()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .text_size(px(theme::FONT_MICRO))
-                                            .text_color(theme::text_muted())
-                                            .child(host_status_label),
-                                    ),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/chevron-right.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .flex_shrink_0()
-                                    .text_color(theme::text_muted()),
-                            ),
-                    )
+                    .child(self.render_drawer_host_row(host_label, host_status, cx))
                     .child(
                         div()
                             .id("mobile-settings-button")
@@ -13334,6 +13284,62 @@ impl MobileApp {
                                     .size(px(18.0))
                                     .text_color(theme::sidebar_text_secondary()),
                             ),
+                    ),
+            )
+    }
+
+    /// The runtime the phone is on, as the drawer footer's compact chip.
+    ///
+    /// The dot's colour is the only place the connection state appears; the
+    /// words stay in the row's accessible name, so the state is never colour
+    /// alone. The row is as wide as what it says rather than the whole footer,
+    /// so its touch area ends with its own label, and the chevron the entry
+    /// used to wear is gone: the row is a status chip, not a disclosed page.
+    fn render_drawer_host_row(
+        &self,
+        label: String,
+        status: RuntimeStatusView,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            // The chip keeps the footer's remaining width, so the settings
+            // button stays against the trailing edge however long the name is.
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .id("mobile-host-switcher")
+                    .debug_selector(|| "mobile-host-switcher".to_string())
+                    .aria_label(format!("{label} · {}", status.label()))
+                    .h(px(theme::DRAWER_ACTION_HEIGHT))
+                    .min_w_0()
+                    .max_w_full()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .px(px(theme::SPACING_SM))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::open_pairing))
+                    .child(
+                        div()
+                            .size(px(theme::ICON_STATUS))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(status.status.dot_color()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_BODY))
+                            .text_color(theme::sidebar_text_secondary())
+                            .child(label),
                     ),
             )
     }
@@ -13962,12 +13968,7 @@ impl Render for MobileApp {
             .pl(insets.left)
             .child(match visible_mode {
                 RootMode::Pairing => self
-                    .render_pairing(
-                        pairing_runtimes_max_height(window),
-                        pairing_sheet_max_height(window),
-                        window,
-                        cx,
-                    )
+                    .render_pairing(pairing_sheet_max_height(window), window, cx)
                     .into_any_element(),
                 RootMode::Connecting => self.render_connecting(window, cx).into_any_element(),
                 RootMode::Workspace => self
@@ -13990,11 +13991,17 @@ fn pairing_sheet_max_height(window: &Window) -> Pixels {
 
 /// How much of the page the saved-runtime list may take before it scrolls.
 ///
-/// The list is a shortcut, not the page: the wordmark above it and the entries
-/// below it keep their room, so a phone with a dozen runtimes still shows the
-/// three ways to reach one.
-fn pairing_runtimes_max_height(window: &Window) -> Pixels {
-    px(f32::from(window.viewport_size().height) * PAIRING_RUNTIMES_HEIGHT_RATIO)
+/// On the first screen the list is a shortcut, not the page: the wordmark above
+/// it and the entries below it keep their room, so a phone with a dozen runtimes
+/// still shows the three ways to reach one. The runtime switcher has no wordmark
+/// to leave that band to, so its list takes the share the wordmark was holding.
+fn pairing_runtimes_max_height(window: &Window, first_screen: bool) -> Pixels {
+    let ratio = if first_screen {
+        PAIRING_RUNTIMES_HEIGHT_RATIO
+    } else {
+        PAIRING_SWITCHER_RUNTIMES_HEIGHT_RATIO
+    };
+    px(f32::from(window.viewport_size().height) * ratio)
 }
 
 fn workspace_page_width(window: &Window) -> f32 {
@@ -15231,12 +15238,7 @@ impl MobileApp {
         match overlay {
             MobileOverlay::Team => self.render_team(cx),
             MobileOverlay::Pairing => self
-                .render_pairing(
-                    pairing_runtimes_max_height(window),
-                    pairing_sheet_max_height(window),
-                    window,
-                    cx,
-                )
+                .render_pairing(pairing_sheet_max_height(window), window, cx)
                 .into_any_element(),
             MobileOverlay::HostDetail => self.render_host_detail(cx),
             MobileOverlay::HostActions => self.render_host_actions_sheet(cx),
@@ -16768,6 +16770,10 @@ const REACHABILITY_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 
 /// The share of the page the saved-runtime list may cover before it scrolls.
 const PAIRING_RUNTIMES_HEIGHT_RATIO: f32 = 0.34;
+
+/// The same share on the runtime switcher, where the wordmark's band is free and
+/// the list is the page.
+const PAIRING_SWITCHER_RUNTIMES_HEIGHT_RATIO: f32 = 0.5;
 
 /// The busy indicator the pairing actions share.
 fn pairing_spinner(color: gpui::Hsla) -> gpui::AnyElement {
@@ -18981,7 +18987,7 @@ mod tests {
             "a runtime row should span the column: {:?}",
             list.size
         );
-        let cap = cx.update(|window, _| pairing_runtimes_max_height(window));
+        let cap = cx.update(|window, _| pairing_runtimes_max_height(window, true));
         assert!(
             list.size.height <= cap,
             "the list should stop at its share of the page: {:?} vs {cap:?}",
@@ -19157,6 +19163,88 @@ mod tests {
         );
     }
 
+    /// The runtime switcher is the pairing page opened over a live connection:
+    /// the saved runtimes, the three ways on pinned to the foot of the page, and
+    /// no product wordmark — the wordmark belongs to the first screen the app
+    /// starts on.
+    #[gpui::test]
+    fn the_runtime_switcher_lists_runtimes_without_the_wordmark(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let mut bundle = host_bundle("runtime-a", "studio");
+        bundle.route = Some(crate::pairing::MobileRemoteRouteBundle {
+            local_network: None,
+            direct_candidates: vec![bundle.record.server_url.clone()],
+            relay: None,
+        });
+        let backend = bundle.backend().expect("valid saved runtime");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
+        });
+        cx.run_until_parked();
+
+        // A phone that has not connected yet starts on the first screen with the
+        // runtimes it already knows, and that page names the product.
+        app.update(cx, |app, cx| {
+            app.remember_host(&bundle, RemoteServerKind::Desktop);
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(app.read_with(cx, |app, _| app.mode), RootMode::Pairing);
+        assert!(
+            cx.debug_bounds("pairing-brand").is_some(),
+            "the first screen should keep the wordmark"
+        );
+        assert!(cx.debug_bounds("pairing-runtimes").is_some());
+
+        // Switching runtimes opens the same page over the running connection:
+        // the rows and the three entries stay, the wordmark goes.
+        app.update(cx, |app, cx| {
+            app.mode = RootMode::Workspace;
+            app.backend = Some(backend.clone());
+            app.controller = Some(AgentWorkflowController::new(
+                backend.clone(),
+                backend.capability_snapshot().agent,
+            ));
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_pairing(&noop_mouse_up(), window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.overlay),
+            Some(MobileOverlay::Pairing)
+        );
+        assert!(
+            cx.debug_bounds("pairing-runtimes").is_some(),
+            "the switcher should list the saved runtimes"
+        );
+        assert!(
+            cx.debug_bounds("pairing-brand").is_none(),
+            "the switcher should carry no wordmark"
+        );
+        let actions = cx
+            .debug_bounds("pairing-actions")
+            .expect("the three entries should stay pinned to the foot of the page");
+        let below = cx.update(|window, _| {
+            f32::from(window.viewport_size().height)
+                - f32::from(actions.origin.y + actions.size.height)
+        });
+        assert!(
+            below.abs() < 1.0,
+            "the three entries should sit at the foot of the page, not {below} below it"
+        );
+    }
+
     /// A pairing card is the phone's whole runtime surface on this page, so it
     /// carries the runtime's own state and the way into its actions — including
     /// removing it.
@@ -19269,10 +19357,11 @@ mod tests {
     }
 
     /// The pairing page is the product wordmark plus the runtimes this phone
-    /// already paired. A title above the wordmark, or rows that wrap instead
-    /// of scrolling, would both undo what the page is for.
+    /// already paired — but only while it is the first screen. A title above
+    /// the wordmark, or rows that wrap instead of scrolling, would both undo
+    /// what the page is for.
     #[test]
-    fn the_pairing_page_keeps_the_wordmark_and_its_runtime_rows() {
+    fn the_pairing_page_keeps_the_wordmark_on_the_first_screen_alone() {
         let source = include_str!("app.rs");
         let page = renderer_source(source, "render_pairing");
         for call in [
@@ -19291,6 +19380,12 @@ mod tests {
         // there are none, and the empty page carries no copy about it.
         assert!(page.contains(".when(saved_runtimes, |page|"));
         assert!(!page.contains("No runtimes yet") && !page.contains("Add a device"));
+        // The wordmark belongs to the first screen; the runtime switcher is the
+        // same page opened over a live connection, so it starts with the rows
+        // and gives the band the wordmark held to the list.
+        assert!(page.contains("let first_screen = !self.is_pairing_overlay_open();"));
+        assert!(page.contains(".when(first_screen, |page|"));
+        assert!(page.contains("pairing_runtimes_max_height(window, first_screen)"));
 
         // The mark supplies the capital "V" and the label completes the name,
         // and the lockup sits in the middle of the page rather than at its
@@ -19997,6 +20092,41 @@ mod tests {
             ),
             "昨天"
         );
+    }
+
+    /// The drawer footer's runtime entry is a status chip: the leading dot's
+    /// colour is the whole connection state, the words for it stay in the
+    /// accessible name, the name takes the row, and the touch area ends with
+    /// its own label instead of spanning the footer behind a disclosure arrow.
+    #[test]
+    fn the_drawer_footer_runtime_row_is_a_dot_and_a_name() {
+        let source = include_str!("app.rs");
+        let row = renderer_source(source, "render_drawer_host_row");
+        // `renderer_source` runs to the next item that carries a doc comment,
+        // and this helper is followed by bare accessors, so cut at the next
+        // signature before asserting on what the row itself paints.
+        let row = &row[..row.find("\n    fn ").unwrap_or(row.len())];
+        // One line: the state is never spelled out under the name.
+        assert!(!row.contains("FONT_MICRO"));
+        assert!(row.contains(".bg(status.status.dot_color())"));
+        assert!(row.contains(".text_ellipsis()"));
+        assert!(row.contains("Self::open_pairing"));
+        // A screen reader still gets the state the colour carries.
+        assert!(row.contains(".aria_label(format!(\"{label} · {}\", status.label()))"));
+
+        // The chip hugs its label rather than stretching to the footer's width;
+        // the flexible wrapper is what keeps the settings button trailing.
+        let chip = row
+            .split_once(".id(\"mobile-host-switcher\")")
+            .expect("the footer row keeps its id")
+            .1;
+        assert!(chip.contains(".child(label)"), "the chip shows the name");
+        assert!(!chip.contains(".flex_1()"));
+        assert!(row.contains(".flex_1()"));
+        // Smaller than a full touch target, and no arrow into another page.
+        assert!(chip.contains(".h(px(theme::DRAWER_ACTION_HEIGHT))"));
+        assert!(!chip.contains(".h(px(theme::TOUCH_TARGET))"));
+        assert!(!chip.contains("chevron-right.svg"));
     }
 
     #[gpui::test]
