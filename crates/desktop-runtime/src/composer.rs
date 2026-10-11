@@ -37,17 +37,6 @@ pub const COMPOSER_SESSION_REFERENCE_KEY: &str = "vibexUseSessionReference";
 /// having to follow a prompt.
 pub const COMPOSER_DELEGATE_NOW_KEY: &str = "vibexUseDelegateNow";
 
-/// Divisor of an `@` list kept for the workspace file index.
-///
-/// The collaborator catalogue can hold every account, model and mode of every
-/// enabled Agent, while the panel has one bound for everything it lists.
-/// Without a floor the catalogue grows past that bound on its own and the file
-/// index the `@` trigger has always offered disappears from the panel, so the
-/// files keep half the list and each source hands back the room it does not
-/// use. Workspace files also lead the list: they are what a reader who opens
-/// `@` and presses Enter without typing has always selected.
-const COMPOSER_FILE_REFERENCE_SHARE_DIVISOR: usize = 2;
-
 /// Resolves one composer discovery request against the authority's state.
 pub async fn discover_composer_commands(
     agent: &AgentHandle,
@@ -59,26 +48,14 @@ pub async fn discover_composer_commands(
     let manager = agent.manager();
     let mut response = manager.discover_commands(request.clone()).await?;
     let capabilities = manager.command_discovery_capabilities(&request)?;
-    if mention_references_are_offered(&request) {
-        let mut collaborators = AgentCommandDiscoverResponse {
-            entries: Vec::new(),
-            diagnostics: Vec::new(),
-        };
-        if let Some(vibex_use) = vibex_use {
-            append_collaborator_reference_commands(vibex_use, &request, &mut collaborators).await?;
-        }
-        let mut workspace_files = AgentCommandDiscoverResponse {
-            entries: Vec::new(),
-            diagnostics: Vec::new(),
-        };
-        append_file_reference_commands(files, &request, &mut workspace_files)?;
-        response.entries = merge_mention_reference_commands(
-            std::mem::take(&mut response.entries),
-            collaborators.entries,
-            workspace_files.entries,
-            request.limit.unwrap_or(50) as usize,
-        );
-    }
+    // The workspace files are the `@` popup's own list; the collaborators are
+    // its second tab. They are bounded separately, so neither one's size can
+    // decide what the other offers.
+    let delegation_entries = match vibex_use {
+        Some(vibex_use) => collaborator_reference_commands(vibex_use, &request).await?,
+        None => Vec::new(),
+    };
+    append_file_reference_commands(files, &request, &mut response)?;
     append_workspace_skill_commands(providers, &request, &mut response, capabilities.skills)?;
     let quick_phrases = manager.discover_quick_phrases(&request)?;
     Ok(AgentCommandDiscovery {
@@ -86,6 +63,7 @@ pub async fn discover_composer_commands(
         slash_commands: capabilities.slash_commands,
         skills: capabilities.skills,
         quick_phrases,
+        delegation_entries,
     })
 }
 
@@ -99,76 +77,36 @@ fn mention_references_are_offered(request: &AgentCommandDiscoverRequest) -> bool
         .is_none_or(|trigger| trigger == AgentCommandTrigger::Mention)
 }
 
-/// Merges the `@` sources into the one bounded list the panel shows.
-///
-/// The list leads with the workspace files and their reserved share, then the
-/// collaborators, then whatever the Agent's own catalogue contributed. Each
-/// source is only a candidate list: room a source does not use is handed to the
-/// ones after it, so a small workspace still reaches every collaborator, a
-/// query that matches no file still fills the list with collaborators, and a
-/// runtime without the collaborator service shows files exactly as it did
-/// before collaborators existed.
-fn merge_mention_reference_commands(
-    provider_entries: Vec<AgentCommandEntry>,
-    mut collaborator_entries: Vec<AgentCommandEntry>,
-    file_entries: Vec<AgentCommandEntry>,
-    limit: usize,
-) -> Vec<AgentCommandEntry> {
-    if limit == 0 {
-        return Vec::new();
-    }
-    let file_reserve = limit.div_ceil(COMPOSER_FILE_REFERENCE_SHARE_DIVISOR);
-    let collaborator_take = collaborator_entries
-        .len()
-        .min(limit.saturating_sub(file_reserve));
-    let mut entries = Vec::with_capacity(limit);
-    entries.extend(file_entries.into_iter().take(limit - collaborator_take));
-    entries.extend(collaborator_entries.drain(..collaborator_take));
-    let room = limit - entries.len();
-    entries.extend(collaborator_entries.drain(..room.min(collaborator_entries.len())));
-    let room = limit - entries.len();
-    entries.extend(provider_entries.into_iter().take(room));
-    entries
-}
-
-/// Offers the enabled Agents and the sessions the user may reference.
+/// The entries of the `@` popup's delegation tab.
 ///
 /// A reference here is a *convenience*, never a grant: the entry carries the
 /// same `vibex://` reference the Agent tools use, and the tool call that
 /// follows still authorizes it. Picking `@Codex` from this list is what tells
 /// the main Agent which collaborator the user has in mind; it does not start
 /// anything by itself.
-async fn append_collaborator_reference_commands(
+async fn collaborator_reference_commands(
     vibex_use: &Arc<VibexUseService>,
     request: &AgentCommandDiscoverRequest,
-    response: &mut AgentCommandDiscoverResponse,
-) -> VibexResult<()> {
+) -> VibexResult<Vec<AgentCommandEntry>> {
     if !mention_references_are_offered(request) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let limit = request.limit.unwrap_or(50) as usize;
-    let mut remaining = limit.saturating_sub(response.entries.len());
-    if remaining == 0 {
-        return Ok(());
-    }
     let query = request
         .query
         .as_deref()
         .map(str::trim)
         .unwrap_or("")
         .to_lowercase();
-    let mut existing_ids = response
-        .entries
+    let catalog = vibex_use.runtime_option_catalog().list().await?;
+    let mut entries = runtime_reference_commands(&catalog.options, request);
+    let mut existing_ids = entries
         .iter()
         .map(|entry| entry.id.clone())
         .collect::<HashSet<_>>();
 
-    let catalog = vibex_use.runtime_option_catalog().list().await?;
-    append_runtime_reference_commands(&catalog.options, request, response);
-    remaining = limit.saturating_sub(response.entries.len());
-
     for session in vibex_use.referenceable_sessions(&query, limit)? {
-        if remaining == 0 {
+        if entries.len() >= limit {
             break;
         }
         let entry = AgentCommandEntry {
@@ -194,31 +132,29 @@ async fn append_collaborator_reference_commands(
         if !existing_ids.insert(entry.id.clone()) {
             continue;
         }
-        response.entries.push(entry);
-        remaining -= 1;
+        entries.push(entry);
     }
-    Ok(())
+    Ok(entries)
 }
 
-fn append_runtime_reference_commands(
+/// The Agent references and direct delegation actions of one catalogue.
+///
+/// Each available account/model combination is independently selectable, so the
+/// entry pair it produces is bounded by the request's own limit here rather
+/// than by whatever the caller has already listed.
+fn runtime_reference_commands(
     options: &[vibex_core::SessionRuntimeOption],
     request: &AgentCommandDiscoverRequest,
-    response: &mut AgentCommandDiscoverResponse,
-) {
-    let mut remaining =
-        (request.limit.unwrap_or(50) as usize).saturating_sub(response.entries.len());
+) -> Vec<AgentCommandEntry> {
+    let limit = request.limit.unwrap_or(50) as usize;
+    let mut remaining = limit;
     let query = request
         .query
         .as_deref()
         .map(str::trim)
         .unwrap_or("")
         .to_lowercase();
-    let mut existing_ids: HashSet<_> = response
-        .entries
-        .iter()
-        .map(|entry| entry.id.clone())
-        .collect();
-    // Each available account/model combination is independently selectable.
+    let mut entries: Vec<AgentCommandEntry> = Vec::with_capacity(limit);
     // Availability is checked before deduplication, so an unavailable default
     // cannot hide another usable configuration of the same Agent.
     let mut seen_selections = HashSet::new();
@@ -288,13 +224,10 @@ fn append_runtime_reference_commands(
                     },
                 ],
             };
-            if (query.is_empty() || command_entry_matches_query(&entry, &query))
-                && existing_ids.insert(entry.id.clone())
-            {
-                response.entries.push(entry);
+            if query.is_empty() || command_entry_matches_query(&entry, &query) {
+                entries.push(entry);
                 remaining -= 1;
             }
-
             // The direct action, offered beside the reference. The task text is
             // whatever the reader already wrote, so it is fully visible before
             // the delegation exists; the entry only decides that it goes to this
@@ -335,13 +268,11 @@ fn append_runtime_reference_commands(
             if !query.is_empty() && !command_entry_matches_query(&action, &query) {
                 continue;
             }
-            if !existing_ids.insert(action.id.clone()) {
-                continue;
-            }
-            response.entries.push(action);
+            entries.push(action);
             remaining -= 1;
         }
     }
+    entries
 }
 
 fn runtime_reference_description(option: &vibex_core::SessionRuntimeOption) -> String {
@@ -593,30 +524,6 @@ mod tests {
         }
     }
 
-    fn named(id: &str) -> AgentCommandEntry {
-        AgentCommandEntry {
-            id: id.to_string(),
-            trigger: AgentCommandTrigger::Mention,
-            source_kind: AgentCommandSourceKind::Reference,
-            label: format!("@{id}"),
-            description: None,
-            insertion_text: format!("@{id} "),
-            command_name: None,
-            provider_kind: Some(ProviderKind::Acp),
-            prompt_id: None,
-            skill_id: None,
-            reference_path: None,
-            selection_behavior: AgentCommandSelectionBehavior::Insert,
-            execution_behavior: AgentCommandExecutionBehavior::None,
-            destructive: false,
-            metadata: Vec::new(),
-        }
-    }
-
-    fn ids(entries: &[AgentCommandEntry]) -> Vec<&str> {
-        entries.iter().map(|entry| entry.id.as_str()).collect()
-    }
-
     fn entries(
         options: &[SessionRuntimeOption],
         query: &str,
@@ -631,12 +538,7 @@ mod tests {
             query: Some(query.into()),
             limit: Some(limit),
         };
-        let mut response = AgentCommandDiscoverResponse {
-            entries: Vec::new(),
-            diagnostics: Vec::new(),
-        };
-        append_runtime_reference_commands(options, &request, &mut response);
-        response.entries
+        runtime_reference_commands(options, &request)
     }
 
     #[test]
@@ -744,64 +646,5 @@ mod tests {
                 "Delegate now to OpenCode",
             ]
         );
-    }
-
-    #[test]
-    fn a_large_collaborator_catalogue_still_shows_the_workspace_file_index() {
-        let collaborators = (0..20)
-            .map(|index| named(&format!("agent:{index}")))
-            .collect();
-        let files = (0..20)
-            .map(|index| named(&format!("file:{index}")))
-            .collect();
-        let merged = merge_mention_reference_commands(Vec::new(), collaborators, files, 10);
-        assert_eq!(
-            ids(&merged),
-            vec![
-                "file:0", "file:1", "file:2", "file:3", "file:4", "agent:0", "agent:1", "agent:2",
-                "agent:3", "agent:4",
-            ]
-        );
-    }
-
-    #[test]
-    fn room_a_source_does_not_use_is_handed_to_the_next_one() {
-        // A small workspace still reaches every collaborator.
-        let merged = merge_mention_reference_commands(
-            Vec::new(),
-            (0..12)
-                .map(|index| named(&format!("agent:{index}")))
-                .collect(),
-            vec![named("file:0"), named("file:1")],
-            10,
-        );
-        assert_eq!(
-            ids(&merged),
-            vec![
-                "file:0", "file:1", "agent:0", "agent:1", "agent:2", "agent:3", "agent:4",
-                "agent:5", "agent:6", "agent:7",
-            ]
-        );
-
-        // A catalogue with nothing to offer leaves the file index the whole list.
-        let merged = merge_mention_reference_commands(
-            Vec::new(),
-            Vec::new(),
-            (0..12)
-                .map(|index| named(&format!("file:{index}")))
-                .collect(),
-            10,
-        );
-        assert_eq!(merged.len(), 10);
-        assert!(merged.iter().all(|entry| entry.id.starts_with("file:")));
-
-        // A single-row list is a file, and only falls back when no file matches.
-        let files = vec![named("file:0")];
-        let merged =
-            merge_mention_reference_commands(Vec::new(), vec![named("agent:0")], files.clone(), 1);
-        assert_eq!(ids(&merged), vec!["file:0"]);
-        let merged =
-            merge_mention_reference_commands(Vec::new(), vec![named("agent:0")], Vec::new(), 1);
-        assert_eq!(ids(&merged), vec!["agent:0"]);
     }
 }

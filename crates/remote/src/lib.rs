@@ -11777,6 +11777,7 @@ mod tests {
                     slash_commands: true,
                     skills: false,
                     quick_phrases: Vec::new(),
+                    delegation_entries: Vec::new(),
                 })
             }
         }

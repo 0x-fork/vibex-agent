@@ -2067,14 +2067,17 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             match result {
                 Ok(discovery) => {
                     if let Some(menu) = app.completion.as_mut() {
-                        // `/` shows the Agent's commands and Vibex Prompts in one
-                        // list; the menu keeps the provider's ordering, which is
-                        // already "most relevant first".
+                        // The menu has no tabs, so it shows what the popup's
+                        // lists hold in one flat list: `/` commands and Vibex
+                        // Prompts, `@` workspace files and delegation targets.
+                        // The provider's ordering is already "most relevant
+                        // first" inside each list.
                         let mut entries = discovery
                             .response
                             .entries
                             .iter()
                             .chain(discovery.quick_phrases.iter())
+                            .chain(discovery.delegation_entries.iter())
                             .map(|entry| crate::composer::Completion {
                                 insert: entry.insertion_text.clone(),
                                 label: entry.label.clone(),

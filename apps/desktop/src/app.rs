@@ -930,48 +930,74 @@ enum ComposerSuggestionAction {
     Dismiss,
 }
 
-/// Which of the two `/` lists the composer popup is showing.
+/// Which list of the composer popup is showing.
 ///
-/// Only a `/` trigger has a second list; `@` and `$` keep their single-panel
-/// behaviour, so this stays [`Self::Commands`] for them.
+/// A `/` popup carries the Agent's commands and the reusable Prompts; an `@`
+/// popup carries the workspace files and the collaborators a reader may hand
+/// work to. `$` keeps its single Skills panel, which is [`Self::Commands`]'
+/// list, so a trigger without tabs still has one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ComposerSuggestionTab {
     #[default]
     Commands,
     Phrases,
+    Files,
+    Delegation,
 }
 
 impl ComposerSuggestionTab {
+    /// The tabs a trigger opens, in header order.
+    fn tabs(trigger: Option<AgentCommandTrigger>) -> &'static [Self] {
+        match trigger {
+            Some(AgentCommandTrigger::Slash) => &[Self::Commands, Self::Phrases],
+            Some(AgentCommandTrigger::Mention) => &[Self::Files, Self::Delegation],
+            _ => &[Self::Commands],
+        }
+    }
+
     /// Stable element-id fragment for this tab's header button.
     fn id(self) -> &'static str {
         match self {
             Self::Commands => "commands",
             Self::Phrases => "phrases",
+            Self::Files => "files",
+            Self::Delegation => "delegation",
         }
     }
 
-    /// The rows this tab shows, given both lists from one discovery result.
+    /// The rows this tab shows, given every list from one discovery result.
+    ///
+    /// `commands` is the discovery's primary list, which is what a `$` skills
+    /// popup and an `@` file popup both show on their first tab.
     fn rows<'a>(
         self,
         commands: &'a [AgentCommandEntry],
         phrases: &'a [AgentCommandEntry],
+        files: &'a [AgentCommandEntry],
+        delegation: &'a [AgentCommandEntry],
     ) -> &'a [AgentCommandEntry] {
         match self {
             Self::Commands => commands,
             Self::Phrases => phrases,
+            Self::Files => files,
+            Self::Delegation => delegation,
         }
     }
 
     /// The tab one `Left` (`forward == false`) or `Right` press moves to.
     ///
-    /// The two tabs clamp instead of wrapping, so a press that cannot change
-    /// the tab falls through to the caret's usual movement.
-    fn moved(self, forward: bool) -> Self {
-        match (self, forward) {
-            (Self::Commands, true) => Self::Phrases,
-            (Self::Phrases, false) => Self::Commands,
-            (tab, _) => tab,
-        }
+    /// A trigger's tabs clamp instead of wrapping, so a press that cannot
+    /// change the tab falls through to the caret's usual movement.
+    fn moved(self, tabs: &[Self], forward: bool) -> Self {
+        let Some(index) = tabs.iter().position(|tab| *tab == self) else {
+            return tabs.first().copied().unwrap_or(self);
+        };
+        let next = if forward {
+            tabs.get(index + 1)
+        } else {
+            index.checked_sub(1).and_then(|index| tabs.get(index))
+        };
+        next.copied().unwrap_or(self)
     }
 }
 
@@ -3936,6 +3962,9 @@ pub struct SessionView {
     /// local and behaves the same against a paired authority as against the
     /// native one.
     phrase_suggestions: Vec<AgentCommandEntry>,
+    /// Collaborators and conversations offered by the `@` popup's delegation
+    /// tab, fetched beside the workspace files of `suggestions`.
+    delegation_suggestions: Vec<AgentCommandEntry>,
     suggestion_tab: ComposerSuggestionTab,
     suggestion_selection: ComposerSuggestionSelection,
     suggestion_context: Option<ComposerSuggestionContext>,
@@ -4045,6 +4074,7 @@ impl SessionView {
             composer_command_entry: None,
             suggestions: Vec::new(),
             phrase_suggestions: Vec::new(),
+            delegation_suggestions: Vec::new(),
             suggestion_tab: ComposerSuggestionTab::default(),
             suggestion_selection: ComposerSuggestionSelection::default(),
             suggestion_context: None,
@@ -23306,6 +23336,7 @@ impl VibexWorkbench {
     fn clear_suggestions(&mut self) {
         self.suggestions.clear();
         self.phrase_suggestions.clear();
+        self.delegation_suggestions.clear();
         self.suggestion_tab = ComposerSuggestionTab::default();
         self.suggestion_selection.dismiss();
         self.suggestion_context = None;
@@ -23485,12 +23516,12 @@ impl VibexWorkbench {
         let request_session_id = self.view_session_id.clone();
         self.suggestion_context = Some(context.clone());
         if !preserve_rows {
-            // A new trigger kind starts on its first tab: `/` always opens on
-            // commands, and `@`/`$` have no second tab at all. A query change
-            // keeps the rows and the tab, so typing does not bounce the user
-            // back to commands.
+            // A new trigger kind starts on its first tab: `/` opens on commands
+            // and `@` on the workspace files. A query change keeps the rows and
+            // the tab, so typing does not bounce the reader back to the first.
             self.suggestions.clear();
             self.phrase_suggestions.clear();
+            self.delegation_suggestions.clear();
             self.suggestion_tab = ComposerSuggestionTab::default();
             self.suggestion_selection.dismiss();
         }
@@ -23499,6 +23530,7 @@ impl VibexWorkbench {
         let Some(backend) = self.backend.clone() else {
             self.suggestions.clear();
             self.phrase_suggestions.clear();
+            self.delegation_suggestions.clear();
             self.suggestion_selection.dismiss();
             self.suggestion_loading = false;
             cx.notify();
@@ -23519,12 +23551,17 @@ impl VibexWorkbench {
                         return;
                     }
                     this.suggestion_loading = false;
-                    let (entries, quick_phrases) = match outcome {
-                        Ok(Ok(discovery)) => (discovery.response.entries, discovery.quick_phrases),
-                        _ => (Vec::new(), Vec::new()),
+                    let (entries, quick_phrases, delegation_entries) = match outcome {
+                        Ok(Ok(discovery)) => (
+                            discovery.response.entries,
+                            discovery.quick_phrases,
+                            discovery.delegation_entries,
+                        ),
+                        _ => (Vec::new(), Vec::new(), Vec::new()),
                     };
                     this.suggestions = entries;
                     this.phrase_suggestions = quick_phrases;
+                    this.delegation_suggestions = delegation_entries;
                     // Keep the selected row where it was across a query update;
                     // the active tab decides which list supplies the count.
                     this.reseat_suggestion_selection(false);
@@ -23594,35 +23631,47 @@ impl VibexWorkbench {
             .is_some_and(|context| context.target == target)
     }
 
-    /// Whether the open popup offers the command and quick-phrase tabs.
+    /// Whether the open popup offers more than one tab.
     ///
-    /// Only `/` resolves two lists; `@` file references and `$` skills keep
-    /// their single-panel popup and their plain `Left`/`Right` caret movement.
+    /// `/` resolves commands and quick phrases, `@` files and collaborators;
+    /// `$` skills keep their single-panel popup and their plain `Left`/`Right`
+    /// caret movement.
     fn composer_suggestion_tabs_available(&self, target: ComposerTarget) -> bool {
-        self.suggestion_context.as_ref().is_some_and(|context| {
-            context.target == target && context.request.trigger == Some(AgentCommandTrigger::Slash)
-        })
+        self.suggestion_context
+            .as_ref()
+            .is_some_and(|context| context.target == target && self.suggestion_tabs().len() > 1)
     }
 
-    /// The tab the popup is showing. A trigger without tabs always reads as
-    /// [`ComposerSuggestionTab::Commands`], so a leftover phrase tab from an
-    /// earlier `/` cannot leak into an `@` or `$` popup.
+    /// The tabs the open popup offers, in header order.
+    fn suggestion_tabs(&self) -> &'static [ComposerSuggestionTab] {
+        ComposerSuggestionTab::tabs(
+            self.suggestion_context
+                .as_ref()
+                .and_then(|context| context.request.trigger),
+        )
+    }
+
+    /// The tab the popup is showing, clamped into the open trigger's tabs so a
+    /// leftover quick-phrase tab from an earlier `/` cannot leak into `@`.
     fn active_suggestion_tab(&self) -> ComposerSuggestionTab {
-        if self
-            .suggestion_context
-            .as_ref()
-            .is_some_and(|context| context.request.trigger == Some(AgentCommandTrigger::Slash))
-        {
+        let tabs = self.suggestion_tabs();
+        if tabs.contains(&self.suggestion_tab) {
             self.suggestion_tab
         } else {
-            ComposerSuggestionTab::Commands
+            tabs.first()
+                .copied()
+                .unwrap_or(ComposerSuggestionTab::Commands)
         }
     }
 
     /// The rows the popup is showing right now.
     fn visible_suggestions(&self) -> &[AgentCommandEntry] {
-        self.active_suggestion_tab()
-            .rows(&self.suggestions, &self.phrase_suggestions)
+        self.active_suggestion_tab().rows(
+            &self.suggestions,
+            &self.phrase_suggestions,
+            &self.suggestions,
+            &self.delegation_suggestions,
+        )
     }
 
     /// Points the popup's selection at the active tab's rows.
@@ -23637,7 +23686,7 @@ impl VibexWorkbench {
         self.suggestion_selection.replace_items(rows);
     }
 
-    /// `Left`/`Right` on an open `/` popup moves between its two tabs.
+    /// `Left`/`Right` on an open `/` or `@` popup moves between its tabs.
     ///
     /// Returns whether the key was consumed. At the edge in that direction the
     /// key is *not* consumed: the caret keeps its usual movement inside the
@@ -23651,7 +23700,9 @@ impl VibexWorkbench {
         if !self.composer_suggestion_tabs_available(target) {
             return false;
         }
-        let next = self.active_suggestion_tab().moved(forward);
+        let next = self
+            .active_suggestion_tab()
+            .moved(self.suggestion_tabs(), forward);
         if next == self.active_suggestion_tab() {
             return false;
         }
@@ -57388,7 +57439,8 @@ impl VibexWorkbench {
             .max(COMPOSER_SUGGESTION_MENU_HORIZONTAL_MARGIN);
         let menu_left = f32::from(surface_bounds.origin.x)
             .clamp(COMPOSER_SUGGESTION_MENU_HORIZONTAL_MARGIN, max_left);
-        let tabs_available = context.request.trigger == Some(AgentCommandTrigger::Slash);
+        let tabs = ComposerSuggestionTab::tabs(context.request.trigger);
+        let tabs_available = tabs.len() > 1;
         let active_tab = self.active_suggestion_tab();
         // The phrase tab is the only one whose rows carry wrapped content, so
         // both the row height and the menu's estimate follow the tab.
@@ -57425,10 +57477,9 @@ impl VibexWorkbench {
                 "$",
             ),
             Some(AgentCommandTrigger::Mention) => (
-                // The `@` list is the workspace file index plus the
-                // collaborators and conversations the same trigger offers, so
-                // its title names the references rather than only the files.
-                locale::text("References", "引用", "引用"),
+                // Reached only if the file and delegation tabs are ever joined
+                // into one panel again; the tabs carry these names otherwise.
+                locale::text("Workspace files", "工作区文件", "工作區檔案"),
                 IconName::File,
                 "@",
             ),
@@ -57473,25 +57524,11 @@ impl VibexWorkbench {
                 .px_3()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(
-                    h_flex()
-                        .min_w_0()
-                        .h_full()
-                        .items_center()
-                        .gap_3()
-                        .child(self.composer_suggestion_tab_button(
-                            target,
-                            ComposerSuggestionTab::Commands,
-                            active_tab == ComposerSuggestionTab::Commands,
-                            cx,
-                        ))
-                        .child(self.composer_suggestion_tab_button(
-                            target,
-                            ComposerSuggestionTab::Phrases,
-                            active_tab == ComposerSuggestionTab::Phrases,
-                            cx,
-                        )),
-                )
+                .child(h_flex().min_w_0().h_full().items_center().gap_3().children(
+                    tabs.iter().map(|tab| {
+                        self.composer_suggestion_tab_button(target, *tab, active_tab == *tab, cx)
+                    }),
+                ))
                 .child(
                     div()
                         .flex_none()
@@ -57654,6 +57691,12 @@ impl VibexWorkbench {
         let label = match tab {
             ComposerSuggestionTab::Commands => locale::text("Commands", "命令", "命令"),
             ComposerSuggestionTab::Phrases => locale::text("Quick phrases", "快捷短语", "快捷短語"),
+            ComposerSuggestionTab::Files => {
+                locale::text("Workspace files", "工作区文件", "工作區檔案")
+            }
+            ComposerSuggestionTab::Delegation => {
+                locale::text("Agent delegation", "Agent 委派", "Agent 委派")
+            }
         };
         h_flex()
             .id(format!(
@@ -82396,28 +82439,68 @@ mod tests {
 
     #[test]
     fn composer_suggestion_tabs_clamp_and_pick_their_own_rows() {
-        // `/` opens on commands and Right reaches phrases; neither end wraps,
-        // so the popup keeps owning the arrow key instead of moving the caret.
+        // `/` opens on commands and Right reaches phrases; `@` opens on the
+        // workspace files and Right reaches the delegation list; neither end
+        // wraps, so the popup keeps owning the arrow key instead of moving the
+        // caret.
+        let slash = ComposerSuggestionTab::tabs(Some(AgentCommandTrigger::Slash));
         assert_eq!(
             ComposerSuggestionTab::default(),
             ComposerSuggestionTab::Commands
         );
+        assert_eq!(slash.first(), Some(&ComposerSuggestionTab::Commands));
         assert_eq!(
-            ComposerSuggestionTab::Commands.moved(false),
+            ComposerSuggestionTab::Commands.moved(slash, false),
             ComposerSuggestionTab::Commands
         );
         assert_eq!(
-            ComposerSuggestionTab::Commands.moved(true),
+            ComposerSuggestionTab::Commands.moved(slash, true),
             ComposerSuggestionTab::Phrases
         );
         assert_eq!(
-            ComposerSuggestionTab::Phrases.moved(true),
+            ComposerSuggestionTab::Phrases.moved(slash, true),
             ComposerSuggestionTab::Phrases
         );
         assert_eq!(
-            ComposerSuggestionTab::Phrases.moved(false),
+            ComposerSuggestionTab::Phrases.moved(slash, false),
             ComposerSuggestionTab::Commands
         );
+
+        // `@` resolves its own two lists, files first.
+        let mention = ComposerSuggestionTab::tabs(Some(AgentCommandTrigger::Mention));
+        assert_eq!(
+            mention,
+            &[
+                ComposerSuggestionTab::Files,
+                ComposerSuggestionTab::Delegation
+            ]
+        );
+        assert_eq!(
+            ComposerSuggestionTab::Files.moved(mention, false),
+            ComposerSuggestionTab::Files
+        );
+        assert_eq!(
+            ComposerSuggestionTab::Files.moved(mention, true),
+            ComposerSuggestionTab::Delegation
+        );
+        assert_eq!(
+            ComposerSuggestionTab::Delegation.moved(mention, true),
+            ComposerSuggestionTab::Delegation
+        );
+        // A leftover `/` tab clamps onto the `@` popup's own first tab.
+        assert_eq!(
+            ComposerSuggestionTab::Phrases.moved(mention, false),
+            ComposerSuggestionTab::Files
+        );
+
+        // `$` skills and the untriggered list keep one panel of the primary
+        // list.
+        for trigger in [Some(AgentCommandTrigger::Dollar), None] {
+            assert_eq!(
+                ComposerSuggestionTab::tabs(trigger),
+                &[ComposerSuggestionTab::Commands]
+            );
+        }
 
         let mut command = command_entry(
             AgentCommandSourceKind::Provider,
@@ -82433,23 +82516,37 @@ mod tests {
         phrase.id = "phrase:one".into();
         phrase.execution_behavior = AgentCommandExecutionBehavior::None;
         phrase.prompt_id = Some(PromptId::parse("prompt_quick_phrase_test").unwrap());
+        let mut file = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        file.id = "reference:file:src/lib.rs".into();
+        let mut collaborator = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        collaborator.id = "reference:agent:codex:sha256:test".into();
         let commands = vec![command.clone()];
         let phrases = vec![phrase.clone()];
-        assert_eq!(
-            ComposerSuggestionTab::Commands
-                .rows(&commands, &phrases)
+        let files = vec![file.clone()];
+        let delegation = vec![collaborator.clone()];
+        let rows = |tab: ComposerSuggestionTab| {
+            tab.rows(&commands, &phrases, &files, &delegation)
                 .iter()
                 .map(|entry| entry.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["command:slash"]
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(ComposerSuggestionTab::Commands), vec!["command:slash"]);
+        assert_eq!(rows(ComposerSuggestionTab::Phrases), vec!["phrase:one"]);
+        assert_eq!(
+            rows(ComposerSuggestionTab::Files),
+            vec!["reference:file:src/lib.rs"]
         );
         assert_eq!(
-            ComposerSuggestionTab::Phrases
-                .rows(&commands, &phrases)
-                .iter()
-                .map(|entry| entry.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["phrase:one"]
+            rows(ComposerSuggestionTab::Delegation),
+            vec!["reference:agent:codex:sha256:test"]
         );
     }
 

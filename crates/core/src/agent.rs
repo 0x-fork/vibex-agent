@@ -854,6 +854,15 @@ pub struct AgentCommandDiscovery {
     /// switching local instead of a round trip through the authority.
     #[serde(default)]
     pub quick_phrases: Vec<AgentCommandEntry>,
+    /// The collaborators, conversations and direct delegation actions the `@`
+    /// popup offers on its second tab.
+    ///
+    /// They travel beside the workspace file references in `response.entries`
+    /// for the same reason as the quick phrases: one discovery answers both
+    /// tabs, so switching between the files and the delegation list never
+    /// returns to the authority.
+    #[serde(default)]
+    pub delegation_entries: Vec<AgentCommandEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
