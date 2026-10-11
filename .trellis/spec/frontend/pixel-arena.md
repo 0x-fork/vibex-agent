@@ -79,8 +79,9 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
   freezes every part. Each form roams in its own gait: the spark hops with
   squash and spin, the knot rolls on its rim, the glyph strides on its stems,
   the chest hops and chomps, the whale swims and breaches, and the helmet
-  strafes, banks and barrel-rolls. Every loop starts in the upper half of the
-  home, clear of the composer. Dialogs freeze preview, and inactive windows follow the
+  strafes, banks and barrel-rolls. Roaming spans most of the home while keeping the
+  whole model inside it, and every loop starts in the upper half, clear of the
+  composer. Dialogs freeze preview, and inactive windows follow the
   existing ambient-animation appearance preference.
 - `scene::Entry` measures the current raster and positions a native ghost
   `Button` around the visible model, excluding its shadow. The Button owns
@@ -96,10 +97,13 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
   Flight height remains continuous; rolls, banks, squash and an open lid settle
   through the nearest upright pose. Reduced motion skips camera travel.
 - Battle fills the home area and remains clipped to it. There is no dialog,
-  title/header/footer, visible instruction panel, selector, control button, or
-  result card. Workbench navigation remains available. Keyboard/mouse instructions
-  and a short guardian-specific puzzle clue belong in the entry tooltip; the
-  canvas has an accessible name.
+  header, instruction panel, selector, or result card. Only two overlays sit on
+  the field: a faint single line at the bottom with the game name and controls
+  (`copy::battle_hint`), and a small pixel-drawn exit mark in the top-right
+  corner that leaves like Escape and never fires an arrow. Neither gives a
+  guardian-specific clue; players discover each encounter themselves. The
+  roaming entry has an accessible label but no hover tooltip. Workbench
+  navigation remains available; the canvas has an accessible name.
 - Death plays for one second, chooses a random clear spawn at a safe distance
   from the guardian, then materializes the archer for 0.7 seconds. It clears
   threats and input and starts a fresh opening delay without replaying entry.

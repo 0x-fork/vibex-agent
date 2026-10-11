@@ -528,46 +528,47 @@ fn landing_squash(u: f32, air: f32) -> f32 {
 
 /// Closed roaming routes and their tangents for a loop parameter in radians.
 fn route(guardian: Guardian, s: f32) -> (Vec2, Vec2) {
+    // Roaming spans most of the home while keeping each model inside it.
     let (x, y, dx, dy) = match guardian {
         Guardian::Claude => {
             let s = s - PI * 0.25;
             (
-                s.sin() * 52.0,
-                (s * 2.0).sin() * 30.0,
-                s.cos() * 52.0,
-                (s * 2.0).cos() * 60.0,
+                s.sin() * 60.0,
+                (s * 2.0).sin() * 34.0,
+                s.cos() * 60.0,
+                (s * 2.0).cos() * 68.0,
             )
         }
         // Every loop starts in the upper half, clear of the composer.
         Guardian::Codex => (
-            s.sin() * 54.0,
-            -s.cos() * 30.0 + (s * 2.0).sin() * 6.0,
-            s.cos() * 54.0,
-            s.sin() * 30.0 + (s * 2.0).cos() * 12.0,
+            s.sin() * 60.0,
+            -s.cos() * 34.0 + (s * 2.0).sin() * 6.0,
+            s.cos() * 60.0,
+            s.sin() * 34.0 + (s * 2.0).cos() * 12.0,
         ),
         Guardian::Pi => (
-            s.sin() * 48.0,
-            -s.cos() * 26.0,
-            s.cos() * 48.0,
-            s.sin() * 26.0,
+            s.sin() * 58.0,
+            -s.cos() * 34.0,
+            s.cos() * 58.0,
+            s.sin() * 34.0,
         ),
         Guardian::OpenCode => (
-            s.sin() * 50.0,
-            -s.cos() * 28.0,
-            s.cos() * 50.0,
-            s.sin() * 28.0,
+            s.sin() * 60.0,
+            -s.cos() * 36.0,
+            s.cos() * 60.0,
+            s.sin() * 36.0,
         ),
         Guardian::DeepSeek => (
-            -s.sin() * 54.0,
-            -s.cos() * 30.0,
-            -s.cos() * 54.0,
-            s.sin() * 30.0,
+            -s.sin() * 58.0,
+            -s.cos() * 34.0,
+            -s.cos() * 58.0,
+            s.sin() * 34.0,
         ),
         Guardian::Copilot => (
-            s.sin() * 48.0 + (s * 7.0).sin() * 5.0,
-            -s.cos() * 30.0,
-            s.cos() * 48.0 + (s * 7.0).cos() * 35.0,
-            s.sin() * 30.0,
+            s.sin() * 54.0 + (s * 7.0).sin() * 5.0,
+            -s.cos() * 32.0,
+            s.cos() * 54.0 + (s * 7.0).cos() * 35.0,
+            s.sin() * 32.0,
         ),
     };
     (CENTER.plus(Vec2::new(x, y)), Vec2::new(dx, dy))

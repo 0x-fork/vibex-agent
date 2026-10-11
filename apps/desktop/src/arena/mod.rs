@@ -19,7 +19,7 @@ use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Bounds, Context, DismissEvent, Entity,
     EventEmitter, FocusHandle, Global, KeyBinding, KeyDownEvent, KeyUpEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Subscription, Task, Window,
-    actions, div, prelude::*,
+    actions, canvas, div, fill, hsla, point, prelude::*, px, size,
 };
 use gpui_component::{ActiveTheme as _, WindowExt as _, scroll::ScrollableElement as _, v_flex};
 use std::{
@@ -339,9 +339,14 @@ impl ArenaView {
         self.pause(cx);
     }
     fn exit(&mut self, _: &Exit, _: &mut Window, cx: &mut Context<Self>) {
-        self.close(cx);
-        cx.emit(DismissEvent);
+        self.leave(cx);
         cx.stop_propagation();
+    }
+    fn leave(&mut self, cx: &mut Context<Self>) {
+        if !self.closed {
+            self.close(cx);
+            cx.emit(DismissEvent);
+        }
     }
     fn resume(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.closed {
@@ -561,7 +566,75 @@ impl Render for ArenaView {
                     .on_mouse_move(cx.listener(Self::mouse_move))
                     .child(board),
             )
+            .child(
+                div()
+                    .debug_selector(|| "unbound-hint".into())
+                    .absolute()
+                    .bottom_2()
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .px_4()
+                    .text_xs()
+                    .text_color(hsla(0.0, 0.0, 1.0, 0.42))
+                    .child(copy::battle_hint()),
+            )
+            .child(exit_button(cx))
     }
+}
+
+/// A small pixel-drawn close mark in the corner; Escape does the same.
+fn exit_button(cx: &mut Context<ArenaView>) -> impl IntoElement {
+    const MARK: [&str; 7] = [
+        "#######", "#x...x#", "#.x.x.#", "#..x..#", "#.x.x.#", "#x...x#", "#######",
+    ];
+    div()
+        .id("unbound-exit")
+        .debug_selector(|| "unbound-exit".into())
+        .absolute()
+        .top_3()
+        .right_3()
+        .size(px(28.0))
+        .occlude()
+        .cursor_pointer()
+        .opacity(0.72)
+        .hover(|this| this.opacity(1.0))
+        .aria_label(copy::exit_label())
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(|view, _, _, cx| view.leave(cx)))
+        .child(
+            canvas(
+                |_, _, _| (),
+                |bounds, _, window, _| {
+                    let cell = bounds.size.width / 7.0;
+                    let scale = window.scale_factor();
+                    let snap = |value: Pixels| px((f32::from(value) * scale).round() / scale);
+                    for (row, line) in MARK.iter().enumerate() {
+                        for (col, mark) in line.bytes().enumerate() {
+                            let color = match mark {
+                                b'#' => hsla(0.0, 0.0, 0.05, 0.55),
+                                b'x' => hsla(0.12, 0.35, 0.92, 1.0),
+                                _ => hsla(0.0, 0.0, 0.0, 0.35),
+                            };
+                            let left = snap(bounds.origin.x + cell * col as f32);
+                            let top = snap(bounds.origin.y + cell * row as f32);
+                            let right = snap(bounds.origin.x + cell * (col + 1) as f32);
+                            let bottom = snap(bounds.origin.y + cell * (row + 1) as f32);
+                            window.paint_quad(fill(
+                                gpui::Bounds::new(
+                                    point(left, top),
+                                    size(right - left, bottom - top),
+                                ),
+                                color,
+                            ));
+                        }
+                    }
+                },
+            )
+            .size_full(),
+        )
 }
 #[cfg(test)]
 mod tests;

@@ -203,13 +203,16 @@ fn only_the_guardian_is_a_pointer_entry_and_escape_restores_the_draft(cx: &mut T
     );
     for old in [
         "unbound-header",
-        "unbound-footer",
         "unbound-continue",
-        "unbound-close",
         "unbound-guardian-Claude",
     ] {
         assert!(cx.debug_bounds(old).is_none());
     }
+    // Only a quiet controls line and a corner exit sit over the field.
+    let hint = cx.debug_bounds("unbound-hint").unwrap();
+    let exit = cx.debug_bounds("unbound-exit").unwrap();
+    assert!(hint.bottom() <= page.bottom() && hint.top() > page.center().y);
+    assert!(exit.left() > page.center().x && exit.bottom() < page.center().y);
     assert!(cx.update(|window, cx| view.read(cx).focus.is_focused(window)));
     key(cx, "j", true);
     press(cx, "escape");
@@ -465,6 +468,22 @@ fn keyboard_pointer_focus_and_pause_use_the_live_battle_without_chrome(cx: &mut 
     assert!(view.read_with(cx, |v, _| v.paused
         && v.clock.is_none()
         && v.keys.is_empty()));
+}
+#[gpui::test]
+fn the_corner_exit_returns_home_without_firing_an_arrow(cx: &mut TestAppContext) {
+    let (home, cx) = open_home(cx);
+    click(cx, "unbound-boss-entry");
+    let view = battle_view(&home, cx);
+    awaken(&view, cx);
+    click(cx, "unbound-exit");
+    draw(cx);
+    assert!(view.read_with(cx, |v, _| v.closed
+        && v.clock.is_none()
+        && !v.mouse_shoot
+        && v.arena.arrow.state == ArrowState::Ready));
+    assert!(home.read_with(cx, |h, cx| h.arena.read(cx).battle.is_none()));
+    assert!(cx.debug_bounds("unbound-game").is_none());
+    assert!(cx.debug_bounds("unbound-boss-entry").is_some());
 }
 #[gpui::test]
 fn the_battle_fills_the_home_at_narrow_widths_and_zoom_levels(cx: &mut TestAppContext) {

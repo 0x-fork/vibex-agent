@@ -60,7 +60,7 @@ impl Arena {
                     self.impact(contact, 6.0);
                     self.boss.dashes = self.boss.dashes.saturating_sub(1);
                     if self.boss.dashes > 0 {
-                        self.boss.begin(Attack::Rush, self.player.position, 0.42);
+                        self.boss.begin(Attack::Rush, self.player.position, 0.5);
                     } else {
                         self.boss.begin(Attack::Leap, self.player.position, 0.55);
                     }
@@ -86,7 +86,7 @@ impl Arena {
                             self.boss.enter(BossState::Recovery, 3.0);
                         }
                         _ if self.boss.exposed > 0.0 => {
-                            self.boss.enter(BossState::Watching, 0.35);
+                            self.boss.enter(BossState::Watching, 0.5);
                         }
                         _ => self.boss.enter(BossState::Recovery, 0.5),
                     }
@@ -96,7 +96,7 @@ impl Arena {
                 self.boss.face(self.player.position, STEP * 2.0);
                 if t >= 1.0 {
                     self.boss.plate = None;
-                    self.boss.enter(BossState::Watching, 0.45);
+                    self.boss.enter(BossState::Watching, 0.7);
                 }
             }
             _ => {}

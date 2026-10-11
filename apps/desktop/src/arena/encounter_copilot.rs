@@ -66,7 +66,7 @@ impl Arena {
                     self.effect(EffectKind::Spark, origin, 0.3, 3.0);
                 }
                 if t >= 1.0 {
-                    self.boss.enter(BossState::Watching, 0.5);
+                    self.boss.enter(BossState::Watching, 0.8);
                 }
             }
             BossState::Rushing => {
@@ -75,7 +75,7 @@ impl Arena {
                     self.impact(contact, self.boss.impact_radius());
                     self.boss.dashes = self.boss.dashes.saturating_sub(1);
                     if self.boss.dashes > 0 {
-                        self.boss.begin(Attack::Dash, self.player.position, 0.4);
+                        self.boss.begin(Attack::Dash, self.player.position, 0.5);
                     } else {
                         self.stun();
                     }
@@ -94,7 +94,7 @@ impl Arena {
                 }
                 if t >= 1.0 {
                     self.boss.bank = (self.boss.bank + PI).rem_euclid(TAU) - PI;
-                    self.boss.enter(BossState::Watching, 0.6);
+                    self.boss.enter(BossState::Watching, 0.9);
                 }
             }
             _ => {}

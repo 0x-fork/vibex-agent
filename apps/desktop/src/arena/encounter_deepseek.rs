@@ -117,7 +117,7 @@ impl Arena {
         self.boss.from = self.boss.position;
         self.boss.target = self.boss.position;
         self.boss.exposed = 0.0;
-        self.boss.enter(BossState::Submerged, 1.1);
+        self.boss.enter(BossState::Submerged, 1.35);
     }
 
     /// Erupts a run-up short of the committed spot and dives onto it, so

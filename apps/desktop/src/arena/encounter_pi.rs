@@ -77,7 +77,7 @@ impl Arena {
                 let striker = 1 - self.boss.guard;
                 self.hover(striker, reach_point, 18.0, 7.0);
                 if t >= 1.0 {
-                    self.boss.enter(BossState::Watching, 0.12);
+                    self.boss.enter(BossState::Watching, 0.3);
                 }
             }
             BossState::Striking if self.boss.attack == Attack::Barrage => {
@@ -107,7 +107,7 @@ impl Arena {
                     self.impact(target, self.boss.impact_radius());
                     self.wave(target, 3.0, 8.0, WaveKind::Stone);
                     self.effect(EffectKind::Dust, target, 0.7, 8.0);
-                    self.boss.enter(BossState::Recovery, 0.28);
+                    self.boss.enter(BossState::Recovery, 0.35);
                 }
             }
             BossState::Recovery => {
@@ -115,7 +115,7 @@ impl Arena {
                 self.boss.hand_heights[striker] =
                     (self.boss.hand_heights[striker] + STEP * 30.0).min(6.0);
                 if t >= 1.0 {
-                    self.boss.enter(BossState::Watching, 0.1);
+                    self.boss.enter(BossState::Watching, 0.3);
                 }
             }
             _ => {}
