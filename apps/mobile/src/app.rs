@@ -1081,6 +1081,11 @@ pub struct MobileApp {
     /// owner: left unclaimed it scrolls whichever list the drawer just
     /// revealed — a leftward swipe always drags a vertical list up.
     drawer_fling_owned: bool,
+    /// The finger pan currently travelling over a page that was opened on top of
+    /// another one, and how far it has moved. A rightward swipe that clears the
+    /// back gesture's own travel leaves that page, exactly as the system back
+    /// event does.
+    overlay_swipe: Option<OverlaySwipe>,
     expanded_process: BTreeMap<String, bool>,
     expanded_timeline_rows: BTreeSet<String>,
     collapsed_timeline_rows: BTreeSet<String>,
@@ -1414,6 +1419,7 @@ impl MobileApp {
             drawer_snap_task: None,
             drawer_pan_last_at: None,
             drawer_fling_owned: false,
+            overlay_swipe: None,
             expanded_process: BTreeMap::new(),
             expanded_timeline_rows: BTreeSet::new(),
             collapsed_timeline_rows: BTreeSet::new(),
@@ -6929,6 +6935,67 @@ impl MobileApp {
         }
     }
 
+    /// The back gesture for a page opened on top of another one — the runtime
+    /// switcher, Settings, a runtime's own pages, a pairing sheet: a rightward
+    /// finger swipe leaves that page exactly as the system back event does.
+    ///
+    /// Mobile platforms report a finger drag as `ScrollWheel` events carrying a
+    /// `TouchPhase`, and the app's capture-phase wrapper hands the page the pan
+    /// before the lists inside it consume the gesture.
+    fn overlay_swipe_back(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.has_overlay_page() {
+            self.overlay_swipe = None;
+            return;
+        }
+        match drawer_pan_input(event) {
+            DrawerPanInput::Started { delta_x, delta_y } => {
+                // Android reports the translation that broke its touch slop on
+                // this very event, so the gesture starts from it.
+                self.overlay_swipe = Some(OverlaySwipe {
+                    dx: delta_x,
+                    dy: delta_y,
+                });
+            }
+            DrawerPanInput::Moved { delta_x, delta_y } => {
+                let Some(swipe) = self.overlay_swipe.as_mut() else {
+                    return;
+                };
+                swipe.dx += delta_x;
+                swipe.dy += delta_y;
+                if overlay_back_swipe_claimed(swipe.dx, swipe.dy) {
+                    // The page owns this pan now: a list under the finger must
+                    // not scroll along with the gesture.
+                    cx.stop_propagation();
+                }
+            }
+            DrawerPanInput::Ended => {
+                let Some(swipe) = self.overlay_swipe.take() else {
+                    return;
+                };
+                if overlay_back_swipe_committed(swipe.dx, swipe.dy) {
+                    cx.stop_propagation();
+                    self.handle_navigate_back(&NavigateBack, window, cx);
+                }
+            }
+            DrawerPanInput::Cancelled => self.overlay_swipe = None,
+            DrawerPanInput::Ignore => {}
+        }
+    }
+
+    /// Whether a page is open on top of the one the phone is on, which is what a
+    /// rightward swipe leaves. The sheets that belong to a page count too: back
+    /// closes them first, and so does the swipe.
+    fn has_overlay_page(&self) -> bool {
+        self.overlay.is_some()
+            || self.pairing_panel != PairingPanel::None
+            || self.runtime_options_open
+    }
+
     fn finish_drawer_pan(&mut self, cancelled: bool, window: &mut Window, cx: &mut Context<Self>) {
         let gesture = self.drawer_gesture.take();
         self.drawer_pan_last_at = None;
@@ -7123,6 +7190,14 @@ impl MobileApp {
         let saved_runtimes = !self.known_hosts.is_empty();
         let first_screen = !self.is_pairing_overlay_open();
         let runtimes_max_height = pairing_runtimes_max_height(window, first_screen);
+        // The switcher has no wordmark between the back button and the list, so
+        // its rows start one spacing step under the button instead of at the
+        // first screen's wordmark line.
+        let top_pad = if first_screen {
+            PAIRING_PAGE_TOP_PAD
+        } else {
+            PAIRING_SWITCHER_TOP_PAD
+        };
         let error_here = (self.pairing_panel != PairingPanel::Manual)
             .then(|| self.pairing_error_line())
             .flatten();
@@ -7153,7 +7228,7 @@ impl MobileApp {
                                     .min_h_0()
                                     .flex()
                                     .flex_col()
-                                    .pt(px(PAIRING_PAGE_TOP_PAD))
+                                    .pt(px(top_pad))
                                     // The switcher opens over a live
                                     // connection and names the runtimes below,
                                     // so it carries no wordmark.
@@ -14433,27 +14508,35 @@ impl Render for MobileApp {
             (_, Some(DrawerPage::Sessions) | Some(DrawerPage::Workbench)) => theme::sidebar_bg(),
             _ => theme::bg_primary(),
         };
-        div()
-            .size_full()
-            .bg(root_background)
-            .font_family("IBM Plex Sans")
-            .text_color(theme::text_secondary())
-            .pt(insets.top)
-            .pr(insets.right)
-            .pb(insets.bottom)
-            .pl(insets.left)
-            .child(match visible_mode {
-                RootMode::Pairing => self
-                    .render_pairing(pairing_sheet_max_height(window), window, cx)
-                    .into_any_element(),
-                RootMode::Connecting => self.render_connecting(window, cx).into_any_element(),
-                RootMode::Workspace => self
-                    .render_workspace(page_width, window, cx)
-                    .into_any_element(),
-            })
-            // Last child, so the selection toolbar sits above the composer it
-            // belongs to. It positions itself in window coordinates.
-            .child(self.selection_menu.clone())
+        // The page under the phone's finger sees a touch pan before the lists
+        // inside it consume the gesture, so a rightward swipe can leave a page
+        // opened on top of another one. The wrapper forwards layout, so the page
+        // it wraps is laid out exactly as before.
+        crate::scroll_capture::capture_scroll_wheel(
+            "mobile-app-swipe-back",
+            div()
+                .size_full()
+                .bg(root_background)
+                .font_family("IBM Plex Sans")
+                .text_color(theme::text_secondary())
+                .pt(insets.top)
+                .pr(insets.right)
+                .pb(insets.bottom)
+                .pl(insets.left)
+                .child(match visible_mode {
+                    RootMode::Pairing => self
+                        .render_pairing(pairing_sheet_max_height(window), window, cx)
+                        .into_any_element(),
+                    RootMode::Connecting => self.render_connecting(window, cx).into_any_element(),
+                    RootMode::Workspace => self
+                        .render_workspace(page_width, window, cx)
+                        .into_any_element(),
+                })
+                // Last child, so the selection toolbar sits above the composer it
+                // belongs to. It positions itself in window coordinates.
+                .child(self.selection_menu.clone()),
+            cx.listener(Self::overlay_swipe_back),
+        )
     }
 }
 
@@ -16331,6 +16414,31 @@ fn drawer_terminal_target(
     })
 }
 
+/// The finger pan travelling over a page opened on top of another one, in the
+/// logical pixels it has covered since it started.
+///
+/// There is no interactive drag to show how far the gesture has come, so the
+/// translation only has to be remembered until the finger lifts.
+#[derive(Debug, Clone, Copy)]
+struct OverlaySwipe {
+    dx: f32,
+    dy: f32,
+}
+
+/// Whether a pan over an overlay page has become the back gesture: firmly
+/// rightward and clearly more horizontal than vertical, judged by the same
+/// thresholds the drawer's own swipe uses.
+fn overlay_back_swipe_claimed(dx: f32, dy: f32) -> bool {
+    dx >= theme::DRAWER_DRAG_THRESHOLD && dx > dy.abs() * theme::DRAWER_VERTICAL_CANCEL_RATIO
+}
+
+/// Whether the released pan travelled far enough to leave the page. A shorter
+/// swipe keeps its page: without an interactive drag, only a deliberate
+/// rightward pull is allowed to navigate.
+fn overlay_back_swipe_committed(dx: f32, dy: f32) -> bool {
+    dx >= theme::OVERLAY_BACK_SWIPE_TRAVEL && overlay_back_swipe_claimed(dx, dy)
+}
+
 /// What a page touch pan should do once its accumulated translation is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrawerPanDecision {
@@ -17684,12 +17792,17 @@ fn sidebar_running_indicator(color: gpui::Hsla) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// Top spacing of the pairing page.
+/// Top spacing of the pairing page's first screen.
 ///
 /// Fixed rather than centered: the wordmark and the entries have to stay put,
 /// and a vertically centered page would shift every control under the user's
 /// finger each time a sheet opened or the keyboard arrived.
 const PAIRING_PAGE_TOP_PAD: f32 = 88.0;
+
+/// Top spacing of the runtime switcher, whose back button is the only thing
+/// above the list: the rows start one small gap under it rather than at the
+/// first screen's wordmark line.
+const PAIRING_SWITCHER_TOP_PAD: f32 = 56.0;
 
 /// The share of the page a pairing sheet may cover before its body scrolls.
 ///
@@ -19261,6 +19374,41 @@ mod tests {
         );
     }
 
+    /// The back swipe over a page opened on top of another one: a deliberate,
+    /// clearly horizontal rightward pull, and nothing else.
+    #[test]
+    fn the_back_swipe_needs_a_deliberate_rightward_pull() {
+        let travel = theme::OVERLAY_BACK_SWIPE_TRAVEL;
+        assert!(overlay_back_swipe_committed(travel, 0.0));
+        // Anything shorter keeps the page, and the same pull leftward is not a
+        // back gesture at all.
+        assert!(!overlay_back_swipe_committed(travel - 1.0, 0.0));
+        assert!(!overlay_back_swipe_committed(-travel, 0.0));
+        // A steep diagonal belongs to the list under the finger.
+        assert!(!overlay_back_swipe_committed(travel, travel));
+        assert!(!overlay_back_swipe_claimed(
+            theme::DRAWER_DRAG_THRESHOLD - 1.0,
+            0.0
+        ));
+        assert!(overlay_back_swipe_claimed(
+            theme::DRAWER_DRAG_THRESHOLD,
+            0.0
+        ));
+        // The claim arms well before the commit: the page has to stop the list
+        // scrolling under a gesture that is still on its way to the threshold.
+        assert!(overlay_back_swipe_claimed(travel, 0.0));
+        // Drift within the drawer's own ratio is tolerated; a steeper diagonal
+        // belongs to the list.
+        assert!(overlay_back_swipe_committed(
+            travel,
+            travel / theme::DRAWER_VERTICAL_CANCEL_RATIO - 1.0
+        ));
+        assert!(!overlay_back_swipe_committed(
+            travel,
+            travel / theme::DRAWER_VERTICAL_CANCEL_RATIO + 1.0
+        ));
+    }
+
     #[test]
     fn a_partial_page_can_resume_or_close_in_either_direction() {
         assert_eq!(
@@ -19385,6 +19533,31 @@ mod tests {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
+    }
+
+    /// Drives one finger drag the way a phone reports it: mobile platforms
+    /// synthesize a touch pan as scroll events carrying a `TouchPhase`.
+    fn drag_finger(cx: &mut gpui::VisualTestContext, dx: f32, dy: f32) {
+        let position = point(px(60.0), px(200.0));
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(dx * 0.25), px(dy * 0.25))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Started,
+        });
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(dx * 0.75), px(dy * 0.75))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, 0.0)),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Ended,
+        });
+        cx.run_until_parked();
     }
 
     #[gpui::test]
@@ -20187,6 +20360,113 @@ mod tests {
             below.abs() < 1.0,
             "the three entries should sit at the foot of the page, not {below} below it"
         );
+        // The rows start under the back button: the switcher has no wordmark
+        // line to hold empty above them.
+        let back = cx
+            .debug_bounds("pairing-back")
+            .expect("the switcher keeps a way back");
+        let list = cx
+            .debug_bounds("pairing-runtimes")
+            .expect("the switcher lists the saved runtimes");
+        let gap = f32::from(list.origin.y) - f32::from(back.origin.y + back.size.height);
+        assert!(
+            (0.0..=f32::from(px(theme::SPACING_LG))).contains(&gap),
+            "the list should start one small gap under the back button, not {gap} below it"
+        );
+    }
+
+    /// The runtime switcher and Settings are pages opened on top of the one the
+    /// phone is on, so a rightward finger swipe leaves them the way the system
+    /// back event does — and only a deliberate, clearly horizontal pull does.
+    #[gpui::test]
+    fn a_rightward_swipe_leaves_an_overlay_page(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let mut bundle = host_bundle("runtime-a", "studio");
+        bundle.route = Some(crate::pairing::MobileRemoteRouteBundle {
+            local_network: None,
+            direct_candidates: vec![bundle.record.server_url.clone()],
+            relay: None,
+        });
+        let backend = bundle.backend().expect("valid saved runtime");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app.backend = Some(backend.clone());
+            app.controller = Some(AgentWorkflowController::new(
+                backend.clone(),
+                backend.capability_snapshot().agent,
+            ));
+            app.remember_host(&bundle, RemoteServerKind::Desktop);
+            app
+        });
+        cx.run_until_parked();
+
+        // A short pull is not the gesture: without an interactive drag, only a
+        // deliberate rightward swipe may leave the page.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_pairing(&noop_mouse_up(), window, cx));
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        drag_finger(cx, theme::OVERLAY_BACK_SWIPE_TRAVEL - 8.0, 0.0);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.overlay),
+            Some(MobileOverlay::Pairing),
+            "a short pull should keep the switcher"
+        );
+
+        // The switcher itself follows a swipe that does clear the travel.
+        drag_finger(cx, theme::OVERLAY_BACK_SWIPE_TRAVEL, 0.0);
+        assert!(
+            app.read_with(cx, |app, _| app.overlay.is_none()),
+            "the swipe should leave the runtime switcher"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.mode),
+            RootMode::Workspace,
+            "leaving the switcher returns to the session page"
+        );
+
+        // Settings is a page in the same position, so the same swipe leaves it.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_settings(&noop_mouse_up(), window, cx)
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.overlay),
+            Some(MobileOverlay::Settings)
+        );
+        drag_finger(cx, theme::OVERLAY_BACK_SWIPE_TRAVEL, 0.0);
+        assert!(
+            app.read_with(cx, |app, _| app.overlay.is_none()),
+            "the swipe should leave Settings"
+        );
+
+        // A pan that is mostly vertical belongs to the list under the finger,
+        // not to the page.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_settings(&noop_mouse_up(), window, cx)
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        drag_finger(cx, theme::DRAWER_DRAG_THRESHOLD * 2.0, 96.0);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.overlay),
+            Some(MobileOverlay::Settings),
+            "a vertical pan should keep the page it scrolls"
+        );
     }
 
     /// A pairing card is the phone's whole runtime surface on this page, so it
@@ -20325,11 +20605,13 @@ mod tests {
         assert!(page.contains(".when(saved_runtimes, |page|"));
         assert!(!page.contains("No runtimes yet") && !page.contains("Add a device"));
         // The wordmark belongs to the first screen; the runtime switcher is the
-        // same page opened over a live connection, so it starts with the rows
-        // and gives the band the wordmark held to the list.
+        // same page opened over a live connection, so it starts with the rows,
+        // gives the band the wordmark held to the list, and starts them one gap
+        // under the back button instead of at the wordmark's baseline.
         assert!(page.contains("let first_screen = !self.is_pairing_overlay_open();"));
         assert!(page.contains(".when(first_screen, |page|"));
         assert!(page.contains("pairing_runtimes_max_height(window, first_screen)"));
+        assert!(page.contains("PAIRING_SWITCHER_TOP_PAD"));
 
         // The mark supplies the capital "V" and the label completes the name,
         // and the lockup sits in the middle of the page rather than at its

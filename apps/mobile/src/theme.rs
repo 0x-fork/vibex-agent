@@ -338,6 +338,11 @@ pub const DRAWER_DRAG_THRESHOLD: f32 = 12.0;
 /// A pan whose vertical travel reaches this fraction of its horizontal travel
 /// belongs to list scrolling, not to a drawer swipe.
 pub const DRAWER_VERTICAL_CANCEL_RATIO: f32 = 1.6;
+/// Rightward travel a finger must cover over a page opened on top of another one
+/// before the swipe counts as the back gesture. Deliberately well above the
+/// drawer's arm threshold: opening a drawer by accident is a page move the user
+/// can see and undo, while leaving a page by accident can lose the work in it.
+pub const OVERLAY_BACK_SWIPE_TRAVEL: f32 = 48.0;
 /// Fraction of the viewport a page must travel before settling on the next page.
 pub const DRAWER_SNAP_TRAVEL_RATIO: f32 = 0.15;
 /// Release-adjacent movement in the intended direction commits the transition.
