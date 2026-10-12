@@ -44103,6 +44103,15 @@ impl VibexWorkbench {
             .iter()
             .map(|workspace| workspace.agent_summary.total)
             .sum::<usize>();
+        // The trailing mark reports only the sessions that are running right
+        // now, across every workspace. It is hidden at zero so an idle project
+        // keeps a clean row, and it is deliberately independent of the search
+        // filter for the same reason the total badge is.
+        let project_running_session_count = group
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.agent_summary.running)
+            .sum::<usize>();
         let Some(current_workspace) = group
             .workspaces
             .iter()
@@ -44231,6 +44240,31 @@ impl VibexWorkbench {
             .bg(cx.theme().muted.opacity(0.55))
             .text_color(cx.theme().muted_foreground)
             .child(project_session_count.to_string());
+        // The running count owns the row's trailing edge, the slot the hover
+        // action cluster paints over, so it yields to that cluster exactly the
+        // way a session row's status column does. A project with nothing
+        // running renders no mark at all.
+        let project_running_session_mark = (project_running_session_count > 0).then(|| {
+            div()
+                .id(format!("sidebar-project-running-{project_id_string}"))
+                .absolute()
+                .right_1()
+                .top_0()
+                .h(px(32.0))
+                .flex()
+                .items_center()
+                .pr(px(6.0))
+                .text_xs()
+                .text_color(cx.theme().sidebar_foreground.opacity(0.48))
+                .when(!self.sidebar_batch_mode, |this| {
+                    this.group_hover(&hover_group, |style| style.invisible())
+                })
+                .child(format!(
+                    "{} {}",
+                    project_running_session_count,
+                    locale::text("running", "运行中", "執行中")
+                ))
+        });
         let context_menu_hover_entity = cx.weak_entity();
         let context_menu_project_id = project_id_string.clone();
         let drag_target_project_id = project_id_string.clone();
@@ -44408,6 +44442,7 @@ impl VibexWorkbench {
                             .child(project_session_count_badge),
                     ),
             )
+            .when_some(project_running_session_mark, |this, mark| this.child(mark))
             .when(self.sidebar_batch_mode, |this| {
                 this.child(
                     div()
@@ -84888,6 +84923,25 @@ mod tests {
         assert!(project.contains("workspace.agent_summary.total"));
         assert!(project.contains("let project_session_count_badge = div()"));
         assert!(project.contains(".rounded_full()"));
+    }
+
+    /// The project row's trailing mark counts only live work, and a project
+    /// with nothing running paints no mark at all: the total-session badge
+    /// beside the name already says how many sessions exist.
+    #[test]
+    fn sidebar_project_row_shows_running_sessions_only_when_any_run() {
+        let source = include_str!("app.rs");
+        let project = source
+            .split_once("    fn render_sidebar_project(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_workspace("))
+            .map(|(body, _)| body)
+            .expect("project renderer should remain inspectable");
+
+        assert!(project.contains("workspace.agent_summary.running"));
+        assert!(project.contains("(project_running_session_count > 0).then("));
+        assert!(project.contains("sidebar-project-running-"));
+        assert!(project.contains("locale::text(\"running\", \"运行中\", \"執行中\")"));
+        assert!(project.contains(".when_some(project_running_session_mark,"));
     }
 
     #[test]
