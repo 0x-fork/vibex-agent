@@ -149,25 +149,20 @@ pub(super) fn format_schedule_countdown(remaining_ms: i64) -> String {
     )
 }
 
-pub(super) fn next_message_index(
+/// The one queue entry the workbench may hand to the submission path next.
+///
+/// The pre-send queue is a single ordered list across sessions, and only its
+/// head is ever a candidate: a scheduled message cannot be overtaken by the
+/// messages behind it, and whichever message the reader moves in front of a
+/// schedule becomes the next send. A row that is being edited holds the whole
+/// queue — the reader is deciding what that message says, and nothing behind it
+/// may leave before it does.
+pub(super) fn next_queue_message_index(
     queue: &[ComposerQueueMessage],
-    session_id: &VibexSessionId,
-    behavior: ComposerQueueDispatchBehavior,
-    ordinary_dispatch_enabled: bool,
-    now_ms: i64,
     is_editing: impl Fn(u64) -> bool,
 ) -> Option<usize> {
-    queue.iter().position(|message| {
-        &message.session_id == session_id
-            && !is_editing(message.id)
-            && match message.scheduled_at_ms {
-                Some(at_ms) => at_ms <= now_ms,
-                None => {
-                    behavior != ComposerQueueDispatchBehavior::Scheduled
-                        && ordinary_dispatch_enabled
-                }
-            }
-    })
+    let head = queue.first()?;
+    (!is_editing(head.id)).then_some(0)
 }
 
 /// The schedule editor one Composer target is currently editing.
@@ -913,8 +908,12 @@ impl VibexWorkbench {
                             .insert(session.id.to_string(), session.clone());
                         this.upsert_session_snapshot(session);
                         this.mark_composer_queue_for_recheck(&session_id);
+                        // The queue is one ordered list, so the session that was
+                        // just loaded only advances the queue when its message
+                        // is the head; the behavior of a message behind another
+                        // entry is the head's own.
                         this.maybe_dispatch_next_composer_queue_message(
-                            &session_id,
+                            Some(&session_id),
                             behavior,
                             window,
                             cx,
@@ -953,17 +952,19 @@ impl VibexWorkbench {
             .collect::<BTreeSet<_>>();
         for session_id in session_ids {
             self.mark_composer_queue_for_recheck(&session_id);
-            // A message the reader lined up may have become sendable while
-            // Vibex was closed. The ordinary rules still decide: a deadline
-            // that has not arrived waits, and Manual send mode still needs the
-            // reader's own send before anything leaves the queue.
-            self.maybe_dispatch_next_composer_queue_message(
-                &session_id,
-                ComposerQueueDispatchBehavior::Automatic,
-                window,
-                cx,
-            );
         }
+        // A message the reader lined up may have become sendable while Vibex
+        // was closed. The queue is one ordered list, so only its head is
+        // re-evaluated, and the ordinary rules still decide: a deadline that
+        // has not arrived waits, a message behind a schedule waits for it, and
+        // Manual send mode still needs the reader's own send before anything
+        // leaves the queue.
+        self.maybe_dispatch_next_composer_queue_message(
+            None,
+            ComposerQueueDispatchBehavior::Automatic,
+            window,
+            cx,
+        );
         self.start_message_schedule_timer(window, cx);
         self.apply_pending_scheduled_titles();
         self.persist_composer_queue();
@@ -1066,20 +1067,23 @@ impl VibexWorkbench {
     }
 
     fn dispatch_due_messages(&mut self, now_ms: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let session_ids = self
+        // A deadline only matters once its message reaches the head of the
+        // queue, but the head is re-evaluated on every tick rather than only
+        // for the sessions that hold a due message: the queue is one list, and
+        // whatever stands in front of a due schedule decides when it may fire.
+        let due = self
             .composer_queue
             .iter()
-            .filter(|message| message.scheduled_at_ms.is_some_and(|at_ms| at_ms <= now_ms))
-            .map(|message| message.session_id.clone())
-            .collect::<BTreeSet<_>>();
-        for session_id in session_ids {
-            self.maybe_dispatch_next_composer_queue_message(
-                &session_id,
-                ComposerQueueDispatchBehavior::Scheduled,
-                window,
-                cx,
-            );
+            .any(|message| message.scheduled_at_ms.is_some_and(|at_ms| at_ms <= now_ms));
+        if !due {
+            return;
         }
+        self.maybe_dispatch_next_composer_queue_message(
+            None,
+            ComposerQueueDispatchBehavior::Automatic,
+            window,
+            cx,
+        );
     }
 
     pub(super) fn render_scheduled_queue_status(

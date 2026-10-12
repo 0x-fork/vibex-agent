@@ -1438,6 +1438,24 @@ enum ComposerQueueDispatchBehavior {
     ExplicitSend,
 }
 
+/// The queued message the rest of the pre-send queue is waiting on.
+///
+/// The queue advances one message at a time: after an entry leaves it, no later
+/// entry is dispatched until the turn that entry started is observed to have
+/// completed normally.
+#[derive(Debug, Clone)]
+struct ComposerQueueDispatchFence {
+    session_id: VibexSessionId,
+    message_id: u64,
+    /// The session revision the dispatch left behind. A turn is only judged once
+    /// the session has moved past it, so a probe that still describes the turn
+    /// before this one cannot release the queue.
+    session_updated_at_ms: i64,
+    /// A command runs no conversational turn of its own, so its submission is
+    /// the boundary that releases the queue.
+    awaits_turn: bool,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposerRuntimeMenuView {
@@ -7080,14 +7098,13 @@ fn promote_composer_queue_message(
 ) -> Option<VibexSessionId> {
     let source_index = queue.iter().position(|message| message.id == message_id)?;
     let mut message = queue.remove(source_index);
-    // Promoting a message is the explicit send-now action.
+    // Promoting a message is the explicit send-now action. The queue is one
+    // ordered list, so the message the reader sent now becomes its head instead
+    // of the first row of its own session: an explicit send is the one thing
+    // that is allowed to jump the order, and it has to jump all of it.
     message.scheduled_at_ms = None;
     let session_id = message.session_id.clone();
-    let insert_at = queue
-        .iter()
-        .position(|queued| queued.session_id == session_id)
-        .unwrap_or(queue.len());
-    queue.insert(insert_at, message);
+    queue.insert(0, message);
     Some(session_id)
 }
 
@@ -7131,10 +7148,12 @@ fn composer_queue_session_blocks_dispatch(
             )
         ),
         ComposerQueueDispatchBehavior::AfterInterrupt => false,
-        ComposerQueueDispatchBehavior::AfterCompletion => {
-            matches!(session_state, Some(AgentSessionState::NeedsInput))
-        }
-        ComposerQueueDispatchBehavior::Automatic
+        // The submission handoff is no longer allowed to guess that a lagging
+        // `Running` snapshot is stale: the queue waits for a turn that actually
+        // ended normally, and the dispatch fence is what proves a turn already
+        // finished when the snapshot is the only thing still saying otherwise.
+        ComposerQueueDispatchBehavior::AfterCompletion
+        | ComposerQueueDispatchBehavior::Automatic
         | ComposerQueueDispatchBehavior::ForceNext
         | ComposerQueueDispatchBehavior::ExplicitSend => {
             matches!(
@@ -7188,6 +7207,66 @@ fn composer_queue_waits_for_continuation(
         // Only a confirmed normal completion may auto-send.
         Some(Some(ended_normally)) => !ended_normally,
     }
+}
+
+/// Whether a dispatch behavior is the reader's own instruction about one
+/// message.
+///
+/// An explicit send is the one gesture allowed to overtake the queue and its
+/// dispatch fence. A head that carries a deadline is always dispatched as
+/// `Scheduled`, so a schedule never inherits this bypass and always waits for
+/// the entries in front of it.
+fn composer_queue_behavior_is_explicit(behavior: ComposerQueueDispatchBehavior) -> bool {
+    matches!(
+        behavior,
+        ComposerQueueDispatchBehavior::ForceNext
+            | ComposerQueueDispatchBehavior::AfterInterrupt
+            | ComposerQueueDispatchBehavior::ExplicitSend
+    )
+}
+
+/// Whether the message the pre-send queue handed over last is still holding it
+/// back.
+///
+/// The queue is one ordered list and advances one message at a time: after an
+/// entry leaves it, no later entry may be dispatched until that message's turn
+/// has been observed to end normally. `dispatched_at_ms` is the session revision
+/// the dispatch left behind, so an answer that still describes the turn before
+/// this one cannot release the queue.
+fn composer_queue_fence_waits(
+    turn_pending: bool,
+    session_state: Option<AgentSessionState>,
+    session_updated_at_ms: Option<i64>,
+    dispatched_at_ms: i64,
+    cached_turn_status: Option<Option<bool>>,
+) -> bool {
+    if turn_pending {
+        return true;
+    }
+    let (Some(state), Some(session_updated_at_ms)) = (session_state, session_updated_at_ms) else {
+        // The queue cannot judge a session the workbench no longer tracks.
+        return false;
+    };
+    if matches!(
+        state,
+        AgentSessionState::Closed | AgentSessionState::Archived
+    ) {
+        // A closed session can no longer produce the completion the queue is
+        // waiting for, so it stops holding the queue.
+        return false;
+    }
+    if session_updated_at_ms <= dispatched_at_ms {
+        // The turn the dispatch asked for has not been observed at all yet.
+        return true;
+    }
+    if !matches!(state, AgentSessionState::Idle | AgentSessionState::Error) {
+        return true;
+    }
+    composer_queue_waits_for_continuation(
+        ComposerQueueDispatchBehavior::Automatic,
+        Some(state),
+        cached_turn_status,
+    )
 }
 
 /// How the timeline should record a queued message that is dispatched now.
@@ -8712,6 +8791,9 @@ pub struct VibexWorkbench {
     composer_queue_ready_after_continuation_session_ids: BTreeSet<String>,
     composer_queue_interrupted_session_ids: BTreeSet<String>,
     composer_queue_steering_session_ids: BTreeSet<String>,
+    /// The queued message whose turn the queue is waiting on before it may hand
+    /// over the next entry. See [`ComposerQueueDispatchFence`].
+    composer_queue_dispatch_fence: Option<ComposerQueueDispatchFence>,
     /// Sessions whose live Agent runtime advertised native steering. The queue
     /// exposes the native steer action only for these sessions.
     native_steering_supported_session_ids: BTreeSet<String>,
@@ -10056,6 +10138,7 @@ impl VibexWorkbench {
             composer_queue_ready_after_continuation_session_ids: BTreeSet::new(),
             composer_queue_interrupted_session_ids: BTreeSet::new(),
             composer_queue_steering_session_ids: BTreeSet::new(),
+            composer_queue_dispatch_fence: None,
             native_steering_supported_session_ids: BTreeSet::new(),
             native_steering_probed_generations: BTreeMap::new(),
             optimistic_user_messages: BTreeMap::new(),
@@ -15036,11 +15119,18 @@ impl VibexWorkbench {
     /// waiting. A queue the user paused is left paused: that state is cleared
     /// only by an explicit resume.
     fn mark_composer_queue_for_recheck(&mut self, session_id: &VibexSessionId) {
-        if self
+        let holds_an_entry = self
             .composer_queue
             .iter()
-            .any(|message| message.session_id == *session_id)
-        {
+            .any(|message| message.session_id == *session_id);
+        // The queue is one ordered list, so a session that only furnished the
+        // turn the queue is waiting on has to wake the same re-evaluation as a
+        // session that still holds an entry.
+        let holds_the_fence = self
+            .composer_queue_dispatch_fence
+            .as_ref()
+            .is_some_and(|fence| fence.session_id == *session_id);
+        if holds_an_entry || holds_the_fence {
             self.composer_queue_ready_after_continuation_session_ids
                 .insert(session_id.as_str().to_string());
         }
@@ -25775,7 +25865,7 @@ impl VibexWorkbench {
                 // its latest turn stopped abnormally. Auto/Manual send mode still
                 // decides whether that is allowed.
                 self.maybe_dispatch_next_composer_queue_message(
-                    &session_id,
+                    Some(&session_id),
                     ComposerQueueDispatchBehavior::ExplicitSend,
                     window,
                     cx,
@@ -26205,6 +26295,17 @@ impl VibexWorkbench {
                         }
                     }
                 }
+                // A remote submission that never landed cannot produce the
+                // completion the pre-send queue is waiting on, so it releases the
+                // fence instead of stranding every message behind it.
+                if !completed
+                    && this
+                        .composer_queue_dispatch_fence
+                        .as_ref()
+                        .is_some_and(|fence| fence.message_id == message_id)
+                {
+                    this.composer_queue_dispatch_fence = None;
+                }
                 let _ = window;
                 cx.notify();
             });
@@ -26467,9 +26568,21 @@ impl VibexWorkbench {
                 let interrupted = this
                     .composer_queue_interrupted_session_ids
                     .remove(submitted_session_id.as_str());
+                // A submission that never landed, or a command that runs no
+                // conversational turn of its own, cannot produce the completion
+                // the pre-send queue is waiting on. Releasing the fence here
+                // keeps one failed send from stranding every message behind it.
+                if (!completed || is_command)
+                    && this
+                        .composer_queue_dispatch_fence
+                        .as_ref()
+                        .is_some_and(|fence| fence.message_id == message_id)
+                {
+                    this.composer_queue_dispatch_fence = None;
+                }
                 if completed || steering || interrupted {
                     this.maybe_dispatch_next_composer_queue_message(
-                        &submitted_session_id,
+                        Some(&submitted_session_id),
                         if steering {
                             ComposerQueueDispatchBehavior::AfterInterrupt
                         } else if completed {
@@ -26518,8 +26631,17 @@ impl VibexWorkbench {
         self.probe_auto_continue_turn_status(session_id.clone(), session_updated_at_ms, cx);
     }
 
-    /// Dispatches the front queued message for `session_id` when the session is
-    /// settled enough to accept it.
+    /// Dispatches the head of the pre-send queue when it is ready to leave.
+    ///
+    /// The queue is one ordered list across sessions, so only its first entry is
+    /// ever a candidate: a message behind a scheduled one waits for that
+    /// schedule to fire and for its turn to end normally, and a message behind
+    /// another session's entry waits for that session the same way.
+    ///
+    /// `origin` names the session whose change asked for this evaluation, and
+    /// `behavior` says what that change was. The behavior only reaches the head
+    /// when the head belongs to `origin`: a user action aimed at one session
+    /// never releases another session's message on that session's terms.
     ///
     /// Returns whether a message was handed to the submission path. Waiting for
     /// an unobserved or abnormal turn boundary never pauses the queue: the
@@ -26528,52 +26650,74 @@ impl VibexWorkbench {
     /// an explicit user interrupt.
     fn maybe_dispatch_next_composer_queue_message(
         &mut self,
-        session_id: &VibexSessionId,
+        origin: Option<&VibexSessionId>,
         behavior: ComposerQueueDispatchBehavior,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let now_ms = unix_timestamp_ms();
-        let Some(index) = message_schedule::next_message_index(
-            &self.composer_queue,
-            session_id,
-            behavior,
-            composer_queue_dispatch_enabled(
-                &self.composer_queue_manual_session_ids,
-                session_id,
-                behavior,
-            ),
-            now_ms,
-            |id| self.queue_message_is_being_edited(id),
-        ) else {
+        let Some(index) = message_schedule::next_queue_message_index(&self.composer_queue, |id| {
+            self.queue_message_is_being_edited(id)
+        }) else {
             return false;
+        };
+        let session_id = self.composer_queue[index].session_id.clone();
+        let behavior = if origin == Some(&session_id) {
+            behavior
+        } else {
+            ComposerQueueDispatchBehavior::Automatic
         };
         // A schedule is an explicit instruction to send at a future time. It
         // remains automatic even in Manual queue mode, but never interrupts a
-        // running turn or resumes a queue the user explicitly paused.
-        let behavior = if self.composer_queue[index].scheduled_at_ms.is_some() {
+        // running turn, resumes a queue the user explicitly paused, or overtakes
+        // the entry in front of it.
+        let scheduled_at_ms = self.composer_queue[index].scheduled_at_ms;
+        let behavior = if scheduled_at_ms.is_some() {
             ComposerQueueDispatchBehavior::Scheduled
         } else {
             behavior
         };
+        // A deadline that has not arrived holds the whole queue: the messages
+        // behind it are not allowed to overtake it.
+        if scheduled_at_ms.is_some_and(|at_ms| at_ms > now_ms) {
+            return false;
+        }
         if self.registered_session(session_id.as_str()).is_none() {
-            self.load_queued_session(session_id.clone(), behavior, window, cx);
+            self.load_queued_session(session_id, behavior, window, cx);
             return false;
         }
         let session = self.registered_session(session_id.as_str());
         let session_state = session.map(|session| session.state);
         let cached_turn_status = session.and_then(|session| {
-            self.cached_auto_continue_turn_status(session_id, session.updated_at_ms)
+            self.cached_auto_continue_turn_status(&session_id, session.updated_at_ms)
         });
         let waits_for_continuation = composer_queue_waits_for_continuation(
             behavior,
             session_state,
             cached_turn_status.map(|status| status.ended_normally),
         );
-        if self.agent_action_pending
+        // A deadline is its own instruction: it stays automatic even in Manual
+        // queue mode, so the ordinary send-mode gate never applies to it.
+        let dispatch_enabled = scheduled_at_ms.is_some()
+            || composer_queue_dispatch_enabled(
+                &self.composer_queue_manual_session_ids,
+                &session_id,
+                behavior,
+            );
+        // An explicit send is the reader's own instruction about one message, and
+        // it is the one gesture allowed to overtake the queue — so it is also the
+        // one that may leave before the previous message's turn has settled. A
+        // scheduled head never carries one of these: its deadline pins it to the
+        // queue's own order, which is what keeps it from overtaking the entries in
+        // front of it.
+        let fence_blocks =
+            !composer_queue_behavior_is_explicit(behavior) && self.composer_queue_fence_blocks();
+        if !dispatch_enabled
+            || self.agent_action_pending
+            || fence_blocks
             || composer_queue_session_blocks_dispatch(
                 behavior,
-                self.session_turn_pending(session_id),
+                self.session_turn_pending(&session_id),
                 session_state,
             )
             || waits_for_continuation
@@ -26583,25 +26727,105 @@ impl VibexWorkbench {
         {
             // An unobserved revision is not proof of a normal completion: probe
             // it so a later frame can release the queue once the latest turn is
-            // known.
+            // known. The turn the queue handed over last is asked about the same
+            // way.
             if waits_for_continuation && cached_turn_status.is_none() {
-                self.probe_composer_queue_turn_status(session_id, cx);
+                self.probe_composer_queue_turn_status(&session_id, cx);
+            }
+            if fence_blocks {
+                self.probe_composer_queue_fence(cx);
             }
             return false;
         }
+        let session_updated_at_ms = session.map_or(0, |session| session.updated_at_ms);
         let message = self.composer_queue.remove(index);
+        let message_id = message.id;
+        self.composer_queue_dispatch_fence = Some(ComposerQueueDispatchFence {
+            session_id: message.session_id.clone(),
+            message_id,
+            session_updated_at_ms,
+            awaits_turn: message.command_invocation.is_none(),
+        });
         self.publish_sidebar_invalidation();
         self.dispatch_composer_message(message, behavior, window, cx);
+        // A submission the dispatch path handed straight back never left the
+        // queue: it keeps the head it had, and it must not hold the queue behind
+        // it either.
+        if let Some(bounced) = self
+            .composer_queue
+            .iter()
+            .position(|queued| queued.id == message_id)
+        {
+            if bounced > 0 {
+                let message = self.composer_queue.remove(bounced);
+                self.composer_queue.insert(0, message);
+            }
+            self.composer_queue_dispatch_fence = None;
+        }
         // The send left the queue, so its name no longer stands and the
         // persisted queue must not bring the message back on the next launch.
         self.composer_queue_changed();
         true
     }
 
-    /// Re-evaluates armed auto-send queues whose latest turn outcome just became
-    /// known. A queue the user paused by interrupting stays paused until they
-    /// explicitly resume it; a queue that is still waiting is re-armed so a
-    /// transient block (action lock, running turn) cannot strand it.
+    /// Whether the pre-send queue is still waiting for the turn of the message it
+    /// handed over last.
+    ///
+    /// The queue advances one message at a time: after an entry leaves it, no
+    /// later entry may be dispatched until that message's turn has been observed
+    /// to end normally. A session that is still running, still initializing or
+    /// still waiting on its first snapshot keeps the queue waiting; a session
+    /// that was closed or archived can no longer produce the completion the
+    /// queue is waiting for, so it stops holding the queue.
+    fn composer_queue_fence_blocks(&self) -> bool {
+        let Some(fence) = self.composer_queue_dispatch_fence.as_ref() else {
+            return false;
+        };
+        if !fence.awaits_turn {
+            return false;
+        }
+        let session = self.registered_session(fence.session_id.as_str());
+        composer_queue_fence_waits(
+            self.session_turn_pending(&fence.session_id),
+            session.map(|session| session.state),
+            session.map(|session| session.updated_at_ms),
+            fence.session_updated_at_ms,
+            session.and_then(|session| {
+                self.cached_auto_continue_turn_status(&fence.session_id, session.updated_at_ms)
+                    .map(|status| status.ended_normally)
+            }),
+        )
+    }
+
+    /// Asks the authority for the turn outcome the queue fence is waiting on.
+    fn probe_composer_queue_fence(&mut self, cx: &mut Context<Self>) {
+        let Some(fence) = self.composer_queue_dispatch_fence.clone() else {
+            return;
+        };
+        if !fence.awaits_turn || self.session_turn_pending(&fence.session_id) {
+            return;
+        }
+        let Some(session) = self.registered_session(fence.session_id.as_str()) else {
+            return;
+        };
+        if session.updated_at_ms <= fence.session_updated_at_ms
+            || !matches!(
+                session.state,
+                AgentSessionState::Idle | AgentSessionState::Error
+            )
+        {
+            return;
+        }
+        self.probe_composer_queue_turn_status(&fence.session_id, cx);
+    }
+
+    /// Re-evaluates the pre-send queue after a turn outcome became known.
+    ///
+    /// The queue is one ordered list, so a settled session releases whichever
+    /// entry is now at its head — not necessarily that session's own. A queue
+    /// the user paused by interrupting stays paused until they explicitly resume
+    /// it; a queue that is still waiting is re-armed so a transient block (action
+    /// lock, running turn, unobserved revision) cannot strand it.
     fn flush_composer_queue_dispatches_after_continuation(
         &mut self,
         window: &mut Window,
@@ -26609,53 +26833,20 @@ impl VibexWorkbench {
     ) {
         let session_ids =
             std::mem::take(&mut self.composer_queue_ready_after_continuation_session_ids);
-        for session_id in session_ids {
-            let Ok(session_id) = VibexSessionId::parse(&session_id) else {
-                continue;
-            };
-            let Some(session_state) = self
-                .registered_session(session_id.as_str())
-                .map(|session| session.state)
-            else {
-                continue;
-            };
-            if !self
-                .composer_queue
-                .iter()
-                .any(|message| message.session_id == session_id)
-            {
-                continue;
-            }
-            if self
-                .composer_queue_paused_session_ids
-                .contains(session_id.as_str())
-            {
-                continue;
-            }
-            // Only the completion handoff may ignore a lagging `Running`
-            // snapshot, because it just cleared the local turn-pending fence. A
-            // background re-evaluation has no such proof, so it never pushes a
-            // queued message into a turn that is genuinely still running.
-            if !matches!(
-                session_state,
-                AgentSessionState::Idle | AgentSessionState::Error
-            ) {
-                continue;
-            }
-            let dispatched = self.maybe_dispatch_next_composer_queue_message(
-                &session_id,
-                ComposerQueueDispatchBehavior::AfterCompletion,
-                window,
-                cx,
-            );
-            let still_queued = self
-                .composer_queue
-                .iter()
-                .any(|message| message.session_id == session_id);
-            if !dispatched && still_queued {
-                self.composer_queue_ready_after_continuation_session_ids
-                    .insert(session_id.as_str().to_string());
-            }
+        if session_ids.is_empty() {
+            return;
+        }
+        let dispatched = self.maybe_dispatch_next_composer_queue_message(
+            None,
+            ComposerQueueDispatchBehavior::AfterCompletion,
+            window,
+            cx,
+        );
+        if !dispatched && !self.composer_queue.is_empty() {
+            // The head is still waiting on something — a probe, a running turn, a
+            // user pause — and this path is what re-reads it.
+            self.composer_queue_ready_after_continuation_session_ids
+                .extend(session_ids);
         }
     }
 
@@ -26975,7 +27166,7 @@ impl VibexWorkbench {
                 .remove(session_id.as_str());
         } else {
             self.maybe_dispatch_next_composer_queue_message(
-                &session_id,
+                Some(&session_id),
                 ComposerQueueDispatchBehavior::Automatic,
                 window,
                 cx,
@@ -26989,12 +27180,32 @@ impl VibexWorkbench {
         message_id: u64,
         target_id: u64,
         after: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if reorder_composer_queue_message(&mut self.composer_queue, message_id, target_id, after) {
             // The order is part of what the reader persisted: the queue is
             // persisted in the order it is shown in.
             self.composer_queue_changed();
+            // Moving a message in front of a schedule is the reader's own
+            // instruction about what goes next, so a session that is already
+            // settled sends the message now instead of waiting for the deadline
+            // that used to stand in front of it. The queue is one ordered list,
+            // so this only holds when the message reached its head.
+            if let Some(session_id) = self
+                .composer_queue
+                .iter()
+                .find(|message| message.id == message_id)
+                .map(|message| message.session_id.clone())
+            {
+                self.mark_composer_queue_for_recheck(&session_id);
+                self.maybe_dispatch_next_composer_queue_message(
+                    Some(&session_id),
+                    ComposerQueueDispatchBehavior::Automatic,
+                    window,
+                    cx,
+                );
+            }
             cx.notify();
         }
     }
@@ -27015,7 +27226,7 @@ impl VibexWorkbench {
         self.composer_queue_paused_session_ids
             .remove(session_id.as_str());
         self.maybe_dispatch_next_composer_queue_message(
-            &session_id,
+            Some(&session_id),
             ComposerQueueDispatchBehavior::ForceNext,
             window,
             cx,
@@ -27045,7 +27256,7 @@ impl VibexWorkbench {
             }
         } else {
             self.maybe_dispatch_next_composer_queue_message(
-                &session_id,
+                Some(&session_id),
                 ComposerQueueDispatchBehavior::ForceNext,
                 window,
                 cx,
@@ -27067,7 +27278,7 @@ impl VibexWorkbench {
             self.composer_queue_manual_session_ids
                 .remove(session_id.as_str());
             self.maybe_dispatch_next_composer_queue_message(
-                &session_id,
+                Some(&session_id),
                 ComposerQueueDispatchBehavior::Automatic,
                 window,
                 cx,
@@ -30580,7 +30791,7 @@ impl VibexWorkbench {
                                 this.composer_queue_steering_session_ids
                                     .remove(interrupted_session_id.as_str());
                                 this.maybe_dispatch_next_composer_queue_message(
-                                    &interrupted_session_id,
+                                    Some(&interrupted_session_id),
                                     ComposerQueueDispatchBehavior::AfterInterrupt,
                                     window,
                                     cx,
@@ -32751,7 +32962,7 @@ impl VibexWorkbench {
                             .remove(session_id.as_str());
                         if initial_message_completed || steering || interrupted {
                             this.maybe_dispatch_next_composer_queue_message(
-                                &session_id,
+                                Some(&session_id),
                                 if steering {
                                     ComposerQueueDispatchBehavior::AfterInterrupt
                                 } else if initial_message_completed {
@@ -60565,22 +60776,25 @@ impl VibexWorkbench {
                             }
                         },
                     ))
-                    .on_drop(cx.listener(move |this, drag: &ComposerQueueDrag, _, cx| {
-                        let target = this.composer_queue_drop_target.take();
-                        if drag.session_id == drop_target_session_id
-                            && let Some(target) =
-                                target.filter(|target| target.message_id == message_id)
-                        {
-                            this.move_composer_queue_message_relative(
-                                drag.message_id,
-                                target.message_id,
-                                target.after,
-                                cx,
-                            );
-                        } else {
-                            cx.notify();
-                        }
-                    }))
+                    .on_drop(
+                        cx.listener(move |this, drag: &ComposerQueueDrag, window, cx| {
+                            let target = this.composer_queue_drop_target.take();
+                            if drag.session_id == drop_target_session_id
+                                && let Some(target) =
+                                    target.filter(|target| target.message_id == message_id)
+                            {
+                                this.move_composer_queue_message_relative(
+                                    drag.message_id,
+                                    target.message_id,
+                                    target.after,
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                cx.notify();
+                            }
+                        }),
+                    )
                     .child(
                         div()
                             .id(format!("composer-queue-drag-{message_id}"))
@@ -92905,7 +93119,9 @@ mod tests {
     }
 
     #[test]
-    fn composer_queue_dispatch_after_turn_boundary_ignores_only_the_stale_session_snapshot() {
+    fn composer_queue_dispatch_waits_for_a_running_turn_except_for_an_explicit_steer() {
+        // An explicit steer is the one handoff that may deliver into the turn it
+        // just interrupted; the local pending flag still fences it.
         assert!(composer_queue_session_blocks_dispatch(
             ComposerQueueDispatchBehavior::AfterInterrupt,
             true,
@@ -92916,12 +93132,15 @@ mod tests {
             false,
             Some(AgentSessionState::Running),
         ));
+        // A submission handoff waits for the turn to end: a snapshot that still
+        // says Running is either the turn itself or a lag the fence keeps the
+        // queue honest through, never a reason to hand over the next entry.
         assert!(composer_queue_session_blocks_dispatch(
             ComposerQueueDispatchBehavior::AfterCompletion,
             true,
             Some(AgentSessionState::Running),
         ));
-        assert!(!composer_queue_session_blocks_dispatch(
+        assert!(composer_queue_session_blocks_dispatch(
             ComposerQueueDispatchBehavior::AfterCompletion,
             false,
             Some(AgentSessionState::Running),
@@ -92946,6 +93165,142 @@ mod tests {
             false,
             Some(AgentSessionState::Idle),
         ));
+    }
+
+    /// The queue advances one message at a time: the entry behind the message
+    /// that was just dispatched waits until that message's turn is observed to
+    /// have ended normally.
+    #[test]
+    fn the_pre_send_queue_waits_for_the_turn_it_handed_over() {
+        // The submission itself is still in flight.
+        assert!(composer_queue_fence_waits(
+            true,
+            Some(AgentSessionState::Idle),
+            Some(10),
+            10,
+            None,
+        ));
+        // The session has not moved past the revision the dispatch left, so the
+        // turn it asked for has not been observed at all.
+        assert!(composer_queue_fence_waits(
+            false,
+            Some(AgentSessionState::Idle),
+            Some(10),
+            10,
+            None,
+        ));
+        // A turn that is still occupying the Agent holds the queue.
+        assert!(composer_queue_fence_waits(
+            false,
+            Some(AgentSessionState::Running),
+            Some(11),
+            10,
+            None,
+        ));
+        assert!(composer_queue_fence_waits(
+            false,
+            Some(AgentSessionState::Initializing),
+            Some(11),
+            10,
+            None,
+        ));
+        // An unobserved revision is not proof of a normal completion.
+        assert!(composer_queue_fence_waits(
+            false,
+            Some(AgentSessionState::Idle),
+            Some(11),
+            10,
+            None,
+        ));
+        // An abnormal stop keeps waiting for a later normal completion...
+        assert!(composer_queue_fence_waits(
+            false,
+            Some(AgentSessionState::Idle),
+            Some(11),
+            10,
+            Some(Some(false)),
+        ));
+        // ...and only a confirmed normal completion releases the queue.
+        assert!(!composer_queue_fence_waits(
+            false,
+            Some(AgentSessionState::Idle),
+            Some(11),
+            10,
+            Some(Some(true)),
+        ));
+        // A probe that found no conversational turn has nothing to wait for.
+        assert!(!composer_queue_fence_waits(
+            false,
+            Some(AgentSessionState::Idle),
+            Some(11),
+            10,
+            Some(None),
+        ));
+        // A session that can no longer produce that completion stops holding
+        // the queue, and so does one the workbench no longer tracks.
+        for state in [AgentSessionState::Closed, AgentSessionState::Archived] {
+            assert!(
+                !composer_queue_fence_waits(false, Some(state), Some(11), 10, None),
+                "{state:?}"
+            );
+        }
+        assert!(!composer_queue_fence_waits(false, None, None, 10, None));
+    }
+
+    /// An explicit send is the one gesture that may overtake the queue. A due
+    /// schedule is never dispatched with one of these behaviors, so it cannot
+    /// inherit the bypass from the reader's message behind it.
+    #[test]
+    fn only_an_explicit_send_may_overtake_the_queue_fence() {
+        for behavior in [
+            ComposerQueueDispatchBehavior::ForceNext,
+            ComposerQueueDispatchBehavior::AfterInterrupt,
+            ComposerQueueDispatchBehavior::ExplicitSend,
+        ] {
+            assert!(
+                composer_queue_behavior_is_explicit(behavior),
+                "{behavior:?}"
+            );
+        }
+        for behavior in [
+            ComposerQueueDispatchBehavior::Automatic,
+            ComposerQueueDispatchBehavior::Scheduled,
+            ComposerQueueDispatchBehavior::AfterCompletion,
+        ] {
+            assert!(
+                !composer_queue_behavior_is_explicit(behavior),
+                "{behavior:?}"
+            );
+        }
+    }
+
+    /// The queue is one list across sessions: the dispatcher asks for its head,
+    /// a head that carries a deadline decides its own `Scheduled` behavior, and
+    /// only then does the explicit-send bypass get a say.
+    #[test]
+    fn the_dispatch_head_is_the_queues_first_entry_and_a_schedule_decides_it() {
+        let source = include_str!("app.rs");
+        let maybe_dispatch = source
+            .split_once("    fn maybe_dispatch_next_composer_queue_message(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Whether the pre-send queue is still waiting for the turn",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("queue dispatch should remain inspectable");
+        let head = maybe_dispatch
+            .find("message_schedule::next_queue_message_index(")
+            .expect("the dispatcher should ask the queue for its head");
+        let scheduled = maybe_dispatch
+            .find("ComposerQueueDispatchBehavior::Scheduled")
+            .expect("a scheduled head should decide its own behavior");
+        let fence = maybe_dispatch
+            .find("composer_queue_behavior_is_explicit(behavior)")
+            .expect("the fence bypass should read the explicit behavior");
+        assert!(head < scheduled);
+        assert!(scheduled < fence);
+        assert!(maybe_dispatch.contains("self.composer_queue.remove(index);"));
     }
 
     #[test]
@@ -93312,16 +93667,19 @@ mod tests {
         assert!(!maybe_dispatch.contains(".insert(session_id.as_str().to_string())"));
 
         // Only an explicit user interrupt pauses, and the re-evaluation path
-        // must leave that pause in place until the user resumes.
+        // must leave that pause in place until the user resumes: it retries
+        // through the head evaluation, which is where the pause is honored.
         assert!(interrupt.contains("ComposerQueueInterruptBehavior::Pause if has_queued_messages"));
         assert!(interrupt.contains("composer_queue_paused_session_ids"));
-        let paused_guard = flush
+        let paused_guard = maybe_dispatch
             .find("composer_queue_paused_session_ids")
-            .expect("queue re-evaluation must honor a user pause");
-        let dispatch_call = flush
-            .find("self.maybe_dispatch_next_composer_queue_message(")
-            .expect("queue re-evaluation should retry the dispatch");
+            .expect("the head evaluation must honor a user pause");
+        let dispatch_call = maybe_dispatch
+            .find("let message = self.composer_queue.remove(index);")
+            .expect("the head is what the queue hands over");
         assert!(paused_guard < dispatch_call);
+        assert!(!flush.contains("composer_queue_paused_session_ids.remove"));
+        assert!(flush.contains("self.maybe_dispatch_next_composer_queue_message("));
     }
 
     #[test]

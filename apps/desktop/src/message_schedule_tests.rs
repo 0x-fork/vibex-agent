@@ -163,104 +163,34 @@ fn the_persisted_queue_round_trips_a_scheduled_command() {
 }
 
 #[test]
-fn deadlines_do_not_block_ready_messages_or_leak_between_sessions() {
+fn the_queue_only_ever_offers_its_head() {
     let session = VibexSessionId::new();
     let other = VibexSessionId::new();
-    let mut queue = vec![
+    let queue = vec![
         queued(1, &session, Some(30_000)),
         queued(2, &other, Some(1_000)),
         queued(3, &session, None),
         queued(4, &session, Some(10_000)),
     ];
-    let candidate = |queue: &[ComposerQueueMessage], behavior, ordinary, now| {
-        next_message_index(queue, &session, behavior, ordinary, now, |_| false)
-    };
-    assert_eq!(
-        candidate(
-            &queue,
-            ComposerQueueDispatchBehavior::Automatic,
-            true,
-            5_000
-        ),
-        Some(2)
-    );
-    assert_eq!(
-        candidate(
-            &queue,
-            ComposerQueueDispatchBehavior::Scheduled,
-            false,
-            9_999
-        ),
-        None
-    );
-    // A timer sends its own due message even with ordinary Auto send disabled.
-    assert_eq!(
-        candidate(
-            &queue,
-            ComposerQueueDispatchBehavior::Scheduled,
-            false,
-            10_000
-        ),
-        Some(3)
-    );
-    let sent = queue.remove(3);
-    assert_eq!(sent.id, 4);
-    assert_eq!(
-        candidate(
-            &queue,
-            ComposerQueueDispatchBehavior::Scheduled,
-            false,
-            10_001
-        ),
-        None
-    );
-    assert_eq!(
-        candidate(
-            &queue,
-            ComposerQueueDispatchBehavior::Scheduled,
-            false,
-            30_000
-        ),
-        Some(0)
-    );
-    // Resuming a paused queue cannot send a future message early.
-    assert_eq!(
-        candidate(
-            &queue[..1],
-            ComposerQueueDispatchBehavior::ForceNext,
-            true,
-            29_999
-        ),
-        None
-    );
+    // Whatever the head is — a deadline that has not arrived, a due schedule,
+    // an ordinary message — nothing behind it is offered, and the session an
+    // entry belongs to never changes that: the queue is one ordered list.
+    assert_eq!(next_queue_message_index(&queue, |_| false), Some(0));
+    // The message behind the head is only offered once the head has left.
+    assert_eq!(next_queue_message_index(&queue[1..], |_| false), Some(0));
+    // A row the reader is editing holds the queue: the message cannot leave
+    // while it is being rewritten, and nothing behind it may overtake it.
+    assert_eq!(next_queue_message_index(&queue, |id| id == 1), None);
+    assert_eq!(next_queue_message_index(&queue, |id| id == 3), Some(0));
+    assert_eq!(next_queue_message_index(&[], |_| false), None);
 }
 
 #[test]
 fn due_messages_wait_for_editing_and_for_a_busy_or_finished_session() {
     let session = VibexSessionId::new();
     let queue = vec![queued(1, &session, Some(1_000))];
-    assert_eq!(
-        next_message_index(
-            &queue,
-            &session,
-            ComposerQueueDispatchBehavior::Scheduled,
-            true,
-            1_000,
-            |_| true
-        ),
-        None
-    );
-    assert_eq!(
-        next_message_index(
-            &queue,
-            &session,
-            ComposerQueueDispatchBehavior::Scheduled,
-            true,
-            1_000,
-            |_| false
-        ),
-        Some(0)
-    );
+    assert_eq!(next_queue_message_index(&queue, |_| true), None);
+    assert_eq!(next_queue_message_index(&queue, |_| false), Some(0));
     // A deferred new session reports `Initializing` — and a session the desktop
     // has not loaded yet reports nothing — until its first message is
     // submitted. Neither is work in progress, so neither may strand the

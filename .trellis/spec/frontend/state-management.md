@@ -610,6 +610,13 @@ Vec<ComposerQueueEntry>` in the versioned desktop UI state, and rebuilds
 `ComposerQueueMessage` on launch. A stored entry is bounded: session id, runtime
 selection, text, attachments, optional command, and `scheduledAtMs`.
 
+`next_queue_message_index(queue, is_editing)` names the one entry the dispatcher
+may hand over — the head, unless it is being edited. One workbench timer checks
+every session, including background sessions. `ComposerQueueDispatchFence`
+remembers the entry that just left the queue (its session, message id, the
+session revision the dispatch left behind, and whether it owes a turn), and
+`composer_queue_fence_waits` decides whether that turn still holds the queue.
+
 ### 3. Contracts
 
 - The pre-send queue survives a restart because it is the reader's own
@@ -629,15 +636,37 @@ selection, text, attachments, optional command, and `scheduledAtMs`.
 - A scheduled new-session submission creates the session with deferred runtime
   materialization and no initial prompt or optimistic user item. Keep its
   message in the queue until dispatch; show a countdown on its empty timeline.
-- One workbench timer checks every session, including background sessions.
-  `Scheduled` dispatch requires an authoritative `Idle`/`Error` snapshot and
-  no local pending turn, action lock, explicit queue pause, or active message
-  edit. The ordinary submission path alone owns delivery and timeline creation.
-- Future deadlines do not block ready queue entries. Due schedules remain
-  automatic in Manual queue mode, but never interrupt a running turn. Ending
-  a queue edit or closing its scheduling dialog re-arms queue evaluation.
+- The pre-send queue is one ordered list across sessions, oldest first, and only
+  its head is ever a dispatch candidate. A scheduled entry therefore cannot be
+  overtaken by the messages behind it, a due schedule cannot jump the entries in
+  front of it — including another session's — and a row being edited holds the
+  whole queue until the edit ends.
+- After an entry leaves the queue, a dispatch fence holds the next one until the
+  turn that entry started is observed to end normally: the fenced session must
+  move past the revision the dispatch left, must settle to `Idle`/`Error`, and
+  must have a probed normal completion (or no conversational turn) for that
+  revision. An abnormal stop keeps the queue waiting for a later normal
+  completion. A submission that never landed, or a command that runs no
+  conversational turn of its own, releases the fence rather than stranding the
+  messages behind it, and a `Closed`/`Archived` session stops holding the queue.
+- Explicit sends are the one gesture allowed to overtake the queue: the row's
+  send-now/steer action promotes the message to the head and its behavior may
+  leave the fence behind. A head that carries a deadline is always dispatched as
+  `Scheduled`, so a schedule can never inherit that bypass and always waits for
+  the entries in front of it.
 - Reordering preserves deadlines; an explicit per-message send clears the
-  deadline. Sidebar clocks are a presentation of queued schedules, never a new
+  deadline. Reordering re-evaluates the head, so a message the reader moved in
+  front of a schedule leaves as soon as its session is settled — no running or
+  pending turn, and the latest turn confirmed normal (or no turn at all, as in a
+  brand-new session) — instead of waiting for the deadline that used to be in
+  front of it.
+- `Scheduled` dispatch requires an authoritative `Idle`/`Error` snapshot and
+  no local pending turn, action lock, explicit queue pause, or active message
+  edit. A due schedule stays automatic in Manual queue mode, but Manual mode
+  still holds an ordinary head, and the queue behind it waits. The ordinary
+  submission path alone owns delivery and timeline creation.
+- Ending a queue edit or closing its scheduling dialog re-arms queue evaluation.
+  Sidebar clocks are a presentation of queued schedules, never a new
   `AgentSessionState`. A session that is only waiting for its scheduled send
   shows the clock and the time left in the row's status lane — including through
   the `Initializing` state a deferred session reports — while a running turn, an
@@ -658,6 +687,12 @@ selection, text, attachments, optional command, and `scheduledAtMs`.
 | Local date/time is ambiguous or nonexistent | Reject rather than choose a timezone offset |
 | Countdown is outside 1 second–365 days, overflows, or has minutes/seconds outside 0–59 | Keep the picker open with an inline error |
 | Session is running, initializing, closed, archived, or unavailable | Retain the scheduled message without dispatch |
+| A message sits in front of a due schedule | Retain the schedule and send the head first |
+| The message ahead of a schedule has not completed a turn normally | Retain the schedule until a later normal completion is observed |
+| The session that owes the queue a turn stops abnormally | Keep waiting; never auto-send past it |
+| The fenced submission failed, or was a command with no turn of its own | Release the fence so the queue is not stranded |
+| A row is being edited | Hold the queue, head included, until the edit ends |
+| The reader moves a message in front of a schedule and its session is settled | Send it without waiting for the deadline |
 | Session creation fails before a record exists | Remove the pending queue entry and restore the active new-session draft including its schedule |
 | A restored entry's session no longer exists | Drop the entry and persist the pruned queue |
 | A restored deadline passed while Vibex was closed | Fire it once, under the ordinary admission rules, instead of dropping it |
@@ -665,25 +700,36 @@ selection, text, attachments, optional command, and `scheduledAtMs`.
 
 ### 5. Good / Base / Bad Cases
 
-- Good: a due message waits for the current turn, then sends once through the
-  existing queue path, even after the user switches sessions.
-- Base: unscheduled messages keep their Auto/Manual behavior.
+- Good: a due message waits for every entry in front of it — and for the turn
+  each of them started to end normally — then sends once through the existing
+  queue path, even after the user switches sessions.
+- Good: a message moved in front of a schedule sends as soon as its session is
+  settled, without waiting for the deadline that used to be ahead of it.
+- Base: unscheduled messages keep their Auto/Manual behavior; a due schedule
+  still fires in Manual queue mode.
 - Bad: render a scheduled prompt on the timeline at submission, or make queue
   resume send a future deadline early.
+- Bad: let a message behind a schedule leave because its own session is idle, or
+  let a due schedule overtake another session's queued entry.
 - Bad: show the manager's `<agent> session` placeholder on a row that is only
   waiting for its scheduled send, or keep that name after the send has landed.
 
 ### 6. Tests Required
 
 `message_schedule_tests.rs` covers deadline boundaries, countdown validation,
-session isolation, active-turn admission, edits, reordering/send-now, draft
-consumption, the row's countdown shape, the name a waiting schedule gives its
-session, and the persisted-entry round trip, plus real dialog keyboard/pointer
-interaction including invalid input, confirmation, dismissal, and removing a
-schedule. `desktop-model` covers the persisted queue's normalization, its
-bounds, and the UI-state encode/decode round trip. A source-level test asserts
-the row keeps the scheduled mark ahead of the generic state indicator and reads
-its name from the queue.
+the head-only queue selection, active-turn admission, edits,
+reordering/send-now, draft consumption, the row's countdown shape, the name a
+waiting schedule gives its session, and the persisted-entry round trip, plus
+real dialog keyboard/pointer interaction including invalid input, confirmation,
+dismissal, and removing a schedule. `app.rs` covers the fence's admission
+matrix — pending submission, unmoved revision, running turn, unobserved
+revision, abnormal stop, normal completion, no turn, closed session — and the
+per-behavior admission of `AfterCompletion`, `AfterInterrupt`, `Automatic`,
+`ForceNext` and `Scheduled`. `desktop-model` covers the persisted queue's
+normalization, its bounds, and the UI-state encode/decode round trip. A
+source-level test asserts the row keeps the scheduled mark ahead of the generic
+state indicator, reads its name from the queue, and keeps the pause honored
+where the head is dispatched.
 
 ### 7. Wrong vs Correct
 
@@ -701,6 +747,17 @@ titles.insert(session_id.clone(), message_text);
 // Correct: derive it from the persisted queue, and stop deriving it once the
 // message has left the queue.
 let title = scheduled_session_title(&self.composer_queue, session);
+```
+
+```rust
+// Wrong: advance the queue when the submission is accepted, or when the head's
+// own session is idle — the message in front may still be running in another
+// session, and a failed submission would strand everything behind it.
+if completed { self.dispatch_next_from_queue(); }
+// Correct: the head may leave only when the turn the previous entry started is
+// observed to have ended normally, and a submission that never landed releases
+// the fence instead of holding the queue.
+let fence_blocks = !explicit && self.composer_queue_fence_blocks();
 ```
 
 ## Scenario: Live Reasoning As Turn Progress
