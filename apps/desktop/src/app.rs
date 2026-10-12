@@ -44518,16 +44518,20 @@ impl VibexWorkbench {
         // action cluster paints over, so it yields to that cluster exactly the
         // way a session row's status column does. A project with nothing
         // running renders no mark at all.
+        //
+        // The row overhangs the list by its icon slot, so its right edge is
+        // already the list inset a session row keeps for its status column;
+        // measuring from the row's edge is what lines this text up with the
+        // session rows' trailing metadata.
         let project_running_session_mark = (project_running_session_count > 0).then(|| {
             div()
                 .id(format!("sidebar-project-running-{project_id_string}"))
                 .absolute()
-                .right_1()
+                .right_0()
                 .top_0()
                 .h(px(32.0))
                 .flex()
                 .items_center()
-                .pr(px(6.0))
                 .text_xs()
                 .text_color(cx.theme().sidebar_foreground.opacity(0.48))
                 .when(!self.sidebar_batch_mode, |this| {
@@ -44692,7 +44696,7 @@ impl VibexWorkbench {
                     .items_center()
                     .gap(px(SIDEBAR_ICON_TITLE_GAP))
                     .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
-                    .when(!self.sidebar_batch_mode, |this| this.pr(px(92.0)))
+                    .when(!self.sidebar_batch_mode, |this| this.pr(px(84.0)))
                     .text_color(if active {
                         cx.theme().sidebar_foreground
                     } else {
@@ -44742,7 +44746,11 @@ impl VibexWorkbench {
                     h_flex()
                         .id(format!("sidebar-project-actions-{project_id_string}"))
                         .absolute()
-                        .right_1()
+                        // The session action cluster keeps its icons 4px inside
+                        // the list; this row's overhang sits inside that inset,
+                        // so the same list-relative inset is negative here and
+                        // the two trailing edges line up.
+                        .right(px(4.0 + SIDEBAR_ROW_ICON_SLOT_OVERHANG))
                         .top_1()
                         .h(px(24.0))
                         .items_center()
@@ -85386,6 +85394,11 @@ mod tests {
         assert!(project.contains("sidebar-project-running-"));
         assert!(project.contains("locale::text(\"running\", \"运行中\", \"執行中\")"));
         assert!(project.contains(".when_some(project_running_session_mark,"));
+        // The project row overhangs the list, so its trailing cluster measures
+        // from the list's right edge: the mark is flush with the row's edge and
+        // the action cluster compensates for the overhang.
+        assert!(project.contains(".right_0()"));
+        assert!(project.contains(".right(px(4.0 + SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
     }
 
     #[test]
