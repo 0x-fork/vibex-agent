@@ -502,6 +502,213 @@ fn team_worker_revision_rearms_its_queue_and_keeps_its_lifecycle_state(cx: &mut 
     });
 }
 
+/// Counts the timeline probes one session was asked for, draining the fixture's
+/// observations so a test can watch them accumulate.
+fn observed_timeline_probes(
+    receiver: &sync_mpsc::Receiver<Observed>,
+    session_id: &VibexSessionId,
+) -> usize {
+    let mut probes = 0;
+    while let Ok(observed) = receiver.try_recv() {
+        if matches!(&observed, Observed::Timeline(probed) if probed == session_id) {
+            probes += 1;
+        }
+    }
+    probes
+}
+
+/// The completion-probe attempts one session has spent on its revision.
+fn probe_attempts(
+    workbench: &Entity<VibexWorkbench>,
+    cx: &mut VisualTestContext,
+    session_id: &VibexSessionId,
+) -> u8 {
+    workbench.read_with(cx, |workbench, _| {
+        workbench
+            .auto_continue_probe_attempts
+            .get(session_id.as_str())
+            .map_or(0, |attempt| attempt.attempts)
+    })
+}
+
+/// Whether the completion probe for one session is still in flight.
+fn probe_in_flight(
+    workbench: &Entity<VibexWorkbench>,
+    cx: &mut VisualTestContext,
+    session_id: &VibexSessionId,
+) -> bool {
+    workbench.read_with(cx, |workbench, _| {
+        workbench
+            .auto_continue_probe_tasks
+            .contains_key(session_id.as_str())
+    })
+}
+
+/// Drives the workbench's tasks until `ready` holds, the way
+/// `TestAppContext::condition` does: a probe is a backend round trip, so its
+/// completion lands after the spawn that made it.
+fn pump_until(
+    cx: &mut VisualTestContext,
+    mut ready: impl FnMut(&mut VisualTestContext) -> bool,
+) -> bool {
+    for _ in 0..400 {
+        cx.run_until_parked();
+        if ready(cx) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+/// An enabled session whose completion probe cannot judge its revision asks
+/// again, on a bounded budget.
+///
+/// A background session has no other reader: its live events are dropped when
+/// no view shows it, so without the retry a failed turn stayed unjudged — and
+/// the countdown only appeared once the reader selected the session and its
+/// load reconciled the status.
+#[gpui::test]
+async fn auto_continue_probe_retries_an_unjudged_revision_up_to_its_budget(
+    cx: &mut TestAppContext,
+) {
+    let (workbench, cx, receiver) = fixture(cx, 2);
+    let unfinished = session(1);
+    workbench.update(cx, |workbench, cx| {
+        workbench
+            .auto_continue_session_ids
+            .insert(unfinished.id.as_str().to_string());
+        workbench.sync_auto_continue_for_session(&unfinished.id, cx);
+    });
+    assert!(
+        probe_in_flight(&workbench, cx, &unfinished.id),
+        "the sync asks the authority for an unjudged revision"
+    );
+    assert_eq!(
+        probe_attempts(&workbench, cx, &unfinished.id),
+        1,
+        "the sync asks the authority once"
+    );
+
+    for attempt in 2..=AUTO_CONTINUE_PROBE_MAX_ATTEMPTS {
+        // The attempt's answer is settled (and its retry armed) before the
+        // backoff the retry waits on can be spent.
+        assert!(
+            pump_until(cx, |cx| !probe_in_flight(&workbench, cx, &unfinished.id)),
+            "the attempt answers before its retry"
+        );
+        cx.executor()
+            .advance_clock(AUTO_CONTINUE_PROBE_RETRY_BACKOFF);
+        assert!(
+            pump_until(cx, |cx| {
+                probe_attempts(&workbench, cx, &unfinished.id) == attempt
+            }),
+            "an answer that cannot judge the revision is asked again"
+        );
+    }
+
+    assert!(
+        pump_until(cx, |cx| !probe_in_flight(&workbench, cx, &unfinished.id)),
+        "the last attempt answers"
+    );
+    cx.executor()
+        .advance_clock(AUTO_CONTINUE_PROBE_RETRY_BACKOFF * 4);
+    std::thread::sleep(Duration::from_millis(50));
+    cx.run_until_parked();
+    assert_eq!(
+        probe_attempts(&workbench, cx, &unfinished.id),
+        AUTO_CONTINUE_PROBE_MAX_ATTEMPTS,
+        "the attempt budget bounds the retry"
+    );
+    assert_eq!(
+        observed_timeline_probes(&receiver, &unfinished.id),
+        usize::from(AUTO_CONTINUE_PROBE_MAX_ATTEMPTS),
+        "every attempt reads the authority's timeline"
+    );
+}
+
+/// A verdict settles its revision; an unjudged one is probed rather than
+/// latched, so the next event (or the probe's own retry) can still decide.
+#[gpui::test]
+async fn auto_continue_does_not_settle_a_revision_without_a_verdict(cx: &mut TestAppContext) {
+    let (workbench, cx, receiver) = fixture(cx, 2);
+    let unfinished = session(1);
+    workbench.update(cx, |workbench, cx| {
+        workbench
+            .auto_continue_session_ids
+            .insert(unfinished.id.as_str().to_string());
+        workbench.auto_continue_turn_statuses.insert(
+            unfinished.id.to_string(),
+            AutoContinueTurnStatus {
+                session_updated_at_ms: unfinished.updated_at_ms,
+                ended_normally: None,
+            },
+        );
+        workbench.sync_auto_continue_for_session(&unfinished.id, cx);
+    });
+    assert!(
+        pump_until(cx, |_cx| {
+            observed_timeline_probes(&receiver, &unfinished.id) >= 1
+        }),
+        "a cached answer with no verdict does not settle the revision"
+    );
+    assert!(
+        workbench.read_with(cx, |workbench, _| {
+            !workbench
+                .auto_continue_countdowns
+                .contains_key(unfinished.id.as_str())
+        }),
+        "an idle session with no verdict does not start a countdown"
+    );
+}
+
+/// A session no view shows reconciles its turn boundary from the live batch
+/// that carries it, because the authority need not publish a new session
+/// revision for that boundary at all.
+#[gpui::test]
+async fn auto_continue_asks_about_a_background_turn_boundary_without_a_view(
+    cx: &mut TestAppContext,
+) {
+    let (workbench, cx, receiver) = fixture(cx, 2);
+    let unfinished = session(1);
+    workbench.update(cx, |workbench, cx| {
+        workbench
+            .auto_continue_session_ids
+            .insert(unfinished.id.as_str().to_string());
+        let payload = TimelinePayload::SystemNotice(SystemNoticePayload {
+            level: SystemNoticeLevel::Info,
+            message: "the turn stopped without an answer".into(),
+        });
+        workbench.apply_live_timeline_batch(
+            vec![TimelineLiveEvent {
+                session_id: unfinished.id.clone(),
+                sequence: 1,
+                item: TimelineItem {
+                    id: TimelineItemId::parse("timeline_background_boundary").unwrap(),
+                    session_id: unfinished.id.clone(),
+                    sequence: 1,
+                    timestamp_ms: 1,
+                    source: TimelineSource::Provider,
+                    kind: payload.kind(),
+                    correlation_id: None,
+                    provider_correlation_id: None,
+                    redaction_state: TimelineRedactionState::None,
+                    execution_attribution: None,
+                    payload_depth: vibex_core::TimelinePayloadDepth::Summary,
+                    payload,
+                },
+            }],
+            cx,
+        );
+    });
+    assert!(
+        pump_until(cx, |_cx| {
+            observed_timeline_probes(&receiver, &unfinished.id) >= 1
+        }),
+        "an unseen session's boundary asks the authority for its outcome"
+    );
+}
+
 #[gpui::test]
 async fn team_queued_session_recovery_uses_metadata_and_drops_only_confirmed_deletions(
     cx: &mut TestAppContext,

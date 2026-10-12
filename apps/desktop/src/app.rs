@@ -723,6 +723,16 @@ const AGENT_TIMELINE_STREAMING_SHRINK_EPSILON_PX: f32 = 1.0;
 /// How long a completion probe that already ran for a revision is left alone
 /// before the same revision may be probed again.
 const AUTO_CONTINUE_PROBE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+/// Attempts one revision's completion probe gets before an answer that could
+/// not judge it is accepted as the verdict.
+///
+/// A background session has no reader but this probe, so an attempt that raced
+/// the turn's own write — or that failed outright — would otherwise leave the
+/// session unjudged for as long as it stayed idle: nothing else re-reads its
+/// timeline, and the countdown only appeared once the reader selected the
+/// session and its load reconciled the status. The budget keeps that recovery
+/// bounded instead of polling a session that genuinely has no verdict.
+const AUTO_CONTINUE_PROBE_MAX_ATTEMPTS: u8 = 3;
 /// Cascade projections the composer memo keeps: one per distinct runtime
 /// selection a session-group split can show at once, with room to spare.
 const RUNTIME_CASCADE_PROJECTION_MEMO_LIMIT: usize = 8;
@@ -918,6 +928,17 @@ struct AutoContinueTurnStatus {
 struct AutoContinueProbeTask {
     session_updated_at_ms: i64,
     _task: Task<()>,
+}
+
+/// One session's completion-probe budget for the revision it is judging.
+///
+/// The attempt count is what bounds the retry of an answer that could not
+/// settle the revision; the timestamp is what spaces those attempts.
+#[derive(Debug, Clone, Copy)]
+struct AutoContinueProbeAttempt {
+    session_updated_at_ms: i64,
+    attempted_at: Instant,
+    attempts: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8702,12 +8723,15 @@ pub struct VibexWorkbench {
     auto_continue_paused_turn_session_ids: BTreeSet<String>,
     auto_continue_handled_turns: BTreeMap<String, i64>,
     auto_continue_turn_statuses: BTreeMap<String, AutoContinueTurnStatus>,
-    /// The revision each session's last completion probe was issued for, and
-    /// when. A probe that cannot answer for a revision must be retried on a
-    /// backoff rather than re-issued on every sync: the sync runs from several
-    /// event paths, and without this a session whose probe never settles kept
-    /// the workbench repainting for as long as it stayed on screen.
-    auto_continue_probe_attempts: BTreeMap<String, (i64, Instant)>,
+    /// The revision each session's last completion probe was issued for, when,
+    /// and how many attempts that revision has spent. A probe that cannot
+    /// answer for a revision must be retried on a backoff rather than re-issued
+    /// on every sync: the sync runs from several event paths, and without this
+    /// a session whose probe never settles kept the workbench repainting for as
+    /// long as it stayed on screen. The attempt count is also what lets a probe
+    /// that could not judge its revision ask again by itself, because a
+    /// background session has no other reader.
+    auto_continue_probe_attempts: BTreeMap<String, AutoContinueProbeAttempt>,
     auto_continue_probe_tasks: BTreeMap<String, AutoContinueProbeTask>,
     auto_continue_countdowns: BTreeMap<String, AutoContinueCountdown>,
     auto_continue_countdown_tasks: BTreeMap<String, Task<()>>,
@@ -14996,96 +15020,150 @@ impl VibexWorkbench {
         }
     }
 
+    /// Asks the authority for one session revision's turn outcome.
+    ///
+    /// Returns whether an answer is on its way: an attempt for this revision is
+    /// in flight, or one was started here. An attempt that leaves the revision
+    /// unjudged — the read failed, or its window held no verdict — is retried
+    /// on the backoff by the attempt itself, because a background session has
+    /// no other reader: its live events are dropped when no view shows it, and
+    /// nothing else re-reads its timeline. The attempt budget bounds that.
     fn probe_auto_continue_turn_status(
         &mut self,
         session_id: VibexSessionId,
         session_updated_at_ms: i64,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if self
             .auto_continue_probe_tasks
             .get(session_id.as_str())
             .is_some_and(|probe| probe.session_updated_at_ms == session_updated_at_ms)
         {
-            return;
+            return true;
         }
-        // One probe per revision per backoff window. A probe whose answer cannot
-        // be cached (the session moved on while it ran) would otherwise be
-        // re-issued by the next sync, which is how a single idle session kept a
-        // repaint loop alive.
-        if self
+        // One probe per revision per backoff window, and a bounded number of
+        // them. A probe whose answer cannot be cached (the session moved on
+        // while it ran) would otherwise be re-issued by the next sync, which is
+        // how a single idle session kept a repaint loop alive.
+        if let Some(attempt) = self
             .auto_continue_probe_attempts
             .get(session_id.as_str())
-            .is_some_and(|(revision, attempted_at)| {
-                *revision == session_updated_at_ms
-                    && attempted_at.elapsed() < AUTO_CONTINUE_PROBE_RETRY_BACKOFF
-            })
+            .filter(|attempt| attempt.session_updated_at_ms == session_updated_at_ms)
         {
-            return;
+            if attempt.attempts >= AUTO_CONTINUE_PROBE_MAX_ATTEMPTS {
+                return false;
+            }
+            if attempt.attempted_at.elapsed() < AUTO_CONTINUE_PROBE_RETRY_BACKOFF {
+                return true;
+            }
         }
+        self.start_auto_continue_probe(session_id, session_updated_at_ms, cx)
+    }
+
+    /// Issues one completion probe and schedules what follows from its answer.
+    ///
+    /// The ungated half of [`Self::probe_auto_continue_turn_status`]: the
+    /// retry of an answer that could not judge its revision has already waited
+    /// the backoff, so only the attempt budget decides there.
+    fn start_auto_continue_probe(
+        &mut self,
+        session_id: VibexSessionId,
+        session_updated_at_ms: i64,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(backend) = self.backend.clone() else {
-            return;
+            return false;
         };
-        self.auto_continue_probe_attempts.insert(
-            session_id.as_str().to_string(),
-            (session_updated_at_ms, Instant::now()),
-        );
-        let probe_session_id = session_id.clone();
-        let request_session_id = probe_session_id.clone();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            backend
-                .agent()
-                .fetch_timeline(FetchTimelineRequest {
-                    session_id: request_session_id,
-                    after_sequence: None,
-                    before_sequence: None,
-                    limit: 500,
-                    max_turns: None,
-                    max_bytes: None,
-                })
-                .await
-        });
+        self.record_auto_continue_probe_attempt(&session_id, session_updated_at_ms);
         let probe_key = session_id.as_str().to_string();
+        let probe_session_id = session_id.clone();
         let task_probe_key = probe_key.clone();
         let task = cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let outcome = runner.await;
-                let _ = entity.update(cx, |this, cx| {
-                    let probe_is_current = this
-                        .auto_continue_probe_tasks
-                        .get(&task_probe_key)
-                        .is_some_and(|probe| probe.session_updated_at_ms == session_updated_at_ms);
-                    if !probe_is_current {
-                        // The session moved on while this probe ran, so its
-                        // answer cannot settle the current revision. Re-arm a
-                        // waiting queue so the next frame probes the revision
-                        // that is actually current instead of stranding it.
-                        this.mark_composer_queue_for_recheck(&probe_session_id);
-                        return;
-                    }
-                    this.auto_continue_probe_tasks.remove(&task_probe_key);
-
-                    let ended_normally = match outcome {
-                        Ok(Ok(page)) if page.session_id == probe_session_id => {
-                            Some(latest_timeline_turn_ended_normally(&page.items))
-                        }
-                        _ => this
-                            .timeline
-                            .session_id
-                            .as_ref()
-                            .filter(|timeline_session_id| *timeline_session_id == &probe_session_id)
-                            .map(|_| latest_timeline_turn_ended_normally(&this.timeline.items)),
-                    };
-                    let changed = this.cache_auto_continue_turn_status(
-                        &probe_session_id,
-                        session_updated_at_ms,
-                        ended_normally.flatten(),
-                        cx,
-                    );
-                    if changed {
-                        cx.notify();
-                    }
+                let request_session_id = probe_session_id.clone();
+                let runner = gpui_tokio::Tokio::spawn(cx, async move {
+                    backend
+                        .agent()
+                        .fetch_timeline(FetchTimelineRequest {
+                            session_id: request_session_id,
+                            after_sequence: None,
+                            before_sequence: None,
+                            limit: 500,
+                            max_turns: None,
+                            max_bytes: None,
+                        })
+                        .await
                 });
+                let outcome = runner.await;
+                let retry = entity
+                    .update(cx, |this, cx| {
+                        let probe_is_current = this
+                            .auto_continue_probe_tasks
+                            .get(&task_probe_key)
+                            .is_some_and(|probe| {
+                                probe.session_updated_at_ms == session_updated_at_ms
+                            });
+                        if !probe_is_current {
+                            // The session moved on while this probe ran, so its
+                            // answer cannot settle the current revision. Re-arm
+                            // a waiting queue so the next frame probes the
+                            // revision that is actually current instead of
+                            // stranding it.
+                            this.mark_composer_queue_for_recheck(&probe_session_id);
+                            return false;
+                        }
+                        this.auto_continue_probe_tasks.remove(&task_probe_key);
+
+                        let ended_normally = match outcome {
+                            Ok(Ok(page)) if page.session_id == probe_session_id => {
+                                Some(latest_timeline_turn_ended_normally(&page.items))
+                            }
+                            _ => this
+                                .timeline
+                                .session_id
+                                .as_ref()
+                                .filter(|timeline_session_id| {
+                                    *timeline_session_id == &probe_session_id
+                                })
+                                .map(|_| latest_timeline_turn_ended_normally(&this.timeline.items)),
+                        }
+                        .flatten();
+                        let changed = this.cache_auto_continue_turn_status(
+                            &probe_session_id,
+                            session_updated_at_ms,
+                            ended_normally,
+                            cx,
+                        );
+                        if changed {
+                            cx.notify();
+                        }
+                        // An answer that leaves the revision unjudged is asked
+                        // again: a background session's only reader is this
+                        // probe, and its read can race the turn's own write.
+                        // The attempt budget bounds the asking.
+                        ended_normally.is_none()
+                            && this.auto_continue_probe_retry_allowed(&probe_session_id)
+                    })
+                    .unwrap_or(false);
+                if !retry {
+                    return;
+                }
+                // The wait cannot live in this task: the task's own handle was
+                // dropped with the probe entry above, and dropping a task
+                // cancels it. A detached retry re-reads the session's state and
+                // its attempt budget before it asks anything, so a session that
+                // moved on while the backoff ran costs one no-op.
+                let retry_session_id = probe_session_id.clone();
+                let retry_entity = entity.clone();
+                cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                    cx.background_executor()
+                        .timer(AUTO_CONTINUE_PROBE_RETRY_BACKOFF)
+                        .await;
+                    let _ = retry_entity.update(cx, |this, cx| {
+                        this.retry_auto_continue_probe(&retry_session_id, cx);
+                    });
+                })
+                .detach();
             },
         );
         self.auto_continue_probe_tasks.insert(
@@ -15093,6 +15171,86 @@ impl VibexWorkbench {
             AutoContinueProbeTask {
                 session_updated_at_ms,
                 _task: task,
+            },
+        );
+        true
+    }
+
+    /// Re-asks for a session's turn outcome after an attempt could not judge
+    /// the revision it ran for.
+    ///
+    /// The revision is read here rather than carried over, and a probe already
+    /// in flight for the session owns the answer: a session that moved on while
+    /// the attempt ran is judged by the probe its own update started, not by a
+    /// stale one this retry would issue.
+    fn retry_auto_continue_probe(&mut self, session_id: &VibexSessionId, cx: &mut Context<Self>) {
+        if self
+            .auto_continue_probe_tasks
+            .contains_key(session_id.as_str())
+        {
+            return;
+        }
+        let Some(session_updated_at_ms) = self
+            .registered_session(session_id.as_str())
+            .map(|session| session.updated_at_ms)
+        else {
+            return;
+        };
+        // An answer that arrived while this retry waited already judges the
+        // revision that is current now, so there is nothing to ask.
+        if self
+            .cached_auto_continue_turn_status(session_id, session_updated_at_ms)
+            .and_then(|status| status.ended_normally)
+            .is_some()
+        {
+            return;
+        }
+        if !self.auto_continue_probe_retry_allowed(session_id) {
+            return;
+        }
+        self.start_auto_continue_probe(session_id.clone(), session_updated_at_ms, cx);
+    }
+
+    /// Whether an attempt that could not judge its revision is worth repeating.
+    ///
+    /// The retry asks for the revision that is current when it fires, so a
+    /// session that moved on is left to the sync that observed the newer
+    /// revision rather than being probed for a revision that no longer exists.
+    fn auto_continue_probe_retry_allowed(&self, session_id: &VibexSessionId) -> bool {
+        self.auto_continue_enabled(session_id)
+            && self
+                .registered_session(session_id.as_str())
+                .is_some_and(|session| {
+                    matches!(
+                        session.state,
+                        AgentSessionState::Idle | AgentSessionState::Error
+                    )
+                })
+            && self
+                .auto_continue_probe_attempts
+                .get(session_id.as_str())
+                .is_none_or(|attempt| attempt.attempts < AUTO_CONTINUE_PROBE_MAX_ATTEMPTS)
+    }
+
+    /// Records one completion-probe attempt. The count is per revision, so a
+    /// session that moves on starts a fresh budget instead of inheriting the
+    /// attempts its previous revision spent.
+    fn record_auto_continue_probe_attempt(
+        &mut self,
+        session_id: &VibexSessionId,
+        session_updated_at_ms: i64,
+    ) {
+        let attempts = self
+            .auto_continue_probe_attempts
+            .get(session_id.as_str())
+            .filter(|attempt| attempt.session_updated_at_ms == session_updated_at_ms)
+            .map_or(0, |attempt| attempt.attempts);
+        self.auto_continue_probe_attempts.insert(
+            session_id.as_str().to_string(),
+            AutoContinueProbeAttempt {
+                session_updated_at_ms,
+                attempted_at: Instant::now(),
+                attempts: attempts.saturating_add(1),
             },
         );
     }
@@ -15166,15 +15324,24 @@ impl VibexWorkbench {
         };
         let cached_status =
             self.cached_auto_continue_turn_status(session_id, session_updated_at_ms);
+        // Only a verdict settles a revision. An answer the authority could not
+        // give — a failed read, or a window with no conversational turn — keeps
+        // the revision unjudged, so the probe is asked again (on its backoff)
+        // instead of the revision latching as "needs no continuation" until the
+        // reader happens to reselect the session. Once this revision's probe
+        // budget is spent, the evaluation below runs with what it has: an
+        // `Error` session continues, an `Idle` one, which has no turn to
+        // continue, does not.
+        let settled_status = cached_status.and_then(|status| status.ended_normally);
         if self.auto_continue_enabled(session_id)
             && matches!(
                 session_state,
                 AgentSessionState::Idle | AgentSessionState::Error
             )
-            && cached_status.is_none()
+            && settled_status.is_none()
+            && self.probe_auto_continue_turn_status(session_id.clone(), session_updated_at_ms, cx)
         {
             self.cancel_auto_continue_countdown(session_id);
-            self.probe_auto_continue_turn_status(session_id.clone(), session_updated_at_ms, cx);
             return;
         }
         if !matches!(
@@ -15188,7 +15355,7 @@ impl VibexWorkbench {
         let should_start = auto_continue_should_start(
             self.auto_continue_enabled(session_id),
             session_state,
-            cached_status.and_then(|status| status.ended_normally),
+            settled_status,
             self.session_turn_pending(session_id),
             self.auto_continue_paused_turn_session_ids
                 .contains(session_id.as_str()),
@@ -21639,6 +21806,12 @@ impl VibexWorkbench {
         let state = self.live_agent_session_state();
         let pending = self.live_turn_pending();
         let reasoning = self.ui_state.session.reasoning_display_mode;
+        // The read describes the revision the session is at when it is asked
+        // for, not whichever revision it reaches while it runs; see the native
+        // twin for why the request-time revision is the one that may be cached.
+        let load_revision = self
+            .registered_session(session_id.as_str())
+            .map(|session| session.updated_at_ms);
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let (items, timeline_has_older) = match resume {
                 Some(resume) => {
@@ -21701,6 +21874,21 @@ impl VibexWorkbench {
                             if this.timeline.needs_authoritative_refetch {
                                 this.refresh_selected_agent_timeline(cx);
                             }
+                            // A paired authority reconciles the turn outcome
+                            // from its own fresh read exactly like the native
+                            // loader, so an enabled session opened onto a
+                            // failed turn starts its countdown here instead of
+                            // waiting for a probe that this load just replaced.
+                            if let Some(session_updated_at_ms) = load_revision {
+                                let ended_normally =
+                                    latest_timeline_turn_ended_normally(&this.timeline.items);
+                                this.cache_auto_continue_turn_status(
+                                    &session_id,
+                                    session_updated_at_ms,
+                                    ended_normally,
+                                    cx,
+                                );
+                            }
                             this.auto_continue_probe_tasks.remove(session_id.as_str());
                             if this.timeline_follow.following_bottom {
                                 this.request_timeline_scroll_to_latest();
@@ -21736,6 +21924,15 @@ impl VibexWorkbench {
         let state = self.live_agent_session_state();
         let pending = self.live_turn_pending();
         let reasoning = self.ui_state.session.reasoning_display_mode;
+        // The window this read returns describes the revision the session is at
+        // when the read is asked for, not whichever revision it reaches while
+        // the read runs. Carrying the request-time revision is what keeps a
+        // turn that ends mid-read from being judged by the previous turn's
+        // tail: a superseded answer is refused, and the completion probe
+        // answers for the revision that is actually current.
+        let load_revision = self
+            .registered_session(session_id.as_str())
+            .map(|session| session.updated_at_ms);
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let (items, timeline_has_older) = match resume {
                 Some(resume) => {
@@ -21796,10 +21993,7 @@ impl VibexWorkbench {
                             if this.timeline.needs_authoritative_refetch {
                                 this.refresh_selected_agent_timeline(cx);
                             }
-                            if let Some(session_updated_at_ms) = this
-                                .registered_session(session_id.as_str())
-                                .map(|session| session.updated_at_ms)
-                            {
+                            if let Some(session_updated_at_ms) = load_revision {
                                 let ended_normally =
                                     latest_timeline_turn_ended_normally(&this.timeline.items);
                                 this.cache_auto_continue_turn_status(
@@ -22536,7 +22730,14 @@ impl VibexWorkbench {
             };
             if !self.session_view_exists(&session_id) {
                 // Nothing on screen shows this session; the sidebar bookkeeping
-                // above is all it needs.
+                // above is all it needs — except for an enabled auto-continue
+                // session, whose turn boundary this batch is the only notice of
+                // when the authority publishes no new session revision for it.
+                // The sync reads cached state and probes on a backoff, so an
+                // ordinary chunk costs a couple of map lookups.
+                if self.auto_continue_enabled(&session_id) {
+                    self.sync_auto_continue_for_session(&session_id, cx);
+                }
                 continue;
             }
             if !visible.contains(session_id.as_str()) {
@@ -22627,7 +22828,13 @@ impl VibexWorkbench {
         }
         let optimistic_reconciled = changed > 0 && self.reconcile_optimistic_user_message();
         if changed > 0 {
+            // A view that still owes an authoritative refetch is not the
+            // session's tail — it fell behind the live stream — so its last
+            // conversational item cannot judge the current revision. Leaving
+            // that revision uncached lets the completion probe answer it from
+            // the authority instead.
             if auto_continue_refresh
+                && !self.timeline.needs_authoritative_refetch
                 && let Some(session_updated_at_ms) = self
                     .registered_session(session_id.as_str())
                     .map(|session| session.updated_at_ms)
@@ -85994,9 +86201,12 @@ mod tests {
         assert!(geometry.contains("self.timeline_scroll_anchor_pending ="));
         assert!(geometry.contains("!self.timeline_follow.following_bottom"));
 
+        // Selecting a session only moves the view onto it. Judging the turn it
+        // was left on is the loader's job, and the loader is addressed as its
+        // own range below.
         let selection = source
             .split_once("    fn select_session_with_history(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_session_timeline("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_session_timeline_remote("))
             .map(|(body, _)| body)
             .expect("session selection should remain inspectable");
         assert!(selection.contains("self.borrow_session_view(&session_id)"));
@@ -90916,6 +91126,110 @@ mod tests {
             .expect("session auto-continue toggle should remain inspectable");
         assert!(session_toggle.contains("auto_continue_session_overrides"));
         assert!(session_toggle.contains("self.queue_ui_state()"));
+    }
+
+    #[test]
+    fn auto_continue_reconciles_an_unjudged_revision_off_the_authority() {
+        let source = include_str!("app.rs");
+        let probe = source
+            .split_once("    fn probe_auto_continue_turn_status(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_auto_continue_enabled("))
+            .map(|(body, _)| body)
+            .expect("the completion probe should remain inspectable");
+        // An answer that cannot judge its revision is asked again by the probe
+        // itself, on a budget: a background session has no other reader, so a
+        // read that raced the turn's own write must not strand the countdown
+        // until the reader happens to reselect the session.
+        assert!(probe.contains("AUTO_CONTINUE_PROBE_MAX_ATTEMPTS"));
+        assert!(probe.contains("auto_continue_probe_retry_allowed"));
+        assert!(probe.contains("AUTO_CONTINUE_PROBE_RETRY_BACKOFF"));
+        assert!(probe.contains("retry_auto_continue_probe"));
+        assert!(probe.contains("auto_continue_probe_attempts"));
+
+        let retry = source
+            .split_once("    fn retry_auto_continue_probe(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Records one completion-probe attempt"))
+            .map(|(body, _)| body)
+            .expect("the completion-probe retry should remain inspectable");
+        // The retry reads the revision it fires for, and an answer already on
+        // its way for the session owns it.
+        assert!(retry.contains("registered_session(session_id.as_str())"));
+        assert!(retry.contains("auto_continue_probe_tasks"));
+        assert!(retry.contains("contains_key"));
+        assert!(retry.contains("start_auto_continue_probe"));
+
+        let start = source
+            .split_once("    fn start_auto_continue_probe(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Re-asks for a session's turn outcome"))
+            .map(|(body, _)| body)
+            .expect("the completion-probe attempt should remain inspectable");
+        // The wait outlives the probe: its own handle is dropped with the
+        // probe entry, and dropping a task cancels it.
+        assert!(start.contains("AUTO_CONTINUE_PROBE_RETRY_BACKOFF"));
+        assert!(start.contains("timer("));
+        assert!(start.contains(".detach();"));
+
+        let sync = source
+            .split_once("    fn sync_auto_continue_for_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn start_auto_continue_countdown("))
+            .map(|(body, _)| body)
+            .expect("auto-continue sync should remain inspectable");
+        // Only a verdict settles a revision: an answer with no verdict probes
+        // again instead of latching as "needs no continuation".
+        assert!(sync.contains("let settled_status = cached_status"));
+        assert!(sync.contains("settled_status.is_none()"));
+        assert!(sync.contains("self.probe_auto_continue_turn_status(session_id.clone()"));
+
+        // A load's window is attributed to the revision it was asked for, so a
+        // turn that ends while the read runs is not judged by the previous
+        // turn's tail — and both authorities reconcile it, not just the native
+        // one.
+        for (loader, next) in [
+            (
+                "    fn load_agent_session_timeline(",
+                "\n    fn refresh_selected_agent_timeline(",
+            ),
+            (
+                "    fn load_agent_session_timeline_remote(",
+                "\n    fn load_agent_session_timeline(",
+            ),
+        ] {
+            let load = source
+                .split_once(loader)
+                .and_then(|(_, tail)| tail.split_once(next))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{loader} should remain inspectable"));
+            assert!(load.contains("let load_revision = self"));
+            assert!(load.contains("cache_auto_continue_turn_status("));
+            assert!(load.contains("session_updated_at_ms"));
+        }
+
+        let live = source
+            .split_once("    fn apply_timeline_events_to_borrowed_view(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Refetches one session's authoritative timeline, selected or not.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("live timeline folding should remain inspectable");
+        // A view that owes an authoritative refetch is not the session's tail,
+        // so its last conversational item cannot judge the current revision.
+        assert!(live.contains("!self.timeline.needs_authoritative_refetch"));
+
+        let batch = source
+            .split_once("    fn apply_live_timeline_batch(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Applies one session's live events to the view currently borrowed.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("live batches should remain inspectable");
+        // A session no view shows still reconciles its turn boundary from the
+        // batch that carries it, because that batch is its only notice.
+        assert!(batch.contains("self.auto_continue_enabled(&session_id)"));
+        assert!(batch.contains("self.sync_auto_continue_for_session(&session_id, cx);"));
     }
 
     #[test]
