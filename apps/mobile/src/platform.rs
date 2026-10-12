@@ -119,7 +119,12 @@ pub fn leave_app() {
     #[cfg(target_os = "android")]
     {
         crate::android_bridge::with_activity(|env, activity| {
-            env.call_method(activity, "gpuiBackgroundApp", "()V", &[])?;
+            env.call_method(
+                activity,
+                jni::jni_str!("gpuiBackgroundApp"),
+                jni::jni_sig!(() -> ()),
+                &[],
+            )?;
             Ok(())
         });
     }
