@@ -1117,19 +1117,24 @@ strings! {
     // ---- command palette / overlays --------------------------------------
     palette_title => { "Command palette", "命令面板", "命令面板" },
     palette_placeholder => { "Type a command…", "输入命令…", "輸入命令…" },
+    // The headings, in the order the palette draws them: where the reader is,
+    // the devices they trust, the client itself, and the conversation.
+    palette_group_view => { "View", "视图", "檢視" },
+    palette_group_pairing => { "Pairing & devices", "配对与设备管理", "配對與裝置管理" },
+    palette_group_app => { "App", "应用", "應用" },
     palette_group_session => { "Session", "会话", "工作階段" },
     palette_group_workbench => { "Workbench", "工作台", "工作台" },
-    palette_group_management => { "Management", "管理", "管理" },
-    palette_group_device => { "Devices", "设备", "裝置" },
-    palette_group_view => { "View", "视图", "檢視" },
-    palette_group_app => { "App", "应用", "應用" },
     // The palette's own names and one-line explanations. They are longer than
     // the key bar's labels because the palette is read as a menu rather than
     // glanced at as a legend.
     palette_cmd_sessions => { "Sessions", "会话", "工作階段" },
     palette_hint_sessions => { "Open the session list", "打开会话列表", "開啟工作階段清單" },
-    palette_cmd_management => { "Management", "管理", "管理" },
-    palette_hint_management => { "Open the management index", "打开管理索引", "開啟管理索引" },
+    palette_cmd_management => { "Configuration centre", "配置中心", "配置中心" },
+    palette_hint_management => {
+        "Open the configuration centre",
+        "打开配置中心",
+        "開啟配置中心"
+    },
     palette_cmd_settings => { "Settings", "设置", "設定" },
     palette_hint_settings => { "Theme, language, keys", "主题、语言、键位", "主題、語言、鍵位" },
     palette_cmd_help => { "Help", "帮助", "說明" },
@@ -1178,9 +1183,13 @@ strings! {
         "重新发现可用的 Agent",
         "重新探索可用的 Agent"
     },
-    palette_cmd_devices => { "Devices", "设备", "裝置" },
-    palette_hint_devices => { "Pair and revoke devices", "配对与吊销设备", "配對與撤銷裝置" },
-    palette_cmd_pair_device => { "Pair a device", "配对设备", "配對裝置" },
+    palette_cmd_devices => { "Device management", "设备管理", "裝置管理" },
+    palette_hint_devices => {
+        "Manage the paired devices",
+        "管理已配对的设备",
+        "管理已配對的裝置"
+    },
+    palette_cmd_pair_device => { "Device pairing", "设备配对", "裝置配對" },
     palette_hint_pair_device => {
         "Issue a one-time pairing code",
         "生成一次性配对码",

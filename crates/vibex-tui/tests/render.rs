@@ -3154,6 +3154,88 @@ fn the_palette_groups_commands_under_their_headings() {
     );
 }
 
+/// The sections read top-down in the order the reader asked for: where they
+/// are, the devices they trust, the client itself, and the conversation. The
+/// headings are compared in Chinese because that is where the two renamed
+/// commands and the merged device section have to be legible.
+#[test]
+fn the_palette_files_its_sections_in_reading_order() {
+    let mut app = app(120, 40);
+    app.strings = Strings::for_locale(Locale::ZhCn);
+    app.perform(vibex_tui::action::Intent::OpenCommandPalette);
+    let buffer = render_buffer(&mut app, 120, 40);
+    let region = app
+        .regions
+        .palette
+        .clone()
+        .expect("the palette published no rows");
+    // A heading is the line the region maps to no entry; reading a wide glyph
+    // back inserts a cell of padding after it, so the spaces come out.
+    let headings = region
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.is_none())
+        .map(|(line, _)| {
+            (region.rect.x..region.rect.right())
+                .filter_map(|column| buffer.cell((column, region.rect.y + line as u16)))
+                .map(|cell| cell.symbol().to_string())
+                .collect::<String>()
+                .replace(' ', "")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        headings,
+        vec!["视图", "配对与设备管理", "应用", "会话"],
+        "the palette's sections are out of order"
+    );
+
+    // The two device commands share the merged heading, and the pairing one is
+    // named for what it does rather than for the page it used to live on.
+    let entries = app.palette_entries("");
+    let pairing = entries
+        .iter()
+        .filter(|listing| listing.group == vibex_tui::view::PaletteGroup::Pairing)
+        .map(|listing| listing.entry.label(Strings::for_locale(Locale::ZhCn)))
+        .collect::<Vec<_>>();
+    assert!(
+        pairing.contains(&"设备配对") && pairing.contains(&"设备管理"),
+        "the pairing section is not the device section: {pairing:?}"
+    );
+}
+
+/// Device management opens the paired devices themselves, not the
+/// configuration centre that used to be the only way to reach them.
+#[test]
+fn the_palette_sends_device_management_to_the_paired_devices() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    // From the composing page and from inside the configuration centre alike:
+    // the command names its own destination, so the page it was opened from
+    // cannot decide where it lands.
+    for start in [Page::NewSession, Page::Management] {
+        app.navigate_to(start);
+        app.perform(Intent::OpenCommandPalette);
+        let index = app
+            .palette_entries("")
+            .iter()
+            .position(|listing| listing.entry.intent == Intent::GotoDevices)
+            .expect("the palette lost its device command");
+        app.select_palette_row(index, false);
+        app.perform(Intent::PaletteRun);
+        assert_eq!(
+            app.page,
+            Page::Devices,
+            "device management opened another page from {start:?}"
+        );
+    }
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("Paired devices"),
+        "the device command did not open the paired devices:\n{screen}"
+    );
+}
+
 #[test]
 fn the_palette_names_its_commands_in_the_reader_s_language() {
     let mut app = app(120, 40);

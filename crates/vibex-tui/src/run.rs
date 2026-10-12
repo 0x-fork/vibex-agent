@@ -3584,18 +3584,22 @@ mod tests {
     /// pointer takes the highlight `↑↓` paints, and a click runs it. Both go
     /// through the cursor the keys move, so the row that is lit and the command
     /// that runs cannot disagree.
+    ///
+    /// The frame is tall because the sections read view-first: a session command
+    /// is the last group down, and a palette window that only fits the first
+    /// screenful cannot show the row this test points at.
     #[test]
     fn the_palette_rows_answer_the_pointer() {
         use crate::action::Intent;
         use crate::view::PaletteGroup;
         let worker = isolation_worker();
-        let mut app = test_app(100, 30);
+        let mut app = test_app(100, 60);
         app.navigate_to(Page::Agent);
         app.overlay = Some(Overlay::Palette {
             query: String::new(),
             selected: 0,
         });
-        conversation_frame(&mut app, 100, 30);
+        conversation_frame(&mut app, 100, 60);
         let region = app
             .regions
             .palette

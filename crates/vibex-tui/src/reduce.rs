@@ -2690,6 +2690,11 @@ impl App {
                 self.overlay = None;
                 self.perform(listing.entry.intent)
             }
+            // Both arrows wrap. The list is a ring rather than a shelf: the
+            // reader holding `↓` on the last command arrives back at the first
+            // one instead of stopping, and `↑` on the first goes to the last.
+            // One rule for both directions is also what keeps a palette whose
+            // length changes under a query from reading as a boundary.
             Intent::SelectNext => {
                 let count = self.palette_entries(&query).len();
                 self.overlay = Some(Overlay::Palette {
@@ -2703,9 +2708,14 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::SelectPrevious => {
+                let count = self.palette_entries(&query).len();
                 self.overlay = Some(Overlay::Palette {
                     query,
-                    selected: selected.saturating_sub(1),
+                    selected: if count == 0 {
+                        0
+                    } else {
+                        (selected + count - 1) % count
+                    },
                 });
                 Outcome::effects(vec![])
             }
@@ -6028,6 +6038,42 @@ mod tests {
         assert!(!app.filtering, "the filter stayed open");
         assert!(app.filter.is_empty(), "the query outlived the filter");
         assert_eq!(app.page, Page::Settings);
+    }
+
+    #[test]
+    fn the_palette_wraps_at_both_ends() {
+        // The list is a ring, not a shelf: `↓` on the last command answers with
+        // the first, and `↑` on the first answers with the last. One rule for
+        // both directions is what keeps an end from reading as a dead key.
+        let mut app = capable_app();
+        app.perform(Intent::OpenCommandPalette);
+        let count = app.palette_entries("").len();
+        assert!(count > 1, "the palette has nothing to walk");
+
+        let selected = |app: &App| match app.overlay {
+            Some(Overlay::Palette { selected, .. }) => selected,
+            _ => panic!("the palette is not up"),
+        };
+
+        app.overlay = Some(Overlay::Palette {
+            query: String::new(),
+            selected: count - 1,
+        });
+        app.perform(Intent::SelectNext);
+        assert_eq!(
+            selected(&app),
+            0,
+            "the last command did not wrap to the first"
+        );
+
+        // The wrap back is the same move in the other direction, from the first
+        // entry the previous press landed on.
+        app.perform(Intent::SelectPrevious);
+        assert_eq!(
+            selected(&app),
+            count - 1,
+            "the first command did not wrap back to the last"
+        );
     }
 
     #[test]

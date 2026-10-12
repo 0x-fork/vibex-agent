@@ -275,23 +275,30 @@ pub const PALETTE: &[PaletteEntry] = &[
 /// The heading a palette command is filed under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PaletteGroup {
-    Session,
-    Workbench,
-    Management,
-    Device,
+    /// The reader's own place in the client: which page is in front of them.
     View,
+    /// Pairing a device and managing the ones already paired. The two are one
+    /// subject — a device arrives by pairing and is revoked from the same
+    /// list — so they share a heading rather than sitting under the pages they
+    /// happen to be reached from.
+    Pairing,
+    /// The client itself: the runtime a session runs on, the keys it answers
+    /// to, the picture on screen.
     App,
+    /// One conversation: creating, renaming, forking, archiving, deleting.
+    Session,
+    /// The transcript the reader is reading.
+    Workbench,
 }
 
 impl PaletteGroup {
     pub fn label(self, strings: Strings) -> &'static str {
         match self {
+            PaletteGroup::View => strings.palette_group_view(),
+            PaletteGroup::Pairing => strings.palette_group_pairing(),
+            PaletteGroup::App => strings.palette_group_app(),
             PaletteGroup::Session => strings.palette_group_session(),
             PaletteGroup::Workbench => strings.palette_group_workbench(),
-            PaletteGroup::Management => strings.palette_group_management(),
-            PaletteGroup::Device => strings.palette_group_device(),
-            PaletteGroup::View => strings.palette_group_view(),
-            PaletteGroup::App => strings.palette_group_app(),
         }
     }
 }
@@ -299,6 +306,17 @@ impl PaletteGroup {
 /// Which heading a command belongs under.
 pub const fn palette_group(intent: Intent) -> PaletteGroup {
     match intent {
+        Intent::GotoSessions
+        | Intent::GotoManagement
+        | Intent::OpenSettings
+        | Intent::ToggleHelp
+        | Intent::ToggleSidebar
+        | Intent::FocusNext
+        | Intent::FocusPrevious => PaletteGroup::View,
+        Intent::GotoDevices
+        | Intent::CreatePairingCode
+        | Intent::RevokeSelectedDevice
+        | Intent::OpenDeviceAudit => PaletteGroup::Pairing,
         Intent::NewSession
         | Intent::BeginRenameSession
         | Intent::ForkSession
@@ -313,25 +331,9 @@ pub const fn palette_group(intent: Intent) -> PaletteGroup {
         | Intent::CopyBlockMetadata
         | Intent::ToggleBlockExpanded
         | Intent::BeginTranscriptSearch => PaletteGroup::Workbench,
-        Intent::GotoDevices
-        | Intent::ConfigModuleNext
-        | Intent::ConfigModulePrevious
-        | Intent::ConfigEntryActions
-        | Intent::ConfigEntryCreate
-        | Intent::ConfigEntryDelete
-        | Intent::ToggleSelectedEntry
-        | Intent::EditSelectedEntry
-        | Intent::ReloadManagement => PaletteGroup::Management,
-        Intent::CreatePairingCode | Intent::RevokeSelectedDevice | Intent::OpenDeviceAudit => {
-            PaletteGroup::Device
-        }
-        Intent::GotoSessions
-        | Intent::GotoManagement
-        | Intent::OpenSettings
-        | Intent::ToggleHelp
-        | Intent::ToggleSidebar
-        | Intent::FocusNext
-        | Intent::FocusPrevious => PaletteGroup::View,
+        // The client's own commands, and the configuration centre's record
+        // verbs with them: they change how the client behaves rather than
+        // which page is in front of the reader.
         _ => PaletteGroup::App,
     }
 }
