@@ -51,7 +51,6 @@ pub enum Page {
     Skills,
     Prompts,
     Devices,
-    Usage,
     Settings,
     Help,
 }
@@ -67,7 +66,6 @@ impl Page {
             Page::Skills => Scope::Skills,
             Page::Prompts => Scope::Prompts,
             Page::Devices => Scope::Devices,
-            Page::Usage => Scope::Usage,
             Page::Settings => Scope::Settings,
             Page::Help => Scope::Help,
         }
@@ -506,8 +504,6 @@ pub struct ManagementData {
     pub skills: Vec<vibex_core::Skill>,
     pub prompts: Vec<vibex_core::Prompt>,
     pub backups: Vec<vibex_core::BackupCreateOutcome>,
-    pub usage: Option<vibex_core::AgentUsageStatistics>,
-    pub usage_session: Option<vibex_core::AgentTokenUsage>,
 }
 
 /// The reader's own arrangement of the session list.
@@ -851,8 +847,6 @@ pub struct App {
     pub run_option_prompt: Option<RunOptionKey>,
     /// In-progress elicitation answers.
     pub elicitation_draft: crate::reduce::ElicitationDraft,
-    /// Whether the usage page shows this session or the aggregate.
-    pub usage_scope_session: bool,
     /// Session ids whose detail card is open in the session list.
     ///
     /// Keyed by id rather than row index so a refresh, a rename or a filter
@@ -935,8 +929,6 @@ pub struct App {
     pub banner: Option<Banner>,
     /// When the running turn started, for the elapsed-time readout.
     pub turn_started: Option<std::time::Instant>,
-    /// Tokens spent by the running turn, for the readout beside the timer.
-    pub turn_tokens: Option<u64>,
     /// The running turn as the line above the composer reads it: its phase, how
     /// many tools it has called, and how fast it is producing output.
     ///
@@ -1464,7 +1456,6 @@ impl App {
             new_session_runtime: None,
             run_option_prompt: None,
             elicitation_draft: crate::reduce::ElicitationDraft::default(),
-            usage_scope_session: true,
             session_cards: std::collections::BTreeSet::new(),
             search: None,
             hover: None,
@@ -1489,7 +1480,6 @@ impl App {
             session_echoes: BTreeMap::new(),
             banner: None,
             turn_started: None,
-            turn_tokens: None,
             turn_readout: crate::turn::TurnReadout::default(),
             activity: None,
             animation_phase: 0,
@@ -2734,7 +2724,7 @@ impl App {
             Page::Prompts => self.management_data.prompts.len(),
             Page::Settings => self.visible_settings().len(),
             Page::Agent => self.transcript.len(),
-            Page::Usage | Page::Help => 0,
+            Page::Help => 0,
         }
     }
 
@@ -3248,13 +3238,6 @@ impl App {
         self.turn_started.map(|started| started.elapsed())
     }
 
-    /// Tokens spent by the running turn.
-    pub fn turn_tokens(&self) -> Option<u64> {
-        self.page_owns_session()
-            .then_some(self.turn_tokens)
-            .flatten()
-    }
-
     /// The reading of the running turn, for the line above the composer.
     ///
     /// `None` when nothing is running or the page has no session of its own:
@@ -3278,7 +3261,6 @@ impl App {
             Page::Skills => strings.management_skills(),
             Page::Prompts => strings.management_prompts(),
             Page::Devices => strings.devices_title(),
-            Page::Usage => strings.nav_usage(),
             Page::Settings => strings.nav_settings(),
             Page::Help => strings.nav_help(),
         }
@@ -3419,7 +3401,6 @@ impl App {
             }
             (false, true) => {
                 self.turn_started = None;
-                self.turn_tokens = None;
                 self.turn_readout.forget();
                 true
             }
@@ -3647,7 +3628,7 @@ impl App {
     ///
     /// The page being left is remembered, because `Esc` walks back through the
     /// pages the reader actually opened rather than through a fixed hierarchy:
-    /// a reader who opened Usage from the composing page lands back on the
+    /// a reader who opened Settings from the composing page lands back on the
     /// composing page, not on a session list they never opened. Showing the
     /// page already on screen is not a step, so it is not remembered either.
     pub fn navigate_to(&mut self, page: Page) {
@@ -5854,7 +5835,6 @@ pub enum Effect {
         prompt_id: vibex_core::PromptId,
         enabled: bool,
     },
-    LoadUsage,
     DiscoverCompletions {
         ticket: ComposerTicket,
         trigger: crate::composer::CompletionTrigger,
@@ -5959,7 +5939,6 @@ impl Effect {
             Effect::ToggleMcp { .. } | Effect::ToggleSkill { .. } | Effect::TogglePrompt { .. } => {
                 "toggle_entry"
             }
-            Effect::LoadUsage => "usage",
             Effect::DiscoverCompletions { .. } => "completions",
             Effect::CheckDrift => "drift",
             Effect::ProbeAgentRuntime { .. } => "runtime_probe",
@@ -6378,7 +6357,6 @@ mod tests {
             Page::Sessions,
             Page::Agent,
             Page::Devices,
-            Page::Usage,
             Page::Settings,
             Page::Help,
         ] {

@@ -59,7 +59,6 @@ intents! {
     ContextualCancel => { scope: Global, id: "cancel", label: "Cancel", help: "Clear the input, else interrupt the running turn, else offer to quit." },
     GotoSessions => { scope: Global, id: "goto_sessions", label: "Sessions", help: "Jump to the session list." },
     GotoManagement => { scope: Global, id: "goto_management", label: "Management", help: "Jump to the management index." },
-    GotoUsage => { scope: Global, id: "goto_usage", label: "Usage", help: "Jump to token usage." },
     ToggleSidebar => { scope: Global, id: "toggle_sidebar", label: "Sidebar", help: "Collapse or show the sidebar." },
     ReloadKeymap => { scope: Global, id: "reload_keymap", label: "Reload keys", help: "Re-read ~/.vibex/tui-keys.toml." },
 
@@ -207,10 +206,6 @@ intents! {
     RevokeSelectedDevice => { scope: Devices, id: "device_revoke", label: "Revoke", help: "Revoke the highlighted device's access." },
     OpenDeviceAudit => { scope: Devices, id: "device_audit", label: "Audit", help: "Show the remote-protocol audit trail." },
 
-    // ---- usage ----------------------------------------------------------
-    UsageSessionScope => { scope: Usage, id: "usage_scope", label: "Scope", help: "Switch between this session and the aggregate." },
-
-
     // ---- settings -------------------------------------------------------
     ActivateSetting => { scope: Settings, id: "setting_activate", label: "Change", help: "Change the highlighted setting." },
     SettingPrevious => { scope: Settings, id: "setting_previous", label: "Previous value", help: "Step the setting backwards." },
@@ -280,7 +275,6 @@ impl Intent {
                 | Intent::NewSession
                 | Intent::GotoSessions
                 | Intent::GotoManagement
-                | Intent::GotoUsage
                 | Intent::SelectPrevious
                 | Intent::SelectNext
                 | Intent::ScrollPageUp

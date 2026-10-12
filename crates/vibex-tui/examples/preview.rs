@@ -141,7 +141,6 @@ fn main() {
     // A live turn, so the rail and the turn line render rather than the idle
     // and single-turn fallbacks.
     app.turn_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(72));
-    app.turn_tokens = Some(12_400);
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");

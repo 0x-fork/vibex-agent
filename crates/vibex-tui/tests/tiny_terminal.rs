@@ -110,7 +110,6 @@ const PAGES: &[Page] = &[
     Page::Skills,
     Page::Prompts,
     Page::Devices,
-    Page::Usage,
     Page::Settings,
     Page::Help,
 ];

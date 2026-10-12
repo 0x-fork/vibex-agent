@@ -286,7 +286,6 @@ pub enum Scope {
     Skills,
     Prompts,
     Devices,
-    Usage,
     Settings,
     Help,
 }
@@ -307,7 +306,6 @@ impl Scope {
         Scope::Skills,
         Scope::Prompts,
         Scope::Devices,
-        Scope::Usage,
         Scope::Settings,
         Scope::Help,
     ];
@@ -327,7 +325,6 @@ impl Scope {
             Scope::Skills => "skills",
             Scope::Prompts => "prompts",
             Scope::Devices => "devices",
-            Scope::Usage => "usage",
             Scope::Settings => "settings",
             Scope::Help => "help",
         }
@@ -347,7 +344,7 @@ impl Scope {
             | Scope::Mcp
             | Scope::Skills
             | Scope::Prompts => Category::Management,
-            Scope::Devices | Scope::Usage | Scope::Settings | Scope::Help => Category::Panels,
+            Scope::Devices | Scope::Settings | Scope::Help => Category::Panels,
         }
     }
 }
@@ -461,12 +458,6 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Chord::plain(KeyCode::Char('2')),
         Intent::GotoManagement,
         "Management",
-    ),
-    binding(
-        Scope::Global,
-        Chord::plain(KeyCode::Char('3')),
-        Intent::GotoUsage,
-        "Usage",
     ),
     binding(
         Scope::Global,
@@ -1293,13 +1284,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::OpenDeviceAudit,
         "Audit log",
     ),
-    // ---- usage -----------------------------------------------------------
-    binding(
-        Scope::Usage,
-        Chord::plain(KeyCode::Char('r')),
-        Intent::Refresh,
-        "Refresh",
-    ),
+    // ---- settings --------------------------------------------------------
     binding(
         Scope::Settings,
         Chord::plain(KeyCode::Up),
@@ -1539,11 +1524,6 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Providers,
         Chord::plain(KeyCode::Char('h')),
         Intent::ProviderHealth,
-    ),
-    alias(
-        Scope::Usage,
-        Chord::plain(KeyCode::Char('s')),
-        Intent::UsageSessionScope,
     ),
 ];
 

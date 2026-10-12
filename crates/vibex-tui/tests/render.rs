@@ -1250,25 +1250,6 @@ fn unavailable_capabilities_are_visible_not_hidden() {
 }
 
 #[test]
-fn usage_never_invents_cost_data() {
-    let mut app = app(120, 40);
-    app.navigate_to(Page::Usage);
-    let screen = text(&render(&mut app, 120, 40));
-    // `$` is deliberately absent: it is the composer's skill trigger, so it is
-    // legitimately on screen. The words are what would signal invented cost data.
-    for forbidden in ["Cost", "Price", "USD", "EUR"] {
-        assert!(
-            !screen.contains(forbidden),
-            "the usage page invented {forbidden}:\n{screen}"
-        );
-    }
-    assert!(
-        screen.contains("token counts only") || screen.contains("Token usage"),
-        "{screen}"
-    );
-}
-
-#[test]
 fn cjk_copy_renders_without_breaking_the_frame() {
     let mut app = app(100, 30);
     app.strings = Strings::for_locale(Locale::ZhCn);
@@ -3099,9 +3080,9 @@ fn the_palette_groups_commands_and_remembers_recent_ones() {
     );
 
     // Running a command remembers it, and the next open leads with it.
-    app.remember_command(Intent::GotoUsage);
+    app.remember_command(Intent::GotoManagement);
     let entries = app.palette_entries("");
-    assert_eq!(entries[0].entry.intent, Intent::GotoUsage);
+    assert_eq!(entries[0].entry.intent, Intent::GotoManagement);
     assert_eq!(entries[0].group, vibex_tui::view::PaletteGroup::Recent);
     let screen = text(&render(&mut app, 120, 40));
     assert!(screen.contains("Recent"), "{screen}");
@@ -3110,7 +3091,7 @@ fn the_palette_groups_commands_and_remembers_recent_ones() {
     // under its own heading, so a section never empties as it is used.
     let groups = entries
         .iter()
-        .filter(|listing| listing.entry.intent == Intent::GotoUsage)
+        .filter(|listing| listing.entry.intent == Intent::GotoManagement)
         .map(|listing| listing.group)
         .collect::<Vec<_>>();
     assert_eq!(
@@ -3155,14 +3136,14 @@ fn the_palette_groups_commands_and_remembers_recent_ones() {
     let recent = entries
         .iter()
         .position(|listing| {
-            listing.entry.intent == Intent::GotoUsage
+            listing.entry.intent == Intent::GotoManagement
                 && listing.group == vibex_tui::view::PaletteGroup::Recent
         })
         .expect("no remembered listing");
     let filed = entries
         .iter()
         .position(|listing| {
-            listing.entry.intent == Intent::GotoUsage
+            listing.entry.intent == Intent::GotoManagement
                 && listing.group == vibex_tui::view::PaletteGroup::View
         })
         .expect("no `View` listing");
@@ -3174,7 +3155,7 @@ fn the_palette_groups_commands_and_remembers_recent_ones() {
     assert_eq!(
         heading_above(line_of(filed)),
         "View",
-        "`Usage` is no longer drawn in the `View` section:\n{screen}"
+        "`Management` is no longer drawn in the `View` section:\n{screen}"
     );
 }
 
@@ -5129,7 +5110,6 @@ fn the_new_session_page_does_not_wear_the_session_behind_it() {
     app.navigate_to(Page::Agent);
     // The clock is the session's: it has been running for a while.
     app.turn_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(189));
-    app.turn_tokens = Some(4_096);
     app.sync_transcript();
     assert!(app.is_animating(), "the running session is not animating");
     assert!(app.turn_elapsed().is_some());
@@ -5156,7 +5136,6 @@ fn the_new_session_page_does_not_wear_the_session_behind_it() {
         app.turn_elapsed().is_none(),
         "the page kept the session's clock"
     );
-    assert!(app.turn_tokens().is_none());
     assert!(app.current_activity().is_none());
     assert!(
         !app.transcript_animating(),
@@ -5186,10 +5165,6 @@ fn the_new_session_page_does_not_wear_the_session_behind_it() {
     assert!(
         !page_screen.contains("3m09s") && !page_screen.contains("189"),
         "the session's clock is on the composing page:\n{page_screen}"
-    );
-    assert!(
-        !page_screen.contains("4.1k") && !page_screen.contains("4096"),
-        "the session's tokens are on the composing page:\n{page_screen}"
     );
     assert!(
         !page_screen.contains("Steer · Ctrl+S"),

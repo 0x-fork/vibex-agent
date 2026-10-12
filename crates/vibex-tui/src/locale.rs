@@ -125,7 +125,6 @@ strings! {
     // ---- destinations ---------------------------------------------------
     nav_sessions => { "Sessions", "会话", "工作階段" },
     nav_management => { "Management", "管理", "管理" },
-    nav_usage => { "Usage", "用量", "用量" },
     nav_settings => { "Settings", "设置", "設定" },
     nav_help => { "Help", "帮助", "說明" },
     nav_agent => { "Agent", "Agent", "Agent" },
@@ -653,20 +652,6 @@ strings! {
         "This action needs a higher permission level",
         "此操作需要更高的权限级别",
         "此操作需要更高的權限層級"
-    },
-
-    // ---- usage ----------------------------------------------------------
-    usage_title => { "Token usage", "Token 用量", "Token 用量" },
-    usage_session => { "This session", "本会话", "本工作階段" },
-    usage_input_tokens => { "Input", "输入", "輸入" },
-    usage_output_tokens => { "Output", "输出", "輸出" },
-    usage_cached_tokens => { "Cached", "缓存", "快取" },
-    usage_total_tokens => { "Total", "合计", "合計" },
-    usage_context => { "Context window", "上下文占用", "上下文佔用" },
-    usage_no_cost_hint => {
-        "Vibex records token counts only; pricing lives with the provider.",
-        "Vibex 只记录 token 数量；价格由 Provider 侧决定。",
-        "Vibex 只記錄 token 數量；價格由 Provider 端決定。"
     },
 
     // ---- settings -------------------------------------------------------

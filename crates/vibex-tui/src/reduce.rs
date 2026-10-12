@@ -170,11 +170,6 @@ impl App {
                 self.select_global(vibex_ui::shell::GlobalDestination::Management);
                 Outcome::effects(vec![])
             }
-            Intent::GotoUsage => {
-                self.navigate_to(Page::Usage);
-                self.navigation.level = vibex_ui::shell::NavigationLevel::Global;
-                Outcome::effects(vec![Effect::LoadUsage])
-            }
             Intent::ToggleSidebar => {
                 self.toggle_sidebar_collapsed();
                 Outcome::effects(vec![])
@@ -1019,12 +1014,6 @@ impl App {
             Intent::RevokeSelectedDevice => self.begin_revoke_device(),
             Intent::OpenDeviceAudit => Outcome::effects(vec![Effect::ListAudit]),
 
-            // ---- usage -------------------------------------------------------
-            Intent::UsageSessionScope => {
-                self.usage_scope_session = !self.usage_scope_session;
-                Outcome::effects(vec![Effect::LoadUsage])
-            }
-
             // ---- settings ----------------------------------------------------
             Intent::ActivateSetting => self.activate_setting(),
             Intent::SettingPrevious => self.step_setting(-1),
@@ -1761,7 +1750,7 @@ impl App {
         }
         // Pages are a history, not a hierarchy: `Esc` returns to the page this
         // one was opened from, in the order the reader opened them. A reader who
-        // opened Usage while writing a new session lands back in that draft —
+        // opened Settings while writing a new session lands back in that draft —
         // never on a session list they never opened.
         if self.navigate_back() {
             return Outcome::effects(vec![]);
@@ -3115,7 +3104,6 @@ impl App {
             Page::Mcp => Outcome::effects(vec![Effect::ListMcp]),
             Page::Skills => Outcome::effects(vec![Effect::ListSkills]),
             Page::Prompts => Outcome::effects(vec![Effect::ListPrompts]),
-            Page::Usage => Outcome::effects(vec![Effect::LoadUsage]),
             Page::Management | Page::Settings | Page::Help => Outcome::effects(vec![]),
         }
     }
@@ -3817,22 +3805,22 @@ mod tests {
     #[test]
     fn escape_walks_back_through_the_pages_that_were_opened() {
         // The pages a reader opened are a history, not a hierarchy: a reader
-        // writing a new session who opens the Usage page comes back to the
+        // writing a new session who opens the Settings page comes back to the
         // draft, with the keyboard where they left it — not to a session list
         // they never opened, which is where a fixed hierarchy sent them.
         let mut app = capable_app();
         assert_eq!(app.page, Page::NewSession);
         app.composer.insert_str("a first thought");
 
-        app.perform(Intent::GotoUsage);
-        assert_eq!(app.page, Page::Usage);
+        app.perform(Intent::OpenSettings);
+        assert_eq!(app.page, Page::Settings);
 
         let outcome = app.perform(Intent::Back);
         assert!(outcome.effects.is_empty());
         assert_eq!(
             app.page,
             Page::NewSession,
-            "Esc left the page the Usage page was opened from"
+            "Esc left the page the Settings page was opened from"
         );
         assert_eq!(app.focus, crate::app::Focus::Composer);
         assert_eq!(app.composer.text(), "a first thought");
@@ -5696,7 +5684,6 @@ mod tests {
                 session_id: session_id.clone(),
             }
             .key(),
-            Effect::LoadUsage.key(),
         ];
         let unique = keys.iter().collect::<std::collections::BTreeSet<_>>();
         assert_eq!(unique.len(), keys.len(), "{keys:?}");

@@ -139,7 +139,6 @@ pub enum AppMessage {
         ticket: crate::app::ComposerTicket,
         result: BackendResult<Box<vibex_core::AgentCommandDiscovery>>,
     },
-    Usage(BackendResult<Box<UsageReport>>),
     Clipboard(BackendResult<()>),
     EditorFinished {
         ticket: Option<crate::app::ComposerTicket>,
@@ -153,13 +152,6 @@ pub enum AppMessage {
         text: String,
         danger: bool,
     },
-}
-
-/// Usage data for the usage page.
-#[derive(Debug, Clone, Default)]
-pub struct UsageReport {
-    pub session: Option<vibex_core::AgentTokenUsage>,
-    pub aggregate: Option<vibex_core::AgentUsageStatistics>,
 }
 
 /// The tokio side of the client.
@@ -1060,16 +1052,6 @@ impl Dispatch {
                     Err(error) => self.failure("toggle_entry", error),
                 }
             }
-            Effect::LoadUsage => {
-                let request = vibex_core::AgentUsageStatisticsRequest::default();
-                let aggregate = self.facade.agent().usage_statistics(request).await;
-                let session = self.current_session_token_usage().await;
-                let report = UsageReport {
-                    session: session.ok().flatten(),
-                    aggregate: aggregate.ok(),
-                };
-                self.send(AppMessage::Usage(Ok(Box::new(report))));
-            }
             Effect::DiscoverCompletions {
                 ticket,
                 trigger,
@@ -1369,19 +1351,6 @@ impl Dispatch {
                 .map(|_| ()),
         }
     }
-
-    async fn current_session_token_usage(
-        &self,
-    ) -> BackendResult<Option<vibex_core::AgentTokenUsage>> {
-        let sessions = self.facade.agent().list_sessions(false).await?;
-        let Some(session) = sessions.first() else {
-            return Ok(None);
-        };
-        self.facade
-            .agent()
-            .session_token_usage(session.id.clone())
-            .await
-    }
 }
 
 #[cfg(test)]
@@ -1428,7 +1397,6 @@ mod tests {
             },
             Effect::RefreshTimeline,
             Effect::ListDevices,
-            Effect::LoadUsage,
         ];
         for effect in effects {
             assert!(!effect.key().is_empty());

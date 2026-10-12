@@ -159,11 +159,6 @@ pub const PALETTE: &[PaletteEntry] = &[
         intent: Intent::GotoManagement,
     },
     PaletteEntry {
-        label: "Usage",
-        hint: "Show token usage",
-        intent: Intent::GotoUsage,
-    },
-    PaletteEntry {
         label: "Settings",
         hint: "Theme, language, keys",
         intent: Intent::OpenSettings,
@@ -296,7 +291,6 @@ pub const fn palette_group(intent: Intent) -> PaletteGroup {
         }
         Intent::GotoSessions
         | Intent::GotoManagement
-        | Intent::GotoUsage
         | Intent::OpenSettings
         | Intent::ToggleHelp
         | Intent::ToggleSidebar
@@ -460,7 +454,6 @@ pub fn palette_matches(query: &str, strings: Strings) -> Vec<PaletteEntry> {
     for (intent, label) in [
         (Intent::GotoSessions, strings.nav_sessions()),
         (Intent::GotoManagement, strings.nav_management()),
-        (Intent::GotoUsage, strings.nav_usage()),
         (Intent::OpenSettings, strings.nav_settings()),
         (Intent::ToggleHelp, strings.nav_help()),
     ] {
@@ -556,7 +549,6 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         | Page::Skills
         | Page::Prompts
         | Page::Devices
-        | Page::Usage
         | Page::Settings
         | Page::Help => render_management_view(frame, bands.scrollback, app, &theme, strings),
     }
@@ -2134,7 +2126,6 @@ fn render_management_view(
             render_entry_list(frame, area, app, theme, strings)
         }
         Page::Devices => render_devices(frame, area, app, theme, strings),
-        Page::Usage => render_usage(frame, area, app, theme, strings),
         Page::Settings => render_settings(frame, area, app, theme, strings),
         Page::Help => render_help(frame, area, app, theme, strings),
         _ => {}
@@ -2289,16 +2280,6 @@ fn render_turn_status(
             .filter(|count| *count > 0)
         {
             measure_part(&mut line, format!("{tool_calls} {}", strings.tool_calls()));
-        }
-        if let Some(tokens) = app.turn_tokens() {
-            measure_part(
-                &mut line,
-                format!(
-                    "{}{}",
-                    crate::glyphs::token_arrow(tier),
-                    compact_tokens(tokens)
-                ),
-            );
         }
         if let Some(rate) = readout.and_then(crate::turn::TurnReadout::tokens_per_second) {
             measure_part(&mut line, format!("{rate:.1} t/s"));
@@ -2814,15 +2795,6 @@ fn render_status_band(
         );
     }
 
-    if let Some(context) = context_usage_spans(app, theme) {
-        push_segment(&mut right, Span::raw(""));
-        right.pop();
-        if !right.is_empty() {
-            right.push(sep.clone());
-        }
-        right.extend(context);
-    }
-
     if let Some(toast) = &app.toast {
         let color = match toast.tone {
             ToastTone::Info => theme.roles.gray,
@@ -3005,43 +2977,6 @@ fn take_width_from_end(path: &str, budget: usize) -> String {
         Some(offset) if offset + 1 < path.len() - start => path[start + offset + 1..].to_string(),
         _ => path[start..].to_string(),
     }
-}
-
-/// The context-window readout, or nothing when there is no measurement.
-///
-/// Vibex records tokens and not prices, so this is the only quantitative status
-/// the interface can honestly show.
-fn context_usage_spans(app: &App, theme: &TuiTheme) -> Option<Vec<Span<'static>>> {
-    // The numbers are a session's own: the composing page has none, and what was
-    // read for the session behind it is not this page's context.
-    if !app.page_owns_session() {
-        return None;
-    }
-    let usage = app.management_data.usage_session.as_ref()?;
-    let used = usage.total_tokens.unwrap_or(0);
-    let total = usage.context_window_size_tokens?;
-    if total == 0 {
-        return None;
-    }
-    let ratio = (used as f64 / total as f64).clamp(0.0, 1.0);
-    let color = if ratio >= 0.9 {
-        theme.roles.danger
-    } else if ratio >= 0.75 {
-        theme.roles.warning
-    } else if ratio >= 0.5 {
-        theme.roles.accent_user
-    } else {
-        theme.roles.gray
-    };
-    Some(vec![Span::styled(
-        format!(
-            "{} {}/{}",
-            crate::glyphs::token_arrow(app.glyph_tier()),
-            compact_tokens(used),
-            compact_tokens(total)
-        ),
-        Style::default().fg(color),
-    )])
 }
 
 /// The shared page shell: bordered title, body, and an empty-state message.
@@ -4173,109 +4108,6 @@ fn render_devices(
     frame.render_widget(Paragraph::new(audit_hint).style(theme.muted()), rows[1]);
 }
 
-fn render_usage(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &mut App,
-    theme: &TuiTheme,
-    strings: Strings,
-) {
-    let inner = page_frame(frame, area, theme, strings.usage_title(), true);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(2)])
-        .split(inner);
-
-    let mut lines = Vec::new();
-    if let Some(snapshot) = &app.management_data.usage_session {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:<16}", strings.usage_input_tokens()),
-                theme.muted(),
-            ),
-            Span::styled(snapshot.input_tokens.unwrap_or(0).to_string(), theme.base()),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:<16}", strings.usage_output_tokens()),
-                theme.muted(),
-            ),
-            Span::styled(
-                snapshot.output_tokens.unwrap_or(0).to_string(),
-                theme.base(),
-            ),
-        ]));
-        if let Some(cached) = snapshot.cached_read_tokens {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{:<16}", strings.usage_cached_tokens()),
-                    theme.muted(),
-                ),
-                Span::styled(cached.to_string(), theme.base()),
-            ]));
-        }
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:<16}", strings.usage_total_tokens()),
-                theme.muted(),
-            ),
-            Span::styled(
-                snapshot.total_tokens.unwrap_or(0).to_string(),
-                theme.strong(),
-            ),
-        ]));
-        if let Some(window) = snapshot.context_window_size_tokens {
-            let total = snapshot.total_tokens.unwrap_or(0);
-            let ratio = if window > 0 {
-                total as f64 / window as f64
-            } else {
-                0.0
-            };
-            let filled = (ratio.clamp(0.0, 1.0) * 20.0).round() as usize;
-            lines.push(Line::from(vec![
-                Span::styled(format!("{:<16}", strings.usage_context()), theme.muted()),
-                Span::styled(
-                    format!("[{}{}]", "█".repeat(filled), "░".repeat(20 - filled)),
-                    theme.accent(),
-                ),
-                Span::styled(format!(" {total}/{window}"), theme.muted()),
-            ]));
-        }
-    }
-    if let Some(statistics) = &app.management_data.usage {
-        lines.push(Line::from(""));
-        for row in statistics.dimension_rows.iter().take(20) {
-            let label = row.label.clone();
-            let values = format!(
-                "requests={} total={}",
-                row.aggregate.requests,
-                row.aggregate.total_tokens.value.unwrap_or(0)
-            );
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{:<28}", truncate_to_width(&label, 28, "…")),
-                    theme.base(),
-                ),
-                Span::styled(truncate_to_width(&values, 40, "…"), theme.muted()),
-            ]));
-        }
-    }
-    if lines.is_empty() {
-        frame.render_widget(
-            Paragraph::new(strings.nothing_here()).style(theme.muted()),
-            rows[0],
-        );
-    } else {
-        frame.render_widget(Paragraph::new(Text::from(lines)), rows[0]);
-    }
-    frame.render_widget(
-        Paragraph::new(strings.usage_no_cost_hint())
-            .style(theme.muted())
-            .wrap(Wrap { trim: true }),
-        rows[1],
-    );
-}
-
 fn render_settings(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -5128,20 +4960,6 @@ fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiT
         used += width;
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-/// Compact a token count to at most four characters.
-///
-/// A status bar cannot afford eight digits for a number nobody reads exactly;
-/// the precise figure lives on the usage page.
-pub fn compact_tokens(value: u64) -> String {
-    match value {
-        0..=999 => value.to_string(),
-        1_000..=9_999 => format!("{:.1}K", value as f64 / 1_000.0),
-        10_000..=999_999 => format!("{}K", value / 1_000),
-        1_000_000..=9_999_999 => format!("{:.1}M", value as f64 / 1_000_000.0),
-        _ => format!("{}M", value / 1_000_000),
-    }
 }
 
 /// Paint a left/centre/right line, dropping the centre before the sides.
@@ -6599,11 +6417,11 @@ mod tests {
 
     #[test]
     fn palette_finds_destinations_by_localised_name() {
-        let chinese = palette_matches("用量", Strings::for_locale(Locale::ZhCn));
+        let chinese = palette_matches("设置", Strings::for_locale(Locale::ZhCn));
         assert!(
             chinese
                 .iter()
-                .any(|entry| entry.intent == Intent::GotoUsage),
+                .any(|entry| entry.intent == Intent::OpenSettings),
             "localised palette lookup failed"
         );
     }

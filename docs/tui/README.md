@@ -347,9 +347,9 @@ columns; very narrow tables become vertical records so cell contents remain read
 
 ### Status bar
 
-The workspace appears on the left. Connection warnings, context usage and the
-current mode appear on the right. A ready connection does not label a running
-turn as complete; the turn status row reports whether work is active. On the
+The workspace appears on the left. Connection warnings and the current mode
+appear on the right. A ready connection does not label a running turn as
+complete; the turn status row reports whether work is active. On the
 session pages the group's last segment is a control rather than a status: the
 clickable **Sessions** entry, which names the chord that answers where the
 keyboard is.
@@ -701,11 +701,6 @@ explains the value is sent to the runtime and cleared locally.
 Pairing issues a one-time code with a scannable link, shows it once, and never
 writes it to logs or configuration. Devices can be renamed and revoked, and the
 remote-protocol audit trail is readable here.
-
-### Usage
-
-Per-session and aggregate token counts. Vibex records tokens only — there is no
-cost, price or currency in the data model, so the page does not invent one.
 
 ### Settings
 

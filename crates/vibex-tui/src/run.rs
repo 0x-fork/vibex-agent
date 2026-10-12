@@ -2129,14 +2129,6 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 }
             }
         }
-        AppMessage::Usage(result) => match result {
-            Ok(report) => {
-                app.management_data.usage = report.aggregate;
-                app.management_data.usage_session = report.session;
-                app.live = LiveState::Ready;
-            }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
         AppMessage::Clipboard(result) => {
             if let Err(error) = result {
                 app.toast(Toast::warning(error.message));

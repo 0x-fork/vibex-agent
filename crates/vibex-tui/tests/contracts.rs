@@ -273,7 +273,7 @@ fn every_locale_key_is_translated_in_all_three_languages() {
         (|s| s.approval_title(), "approval"),
         (|s| s.elicitation_title(), "elicitation"),
         (|s| s.devices_title(), "devices"),
-        (|s| s.usage_title(), "usage"),
+        (|s| s.settings_theme(), "theme"),
     ];
     for (accessor, label) in pairs {
         assert!(!accessor(&en).is_empty(), "{label} missing in en");
@@ -315,7 +315,6 @@ fn effect_keys_are_stable_identifiers() {
             include_archived: false,
         },
         Effect::ListDevices,
-        Effect::LoadUsage,
         Effect::RefreshTimeline,
     ] {
         let key = effect.key();
@@ -344,7 +343,6 @@ fn the_documentation_exists_for_every_page() {
         "Agent",
         "Management",
         "Devices",
-        "Usage",
         "Settings",
         "Help",
     ] {

@@ -78,14 +78,6 @@ pub fn check_mark(tier: GlyphTier) -> &'static str {
     }
 }
 
-/// The arrow preceding a token count. One column.
-pub fn token_arrow(tier: GlyphTier) -> &'static str {
-    match tier {
-        GlyphTier::Full => "⇣",
-        GlyphTier::Legacy => "v",
-    }
-}
-
 /// A filled diamond, used for the current item and for done steps. One column.
 pub fn diamond_filled(tier: GlyphTier) -> &'static str {
     match tier {
@@ -324,7 +316,6 @@ mod tests {
                 connector(tier),
                 ballot_x(tier),
                 check_mark(tier),
-                token_arrow(tier),
                 diamond_filled(tier),
                 diamond_hollow(tier),
                 diamond_dotted(tier),
@@ -373,7 +364,6 @@ mod tests {
             accent_bar(tier),
             ballot_x(tier),
             check_mark(tier),
-            token_arrow(tier),
             diamond_filled(tier),
             diamond_hollow(tier),
             diamond_dotted(tier),
