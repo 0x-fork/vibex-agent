@@ -2177,7 +2177,7 @@ impl AgentManager {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let Some(cursor) = sweep.current.as_mut() else {
-                return Ok(Self::open_sweep_session(conn, &mut sweep)?);
+                return Self::open_sweep_session(conn, &mut sweep);
             };
             let session_id = cursor.session_id.clone();
             let end = TimelineRepository::timeline_end_sequence(conn, &session_id)?;

@@ -5707,11 +5707,11 @@ fn steering_on_the_new_session_page_keeps_the_draft_out_of_the_session_behind() 
 
 #[test]
 fn the_composing_page_never_names_the_agent_behind_it() {
-    // The catalogue has not arrived — the page cannot name the entry it will
-    // create with — and the session behind it is a codex one. The page must
-    // still not name that Agent: it names the entry a creation with no choice
-    // would use once the catalogue lands, and says the runtime is unavailable
-    // when it never does.
+    // The page cannot name the entry it will create with — this backend
+    // publishes no catalogue to read — and the session behind it is a codex
+    // one. The page must still not name that Agent: it names the entry a
+    // creation with no choice would use once a catalogue lands, and says the
+    // runtime is unavailable when none can be read at all.
     use vibex_tui::action::Intent;
     let mut app = app(120, 40);
     app.live = vibex_tui::app::LiveState::Ready;

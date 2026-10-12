@@ -1016,6 +1016,14 @@ impl VibexWorkbench {
                 .values()
                 .any(|view| view.composer_queue_editing_id == Some(id))
             || self
+                .composer_queue_edit_in_composer
+                .is_some_and(|edit| edit.message_id == id)
+            || self.session_views.values().any(|view| {
+                view.composer_queue_edit_in_composer
+                    .as_ref()
+                    .is_some_and(|edit| edit.message_id == id)
+            })
+            || self
                 .message_schedule_editor
                 .as_ref()
                 .is_some_and(|editor| editor.target() == &MessageScheduleTarget::Queued(id))

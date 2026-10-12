@@ -1186,6 +1186,16 @@ impl ComposerDraft {
 /// pressure and its textarea goes with it, while a draft the reader has typed
 /// but not sent has to survive the switch — and a later visit has to bring it
 /// back.
+/// Marks the queued message currently being edited inside the Composer input.
+///
+/// The message stays in `composer_queue` at its original position while the
+/// reader rewrites it, so the dispatcher must hold its slot back. On send the
+/// message is updated in place by id, which keeps its queue position for free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComposerQueueEditInComposer {
+    message_id: u64,
+}
+
 #[derive(Debug, Default)]
 struct ComposerDraftStore {
     drafts: BTreeMap<String, ComposerDraft>,
@@ -4492,6 +4502,11 @@ pub struct SessionView {
     composer_queue_editing_id: Option<u64>,
     composer_queue_edit_attachments: Vec<InlineComposerAttachment>,
     composer_queue_edit_geometry: ComposerGeometry,
+    /// The queued message being rewritten inside the Composer input itself.
+    ///
+    /// Set only when the edit started with an empty Composer, so the queued
+    /// text could be loaded there instead of an inline row editor.
+    composer_queue_edit_in_composer: Option<ComposerQueueEditInComposer>,
     /// Where this view's Composer was painted last frame.
     ///
     /// The geometry belongs to the view rather than to the workbench because a
@@ -4614,6 +4629,7 @@ impl SessionView {
             composer_queue_editing_id: None,
             composer_queue_edit_attachments: Vec::new(),
             composer_queue_edit_geometry: ComposerGeometry::default(),
+            composer_queue_edit_in_composer: None,
             composer_queue_drop_target: None,
             composer_geometry: ComposerGeometry::default(),
             composer_terminals: Vec::new(),
@@ -14713,6 +14729,16 @@ impl VibexWorkbench {
             self.composer_queue_editing_id = None;
             self.composer_queue_edit_attachments.clear();
             self.composer_queue_edit_geometry.input_bounds = None;
+        }
+        if self.composer_queue_edit_in_composer.is_some_and(|edit| {
+            !self
+                .composer_queue
+                .iter()
+                .any(|message| message.id == edit.message_id)
+        }) {
+            // The lifted message is gone; the composer text becomes a normal
+            // draft again instead of rewriting a vanished queue entry.
+            self.composer_queue_edit_in_composer = None;
         }
         self.auto_continue_session_ids
             .retain(|id| valid_session_ids.contains(id));
@@ -25838,6 +25864,14 @@ impl VibexWorkbench {
         if self.agent_action_pending && !session_running {
             return;
         }
+        // A queued message lifted into the composer is sent from here: the
+        // submission rewrites the queued entry in place, so it keeps its
+        // position in the queue instead of becoming a second message.
+        if let Some(edit) = self.composer_queue_edit_in_composer
+            && self.submit_edited_composer_queue_message(edit, window, cx)
+        {
+            return;
+        }
         let Some(message) = self.take_composer_message(window, cx) else {
             return;
         };
@@ -25969,6 +26003,67 @@ impl VibexWorkbench {
         // still pointing at the previous timeline is stale from here on.
         self.reset_composer_history();
         Some(message)
+    }
+
+    /// Sends the queued message that is currently lifted into the composer.
+    ///
+    /// Returns `true` when the submission was handled: either the queued
+    /// entry was rewritten in place, or an emptied payload released the edit
+    /// back to the queue untouched. `false` means the marker has outlived its
+    /// message and the normal composer submission should take over, so typed
+    /// work is never dropped.
+    fn submit_edited_composer_queue_message(
+        &mut self,
+        edit: ComposerQueueEditInComposer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let composer_input = self.ensure_composer_input(window, cx);
+        if composer_input.update(cx, |input, cx| {
+            EntityInputHandler::marked_text_range(input, window, cx).is_some()
+        }) {
+            return true;
+        }
+        let raw_text = composer_input.read(cx).value().to_string();
+        let (text, attachments) =
+            composer_submission_payload(&raw_text, &self.composer_attachments);
+        if text.trim().is_empty() && attachments.is_empty() {
+            // An emptied payload cancels the edit: the queued message keeps
+            // its original content instead of being destroyed.
+            self.composer_queue_edit_in_composer = None;
+            cx.notify();
+            return true;
+        }
+        let Some(message) = self
+            .composer_queue
+            .iter_mut()
+            .find(|message| message.id == edit.message_id)
+        else {
+            // The queued entry is already gone (deleted or cleared while the
+            // edit sat in the composer); fall through to a normal send.
+            self.composer_queue_edit_in_composer = None;
+            cx.notify();
+            return false;
+        };
+        let session_id = message.session_id.clone();
+        message.text = text;
+        message.attachments = attachments;
+        message.mentions = composer_mentions(composer_input.read(cx).tokens());
+        message.command_invocation = None;
+        // The entry is being edited, not rescheduled; a stale schedule would
+        // either fire the rewrite or reject the send once it ran out.
+        message.scheduled_at_ms = None;
+        composer_input.update(cx, |input, cx| input.set_value("", window, cx));
+        self.composer_attachments.clear();
+        self.composer_command_entry = None;
+        self.clear_suggestions();
+        self.composer_queue_edit_in_composer = None;
+        self.composer_drafts.consume(session_id.as_str());
+        self.reset_composer_history();
+        self.mark_composer_queue_for_recheck(&session_id);
+        self.composer_queue_changed();
+        cx.notify();
+        true
     }
 
     /// Remote twin of [`Self::take_composer_message`]: identical payload
@@ -26850,6 +26945,15 @@ impl VibexWorkbench {
         }
     }
 
+    /// Starts editing a queued message.
+    ///
+    /// When the composer still holds a draft, editing keeps happening inside
+    /// the queue row: the draft is not sacrificed for somebody else's text.
+    /// When the composer is completely empty, the queued message is lifted
+    /// into the composer itself so the user edits it where they normally
+    /// type; sending it from there rewrites the queue entry in place, so it
+    /// keeps its position. The queue never has to know which editor is
+    /// open, because [`Self::queue_message_is_being_edited`] reports both.
     fn begin_composer_queue_edit(
         &mut self,
         message_id: u64,
@@ -26864,6 +26968,49 @@ impl VibexWorkbench {
         else {
             return;
         };
+        let composer_input = self.ensure_composer_input(window, cx);
+        let composer_free = self.composer_attachments.is_empty()
+            && self
+                .view_session_id
+                .as_ref()
+                .and_then(|session_id| self.composer_drafts.get(session_id.as_str()))
+                .is_none_or(|draft| draft.is_empty());
+        let composer_empty = composer_input.read(cx).value().trim().is_empty();
+        if composer_empty && composer_free {
+            let (text, attachments, serial) = composer_queue_edit_insertion(
+                &message.text,
+                &message.attachments,
+                self.composer_attachment_serial,
+            );
+            self.composer_attachment_serial = serial;
+            // set_value suppresses its own change event, so the view fields
+            // are written here rather than left to the composer's edit path.
+            self.composer_attachments = attachments;
+            self.composer_queue_edit_in_composer = Some(ComposerQueueEditInComposer { message_id });
+            self.composer_queue_editing_id = None;
+            self.composer_queue_edit_attachments.clear();
+            self.composer_queue_edit_geometry.input_bounds = None;
+            composer_input.update(cx, |input, cx| {
+                input.set_value(
+                    composer_content_with_mentions(&text, &message.mentions),
+                    window,
+                    cx,
+                );
+                input.focus(window, cx);
+            });
+            self.remember_composer_draft(cx);
+            cx.notify();
+            return;
+        }
+        // One message cannot sit in two editors: reopening it in the queue
+        // row releases the composer edit. Whatever the composer holds stays
+        // behind as an ordinary draft, exactly like the delete path.
+        if self
+            .composer_queue_edit_in_composer
+            .is_some_and(|edit| edit.message_id == message_id)
+        {
+            self.composer_queue_edit_in_composer = None;
+        }
         let (text, attachments, serial) = composer_queue_edit_insertion(
             &message.text,
             &message.attachments,
@@ -27155,6 +27302,14 @@ impl VibexWorkbench {
             self.composer_queue_edit_attachments.clear();
             self.composer_queue_edit_geometry.input_bounds = None;
         }
+        if self
+            .composer_queue_edit_in_composer
+            .is_some_and(|edit| edit.message_id == message_id)
+        {
+            // Deleting the lifted message releases the edit; the composer
+            // text stays behind as an ordinary draft the user can still send.
+            self.composer_queue_edit_in_composer = None;
+        }
         if !self
             .composer_queue
             .iter()
@@ -27302,6 +27457,14 @@ impl VibexWorkbench {
             self.composer_queue_editing_id = None;
             self.composer_queue_edit_attachments.clear();
             self.composer_queue_edit_geometry.input_bounds = None;
+        }
+        if self.composer_queue_edit_in_composer.is_some_and(|edit| {
+            !self
+                .composer_queue
+                .iter()
+                .any(|message| message.id == edit.message_id)
+        }) {
+            self.composer_queue_edit_in_composer = None;
         }
         self.composer_queue_drop_target = None;
         self.composer_queue_paused_session_ids
@@ -45050,7 +45213,7 @@ impl VibexWorkbench {
                     .items_center()
                     .gap(px(SIDEBAR_ICON_TITLE_GAP))
                     .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
-                    .when(!self.sidebar_batch_mode, |this| this.pr(px(84.0)))
+                    .when(!self.sidebar_batch_mode, |this| this.pr(px(92.0)))
                     .text_color(if active {
                         cx.theme().sidebar_foreground
                     } else {
@@ -72825,7 +72988,7 @@ impl FoundationSettings {
     fn request_storage_usage_probe(&mut self, cx: &mut Context<Self>) {
         let settings = cx.entity();
         cx.defer(move |cx| {
-            let _ = settings.update(cx, |settings, cx| settings.start_storage_usage_probe(cx));
+            settings.update(cx, |settings, cx| settings.start_storage_usage_probe(cx));
         });
     }
 
@@ -93911,6 +94074,98 @@ mod tests {
         assert!(initial_state < guarded_selection);
         assert!(guarded_selection < session_selection);
         assert!(overview.contains("this.finish_startup_loading(cx);"));
+    }
+
+    /// Lifting a queued message into an empty Composer and sending it rewrites
+    /// the same queue entry in place: the message keeps its slot, keeps the
+    /// queue from advancing past it while it is being edited, and never picks
+    /// up a schedule of its own.
+    #[gpui::test]
+    fn composer_queue_message_edits_in_the_composer_keep_its_queue_slot(cx: &mut TestAppContext) {
+        struct QueueEditWorkbenchProbe {
+            workbench: Entity<VibexWorkbench>,
+        }
+
+        impl Render for QueueEditWorkbenchProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let (probe, cx) = cx.add_window_view(|window, cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            let workbench =
+                cx.new(|cx| VibexWorkbench::with_initial_state(None, ui_state, None, window, cx));
+            QueueEditWorkbenchProbe { workbench }
+        });
+        let workbench = probe.read_with(cx, |probe, _| probe.workbench.clone());
+        let selection = SessionRuntimeSelection::provider(
+            AgentId::parse("agent-edit").unwrap(),
+            ProviderProfileId::parse("provider_edit").unwrap(),
+            "model-edit",
+        );
+        let session_id = VibexSessionId::parse("session_queue_edit").unwrap();
+
+        workbench.update_in(cx, |workbench: &mut VibexWorkbench, window, cx| {
+            workbench.composer_queue = vec![ComposerQueueMessage {
+                id: 7,
+                session_id: session_id.clone(),
+                desired_runtime: selection.clone(),
+                text: "queued draft".into(),
+                attachments: Vec::new(),
+                command_invocation: None,
+                scheduled_at_ms: None,
+                mentions: Vec::new(),
+            }];
+            workbench.view_session_id = Some(session_id.clone());
+            workbench
+                .composer_queue_manual_session_ids
+                .insert(session_id.as_str().to_string());
+
+            let head_blocked_before = workbench.queue_message_is_being_edited(7);
+            workbench.begin_composer_queue_edit(7, window, cx);
+            assert!(
+                !head_blocked_before,
+                "the queue only blocks once an editor is open"
+            );
+            assert!(
+                workbench.composer_queue_edit_in_composer.is_some(),
+                "an empty composer lifts the message into the input"
+            );
+            assert_eq!(workbench.composer_queue_editing_id, None);
+            assert!(
+                workbench.queue_message_is_being_edited(7),
+                "the lifted message must hold its session's queue head"
+            );
+            let input = workbench.composer_input.clone().expect("composer input");
+            let text = input.read(cx).value().to_string();
+            assert!(
+                text.contains("queued draft"),
+                "the queued text should be editable in the composer: {text}"
+            );
+
+            input.update(cx, |input, cx| input.set_value("edited body", window, cx));
+            assert!(
+                workbench.submit_edited_composer_queue_message(
+                    workbench.composer_queue_edit_in_composer.unwrap(),
+                    window,
+                    cx,
+                ),
+                "the send should be handled by the in-place rewrite"
+            );
+            assert_eq!(workbench.composer_queue_edit_in_composer, None);
+            assert_eq!(workbench.composer_queue.len(), 1);
+            let edited = &workbench.composer_queue[0];
+            assert_eq!(edited.id, 7, "the entry keeps its own queue slot");
+            assert_eq!(edited.text, "edited body");
+            assert_eq!(edited.scheduled_at_ms, None);
+            assert!(
+                workbench.composer_drafts.get(session_id.as_str()).is_none(),
+                "the lifted draft must not resurrect or reschedule itself"
+            );
+        });
     }
 
     #[test]
