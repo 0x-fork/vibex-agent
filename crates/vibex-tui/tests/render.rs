@@ -3160,18 +3160,43 @@ fn the_palette_groups_commands_under_their_headings() {
 /// commands and the merged device section have to be legible.
 #[test]
 fn the_palette_files_its_sections_in_reading_order() {
+    use vibex_tui::view::PaletteGroup;
     let mut app = app(120, 40);
     app.strings = Strings::for_locale(Locale::ZhCn);
     app.perform(vibex_tui::action::Intent::OpenCommandPalette);
+
+    // The order is a property of the listing rather than of the drawer: the
+    // frame can only show as many lines as it has room for, and a section that
+    // no line fits on would otherwise read as a section that moved.
+    let entries = app.palette_entries("");
+    let mut sections = Vec::new();
+    for listing in &entries {
+        if sections.last() != Some(&listing.group) {
+            sections.push(listing.group);
+        }
+    }
+    assert_eq!(
+        sections,
+        vec![
+            PaletteGroup::View,
+            PaletteGroup::Pairing,
+            PaletteGroup::App,
+            PaletteGroup::Session
+        ],
+        "the palette's sections are out of order"
+    );
+
+    // The frame draws those headings, in that order: what a reader sees is the
+    // list the sections were filed in. A heading is the line the region maps to
+    // no entry, and reading a wide glyph back inserts a cell of padding after
+    // it, so the spaces come out.
     let buffer = render_buffer(&mut app, 120, 40);
     let region = app
         .regions
         .palette
         .clone()
         .expect("the palette published no rows");
-    // A heading is the line the region maps to no entry; reading a wide glyph
-    // back inserts a cell of padding after it, so the spaces come out.
-    let headings = region
+    let drawn = region
         .rows
         .iter()
         .enumerate()
@@ -3184,18 +3209,23 @@ fn the_palette_files_its_sections_in_reading_order() {
                 .replace(' ', "")
         })
         .collect::<Vec<_>>();
+    let expected = ["视图", "配对与设备管理", "应用", "会话"];
+    assert!(drawn.len() >= 2, "the palette drew no sections: {drawn:?}");
+    assert!(
+        drawn.len() <= expected.len(),
+        "the palette drew a section the order does not name: {drawn:?}"
+    );
     assert_eq!(
-        headings,
-        vec!["视图", "配对与设备管理", "应用", "会话"],
-        "the palette's sections are out of order"
+        drawn,
+        expected[..drawn.len()],
+        "the palette drew its sections out of order"
     );
 
     // The two device commands share the merged heading, and the pairing one is
     // named for what it does rather than for the page it used to live on.
-    let entries = app.palette_entries("");
     let pairing = entries
         .iter()
-        .filter(|listing| listing.group == vibex_tui::view::PaletteGroup::Pairing)
+        .filter(|listing| listing.group == PaletteGroup::Pairing)
         .map(|listing| listing.entry.label(Strings::for_locale(Locale::ZhCn)))
         .collect::<Vec<_>>();
     assert!(
