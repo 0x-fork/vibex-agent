@@ -13,10 +13,17 @@
 //! cargo run -p vibex-tui --example preview -- 100 30 --thinking --phase 4
 //! cargo run -p vibex-tui --example preview -- 100 30 --new
 //! cargo run -p vibex-tui --example preview -- 100 30 --new --glitch --phase 2
+//! cargo run -p vibex-tui --example preview -- 120 40 --paste
+//! cargo run -p vibex-tui --example preview -- 120 40 --image --ansi
 //! ```
 //!
 //! `--thinking` adds a thought that is still arriving, so the live window and
 //! its rail can be reviewed at a chosen `--phase` of the animation clock.
+//!
+//! `--paste` and `--image` leave a collapsed chip under the caret, which is
+//! what the panel above the composer explains. `--image` draws a picture this
+//! example generates, so the raster has real pixels in it; `--ansi` is the only
+//! way to see them from a pipeline.
 //!
 //! `--ansi` emits real SGR codes instead of plain text, which is the only way
 //! to review the rails and background bands from a pipeline.
@@ -43,6 +50,8 @@ fn main() {
     let mut new_session = false;
     let mut glitch = false;
     let mut thinking = false;
+    let mut paste = false;
+    let mut image = false;
     let mut phase = 0u32;
     let mut numbers = Vec::new();
     let mut arguments = arguments.into_iter();
@@ -60,6 +69,10 @@ fn main() {
             "--glitch" => glitch = true,
             // A running thought, to review the live window and its rail.
             "--thinking" => thinking = true,
+            // A collapsed chip under the caret, which is what the preview panel
+            // above the composer explains.
+            "--paste" => paste = true,
+            "--image" => image = true,
             "--phase" => {
                 phase = arguments
                     .next()
@@ -122,6 +135,25 @@ fn main() {
     }
     if glitch {
         app.settings.mark = vibex_tui::logo::MarkStyle::Glitch;
+    }
+    if paste {
+        // The caret lands at the label's right edge, where a paste leaves it
+        // and where the panel says the same block pasted again opens it.
+        // Focus is set here rather than at the top because moving to a page
+        // hands the keyboard back to the transcript.
+        app.focus = vibex_tui::app::Focus::Composer;
+        app.composer.set_text("");
+        let log = (0..40)
+            .map(|index| format!("2025-09-30 12:04:{index:02} INFO  upload: retry {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.composer.insert_paste(&log);
+    }
+    if image {
+        app.focus = vibex_tui::app::Focus::Composer;
+        app.composer.set_text("");
+        let _ = app.attach_image_bytes("image/png", sample_png());
+        app.composer.move_left();
     }
     let blocks = sample_session();
     if !welcome {
@@ -186,6 +218,36 @@ fn main() {
         selected: 0,
         collapsed: std::collections::BTreeSet::new(),
     };
+}
+
+/// A picture the image preview has something to draw for.
+///
+/// A screenshot is the case the panel exists for, and a generated one keeps
+/// this example runnable without a fixture file: a gradient with a darker
+/// block in it, so the raster's shape and its colours are both visible.
+fn sample_png() -> Vec<u8> {
+    let (width, height) = (480u32, 270u32);
+    let mut picture = image::RgbImage::new(width, height);
+    for (x, y, pixel) in picture.enumerate_pixels_mut() {
+        let horizon = height / 3;
+        *pixel = if y < horizon {
+            image::Rgb([
+                (40 + x * 120 / width) as u8,
+                90,
+                (180 - x * 60 / width) as u8,
+            ])
+        } else {
+            image::Rgb([(24 + x % 60) as u8, (28 + y % 40) as u8, 48])
+        };
+    }
+    let mut bytes = Vec::new();
+    picture
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("the sample encodes");
+    bytes
 }
 
 /// A thought that is still arriving, long enough to overflow its window.

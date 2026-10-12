@@ -98,6 +98,17 @@ impl App {
             return self.perform_filter(intent);
         }
 
+        // A collapsed paste under the caret is opened by `Enter` before
+        // anything else looks at the key. It is an edit to the draft rather
+        // than a send, so it is answered even where sending is not — a
+        // disconnected seat still lets a reader read what they pasted — and it
+        // is answered here rather than in the send, which is where the
+        // availability of the runtime is decided.
+        if matches!(intent, Intent::SubmitComposer) && self.composer.expand_paste_at_cursor() {
+            self.refresh_completion();
+            return Outcome::effects(vec![]);
+        }
+
         if let Some(reason) = self.unavailable_reason(intent) {
             self.toast(Toast::warning(reason));
             return Outcome::quiet();

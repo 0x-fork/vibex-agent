@@ -22,6 +22,12 @@ crossterm.workspace = true
 # Markdown is parsed in-crate (`src/markdown/`) so the terminal client owns its
 # own document model instead of depending on the desktop Markdown crate.
 html5ever.workspace = true
+# A pasted screenshot is previewed as a half-block raster, which is the one
+# thing in this client that has to look inside a picture. The decoder is a leaf
+# dependency with no window server in it, so the crate stays linkable wherever
+# a terminal is; the formats are the ones a clipboard and a file paste can
+# carry, and the same set the attach path already accepts.
+image = { workspace = true, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 markup5ever_rcdom.workspace = true
 pulldown-cmark.workspace = true
 qrcode.workspace = true
@@ -55,6 +61,9 @@ pty-harness = []
 [dev-dependencies]
 anyhow.workspace = true
 crossterm.workspace = true
+# The render tests encode a real PNG fixture: a preview of pixels has to be
+# asserted against pixels, not against a hand-written byte string.
+image = { workspace = true, features = ["png"] }
 portable-pty.workspace = true
 ratatui.workspace = true
 tempfile = "3"

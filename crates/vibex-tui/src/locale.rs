@@ -408,6 +408,20 @@ strings! {
     composer_skill_menu => { "Skills", "技能", "技能" },
     composer_no_matches => { "No matches", "没有匹配项", "沒有符合項目" },
 
+    // ---- the panel that explains a collapsed chip -----------------------
+    preview_more_lines => { "more lines", "行未显示", "行未顯示" },
+    preview_expand_enter => { "Enter to expand", "Enter 展开", "Enter 展開" },
+    preview_expand_paste => {
+        "Paste the same block again to expand",
+        "再次粘贴同样的内容以展开",
+        "再次貼上同樣的內容以展開"
+    },
+    preview_unavailable => {
+        "This picture could not be read",
+        "无法读取该图片",
+        "無法讀取該圖片"
+    },
+
     // ---- transcript -----------------------------------------------------
     transcript_thinking => { "Thinking", "思考", "思考" },
     transcript_tool => { "Tool", "工具", "工具" },

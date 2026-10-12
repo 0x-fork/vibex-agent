@@ -197,6 +197,40 @@ enum ChipPayload {
     Image(ImageAttachment),
 }
 
+/// A chip the caret is standing on, for the panel that explains it.
+///
+/// A label is all the draft draws — `[Pasted: 40 lines]` is one row wide
+/// whatever it stands for — so the reader has no way to check what a chip
+/// holds without opening it. This is the read-only half of that: what the
+/// label stands for, and whether the caret is *on* the chip rather than just
+/// after it, which is the difference between `Enter` opening the chip and
+/// `Enter` sending the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChipPeek<'a> {
+    /// The label as the draft draws it.
+    pub label: &'a str,
+    /// What the label stands for.
+    pub payload: ChipPeekPayload<'a>,
+    /// Whether the caret is inside the label rather than at its right edge.
+    pub on_chip: bool,
+}
+
+/// What a chip holds, borrowed from the draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChipPeekPayload<'a> {
+    /// A collapsed paste: the bytes the label stands for.
+    Paste(&'a str),
+    /// An attached image, drawn as a raster when the terminal can show one.
+    Image(&'a ImageAttachment),
+}
+
+impl ChipPeek<'_> {
+    /// Whether this chip has text to expand into the draft.
+    pub const fn is_paste(&self) -> bool {
+        matches!(self.payload, ChipPeekPayload::Paste(_))
+    }
+}
+
 /// An image attached to the draft, before it is turned into a wire attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageAttachment {
@@ -204,6 +238,63 @@ pub struct ImageAttachment {
     pub label: String,
     pub mime_type: String,
     pub source: ImageSource,
+    /// How many bytes the picture is, measured when it was attached.
+    ///
+    /// Named under the picture in the preview, and measured there rather than
+    /// read there: a file's size is a stat, and the preview is drawn on every
+    /// frame the caret rests on the chip.
+    pub byte_len: usize,
+    /// The picture reduced to something a character grid can draw.
+    ///
+    /// Decoded once, when the image is attached. `None` for bytes that are not
+    /// a picture this client can read, which is a preview that says so rather
+    /// than a paste that fails.
+    pub thumbnail: Option<ImageThumbnail>,
+}
+
+/// A picture as a block of terminal cells.
+///
+/// Each cell carries two pixels — the half-block character is the upper one,
+/// the cell's background the lower — so a raster is `cols` wide and `2 * rows`
+/// pixels tall, which is the closest a character grid comes to square pixels.
+/// The pixels are kept as plain RGB rather than a `ratatui::Color` so the data
+/// belongs to the attachment rather than to the terminal it will be drawn on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageThumbnail {
+    /// The picture's own width and height, before it was scaled.
+    pub width: u32,
+    pub height: u32,
+    /// How many cells the raster is, left to right and top to bottom.
+    pub cols: u16,
+    pub rows: u16,
+    /// `cols * rows` cells, row-major, each one `[top r, g, b, bottom r, g, b]`.
+    pub cells: Vec<[u8; 6]>,
+}
+
+impl ImageThumbnail {
+    /// The two pixels of one cell, or `None` outside the raster.
+    pub fn cell(&self, column: u16, row: u16) -> Option<([u8; 3], [u8; 3])> {
+        if column >= self.cols || row >= self.rows {
+            return None;
+        }
+        let cell = self
+            .cells
+            .get(usize::from(row) * usize::from(self.cols) + usize::from(column))?;
+        Some(([cell[0], cell[1], cell[2]], [cell[3], cell[4], cell[5]]))
+    }
+}
+
+/// A picture on its way into the draft: everything `insert_image` needs that
+/// the label and the number it assigns do not already carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedImage {
+    pub mime_type: String,
+    pub source: ImageSource,
+    /// The bytes' length. See [`ImageAttachment::byte_len`].
+    pub byte_len: usize,
+    /// The decoded raster, when the bytes are a picture. See
+    /// [`ImageAttachment::thumbnail`].
+    pub thumbnail: Option<ImageThumbnail>,
 }
 
 /// Where an attached image's bytes live.
@@ -515,6 +606,45 @@ impl ComposerBuffer {
             .collect()
     }
 
+    /// The chip the caret is on, or the one whose right edge it stands at.
+    ///
+    /// Both positions count: [`Self::insert_paste`] and [`Self::insert_image`]
+    /// leave the caret immediately after the label they inserted, and that is
+    /// where the reader is when the question "what did I just paste?" is worth
+    /// answering. Only the first is a position `Enter` can act from, which is
+    /// why [`ChipPeek::on_chip`] travels with it.
+    pub fn chip_peek(&self) -> Option<ChipPeek<'_>> {
+        let index = self.chip_covering(self.cursor).or_else(|| {
+            self.chips
+                .iter()
+                .position(|chip| chip.end == self.cursor && chip.start < chip.end)
+        })?;
+        let chip = self.chips.get(index)?;
+        Some(ChipPeek {
+            label: &chip.label,
+            payload: match &chip.payload {
+                ChipPayload::Paste(content) => ChipPeekPayload::Paste(content),
+                ChipPayload::Image(image) => ChipPeekPayload::Image(image),
+            },
+            on_chip: chip.start <= self.cursor && self.cursor < chip.end,
+        })
+    }
+
+    /// Replace the paste chip under the caret with its content, in place.
+    ///
+    /// Strictly on-chip: a caret at the chip's right edge is where the reader
+    /// finished a sentence that happens to end in a paste, and `Enter` there
+    /// means "send", not "expand". Returns whether a paste was opened.
+    pub fn expand_paste_at_cursor(&mut self) -> bool {
+        let Some(index) = self.chip_covering(self.cursor) else {
+            return false;
+        };
+        if !matches!(self.chips[index].payload, ChipPayload::Paste(_)) {
+            return false;
+        }
+        self.expand_chip(index)
+    }
+
     pub fn can_undo(&self) -> bool {
         self.history_index > 0
     }
@@ -704,11 +834,7 @@ impl ComposerBuffer {
     ///
     /// Returns the label it was given, or `None` when the draft already holds
     /// as many images as a prompt should carry.
-    pub fn insert_image(
-        &mut self,
-        mime_type: impl Into<String>,
-        source: ImageSource,
-    ) -> Option<String> {
+    pub fn insert_image(&mut self, image: AttachedImage) -> Option<String> {
         if self.image_count() >= IMAGE_CAP {
             return None;
         }
@@ -729,8 +855,10 @@ impl ComposerBuffer {
             label: label.clone(),
             payload: ChipPayload::Image(ImageAttachment {
                 label: label.clone(),
-                mime_type: mime_type.into(),
-                source,
+                mime_type: image.mime_type,
+                source: image.source,
+                byte_len: image.byte_len,
+                thumbnail: image.thumbnail,
             }),
         });
         self.chips.sort_by_key(|chip| chip.start);
@@ -756,7 +884,13 @@ impl ComposerBuffer {
         for (image, offset) in images {
             let byte = utf16_offset_to_byte(self.text(), offset as usize) + shift;
             self.cursor = byte.min(self.text.len());
-            if let Some(label) = self.insert_image(image.mime_type, image.source) {
+            let attached = AttachedImage {
+                mime_type: image.mime_type,
+                source: image.source,
+                byte_len: image.byte_len,
+                thumbnail: image.thumbnail,
+            };
+            if let Some(label) = self.insert_image(attached) {
                 shift += label.len();
             }
         }
@@ -1821,7 +1955,7 @@ fn paste_label(value: &str, lines: usize) -> String {
 }
 
 /// Decimal byte count, the way a file manager reports one.
-fn compact_bytes(bytes: usize) -> String {
+pub fn compact_bytes(bytes: usize) -> String {
     if bytes >= 1_000_000 {
         format!("{:.1} MB", bytes as f64 / 1_000_000.0)
     } else if bytes >= 1_000 {
@@ -2145,6 +2279,74 @@ mod tests {
     }
 
     #[test]
+    fn the_chip_peek_reports_what_stands_under_the_caret() {
+        let mut buffer = ComposerBuffer::default();
+        let log = (0..9)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(buffer.insert_paste(&log));
+        // A paste leaves the caret at the label's right edge, which is the
+        // position the reader asks "what did I paste?" from.
+        let peek = buffer.chip_peek().expect("the caret is at the chip");
+        assert!(!peek.on_chip, "the caret is after the label, not on it");
+        assert!(peek.is_paste());
+        assert_eq!(peek.label, "[Pasted: 9 lines]");
+        assert!(matches!(peek.payload, ChipPeekPayload::Paste(text) if text == log));
+
+        // The label's left edge is the other position, and the one `Enter`
+        // acts from: a chip is one stop, so a step left from its end lands on
+        // its start rather than inside it.
+        buffer.move_left();
+        let peek = buffer.chip_peek().expect("the caret is on the chip");
+        assert!(peek.on_chip, "the caret is at the label's first cell");
+
+        // Away from the chip there is nothing to explain.
+        buffer.move_to_end();
+        buffer.insert_str(" and a trailing sentence");
+        assert!(buffer.chip_peek().is_none());
+    }
+
+    #[test]
+    fn enter_opens_a_paste_only_from_on_the_chip() {
+        let mut buffer = ComposerBuffer::default();
+        let log = (0..7)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(buffer.insert_paste(&log));
+        // At the right edge the caret is at the end of a message, not on the
+        // chip: the send that follows must not be turned into an expand.
+        assert!(!buffer.expand_paste_at_cursor());
+        assert_eq!(buffer.chip_count(), 1);
+
+        // One step left is the label's own position, where `Enter` opens it.
+        buffer.move_left();
+        assert!(buffer.expand_paste_at_cursor());
+        assert_eq!(buffer.text(), log);
+        assert_eq!(buffer.chip_count(), 0);
+    }
+
+    #[test]
+    fn an_image_chip_has_nothing_to_expand_and_says_so() {
+        let mut buffer = ComposerBuffer::default();
+        buffer.insert_image(attached_path("/tmp/shot.png"));
+        buffer.move_left();
+        let peek = buffer.chip_peek().expect("the caret is on the chip");
+        assert!(peek.on_chip);
+        assert!(!peek.is_paste());
+        assert!(matches!(
+            peek.payload,
+            ChipPeekPayload::Image(image) if image.label == "[Image #1]"
+        ));
+        assert!(
+            !buffer.expand_paste_at_cursor(),
+            "an image has no text to open into the draft"
+        );
+        assert_eq!(buffer.chip_count(), 1);
+    }
+
+    #[test]
     fn a_chip_is_expanded_on_the_way_out_and_not_before() {
         let mut buffer = ComposerBuffer::default();
         let log = (0..10)
@@ -2457,15 +2659,28 @@ mod tests {
         vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
     }
 
+    /// An attachment as the client's paste path builds one: a path, its length
+    /// and nothing decoded.
+    fn attached_path(path: &str) -> AttachedImage {
+        AttachedImage {
+            mime_type: "image/png".into(),
+            byte_len: 0,
+            thumbnail: None,
+            source: ImageSource::Path(path.to_string()),
+        }
+    }
+
     #[test]
     fn an_image_attaches_as_a_chip_and_leaves_the_text() {
         let mut buffer = ComposerBuffer::default();
         buffer.insert_str("look at this ");
         let label = buffer
-            .insert_image(
-                "image/png",
-                ImageSource::Bytes(std::sync::Arc::new(png_bytes())),
-            )
+            .insert_image(AttachedImage {
+                mime_type: "image/png".into(),
+                source: ImageSource::Bytes(std::sync::Arc::new(png_bytes())),
+                byte_len: png_bytes().len(),
+                thumbnail: None,
+            })
             .expect("the first image fits");
         assert_eq!(label, "[Image #1]");
         assert_eq!(buffer.text(), "look at this [Image #1]");
@@ -2482,7 +2697,7 @@ mod tests {
     fn an_image_chip_is_one_object() {
         let mut buffer = ComposerBuffer::default();
         buffer.insert_str("before ");
-        buffer.insert_image("image/png", ImageSource::Path("/tmp/a.png".into()));
+        buffer.insert_image(attached_path("/tmp/a.png"));
         assert_eq!(buffer.text(), "before [Image #1]");
         // The cursor sits just past the label, so one press removes all of it.
         assert!(buffer.backspace());
@@ -2494,7 +2709,7 @@ mod tests {
     fn a_draft_taken_for_sending_carries_its_images() {
         let mut buffer = ComposerBuffer::default();
         buffer.insert_str("see ");
-        buffer.insert_image("image/png", ImageSource::Path("/tmp/shot.png".into()));
+        buffer.insert_image(attached_path("/tmp/shot.png"));
         let (text, images) = buffer.take_with_attachments();
         assert_eq!(text, "see ");
         assert_eq!(images.len(), 1);
@@ -2507,17 +2722,13 @@ mod tests {
         let mut buffer = ComposerBuffer::default();
         for index in 0..IMAGE_CAP {
             assert!(
-                buffer
-                    .insert_image("image/png", ImageSource::Path("/tmp/a.png".into()))
-                    .is_some(),
+                buffer.insert_image(attached_path("/tmp/a.png")).is_some(),
                 "image {index} was refused below the cap"
             );
         }
         assert!(buffer.image_count() == IMAGE_CAP);
         assert!(
-            buffer
-                .insert_image("image/png", ImageSource::Path("/tmp/a.png".into()))
-                .is_none(),
+            buffer.insert_image(attached_path("/tmp/a.png")).is_none(),
             "the cap did not hold"
         );
     }
@@ -2526,7 +2737,7 @@ mod tests {
     fn image_labels_are_not_recycled_within_a_draft() {
         let mut buffer = ComposerBuffer::default();
         assert_eq!(
-            buffer.insert_image("image/png", ImageSource::Path("/tmp/a.png".into())),
+            buffer.insert_image(attached_path("/tmp/a.png")),
             Some("[Image #1]".to_string())
         );
         buffer.move_to_start();
@@ -2535,13 +2746,13 @@ mod tests {
         // The second image is #2: a number that once named a picture must never
         // name a different one.
         assert_eq!(
-            buffer.insert_image("image/png", ImageSource::Path("/tmp/b.png".into())),
+            buffer.insert_image(attached_path("/tmp/b.png")),
             Some("[Image #2]".to_string())
         );
         // Emptied, the draft starts counting again.
         buffer.take_expanded();
         assert_eq!(
-            buffer.insert_image("image/png", ImageSource::Path("/tmp/c.png".into())),
+            buffer.insert_image(attached_path("/tmp/c.png")),
             Some("[Image #1]".to_string())
         );
     }
@@ -2555,6 +2766,8 @@ mod tests {
                 label: "[Image #1]".into(),
                 mime_type: "image/png".into(),
                 source: ImageSource::Path("/tmp/shot.png".into()),
+                byte_len: 0,
+                thumbnail: None,
             },
             7,
             true,
@@ -2574,6 +2787,8 @@ mod tests {
                 label: "[Image #2]".into(),
                 mime_type: "image/png".into(),
                 source: ImageSource::Path("shot.png".into()),
+                byte_len: 0,
+                thumbnail: None,
             },
             0,
             true,
@@ -2588,6 +2803,8 @@ mod tests {
                 label: "[Image #3]".into(),
                 mime_type: "image/png".into(),
                 source: ImageSource::Bytes(std::sync::Arc::new(png_bytes())),
+                byte_len: 0,
+                thumbnail: None,
             },
             0,
             false,
@@ -2603,6 +2820,8 @@ mod tests {
                 label: "[Image #4]".into(),
                 mime_type: "image/png".into(),
                 source: ImageSource::Bytes(std::sync::Arc::new(png_bytes())),
+                byte_len: 0,
+                thumbnail: None,
             },
             0,
             true,
@@ -2624,7 +2843,7 @@ mod tests {
         let mut buffer = ComposerBuffer::default();
         buffer.insert_str("前面 ");
         buffer
-            .insert_image("image/png", ImageSource::Path("/tmp/a.png".into()))
+            .insert_image(attached_path("/tmp/a.png"))
             .expect("the image attaches");
         buffer.insert_str(" 后面");
         let outgoing = buffer.outgoing();
@@ -2640,7 +2859,7 @@ mod tests {
         let mut trailing = ComposerBuffer::default();
         trailing.insert_str("hi ");
         trailing
-            .insert_image("image/png", ImageSource::Path("/tmp/b.png".into()))
+            .insert_image(attached_path("/tmp/b.png"))
             .expect("the image attaches");
         assert_eq!(trailing.outgoing().images[0].1, 3);
     }
@@ -2652,6 +2871,8 @@ mod tests {
             label: "[Image #1]".into(),
             mime_type: "image/png".into(),
             source: ImageSource::Path("/tmp/shot.png".into()),
+            byte_len: 0,
+            thumbnail: None,
         };
         // The offset is where the picture sat in the text as it was sent; the
         // label goes back there, not at the end of the paragraph.

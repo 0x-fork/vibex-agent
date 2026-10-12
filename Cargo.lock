@@ -10591,6 +10591,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "html5ever",
+ "image",
  "markup5ever_rcdom",
  "portable-pty",
  "pulldown-cmark",

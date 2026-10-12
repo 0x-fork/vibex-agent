@@ -24,6 +24,7 @@
 //! notify    what the terminal is told when a session needs the reader
 //! onboarding what to do first, in order, until it is done
 //! composer  the edit buffer, completion triggers and history
+//! preview   what a collapsed paste or an attached picture holds, drawn in place
 //! search    transcript search: regex with smart case
 //! scramble  the character transition a line wears when its text changes
 //! transcript block cache, incremental layout, viewport-only rendering
@@ -55,6 +56,7 @@ pub mod markdown;
 pub mod modal;
 pub mod notify;
 pub mod onboarding;
+pub mod preview;
 pub mod reduce;
 pub mod run;
 pub mod runtime_picker;

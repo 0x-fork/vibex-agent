@@ -2040,10 +2040,12 @@ fn an_attached_image_shows_as_a_chip_and_a_count() {
     app.focus = vibex_tui::app::Focus::Composer;
     app.composer.insert_str("look at this ");
     app.composer
-        .insert_image(
-            "image/png",
-            vibex_tui::composer::ImageSource::Path("/tmp/shot.png".into()),
-        )
+        .insert_image(vibex_tui::composer::AttachedImage {
+            mime_type: "image/png".into(),
+            source: vibex_tui::composer::ImageSource::Path("/tmp/shot.png".into()),
+            byte_len: 0,
+            thumbnail: None,
+        })
         .expect("the image attaches");
     let screen = text(&render(&mut app, 120, 40));
     assert!(screen.contains("[Image #1]"), "{screen}");
@@ -3353,6 +3355,186 @@ fn a_big_paste_shows_as_one_chip_in_the_composer() {
     );
     // What is sent is the bytes, not the label.
     assert!(app.composer.expanded_text().contains("INFO line 7"));
+}
+
+/// A small real PNG, so a preview has pixels to draw rather than a fallback.
+fn shot_png() -> Vec<u8> {
+    let mut picture = image::RgbImage::new(40, 20);
+    for (column, _, pixel) in picture.enumerate_pixels_mut() {
+        *pixel = image::Rgb([(column * 6) as u8, 40, 200]);
+    }
+    let mut bytes = Vec::new();
+    picture
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("the fixture encodes");
+    bytes
+}
+
+#[test]
+fn a_collapsed_paste_is_previewed_while_the_caret_stands_on_it() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    let log = (0..40)
+        .map(|index| format!("2025-09-30 INFO line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(app.composer.insert_paste(&log));
+    // The paste leaves the caret at the label's right edge, which is where the
+    // reader asks what they just pasted.
+    let screen = text(&render(&mut app, 120, 40));
+    for needle in [
+        "INFO line 0",
+        "34 more lines",
+        "INFO line 39",
+        "again to expand",
+    ] {
+        assert!(
+            screen.contains(needle),
+            "the preview lost {needle}:\n{screen}"
+        );
+    }
+    assert!(
+        !screen.contains("INFO line 7"),
+        "the middle of the paste is not elided:\n{screen}"
+    );
+
+    // On the label itself `Enter` is the key that opens it, and the panel says
+    // so rather than advertising the paste again.
+    app.composer.move_left();
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("Enter to expand"), "{screen}");
+    assert!(!screen.contains("again to expand"), "{screen}");
+
+    // Leaving the chip takes the panel with it: it belongs to the chip.
+    app.composer.move_to_end();
+    app.composer.insert_str(" please read");
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        !screen.contains("more lines"),
+        "the preview followed the caret:\n{screen}"
+    );
+
+    // A composer that does not have the reader's focus is not explained.
+    app.composer.move_left();
+    app.focus = vibex_tui::app::Focus::Main;
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(!screen.contains("Enter to expand"), "{screen}");
+}
+
+#[test]
+fn enter_opens_a_collapsed_paste_instead_of_sending_it() {
+    use vibex_tui::action::Intent;
+    let mut opening = app(120, 40);
+    enter_session(&mut opening, "session_paste00001");
+    opening.focus = vibex_tui::app::Focus::Composer;
+    let log = (0..12)
+        .map(|index| format!("row {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(opening.composer.insert_paste(&log));
+
+    // A caret on the label reads the forty lines behind it rather than sending
+    // a message the reader cannot see.
+    opening.composer.move_left();
+    let outcome = opening.perform(Intent::SubmitComposer);
+    assert!(
+        outcome.effects.is_empty(),
+        "Enter sent a message instead of opening the chip"
+    );
+    assert_eq!(opening.composer.text(), log);
+    assert_eq!(opening.composer.chip_count(), 0, "the chip is open now");
+
+    // At the label's right edge the caret has finished a sentence, and Enter
+    // is the send it always was.
+    let mut sending = app(120, 40);
+    enter_session(&mut sending, "session_paste00002");
+    sending.live = vibex_tui::app::LiveState::Ready;
+    sending.focus = vibex_tui::app::Focus::Composer;
+    assert!(sending.composer.insert_paste(&log));
+    let outcome = sending.perform(Intent::SubmitComposer);
+    assert!(
+        outcome
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, vibex_tui::Effect::SendMessage { .. })),
+        "the message after the chip was not sent"
+    );
+}
+
+#[test]
+fn an_image_chip_is_previewed_as_pixels_and_a_caption() {
+    let mut colorful = app(120, 40);
+    colorful.navigate_to(Page::Agent);
+    colorful.focus = vibex_tui::app::Focus::Composer;
+    let directory = tempfile::tempdir().expect("temp dir");
+    let shot = directory.path().join("shot.png");
+    std::fs::write(&shot, shot_png()).expect("write");
+    colorful
+        .attach_image_path(&shot.display().to_string())
+        .expect("the image attaches");
+    colorful.composer.move_left();
+
+    let screen = text(&render(&mut colorful, 120, 40));
+    for needle in ["[Image #1]", "shot.png", "PNG", "40×20"] {
+        assert!(
+            screen.contains(needle),
+            "the preview lost {needle}:\n{screen}"
+        );
+    }
+
+    // The raster itself: a half block whose top half is the picture's own
+    // colour, rather than a caption standing in for it.
+    let buffer = render_buffer(&mut colorful, 120, 40);
+    let painted = (0..40u16)
+        .flat_map(|row| (0..120u16).map(move |column| (column, row)))
+        .filter(|(column, row)| {
+            buffer
+                .cell((*column, *row))
+                .is_some_and(|cell| cell.symbol() == "▀" && cell.fg != ratatui::style::Color::Reset)
+        })
+        .count();
+    assert!(painted > 20, "only {painted} cells of picture were drawn");
+
+    // A terminal that cannot paint the colours gets the facts instead: the
+    // caption is not a consolation prize, it is the other half of the preview.
+    let mut plain = app(120, 40);
+    plain.navigate_to(Page::Agent);
+    plain.focus = vibex_tui::app::Focus::Composer;
+    plain.capability.mode = vibex_tui::ColorMode::Ansi16;
+    plain
+        .attach_image_path(&shot.display().to_string())
+        .expect("the image attaches");
+    plain.composer.move_left();
+    let screen = text(&render(&mut plain, 120, 40));
+    for needle in ["shot.png", "PNG", "40×20"] {
+        assert!(
+            screen.contains(needle),
+            "the caption lost {needle}:\n{screen}"
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_picture_says_so_rather_than_showing_nothing() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    let directory = tempfile::tempdir().expect("temp dir");
+    let shot = directory.path().join("masked.png");
+    std::fs::write(&shot, b"not really a picture").expect("write");
+    app.attach_image_path(&shot.display().to_string())
+        .expect("the bytes still attach");
+    app.composer.move_left();
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("masked.png"), "{screen}");
+    assert!(
+        screen.contains("could not be read"),
+        "the preview claimed to show a picture it could not read:\n{screen}"
+    );
 }
 
 #[test]

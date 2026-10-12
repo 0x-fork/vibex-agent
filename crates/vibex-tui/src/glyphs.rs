@@ -195,6 +195,45 @@ pub fn heading_rule(tier: GlyphTier) -> &'static str {
     }
 }
 
+/// The dot between two facts written on one row. One column.
+///
+/// A hyphen rather than a middle dot on a console that lacks one: the row it
+/// separates is a caption, and a caption is read as a sentence.
+pub fn separator(tier: GlyphTier) -> &'static str {
+    match tier {
+        GlyphTier::Full => "·",
+        GlyphTier::Legacy => "-",
+    }
+}
+
+/// The multiplication sign a pair of dimensions is written with. One column.
+pub fn times(tier: GlyphTier) -> &'static str {
+    match tier {
+        GlyphTier::Full => "×",
+        GlyphTier::Legacy => "x",
+    }
+}
+
+/// The mark that stands for the lines a preview left out. One column.
+pub fn elision(tier: GlyphTier) -> &'static str {
+    match tier {
+        GlyphTier::Full => "⋮",
+        GlyphTier::Legacy => ":",
+    }
+}
+
+/// The upper half block a picture is drawn with, two pixels to a cell.
+///
+/// A console without it gets a solid mark and one colour per cell: a coarse
+/// picture rather than no picture, which is the same trade every other fallback
+/// in this module makes.
+pub fn half_block(tier: GlyphTier) -> &'static str {
+    match tier {
+        GlyphTier::Full => "▀",
+        GlyphTier::Legacy => "#",
+    }
+}
+
 /// A chevron pointing at what is not shown yet. One column.
 ///
 /// It survives the turn rail it was written for, which no longer jumps a turn

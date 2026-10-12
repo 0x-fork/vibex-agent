@@ -561,8 +561,41 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
     render_shortcuts(frame, bands.shortcuts, app, &theme);
 
+    // The chip under the caret explains itself in the room above the composer,
+    // which is why this is drawn after the transcript and before any modal: the
+    // panel belongs to the draft rather than to the page, and a modal that is
+    // open is a different conversation.
+    if app.overlay.is_none() {
+        crate::preview::render(frame, composer_preview_area(area, &bands), app, &theme);
+    }
+
     if let Some(overlay) = app.overlay.clone() {
         render_overlay(frame, area, app, &overlay, &theme);
+    }
+}
+
+/// The rows a chip preview may use: everything above the composer's own stack.
+///
+/// The panel is anchored to the bottom of this area, so it grows upward from
+/// the queue, turn line, banner and dock rather than covering them — those are
+/// the rows that say what the turn is doing, and the draft's own band is the
+/// one thing a preview must never hide.
+fn composer_preview_area(area: Rect, bands: &Bands) -> Rect {
+    let anchor = [
+        bands.queue,
+        bands.turn_status,
+        bands.banner,
+        bands.dock,
+        bands.prompt,
+    ]
+    .into_iter()
+    .filter(|band| Bands::is_visible(*band))
+    .map(|band| band.y)
+    .min()
+    .unwrap_or(area.bottom());
+    Rect {
+        height: anchor.saturating_sub(area.y),
+        ..area
     }
 }
 

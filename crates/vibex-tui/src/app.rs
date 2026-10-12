@@ -5618,11 +5618,20 @@ impl App {
         if metadata.len() as usize > crate::composer::IMAGE_MAX_BYTES {
             return Err(self.strings.image_too_large().to_string());
         }
+        // The picture is read here, once, because the preview is the only
+        // reader that wants its pixels and a preview is drawn on every frame
+        // the caret rests on the chip. A file that cannot be read is still an
+        // attachment: the runtime it is sent to is the one that has to have it.
+        let thumbnail = std::fs::read(trimmed)
+            .ok()
+            .and_then(|bytes| crate::preview::thumbnail(&bytes));
         self.composer
-            .insert_image(
-                mime,
-                crate::composer::ImageSource::Path(trimmed.to_string()),
-            )
+            .insert_image(crate::composer::AttachedImage {
+                mime_type: mime.to_string(),
+                source: crate::composer::ImageSource::Path(trimmed.to_string()),
+                byte_len: metadata.len() as usize,
+                thumbnail,
+            })
             .ok_or_else(|| self.strings.image_cap().to_string())
     }
 
@@ -5635,11 +5644,15 @@ impl App {
         if bytes.len() > crate::composer::IMAGE_MAX_BYTES {
             return Err(self.strings.image_too_large().to_string());
         }
+        let byte_len = bytes.len();
+        let thumbnail = crate::preview::thumbnail(&bytes);
         self.composer
-            .insert_image(
-                mime_type,
-                crate::composer::ImageSource::Bytes(std::sync::Arc::new(bytes)),
-            )
+            .insert_image(crate::composer::AttachedImage {
+                mime_type: mime_type.into(),
+                source: crate::composer::ImageSource::Bytes(std::sync::Arc::new(bytes)),
+                byte_len,
+                thumbnail,
+            })
             .ok_or_else(|| self.strings.image_cap().to_string())
     }
 
@@ -6960,10 +6973,12 @@ mod tests {
         app.navigate_to(Page::Agent);
         app.composer.insert_str("see this ");
         app.composer
-            .insert_image(
-                "image/png",
-                crate::composer::ImageSource::Bytes(std::sync::Arc::new(vec![1, 2, 3])),
-            )
+            .insert_image(crate::composer::AttachedImage {
+                mime_type: "image/png".into(),
+                source: crate::composer::ImageSource::Bytes(std::sync::Arc::new(vec![1, 2, 3])),
+                byte_len: 3,
+                thumbnail: None,
+            })
             .expect("the image attaches");
         let outgoing = app.composer.take_outgoing();
         app.enqueue(session_id.clone(), outgoing.text, outgoing.images);
