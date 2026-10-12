@@ -1,7 +1,10 @@
-//! The reward a won encounter unlocks: that Agent's guardian rides the strip
-//! on top of its session composer while the turn runs, and dives into the
-//! composer when the session stops. Double-clicking it opens the same duel the home page
-//! offers, over the session page instead of the new-session page.
+//! The reward a won encounter unlocks: that Agent's guardian rides a lane the
+//! session page floats over the bottom of its timeline while the turn runs, and
+//! dives into the composer when the session stops. Floating it — instead of
+//! giving it a row of the composer — keeps the timeline at its full height and
+//! lets the lane share the timeline's bottom with the follow-the-agent button,
+//! painted over it rather than beside it. Double-clicking it opens the same duel
+//! the home page offers, over the session page instead of the new-session page.
 
 use super::{
     ArenaView, Awakened, art,
@@ -28,9 +31,10 @@ use std::{
 /// The height a guardian's ordinary standing pose is drawn at, in screen
 /// pixels. Every guardian reads at about this size, whatever its proportions.
 ///
-/// This is a lane on top of the composer, not a stage: the model is small
-/// enough to read as a passenger of the composer rather than as the home page's
-/// guardian, yet large enough that its pixels still resolve into a figure.
+/// This is a lane the session page floats over the timeline's bottom, not a
+/// stage: the model is small enough to read as a passenger of the composer it
+/// dives into rather than as the home page's guardian, yet large enough that
+/// its pixels still resolve into a figure.
 const MODEL_HEIGHT: f32 = 40.0;
 /// The tallest lane a companion may reserve. A guardian whose loop reaches far
 /// above its standing pose — the whale's breach — is drawn smaller instead.
@@ -270,8 +274,12 @@ fn lane_x(lane_width: f32, badge_width: f32, across: f32) -> f32 {
     (INSET + across.clamp(0.0, 1.0) * span).round()
 }
 
-/// The lane on top of the composer, or nothing when this session has no reward
-/// to show, when its turn is not running, or when motion is reduced.
+/// The lane the session page floats over the timeline's bottom, or nothing when
+/// this session has no reward to show, when its turn is not running, or when
+/// motion is reduced.
+///
+/// The lane is built here as the strip it always was; where it is mounted — in
+/// flow, or absolutely above the composer's own edge — is the page's decision.
 pub(crate) fn lane(
     state: &Entity<Companion>,
     reward: Option<&str>,

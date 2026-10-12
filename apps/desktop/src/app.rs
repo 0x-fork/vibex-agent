@@ -60451,11 +60451,12 @@ impl VibexWorkbench {
             self.render_composer_goal(cx)
         };
         // The reward of a won encounter rides this composer for as long as its
-        // turn runs, on a strip on top of everything the composer stacks above
-        // its input box — status line, queue, goal — so those rows never trap it
-        // underneath them. Only the composer that owns the keyboard carries it:
-        // a pane that merely mirrors another session's timeline owns no turn
-        // for it to ride.
+        // turn runs, on a lane the session page floats over the timeline rather
+        // than on a row of the composer: the reserved strip used to shorten the
+        // conversation by its own height, and it is now a layer, exactly like
+        // the follow-the-agent button it shares the timeline's bottom with.
+        // Only the composer that owns the keyboard carries it: a pane that
+        // merely mirrors another session's timeline owns no turn for it to ride.
         let companion_focus = composer_input.read(cx).focus_handle(cx);
         let companion_reward = selected_runtime
             .as_ref()
@@ -60474,6 +60475,11 @@ impl VibexWorkbench {
         } else {
             None
         };
+        // The floating lane is anchored to the composer's own edge and keeps the
+        // timeline's content spine, so it needs both the inset and the state the
+        // row it replaces used to read from the composer's own box.
+        let companion_inset = content_insets.horizontal;
+        let composer_is_expanded = self.composer_expanded;
         let composer_extension_visible = composer_queue.is_some() || composer_goal.is_some();
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
@@ -60630,14 +60636,35 @@ impl VibexWorkbench {
                 this.add_composer_paths(paths, window, cx)
             }))
             .when_some(composer_companion, |this, companion| {
+                let lane = div()
+                    .w_full()
+                    .min_w_0()
+                    .when_some(content_max_width, |this, max_width| this.max_w(px(max_width)))
+                    .child(companion);
+                // An expanded composer owns the whole page, so there is no
+                // timeline left to float over and the lane keeps its own row.
+                if composer_is_expanded {
+                    return this.child(lane);
+                }
+                // Otherwise the lane is a layer over the timeline rather than a
+                // row of the composer: anchored to the composer's own top edge,
+                // it costs the conversation no height, and it is painted with
+                // the composer — which the workbench stacks after the timeline
+                // and its follow-the-agent button — so it rides over that
+                // button instead of being pushed aside by it.
                 this.child(
                     div()
-                        .w_full()
-                        .min_w_0()
-                        .when_some(content_max_width, |this, max_width| {
-                            this.max_w(px(max_width))
-                        })
-                        .child(companion),
+                        .id("composer-companion-floats")
+                        .debug_selector(|| "composer-companion-floats".into())
+                        .absolute()
+                        .bottom_full()
+                        .left_0()
+                        .right_0()
+                        // The lane keeps the timeline's own content spine.
+                        .px(px(companion_inset))
+                        .flex()
+                        .justify_center()
+                        .child(lane),
                 )
             })
             .when_some(self.agent_error.clone(), |this, error| {
@@ -86958,9 +86985,10 @@ mod tests {
     }
 
     /// The reward of a won encounter is wired into the session surface exactly
-    /// where a reader sees it: a lane mounted on top of every row of the
-    /// composer whose Agent owns it, and a duel that covers the session
-    /// page rather than the whole window.
+    /// where a reader sees it: a lane floating over the timeline above the
+    /// composer of the Agent that owns it, painted over the follow-the-agent
+    /// button the timeline mounts at its own bottom, and a duel that covers the
+    /// session page rather than the whole window.
     #[test]
     fn the_session_composer_carries_a_won_companion_reward() {
         let source = include_str!("app.rs");
@@ -86981,15 +87009,44 @@ mod tests {
             composer.contains("crate::arena::reward_key(selection.agent_id.as_str())"),
             "the companion follows the Agent the composer renders"
         );
-        let lane = composer
-            .find(".child(companion)")
-            .expect("the lane is a row of the composer column");
-        let first_row = composer
-            .find(".when_some(self.agent_error.clone()")
-            .expect("the composer still stacks its error row");
+        // The lane is a layer above the composer, not a row of it: the strip it
+        // takes belongs to the timeline, which used to lose its full height to
+        // a reserved row of the composer column.
+        let mount = composer
+            .split_once(".when_some(composer_companion, |this, companion| {")
+            .and_then(|(_, tail)| tail.split_once(".when_some(self.agent_error.clone()"))
+            .map(|(body, _)| body)
+            .expect("the companion mount should remain inspectable");
         assert!(
-            lane < first_row,
-            "the lane rides on top of every row the composer stacks"
+            mount.contains(".absolute()") && mount.contains(".bottom_full()"),
+            "the lane is anchored above the composer's own top edge"
+        );
+        assert!(
+            mount.contains(".px(px(companion_inset))"),
+            "the floating lane keeps the timeline's content spine"
+        );
+        assert!(
+            mount.contains("if composer_is_expanded {"),
+            "a composer expanded over the whole page has no timeline to float over"
+        );
+
+        // Painting follows the workbench's own order, so the lane rides over
+        // the follow-the-agent button only because the composer is stacked
+        // after the column that mounts that button.
+        let workbench = source
+            .split_once("    fn render_agent_workbench_for(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(body, _)| body)
+            .expect("the workbench should remain inspectable");
+        let bottom_control = workbench
+            .find(".when_some(timeline_bottom_control, |this, control| this.child(control))")
+            .expect("the timeline still mounts its follow-the-agent control");
+        let composer_row = workbench
+            .find(".when_some(composer, |this, composer| this.child(composer))")
+            .expect("the workbench still stacks its composer under the timeline");
+        assert!(
+            bottom_control < composer_row,
+            "the floating lane paints with the composer, over the timeline's own bottom control"
         );
 
         let page = source
