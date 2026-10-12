@@ -1142,22 +1142,25 @@ strings! {
     palette_cmd_new_session => { "New session", "新建会话", "新增工作階段" },
     palette_hint_new_session => { "Create a session", "创建一个会话", "建立一個工作階段" },
     palette_cmd_rename_session => { "Rename session", "重命名会话", "重新命名工作階段" },
+    // The session verbs act on the session list's own cursor — the row the
+    // reader has selected there — which is not always the session on screen.
+    // The hints name that target rather than promising "the open session".
     palette_hint_rename_session => {
-        "Rename the open session",
-        "重命名当前会话",
-        "重新命名目前的工作階段"
+        "Rename the selected session",
+        "重命名选中的会话",
+        "重新命名選取的工作階段"
     },
     palette_cmd_fork_session => { "Fork session", "复制会话分支", "複製工作階段分支" },
     palette_hint_fork_session => {
-        "Copy the session",
-        "复制当前会话",
-        "複製目前的工作階段"
+        "Copy the selected session",
+        "复制选中的会话",
+        "複製選取的工作階段"
     },
     palette_cmd_archive_session => { "Archive session", "归档会话", "封存工作階段" },
     palette_hint_archive_session => {
-        "Archive the open session",
-        "归档当前会话",
-        "封存目前的工作階段"
+        "Archive the selected session",
+        "归档选中的会话",
+        "封存選取的工作階段"
     },
     palette_cmd_restore_session => { "Restore session", "恢复会话", "還原工作階段" },
     palette_hint_restore_session => {
@@ -1167,9 +1170,9 @@ strings! {
     },
     palette_cmd_delete_session => { "Delete session", "删除会话", "刪除工作階段" },
     palette_hint_delete_session => {
-        "Delete the open session",
-        "删除当前会话",
-        "刪除目前的工作階段"
+        "Delete the selected session",
+        "删除选中的会话",
+        "刪除選取的工作階段"
     },
     palette_cmd_switch_runtime => { "Switch runtime", "切换运行时", "切換執行階段" },
     palette_hint_switch_runtime => {
