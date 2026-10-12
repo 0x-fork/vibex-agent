@@ -207,6 +207,28 @@ pub enum TerminalWorkingDirectory {
     CurrentFile,
 }
 
+/// How the Composer's terminal button puts a terminal on screen.
+///
+/// `BottomPanel` slides a full-width panel in under the Composer and lifts the
+/// input by the panel's height, which is what a fresh install starts with. The
+/// `Composer` mode is the older single-surface behavior: the input itself is
+/// replaced by the terminal until the reader goes back to the conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalOpenMode {
+    #[default]
+    BottomPanel,
+    Composer,
+}
+
+impl TerminalOpenMode {
+    /// Whether the terminal takes the Composer's place instead of riding a
+    /// panel under it.
+    pub const fn replaces_composer(self) -> bool {
+        matches!(self, Self::Composer)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarProjectLogo {
@@ -1289,6 +1311,10 @@ pub struct TerminalPreferencesUiState {
     pub shell: Option<String>,
     #[serde(default)]
     pub working_directory: TerminalWorkingDirectory,
+    /// Where the Composer terminal opens. Older state files predate the
+    /// setting, and the panel is the default for them too.
+    #[serde(default)]
+    pub open_mode: TerminalOpenMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -3247,6 +3273,43 @@ mod tests {
         assert_eq!(
             decoded.workbench.preview_window_mode,
             PreviewWindowMode::Inline
+        );
+    }
+
+    #[test]
+    fn terminal_open_mode_defaults_to_the_bottom_panel_and_round_trips_a_composer_choice() {
+        assert_eq!(
+            TerminalPreferencesUiState::default().open_mode,
+            TerminalOpenMode::BottomPanel
+        );
+        assert!(!TerminalOpenMode::BottomPanel.replaces_composer());
+        assert!(TerminalOpenMode::Composer.replaces_composer());
+
+        let mut state = DesktopUiStateV1::default();
+        state.terminal_preferences.open_mode = TerminalOpenMode::Composer;
+
+        let decoded = decode_and_migrate(&serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert_eq!(
+            decoded.terminal_preferences.open_mode,
+            TerminalOpenMode::Composer
+        );
+    }
+
+    #[test]
+    fn legacy_state_without_a_terminal_open_mode_opens_the_bottom_panel() {
+        let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        value
+            .get_mut("terminalPreferences")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("openMode");
+
+        let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+        assert_eq!(
+            decoded.terminal_preferences.open_mode,
+            TerminalOpenMode::BottomPanel
         );
     }
 

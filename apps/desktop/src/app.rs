@@ -157,7 +157,7 @@ use vibex_desktop_model::{
     SidebarOrganizationItem, SidebarOrganizationScope, SidebarOrganizationState,
     SidebarOrganizationView, SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
     SidebarProjectProjection, SidebarState, SidebarUiState, SidebarWorkspaceProjection,
-    StartupDestination, TerminalWorkingDirectory, ThemeMode as ModelThemeMode,
+    StartupDestination, TerminalOpenMode, TerminalWorkingDirectory, ThemeMode as ModelThemeMode,
     ThrottledUiStateWriter, TimelineConversationTurn, TimelineDelegationProjection,
     TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
     UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceContextProjection,
@@ -468,6 +468,8 @@ const COMPOSER_TERMINAL_DEFAULT_HEIGHT_PX: f32 = 288.0;
 const COMPOSER_TERMINAL_MIN_HEIGHT_PX: f32 = 160.0;
 const COMPOSER_TERMINAL_MAX_HEIGHT_INSET_PX: f32 = 224.0;
 const COMPOSER_TERMINAL_RESIZE_HANDLE_HEIGHT_PX: f32 = 10.0;
+/// The Composer's bottom terminal panel slides the input up by this long.
+const COMPOSER_TERMINAL_PANEL_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const RIGHT_ACTIVITY_BAR_WIDTH: f32 = 40.0;
 const RIGHT_ACTIVITY_BUTTON_SIZE: f32 = 32.0;
 const RIGHT_ACTIVITY_ITEM_GAP: f32 = 4.0;
@@ -3763,6 +3765,19 @@ impl Render for ComposerTerminalResizeDrag {
     }
 }
 
+/// Which surface draws the Composer terminal card.
+///
+/// The card itself — tab strip, shell picker, live surface — is the same in
+/// both; only the shell around it and the two trailing toolbar buttons differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerTerminalChrome {
+    /// The card replaces the Composer, the way the input itself becomes a
+    /// terminal.
+    Composer,
+    /// The card rides a full-width panel under the Composer.
+    Panel,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RightPanelKind {
     Preview,
@@ -4473,6 +4488,14 @@ pub struct SessionView {
     composer_terminals: Vec<TerminalSession>,
     selected_composer_terminal_id: Option<TerminalId>,
     composer_terminal_mode: bool,
+    /// The Composer's bottom terminal panel is asked for. It stays true while
+    /// the panel's close transition plays, so `mounted` is the flag the render
+    /// path reads.
+    composer_terminal_panel_open: bool,
+    /// The bottom terminal panel is in the element tree. It outlives `open` by
+    /// one transition so the input can be lowered back down smoothly.
+    composer_terminal_panel_mounted: bool,
+    composer_terminal_panel_close_task: Option<Task<()>>,
     composer_terminal_expanded: bool,
     composer_terminal_height: f32,
     composer_terminal_resize_drag: Option<ComposerTerminalResizeDragState>,
@@ -4578,6 +4601,9 @@ impl SessionView {
             composer_terminals: Vec::new(),
             selected_composer_terminal_id: None,
             composer_terminal_mode: false,
+            composer_terminal_panel_open: false,
+            composer_terminal_panel_mounted: false,
+            composer_terminal_panel_close_task: None,
             composer_terminal_expanded: false,
             composer_terminal_height: COMPOSER_TERMINAL_DEFAULT_HEIGHT_PX,
             composer_terminal_resize_drag: None,
@@ -21669,6 +21695,9 @@ impl VibexWorkbench {
         self.composer_terminals.clear();
         self.selected_composer_terminal_id = None;
         self.composer_terminal_mode = false;
+        self.composer_terminal_panel_open = false;
+        self.composer_terminal_panel_mounted = false;
+        self.composer_terminal_panel_close_task = None;
         self.composer_terminal_expanded = false;
         self.composer_terminal_resize_drag = None;
         self.composer_terminal_drop_target = None;
@@ -28704,11 +28733,11 @@ impl VibexWorkbench {
     fn sync_composer_terminal_surface_activity(&mut self, cx: &mut Context<Self>) {
         let desired = (self.ui_state.workbench.active_tab == "agent"
             && !self.new_session_open
-            && self.composer_terminal_mode)
-            .then_some(self.selected_composer_terminal_id.as_ref())
-            .flatten()
-            .map(|terminal_id| terminal_id.as_str().to_string())
-            .filter(|terminal_id| self.composer_terminal_surfaces.contains_key(terminal_id));
+            && self.composer_terminal_surface_visible())
+        .then_some(self.selected_composer_terminal_id.as_ref())
+        .flatten()
+        .map(|terminal_id| terminal_id.as_str().to_string())
+        .filter(|terminal_id| self.composer_terminal_surfaces.contains_key(terminal_id));
         if desired == self.active_composer_terminal_surface_id {
             return;
         }
@@ -28982,7 +29011,7 @@ impl VibexWorkbench {
             .find(|terminal| terminal.id == terminal_id)
             .cloned();
         self.selected_composer_terminal_id = Some(terminal_id.clone());
-        self.composer_terminal_mode = true;
+        self.show_composer_terminal(cx);
         self.clear_suggestions();
         if let Some(terminal) = terminal
             && let Some(surface) = self.ensure_composer_terminal_surface(terminal, window, cx)
@@ -28990,6 +29019,78 @@ impl VibexWorkbench {
             self.sync_composer_terminal_surface_activity(cx);
             surface.update(cx, |surface, cx| surface.focus_input(window, cx));
         }
+        cx.notify();
+    }
+
+    /// Whether the Composer's terminal button should raise the bottom panel
+    /// instead of turning the input into a terminal.
+    fn composer_terminal_opens_in_panel(&self) -> bool {
+        !self
+            .ui_state
+            .terminal_preferences
+            .open_mode
+            .replaces_composer()
+    }
+
+    /// Whether a Composer terminal is on screen right now, in whichever host
+    /// the preference names.
+    fn composer_terminal_surface_visible(&self) -> bool {
+        if self.composer_terminal_opens_in_panel() {
+            self.composer_terminal_panel_open
+        } else {
+            self.composer_terminal_mode
+        }
+    }
+
+    /// Puts the selected terminal on screen in the host the preference names.
+    /// Both hosts are mutually exclusive: a terminal is either the Composer or
+    /// a panel under it, and leaving the other host armed would render two
+    /// live surfaces for one PTY.
+    fn show_composer_terminal(&mut self, cx: &mut Context<Self>) {
+        if self.composer_terminal_opens_in_panel() {
+            self.composer_terminal_mode = false;
+            self.set_composer_terminal_panel_open(true, cx);
+        } else {
+            self.composer_terminal_panel_open = false;
+            self.composer_terminal_panel_mounted = false;
+            self.composer_terminal_mode = true;
+        }
+    }
+
+    /// Raises or lowers the Composer's bottom terminal panel.
+    ///
+    /// Lowering keeps the panel mounted for one transition so the Composer
+    /// settles back down instead of snapping; a hidden panel with no terminals
+    /// left has nothing to animate and unmounts at once.
+    fn set_composer_terminal_panel_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.composer_terminal_panel_open == open {
+            if open && !self.composer_terminal_panel_mounted {
+                self.composer_terminal_panel_mounted = true;
+                cx.notify();
+            }
+            return;
+        }
+        self.composer_terminal_panel_open = open;
+        self.composer_terminal_panel_close_task = None;
+        if open {
+            self.composer_terminal_panel_mounted = true;
+        } else if self.ui_state.appearance.reduced_motion || self.composer_terminals.is_empty() {
+            self.composer_terminal_panel_mounted = false;
+        } else if self.composer_terminal_panel_mounted {
+            self.composer_terminal_panel_close_task = Some(cx.spawn(async move |entity, cx| {
+                cx.background_executor()
+                    .timer(COMPOSER_TERMINAL_PANEL_TRANSITION_DURATION)
+                    .await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.composer_terminal_panel_close_task = None;
+                    if !this.composer_terminal_panel_open {
+                        this.composer_terminal_panel_mounted = false;
+                        cx.notify();
+                    }
+                });
+            }));
+        }
+        self.sync_composer_terminal_surface_activity(cx);
         cx.notify();
     }
 
@@ -29015,10 +29116,28 @@ impl VibexWorkbench {
         if let Some(terminal_id) = terminal_id {
             self.select_composer_terminal(terminal_id, window, cx);
         } else {
-            self.composer_terminal_mode = true;
+            self.show_composer_terminal(cx);
             self.clear_suggestions();
             self.create_composer_terminal(window_handle, cx);
         }
+    }
+
+    /// The Composer terminal button. In panel mode it toggles the panel; in
+    /// Composer mode it swaps the input for the terminal.
+    fn toggle_composer_terminal(
+        &mut self,
+        window_handle: AnyWindowHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.composer_terminal_opens_in_panel() && self.composer_terminal_panel_open {
+            self.set_composer_terminal_panel_open(false, cx);
+            if let Some(input) = self.composer_input_entity() {
+                input.update(cx, |input, cx| input.focus(window, cx));
+            }
+            return;
+        }
+        self.switch_to_composer_terminal(window_handle, window, cx);
     }
 
     fn open_code_file(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -29381,7 +29500,7 @@ impl VibexWorkbench {
                         Ok(Ok(terminal)) => {
                             let terminal_id = terminal.id.clone();
                             this.selected_composer_terminal_id = Some(terminal_id.clone());
-                            this.composer_terminal_mode = true;
+                            this.show_composer_terminal(cx);
                             this.composer_terminals
                                 .retain(|item| item.id != terminal_id);
                             this.composer_terminals.push(terminal.clone());
@@ -29401,7 +29520,15 @@ impl VibexWorkbench {
                             if terminal_state_changed {
                                 this.queue_ui_state();
                             }
-                            this.ensure_composer_terminal_surface(terminal, window, cx);
+                            if let Some(surface) =
+                                this.ensure_composer_terminal_surface(terminal, window, cx)
+                            {
+                                // A terminal the reader just asked for takes
+                                // the keyboard. In panel mode the Composer is
+                                // still on screen above it and would otherwise
+                                // keep typing where the reader cannot see it.
+                                surface.update(cx, |surface, cx| surface.focus_input(window, cx));
+                            }
                             this.sync_composer_terminal_surface_activity(cx);
                         }
                         Ok(Err(error)) => {
@@ -29607,6 +29734,9 @@ impl VibexWorkbench {
                         if this.selected_composer_terminal_id.is_none() {
                             this.composer_terminal_mode = false;
                             this.composer_terminal_expanded = false;
+                            // The last terminal is gone, so the panel has
+                            // nothing left to hold open and lowers at once.
+                            this.set_composer_terminal_panel_open(false, cx);
                         }
                         this.sync_composer_terminal_surface_activity(cx);
                         if !errors.is_empty() {
@@ -37830,6 +37960,15 @@ impl VibexWorkbench {
             cx.notify();
             return;
         }
+        // The shortcut is the button's twin: in panel mode it puts the panel
+        // away again instead of swapping the Composer for a terminal.
+        if self.composer_terminal_opens_in_panel() && self.composer_terminal_panel_open {
+            self.set_composer_terminal_panel_open(false, cx);
+            if let Some(input) = self.composer_input_entity() {
+                input.update(cx, |input, cx| input.focus(window, cx));
+            }
+            return;
+        }
         if self.runtime.is_none() {
             return;
         }
@@ -42679,6 +42818,7 @@ impl VibexWorkbench {
         // The pane's rail spans the pane, composer and all: a pane whose plan
         // panel grows must not move the ticks beside its own conversation.
         let rail = self.render_session_pane_rail(cx);
+        let terminal_panel = self.render_composer_terminal_panel(cx);
         v_flex()
             .size_full()
             .min_w_0()
@@ -42695,6 +42835,7 @@ impl VibexWorkbench {
             .when_some(conversation_find, |this, find| this.child(find))
             .child(composer)
             .when_some(rail, |this, rail| this.child(rail))
+            .when_some(terminal_panel, |this, panel| this.child(panel))
             .into_any_element()
     }
 
@@ -50605,13 +50746,22 @@ impl VibexWorkbench {
             .then(|| self.render_conversation_find(cx))
             .flatten();
         let composer = include_composer.then(|| self.render_composer(window, cx, true));
+        // The bottom terminal panel belongs to the Composer's surface, so only
+        // a pane that mounts a Composer mounts it. It is the last row of the
+        // page: raising it is what lifts the input.
+        let composer_terminal_panel = include_composer
+            .then(|| self.render_composer_terminal_panel(cx))
+            .flatten();
         // Terminal mode routes its own near-fullscreen expansion through the
         // same timeline-collapse path as the input composer's expanded state.
-        let composer_fullscreen = if self.composer_terminal_mode {
-            self.composer_terminal_expanded
-        } else {
-            self.composer_expanded
-        };
+        // The bottom terminal panel borrows the same expansion: a maximized
+        // panel takes the room the timeline gives up.
+        let composer_fullscreen =
+            if self.composer_terminal_mode || self.composer_terminal_panel_open {
+                self.composer_terminal_expanded
+            } else {
+                self.composer_expanded
+            };
         // The follow-the-agent affordance floats over the timeline instead of
         // occupying a row above the composer. A reserved row shortened the
         // timeline viewport by its full height, so the band it painted hid the
@@ -50793,6 +50943,7 @@ impl VibexWorkbench {
             .when_some(conversation_find, |this, find| this.child(find))
             .when_some(composer, |this, composer| this.child(composer))
             .when_some(turn_preview_rail, |this, rail| this.child(rail))
+            .when_some(composer_terminal_panel, |this, panel| this.child(panel))
             .into_any_element()
     }
 
@@ -51434,8 +51585,15 @@ impl VibexWorkbench {
     }
 
     fn render_composer_terminal_menu(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let panel_mode = self.composer_terminal_opens_in_panel();
         let tooltip = if self.composer_terminals.is_empty() {
             "Create Composer terminal"
+        } else if panel_mode && self.composer_terminal_panel_open {
+            // The button is the panel's toggle in panel mode, so it has to name
+            // what the next press does, not just what the surface is.
+            "Hide terminal panel"
+        } else if panel_mode {
+            "Show terminal panel"
         } else {
             "Switch to terminal mode"
         };
@@ -51447,7 +51605,7 @@ impl VibexWorkbench {
             .tooltip(tooltip)
             .disabled(self.agent_action_pending || self.view_session_id.is_none())
             .on_click(cx.listener(|this, _, window, cx| {
-                this.switch_to_composer_terminal(window.window_handle(), window, cx)
+                this.toggle_composer_terminal(window.window_handle(), window, cx)
             }))
             .into_any_element()
     }
@@ -51710,7 +51868,128 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    /// The Composer terminal as the Composer itself: the input is replaced by
+    /// the terminal card until the reader goes back to the conversation.
     fn render_composer_terminal(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let (min_terminal_height, max_terminal_height) = self.composer_terminal_height_limits();
+        let terminal_height = self
+            .composer_terminal_height
+            .clamp(min_terminal_height, max_terminal_height);
+        let content_max_width = session_content_max_width(self.ui_state.session.content_width);
+        let content_insets = self.session_content_insets();
+        let resize_handle = if self.composer_terminal_expanded {
+            None
+        } else {
+            Some(self.render_composer_terminal_resize_handle(cx))
+        };
+        let card = self.render_composer_terminal_card(ComposerTerminalChrome::Composer, cx);
+
+        v_flex()
+            .id("agent-composer-terminal")
+            .relative()
+            .when(!self.composer_terminal_expanded, |this| this.flex_none())
+            .when(self.composer_terminal_expanded, |this| {
+                this.flex_1().min_h_0().pt_4()
+            })
+            .items_center()
+            .bg(cx.theme().background)
+            .px(px(content_insets.horizontal))
+            .py_2()
+            .when_some(resize_handle, |this, handle| this.child(handle))
+            .child(
+                v_flex()
+                    .w_full()
+                    .when_some(content_max_width, |this, max_width| {
+                        this.max_w(px(max_width))
+                    })
+                    .when(!self.composer_terminal_expanded, |this| {
+                        this.h(px(terminal_height))
+                    })
+                    .when(self.composer_terminal_expanded, |this| {
+                        this.flex_1().min_h_0()
+                    })
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(card),
+            )
+            .into_any_element()
+    }
+
+    /// The Composer terminal as a full-width panel under the input.
+    ///
+    /// The panel is the last row of the session page, so raising it lifts the
+    /// Composer — and the conversation above it — by the panel's height. It is
+    /// not mounted at all while there is no terminal to show: an empty panel
+    /// would push the input up for an empty state the Composer's own terminal
+    /// button already answers.
+    fn render_composer_terminal_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.composer_terminal_panel_mounted || self.composer_terminals.is_empty() {
+            return None;
+        }
+        let (min_terminal_height, max_terminal_height) = self.composer_terminal_height_limits();
+        let terminal_height = self
+            .composer_terminal_height
+            .clamp(min_terminal_height, max_terminal_height);
+        // The panel owns the window's bottom edge, so its height is the
+        // terminal plus the resize strip above it.
+        let panel_height = terminal_height + COMPOSER_TERMINAL_RESIZE_HANDLE_HEIGHT_PX;
+        let expanded = self.composer_terminal_expanded;
+        let resize_handle = if expanded {
+            None
+        } else {
+            Some(self.render_composer_terminal_resize_handle(cx))
+        };
+        let card = self.render_composer_terminal_card(ComposerTerminalChrome::Panel, cx);
+        let panel = v_flex()
+            .id("agent-composer-terminal-panel")
+            .relative()
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .when(expanded, |this| this.flex_1().min_h_0())
+            .overflow_hidden()
+            .bg(cx.theme().background)
+            .pt(px(COMPOSER_TERMINAL_RESIZE_HANDLE_HEIGHT_PX))
+            .when_some(resize_handle, |this, handle| this.child(handle))
+            .child(
+                v_flex()
+                    .w_full()
+                    .when(!expanded, |this| this.h(px(terminal_height)))
+                    .when(expanded, |this| this.flex_1().min_h_0())
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(card),
+            );
+        if self.ui_state.appearance.reduced_motion || expanded {
+            return Some(panel.into_any_element());
+        }
+        // A closed panel stays mounted for one transition so the Composer
+        // settles back down instead of snapping.
+        Some(if self.composer_terminal_panel_open {
+            Transition::new(COMPOSER_TERMINAL_PANEL_TRANSITION_DURATION)
+                .ease(motion::EASE.easing())
+                .height(px(0.0), px(panel_height))
+                .fade(0.0, 1.0)
+                .apply(panel, "composer-terminal-panel-open")
+                .into_any_element()
+        } else {
+            Transition::new(COMPOSER_TERMINAL_PANEL_TRANSITION_DURATION)
+                .ease(motion::EASE.easing())
+                .height(px(panel_height), px(0.0))
+                .fade(1.0, 0.0)
+                .apply(panel, "composer-terminal-panel-close")
+                .into_any_element()
+        })
+    }
+
+    /// The terminal card both hosts share: tab strip, shell picker and the live
+    /// surface. `chrome` decides only how the card is shelled and which two
+    /// trailing toolbar buttons it carries.
+    fn render_composer_terminal_card(
+        &mut self,
+        chrome: ComposerTerminalChrome,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let terminals = order_terminal_sessions(
             self.composer_terminals.clone(),
             &self.ui_state.terminal.tab_order,
@@ -51814,185 +52093,183 @@ impl VibexWorkbench {
                 )
             })
             .collect::<Vec<_>>();
-        let (min_terminal_height, max_terminal_height) = self.composer_terminal_height_limits();
-        let terminal_height = self
-            .composer_terminal_height
-            .clamp(min_terminal_height, max_terminal_height);
-        let content_max_width = session_content_max_width(self.ui_state.session.content_width);
-        let content_insets = self.session_content_insets();
-        let resize_handle = if self.composer_terminal_expanded {
-            None
-        } else {
-            Some(self.render_composer_terminal_resize_handle(cx))
-        };
-
-        v_flex()
-            .id("agent-composer-terminal")
-            .relative()
-            .when(!self.composer_terminal_expanded, |this| this.flex_none())
-            .when(self.composer_terminal_expanded, |this| {
-                this.flex_1().min_h_0().pt_4()
+        let card_border = cx.theme().border;
+        let card = v_flex()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .when(chrome == ComposerTerminalChrome::Composer, |this| {
+                this.rounded(px(8.0)).border_1().border_color(card_border)
             })
-            .items_center()
-            .bg(cx.theme().background)
-            .px(px(content_insets.horizontal))
-            .py_2()
-            .when_some(resize_handle, |this, handle| this.child(handle))
+            // The panel is docked to the window's bottom edge: a top hairline
+            // separates it from the Composer without drawing a card the width
+            // of the page.
+            .when(chrome == ComposerTerminalChrome::Panel, |this| {
+                this.border_t_1().border_color(card_border)
+            })
+            .bg(card_color)
             .child(
-                v_flex()
-                    .w_full()
-                    .when_some(content_max_width, |this, max_width| {
-                        this.max_w(px(max_width))
-                    })
-                    .when(!self.composer_terminal_expanded, |this| {
-                        this.h(px(terminal_height))
-                    })
-                    .when(self.composer_terminal_expanded, |this| {
-                        this.flex_1().min_h_0()
-                    })
+                h_flex()
+                    .h(px(38.0))
+                    .flex_none()
                     .min_w_0()
-                    .overflow_hidden()
-                    .rounded(px(8.0))
-                    .border_1()
+                    .bg(cx.theme().muted.opacity(0.24))
+                    .border_b_1()
                     .border_color(cx.theme().border)
-                    .bg(card_color)
                     .child(
                         h_flex()
-                            .h(px(38.0))
-                            .flex_none()
+                            .h_full()
                             .min_w_0()
-                            .bg(cx.theme().muted.opacity(0.24))
-                            .border_b_1()
-                            .border_color(cx.theme().border)
-                            .child(
-                                h_flex()
-                                    .h_full()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .overflow_x_scrollbar()
-                                    .children(tabs),
-                            )
-                            .child(
-                                Button::new("new-composer-terminal")
-                                    .small()
-                                    .ghost()
-                                    .compact()
-                                    .h_full()
-                                    .w(px(38.0))
-                                    .rounded_none()
-                                    .border_l_1()
-                                    .border_color(cx.theme().border)
-                                    .icon(IconName::Plus)
-                                    .tooltip(locale::text("New terminal", "新建终端", "新增終端機"))
-                                    .disabled(
-                                        self.agent_action_pending || self.view_session_id.is_none(),
-                                    )
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.create_composer_terminal(window.window_handle(), cx)
-                                    })),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .h(px(34.0))
-                            .flex_none()
-                            .min_w_0()
-                            .items_center()
-                            .gap_2()
-                            .border_b_1()
-                            .border_color(cx.theme().border)
-                            .px_2()
-                            .child(shell_menu)
-                            .child(div().flex_1())
-                            .child(
-                                Button::new("back-to-conversation")
-                                    .xsmall()
-                                    .ghost()
-                                    .icon(IconName::ArrowLeft)
-                                    .label(locale::text(
-                                        "Back to conversation",
-                                        "返回对话框",
-                                        "返回對話框",
-                                    ))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.composer_terminal_mode = false;
-                                        this.sync_composer_terminal_surface_activity(cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("toggle-composer-terminal-expanded")
-                                    .xsmall()
-                                    .ghost()
-                                    .compact()
-                                    .icon(if self.composer_terminal_expanded {
-                                        IconName::Minimize
-                                    } else {
-                                        IconName::Maximize
-                                    })
-                                    .tooltip(if self.composer_terminal_expanded {
-                                        locale::text("Collapse terminal", "收起终端", "收合終端機")
-                                    } else {
-                                        locale::text("Expand terminal", "展开终端", "展開終端機")
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.composer_terminal_expanded =
-                                            !this.composer_terminal_expanded;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
                             .flex_1()
-                            .min_h_0()
-                            .min_w_0()
-                            .when_some(selected_surface, |surface, terminal| {
-                                surface
-                                    .child(terminal.cached(StyleRefinement::default().size_full()))
-                            })
-                            .when(selected_terminal.is_none(), |surface| {
-                                surface.child(
-                                    EmptyState::new()
-                                        .size_full()
-                                        .gap_2()
-                                        .header(EmptyHeader::new().description(
-                                            EmptyDescription::new().child(locale::text(
-                                                "No Composer terminal",
-                                                "暂无编辑器终端",
-                                                "暫無編輯器終端機",
-                                            )),
-                                        ))
-                                        .content(
-                                            EmptyContent::new().child(
-                                                Button::new("create-first-composer-terminal")
-                                                    .small()
-                                                    .primary()
-                                                    .icon(IconName::Plus)
-                                                    .label(locale::text(
-                                                        "New terminal",
-                                                        "新建终端",
-                                                        "新增終端機",
-                                                    ))
-                                                    .disabled(
-                                                        self.agent_action_pending
-                                                            || self.view_session_id.is_none(),
-                                                    )
-                                                    .on_click(cx.listener(
-                                                        |this, _, window, cx| {
-                                                            this.create_composer_terminal(
-                                                                window.window_handle(),
-                                                                cx,
-                                                            )
-                                                        },
-                                                    )),
-                                            ),
-                                        ),
-                                )
-                            }),
+                            .overflow_x_scrollbar()
+                            .children(tabs),
+                    )
+                    .child(
+                        Button::new("new-composer-terminal")
+                            .small()
+                            .ghost()
+                            .compact()
+                            .h_full()
+                            .w(px(38.0))
+                            .rounded_none()
+                            .border_l_1()
+                            .border_color(cx.theme().border)
+                            .icon(IconName::Plus)
+                            .tooltip(locale::text("New terminal", "新建终端", "新增終端機"))
+                            .disabled(self.agent_action_pending || self.view_session_id.is_none())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.create_composer_terminal(window.window_handle(), cx)
+                            })),
                     ),
             )
-            .into_any_element()
+            .child(
+                h_flex()
+                    .h(px(34.0))
+                    .flex_none()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .px_2()
+                    .child(shell_menu)
+                    .child(div().flex_1())
+                    .when(chrome == ComposerTerminalChrome::Composer, |this| {
+                        this.child(
+                            Button::new("back-to-conversation")
+                                .xsmall()
+                                .ghost()
+                                .icon(IconName::ArrowLeft)
+                                .label(locale::text(
+                                    "Back to conversation",
+                                    "返回对话框",
+                                    "返回對話框",
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.composer_terminal_mode = false;
+                                    this.sync_composer_terminal_surface_activity(cx);
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .when(chrome == ComposerTerminalChrome::Panel, |this| {
+                        this.child(
+                            Button::new("collapse-composer-terminal-panel")
+                                .xsmall()
+                                .ghost()
+                                .icon(IconName::ArrowDown)
+                                .label(locale::text(
+                                    "Collapse panel",
+                                    "收起终端面板",
+                                    "收合終端機面板",
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_composer_terminal_panel_open(false, cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("toggle-composer-terminal-expanded")
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .icon(if self.composer_terminal_expanded {
+                                IconName::Minimize
+                            } else {
+                                IconName::Maximize
+                            })
+                            .tooltip(if self.composer_terminal_expanded {
+                                match chrome {
+                                    ComposerTerminalChrome::Composer => {
+                                        locale::text("Collapse terminal", "收起终端", "收合終端機")
+                                    }
+                                    ComposerTerminalChrome::Panel => {
+                                        locale::text("Restore panel", "还原面板", "還原面板")
+                                    }
+                                }
+                            } else {
+                                match chrome {
+                                    ComposerTerminalChrome::Composer => {
+                                        locale::text("Expand terminal", "展开终端", "展開終端機")
+                                    }
+                                    ComposerTerminalChrome::Panel => {
+                                        locale::text("Maximize panel", "最大化面板", "最大化面板")
+                                    }
+                                }
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.composer_terminal_expanded = !this.composer_terminal_expanded;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .when_some(selected_surface, |surface, terminal| {
+                        surface.child(terminal.cached(StyleRefinement::default().size_full()))
+                    })
+                    .when(selected_terminal.is_none(), |surface| {
+                        surface.child(
+                            EmptyState::new()
+                                .size_full()
+                                .gap_2()
+                                .header(EmptyHeader::new().description(
+                                    EmptyDescription::new().child(locale::text(
+                                        "No Composer terminal",
+                                        "暂无编辑器终端",
+                                        "暫無編輯器終端機",
+                                    )),
+                                ))
+                                .content(
+                                    EmptyContent::new().child(
+                                        Button::new("create-first-composer-terminal")
+                                            .small()
+                                            .primary()
+                                            .icon(IconName::Plus)
+                                            .label(locale::text(
+                                                "New terminal",
+                                                "新建终端",
+                                                "新增終端機",
+                                            ))
+                                            .disabled(
+                                                self.agent_action_pending
+                                                    || self.view_session_id.is_none(),
+                                            )
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.create_composer_terminal(
+                                                    window.window_handle(),
+                                                    cx,
+                                                )
+                                            })),
+                                    ),
+                                ),
+                        )
+                    }),
+            );
+        card.into_any_element()
     }
 
     fn render_composer_terminal_resize_handle(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -73867,6 +74144,34 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_terminal_open_mode(&mut self, mode: TerminalOpenMode, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            if this.ui_state.terminal_preferences.open_mode == mode {
+                return;
+            }
+            this.ui_state.terminal_preferences.open_mode = mode;
+            // The armed host no longer matches the preference. Put the terminal
+            // away rather than leaving it on screen in the way the reader just
+            // turned off; the Composer's terminal button puts it back in the
+            // new host.
+            if mode.replaces_composer() {
+                // The Composer is about to draw the terminal itself, so the
+                // panel goes outright instead of animating out beside the card
+                // that replaces it.
+                this.composer_terminal_panel_open = false;
+                this.composer_terminal_panel_mounted = false;
+                this.composer_terminal_panel_close_task = None;
+            } else {
+                this.composer_terminal_mode = false;
+                this.composer_terminal_expanded = false;
+            }
+            this.sync_composer_terminal_surface_activity(cx);
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     fn set_shortcut(&mut self, action: String, keystroke: String, cx: &mut Context<Self>) -> bool {
         let applied = self
             .workbench
@@ -76015,6 +76320,26 @@ impl FoundationSettings {
             cx,
         );
         let cwd = preferences.working_directory;
+        let open_mode = preferences.open_mode;
+        let open_mode_control = settings_segmented_control(
+            "terminal-open-mode",
+            vec![
+                settings_segmented_option(
+                    locale::text("Bottom panel", "底部面板", "底部面板"),
+                    open_mode == TerminalOpenMode::BottomPanel,
+                    cx.listener(|this, _, _, cx| {
+                        this.set_terminal_open_mode(TerminalOpenMode::BottomPanel, cx)
+                    }),
+                ),
+                settings_segmented_option(
+                    locale::text("Replace input", "替换输入框", "取代輸入框"),
+                    open_mode == TerminalOpenMode::Composer,
+                    cx.listener(|this, _, _, cx| {
+                        this.set_terminal_open_mode(TerminalOpenMode::Composer, cx)
+                    }),
+                ),
+            ],
+        );
         let cwd_control = settings_segmented_control(
             "terminal-cwd",
             vec![
@@ -76058,6 +76383,20 @@ impl FoundationSettings {
                 "設定新建終端機的預設值。",
             ),
             vec![
+                SettingsGroup::new(
+                    locale::text("Composer", "对话框", "對話框"),
+                    vec![setting_row(
+                        locale::text("Open terminal in", "终端打开方式", "終端機開啟方式"),
+                        locale::text(
+                            "The bottom panel lifts the input and keeps it available; replacing the input turns the Composer itself into the terminal.",
+                            "底部面板会抬升输入框并保持可用；替换输入框则把对话框本身变成终端。",
+                            "底部面板會抬升輸入框並保持可用；取代輸入框則把對話框本身變成終端機。",
+                        ),
+                        open_mode_control,
+                        stacked,
+                        cx,
+                    )],
+                ),
                 SettingsGroup::new(
                     locale::text("Shell", "Shell", "Shell"),
                     vec![
@@ -85259,13 +85598,20 @@ mod tests {
         assert!(terminal.contains("when_some(resize_handle"));
         assert!(terminal.contains("composer-terminal-resize-handle"));
         assert!(terminal.contains("ComposerTerminalResizeDrag"));
+        // Both hosts draw the one card, so the panel cannot drift away from
+        // what the Composer mode renders.
+        assert!(terminal.contains("ComposerTerminalChrome::Composer"));
+        assert!(terminal.contains("ComposerTerminalChrome::Panel"));
 
         let workbench = source
             .split_once("    fn render_agent_workbench(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_controls("))
             .map(|(body, _)| body)
             .expect("agent workbench renderer should remain inspectable");
-        assert!(workbench.contains("let composer_fullscreen = if self.composer_terminal_mode {"));
+        assert!(
+            workbench
+                .contains("if self.composer_terminal_mode || self.composer_terminal_panel_open {")
+        );
         assert!(workbench.contains(".when(!composer_fullscreen, |this| this.flex_1())"));
         assert!(workbench.contains(".when(composer_fullscreen, |this| this.h_0().flex_none())"));
 
@@ -85275,6 +85621,54 @@ mod tests {
             .map(|(body, _)| body)
             .expect("terminal resize updater should remain inspectable");
         assert!(resize.contains("drag.start_height - (window_y - drag.start_window_y)"));
+    }
+
+    #[test]
+    fn composer_terminal_panel_hosts_the_same_card_and_lifts_the_input() {
+        let source = include_str!("app.rs");
+        let panel = source
+            .split_once("    fn render_composer_terminal_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_card("))
+            .map(|(body, _)| body)
+            .expect("composer terminal panel renderer should remain inspectable");
+        assert!(panel.contains("composer_terminal_panel_mounted"));
+        assert!(panel.contains("COMPOSER_TERMINAL_PANEL_TRANSITION_DURATION"));
+        assert!(panel.contains("\"composer-terminal-panel-open\""));
+        assert!(panel.contains("\"composer-terminal-panel-close\""));
+        // The panel pulls the full width of the session page rather than
+        // matching the input's content column.
+        assert!(panel.contains(".w_full()"));
+        assert!(!panel.contains("content_max_width"));
+
+        let toggle = source
+            .split_once("    fn toggle_composer_terminal(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn open_code_file("))
+            .map(|(body, _)| body)
+            .expect("composer terminal toggle should remain inspectable");
+        assert!(toggle.contains("self.composer_terminal_panel_open"));
+        assert!(toggle.contains("self.set_composer_terminal_panel_open(false, cx)"));
+        assert!(toggle.contains("self.switch_to_composer_terminal("));
+
+        // The last terminal leaving the panel is the other way it collapses.
+        let close = source
+            .split_once("    fn kill_composer_terminals(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn switch_composer_terminal_shell("))
+            .map(|(body, _)| body)
+            .expect("composer terminal close should remain inspectable");
+        assert!(close.contains("this.set_composer_terminal_panel_open(false, cx)"));
+
+        let settings = source
+            .split_once("    fn render_terminal_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Browser panel settings"))
+            .map(|(body, _)| body)
+            .expect("terminal settings page should remain inspectable");
+        assert!(settings.contains("\"terminal-open-mode\""));
+        assert!(settings.contains("TerminalOpenMode::BottomPanel"));
+        assert!(settings.contains("TerminalOpenMode::Composer"));
+
+        // Panel mode is the default the preference ships with, so a fresh
+        // install presses the terminal button into the panel.
+        assert_eq!(TerminalOpenMode::default(), TerminalOpenMode::BottomPanel);
     }
 
     #[test]
