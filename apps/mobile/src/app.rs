@@ -168,12 +168,22 @@ fn install_timeline_scroll_handler(state: &ListState, owner: WeakEntity<MobileAp
         };
         let _ = owner.update(cx, |app, cx| {
             app.timeline_viewport = Some(viewport);
-            // Follow is the reader's decision, not a measurement taken while
-            // the Agent is streaming: a turn that grows by a line per frame
-            // kept re-qualifying as "near the bottom" and pulled the list back
-            // under a finger that had just scrolled up.
-            app.timeline_follow = app.timeline_is_near_bottom();
             app.prefetch_older_history_if_near_top(cx);
+        });
+        // The list runs this handler while it already holds its own state
+        // mutably, so reading that state back here — the scroll offsets
+        // `timeline_is_near_bottom` needs — panics with "RefCell already
+        // mutably borrowed" and takes the render thread down with it. Ask the
+        // question once the handler has returned and the borrow is released.
+        let owner = owner.clone();
+        cx.defer(move |cx| {
+            let _ = owner.update(cx, |app, _cx| {
+                // Follow is the reader's decision, not a measurement taken
+                // while the Agent is streaming: a turn that grows by a line per
+                // frame kept re-qualifying as "near the bottom" and pulled the
+                // list back under a finger that had just scrolled up.
+                app.timeline_follow = app.timeline_is_near_bottom();
+            });
         });
     });
 }
@@ -5096,8 +5106,16 @@ impl MobileApp {
         };
         self.token_usage_generation = self.token_usage_generation.wrapping_add(1);
         let generation = self.token_usage_generation;
+        // The RPC runs on the Tokio runtime the client drives its request
+        // timeouts from. Polling it on the GPUI executor instead panics with
+        // "there is no reactor running", and a panic raised inside the
+        // dispatcher's looper callback cannot unwind, so the process aborts.
+        let usage_session_id = session_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.session_token_usage(usage_session_id).await
+        });
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let usage = backend.session_token_usage(session_id.clone()).await;
+            let usage = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
                 if generation != this.token_usage_generation
                     || this
