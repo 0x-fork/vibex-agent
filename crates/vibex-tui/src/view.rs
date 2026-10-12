@@ -4427,14 +4427,15 @@ fn render_help(
     } else {
         inner
     };
-    let scopes = app.documented_scopes();
     let needle = app.filter.trim().to_lowercase();
     // Help is generated from the binding tables, so filtering it is filtering
-    // the same data that dispatches the keys.
+    // the same data that dispatches the keys — and it names the key that
+    // answers here rather than the first row of the table that shares the
+    // intent.
     let bindings = app
-        .keymap
-        .advertised(&scopes)
+        .advertised_keys()
         .into_iter()
+        .map(|(_, binding)| binding)
         .filter(|binding| {
             needle.is_empty()
                 || binding.chord.display().to_lowercase().contains(&needle)
@@ -4868,13 +4869,12 @@ fn category_label(category: crate::keymap::Category, strings: Strings) -> &'stat
 /// terminal are pinned and drawn first, so shrinking the window degrades the bar
 /// from the least important end rather than truncating it arbitrarily.
 fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTheme) {
-    let scopes = app.documented_scopes();
     let strings = app.strings;
-    let mut hints = Vec::new();
+    let mut labels = Vec::new();
     if app.page.is_session_page() && app.overlay.is_none() {
         let composing = app.focus == crate::app::Focus::Composer || app.page_is_composing();
         if composing {
-            hints.push((
+            labels.push((
                 Intent::SubmitComposer,
                 if app.turn_reads_running() {
                     strings.composer_queue()
@@ -4882,14 +4882,14 @@ fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiT
                     strings.composer_send()
                 },
             ));
-            hints.push((Intent::InsertNewline, strings.composer_newline()));
+            labels.push((Intent::InsertNewline, strings.composer_newline()));
         } else {
-            hints.push((Intent::ToggleBlockExpanded, strings.transcript_expand()));
-            hints.push((Intent::OpenBlockDetails, strings.transcript_details()));
-            hints.push((Intent::FocusComposer, strings.composer_send()));
+            labels.push((Intent::ToggleBlockExpanded, strings.transcript_expand()));
+            labels.push((Intent::OpenBlockDetails, strings.transcript_details()));
+            labels.push((Intent::FocusComposer, strings.composer_send()));
         }
         if app.turn_reads_running() {
-            hints.push((
+            labels.push((
                 Intent::ContextualCancel,
                 if app.composer.is_empty() {
                     strings.session_stop()
@@ -4898,20 +4898,25 @@ fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiT
                 },
             ));
         }
-        hints.push((Intent::SwitchAgentRuntime, strings.runtime_title()));
-        hints.push((Intent::FocusNext, strings.transcript_browse()));
+        labels.push((Intent::SwitchAgentRuntime, strings.runtime_title()));
+        labels.push((Intent::FocusNext, strings.transcript_browse()));
     }
-    for binding in app.keymap.advertised(&scopes) {
+    // The table fills in the rest, and the whole list is read back through the
+    // keys that answer here: a hint whose intent has no chord on this surface
+    // — `Tab` means "previous pane" on the transcript and "accept completion"
+    // in the composer, and `?` is help on the list and a question mark in a
+    // draft — is dropped rather than spelled wrong.
+    for (_, binding) in app.advertised_keys() {
         if let Some(label) = binding.label
-            && !hints.iter().any(|(intent, _)| *intent == binding.intent)
+            && !labels.iter().any(|(hinted, _)| *hinted == binding.intent)
         {
-            hints.push((binding.intent, label));
+            labels.push((binding.intent, label));
         }
     }
     let mut spans = vec![Span::raw(" ")];
     let mut used = 1usize;
-    for (intent, label) in hints {
-        let Some(chord) = app.keymap.chord_for(intent) else {
+    for (intent, label) in labels {
+        let Some(chord) = app.advertised_chord(intent) else {
             continue;
         };
         let key = chord.display();

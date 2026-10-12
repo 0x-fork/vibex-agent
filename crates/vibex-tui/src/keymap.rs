@@ -1681,6 +1681,13 @@ impl Keymap {
     }
 
     /// Every binding that should be advertised for a scope, in table order.
+    ///
+    /// Table order is the order the bindings were declared in, which is *not*
+    /// the order they answer in: `1` is the session list in [`Scope::Global`]
+    /// and `Ctrl+L` is the same destination in [`Scope::Composer`]. A surface
+    /// that names a key has to check each row against [`Self::resolve`] — which
+    /// is what [`crate::app::App::advertised_keys`] does — or it will spell the
+    /// row that lost.
     pub fn advertised(&self, scopes: &[Scope]) -> Vec<&Binding> {
         self.bindings
             .iter()

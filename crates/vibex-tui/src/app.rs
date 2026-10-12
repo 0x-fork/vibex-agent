@@ -25,7 +25,9 @@ use crate::action::Intent;
 use crate::composer::{CompletionMenu, ComposerBuffer, ComposerHistory};
 use serde::{Deserialize, Serialize};
 
-use crate::keymap::{Chord, Keymap, Scope};
+use crossterm::event::{KeyCode, KeyModifiers};
+
+use crate::keymap::{Binding, Chord, Keymap, Scope};
 use crate::locale::{Locale, Strings};
 use crate::theme::{ColorCapability, TuiTheme};
 use crate::transcript::{Block, ScrollState, Transcript};
@@ -2768,6 +2770,152 @@ impl App {
             return vec![Scope::Composer, Scope::Global];
         }
         vec![self.page.scope(), Scope::Global]
+    }
+
+    /// The bindings the key bar and the help page may name right now, one per
+    /// intent, paired with the scope each answers in.
+    ///
+    /// [`Self::documented_scopes`] says whose bindings are eligible and
+    /// [`Keymap::advertised`] walks them in table order; two rules then cut the
+    /// list down to what the reader can actually press, which is the only thing
+    /// a bar may promise:
+    ///
+    /// * The binding has to be the one that would fire. One intent can be bound
+    ///   in two scopes — `1` is the session list in `Scope::Global` and
+    ///   `Ctrl+L` is the same destination in `Scope::Composer` — and the table
+    ///   lists both, so the row that loses is dropped rather than spelled.
+    /// * The chord has to reach the table at all: a surface that types what the
+    ///   reader pressed answers before the bindings do, and `?` is a question
+    ///   mark in a draft where it is help on a list. See [`Self::chord_is_input`].
+    pub fn advertised_keys(&self) -> Vec<(Scope, &Binding)> {
+        let eligible = self.documented_scopes();
+        let dispatch = self.active_scopes();
+        let mut advertised: Vec<(Scope, &Binding)> = Vec::new();
+        for binding in self.keymap.advertised(&eligible) {
+            if advertised
+                .iter()
+                .any(|(_, row)| row.intent == binding.intent)
+            {
+                continue;
+            }
+            if self.chord_is_input(binding.chord) {
+                continue;
+            }
+            if self.keymap.resolve(&dispatch, binding.chord) != Some(binding.intent) {
+                continue;
+            }
+            if (self.overlay.is_some() || self.filtering)
+                && binding.scope == Scope::Global
+                && !self.surface_answers(binding.intent)
+            {
+                continue;
+            }
+            advertised.push((binding.scope, binding));
+        }
+        advertised
+    }
+
+    /// Whether the reducer still answers this intent while a modal or a filter
+    /// owns the keyboard.
+    ///
+    /// Both surfaces put themselves down for `Esc` and for a destination named
+    /// from them, and a filter also answers `Ctrl+C`; everything else the
+    /// global scope binds is swallowed, because a modal holding the keyboard is
+    /// the whole point of one. The bar drops those rows rather than naming keys
+    /// that do nothing — the surface's own scope keeps its own rows, since a
+    /// modal answers those out of its own arms.
+    fn surface_answers(&self, intent: Intent) -> bool {
+        if intent.leaves_the_surface() || matches!(intent, Intent::Back | Intent::CloseOverlay) {
+            return true;
+        }
+        self.filtering && intent == Intent::ContextualCancel
+    }
+
+    /// The chord one intent answers to on the surface that owns the keyboard.
+    ///
+    /// `None` when the intent has no chord there — either because nothing
+    /// binds it in the eligible scopes, or because the chord it is bound to is
+    /// spent before the binding table sees it (see [`Self::chord_is_input`]).
+    /// A hint that names a key takes the chord from here, so it can never spell
+    /// a key that does something else.
+    pub fn advertised_chord(&self, intent: Intent) -> Option<Chord> {
+        self.advertised_keys()
+            .into_iter()
+            .find(|(_, binding)| binding.intent == intent)
+            .map(|(_, binding)| binding.chord)
+    }
+
+    /// Whether the surface in front of the binding table spends this chord
+    /// itself, so a binding on it would never fire.
+    ///
+    /// The order mirrors `run::handle_key`: a text field types what the reader
+    /// pressed, a card that answers with a digit spends it, and the key
+    /// editor's capture takes every key there is. What is left is the truth
+    /// behind two rules the bar and the help page live by:
+    ///
+    /// * A chord named anywhere is a chord that answers there. `?` is help on
+    ///   the session list and a question mark in the draft, and only one of
+    ///   those can be advertised where it is.
+    /// * A chord that is not text is a destination everywhere. The function
+    ///   keys and the control chords are never typed, so `run::handle_key`
+    ///   lets them through to the table even while a mode that takes every
+    ///   other key owns the keyboard — which is why this says `F1` is free in
+    ///   the middle of a filter rather than reporting it dead.
+    pub fn chord_is_input(&self, chord: Chord) -> bool {
+        // The key editor records the chord the reader presses: while it is
+        // capturing, every key is data — `F1` included.
+        if matches!(
+            self.overlay,
+            Some(Overlay::Keys {
+                capturing: Some(_),
+                ..
+            })
+        ) {
+            return true;
+        }
+        // The two modes that take every key but the control chords: an arrow is
+        // a cursor move and a function key is nothing at all, and either way it
+        // is theirs rather than the table's.
+        if self.search_composing()
+            || (self.page == Page::Settings && !self.settings.view.is_browse())
+        {
+            return !matches!(chord.code, KeyCode::F(_))
+                && !chord.modifiers.contains(KeyModifiers::CONTROL);
+        }
+        let typing = match chord.code {
+            KeyCode::Char(_) => !chord
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
+            KeyCode::Backspace | KeyCode::Delete => {
+                !chord.modifiers.contains(KeyModifiers::CONTROL)
+            }
+            _ => false,
+        };
+        if !typing {
+            return false;
+        }
+        if self.runtime_picker_filtering() || self.filtering {
+            return true;
+        }
+        match &self.overlay {
+            // The surfaces with a query or a form of their own type what the
+            // reader pressed, and the two that answer with a digit spend it.
+            Some(Overlay::Palette { .. })
+            | Some(Overlay::Help { .. })
+            | Some(Overlay::Prompt { .. })
+            | Some(Overlay::Approval { .. })
+            | Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Choices,
+                ..
+            }) => true,
+            Some(_) => false,
+            None => self.composer_takes_keys(),
+        }
+    }
+
+    /// Whether the composer answers this key before the binding table does.
+    pub fn composer_takes_keys(&self) -> bool {
+        self.focus == Focus::Composer && self.page.is_composing_page()
     }
 
     // ---- mutation helpers ----------------------------------------------
@@ -5970,6 +6118,93 @@ mod tests {
             .map(|theme| theme.id)
             .find(|id| *id != default)
             .expect("more than one theme ships per appearance")
+    }
+
+    #[test]
+    fn the_key_bar_names_the_key_that_answers_where_the_composer_types() {
+        // The composer types what the reader presses, so `?` and the digits are
+        // text there rather than the help and the destinations a list binds
+        // them to. A bar generated from the table alone advertised them anyway:
+        // the reader pressed `?` and watched a question mark appear where the
+        // bar had promised help. The same destinations are still named — the
+        // composer scope binds the session list to `Ctrl+L` for exactly this
+        // reason — so the fix is to spell the chord that answers, not to drop
+        // the row.
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = settings_app(&directory.path().join("tui-interface.json"));
+        app.live = LiveState::Ready;
+        app.perform(Intent::NewSession);
+        assert!(app.composer_takes_keys(), "the composer owns the keyboard");
+
+        let typed = [
+            Chord::plain(KeyCode::Char('?')),
+            Chord::plain(KeyCode::Char('1')),
+            Chord::plain(KeyCode::Char('5')),
+            Chord::plain(KeyCode::Char(' ')),
+        ];
+        let advertised = app.advertised_keys();
+        for chord in typed {
+            assert!(
+                !advertised.iter().any(|(_, row)| row.chord == chord),
+                "{} is typed into the draft, so it is not a shortcut here",
+                chord
+            );
+        }
+        assert_eq!(
+            app.advertised_chord(Intent::GotoSessions),
+            Some(Chord::ctrl('l')),
+            "the bar named the global digit instead of the chord that answers"
+        );
+        assert_eq!(app.advertised_chord(Intent::ToggleHelp), None);
+        assert_eq!(
+            app.advertised_chord(Intent::CompletionAccept),
+            Some(Chord::plain(KeyCode::Tab)),
+            "`Tab` is the completion key where the composer owns it"
+        );
+        assert_eq!(
+            app.advertised_chord(Intent::FocusNext),
+            None,
+            "`Tab` moves the focus on a list, not in the composer"
+        );
+        // A plain page keeps the global keys: nothing there types them.
+        app.perform(Intent::Back);
+        assert!(!app.composer_takes_keys());
+        assert_eq!(
+            app.advertised_chord(Intent::ToggleHelp),
+            Some(Chord::plain(KeyCode::Char('?')))
+        );
+        assert_eq!(
+            app.advertised_chord(Intent::GotoSessions),
+            Some(Chord::plain(KeyCode::Char('1')))
+        );
+    }
+
+    #[test]
+    fn the_key_bar_drops_the_global_keys_a_modal_swallows() {
+        // A modal owns the keyboard while it is up, so the rows it does not
+        // answer are dropped from the bar — and the destinations it *does*
+        // answer, because the reducer puts the modal down for them, are kept.
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = settings_app(&directory.path().join("tui-interface.json"));
+        app.perform(Intent::ToggleHelp);
+        assert!(matches!(app.overlay, Some(Overlay::Help { .. })));
+
+        assert_eq!(
+            app.advertised_chord(Intent::OpenSettings),
+            Some(Chord::plain(KeyCode::F(1))),
+            "the cheatsheet lists `F1`, so the bar has to be able to name it"
+        );
+        assert_eq!(
+            app.advertised_chord(Intent::Refresh),
+            None,
+            "a modal swallows `Ctrl+R`"
+        );
+        assert_eq!(
+            app.advertised_chord(Intent::ToggleSidebar),
+            None,
+            "a modal swallows `Ctrl+B`"
+        );
+        assert_eq!(app.advertised_chord(Intent::ToggleHelp), None);
     }
 
     #[test]

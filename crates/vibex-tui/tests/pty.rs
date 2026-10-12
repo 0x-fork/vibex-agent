@@ -634,6 +634,55 @@ fn the_session_list_paints_without_a_frame() {
     );
 }
 
+/// The cheatsheet's own footer, which no other surface draws. The key bar
+/// names the same labels, so a scenario that waited for a label would accept
+/// the bar for the panel.
+const CHEATSHEET_OPEN: &str = "←→ toggle";
+
+/// `?` opens the cheatsheet where it is not text: the session list has no
+/// composer, so the key the list's own sidebar advertises is the key that
+/// answers.
+#[test]
+fn help_opens_where_the_key_is_not_text() {
+    let mut session = Session::start(100, 30);
+    session.wait_for_first_frame();
+    session.send(b"\x0c"); // Ctrl+L: the session list, where the composer is out of the way
+    session.wait_for(|screen| screen.contains("Session list"));
+    session.send(b"?");
+    let screen = session.wait_for(|screen| screen.contains(CHEATSHEET_OPEN));
+    assert!(
+        screen.contains("Contextual help"),
+        "the cheatsheet does not list the key that opened it:\n{screen}"
+    );
+}
+
+/// The keys the cheatsheet names answer from inside it.
+///
+/// `?` cannot open help from a session page's composer — it is a question mark
+/// in a draft there, which is why the palette is the route — and the list it
+/// opens goes on naming the global chords, `F1 Settings` among them. An overlay
+/// that swallowed them was promising keys it did not answer: a reader read
+/// `F1` off that list, pressed it, and watched nothing happen.
+#[test]
+fn the_global_keys_the_cheatsheet_names_answer_from_inside_it() {
+    let mut session = Session::start(120, 40);
+    session.wait_for_first_frame();
+
+    session.send(b"\x10"); // Ctrl+P: the palette
+    session.pump(Duration::from_millis(400));
+    session.send(b"help");
+    session.pump(Duration::from_millis(400));
+    session.send(b"\r"); // run the Help command
+    session.wait_for(|screen| screen.contains(CHEATSHEET_OPEN));
+
+    session.send(b"\x1bOP"); // F1, as xterm, kitty and foot send it
+    let screen = session.wait_for(|screen| screen.contains("Theme mode"));
+    assert!(
+        !screen.contains(CHEATSHEET_OPEN),
+        "the cheatsheet stayed up over the page `F1` names:\n{screen}"
+    );
+}
+
 /// `Shift+Enter` as a terminal that has been asked for the keyboard protocol
 /// sends it: `CSI 13 ; 2 u`. A terminal that ignores the protocol sends the same
 /// carriage return `Enter` sends — which is why `Ctrl+J`, a line feed every

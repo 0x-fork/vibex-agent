@@ -256,6 +256,23 @@ impl Intent {
         )
     }
 
+    /// Whether the intent names somewhere else to be.
+    ///
+    /// These are the destinations the key bar and the cheatsheet keep
+    /// advertising while a modal or a filter owns the keyboard, so a surface
+    /// that swallowed them would be promising keys it does not answer: a modal
+    /// puts itself down and runs one, exactly as `Esc` would have put it down.
+    pub const fn leaves_the_surface(self) -> bool {
+        matches!(
+            self,
+            Intent::OpenCommandPalette
+                | Intent::ToggleHelp
+                | Intent::OpenSettings
+                | Intent::GotoSessions
+                | Intent::GotoManagement
+        )
+    }
+
     /// Whether the intent is meaningful while the connection is down.
     ///
     /// `NewSession` is here rather than in [`Self::mutates`] because it only

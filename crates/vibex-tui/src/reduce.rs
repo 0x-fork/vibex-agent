@@ -1195,6 +1195,15 @@ impl App {
                 self.should_quit = true;
                 return Outcome::effects(vec![]);
             }
+            // Naming somewhere else to be is leaving, and the key bar and the
+            // cheatsheet go on naming these while a modal is up: an overlay
+            // that swallowed them would be promising keys it does not answer.
+            // Putting the surface down first is `Esc`'s job, so a reader who
+            // asked for Settings with a modal open asked for exactly that.
+            _ if intent.leaves_the_surface() => {
+                self.overlay = None;
+                return self.perform_intent(intent);
+            }
             _ => {}
         }
         let Some(overlay) = self.overlay.clone() else {
@@ -1510,6 +1519,14 @@ impl App {
     }
 
     fn perform_filter(&mut self, intent: Intent) -> Outcome {
+        // The same rule the overlay follows: a destination named from the
+        // filter is the reader leaving it, so the query is given up rather than
+        // swallowing the key.
+        if intent.leaves_the_surface() {
+            self.filtering = false;
+            self.filter.clear();
+            return self.perform_intent(intent);
+        }
         match intent {
             Intent::Back | Intent::CloseOverlay | Intent::ContextualCancel => {
                 self.filtering = false;
@@ -4708,6 +4725,46 @@ mod tests {
             app.overlay, None,
             "a draft with text in it opened the picker instead of killing a word"
         );
+    }
+
+    #[test]
+    fn a_destination_named_from_behind_a_modal_leaves_it() {
+        // The cheatsheet goes on listing the global destinations while it is
+        // open, so `F1` has to answer there. An overlay that held the keyboard
+        // against them was promising a key it did not answer: the reader read
+        // `F1 Settings` off the list, pressed it, and nothing happened.
+        let mut app = capable_app();
+        app.perform(Intent::ToggleHelp);
+        assert!(matches!(app.overlay, Some(Overlay::Help { .. })));
+
+        app.perform(Intent::OpenSettings);
+        assert_eq!(app.overlay, None, "the overlay stayed up");
+        assert_eq!(app.page, Page::Settings);
+
+        // The palette is a destination too, and a `Confirm` card is the one
+        // modal a reader is most likely to be in front of when they change
+        // their mind about where they wanted to be.
+        app.perform(Intent::OpenCommandPalette);
+        assert!(matches!(app.overlay, Some(Overlay::Palette { .. })));
+        app.perform(Intent::GotoSessions);
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.page, Page::Sessions);
+    }
+
+    #[test]
+    fn a_destination_named_from_a_filter_gives_the_query_up() {
+        // A filter is a text field with the same rule: the reader who names
+        // somewhere else to be is done filtering, and the query is not a reason
+        // to swallow the key.
+        let mut app = capable_app();
+        app.perform(Intent::GotoSessions);
+        app.filtering = true;
+        app.filter = "alpha".to_string();
+
+        app.perform(Intent::OpenSettings);
+        assert!(!app.filtering, "the filter stayed open");
+        assert!(app.filter.is_empty(), "the query outlived the filter");
+        assert_eq!(app.page, Page::Settings);
     }
 
     #[test]

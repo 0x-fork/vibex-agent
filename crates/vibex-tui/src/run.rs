@@ -362,6 +362,22 @@ fn handle_key(
     key: KeyEvent,
 ) -> BackendResult<bool> {
     let key = normalized_key(key);
+    // Naming somewhere else to be is answered from anywhere the key is not
+    // text: the key bar and the cheatsheet go on naming these chords while a
+    // field or a modal owns the keyboard, so a reader who presses one is asking
+    // to leave — and the modes below either ignore the key (a function key in a
+    // filter) or would swallow it (a modal). `chord_is_input` is the same
+    // question the bar asks before it names a key, so the two cannot disagree
+    // about whether `F1` is Settings or nothing at all.
+    let chord = Chord::from_event(key);
+    if !app.chord_is_input(chord)
+        && let Some(intent) = app.keymap.resolve(&app.active_scopes(), chord)
+        && intent.leaves_the_surface()
+    {
+        let outcome = app.perform(intent);
+        dispatch_all(worker, &outcome);
+        return Ok(app.should_quit);
+    }
     // The transcript search bar is a text field, so it takes printable keys
     // before the binding table sees them — the same rule the list filter uses.
     // Control chords still fall through, so `Ctrl+P` and `Ctrl+C` keep working
@@ -759,13 +775,12 @@ fn handle_key(
                 return Ok(false);
             }
         }
-    } else if composer_takes_keys(app)
+    } else if app.composer_takes_keys()
         && let Some(exit) = handle_composer_key(app, worker, key)?
     {
         return Ok(exit);
     }
 
-    let chord = Chord::from_event(key);
     let scopes = app.active_scopes();
     let Some(intent) = app.keymap.resolve(&scopes, chord) else {
         // An unbound key must not be swallowed silently when it looks like an
@@ -907,18 +922,6 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Composer editing keys. Returns `Some(true)` to exit the program.
-/// Whether the composer's own text path handles this key before the binding
-/// table does.
-///
-/// The page matters as much as the focus does. The page where a session is
-/// written has no session yet — but it has a composer, and there a printable
-/// key is *text*: without this the keys fell through to the Agent scope, where
-/// typing did nothing and `/` meant "search the transcript" and left the page.
-fn composer_takes_keys(app: &App) -> bool {
-    app.focus == Focus::Composer && app.page.is_composing_page()
-}
-
 fn dispatch_completions(app: &mut App, worker: &Worker) {
     if let Some((trigger, query)) = app.refresh_completion() {
         worker.dispatch(crate::app::Effect::DiscoverCompletions {
@@ -929,6 +932,7 @@ fn dispatch_completions(app: &mut App, worker: &Worker) {
     }
 }
 
+/// Composer editing keys. Returns `Some(true)` to exit the program.
 fn handle_composer_key(
     app: &mut App,
     worker: &Worker,
@@ -2326,7 +2330,7 @@ mod tests {
         app.perform(crate::action::Intent::NewSession);
         assert_eq!(app.page, crate::app::Page::NewSession);
         assert!(
-            composer_takes_keys(&app),
+            app.composer_takes_keys(),
             "the page's composer does not own the keyboard it shows"
         );
 
@@ -2355,7 +2359,7 @@ mod tests {
         app.perform(crate::action::Intent::Back);
         assert_eq!(app.page, crate::app::Page::Sessions);
         app.focus = crate::app::Focus::Composer;
-        assert!(!composer_takes_keys(&app));
+        assert!(!app.composer_takes_keys());
     }
 
     #[test]
@@ -2371,7 +2375,7 @@ mod tests {
         app.live = crate::app::LiveState::Ready;
         app.perform(crate::action::Intent::NewSession);
         assert!(
-            composer_takes_keys(&app),
+            app.composer_takes_keys(),
             "the composer does not own its keys"
         );
 
