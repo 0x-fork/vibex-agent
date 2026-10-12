@@ -497,6 +497,47 @@ scheduler activity, execute each test case in its own process; serial Rust test
 threads still share those subscribers.
 
 
+## Convention: Mobile Notices Are Toasts
+
+A phone shows one narrow column of content, so a notice never takes a line in a
+page's layout. Every notice the mobile client raises — a failed operation, a
+rename or an added project, a connection that dropped, a reconnect that gave up
+— is a toast on the window's notification layer, delivered by
+`toast::push`. The surface is the kit's `Notification` on the same layer the
+desktop workbench uses, so tone, autohide, and replace-by-id behave identically
+on both clients; only where it lands differs.
+
+- Nothing is painted from notice state. `MobileApp` queues notices in
+  `pending_hints` and hands them to the layer once per frame, because the paths
+  that raise them — async completions, platform callbacks, storage failures —
+  run without a window. A page never reads a "current notice" field, so a
+  message cannot outlive the state it described.
+- A hint's text is its identity. Pushing the same message again replaces the
+  hint already on screen instead of stacking a copy of it, so a repeating event
+  — a connection that keeps dropping — cannot fill the corner with identical
+  cards.
+- The layer is bottom-centred and inset-aware. `theme::sync_notification_metrics`
+  recomputes its width and margins from the live window each frame: rotation
+  changes the usable width, and the gesture bar and the software keyboard both
+  arrive as bottom insets that a toast has to clear. Do not fix these at startup.
+- Sheet-scoped validation is the one exception, and only while it belongs to a
+  field the user is filling in (the runtime sheet's switch failure, the new
+  project path prompt). It is dismissible with the surface that owns it.
+- Nothing an automatic refresh says outlives its connection. A teardown
+  abandons the previous backend with requests in flight, and each one fails on
+  the socket that just closed; announcing that failure puts a transport message
+  about a connection the user already left onto whatever screen replaced it.
+  Gate the answer with `MobileApp::still_connected_to` (or the equivalent
+  active-host check) before applying data or announcing a failure. What the user
+  asked for directly is still announced — a send that did not land is worth
+  saying — and connection *state* changes are announced once, by the event that
+  reports them, not once per in-flight request.
+
+Tests that assert a notice was announced — or that none was — must open their
+window through `add_rooted_window_view`, because the layer lives on the kit's
+`Root`.
+
+
 ## Scenario: Native File Dialog Backend Isolation
 
 ### 1. Scope / Trigger

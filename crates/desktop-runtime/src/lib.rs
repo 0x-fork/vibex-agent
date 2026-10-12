@@ -2764,6 +2764,9 @@ impl DesktopRuntime {
         }
         let _ = management_snapshot_cell.set(runtime.management());
         let _ = recovery_cell.set(runtime.management());
+        startup_stage("timeline_compaction_spawn", || {
+            runtime.spawn_timeline_compaction()
+        })?;
         startup_stage("usage_consumer_start", || {
             runtime.spawn_usage_consumer(usage_receiver)
         })?;
@@ -3304,6 +3307,56 @@ impl DesktopRuntime {
         })?;
         let service = self.app_update.clone();
         tasks.push(tokio::spawn(service.run_automatic_checks()));
+        Ok(())
+    }
+
+    /// Advances the sweep over histories written before the timeline folded
+    /// its update runs on disk.
+    ///
+    /// A reader opening such a session pays for every intermediate state the
+    /// projection is about to discard, and the window it opens reaches a
+    /// fraction as far — the session reads as a replay of how it was
+    /// produced. Each slice writes one chunk through the streamed-append
+    /// connection and yields, so a live turn's appends wait for a chunk rather
+    /// than for a session.
+    fn spawn_timeline_compaction(&self) -> VibexResult<()> {
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            VibexError::process(
+                "desktop_runtime_task_lock_failed",
+                "desktop runtime task ownership is unavailable",
+            )
+        })?;
+        let manager = self.agent.manager();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                let pass = match manager.compact_historical_timelines() {
+                    Ok(pass) => pass,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "vibex_desktop",
+                            error_code = %error.code,
+                            "Timeline compaction sweep failed"
+                        );
+                        return;
+                    }
+                };
+                if pass.removed > 0 {
+                    tracing::info!(
+                        target: "vibex_desktop",
+                        sessions = pass.sessions,
+                        removed = pass.removed,
+                        "Timeline compaction collapsed historical update runs"
+                    );
+                }
+                if !pass.more {
+                    return;
+                }
+                // Yield between chunks: the sweep is scenery, and a reader
+                // waiting on a window is what it exists to keep fast.
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }));
         Ok(())
     }
 

@@ -19186,7 +19186,8 @@ impl VibexWorkbench {
     /// drag can reorder are the member rows the sidebar paints as selected, in
     /// the group's own order. A selection reaching outside the group cannot be
     /// reordered inside it, and the drag carries the part of it the group's
-    /// order speaks for instead.
+    /// order speaks for instead. A member the group paints as a child session is
+    /// left out: that row is not a drag source, so nothing carries it.
     fn sidebar_group_drag_session_ids(&self, group_id: &str, session_id: &str) -> Vec<String> {
         let row_alone = vec![session_id.to_string()];
         if !self

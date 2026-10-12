@@ -8,12 +8,14 @@
 
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-use gpui::{App, Hsla, Rgba, Window, hsla, px, rgb};
-use gpui_component::{Theme, ThemeMode as ComponentThemeMode};
+use gpui::{Anchor, App, Hsla, Pixels, Rgba, Window, hsla, px, rgb};
+use gpui_component::{Edges, Theme, ThemeMode as ComponentThemeMode};
 use vibex_desktop_model::ThemeSelection;
 use vibex_ui::{
     GpuiThemeDefinition, GpuiThemeMode, default_theme, semantic_token, theme_at, theme_index,
 };
+
+use crate::platform::WindowInsetsExt as _;
 
 // ---------------------------------------------------------------------------
 // Appearance mode
@@ -228,6 +230,15 @@ pub const SPACING_SM: f32 = 8.0;
 pub const SPACING_MD: f32 = 12.0;
 pub const SPACING_LG: f32 = 16.0;
 pub const SPACING_XL: f32 = 20.0;
+
+/// The narrowest a toast may become before it stops reading as a card.
+pub const TOAST_MIN_WIDTH: f32 = 200.0;
+/// The widest a toast may grow: a landscape window or a tablet would otherwise
+/// stretch one line across the whole screen.
+pub const TOAST_MAX_WIDTH: f32 = 420.0;
+/// How many toasts may share the screen. A phone shows one or two; beyond that
+/// they cover the content they are talking about.
+pub const TOAST_MAX_VISIBLE: usize = 3;
 
 pub const FONT_APP_TITLE: f32 = 28.0;
 pub const FONT_HEADING: f32 = 13.0;
@@ -666,6 +677,56 @@ pub fn apply_component_theme(window: Option<&mut Window>, cx: &mut App) {
         // view defaults, and refreshes every window.
         vibex_ui::apply_component_palette(theme, active_theme(model_mode(dark)));
     });
+}
+
+/// Points the kit's notification layer at the phone's own corner.
+///
+/// The surface is the one the desktop workbench delivers its hints through; on
+/// a phone only where it lands differs. Toasts sit along the bottom, where a
+/// thumb already rests and where they cover no header control, and they keep
+/// clear of the system gesture bar and of the software keyboard — both of which
+/// reach the app as window insets, and the keyboard arrives as a bottom inset
+/// the moment it opens.
+///
+/// The kit reads the layer's width and margins from the theme rather than from
+/// each notification, so they are recomputed from the live window instead of
+/// being set once: the usable width changes with rotation, and the bottom
+/// margin changes with the keyboard.
+///
+/// This is called from the app's render, so it writes the theme global in place
+/// rather than through `Theme::update`. `Theme::update` finishes by refreshing
+/// every window, which during a render schedules the very frame it is already
+/// in: the metrics would be re-derived and re-applied forever and the app would
+/// never go idle. The write is guarded so it only lands when the window has
+/// actually moved, and the layer renders after the view, so it reads the new
+/// values in the same frame.
+pub fn sync_notification_metrics(window: &Window, cx: &mut App) {
+    let insets = window.insets().effective();
+    let viewport = window.viewport_size();
+    let usable = f32::from(viewport.width)
+        - f32::from(insets.left)
+        - f32::from(insets.right)
+        - SPACING_MD * 2.0;
+    let width = px(usable.clamp(TOAST_MIN_WIDTH, TOAST_MAX_WIDTH));
+    let margin = |inset: Pixels| px(f32::from(inset) + SPACING_MD);
+    let margins = Edges {
+        top: margin(insets.top),
+        right: margin(insets.right),
+        bottom: margin(insets.bottom),
+        left: margin(insets.left),
+    };
+    let settings = &mut Theme::global_mut(cx).notification;
+    if settings.placement == Anchor::BottomCenter
+        && settings.max_items == TOAST_MAX_VISIBLE
+        && settings.width == width
+        && settings.margins == margins
+    {
+        return;
+    }
+    settings.placement = Anchor::BottomCenter;
+    settings.max_items = TOAST_MAX_VISIBLE;
+    settings.width = width;
+    settings.margins = margins;
 }
 
 #[cfg(test)]

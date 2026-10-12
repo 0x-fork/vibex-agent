@@ -9422,6 +9422,242 @@ impl TimelineRepository {
     /// sequence and absorbs the text; the rest are removed.
     ///
     /// Returns how many rows were removed.
+    /// Collapses the repeated updates of one operation into the update that
+    /// describes it.
+    ///
+    /// A provider narrates an operation as a run of items, one per update, and
+    /// only the newest of them describes the operation — the projection folds
+    /// them into a single row and reads that newest item for its text. Keeping
+    /// the whole run on disk stores a process log where the reader sees a call.
+    ///
+    /// Only sequence-adjacent rows are folded, so nothing moves relative to
+    /// what sat between them: an operation that was interrupted by other
+    /// activity keeps its updates as separate rows, exactly as the projection
+    /// would have drawn them.
+    ///
+    /// The identity comes from [`TimelineItem::process_compaction_key`], the
+    /// same function the projection folds with, so a key that draws one row
+    /// there is the key that collapses one run here.
+    fn compact_replacement_segments(
+        conn: &mut Connection,
+        session_id: &VibexSessionId,
+        from_sequence: i64,
+        through_sequence: i64,
+    ) -> VibexResult<usize> {
+        if through_sequence <= from_sequence {
+            return Ok(0);
+        }
+        let kinds = TimelineItemKind::FOLDABLE_REPEATED_UPDATES
+            .iter()
+            .map(enum_to_db)
+            .collect::<VibexResult<Vec<_>>>()?;
+        if kinds.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = (0..kinds.len())
+            .map(|index| format!("?{}", index + 4))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut rows = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare_cached(&format!(
+                    "
+                    SELECT session_id, sequence, timeline_item_id, kind, source, timestamp_ms,
+                        correlation_id, provider_correlation_id, payload_json, redaction_state,
+                        execution_attribution_json
+                    FROM agent_timeline_items
+                    WHERE session_id = ?1
+                        AND sequence > ?2
+                        AND sequence <= ?3
+                        AND kind IN ({placeholders})
+                        AND provider_correlation_id IS NOT NULL
+                    ORDER BY sequence ASC
+                    ",
+                ))
+                .map_err(storage_err(
+                    "timeline_compaction_scan_failed",
+                    "failed to prepare the operation update scan",
+                ))?;
+            let mut params = vec![
+                rusqlite::types::Value::Text(session_id.as_str().to_string()),
+                rusqlite::types::Value::Integer(from_sequence),
+                rusqlite::types::Value::Integer(through_sequence),
+            ];
+            params.extend(kinds.iter().cloned().map(rusqlite::types::Value::Text));
+            let mapped = stmt
+                .query_map(rusqlite::params_from_iter(params), map_timeline_item)
+                .map_err(storage_err(
+                    "timeline_compaction_scan_failed",
+                    "failed to query operation updates",
+                ))?;
+            for row in mapped {
+                rows.push(row.map_err(storage_err(
+                    "timeline_compaction_scan_failed",
+                    "failed to decode an operation update",
+                ))?);
+            }
+        }
+
+        // The run key carries the same identity the projection folds on, plus
+        // the row's own coordinates, so two rows only ever collapse when they
+        // agree about what they are and where they came from.
+        let mut run_key: Option<String> = None;
+        let mut run_sequence: Option<i64> = None;
+        let mut superseded = Vec::new();
+        for item in &rows {
+            let Some(key) = item.process_compaction_key() else {
+                run_key = None;
+                run_sequence = None;
+                continue;
+            };
+            let identity = serde_json::to_string(&(
+                key.as_str(),
+                item.kind,
+                item.source,
+                item.provider_correlation_id.as_deref(),
+                item.redaction_state,
+                item.execution_attribution.as_ref(),
+            ))
+            .unwrap_or_default();
+            let continues = run_sequence.is_some_and(|previous| previous + 1 == item.sequence)
+                && run_key.as_deref() == Some(identity.as_str());
+            if continues && let Some(previous) = run_sequence {
+                // The update just read describes the operation; the one before
+                // it described a state that had already moved on.
+                superseded.push(previous);
+            }
+            run_key = Some(identity);
+            run_sequence = Some(item.sequence);
+        }
+        remove_timeline_sequences(conn, session_id, &superseded)
+    }
+
+    /// Collapses every settled update run a session holds, in bounded chunks.
+    ///
+    /// Sessions written before the timeline folded its update runs on disk
+    /// carry the whole process log; a reader opening one pays for every
+    /// intermediate state the projection is about to discard. Chunking keeps
+    /// the scan's memory bounded: a run that spans a boundary is folded as far
+    /// as the chunk can see it and the rest waits for the next pass, which
+    /// still converges because only the operation's own updates ever sat
+    /// between them.
+    pub fn compact_session_streamed_segments(
+        conn: &mut Connection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<usize> {
+        let last = Self::timeline_end_sequence(conn, session_id)?;
+        let mut removed = 0;
+        let mut cursor = 0_i64;
+        while cursor < last {
+            let through = cursor.saturating_add(TIMELINE_COMPACTION_CHUNK).min(last);
+            removed +=
+                TimelineRepository::compact_streamed_segments(conn, session_id, cursor, through)?;
+            cursor = through;
+        }
+        Ok(removed)
+    }
+
+    /// The sequence the session's timeline ends at, or zero when it is empty.
+    pub fn timeline_end_sequence(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<i64> {
+        conn.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM agent_timeline_items WHERE session_id = ?1",
+            params![session_id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(storage_err(
+            "timeline_compaction_scan_failed",
+            "failed to find the end of the session timeline",
+        ))
+    }
+
+    /// Sessions whose timeline still holds adjacent updates of one operation.
+    ///
+    /// This is the selector for the one-time pass over histories that were
+    /// written before the timeline folded its update runs: a session is only
+    /// worth scanning when it actually has a run to collapse, so a large but
+    /// already-collapsed session is not picked up again on every start.
+    pub fn sessions_with_uncompacted_timelines(
+        conn: &Connection,
+        limit: u32,
+    ) -> VibexResult<Vec<VibexSessionId>> {
+        let kinds = replayable_timeline_kinds()?;
+        let placeholders = (0..kinds.len())
+            .map(|index| format!("?{}", index + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = conn
+            .prepare_cached(&format!(
+                "
+                WITH scanned AS (
+                    SELECT session_id, sequence, kind, source, provider_correlation_id,
+                        LAG(sequence) OVER (PARTITION BY session_id ORDER BY sequence) AS previous_sequence,
+                        LAG(kind) OVER (PARTITION BY session_id ORDER BY sequence) AS previous_kind,
+                        LAG(source) OVER (PARTITION BY session_id ORDER BY sequence) AS previous_source,
+                        LAG(provider_correlation_id) OVER (PARTITION BY session_id ORDER BY sequence) AS previous_correlation
+                    FROM agent_timeline_items
+                    WHERE kind IN ({placeholders})
+                        AND provider_correlation_id IS NOT NULL
+                        -- A turn in flight is still writing its updates, and
+                        -- folding them as they arrive would take the row the
+                        -- live stream is about to update.
+                        AND session_id IN (
+                            SELECT session_id FROM agent_sessions WHERE state NOT IN (?{}, ?{})
+                        )
+                )
+                SELECT session_id, COUNT(*) AS runs FROM scanned
+                WHERE previous_sequence = sequence - 1
+                    AND previous_kind = kind
+                    AND previous_source = source
+                    AND previous_correlation = provider_correlation_id
+                GROUP BY session_id
+                ORDER BY runs DESC
+                LIMIT ?{}
+                ",
+                kinds.len() + 1,
+                kinds.len() + 2,
+                kinds.len() + 3
+            ))
+            .map_err(storage_err(
+                "timeline_compaction_scan_failed",
+                "failed to prepare the uncompacted session scan",
+            ))?;
+        let mut params = kinds
+            .iter()
+            .cloned()
+            .map(rusqlite::types::Value::Text)
+            .collect::<Vec<_>>();
+        params.push(rusqlite::types::Value::Text(enum_to_db(
+            &AgentSessionState::Running,
+        )?));
+        params.push(rusqlite::types::Value::Text(enum_to_db(
+            &AgentSessionState::Initializing,
+        )?));
+        params.push(rusqlite::types::Value::Integer(i64::from(limit)));
+        let mapped = stmt
+            .query_map(rusqlite::params_from_iter(params), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(storage_err(
+                "timeline_compaction_scan_failed",
+                "failed to query uncompacted sessions",
+            ))?;
+        let mut sessions = Vec::new();
+        for row in mapped {
+            let session_id = row.map_err(storage_err(
+                "timeline_compaction_scan_failed",
+                "failed to read an uncompacted session",
+            ))?;
+            sessions.push(VibexSessionId::parse(&session_id).map_err(|error| {
+                VibexError::storage("timeline_compaction_scan_failed", error.to_string())
+            })?);
+        }
+        Ok(sessions)
+    }
+
     pub fn compact_streamed_segments(
         conn: &mut Connection,
         session_id: &VibexSessionId,
@@ -9431,6 +9667,11 @@ impl TimelineRepository {
         if through_sequence <= from_sequence {
             return Ok(0);
         }
+        // The replacement updates are collapsed first, without reading a
+        // single payload: an operation's newest update is the one that stays,
+        // so the states it replaced never have to be decoded.
+        let replaced =
+            Self::compact_replacement_segments(conn, session_id, from_sequence, through_sequence)?;
         let delta_kind = enum_to_db(&TimelineItemKind::AgentMessageDelta)?;
         let reasoning_kind = enum_to_db(&TimelineItemKind::Reasoning)?;
         let mut rows = Vec::new();
@@ -9517,7 +9758,7 @@ impl TimelineRepository {
             runs.push(current);
         }
         if runs.is_empty() {
-            return Ok(0);
+            return Ok(replaced);
         }
 
         let tx = conn
@@ -9593,7 +9834,7 @@ impl TimelineRepository {
             "timeline_compaction_failed",
             "failed to commit the streamed segment compaction",
         ))?;
-        Ok(removed)
+        Ok(removed + replaced)
     }
 
     pub fn fetch_range(
@@ -15801,6 +16042,66 @@ fn map_provider_usage_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provid
     })
 }
 
+/// How much of a session one compaction chunk covers.
+///
+/// A chunk bounds the scan's memory — an update row carries the whole tool
+/// input — so a run that spans a boundary is folded only as far as each chunk
+/// can see it. That is safe because the only rows between an operation's
+/// updates are its own, and repeated passes converge. A sweep also advances a
+/// chunk at a time so it never holds the streamed-append connection for
+/// longer than one chunk takes.
+pub const TIMELINE_COMPACTION_CHUNK: i64 = 5_000;
+
+/// The kinds a session scan has to look at to find collapsible runs.
+fn replayable_timeline_kinds() -> VibexResult<Vec<String>> {
+    let mut kinds = TimelineItemKind::FOLDABLE_REPEATED_UPDATES
+        .iter()
+        .map(enum_to_db)
+        .collect::<VibexResult<Vec<_>>>()?;
+    kinds.push(enum_to_db(&TimelineItemKind::AgentMessageDelta)?);
+    kinds.push(enum_to_db(&TimelineItemKind::Reasoning)?);
+    Ok(kinds)
+}
+
+/// Removes rows a collapse superseded.
+fn remove_timeline_sequences(
+    conn: &mut Connection,
+    session_id: &VibexSessionId,
+    sequences: &[i64],
+) -> VibexResult<usize> {
+    if sequences.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "timeline_compaction_failed",
+        "failed to open a compaction transaction",
+    ))?;
+    {
+        // The statement is prepared once and reused: a session can supersede
+        // hundreds of thousands of rows.
+        let mut stmt = tx
+            .prepare_cached(
+                "DELETE FROM agent_timeline_items WHERE session_id = ?1 AND sequence = ?2",
+            )
+            .map_err(storage_err(
+                "timeline_compaction_failed",
+                "failed to prepare the superseded row removal",
+            ))?;
+        for sequence in sequences {
+            stmt.execute(params![session_id.as_str(), sequence])
+                .map_err(storage_err(
+                    "timeline_compaction_failed",
+                    "failed to remove a superseded row",
+                ))?;
+        }
+    }
+    tx.commit().map_err(storage_err(
+        "timeline_compaction_failed",
+        "failed to commit the superseded row removal",
+    ))?;
+    Ok(sequences.len())
+}
+
 /// The row ceiling for a turn window that carries a byte budget.
 ///
 /// High enough that a window's byte budget is what actually bounds it — a
@@ -20635,6 +20936,281 @@ mod tests {
                 .iter()
                 .any(|item| item.sequence == question.sequence),
             "the newest turn's question is inside its own window"
+        );
+
+        cleanup_db(temp);
+    }
+
+    /// Appends one update of a streamed operation.
+    fn append_operation_update(
+        conn: &mut Connection,
+        session_id: &VibexSessionId,
+        tool_call_id: &str,
+        summary: &str,
+    ) -> i64 {
+        TimelineRepository::append(
+            conn,
+            session_id,
+            TimelineSource::Provider,
+            TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: "read_file".to_string(),
+                status: vibex_core::ToolCallStatus::Progress,
+                summary: summary.to_string(),
+                input_summary: None,
+                output_summary: None,
+                raw_extension: None,
+            }),
+            None,
+            Some(tool_call_id),
+            TimelineRedactionState::None,
+        )
+        .unwrap()
+        .sequence
+    }
+
+    fn append_message(conn: &mut Connection, session_id: &VibexSessionId, text: &str) -> i64 {
+        TimelineRepository::append(
+            conn,
+            session_id,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: text.to_string(),
+                chunk_index: 0,
+                phase: None,
+            }),
+            None,
+            Some("message"),
+            TimelineRedactionState::None,
+        )
+        .unwrap()
+        .sequence
+    }
+
+    fn insert_session(conn: &Connection, root: &str) -> AgentSession {
+        let (_project, workspace) =
+            WorkspaceRepository::ensure(conn, root, WorkspaceMode::CurrentCheckout).unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Compaction".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Initializing,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(conn, &session).unwrap();
+        SessionRepository::update_state(conn, &session.id, AgentSessionState::Idle).unwrap();
+        session
+    }
+
+    /// A run of updates of one operation is the operation, not its history.
+    ///
+    /// Each update is its own row and only the newest one describes what
+    /// happened, so keeping the run on disk stores a process log where the
+    /// reader sees a call — and makes every window the reader opens reach a
+    /// fraction as far.
+    #[test]
+    fn an_operation_update_run_collapses_to_its_newest_update() {
+        let temp = temp_db_path("operation-run");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session = insert_session(&conn, "/tmp/vibex-db-operation-run");
+
+        append_operation_update(&mut conn, &session.id, "call-a", "reading 0");
+        append_operation_update(&mut conn, &session.id, "call-a", "reading 1");
+        let newest = append_operation_update(&mut conn, &session.id, "call-a", "reading 2");
+        append_message(&mut conn, &session.id, "done");
+
+        let removed =
+            TimelineRepository::compact_streamed_segments(&mut conn, &session.id, 0, newest + 1)
+                .unwrap();
+        assert_eq!(removed, 2, "the two superseded updates are gone");
+
+        let page = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            500,
+            None,
+            None,
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].sequence, newest);
+        let TimelinePayload::ToolCall(tool) = &page.items[0].payload else {
+            panic!("the surviving row is the operation");
+        };
+        assert_eq!(tool.summary, "reading 2", "the newest update supplies it");
+
+        cleanup_db(temp);
+    }
+
+    /// A run interrupted by other activity is not a run.
+    ///
+    /// Folding across the interruption would move the operation past text it
+    /// was interleaved with, which changes the conversation's order.
+    #[test]
+    fn an_operation_run_split_by_other_activity_is_left_alone() {
+        let temp = temp_db_path("operation-run-split");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session = insert_session(&conn, "/tmp/vibex-db-operation-run-split");
+
+        append_operation_update(&mut conn, &session.id, "call-a", "reading 0");
+        append_message(&mut conn, &session.id, "meanwhile");
+        let last = append_operation_update(&mut conn, &session.id, "call-a", "reading 1");
+
+        let removed =
+            TimelineRepository::compact_streamed_segments(&mut conn, &session.id, 0, last + 1)
+                .unwrap();
+        assert_eq!(removed, 0);
+
+        let page = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            500,
+            None,
+            None,
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(page.items.len(), 3);
+
+        cleanup_db(temp);
+    }
+
+    /// A run the compacted range cuts in half still converges on one update.
+    ///
+    /// The chunks a whole-session pass is cut into are arbitrary, so a run can
+    /// straddle two of them. The side a chunk can see is folded and the rest
+    /// waits for the next pass; the newest update is never the one dropped,
+    /// and nothing but the operation's own updates ever sat between them, so
+    /// no repeat of the pass can move it past other activity.
+    #[test]
+    fn a_run_straddling_the_compacted_range_converges_on_one_update() {
+        let temp = temp_db_path("operation-run-range");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session = insert_session(&conn, "/tmp/vibex-db-operation-run-range");
+
+        append_operation_update(&mut conn, &session.id, "call-a", "reading 0");
+        let middle = append_operation_update(&mut conn, &session.id, "call-a", "reading 1");
+        let last = append_operation_update(&mut conn, &session.id, "call-a", "reading 2");
+
+        // The scan stops on the middle row, so the run's tail is out of sight.
+        let first_pass =
+            TimelineRepository::compact_streamed_segments(&mut conn, &session.id, 0, middle)
+                .unwrap();
+        assert_eq!(first_pass, 1, "the chunk folds what it can see");
+
+        let surviving = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            500,
+            None,
+            None,
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(
+            surviving
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![middle, last],
+            "the newest update survives the cut"
+        );
+
+        // The next pass sees the rest and finishes the job.
+        let second_pass =
+            TimelineRepository::compact_streamed_segments(&mut conn, &session.id, 0, last + 1)
+                .unwrap();
+        assert_eq!(second_pass, 1);
+        let collapsed = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            500,
+            None,
+            None,
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(collapsed.items.len(), 1);
+        assert_eq!(collapsed.items[0].sequence, last);
+
+        cleanup_db(temp);
+    }
+
+    /// A history written before the timeline folded its runs is collapsed whole.
+    #[test]
+    fn a_session_is_collapsed_end_to_end_and_then_stops_being_a_candidate() {
+        let temp = temp_db_path("operation-session-pass");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session = insert_session(&conn, "/tmp/vibex-db-operation-session-pass");
+        let other = insert_session(&conn, "/tmp/vibex-db-operation-session-pass-other");
+
+        for call in 0..6 {
+            for update in 0..40 {
+                append_operation_update(
+                    &mut conn,
+                    &session.id,
+                    &format!("call-{call}"),
+                    &format!("reading {update}"),
+                );
+            }
+            append_message(&mut conn, &session.id, "next");
+        }
+        // A session that never streamed a repeated update is not a candidate.
+        append_message(&mut conn, &other.id, "only a message");
+
+        let candidates =
+            TimelineRepository::sessions_with_uncompacted_timelines(&conn, 16).unwrap();
+        assert_eq!(candidates, vec![session.id.clone()]);
+
+        let removed =
+            TimelineRepository::compact_session_streamed_segments(&mut conn, &session.id).unwrap();
+        assert_eq!(removed, 6 * 39);
+
+        let page = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            500,
+            None,
+            None,
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(
+            page.items.len(),
+            12,
+            "six operations and six messages remain"
+        );
+        assert!(
+            TimelineRepository::sessions_with_uncompacted_timelines(&conn, 16)
+                .unwrap()
+                .is_empty(),
+            "a collapsed session is not scanned again"
         );
 
         cleanup_db(temp);

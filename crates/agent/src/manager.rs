@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -94,6 +94,66 @@ static LOCAL_HISTORY_IMPORT_GUARD: OnceLock<AsyncMutex<()>> = OnceLock::new();
 pub const PROVIDER_SELECTED_MODEL_METADATA_KEY: &str = "selectedModel";
 pub const PROVIDER_SELECTED_REASONING_EFFORT_METADATA_KEY: &str = "selectedReasoningEffort";
 
+/// Where the sweep over histories written before the timeline folded its
+/// update runs on disk has got to.
+///
+/// The sweep decides for itself when a session is finished rather than asking
+/// the selector again. The selector answers a coarser question — it reports
+/// any run of adjacent rows that agree about their kind, source and provider
+/// correlation — and the fold refuses a few of those, because two adjacent
+/// updates of one operation can still belong to different streamed phases or
+/// carry different attribution. A session holding such a pair would be a
+/// candidate forever, and the sweep would never finish.
+#[derive(Default)]
+struct TimelineCompactionSweep {
+    /// Sessions a completed pass left nothing to fold in.
+    settled: HashSet<VibexSessionId>,
+    /// Candidates still to sweep, worst offender first.
+    pending: VecDeque<VibexSessionId>,
+    /// The session being swept and the sequence the next chunk starts at.
+    current: Option<TimelineCompactionCursor>,
+}
+
+/// One session's place in the sweep.
+struct TimelineCompactionCursor {
+    session_id: VibexSessionId,
+    /// The sequence the next chunk starts at.
+    from: i64,
+    /// How many rows the pass in progress has removed.
+    ///
+    /// A pass that removed nothing is the proof that the session holds no run
+    /// the fold is willing to take, which is the only thing that settles it.
+    removed: usize,
+}
+
+/// What one chunk of the sweep over the uncompacted histories did.
+#[derive(Clone, Copy, Debug)]
+pub struct TimelineCompactionPass {
+    /// How many sessions the chunk finished.
+    pub sessions: usize,
+    /// How many rows the chunk removed.
+    pub removed: usize,
+    /// Whether the sweep has more to do.
+    pub more: bool,
+}
+
+impl TimelineCompactionPass {
+    /// A chunk that found nothing left to sweep.
+    const fn settled() -> Self {
+        Self {
+            sessions: 0,
+            removed: 0,
+            more: false,
+        }
+    }
+}
+
+/// How many candidate sessions the sweep looks up when it needs one.
+///
+/// The selector answers with a window function over the whole timeline table,
+/// so it is asked rarely and answered generously.
+const TIMELINE_COMPACTION_SESSION_BATCH: u32 = 64;
+
 pub struct AgentManager {
     db_path: PathBuf,
     observability: Arc<RuntimeObservability>,
@@ -122,6 +182,13 @@ pub struct AgentManager {
     /// port every time computer use is started, so a switch turned off and on
     /// again has to reach sessions with the new address instead of a dead one.
     computer_mcp_tool: StdMutex<Option<ComputerMcpToolConfig>>,
+    /// Where the sweep over histories written before the timeline folded its
+    /// update runs on disk has got to.
+    ///
+    /// The sweep advances one chunk per call so it never holds the streamed
+    /// append connection for longer than a chunk takes; a live turn appends
+    /// through that same connection.
+    timeline_compaction_sweep: StdMutex<TimelineCompactionSweep>,
     /// Which built-in tool panels each Agent may receive.
     ///
     /// The workbench's Config Center is the only writer today, but the answer
@@ -532,6 +599,7 @@ impl AgentManager {
             vibex_use_host: OnceLock::new(),
             browser_mcp_tool: OnceLock::new(),
             computer_mcp_tool: StdMutex::new(None),
+            timeline_compaction_sweep: StdMutex::new(TimelineCompactionSweep::default()),
             agent_tool_preferences: StdMutex::new(vibex_core::AgentToolPreferences::default()),
             delegation_lifecycle_locks: StdMutex::new(HashMap::new()),
             execution_observers: StdMutex::new(HashSet::new()),
@@ -2084,6 +2152,116 @@ impl AgentManager {
                 // keeping; the next call starts from a fresh one.
                 *reader = None;
                 Err(error)
+            }
+        }
+    }
+
+    /// Advances the sweep over histories written before the timeline folded
+    /// its update runs on disk by one chunk.
+    ///
+    /// A reader opening one of those sessions pays for every intermediate
+    /// state the projection is about to discard, and the window it opens
+    /// reaches a fraction as far — the session reads as a replay of how it was
+    /// produced. The sweep is resumable and advances a chunk at a time because
+    /// it writes through the same connection a live turn appends through: a
+    /// session takes as long as it takes, but the connection is never held for
+    /// more than one chunk of it.
+    ///
+    /// Sessions whose turn is still in flight are skipped, so a turn that is
+    /// running while the sweep advances is never folded underneath the live
+    /// stream.
+    pub fn compact_historical_timelines(&self) -> VibexResult<TimelineCompactionPass> {
+        self.with_stream_writer(|conn| {
+            let mut sweep = self
+                .timeline_compaction_sweep
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(cursor) = sweep.current.as_mut() else {
+                return Ok(Self::open_sweep_session(conn, &mut sweep)?);
+            };
+            let session_id = cursor.session_id.clone();
+            let end = TimelineRepository::timeline_end_sequence(conn, &session_id)?;
+            if cursor.from >= end {
+                // A pass over the session just ended. A pass that removed
+                // something may have left the runs it cut at a chunk boundary
+                // adjacent to their own tails, so the session is only settled
+                // once a pass finds nothing at all.
+                let removed = cursor.removed;
+                if removed == 0 {
+                    sweep.settled.insert(session_id);
+                    sweep.current = None;
+                    return Ok(TimelineCompactionPass {
+                        sessions: 1,
+                        removed: 0,
+                        more: true,
+                    });
+                }
+                cursor.from = 0;
+                cursor.removed = 0;
+                return Ok(TimelineCompactionPass {
+                    sessions: 0,
+                    removed: 0,
+                    more: true,
+                });
+            }
+            let through = cursor
+                .from
+                .saturating_add(vibex_db::TIMELINE_COMPACTION_CHUNK)
+                .min(end);
+            let removed = TimelineRepository::compact_streamed_segments(
+                conn,
+                &session_id,
+                cursor.from,
+                through,
+            )?;
+            cursor.from = through;
+            cursor.removed += removed;
+            Ok(TimelineCompactionPass {
+                removed,
+                sessions: 0,
+                more: true,
+            })
+        })
+    }
+
+    /// Picks the next session for the sweep, or reports that it is over.
+    fn open_sweep_session(
+        conn: &mut DbConnection,
+        sweep: &mut TimelineCompactionSweep,
+    ) -> VibexResult<TimelineCompactionPass> {
+        loop {
+            while let Some(session_id) = sweep.pending.pop_front() {
+                if sweep.settled.contains(&session_id) {
+                    continue;
+                }
+                sweep.current = Some(TimelineCompactionCursor {
+                    session_id,
+                    from: 0,
+                    removed: 0,
+                });
+                return Ok(TimelineCompactionPass {
+                    sessions: 0,
+                    removed: 0,
+                    more: true,
+                });
+            }
+            // A selector pass is a full scan of the timeline table, so it is
+            // asked for a batch and the answers are kept.
+            sweep.pending = TimelineRepository::sessions_with_uncompacted_timelines(
+                conn,
+                TIMELINE_COMPACTION_SESSION_BATCH,
+            )?
+            .into();
+            // The selector keeps reporting a settled session, because its
+            // question is coarser than the fold's. When a whole batch is
+            // settled there is nothing left this sweep is willing to take, and
+            // asking again would only return the same answer.
+            if sweep
+                .pending
+                .iter()
+                .all(|session_id| sweep.settled.contains(session_id))
+            {
+                return Ok(TimelineCompactionPass::settled());
             }
         }
     }

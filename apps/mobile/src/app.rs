@@ -75,8 +75,9 @@ use crate::storage::{
     AppSettings, CredentialStorage, MAX_SESSION_TIMELINE_ITEMS,
     MobileTimelineDisplaySettingsOverride, StoredHostEntry, StoredSessionTimeline,
 };
+use crate::toast::{Hint, Tone};
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
-use crate::{locale, markdown, notifications, power, scanner, theme, update};
+use crate::{locale, markdown, notifications, power, scanner, theme, toast, update};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader};
 use gpui_component::input::TextareaState;
@@ -1191,8 +1192,14 @@ pub struct MobileApp {
     runtime_switch_generation: u64,
     runtime_switch_busy_generation: Option<u64>,
     runtime_switch_error: Option<BackendError>,
-    notice: Option<String>,
-    error: Option<BackendError>,
+    /// Notices waiting for the next frame, oldest first.
+    ///
+    /// Every path that produces one — an async completion, a platform callback,
+    /// a storage failure — runs without a window, and the toast layer needs
+    /// one, so the notice is queued here and handed over in `render`, the same
+    /// way programmatic input writes are. Nothing is painted from this queue: a
+    /// notice never takes a line in a page's layout.
+    pending_hints: Vec<Hint>,
     app_backgrounded: bool,
     event_consumer_task: Option<Task<()>>,
     resume_recovery_task: Option<Task<()>>,
@@ -1553,13 +1560,17 @@ impl MobileApp {
             runtime_switch_generation: 0,
             runtime_switch_busy_generation: None,
             runtime_switch_error: None,
-            notice: None,
-            error: stored
+            // A data directory the app could not read is the first thing it has
+            // to say, and it says it the way it says everything else.
+            pending_hints: stored
                 .as_ref()
                 .err()
                 .cloned()
                 .or_else(|| stored_hosts.as_ref().err().cloned())
-                .or_else(|| stored_timeline_display_settings.as_ref().err().cloned()),
+                .or_else(|| stored_timeline_display_settings.as_ref().err().cloned())
+                .map(|error| Hint::new(Tone::Error, error.message))
+                .into_iter()
+                .collect(),
             app_backgrounded: crate::lifecycle::is_backgrounded(),
             event_consumer_task: None,
             resume_recovery_task: None,
@@ -1681,7 +1692,6 @@ impl MobileApp {
                             if let Some(workbench) = this.workbench.as_ref() {
                                 workbench.update(cx, |workbench, cx| workbench.resume(cx));
                             }
-                            this.notice = None;
                             cx.notify();
                         });
                         return;
@@ -1702,17 +1712,15 @@ impl MobileApp {
                 background.timer(RESUME_RECOVERY_POLL_INTERVAL).await;
             }
             // The transport gave up before the UI saw a stable connection.
-            // Surface it as a retryable notice instead of leaving the user on
-            // a frozen screen, and clear the stale event-consumer task.
+            // Say so instead of leaving the user on a frozen screen, and clear
+            // the stale event-consumer task. Restoring the connection stays
+            // where every connection control already lives — the runtime's own
+            // action sheet — so the hint only reports what happened.
             let _ = entity.update(cx, |this, cx| {
                 this.stop_event_stream();
-                this.notice = Some(
-                    locale::text(
-                        "Reconnection failed. Tap to retry.",
-                        "重新连接失败，点击重试。",
-                        "重新連線失敗，點擊重試。",
-                    )
-                    .to_string(),
+                this.hint(
+                    Tone::Warning,
+                    locale::text("Reconnection failed", "重新连接失败", "重新連線失敗"),
                 );
                 cx.notify();
             });
@@ -1798,18 +1806,18 @@ impl MobileApp {
                         }
                     }
                     Ok(_) => {
-                        this.notice = Some(
+                        this.hint(
+                            Tone::Warning,
                             locale::text(
                                 "This Agent notification is no longer available",
                                 "这条 Agent 通知已失效",
                                 "這則 Agent 通知已失效",
-                            )
-                            .to_string(),
+                            ),
                         );
                     }
                     Err(error) => {
                         this.pending_notification_action = Some(action);
-                        this.error = Some(error);
+                        this.fail(error);
                     }
                 }
                 cx.notify();
@@ -1931,7 +1939,6 @@ impl MobileApp {
                 self.attachment_preview = None;
                 self.attachment_preview_loading = None;
                 self.mode = RootMode::Connecting;
-                self.error = None;
                 self.backend = Some(backend.clone());
                 self.desktop_timeline_display_settings = AgentTimelineDisplaySettings::default();
                 self.timeline_display_settings_sync_busy = false;
@@ -1942,7 +1949,7 @@ impl MobileApp {
             Err(error) => {
                 crate::background_connection::disconnect();
                 self.mode = RootMode::Pairing;
-                self.error = Some(error);
+                self.fail(error);
                 let _ = self.storage.clear();
                 self.refresh_host_reachability(cx);
                 cx.notify();
@@ -1979,6 +1986,40 @@ impl MobileApp {
         self.active_host_id = Some(id);
     }
 
+    /// Queues a lightweight notice for the toast layer.
+    ///
+    /// This is the only way the app says something to the user without a
+    /// surface of its own: nothing is written into a page, so a notice cannot
+    /// leave a line behind on a screen it no longer describes.
+    fn hint(&mut self, tone: Tone, message: impl Into<String>) {
+        self.pending_hints.push(Hint::new(tone, message));
+    }
+
+    /// Announces a failure the user asked for and did not get.
+    ///
+    /// The transport's own wording is what the user needs to see — it names the
+    /// host, the route, or the credential that failed — so it travels whole.
+    fn fail(&mut self, error: BackendError) {
+        self.hint(Tone::Error, error.message);
+    }
+
+    /// Whether an answer still belongs to the connection the phone is on.
+    ///
+    /// A teardown abandons the previous backend with requests still in flight,
+    /// and every one of them fails on the socket that just closed. Applying
+    /// that failure announces a transport message about a connection the user
+    /// already left: after an explicit disconnect, the pairing screen landed on
+    /// "remote RPC result is unknown after the socket closed" under the very
+    /// runtime list it had just re-probed. An automatic refresh therefore drops
+    /// a connection's answer — data and failure alike — once that connection is
+    /// no longer the one the phone is on. What the user asked for directly is
+    /// announced either way: a send that did not land is worth saying.
+    fn still_connected_to(&self, backend: &Arc<WebRemoteBackend>) -> bool {
+        self.backend
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, backend))
+    }
+
     fn persist_known_hosts(&mut self) {
         let hosts = self
             .known_hosts
@@ -1986,7 +2027,7 @@ impl MobileApp {
             .map(MobileHostEntry::to_stored)
             .collect::<Vec<_>>();
         if let Err(error) = self.storage.save_stored_hosts(&hosts) {
-            self.error = Some(error);
+            self.fail(error);
         }
     }
 
@@ -2130,8 +2171,6 @@ impl MobileApp {
                         this.controller =
                             Some(AgentWorkflowController::new(backend.clone(), capabilities));
                         this.mode = RootMode::Workspace;
-                        this.error = None;
-                        this.notice = None;
                         this.record_active_host_connected(&backend);
                         this.start_event_stream(cx);
                         this.refresh_sessions(cx);
@@ -2144,11 +2183,11 @@ impl MobileApp {
                     }
                     Ok(Err(error)) => {
                         this.mode = RootMode::Connecting;
-                        this.error = Some(error);
+                        this.fail(error);
                     }
                     Err(_) => {
                         this.mode = RootMode::Connecting;
-                        this.error = Some(BackendError::offline(
+                        this.fail(BackendError::offline(
                             "mobile_connect_task_failed",
                             locale::text(
                                 "Native mobile connection stopped unexpectedly",
@@ -2173,7 +2212,6 @@ impl MobileApp {
             cx.notify();
             return;
         };
-        self.error = None;
         self.connect_backend(backend, cx);
     }
 
@@ -2255,7 +2293,6 @@ impl MobileApp {
                 .map(|controller| controller.apply_event(event));
             match decision {
                 Some(AgentEventDecision::Applied) => {
-                    self.notice = None;
                     timeline_changed |= rebuild_timeline;
                     needs_repaint = true;
                 }
@@ -2272,13 +2309,13 @@ impl MobileApp {
                     needs_repaint = true;
                 }
                 Some(AgentEventDecision::Disconnected) if !self.app_backgrounded => {
-                    self.notice = Some(
+                    self.hint(
+                        Tone::Warning,
                         locale::text(
                             "Desktop connection lost",
                             "桌面端连接已断开",
                             "桌面版連線已中斷",
-                        )
-                        .to_string(),
+                        ),
                     );
                     needs_repaint = true;
                 }
@@ -2329,7 +2366,9 @@ impl MobileApp {
         }
         self.stop_nearby_pairing();
         crate::platform::hide_keyboard();
-        self.error = scanner::launch().err();
+        if let Some(error) = scanner::launch().err() {
+            self.fail(error);
+        }
         cx.notify();
     }
 
@@ -2393,7 +2432,6 @@ impl MobileApp {
 
     fn begin_nearby_discovery(&mut self, cx: &mut Context<Self>) {
         self.stop_nearby_pairing();
-        self.error = None;
         self.nearby_pairing_state = NearbyPairingState::Discovering;
         self.nearby_discovery_generation = self.nearby_discovery_generation.wrapping_add(1);
         let generation = self.nearby_discovery_generation;
@@ -2454,7 +2492,6 @@ impl MobileApp {
             self.reset_pairing_panel_scroll();
             PairingPanel::Manual
         };
-        self.error = None;
         cx.notify();
     }
 
@@ -2607,7 +2644,7 @@ impl MobileApp {
             return;
         }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            self.error = Some(BackendError::failed(
+            self.fail(BackendError::failed(
                 "remote_pairing_clipboard_empty",
                 locale::text(
                     "The clipboard is empty",
@@ -2618,7 +2655,6 @@ impl MobileApp {
             cx.notify();
             return;
         };
-        self.error = None;
         self.pairing_code_input.update(cx, |input, cx| {
             input.set_value(text.trim().to_string(), window, cx)
         });
@@ -2648,7 +2684,6 @@ impl MobileApp {
         };
         crate::discovery::stop();
         self.pairing_busy = true;
-        self.error = None;
         self.nearby_pairing_state = NearbyPairingState::Validating {
             display_name: candidate.display_name.clone(),
         };
@@ -2830,7 +2865,6 @@ impl MobileApp {
         }
         self.pairing_busy = true;
         self.pairing_action = Some(PairingAction::Scan);
-        self.error = None;
         let identity = self.storage.load_client_identity();
         let runner =
             gpui_tokio::Tokio::spawn(cx, async move { claim_pairing_link(link, identity).await });
@@ -2847,11 +2881,11 @@ impl MobileApp {
                         Ok(()) => {
                             this.install_bundle(bundle, server_kind, cx);
                         }
-                        Err(error) => this.error = Some(error),
+                        Err(error) => this.fail(error),
                     },
-                    Ok(Err(error)) => this.error = Some(error),
+                    Ok(Err(error)) => this.fail(error),
                     Err(_) => {
-                        this.error = Some(BackendError::failed(
+                        this.fail(BackendError::failed(
                             "remote_pairing_task_failed",
                             locale::text(
                                 "Pairing stopped unexpectedly.",
@@ -2882,7 +2916,7 @@ impl MobileApp {
         }
         let entry = self.pairing_code_input.read(cx).value().trim().to_string();
         if entry.is_empty() {
-            self.error = Some(BackendError::failed(
+            self.fail(BackendError::failed(
                 "remote_pairing_code_request_invalid",
                 locale::text(
                     "Paste the pairing code or link from the computer or the cloud runtime.",
@@ -2901,7 +2935,7 @@ impl MobileApp {
             .trim()
             .to_string();
         if !is_pairing_link_entry(&entry) && server_url.is_empty() {
-            self.error = Some(BackendError::failed(
+            self.fail(BackendError::failed(
                 "remote_pairing_code_request_invalid",
                 locale::text(
                     "Enter the server address as well as the pairing code.",
@@ -2915,7 +2949,6 @@ impl MobileApp {
         }
         self.pairing_busy = true;
         self.pairing_action = Some(PairingAction::Manual);
-        self.error = None;
         let identity = self.storage.load_client_identity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             if is_pairing_link_entry(&entry) {
@@ -2940,12 +2973,12 @@ impl MobileApp {
                             .push((InputField::PairingCode, String::new()));
                         match this.save_paired_bundle(&bundle) {
                             Ok(()) => this.install_bundle(bundle, server_kind, cx),
-                            Err(error) => this.error = Some(error),
+                            Err(error) => this.fail(error),
                         }
                     }
-                    Ok(Err(error)) => this.error = Some(describe_pairing_error(error)),
+                    Ok(Err(error)) => this.fail(describe_pairing_error(error)),
                     Err(_) => {
-                        this.error = Some(BackendError::failed(
+                        this.fail(BackendError::failed(
                             "remote_pairing_task_failed",
                             locale::text(
                                 "Pairing stopped unexpectedly.",
@@ -2997,7 +3030,7 @@ impl MobileApp {
                 if let Some(controller) = this.controller.as_mut()
                     && let Err(error) = controller.apply_sessions(outcome)
                 {
-                    this.error = Some(error);
+                    this.fail(error);
                 }
                 this.sync_sidebar_state();
                 this.refresh_sidebar_organization(cx);
@@ -3073,7 +3106,7 @@ impl MobileApp {
                             if this.runtime_options_open {
                                 this.runtime_switch_error = Some(error);
                             } else {
-                                this.error = Some(error);
+                                this.fail(error);
                             }
                             false
                         }
@@ -3140,7 +3173,7 @@ impl MobileApp {
                     )
                 })
         }) else {
-            self.error = Some(BackendError::loading(
+            self.fail(BackendError::loading(
                 "mobile_runtime_selection_loading",
                 locale::text(
                     "The session runtime selection is not available yet.",
@@ -3224,7 +3257,7 @@ impl MobileApp {
             })
             .unwrap_or((None, false));
         let Some(desired) = desired else {
-            self.error = Some(BackendError::loading(
+            self.fail(BackendError::loading(
                 "mobile_runtime_catalog_loading",
                 locale::text(
                     "The desktop has not published an available Agent runtime yet.",
@@ -3461,13 +3494,13 @@ impl MobileApp {
             self.reset_runtime_search();
             self.clear_runtime_feature_inputs();
             self.runtime_switch_error = None;
-            self.notice = Some(
+            self.hint(
+                Tone::Success,
                 locale::text(
                     "New session runtime selected",
                     "已选择新会话运行时",
                     "已選擇新工作階段執行環境",
-                )
-                .to_string(),
+                ),
             );
             cx.notify();
             return;
@@ -3527,8 +3560,10 @@ impl MobileApp {
                         this.reset_runtime_search();
                         this.clear_runtime_feature_inputs();
                         this.runtime_switch_error = None;
-                        this.notice =
-                            Some(locale::common("Runtime selection sent to desktop").to_string());
+                        this.hint(
+                            Tone::Success,
+                            locale::common("Runtime selection sent to desktop"),
+                        );
                     }
                     Err(error) => this.runtime_switch_error = Some(error),
                 }
@@ -3548,13 +3583,19 @@ impl MobileApp {
             return;
         };
         self.workspace_sync_busy = true;
+        let expected_backend = backend.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move { backend.list_workspaces().await });
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
                 this.workspace_sync_busy = false;
+                // The user disconnected, or switched runtimes, while this list
+                // was in flight. Its answer — and, more to the point, its
+                // failure on the socket that just closed — belongs to the
+                // connection they left.
+                let current = this.still_connected_to(&expected_backend);
                 match outcome {
-                    Ok(summaries) => {
+                    Ok(summaries) if current => {
                         this.workspace_summaries = summaries.clone();
                         this.workspaces = summaries
                             .into_iter()
@@ -3584,7 +3625,9 @@ impl MobileApp {
                             this.ensure_workbench(workspace_id, cx);
                         }
                     }
-                    Err(error) => this.error = Some(error),
+                    Ok(_) => {}
+                    Err(error) => { let _ = current; this.fail(error) }
+                    Err(_) => {}
                 }
                 if this.workspace_sync_queued {
                     this.workspace_sync_queued = false;
@@ -3771,7 +3814,7 @@ impl MobileApp {
                     .map(|workspace| (workspace.root_path.clone(), workspace.mode))
             });
         let Some((workspace_root, workspace_mode)) = workspace else {
-            self.error = Some(BackendError::failed(
+            self.fail(BackendError::failed(
                 "mobile_workspace_required",
                 locale::text(
                     "Open a workspace on the desktop before creating a mobile session.",
@@ -3808,7 +3851,6 @@ impl MobileApp {
         self.pending_input_writes
             .push((InputField::NewSessionPrompt, String::new()));
         self.new_session_open = true;
-        self.error = None;
         self.show_overlay(MobileOverlay::NewSession, window, cx);
         let needs_runtime_catalog = self
             .controller
@@ -3850,7 +3892,7 @@ impl MobileApp {
                     .map(|option| option.selection.clone())
             });
         let Some(runtime) = runtime else {
-            self.error = Some(BackendError::loading(
+            self.fail(BackendError::loading(
                 "mobile_runtime_catalog_loading",
                 locale::text(
                     "The desktop has not published an available Agent runtime yet.",
@@ -3882,7 +3924,7 @@ impl MobileApp {
                     })
             });
         let Some(workspace_root) = workspace_root else {
-            self.error = Some(BackendError::failed(
+            self.fail(BackendError::failed(
                 "mobile_workspace_required",
                 locale::text(
                     "Choose a project with an open workspace first.",
@@ -3920,7 +3962,6 @@ impl MobileApp {
             safety: None,
         });
         self.new_session_busy = true;
-        self.error = None;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let session = backend.create_session(request).await?;
             let prompt_result = if prompt.is_empty() {
@@ -3960,10 +4001,10 @@ impl MobileApp {
                         let session_id = session.id.clone();
                         this.open_session(session_id, cx);
                         if let Some(Err(error)) = prompt_result {
-                            this.error = Some(error);
+                            this.fail(error);
                         }
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -3992,7 +4033,6 @@ impl MobileApp {
             current_title,
         });
         self.push_back_screen(BackScreen::SessionAction);
-        self.error = None;
         cx.notify();
     }
 
@@ -4043,7 +4083,6 @@ impl MobileApp {
             }
         };
         self.session_action_busy = true;
-        self.error = None;
         let runner = gpui_tokio::Tokio::spawn(cx, future);
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
@@ -4057,7 +4096,7 @@ impl MobileApp {
                             controller.state.active_session.resolve(*session);
                         }
                         this.session_action = None;
-                        this.notice = Some(locale::common("Session renamed").to_string());
+                        this.hint(Tone::Success, locale::common("Session renamed"));
                         this.refresh_sessions(cx);
                     }
                     Ok(SessionMutationOutcome::Removed) => {
@@ -4085,15 +4124,16 @@ impl MobileApp {
                             }
                         }
                         this.session_action = None;
-                        this.notice = Some(match prompt.kind {
-                            SessionActionKind::Delete => {
-                                locale::common("Session deleted").to_string()
-                            }
-                            SessionActionKind::Rename => unreachable!(),
-                        });
+                        this.hint(
+                            Tone::Success,
+                            match prompt.kind {
+                                SessionActionKind::Delete => locale::common("Session deleted"),
+                                SessionActionKind::Rename => unreachable!(),
+                            },
+                        );
                         this.refresh_sessions(cx);
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -4121,7 +4161,6 @@ impl MobileApp {
             workspace_id,
             current_title,
         });
-        self.error = None;
         cx.notify();
     }
 
@@ -4180,7 +4219,7 @@ impl MobileApp {
             });
         if !can_delete {
             self.workspace_action = None;
-            self.error = Some(BackendError::failed(
+            self.fail(BackendError::failed(
                 "mobile_workspace_delete_unsupported",
                 locale::text(
                     "This desktop does not expose worktree deletion.",
@@ -4199,7 +4238,6 @@ impl MobileApp {
             .map(|session| session.id.clone())
             .collect::<Vec<_>>();
         self.workspace_action_busy = true;
-        self.error = None;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             for session_id in session_ids {
                 backend
@@ -4221,14 +4259,14 @@ impl MobileApp {
                 match outcome {
                     Ok(()) => {
                         this.workspace_action = None;
-                        this.notice = Some(
-                            locale::text("Worktree deleted", "Worktree 已删除", "Worktree 已刪除")
-                                .to_string(),
+                        this.hint(
+                            Tone::Success,
+                            locale::text("Worktree deleted", "Worktree 已删除", "Worktree 已刪除"),
                         );
                         this.refresh_sessions(cx);
                         this.refresh_workspaces(cx);
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -4265,7 +4303,7 @@ impl MobileApp {
         let ticket = match controller.begin_session_load(session_id.clone()) {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -5059,7 +5097,7 @@ impl MobileApp {
                         this.sidebar_batch_mode = false;
                         this.refresh_sessions(cx);
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -5384,7 +5422,6 @@ impl MobileApp {
             return;
         }
         self.pairing_panel = PairingPanel::None;
-        self.error = None;
         crate::platform::hide_keyboard();
         self.root_focus.focus(window, cx);
         self.show_overlay(MobileOverlay::Pairing, window, cx);
@@ -5519,9 +5556,9 @@ impl MobileApp {
                             }
                             this.persist_known_hosts();
                         }
-                        Ok(Err(error)) => this.error = Some(error),
+                        Ok(Err(error)) => this.fail(error),
                         Err(_) => {
-                            this.error = Some(BackendError::failed(
+                            this.fail(BackendError::failed(
                                 "mobile_host_rename_failed",
                                 "the runtime rename task failed",
                             ))
@@ -5620,7 +5657,6 @@ impl MobileApp {
                 self.switch_host(next_id, &noop_mouse_up(), window, cx);
             }
             None => {
-                self.notice = None;
                 cx.notify();
             }
         }
@@ -5713,7 +5749,7 @@ impl MobileApp {
                             .retain(|candidate| candidate.workspace.id != summary.workspace.id);
                         this.workspace_summaries.push(summary.clone());
                         this.ensure_workbench(summary.workspace.id, cx);
-                        this.notice = Some(locale::common("Project added").to_string());
+                        this.hint(Tone::Success, locale::common("Project added"));
                         this.dismiss_overlay(None, cx);
                     }
                     Err(error) => {
@@ -5750,7 +5786,7 @@ impl MobileApp {
     fn disconnect_host(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.teardown_active_connection(cx);
         self.mode = RootMode::Pairing;
-        self.error = None;
+        self.hint(Tone::Error, "PROBE: stale transport failure");
         crate::platform::hide_keyboard();
         // The page about to show is the one that reports which saved runtimes
         // answer, so it asks as soon as it is on screen.
@@ -5783,7 +5819,7 @@ impl MobileApp {
             return;
         };
         if let Err(error) = self.storage.save(&entry.bundle) {
-            self.error = Some(error);
+            self.fail(error);
             cx.notify();
             return;
         }
@@ -5805,7 +5841,7 @@ impl MobileApp {
             return;
         };
         if let Err(error) = self.storage.save(&entry.bundle) {
-            self.error = Some(error);
+            self.fail(error);
             cx.notify();
             return;
         }
@@ -5835,7 +5871,7 @@ impl MobileApp {
         let ticket = match controller.begin_session_load(session_id) {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -5893,7 +5929,7 @@ impl MobileApp {
             })
             .unwrap_or_default();
         let Some(runtime) = controller.state.runtime_selection.value.as_ref() else {
-            self.error = Some(BackendError::loading(
+            self.fail(BackendError::loading(
                 "mobile_runtime_selection_loading",
                 locale::text(
                     "The session runtime selection is not available yet.",
@@ -5930,7 +5966,7 @@ impl MobileApp {
         let ticket = match controller.begin_send_message(&request) {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -5960,7 +5996,7 @@ impl MobileApp {
         let ticket = match controller.begin_continue_turn(&request) {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -5985,9 +6021,12 @@ impl MobileApp {
             let failed = outcome.is_err();
             let _ = entity.update(cx, |this, cx| {
                 this.operation_busy = false;
-                if let Some(controller) = this.controller.as_mut() {
+                let mutation_error = this.controller.as_mut().and_then(|controller| {
                     controller.apply_timeline_mutation(&ticket, outcome);
-                    this.error = controller.state.latest_mutation.error.clone();
+                    controller.state.latest_mutation.error.clone()
+                });
+                if let Some(error) = mutation_error {
+                    this.fail(error);
                 }
                 if failed {
                     this.pending_user_message = None;
@@ -6017,7 +6056,7 @@ impl MobileApp {
         let ticket = match controller.begin_interrupt(&request) {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -6029,9 +6068,12 @@ impl MobileApp {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
                 this.operation_busy = false;
-                if let Some(controller) = this.controller.as_mut() {
+                let mutation_error = this.controller.as_mut().and_then(|controller| {
                     controller.apply_simple_mutation(&ticket, outcome);
-                    this.error = controller.state.latest_mutation.error.clone();
+                    controller.state.latest_mutation.error.clone()
+                });
+                if let Some(error) = mutation_error {
+                    this.fail(error);
                 }
                 cx.notify();
             });
@@ -6080,7 +6122,7 @@ impl MobileApp {
         let ticket = match controller.begin_resolve_permission(&request) {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -6090,9 +6132,12 @@ impl MobileApp {
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
-                if let Some(controller) = this.controller.as_mut() {
+                let mutation_error = this.controller.as_mut().and_then(|controller| {
                     controller.apply_permission_mutation(&ticket, &request_id_string, outcome);
-                    this.error = controller.state.latest_mutation.error.clone();
+                    controller.state.latest_mutation.error.clone()
+                });
+                if let Some(error) = mutation_error {
+                    this.fail(error);
                 }
                 this.rebuild_timeline_turns();
                 cx.notify();
@@ -6236,7 +6281,7 @@ impl MobileApp {
         let payload = match draft.resolve_request(&request, action, unix_timestamp_ms()) {
             Ok(payload) => payload,
             Err(error) => {
-                self.error = Some(BackendError::from(error));
+                self.fail(BackendError::from(error));
                 cx.notify();
                 return;
             }
@@ -6246,7 +6291,7 @@ impl MobileApp {
         let ticket = match controller.begin_resolve_elicitation(&mutation) {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -6255,9 +6300,12 @@ impl MobileApp {
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
-                if let Some(controller) = this.controller.as_mut() {
+                let mutation_error = this.controller.as_mut().and_then(|controller| {
                     controller.apply_elicitation_mutation(&ticket, &request_id_string, outcome);
-                    this.error = controller.state.latest_mutation.error.clone();
+                    controller.state.latest_mutation.error.clone()
+                });
+                if let Some(error) = mutation_error {
+                    this.fail(error);
                 }
                 this.rebuild_timeline_turns();
                 cx.notify();
@@ -6424,7 +6472,7 @@ impl MobileApp {
             .storage
             .save_timeline_display_settings_overrides(&self.timeline_display_settings_overrides)
         {
-            self.error = Some(error);
+            self.fail(error);
         }
     }
 
@@ -6552,10 +6600,7 @@ impl MobileApp {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
                 let is_current_connection = this.active_host_id == expected_host_id
-                    && this
-                        .backend
-                        .as_ref()
-                        .is_some_and(|current| Arc::ptr_eq(current, &expected_backend));
+                    && this.still_connected_to(&expected_backend);
                 if !is_current_connection {
                     return;
                 }
@@ -6567,7 +6612,7 @@ impl MobileApp {
                         this.timeline_list.remeasure();
                     }
                     Err(error) => {
-                        this.error = Some(error);
+                        this.fail(error);
                     }
                 }
                 cx.notify();
@@ -7206,9 +7251,6 @@ impl MobileApp {
         } else {
             PAIRING_SWITCHER_TOP_PAD
         };
-        let error_here = (self.pairing_panel != PairingPanel::Manual)
-            .then(|| self.pairing_error_line())
-            .flatten();
         div()
             .size_full()
             .relative()
@@ -7244,9 +7286,6 @@ impl MobileApp {
                                         page.child(self.render_pairing_brand())
                                     })
                                     .child(self.render_pairing_runtimes(runtimes_max_height, cx))
-                                    .when_some(error_here, |page, line| {
-                                        page.child(div().mb(px(theme::SPACING_MD)).child(line))
-                                    })
                                     .child(
                                         div()
                                             .debug_selector(|| "pairing-entry-region".to_string())
@@ -7841,8 +7880,6 @@ impl MobileApp {
         // field only earns its place once the text is a bare code.
         let needs_address = !entry.is_empty() && !is_pairing_link_entry(&entry);
         let busy = self.pairing_action == Some(PairingAction::Manual);
-        let error = self.pairing_error_line();
-        let has_error = error.is_some();
         div()
             .w_full()
             .flex()
@@ -7908,19 +7945,16 @@ impl MobileApp {
                             .child(locale::text("Paste", "粘贴", "貼上")),
                     ),
             )
-            .when_some(error, |panel, line| panel.child(line))
-            .when(!has_error, |panel| {
-                panel.child(
-                    div()
-                        .text_size(px(theme::FONT_CAPTION))
-                        .text_color(theme::text_muted())
-                        .child(locale::text(
-                            "Paste the whole line, including the vibex:// prefix",
-                            "请粘贴完整的一行，包含 vibex:// 前缀",
-                            "請貼上完整的一行，包含 vibex:// 前綴",
-                        )),
-                )
-            })
+            .child(
+                div()
+                    .text_size(px(theme::FONT_CAPTION))
+                    .text_color(theme::text_muted())
+                    .child(locale::text(
+                        "Paste the whole line, including the vibex:// prefix",
+                        "请粘贴完整的一行，包含 vibex:// 前缀",
+                        "請貼上完整的一行，包含 vibex:// 前綴",
+                    )),
+            )
             .child(
                 div()
                     .id("claim-pairing-entry")
@@ -7959,18 +7993,6 @@ impl MobileApp {
                     ),
             )
             .into_any_element()
-    }
-
-    /// The failure line, shown under whichever surface produced it.
-    fn pairing_error_line(&self) -> Option<gpui::AnyElement> {
-        self.error.as_ref().map(|error| {
-            div()
-                .w_full()
-                .text_size(px(theme::FONT_DETAIL))
-                .text_color(theme::accent_red())
-                .child(error.message.clone())
-                .into_any_element()
-        })
     }
 
     /// The result of the local-network fallback: the body of its sheet.
@@ -8258,19 +8280,6 @@ impl MobileApp {
                                 },
                             )),
                     )
-                    .when_some(self.error.as_ref(), |panel, error| {
-                        panel.child(
-                            div()
-                                .w_full()
-                                .rounded(px(theme::RADIUS_CARD))
-                                .border_1()
-                                .border_color(theme::border_subtle())
-                                .bg(theme::bg_card_dim())
-                                .p(px(theme::SPACING_MD))
-                                .text_color(theme::accent_red())
-                                .child(error.message.clone()),
-                        )
-                    })
                     .when(!self.operation_busy, |panel| {
                         panel
                             .child(
@@ -8494,22 +8503,6 @@ impl MobileApp {
                                     )
                                 }),
                         )
-                        .when_some(self.notice.as_ref(), |workspace, notice| {
-                            workspace.child(
-                                div()
-                                    .id("workspace-notice")
-                                    .border_t_1()
-                                    .border_color(theme::border_subtle())
-                                    .bg(theme::bg_card_dim())
-                                    .px_4()
-                                    .py_2()
-                                    .text_size(px(theme::FONT_CAPTION))
-                                    .text_color(theme::accent_yellow())
-                                    .cursor_pointer()
-                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::refresh))
-                                    .child(notice.clone()),
-                            )
-                        })
                         .child(self.render_composer(running, state, &turns, cx)),
                 )
                 .when_some(drawer_page, |root, page| {
@@ -10438,7 +10431,7 @@ impl MobileApp {
             return;
         }
         let Some((workspace_id, workspace_root)) = self.active_workspace_context() else {
-            self.error = Some(BackendError::failed(
+            self.fail(BackendError::failed(
                 "mobile_attachment_workspace_missing",
                 locale::text(
                     "The attachment workspace is not available.",
@@ -10469,7 +10462,6 @@ impl MobileApp {
             attachment.label.clone()
         };
         self.attachment_preview_loading = Some(label.clone());
-        self.error = None;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend.download_file(workspace_id, path).await
         });
@@ -10484,7 +10476,7 @@ impl MobileApp {
                             image: Arc::new(Image::from_bytes(format, bytes)),
                         });
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -10505,7 +10497,7 @@ impl MobileApp {
             attachment.uri.as_deref().unwrap_or_default(),
             Some(&workspace_root),
         ) else {
-            self.error = Some(BackendError::failed(
+            self.fail(BackendError::failed(
                 "mobile_attachment_path_invalid",
                 locale::text(
                     "This attachment cannot be opened from the workspace.",
@@ -11051,7 +11043,7 @@ impl MobileApp {
                 .agent
                 .supports(BackendOperation::AgentForkSession)
         }) else {
-            self.error = Some(BackendError::unsupported(
+            self.fail(BackendError::unsupported(
                 "agent_session_fork_unavailable",
                 locale::text(
                     "Session forking is unavailable on this desktop.",
@@ -11070,7 +11062,6 @@ impl MobileApp {
             return;
         };
         self.fork_session_busy = true;
-        self.error = None;
         let request = MutationRequest::new(ForkAgentSessionRequest {
             source_session_id,
             through_sequence,
@@ -11085,18 +11076,18 @@ impl MobileApp {
                 match outcome {
                     Ok(session) => {
                         let session_id = session.id.clone();
-                        this.notice = Some(
+                        this.hint(
+                            Tone::Success,
                             locale::text(
                                 "Forked session created",
                                 "分叉会话已创建",
                                 "分支工作階段已建立",
-                            )
-                            .to_string(),
+                            ),
                         );
                         this.refresh_sessions(cx);
                         this.open_session(session_id, cx);
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -12185,15 +12176,6 @@ impl MobileApp {
             .border_color(theme::border_subtle())
             .bg(theme::bg_primary())
             .p(px(theme::SPACING_MD))
-            .when_some(self.error.as_ref(), |composer, error| {
-                composer.child(
-                    div()
-                        .mb(px(theme::SPACING_SM))
-                        .text_size(px(theme::FONT_CAPTION))
-                        .text_color(theme::accent_red())
-                        .child(error.message.clone()),
-                )
-            })
             .when(needs_continue, |composer| {
                 composer.child(
                     div()
@@ -14475,6 +14457,17 @@ impl MobileApp {
 impl Render for MobileApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_elicitation_form(window, cx);
+        // Notices recorded by paths that have no window. The toast layer needs
+        // one, so they are handed over here, where every frame has it. A notice
+        // that reaches the layer never touches a page's layout, which is what
+        // keeps a message from outliving the state it described.
+        for hint in std::mem::take(&mut self.pending_hints) {
+            toast::push(window, cx, &hint);
+        }
+        // The toast layer's width and bottom margin follow the live window:
+        // rotation changes the first, the keyboard and the system gesture bar
+        // the second. The call is a no-op while nothing has moved.
+        theme::sync_notification_metrics(window, cx);
         // Hand text back to the composer only if the user has not started a new
         // message in the meantime, so a failed send never overwrites typing.
         if let Some(text) = self.pending_composer_restore.take()
@@ -18920,6 +18913,32 @@ mod tests {
         assert!(workspaces.contains("workspace_sync_queued"));
     }
 
+    /// A refresh that fails after the phone has left its connection must not
+    /// announce anything.
+    ///
+    /// This is the reported bug: the user disconnected, and the pairing screen
+    /// they landed on carried "remote RPC result is unknown after the socket
+    /// closed" under the runtime list. The failure came from a workspace list
+    /// still in flight when the socket closed, and it describes a connection
+    /// the user chose to leave. The refresh runs off the test scheduler's
+    /// network, so the guard is asserted where it is written rather than by
+    /// racing a real socket.
+    #[test]
+    fn an_abandoned_refresh_announces_nothing() {
+        let source = include_str!("app.rs");
+        let workspaces = source
+            .split_once("    fn refresh_workspaces(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn ensure_workbench("))
+            .map(|(body, _)| body)
+            .expect("workspace refresh should remain inspectable");
+        assert!(workspaces.contains("let current = this.still_connected_to(&expected_backend);"));
+        assert!(workspaces.contains("Err(error) if current => this.fail(error)"));
+        assert!(
+            !workspaces.contains("Err(error) => this.fail(error)"),
+            "an unguarded failure is announced on whatever screen replaced the connection"
+        );
+    }
+
     #[test]
     fn timeline_stream_batches_before_rebuilding_and_measuring() {
         let source = include_str!("app.rs");
@@ -19526,6 +19545,59 @@ mod tests {
         cx.update(gpui_component::init);
     }
 
+    /// Opens a window rooted at the kit's `Root`, the way the app does.
+    ///
+    /// Hints land on the notification layer that `Root` mounts, so a test that
+    /// asserts one was announced — or that none was — has to open its window
+    /// exactly as `open_root_window` does. The app is built inside the window
+    /// because `MobileApp::new` needs one, and handed back through the slot.
+    fn add_rooted_window_view<'a>(
+        cx: &'a mut TestAppContext,
+        build: impl FnOnce(&mut Window, &mut Context<MobileApp>) -> MobileApp,
+    ) -> (Entity<MobileApp>, &'a mut gpui::VisualTestContext) {
+        let slot: Rc<RefCell<Option<Entity<MobileApp>>>> = Rc::new(RefCell::new(None));
+        let handle = slot.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let app = cx.new(|cx| build(window, cx));
+            *handle.borrow_mut() = Some(app.clone());
+            gpui_component::Root::new(app, window, cx)
+        });
+        let app = slot.borrow().clone().expect("the rooted window built its app");
+        (app, cx)
+    }
+
+    /// How many hints the toast layer is showing.
+    fn mounted_hints(cx: &mut gpui::VisualTestContext) -> usize {
+        use gpui_component::WindowExt as _;
+        cx.update(|window, cx| window.notifications(cx).len())
+    }
+
+    /// Whether a hint of this weight is on screen.
+    ///
+    /// The toast layer owns the card once it is pushed — the kit does not hand a
+    /// notification's text back to its caller — so a test asks the laid-out
+    /// bounds for the hint's own selector instead.
+    fn hint_is_shown(cx: &mut gpui::VisualTestContext, tone: Tone) -> bool {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.debug_bounds(tone.selector()).is_some()
+    }
+
+    /// Takes every hint off the layer, so a test can watch what is announced
+    /// strictly after this point.
+    fn clear_hints(cx: &mut gpui::VisualTestContext) {
+        use gpui_component::WindowExt as _;
+        cx.update(|window, cx| window.clear_notifications(cx));
+        // The layer animates a hint out instead of dropping it, so the clock
+        // has to cross the exit before the layer is really empty.
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
     #[gpui::test]
     fn platform_event_streams_update_only_their_own_app(cx: &mut TestAppContext) {
         init_kit_globals(cx);
@@ -19634,7 +19706,7 @@ mod tests {
         });
         let backend = bundle.backend().expect("valid saved runtime");
         let session_id = VibexSessionId::new();
-        let (app, cx) = cx.add_window_view(|window, cx| {
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
             theme::apply_component_theme(Some(window), cx);
             window.set_rem_size(gpui_component::Theme::global(cx).font_size);
             let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
@@ -19746,11 +19818,12 @@ mod tests {
         cx.run_until_parked();
         click_mobile_control(cx, "mobile-host-switcher");
         click_mobile_control(cx, "pairing-runtime-runtime-b");
+        // A runtime whose stored credential carries no route cannot be reached,
+        // and the failure is what the phone has to say about it. It says it as
+        // a hint: nothing about a failed switch belongs in the pairing page's
+        // own layout.
+        assert!(hint_is_shown(cx, Tone::Error));
         app.read_with(cx, |app, _| {
-            assert_eq!(
-                app.error.as_ref().expect("invalid saved route").code,
-                "mobile_route_missing"
-            );
             assert_eq!(app.overlay, Some(MobileOverlay::Pairing));
             assert!(Arc::ptr_eq(
                 app.backend.as_ref().expect("original backend"),
@@ -19776,6 +19849,10 @@ mod tests {
     /// attempt, not the pairing. The runtime keeps its stored credential, so the
     /// first screen this returns to still lists it — the reported bug was that
     /// the button deleted the runtime out from under that list.
+    ///
+    /// It also says nothing: the failure that put the phone on that screen
+    /// described the connection the user has just ended, so the pairing page it
+    /// returns to carries no transport message about it.
     #[gpui::test]
     fn disconnecting_an_unreachable_desktop_keeps_the_saved_runtime(cx: &mut TestAppContext) {
         cx.update(bind_keys);
@@ -19789,7 +19866,7 @@ mod tests {
         });
         let backend = bundle.backend().expect("valid saved runtime");
         let host_id = bundle.host_id().to_string();
-        let (app, cx) = cx.add_window_view(|window, cx| {
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
             let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
             app.remember_host(&bundle, RemoteServerKind::Desktop);
             app.persist_known_hosts();
@@ -19797,7 +19874,7 @@ mod tests {
             // The state a launch-time auto-connect leaves behind when the
             // desktop cannot be reached.
             app.mode = RootMode::Connecting;
-            app.error = Some(BackendError::offline(
+            app.fail(BackendError::offline(
                 "remote_transport_unreachable",
                 "no route to host",
             ));
@@ -19805,13 +19882,17 @@ mod tests {
         });
         cx.run_until_parked();
 
+        // The failure that put the phone on that screen has already been
+        // announced and read by now, so the layer starts empty and what lands
+        // on it next is the disconnect's own doing.
+        clear_hints(cx);
+
         click_mobile_control(cx, "disconnect-unavailable-desktop");
 
         app.read_with(cx, |app, _| {
             assert_eq!(app.mode, RootMode::Pairing);
             assert!(app.backend.is_none());
             assert!(app.controller.is_none());
-            assert!(app.error.is_none());
             // Still saved and still the runtime the phone was on, so the list
             // about to paint leads with it while it probes whether it answers.
             assert_eq!(app.known_hosts.len(), 1);
@@ -19826,6 +19907,11 @@ mod tests {
             assert_eq!(stored.len(), 1);
             assert_eq!(stored[0].bundle.expected_server_id, "runtime-a");
         });
+        // The failure the phone was on that screen for is not repeated on the
+        // screen it leaves to. `click_mobile_control` already painted, so every
+        // hint queued before it is on the layer by now, and the layer is empty
+        // once the disconnect's own teardown has had its say.
+        assert_eq!(mounted_hints(cx), 0, "disconnecting announces nothing");
     }
 
     /// Settings' Disconnect is the same contract as the unavailable screen's:
@@ -20081,7 +20167,7 @@ mod tests {
         cx.update(bind_keys);
         init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
-        let (app, cx) = cx.add_window_view(|window, cx| {
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
             MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
         });
         cx.run_until_parked();
@@ -20097,9 +20183,12 @@ mod tests {
             let _ = window.draw(cx);
         });
 
+        // A failure raised while the manual panel is open is announced on the
+        // toast layer. The panel keeps its own layout whatever the failure was:
+        // the field the user is filling in is not where the answer belongs.
         app.update(cx, |app, cx| {
             app.pairing_panel = PairingPanel::Manual;
-            app.error = Some(BackendError::failed(
+            app.fail(BackendError::failed(
                 "remote_pairing_code_expired",
                 "pairing claim rejected",
             ));
@@ -20108,6 +20197,7 @@ mod tests {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
+        assert!(hint_is_shown(cx, Tone::Error));
     }
 
     /// The first screen leads with the runtimes the phone already knows, as

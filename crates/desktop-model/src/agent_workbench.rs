@@ -858,7 +858,7 @@ fn compact_process_rows(rows: Vec<TimelineRow>, items: &[&TimelineItem]) -> Vec<
         let key = row.item_ids.iter().rev().find_map(|item_id| {
             items_by_id
                 .get(item_id.as_str())
-                .and_then(|item| process_compaction_key(item))
+                .and_then(|item| item.process_compaction_key())
         });
         let Some(key) = key else {
             compacted.push(row);
@@ -881,39 +881,6 @@ fn compact_process_rows(rows: Vec<TimelineRow>, items: &[&TimelineItem]) -> Vec<
         *existing = row;
     }
     compacted
-}
-
-fn process_compaction_key(item: &TimelineItem) -> Option<String> {
-    match &item.payload {
-        TimelinePayload::ToolCall(tool) => Some(format!("tool:{}", tool.tool_call_id)),
-        TimelinePayload::Command(command) => Some(format!(
-            "command:{}:{}",
-            command.cwd.as_deref().unwrap_or_default(),
-            command.command
-        )),
-        TimelinePayload::FileOperation(operation) => {
-            Some(format!("file:{:?}:{}", operation.operation, operation.path))
-        }
-        TimelinePayload::WebSearch(search) => Some(format!("web:{}", search.query)),
-        TimelinePayload::TodoUpdate(todo) => Some(format!("todo:{}", todo.title)),
-        TimelinePayload::Collaboration(collaboration) => Some(format!(
-            "collaboration:{}",
-            item.provider_correlation_id
-                .clone()
-                .unwrap_or_else(|| format!(
-                    "{}:{}",
-                    collaboration.action,
-                    collaboration.agent_label.as_deref().unwrap_or_default()
-                ))
-        )),
-        TimelinePayload::ImageGeneration(_) => Some(format!(
-            "image:{}",
-            item.provider_correlation_id
-                .as_deref()
-                .unwrap_or_else(|| item.id.as_str())
-        )),
-        _ => None,
-    }
 }
 
 fn find_conversation_turn_conclusion<'a>(

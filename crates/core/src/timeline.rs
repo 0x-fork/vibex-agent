@@ -1098,6 +1098,87 @@ pub struct TimelineItem {
     pub payload: TimelinePayload,
 }
 
+impl TimelineItemKind {
+    /// The kinds whose items can repeat as updates of one operation.
+    ///
+    /// A provider narrates an operation as a run of items — a tool call
+    /// streams its growing input, a search its results — where each update is
+    /// its own item and only the newest one describes the operation. These are
+    /// the kinds that fold; every other kind is a single event that stands on
+    /// its own.
+    pub const FOLDABLE_REPEATED_UPDATES: [Self; 7] = [
+        Self::ToolCall,
+        Self::Command,
+        Self::FileOperation,
+        Self::WebSearch,
+        Self::TodoUpdate,
+        Self::Collaboration,
+        Self::ImageGeneration,
+    ];
+
+    /// Whether items of this kind can repeat as updates of one operation.
+    pub const fn folds_repeated_updates(self) -> bool {
+        matches!(
+            self,
+            Self::ToolCall
+                | Self::Command
+                | Self::FileOperation
+                | Self::WebSearch
+                | Self::TodoUpdate
+                | Self::Collaboration
+                | Self::ImageGeneration
+        )
+    }
+}
+
+impl TimelineItem {
+    /// The identity that makes repeated updates of one operation one row.
+    ///
+    /// The projection folds a turn's updates of one operation into a single
+    /// row, and the durable timeline can collapse them for exactly the same
+    /// reason: they are one operation, and only the newest item describes it.
+    /// Both sides read this function, so what a reader sees and what is kept
+    /// on disk cannot drift apart — a key added here is folded by both, and a
+    /// kind missing from it is folded by neither.
+    ///
+    /// `None` means the item is not a repeated update; it is its own row.
+    pub fn process_compaction_key(&self) -> Option<String> {
+        if !self.kind.folds_repeated_updates() {
+            return None;
+        }
+        match &self.payload {
+            TimelinePayload::ToolCall(tool) => Some(format!("tool:{}", tool.tool_call_id)),
+            TimelinePayload::Command(command) => Some(format!(
+                "command:{}:{}",
+                command.cwd.as_deref().unwrap_or_default(),
+                command.command
+            )),
+            TimelinePayload::FileOperation(operation) => {
+                Some(format!("file:{:?}:{}", operation.operation, operation.path))
+            }
+            TimelinePayload::WebSearch(search) => Some(format!("web:{}", search.query)),
+            TimelinePayload::TodoUpdate(todo) => Some(format!("todo:{}", todo.title)),
+            TimelinePayload::Collaboration(collaboration) => Some(format!(
+                "collaboration:{}",
+                self.provider_correlation_id
+                    .clone()
+                    .unwrap_or_else(|| format!(
+                        "{}:{}",
+                        collaboration.action,
+                        collaboration.agent_label.as_deref().unwrap_or_default()
+                    ))
+            )),
+            TimelinePayload::ImageGeneration(_) => Some(format!(
+                "image:{}",
+                self.provider_correlation_id
+                    .as_deref()
+                    .unwrap_or(self.id.as_str())
+            )),
+            _ => None,
+        }
+    }
+}
+
 impl TimelineItem {
     /// Whether this item already carries its complete payload.
     pub fn has_complete_payload(&self) -> bool {
