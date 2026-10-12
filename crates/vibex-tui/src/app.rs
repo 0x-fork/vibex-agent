@@ -845,6 +845,14 @@ pub struct App {
 
     /// Runtime catalog, kept for the runtime picker.
     pub runtime_options: Option<vibex_core::SessionRuntimeOptionCatalog>,
+    /// Whether a catalogue read is on its way.
+    ///
+    /// A read that has not answered is not a catalogue that came back empty:
+    /// the composing page names the Agent the session will be created with,
+    /// and while one is in flight it says it is loading rather than claiming
+    /// the runtime is unavailable. Every request sets this and the answer —
+    /// whether it carries a catalogue or an error — clears it.
+    pub runtime_options_reading: bool,
     /// Whether the pending catalogue read was asked for by the picker, so the
     /// overlay opens when it lands. A catalogue fetched for the composer's
     /// info line must not pop a modal over the session.
@@ -1490,6 +1498,7 @@ impl App {
             session_scroll_manual: false,
             regions: FrameRegions::default(),
             runtime_options: None,
+            runtime_options_reading: false,
             runtime_picker_pending: false,
             runtime_prefs: crate::runtime_prefs::RuntimePreferences::load(
                 options.runtime_path.as_deref(),
@@ -2004,10 +2013,11 @@ impl App {
     ///
     /// The composing page has no session to fall back to either: when it holds
     /// no choice — a catalogue that has not arrived, or one that publishes
-    /// nothing — it names the entry a creation with no choice would use, or
-    /// says the runtime is unavailable when the catalogue has none. Naming the
-    /// session behind the page here is what made the page claim codex while the
-    /// creation used the catalogue's default.
+    /// nothing — it names the entry a creation with no choice would use, says it
+    /// is loading while the read is still on its way, or says the runtime is
+    /// unavailable when the catalogue has none to name. Naming the session
+    /// behind the page here is what made the page claim codex while the creation
+    /// used the catalogue's default.
     pub fn composer_runtime_labels(&self) -> (String, String) {
         if let Some(selection) = self.page_runtime_selection() {
             if let Some(option) = self.runtime_option_for(&selection) {
@@ -2042,6 +2052,14 @@ impl App {
             .and_then(|catalog| catalog.options.first())
         {
             Some(option) => (option.agent_label.clone(), option.model_label.clone()),
+            // A catalogue that is still on its way has no entry to name yet,
+            // and "unavailable" is a claim about the runtime rather than about
+            // this read: the page says it is loading instead. A read that has
+            // answered — with a catalogue that publishes nothing — leaves the
+            // claim standing.
+            None if self.runtime_options_reading => {
+                (self.strings.loading().to_string(), String::new())
+            }
             None => (
                 self.strings.runtime_unavailable().to_string(),
                 String::new(),

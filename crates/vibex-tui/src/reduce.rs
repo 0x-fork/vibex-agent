@@ -3225,7 +3225,7 @@ impl App {
         self.sync_transcript();
         let mut effects = vec![Effect::OpenSession { session_id, ticket }];
         if self.runtime_options.is_none() && self.runtime_catalog_available() {
-            effects.push(Effect::ListRuntimeOptions);
+            effects.push(self.read_runtime_catalogue());
         }
         Outcome::effects(effects)
     }
@@ -3254,11 +3254,12 @@ impl App {
         let mut effects = vec![Effect::ListWorkspaces];
         // The page names the Agent the session will be created with and offers
         // its run options, so the catalogue is read on the way in rather than
-        // only when the switcher is opened — otherwise the page spends its
-        // first moments saying the runtime is unavailable. It is a read; a
-        // failure leaves the page naming the Agent it can.
+        // only when the switcher is opened — the page says it is loading for as
+        // short a time as the read allows, and never spends it saying the
+        // runtime is unavailable. It is a read; a failure leaves the page naming
+        // the Agent it can.
         if self.runtime_options.is_none() && self.runtime_catalog_available() {
-            effects.push(Effect::ListRuntimeOptions);
+            effects.push(self.read_runtime_catalogue());
         }
         // The list of existing sessions is read once on the way in even though
         // this page draws none of it: the client's own background work — an
@@ -3307,7 +3308,7 @@ impl App {
             };
             self.toast(Toast::warning(message.to_string()));
             return if self.runtime_options.is_none() {
-                Outcome::effects(vec![Effect::ListRuntimeOptions])
+                Outcome::effects(vec![self.read_runtime_catalogue()])
             } else {
                 Outcome::quiet()
             };
@@ -3613,6 +3614,18 @@ impl App {
             .is_available()
     }
 
+    /// Ask for the runtime catalogue, remembering that it is on its way.
+    ///
+    /// Every request goes through here so no path can ask without saying so:
+    /// the composing page names the Agent the session will be created with, and
+    /// a read that has not answered yet is not a catalogue that came back
+    /// empty. Until the answer lands — either way — the page says it is
+    /// loading rather than that the runtime is unavailable.
+    fn read_runtime_catalogue(&mut self) -> Effect {
+        self.runtime_options_reading = true;
+        Effect::ListRuntimeOptions
+    }
+
     fn open_runtime_picker(&mut self) -> Outcome {
         // A backend that cannot move a session between runtimes gets an
         // explanation rather than an overlay whose Enter does nothing.
@@ -3638,7 +3651,7 @@ impl App {
             // Opening the picker is what asked for the catalogue; the message
             // that carries it is what opens the overlay.
             self.runtime_picker_pending = true;
-            return Outcome::effects(vec![Effect::ListRuntimeOptions]);
+            return Outcome::effects(vec![self.read_runtime_catalogue()]);
         }
         self.show_runtime_picker();
         Outcome::effects(vec![])
@@ -6012,6 +6025,46 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::ListRuntimeOptions)),
             "the page read a catalogue it already had: {reopened:?}"
+        );
+    }
+
+    #[test]
+    fn the_composing_page_says_it_is_loading_until_the_catalogue_lands() {
+        // The read the page opens with is not instantaneous: the first frames
+        // are painted before the answer is. "Unavailable" would be a claim
+        // about the runtime rather than about this read, so the Agent setup
+        // line says it is loading, and the answer — a catalogue, an empty one,
+        // or a failure — is what replaces it.
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        assert!(app.runtime_options.is_none());
+
+        app.perform(Intent::NewSession);
+        assert!(
+            app.runtime_options_reading,
+            "the page asked for the catalogue without recording the read"
+        );
+        assert_eq!(
+            app.composer_runtime_labels().0,
+            app.strings.loading(),
+            "a read on its way was reported as an answer"
+        );
+
+        // The catalogue that lands names the entry a creation would use.
+        app.runtime_options = Some(run_option_catalog());
+        app.runtime_options_reading = false;
+        assert_eq!(app.composer_runtime_labels().0, "claude");
+
+        // A backend that cannot read a catalogue never asks, so a page with
+        // none in hand still says the runtime is unavailable.
+        let mut offline =
+            app_with_capabilities(vibex_backend::BackendCapabilitySnapshot::disconnected_v1());
+        offline.live = crate::app::LiveState::Ready;
+        offline.perform(Intent::NewSession);
+        assert!(!offline.runtime_options_reading);
+        assert_eq!(
+            offline.composer_runtime_labels().0,
+            offline.strings.runtime_unavailable()
         );
     }
 

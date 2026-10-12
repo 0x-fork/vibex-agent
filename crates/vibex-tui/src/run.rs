@@ -1852,6 +1852,10 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             // one opens an overlay, which is what the pending flag records.
             let picker_waiting = app.runtime_picker_pending && app.runtime_picker_is_current();
             app.runtime_picker_pending = false;
+            // The read has answered, so the composing page stops saying it is
+            // loading: a catalogue replaces it with the Agent it names, and an
+            // empty or failed one leaves the runtime's own answer standing.
+            app.runtime_options_reading = false;
             match result {
                 Ok(catalog) => {
                     let picker_open = matches!(
@@ -4318,6 +4322,47 @@ mod tests {
         assert_eq!(
             app.new_session_runtime.as_ref().unwrap().agent_id.as_str(),
             "deepseek-harness"
+        );
+    }
+
+    #[test]
+    fn a_landed_catalogue_ends_the_loading_line() {
+        use crate::action::Intent;
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        let catalog = app.runtime_options.take().unwrap();
+
+        // The page has asked and the answer is still on its way: the Agent
+        // setup line says it is loading rather than that the runtime is
+        // unavailable.
+        app.perform(Intent::NewSession);
+        assert!(app.runtime_options_reading);
+        assert_eq!(app.composer_runtime_labels().0, app.strings.loading());
+
+        // The answer names the Agent the next creation will use, and the page
+        // stops saying it is waiting.
+        apply_message(&mut app, &worker, AppMessage::RuntimeOptions(Ok(catalog))).unwrap();
+        assert!(!app.runtime_options_reading);
+        assert_eq!(app.composer_runtime_labels().0, "codex");
+
+        // A read that fails is not a read that is still coming: the page stops
+        // loading and says the runtime is unavailable.
+        app.runtime_options = None;
+        app.perform(Intent::NewSession);
+        assert!(app.runtime_options_reading);
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::RuntimeOptions(Err(vibex_backend::BackendError::failed(
+                "test",
+                "catalogue failed",
+            ))),
+        )
+        .unwrap();
+        assert!(!app.runtime_options_reading);
+        assert_eq!(
+            app.composer_runtime_labels().0,
+            app.strings.runtime_unavailable()
         );
     }
     #[test]

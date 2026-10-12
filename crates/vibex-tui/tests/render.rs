@@ -41,6 +41,37 @@ fn app(columns: u16, rows: u16) -> App {
     app
 }
 
+/// An app over a runtime that reports the operations a live one does.
+///
+/// `DisconnectedBackend::facade` publishes an offline snapshot, which is the
+/// right fixture for a page that must degrade — but it also cannot ask for a
+/// catalogue at all. A page whose first frames are the ones being asserted
+/// needs the capability snapshot a real seat hands over.
+fn capable_app(columns: u16, rows: u16) -> App {
+    let facade = DisconnectedBackend::facade();
+    facade.replace_capabilities(vibex_backend::BackendCapabilitySnapshot::desktop_native_v1());
+    let mut app = App::new(
+        facade,
+        AppOptions {
+            seat: SeatKind::Remote,
+            capability: ColorCapability {
+                mode: ColorMode::TrueColor,
+                glyphs: GlyphMode::Unicode,
+            },
+            theme_id: Some("vibex-dark".to_string()),
+            mode: vibex_ui::GpuiThemeMode::Dark,
+            locale: Locale::En,
+            sidebar_path: None,
+            runtime_path: None,
+            preferences_path: None,
+            ..Default::default()
+        },
+    );
+    app.keymap = vibex_tui::keymap::Keymap::built_in();
+    app.resize(columns, rows);
+    app
+}
+
 /// Something only the composing page draws.
 ///
 /// The page stopped naming itself — it is the prompt, and a reader who typed the
@@ -5369,6 +5400,32 @@ fn the_composing_page_never_names_the_agent_behind_it() {
     assert!(
         !screen.contains("codex"),
         "the page named the Agent behind it:\n{screen}"
+    );
+}
+
+#[test]
+fn the_composing_page_says_it_is_loading_before_the_catalogue_lands() {
+    // The page reads the catalogue as it opens and the first frames are painted
+    // before the answer is. The Agent setup row says it is loading: calling an
+    // unanswered read unavailable would be a claim about the runtime, and the
+    // reader would be told the wrong thing about a read still on its way.
+    use vibex_tui::action::Intent;
+    let mut app = capable_app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    assert!(
+        app.runtime_options.is_none(),
+        "the fixture held a catalogue"
+    );
+    app.perform(Intent::NewSession);
+
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains(app.strings.loading()),
+        "an unanswered catalogue read does not read as loading:\n{screen}"
+    );
+    assert!(
+        !screen.contains(app.strings.runtime_unavailable()),
+        "an unanswered catalogue read was called unavailable:\n{screen}"
     );
 }
 
