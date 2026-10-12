@@ -3748,7 +3748,9 @@ impl App {
         match intent {
             Intent::ConfirmOverlay | Intent::ApprovalApprove => {
                 match self.runtime_picker_rows().get(selected).cloned() {
-                    Some(RuntimePickerRow::Entry { index, .. }) => self.choose_runtime_entry(index),
+                    Some(RuntimePickerRow::Entry {
+                        index, remembered, ..
+                    }) => self.choose_runtime_entry(index, remembered),
                     // A heading is a control rather than a choice, and the one
                     // thing it controls is whether its entries are on screen.
                     Some(RuntimePickerRow::Agent {
@@ -4270,14 +4272,19 @@ impl App {
         )
     }
 
-    /// Choose one catalogue entry and put how it runs in front of the reader.
+    /// Choose one catalogue entry, and say whether how it runs is still a
+    /// question.
     ///
     /// Choosing an Agent and saying how it runs are one errand: sending the
     /// reader back to the catalogue — or out of the picker and in again — just
     /// to reach the run options costs them a second visit to a surface they are
-    /// already standing in. An entry with nothing to tune closes the picker,
+    /// already standing in. A *remembered* row is the whole answer already: it
+    /// is one of the reader's own recent choices, so `Enter` takes the run
+    /// options it carries and closes rather than asking them to read back what
+    /// they asked for. `Tab` is what still opens them, for the reader who wants
+    /// to change one. An entry with nothing to tune closes the picker too,
     /// because there is nothing left to ask.
-    fn choose_runtime_entry(&mut self, index: usize) -> Outcome {
+    fn choose_runtime_entry(&mut self, index: usize, remembered: bool) -> Outcome {
         let Some(selection) = self.selection_for_catalog_entry(index) else {
             return Outcome::quiet();
         };
@@ -4287,7 +4294,7 @@ impl App {
         // it did when it opened.
         self.fold_runtime_picker_to_current();
         let mut outcome = self.apply_picker_selection(selection);
-        if self.picker_run_options().is_empty() {
+        if remembered || self.picker_run_options().is_empty() {
             self.overlay = None;
             return outcome;
         }
@@ -4338,8 +4345,9 @@ impl App {
     /// Choose one of the pinned recent rows by its number.
     ///
     /// A digit is `Enter` on a row the reader cannot be bothered to walk to, so
-    /// it does what `Enter` does: the entry is chosen, and its run options are
-    /// what the picker shows next.
+    /// it does what `Enter` does: the row names one of the reader's own recent
+    /// choices, so the choice is applied — run options and all — and the picker
+    /// closes.
     ///
     /// Answers `None` when the digit is not one of them, which is what lets the
     /// caller fall through to the binding table: a key the reviewer did not
@@ -4349,12 +4357,20 @@ impl App {
         if position == 0 {
             return None;
         }
-        let rows = self.runtime_picker_rows();
-        let row = rows.iter().position(|row| {
-            matches!(row, RuntimePickerRow::Entry { quick: Some(quick), .. } if *quick == digit)
-        })?;
-        let index = rows[row].entry()?;
-        Some(self.choose_runtime_entry(index))
+        // The row carries both facts the choice needs, so they are read off it
+        // together rather than one of them being assumed from the other.
+        let (index, remembered) = self
+            .runtime_picker_rows()
+            .iter()
+            .find_map(|row| match row {
+                RuntimePickerRow::Entry {
+                    index,
+                    quick: Some(quick),
+                    remembered,
+                } if *quick == digit => Some((*index, *remembered)),
+                _ => None,
+            })?;
+        Some(self.choose_runtime_entry(index, remembered))
     }
 
     /// What entering the session list reads: the sessions themselves, and the
@@ -5630,6 +5646,96 @@ mod tests {
                 .and_then(|working| working.reasoning_effort.as_deref()),
             Some("high")
         );
+    }
+
+    /// The catalogue row one of the pinned recent entries is drawn on.
+    fn recent_row(app: &App, position: usize) -> usize {
+        app.runtime_picker_rows()
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                matches!(
+                    row,
+                    RuntimePickerRow::Entry {
+                        remembered: true,
+                        ..
+                    }
+                )
+            })
+            .map(|(row, _)| row)
+            .nth(position)
+            .expect("the remembered row is on the list")
+    }
+
+    /// A session on the catalogue's second entry, which ran at `High` once.
+    fn app_with_a_recent_run() -> App {
+        let mut app = app_with_run_options(Page::Agent);
+        let mut remembered = app.runtime_options.as_ref().expect("catalogue").options[1]
+            .selection
+            .clone();
+        remembered.reasoning_effort = Some("high".to_string());
+        app.remember_runtime_selection(&remembered);
+        app.show_runtime_picker();
+        app.overlay = Some(Overlay::RuntimePicker {
+            view: RuntimePickerView::Choices,
+            selected: recent_row(&app, 0),
+        });
+        app
+    }
+
+    #[test]
+    fn a_recent_row_is_chosen_with_the_run_options_it_remembers() {
+        // A pinned recent row is the reader's own answer read back to them: the
+        // Agent, the model and how it ran were chosen together, so `Enter` on it
+        // takes the whole answer and closes. Walking them through their own note
+        // to agree with it is the second visit this saves.
+        let mut app = app_with_a_recent_run();
+        let chosen = app.perform(Intent::ConfirmOverlay);
+        let selection = switched(&chosen).expect("the recent row did not switch the session");
+        assert_eq!(
+            selection.reasoning_effort.as_deref(),
+            Some("high"),
+            "the row was chosen without what it remembered"
+        );
+        assert_eq!(
+            app.overlay, None,
+            "the picker asked again for an answer it already had"
+        );
+    }
+
+    #[test]
+    fn tab_on_a_recent_row_still_opens_its_run_options() {
+        // `Enter` is a shortcut rather than a lock: the reader who does want to
+        // change a remembered value reaches it exactly where it always was, and
+        // the view opens on what the row carried rather than on the Agent's
+        // default.
+        let mut app = app_with_a_recent_run();
+        let opened = app.perform(Intent::OverlayNextField);
+        assert!(opened.effects.is_empty(), "{opened:?}");
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Options,
+                selected: 0,
+            }),
+            "`Tab` did not open the run options"
+        );
+        let options = app.picker_run_options();
+        assert_eq!(options[0].explicit.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn a_digit_takes_a_recent_row_the_way_enter_does() {
+        // A digit is `Enter` on a row the reader cannot be bothered to walk to,
+        // and the numbered rows are exactly the recent ones: the gesture is the
+        // same, so the answer must be too.
+        let mut app = app_with_a_recent_run();
+        let chosen = app
+            .quick_pick_runtime('1')
+            .expect("the digit names no remembered row");
+        let selection = switched(&chosen).expect("the digit did not switch the session");
+        assert_eq!(selection.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(app.overlay, None, "the digit stopped to ask again");
     }
 
     #[test]

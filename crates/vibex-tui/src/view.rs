@@ -6748,7 +6748,7 @@ fn runtime_picker_entry_line(
     theme: &TuiTheme,
 ) -> Line<'static> {
     let strings = app.strings;
-    let RuntimePickerRow::Entry { index, quick } = row else {
+    let RuntimePickerRow::Entry { index, quick, .. } = row else {
         return Line::from("");
     };
     let Some(option) = options.get(*index) else {

@@ -559,8 +559,12 @@ is never a column count.
   `RuntimePickerState::working` for as long as the picker is up: `Tab` seeds it
   from the catalogue row under the cursor without choosing it, and `Enter` on a
   row chooses it and moves straight to its options, so picking an Agent and
-  saying how it runs are one visit rather than two. An entry with nothing to tune
-  closes the picker instead of opening an empty view.
+  saying how it runs are one visit rather than two. The pinned recent rows are
+  the deliberate exception: a recent row *is* the reader's own answer read back
+  to them — the Agent, the model and the run options they chose together — so
+  `Enter` on one applies it and closes the picker, and `Tab` is what opens it
+  for editing. An entry with nothing to tune closes the picker instead of
+  opening an empty view.
 
   A row opens a value list whose first entry is the Agent's own default
   (`On`/`Off` for a switch, free text for a string feature, which the prompt
@@ -848,7 +852,10 @@ is never a column count.
   instead of handing the choice to the runtime's default — the draft waits, and
   the reader presses `Enter` again once the Agent has a name. Only a backend
   that publishes no catalogue at all keeps the runtime's fallback, because there
-  is nothing there for the page to name.
+  is nothing there for the page to name. A read that has not answered is not an
+  answer either: `App::runtime_options_reading` keeps the Agent setup row saying
+  it is *loading* rather than calling an unanswered read unavailable, and the
+  reply — a catalogue, an empty one, or a failure — is what replaces it.
 * **A runtime choice moves the session the page is showing, and nothing else.**
   `Ctrl+G` is a global key, so its *target* has to come from the page rather
   than from "is a session selected?": the client keeps a session selected behind

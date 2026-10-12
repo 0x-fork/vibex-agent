@@ -96,6 +96,14 @@ pub enum RuntimePickerRow {
         index: usize,
         /// The digit that chooses this row outright, when it has one.
         quick: Option<char>,
+        /// Whether how this entry runs is already decided.
+        ///
+        /// A pinned recent row is the reader's own answer read back to them:
+        /// they chose the Agent, the model and the run options together, and
+        /// the row carries all three. `Enter` on it has nothing left to ask, so
+        /// it takes the remembered options and closes; a catalogue row names an
+        /// entry, and `Tab` is what opens the options still to be said.
+        remembered: bool,
     },
 }
 
@@ -270,6 +278,8 @@ impl App {
     /// search the pinned sections come first — the shortcut past a long
     /// catalogue — and then the Agents in the order the runtime published them,
     /// each heading carrying what the reader needs to decide whether to open it.
+    /// Only the recent section's rows are marked remembered: they are the ones
+    /// that carry how they ran, which is what lets `Enter` stop there.
     pub fn runtime_picker_rows(&self) -> Vec<RuntimePickerRow> {
         let Some(catalog) = self.runtime_options.as_ref() else {
             return Vec::new();
@@ -288,11 +298,11 @@ impl App {
                     continue;
                 }
                 rows.push(self.agent_heading(&catalog.options, agent_id, label, &matches, false));
-                rows.extend(
-                    matches
-                        .into_iter()
-                        .map(|index| RuntimePickerRow::Entry { index, quick: None }),
-                );
+                rows.extend(matches.into_iter().map(|index| RuntimePickerRow::Entry {
+                    index,
+                    quick: None,
+                    remembered: false,
+                }));
             }
             return rows;
         }
@@ -303,6 +313,7 @@ impl App {
                 rows.push(RuntimePickerRow::Entry {
                     index: catalog_index(catalog, &option.selection),
                     quick: char::from_digit(position as u32 + 1, 10),
+                    remembered: true,
                 });
             }
         }
@@ -313,6 +324,7 @@ impl App {
                 rows.push(RuntimePickerRow::Entry {
                     index: catalog_index(catalog, &option.selection),
                     quick: None,
+                    remembered: false,
                 });
             }
         }
@@ -320,11 +332,11 @@ impl App {
             let folded = self.runtime_picker.folded.contains(&agent_id);
             rows.push(self.agent_heading(&catalog.options, agent_id, label, &indices, folded));
             if !folded {
-                rows.extend(
-                    indices
-                        .into_iter()
-                        .map(|index| RuntimePickerRow::Entry { index, quick: None }),
-                );
+                rows.extend(indices.into_iter().map(|index| RuntimePickerRow::Entry {
+                    index,
+                    quick: None,
+                    remembered: false,
+                }));
             }
         }
         rows
