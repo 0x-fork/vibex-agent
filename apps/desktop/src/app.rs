@@ -44519,15 +44519,13 @@ impl VibexWorkbench {
         // way a session row's status column does. A project with nothing
         // running renders no mark at all.
         //
-        // The row overhangs the list by its icon slot, so its right edge is
-        // already the list inset a session row keeps for its status column;
-        // measuring from the row's edge is what lines this text up with the
-        // session rows' trailing metadata.
+        // The row ends at the list's right edge, so the inset that keeps a
+        // session row's metadata off that edge is the same inset here.
         let project_running_session_mark = (project_running_session_count > 0).then(|| {
             div()
                 .id(format!("sidebar-project-running-{project_id_string}"))
                 .absolute()
-                .right_0()
+                .right_2()
                 .top_0()
                 .h(px(32.0))
                 .flex()
@@ -44553,10 +44551,14 @@ impl VibexWorkbench {
             .id(format!("sidebar-project-row-{project_id_string}"))
             .group(hover_group.clone())
             .relative()
-            .left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))
+            // The icon slot overhangs the list, but the row still has to end at
+            // the list's right edge: a negative start margin makes the
+            // stretched row that much wider, so the row keeps its logo overhung
+            // while its trailing edge reaches the same edge every session row's
+            // trailing metadata is measured against.
+            .ml(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))
             .h(px(32.0))
             .min_h(px(32.0))
-            .w_full()
             .min_w_0()
             .cursor_pointer()
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
@@ -44746,11 +44748,10 @@ impl VibexWorkbench {
                     h_flex()
                         .id(format!("sidebar-project-actions-{project_id_string}"))
                         .absolute()
-                        // The session action cluster keeps its icons 4px inside
-                        // the list; this row's overhang sits inside that inset,
-                        // so the same list-relative inset is negative here and
-                        // the two trailing edges line up.
-                        .right(px(4.0 + SIDEBAR_ROW_ICON_SLOT_OVERHANG))
+                        // The row reaches the list's right edge, so the same
+                        // inset the session rows' action cluster uses keeps the
+                        // two trailing edges in line.
+                        .right_1()
                         .top_1()
                         .h(px(24.0))
                         .items_center()
@@ -85394,11 +85395,11 @@ mod tests {
         assert!(project.contains("sidebar-project-running-"));
         assert!(project.contains("locale::text(\"running\", \"运行中\", \"執行中\")"));
         assert!(project.contains(".when_some(project_running_session_mark,"));
-        // The project row overhangs the list, so its trailing cluster measures
-        // from the list's right edge: the mark is flush with the row's edge and
-        // the action cluster compensates for the overhang.
-        assert!(project.contains(".right_0()"));
-        assert!(project.contains(".right(px(4.0 + SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
+        // The project row ends at the list's right edge, so its mark and action
+        // cluster keep the same trailing insets the session rows use.
+        assert!(project.contains(".right_2()"));
+        assert!(project.contains(".right_1()"));
+        assert!(project.contains(".ml(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
     }
 
     #[test]
@@ -88275,7 +88276,7 @@ mod tests {
             .expect("project row should remain inspectable");
         assert!(project_row.contains(".text_base()"));
         assert!(source.contains("const SIDEBAR_ROW_ICON_SLOT_OVERHANG: f32 = -8.0;"));
-        assert!(project_row.contains(".left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
+        assert!(project_row.contains(".ml(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
         let folder = source
             .split_once("    fn render_sidebar_folder(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
