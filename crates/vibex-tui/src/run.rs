@@ -2098,12 +2098,6 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
-        AppMessage::ProviderHealth(result) => match result {
-            Ok(health) => {
-                app.management_data.health = health;
-            }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
         AppMessage::ProviderTest(result) => match result {
             Ok(outcome) => {
                 app.overlay = Some(Overlay::TextView {
@@ -2162,10 +2156,6 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                     scroll: 0,
                 });
             }
-            Err(error) => app.toast(Toast::danger(error.message)),
-        },
-        AppMessage::Hooks(result) => match result {
-            Ok(hooks) => app.management_data.hooks = hooks,
             Err(error) => app.toast(Toast::danger(error.message)),
         },
         AppMessage::ConfigSources { module, mcp, skill } => {

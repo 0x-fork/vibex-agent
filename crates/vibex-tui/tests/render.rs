@@ -1263,8 +1263,17 @@ fn the_configuration_centre_lists_every_module_and_area() {
             "the centre lost the {needle} module:\n{screen}"
         );
     }
-    for needle in ["Agents", "Model providers", "Health"] {
+    for needle in ["Agents", "Model providers"] {
         assert!(screen.contains(needle), "the rail lost {needle}:\n{screen}");
+    }
+    // The health area left the agent module, and the hooks area left prompts:
+    // neither is a configuration the centre manages, and a rail entry that
+    // only reported state was a row the reader could not act on.
+    for needle in ["Health", "Hook"] {
+        assert!(
+            !screen.contains(needle),
+            "the rail grew {needle} back:\n{screen}"
+        );
     }
     // The device pages are not a configuration module; they are reachable
     // from the palette, and the centre must not have swallowed them.

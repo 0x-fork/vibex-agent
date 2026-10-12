@@ -226,6 +226,11 @@ impl App {
             Intent::SelectPrevious => self.move_selection(-1),
             Intent::SelectNext => self.move_selection(1),
             Intent::ScrollPageUp => {
+                if self.page == Page::Management {
+                    // The detail pane has no cursor: the page keys move it
+                    // while the record keys move the row it describes.
+                    return self.scroll_config_detail(-6);
+                }
                 if self.scrolls_session_list() {
                     let step = self.session_page_step();
                     self.scroll_session_list(-(step as i64));
@@ -235,6 +240,9 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::ScrollPageDown => {
+                if self.page == Page::Management {
+                    return self.scroll_config_detail(6);
+                }
                 if self.scrolls_session_list() {
                     let step = self.session_page_step();
                     self.scroll_session_list(step as i64);
@@ -1077,21 +1085,18 @@ impl App {
 
     /// Read whatever the area being opened needs and does not already hold.
     ///
-    /// The three list areas every module owns are read on entry; the registry
-    /// and the import areas are read on demand, because a search costs a
-    /// network round trip and a reader who never opens the registry should
-    /// never pay for one.
+    /// The list areas every module owns are read on entry; the registry and
+    /// the import areas are read on demand, because a search costs a network
+    /// round trip and a reader who never opens the registry should never pay
+    /// for one.
     fn config_section_effects(&mut self) -> Vec<Effect> {
         use crate::config_center::ConfigSection;
         match (self.config_center.module, self.config_center.section) {
             (_, ConfigSection::Agents) => vec![Effect::ListAgents],
-            (_, ConfigSection::Providers) | (_, ConfigSection::Health) => {
-                vec![Effect::ListProfiles, Effect::ListHealth]
-            }
+            (_, ConfigSection::Providers) => vec![Effect::ListProfiles],
             (_, ConfigSection::Servers) => vec![Effect::ListMcp],
             (_, ConfigSection::Installed) => vec![Effect::ListSkills],
             (_, ConfigSection::Prompts) => vec![Effect::ListPrompts],
-            (_, ConfigSection::Hooks) => vec![Effect::ListHooks],
             (module, ConfigSection::Catalog) => vec![Effect::SearchRegistry {
                 module,
                 query: self.config_center.filter.clone(),
@@ -1325,9 +1330,6 @@ impl App {
                     profile_id,
                 })
             }
-            (ConfigSection::Health, ConfigAction::Probe) => {
-                self.begin_config_mutation(crate::app::ConfigMutation::RunHealthProbes)
-            }
             (ConfigSection::Servers, ConfigAction::Toggle) => {
                 let Some(server) = self.mcp_server(key) else {
                     return Outcome::quiet();
@@ -1402,43 +1404,6 @@ impl App {
                 ));
                 Outcome::quiet()
             }
-            (ConfigSection::Hooks, ConfigAction::Toggle) => {
-                let Some(hook) = self.hook(key) else {
-                    return Outcome::quiet();
-                };
-                let status = if hook.status == vibex_core::HookStatus::Enabled {
-                    vibex_core::HookStatus::Disabled
-                } else {
-                    vibex_core::HookStatus::Enabled
-                };
-                self.begin_config_mutation(crate::app::ConfigMutation::UpdateHook(Box::new(
-                    vibex_core::HookUpdateRequest {
-                        hook_id: hook.id.clone(),
-                        display_name: None,
-                        provider_kind: None,
-                        event_kind: None,
-                        status: Some(status),
-                        install_state: None,
-                        command_preview: None,
-                        managed_marker: None,
-                        description: None,
-                    },
-                )))
-            }
-            (ConfigSection::Hooks, ConfigAction::Preview) => {
-                let Some(hook_id) = self.hook_id(key) else {
-                    return Outcome::quiet();
-                };
-                self.begin_config_mutation(crate::app::ConfigMutation::PreviewHookInstall {
-                    hook_id,
-                })
-            }
-            (ConfigSection::Hooks, ConfigAction::Delete) => {
-                let Some(hook_id) = self.hook_id(key) else {
-                    return Outcome::quiet();
-                };
-                self.begin_config_mutation(crate::app::ConfigMutation::DeleteHook { hook_id })
-            }
             (ConfigSection::Catalog, ConfigAction::Install) => self.install_registry_entry(key),
             (ConfigSection::Sources, ConfigAction::Import) => self.import_discovery(key),
             _ => Outcome::quiet(),
@@ -1461,14 +1426,6 @@ impl App {
             .map(|profile| profile.id.clone())
     }
 
-    fn hook_id(&self, key: &str) -> Option<vibex_core::HookId> {
-        self.management_data
-            .hooks
-            .iter()
-            .find(|hook| hook.id.as_str() == key)
-            .map(|hook| hook.id.clone())
-    }
-
     fn mcp_server(&self, key: &str) -> Option<&vibex_core::McpServer> {
         self.management_data
             .mcp
@@ -1488,13 +1445,6 @@ impl App {
             .prompts
             .iter()
             .find(|prompt| prompt.id.as_str() == key)
-    }
-
-    fn hook(&self, key: &str) -> Option<&vibex_core::Hook> {
-        self.management_data
-            .hooks
-            .iter()
-            .find(|hook| hook.id.as_str() == key)
     }
 
     fn profile_agent_id(&self, key: &str) -> Option<vibex_core::AgentId> {
@@ -1571,10 +1521,6 @@ impl App {
             (ConfigModule::Prompts, ConfigSection::Prompts) => {
                 let prompt = key.and_then(|key| self.prompt(key)).cloned();
                 Some(crate::config_center::prompt_form(prompt.as_ref(), strings))
-            }
-            (ConfigModule::Prompts, ConfigSection::Hooks) => {
-                let hook = key.and_then(|key| self.hook(key)).cloned();
-                Some(crate::config_center::hook_form(hook.as_ref(), strings))
             }
             (ConfigModule::Agent, ConfigSection::Providers) => {
                 let profile = key
@@ -2079,55 +2025,6 @@ impl App {
                             body,
                             description,
                             tags,
-                        },
-                    ))),
-                }
-            }
-            FormPurpose::Hook { hook_id } => {
-                if name.is_empty() {
-                    return Err(strings.config_form_error_name());
-                }
-                let provider = match form.value("provider").as_deref() {
-                    Some("claude") => vibex_core::ProviderKind::Claude,
-                    Some("codex") => vibex_core::ProviderKind::Codex,
-                    _ => vibex_core::ProviderKind::Acp,
-                };
-                let event = match form.value("event").as_deref() {
-                    Some("session_start") => vibex_core::HookEventKind::SessionStart,
-                    Some("session_stop") => vibex_core::HookEventKind::SessionStop,
-                    Some("terminal_activity") => vibex_core::HookEventKind::TerminalActivity,
-                    _ => vibex_core::HookEventKind::PermissionRequest,
-                };
-                let status = match form.value("status").as_deref() {
-                    Some("enabled") => vibex_core::HookStatus::Enabled,
-                    Some("disabled") => vibex_core::HookStatus::Disabled,
-                    _ => vibex_core::HookStatus::Draft,
-                };
-                let command = form.optional("command");
-                let description = form.optional("description");
-                match hook_id {
-                    Some(id) => Ok(ConfigMutation::UpdateHook(Box::new(
-                        vibex_core::HookUpdateRequest {
-                            hook_id: parse_config_id(id)?,
-                            display_name: Some(name),
-                            provider_kind: Some(provider),
-                            event_kind: Some(event),
-                            status: Some(status),
-                            install_state: None,
-                            command_preview: command,
-                            managed_marker: None,
-                            description,
-                        },
-                    ))),
-                    None => Ok(ConfigMutation::CreateHook(Box::new(
-                        vibex_core::HookCreateRequest {
-                            display_name: name,
-                            provider_kind: provider,
-                            event_kind: event,
-                            status,
-                            command_preview: command,
-                            managed_marker: None,
-                            description,
                         },
                     ))),
                 }
@@ -3134,7 +3031,7 @@ impl App {
     }
 
     /// Move inside the configuration centre, where the same two keys mean
-    /// four things depending on the pane the reader is in.
+    /// three things depending on the pane the reader is in.
     fn move_config_selection(&mut self, delta: i64) -> Outcome {
         use crate::config_center::ConfigZone;
         match self.config_center.zone {
@@ -3145,11 +3042,6 @@ impl App {
             ConfigZone::Rail => {
                 self.config_center.step_section(delta as isize);
                 Outcome::effects(self.config_section_effects())
-            }
-            ConfigZone::Detail => {
-                let row = self.config_center.detail_scroll as i64 + delta;
-                self.config_center.detail_scroll = row.max(0) as u16;
-                Outcome::effects(vec![])
             }
             ConfigZone::Rows => {
                 let rows = self.visible_config_rows();
@@ -3162,6 +3054,16 @@ impl App {
                 Outcome::effects(vec![])
             }
         }
+    }
+
+    /// Scroll the detail pane, which belongs to the records zone.
+    ///
+    /// It has no cursor of its own — it describes the row the cursor is on —
+    /// so the page keys move it while the record keys move the cursor.
+    fn scroll_config_detail(&mut self, delta: i64) -> Outcome {
+        let row = self.config_center.detail_scroll as i64 + delta;
+        self.config_center.detail_scroll = row.max(0) as u16;
+        Outcome::effects(vec![])
     }
 
     /// Whether the page in front of the reader is the session list, whose

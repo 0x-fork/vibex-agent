@@ -54,8 +54,6 @@ pub enum ClipboardContent {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum AppMessage {
-    /// The hooks the runtime manages.
-    Hooks(BackendResult<Vec<vibex_core::Hook>>),
     /// What a resource kind can be imported from. `mcp` and `skill` are the
     /// same answer for two different modules, so the module travels with it
     /// rather than the client guessing from which field is set.
@@ -154,7 +152,6 @@ pub enum AppMessage {
     PairingOffer(BackendResult<Box<vibex_core::RemoteCreatePairingOfferResponse>>),
     Audit(BackendResult<Vec<vibex_core::RemoteAuditRecord>>),
     Profiles(BackendResult<Vec<vibex_core::ProviderProfileSummary>>),
-    ProviderHealth(BackendResult<Vec<vibex_core::ProviderHealthSummary>>),
     ProviderTest(BackendResult<vibex_core::AgentModelProviderProfileTestResult>),
     ProviderModels(BackendResult<Vec<vibex_core::ProviderConfiguredModel>>),
     Agents(BackendResult<Vec<vibex_core::AgentSnapshotEntry>>),
@@ -544,19 +541,6 @@ impl Dispatch {
                     .await
                     .map(|_| ())
             }
-            M::RunHealthProbes => {
-                let request = MutationRequest::new(vibex_core::ProviderRunHealthProbesRequest {
-                    provider_profile_ids: None,
-                    probe_kinds: None,
-                });
-                self.facade
-                    .management()
-                    .run_health_probes(request)
-                    .await
-                    .map(|result| {
-                        self.send(AppMessage::ProviderHealth(Ok(result.summaries)));
-                    })
-            }
             M::CreateMcpServer(request) => {
                 let request = MutationRequest::new(*request);
                 self.facade
@@ -831,51 +815,6 @@ impl Dispatch {
                     .delete_prompt(request)
                     .await
                     .map(|_| ())
-            }
-            M::CreateHook(request) => {
-                let request = MutationRequest::new(*request);
-                self.facade
-                    .management()
-                    .create_hook(request)
-                    .await
-                    .map(|_| ())
-            }
-            M::UpdateHook(request) => {
-                let request = MutationRequest::new(*request);
-                self.facade
-                    .management()
-                    .update_hook(request)
-                    .await
-                    .map(|_| ())
-            }
-            M::DeleteHook { hook_id } => {
-                let request = MutationRequest::new(vibex_core::HookDeleteRequest { hook_id });
-                self.facade
-                    .management()
-                    .delete_hook(request)
-                    .await
-                    .map(|_| ())
-            }
-            M::PreviewHookInstall { hook_id } => {
-                let request = vibex_core::HookInstallPreviewRequest {
-                    hook_id,
-                    target_path: None,
-                };
-                let result = self.facade.management().preview_hook_install(request).await;
-                match result {
-                    Ok(preview) => {
-                        self.send(AppMessage::Validation {
-                            key: None,
-                            message: format!(
-                                "{} · {}",
-                                preview.target_path, preview.redacted_preview
-                            ),
-                            failed: false,
-                        });
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                }
             }
         };
         match result {
@@ -1456,10 +1395,6 @@ impl Dispatch {
                     .map(|response| response.models);
                 self.send(AppMessage::ProviderModels(result));
             }
-            Effect::ListHealth => {
-                let result = self.facade.management().health_summaries().await;
-                self.send(AppMessage::ProviderHealth(result));
-            }
             Effect::ListAgents => {
                 let request = vibex_core::AgentListRequest {
                     include_disabled: true,
@@ -1506,10 +1441,6 @@ impl Dispatch {
                 }
             }
             Effect::ConfigMutation { mutation } => self.config_mutation(mutation).await,
-            Effect::ListHooks => {
-                let result = self.facade.management().hooks().await;
-                self.send(AppMessage::Hooks(result));
-            }
             Effect::DiscoverSources { module } => {
                 use crate::config_center::ConfigModule;
                 match module {

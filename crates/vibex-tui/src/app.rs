@@ -520,13 +520,11 @@ pub struct ManagementData {
     pub audit: Vec<vibex_core::RemoteAuditRecord>,
     pub profiles: Vec<vibex_core::ProviderProfileSummary>,
     pub providers: Vec<vibex_core::ProviderProfileSummary>,
-    pub health: Vec<vibex_core::ProviderHealthSummary>,
     pub agents: Vec<vibex_core::AgentSnapshotEntry>,
     pub agent_auth: Vec<vibex_core::AgentAuthContext>,
     pub mcp: Vec<vibex_core::McpServer>,
     pub skills: Vec<vibex_core::Skill>,
     pub prompts: Vec<vibex_core::Prompt>,
-    pub hooks: Vec<vibex_core::Hook>,
     /// The last registry page the configuration centre asked for. Market
     /// results are a read like any other, so they are held beside the records
     /// rather than inside the surface that drew them.
@@ -6089,7 +6087,6 @@ pub enum ConfigMutation {
         agent_id: vibex_core::AgentId,
         profile_id: vibex_core::ProviderProfileId,
     },
-    RunHealthProbes,
     // ---- MCP ------------------------------------------------------------
     CreateMcpServer(Box<vibex_core::McpServerCreateRequest>),
     UpdateMcpServer(Box<vibex_core::McpServerUpdateRequest>),
@@ -6150,14 +6147,6 @@ pub enum ConfigMutation {
     DeletePrompt {
         prompt_id: vibex_core::PromptId,
     },
-    CreateHook(Box<vibex_core::HookCreateRequest>),
-    UpdateHook(Box<vibex_core::HookUpdateRequest>),
-    DeleteHook {
-        hook_id: vibex_core::HookId,
-    },
-    PreviewHookInstall {
-        hook_id: vibex_core::HookId,
-    },
 }
 
 impl ConfigMutation {
@@ -6172,7 +6161,6 @@ impl ConfigMutation {
             | Self::DeleteProviderProfile { profile_id, .. } => {
                 format!("provider:{}", profile_id.as_str())
             }
-            Self::RunHealthProbes => "health".to_string(),
             Self::CreateMcpServer(_) => "mcp:new".to_string(),
             Self::UpdateMcpServer(request) => format!("mcp:{}", request.mcp_server_id.as_str()),
             Self::DeleteMcpServer { server_id }
@@ -6198,11 +6186,6 @@ impl ConfigMutation {
             Self::CreatePrompt(_) => "prompt:new".to_string(),
             Self::UpdatePrompt(request) => format!("prompt:{}", request.prompt_id.as_str()),
             Self::DeletePrompt { prompt_id } => format!("prompt:{}", prompt_id.as_str()),
-            Self::CreateHook(_) => "hook:new".to_string(),
-            Self::UpdateHook(request) => format!("hook:{}", request.hook_id.as_str()),
-            Self::DeleteHook { hook_id } | Self::PreviewHookInstall { hook_id } => {
-                format!("hook:{}", hook_id.as_str())
-            }
         }
     }
 
@@ -6215,7 +6198,6 @@ impl ConfigMutation {
             Self::RollbackAgent { .. } => "agent_rollback",
             Self::UpdateProviderProfile { .. } => "provider_profile",
             Self::DeleteProviderProfile { .. } => "provider_profile_delete",
-            Self::RunHealthProbes => "health_probes",
             Self::CreateMcpServer(_) => "mcp_create",
             Self::UpdateMcpServer(_) => "mcp_update",
             Self::DeleteMcpServer { .. } => "mcp_delete",
@@ -6237,10 +6219,6 @@ impl ConfigMutation {
             Self::CreatePrompt(_) => "prompt_create",
             Self::UpdatePrompt(_) => "prompt_update",
             Self::DeletePrompt { .. } => "prompt_delete",
-            Self::CreateHook(_) => "hook_create",
-            Self::UpdateHook(_) => "hook_update",
-            Self::DeleteHook { .. } => "hook_delete",
-            Self::PreviewHookInstall { .. } => "hook_preview",
         }
     }
 }
@@ -6448,8 +6426,6 @@ pub enum Effect {
     ConfigMutation {
         mutation: ConfigMutation,
     },
-    /// Read the hooks the runtime manages.
-    ListHooks,
     /// Read the Agent sources a module's resources can be imported from.
     DiscoverSources {
         module: crate::config_center::ConfigModule,
@@ -6459,8 +6435,6 @@ pub enum Effect {
         module: crate::config_center::ConfigModule,
         query: String,
     },
-    /// Provider health summaries.
-    ListHealth,
     /// Rename a provider profile.
     RenameProfile {
         profile_id: vibex_core::ProviderProfileId,
@@ -6508,7 +6482,6 @@ impl Effect {
             Effect::ProbeAutoContinue { .. } => "auto_continue_probe",
             Effect::MutateSidebarOrganization { .. } => "sidebar_organization_mutation",
             Effect::ConfigMutation { mutation } => mutation.label(),
-            Effect::ListHooks => "hooks",
             Effect::DiscoverSources { .. } => "config_sources",
             Effect::SearchRegistry { .. } => "config_registry",
             Effect::OpenSession { .. } => "open_session",
@@ -6557,7 +6530,6 @@ impl Effect {
             Effect::CheckDrift => "drift",
             Effect::ProbeAgentRuntime { .. } => "runtime_probe",
             Effect::UpdateEntry { .. } => "update_entry",
-            Effect::ListHealth => "provider_health",
             Effect::RenameProfile { .. } => "rename_profile",
             Effect::EditExternally { .. } => "edit_external",
             Effect::Clipboard { .. } => "clipboard",

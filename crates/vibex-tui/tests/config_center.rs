@@ -443,3 +443,212 @@ fn the_default_centre_is_empty_rather_than_wrong() {
     );
     assert_eq!(ConfigCenter::default().zone, ConfigZone::Rows);
 }
+
+#[test]
+fn the_three_panes_wrap_when_the_left_and_right_keys_walk_them() {
+    let mut app = loaded(140, 40);
+    assert_eq!(app.config_center.zone, ConfigZone::Rows);
+    // The three panes are the ones the surface draws, in reading order.
+    assert_eq!(
+        ConfigZone::ALL,
+        [ConfigZone::Modules, ConfigZone::Rail, ConfigZone::Rows]
+    );
+    let mut walked = vec![app.config_center.zone];
+    for _ in 0..2 {
+        app.perform(vibex_tui::action::Intent::ConfigPaneNext);
+        walked.push(app.config_center.zone);
+    }
+    assert_eq!(
+        walked,
+        [ConfigZone::Rows, ConfigZone::Modules, ConfigZone::Rail]
+    );
+    // The fourth press is the first again: `→` never dead-ends.
+    app.perform(vibex_tui::action::Intent::ConfigPaneNext);
+    assert_eq!(app.config_center.zone, ConfigZone::Rows);
+    // And `←` walks the other way, also wrapping.
+    app.perform(vibex_tui::action::Intent::ConfigPanePrevious);
+    assert_eq!(app.config_center.zone, ConfigZone::Rail);
+    app.perform(vibex_tui::action::Intent::ConfigPanePrevious);
+    assert_eq!(app.config_center.zone, ConfigZone::Modules);
+    app.perform(vibex_tui::action::Intent::ConfigPanePrevious);
+    assert_eq!(app.config_center.zone, ConfigZone::Rows);
+}
+
+#[test]
+fn the_focused_pane_is_named_on_screen_and_the_others_are_not() {
+    let mut app = loaded(140, 40);
+    for zone in ConfigZone::ALL {
+        while app.config_center.zone != zone {
+            app.perform(vibex_tui::action::Intent::ConfigPaneNext);
+        }
+        let screen = text(&mut app, 140, 40);
+        let expected = format!("Focus · {}", zone.label(app.strings));
+        assert!(
+            screen.contains(&expected),
+            "the footer does not name the {zone:?} pane:\n{screen}"
+        );
+        // Exactly one pane is named: a second focus line would be a second
+        // answer to "where are my keys going".
+        let named = ["Focus · Modules", "Focus · Areas", "Focus · Records"]
+            .iter()
+            .filter(|needle| screen.contains(*needle))
+            .count();
+        assert_eq!(named, 1, "two panes claimed the focus:\n{screen}");
+    }
+}
+
+#[test]
+fn the_heading_row_sits_over_the_cells_it_names() {
+    use ratatui::backend::TestBackend;
+
+    let mut app = loaded(160, 40);
+    // A wide glyph in the record's own name: it is two columns wide, and a
+    // table padded by character count walks every cell after it out of line by
+    // one column per glyph.
+    if let Some(agent) = app.management_data.agents.first_mut() {
+        agent.label = "代码助手".to_string();
+    }
+    if let Some(server) = app.management_data.mcp.first_mut() {
+        server.display_name = "文件系统".to_string();
+    }
+    for (module, section) in [
+        (ConfigModule::Agent, ConfigSection::Agents),
+        (ConfigModule::Mcp, ConfigSection::Servers),
+    ] {
+        app.show_config_module(module, None);
+        let columns = vibex_tui::config_center::columns(module, section, app.strings);
+        let rows = app.config_center.visible(&app.management_data, app.strings);
+        let first = rows
+            .first()
+            .unwrap_or_else(|| panic!("{module:?} has no row"));
+
+        let backend = TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| vibex_tui::view::render(frame, &mut app))
+            .expect("frame draws");
+        let buffer = terminal.backend().buffer().clone();
+
+        // The columns are positions in the *drawn* frame, so the check is
+        // positional: a heading and the cell it names must start in the same
+        // terminal column, whatever either of them holds.
+        let heading_row = (0..buffer.area.height)
+            .find(|row| {
+                buffer_find(&buffer, *row, columns[0]).is_some()
+                    && buffer_find(&buffer, *row, "●").is_none()
+                    && buffer_find(&buffer, *row, "○").is_none()
+            })
+            .unwrap_or_else(|| panic!("no heading row for {module:?}"));
+        let record_row = (0..buffer.area.height)
+            .find(|row| {
+                buffer_find(&buffer, *row, "●").is_some()
+                    || buffer_find(&buffer, *row, "○").is_some()
+            })
+            .unwrap_or_else(|| panic!("no record row for {module:?}"));
+
+        let mut previous = 0u16;
+        for (index, column) in columns.iter().enumerate() {
+            let Some(cell) = first.cells.get(index) else {
+                panic!("{module:?} has a heading with no cell under it: {column}");
+            };
+            let heading_at = buffer_find(&buffer, heading_row, column)
+                .unwrap_or_else(|| panic!("{column} is not in the heading row"));
+            let record_at = buffer_find(&buffer, record_row, cell)
+                .unwrap_or_else(|| panic!("{cell} is not in the record row"));
+            assert_eq!(
+                heading_at, record_at,
+                "the {column} heading of {module:?} is not over its cell"
+            );
+            assert!(
+                heading_at >= previous,
+                "the headings of {module:?} are out of order"
+            );
+            previous = heading_at;
+        }
+    }
+}
+
+/// The terminal column a word starts at in one drawn row, if it is there.
+///
+/// A word is matched against the cells themselves rather than against a
+/// string built from them: a wide glyph occupies two cells and the second one
+/// is empty, so a string index would drift one column per wide glyph and the
+/// alignment this test is about would be invisible.
+fn buffer_find(buffer: &ratatui::buffer::Buffer, row: u16, needle: &str) -> Option<u16> {
+    let symbols = (0..buffer.area.width)
+        .map(|column| {
+            buffer
+                .cell((column, row))
+                .map(|cell| cell.symbol().to_string())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let wanted = needle.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
+    (0..symbols.len())
+        .find(|start| {
+            wanted
+                .iter()
+                .enumerate()
+                .all(|(offset, expected)| symbols.get(start + offset) == Some(expected))
+        })
+        .map(|start| start as u16)
+}
+
+#[test]
+fn the_agent_module_has_no_health_area_and_prompts_have_no_hooks() {
+    assert_eq!(
+        ConfigModule::Agent.sections(),
+        [ConfigSection::Agents, ConfigSection::Providers]
+    );
+    assert_eq!(ConfigModule::Prompts.sections(), [ConfigSection::Prompts]);
+    // Every section still in the model is reachable from some module, so a
+    // variant cannot outlive the area that drew it.
+    for section in [
+        ConfigSection::Agents,
+        ConfigSection::Providers,
+        ConfigSection::Servers,
+        ConfigSection::Installed,
+        ConfigSection::Catalog,
+        ConfigSection::Sources,
+        ConfigSection::Prompts,
+    ] {
+        assert!(
+            ConfigModule::ALL
+                .iter()
+                .any(|module| module.sections().contains(&section)),
+            "{section:?} is unreachable"
+        );
+    }
+    let mut app = loaded(140, 40);
+    let screen = text(&mut app, 140, 40);
+    assert!(!screen.contains("Health"), "{screen}");
+    assert!(!screen.contains("Hook"), "{screen}");
+    app.show_config_module(ConfigModule::Prompts, None);
+    let screen = text(&mut app, 140, 40);
+    assert!(!screen.contains("Hook"), "{screen}");
+}
+
+#[test]
+fn the_page_keys_scroll_the_detail_that_the_cursor_describes() {
+    let mut app = loaded(140, 40);
+    // Nothing to scroll until the pane holds more lines than it has rows, so
+    // give the highlighted record enough to overflow it.
+    if let Some(agent) = app.management_data.agents.first_mut() {
+        for index in 0..40 {
+            agent
+                .native_config_paths
+                .push(format!("/tmp/config-{index}.toml"));
+        }
+    }
+    let before = app.config_center.detail_scroll;
+    app.perform(vibex_tui::action::Intent::ScrollPageDown);
+    assert!(
+        app.config_center.detail_scroll > before,
+        "the page key did not move the detail pane"
+    );
+    // The cursor is untouched: the detail belongs to the records pane, and the
+    // page keys move the pane rather than the row it describes.
+    assert_eq!(app.config_center.cursor(1), 0);
+    app.perform(vibex_tui::action::Intent::ScrollPageUp);
+    assert_eq!(app.config_center.detail_scroll, before);
+}

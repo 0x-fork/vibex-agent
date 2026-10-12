@@ -17,8 +17,8 @@
 use std::collections::BTreeMap;
 
 use vibex_core::{
-    AgentManagedInstallStatus, AgentRuntimeStatus, HookInstallState, McpServerTransportKind,
-    PromptKind, ProviderHealthStatus, ProviderSecretSetupState, ResourceDiscoveryStatus,
+    AgentManagedInstallStatus, AgentRuntimeStatus, McpServerTransportKind, PromptKind,
+    ProviderSecretSetupState, ResourceDiscoveryStatus,
 };
 
 use crate::app::ManagementData;
@@ -62,11 +62,7 @@ impl ConfigModule {
     /// The function areas this module offers, in rail order.
     pub const fn sections(self) -> &'static [ConfigSection] {
         match self {
-            Self::Agent => &[
-                ConfigSection::Agents,
-                ConfigSection::Providers,
-                ConfigSection::Health,
-            ],
+            Self::Agent => &[ConfigSection::Agents, ConfigSection::Providers],
             Self::Mcp => &[
                 ConfigSection::Servers,
                 ConfigSection::Catalog,
@@ -77,7 +73,7 @@ impl ConfigModule {
                 ConfigSection::Catalog,
                 ConfigSection::Sources,
             ],
-            Self::Prompts => &[ConfigSection::Prompts, ConfigSection::Hooks],
+            Self::Prompts => &[ConfigSection::Prompts],
         }
     }
 
@@ -102,7 +98,6 @@ pub enum ConfigSection {
     // ---- Agent ----------------------------------------------------------
     Agents,
     Providers,
-    Health,
     // ---- MCP ------------------------------------------------------------
     Servers,
     // ---- Skills ---------------------------------------------------------
@@ -112,7 +107,6 @@ pub enum ConfigSection {
     Sources,
     // ---- Prompts --------------------------------------------------------
     Prompts,
-    Hooks,
 }
 
 impl ConfigSection {
@@ -120,13 +114,11 @@ impl ConfigSection {
         match self {
             Self::Agents => "agents",
             Self::Providers => "providers",
-            Self::Health => "health",
             Self::Servers => "servers",
             Self::Installed => "installed",
             Self::Catalog => "catalog",
             Self::Sources => "sources",
             Self::Prompts => "prompts",
-            Self::Hooks => "hooks",
         }
     }
 
@@ -134,13 +126,11 @@ impl ConfigSection {
         match self {
             Self::Agents => strings.config_section_agents(),
             Self::Providers => strings.config_section_providers(),
-            Self::Health => strings.config_section_health(),
             Self::Servers => strings.config_section_servers(),
             Self::Installed => strings.config_section_installed(),
             Self::Catalog => strings.config_section_catalog(),
             Self::Sources => strings.config_section_sources(),
             Self::Prompts => strings.config_section_prompts(),
-            Self::Hooks => strings.config_section_hooks(),
         }
     }
 
@@ -149,43 +139,50 @@ impl ConfigSection {
         match self {
             Self::Agents => strings.config_hint_agents(),
             Self::Providers => strings.config_hint_providers(),
-            Self::Health => strings.config_hint_health(),
             Self::Servers => strings.config_hint_servers(),
             Self::Installed => strings.config_hint_installed(),
             Self::Catalog => strings.config_hint_catalog(),
             Self::Sources => strings.config_hint_sources(),
             Self::Prompts => strings.config_hint_prompts(),
-            Self::Hooks => strings.config_hint_hooks(),
         }
-    }
-
-    /// Whether `Enter` on a row opens the action list rather than a detail.
-    pub const fn is_read_only(self) -> bool {
-        matches!(self, Self::Health)
     }
 }
 
-/// Which of the three panes owns the keyboard.
+/// Which of the centre's three panes owns the keyboard.
 ///
-/// `Tab` walks them in this order, and the mouse sets the zone by clicking in
-/// it, so the pane that is lit and the pane a key acts on cannot disagree.
+/// Three, because that is how many the surface is: the module tabs across the
+/// top, the area rail down the side, and the records — table and detail
+/// together — in the middle. `←`/`→` and `Tab` walk them in this order and
+/// wrap, and the mouse sets the zone by clicking in it, so the pane that is lit
+/// and the pane a key acts on cannot disagree.
+///
+/// The detail is part of the records pane rather than a fourth stop: it shows
+/// the row the cursor is on, and a focus ring on a pane that has no cursor of
+/// its own only makes the reader hunt for what they are controlling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigZone {
     Modules,
     Rail,
     Rows,
-    Detail,
 }
 
 impl ConfigZone {
-    pub const ALL: [Self; 4] = [Self::Modules, Self::Rail, Self::Rows, Self::Detail];
+    pub const ALL: [Self; 3] = [Self::Modules, Self::Rail, Self::Rows];
 
     pub const fn index(self) -> usize {
         match self {
             Self::Modules => 0,
             Self::Rail => 1,
             Self::Rows => 2,
-            Self::Detail => 3,
+        }
+    }
+
+    /// What the pane is called, for the one line that names the focus.
+    pub const fn label(self, strings: Strings) -> &'static str {
+        match self {
+            Self::Modules => strings.config_pane_modules(),
+            Self::Rail => strings.config_pane_areas(),
+            Self::Rows => strings.config_pane_records(),
         }
     }
 }
@@ -224,14 +221,11 @@ pub enum ConfigAction {
     Secret,
     Test,
     FetchModels,
-    Probe,
     Validate,
     /// Choose which Agents receive a resource.
     Matrix,
     /// Import a discovered resource.
     Import,
-    /// Read the install preview for a hook.
-    Preview,
 }
 
 impl ConfigAction {
@@ -251,11 +245,9 @@ impl ConfigAction {
             Self::Secret => strings.config_action_secret(),
             Self::Test => strings.config_action_test(),
             Self::FetchModels => strings.config_action_fetch_models(),
-            Self::Probe => strings.config_action_probe(),
             Self::Validate => strings.config_action_validate(),
             Self::Matrix => strings.config_action_matrix(),
             Self::Import => strings.config_action_import(),
-            Self::Preview => strings.config_action_preview(),
         }
     }
 
@@ -378,11 +370,6 @@ pub fn columns(
             strings.config_col_model(),
             strings.config_col_secret(),
         ],
-        ConfigSection::Health => vec![
-            strings.config_col_health(),
-            strings.config_col_checked(),
-            strings.config_col_probes(),
-        ],
         ConfigSection::Servers => vec![
             strings.config_col_transport(),
             strings.config_col_scope(),
@@ -419,11 +406,6 @@ pub fn columns(
             strings.config_col_scope(),
             strings.config_col_tags(),
             strings.config_col_updated(),
-        ],
-        ConfigSection::Hooks => vec![
-            strings.config_col_provider(),
-            strings.config_col_event(),
-            strings.config_col_install(),
         ],
     }
 }
@@ -552,7 +534,6 @@ impl ConfigCenter {
         match self.section {
             ConfigSection::Agents => agent_rows(data, strings),
             ConfigSection::Providers => provider_rows(data, strings),
-            ConfigSection::Health => health_rows(data, strings),
             ConfigSection::Servers => server_rows(data, strings),
             ConfigSection::Installed => skill_rows(data, strings),
             ConfigSection::Catalog => match self.module {
@@ -564,7 +545,6 @@ impl ConfigCenter {
                 _ => skill_source_rows(data, strings),
             },
             ConfigSection::Prompts => prompt_rows(data, strings),
-            ConfigSection::Hooks => hook_rows(data, strings),
         }
     }
 
@@ -689,29 +669,8 @@ fn runtime_tone(status: AgentRuntimeStatus) -> ConfigTone {
     }
 }
 
-fn health_tone(status: ProviderHealthStatus) -> ConfigTone {
-    match status {
-        ProviderHealthStatus::Pass => ConfigTone::Ok,
-        ProviderHealthStatus::Warn | ProviderHealthStatus::Skipped => ConfigTone::Warn,
-        ProviderHealthStatus::Fail => ConfigTone::Bad,
-        ProviderHealthStatus::Unknown | ProviderHealthStatus::Unsupported => ConfigTone::Muted,
-    }
-}
-
 /// A probe status as a word. The core enum carries no `Display` of its own,
 /// and a chip that read `ProbeFailed` would be the wire spelling, not English.
-fn health_label(status: ProviderHealthStatus) -> String {
-    match status {
-        ProviderHealthStatus::Unknown => "Unknown",
-        ProviderHealthStatus::Pass => "Pass",
-        ProviderHealthStatus::Warn => "Warn",
-        ProviderHealthStatus::Fail => "Fail",
-        ProviderHealthStatus::Skipped => "Skipped",
-        ProviderHealthStatus::Unsupported => "Unsupported",
-    }
-    .to_string()
-}
-
 fn discovery_tone(status: ResourceDiscoveryStatus) -> ConfigTone {
     match status {
         ResourceDiscoveryStatus::Importable => ConfigTone::Ok,
@@ -987,64 +946,6 @@ fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                 ConfigAction::FetchModels,
                 ConfigAction::Delete,
             ])
-        })
-        .collect()
-}
-
-fn health_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
-    data.health
-        .iter()
-        .map(|summary| {
-            let failures = summary
-                .probe_results
-                .iter()
-                .filter(|probe| {
-                    probe.status == ProviderHealthStatus::Fail
-                        || probe.status == ProviderHealthStatus::Warn
-                })
-                .count();
-            ConfigRow::new(
-                summary.profile.id.as_str().to_string(),
-                summary.profile.display_name.clone(),
-            )
-            .cell(health_label(summary.overall_status))
-            .cell(
-                summary
-                    .last_checked_at_ms
-                    .map(stamp)
-                    .unwrap_or_else(|| strings.config_never().to_string()),
-            )
-            .cell(format!("{failures}/{}", summary.probe_results.len()))
-            .chip(
-                health_label(summary.overall_status),
-                health_tone(summary.overall_status),
-            )
-            .detail(strings.config_field_id(), summary.profile.id.as_str())
-            .detail(
-                strings.config_field_agent(),
-                summary.profile.agent_id.as_str(),
-            )
-            .detail(
-                strings.config_field_model(),
-                summary.profile.default_model.clone().unwrap_or_default(),
-            )
-            .detail(
-                strings.config_field_probes(),
-                summary
-                    .probe_results
-                    .iter()
-                    .map(|probe| {
-                        format!(
-                            "{:?} · {} · {}",
-                            probe.probe_kind,
-                            health_label(probe.status),
-                            probe.summary
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )
-            .actions(&[ConfigAction::Probe, ConfigAction::Edit])
         })
         .collect()
 }
@@ -1422,55 +1323,6 @@ fn prompt_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
         .collect()
 }
 
-fn hook_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
-    data.hooks
-        .iter()
-        .map(|hook| {
-            let enabled = hook.status == vibex_core::HookStatus::Enabled;
-            ConfigRow::new(hook.id.as_str().to_string(), hook.display_name.clone())
-                .cell(hook.provider_kind.to_string())
-                .cell(format!("{:?}", hook.event_kind))
-                .cell(match hook.install_state {
-                    HookInstallState::Installed => strings.config_state_installed(),
-                    HookInstallState::NotInstalled => strings.config_state_missing(),
-                    HookInstallState::PreviewOnly => strings.config_state_preview(),
-                    HookInstallState::Stale => strings.config_state_stale(),
-                })
-                .chip(
-                    match hook.status {
-                        vibex_core::HookStatus::Enabled => strings.config_state_enabled(),
-                        vibex_core::HookStatus::Disabled => strings.config_state_disabled(),
-                        vibex_core::HookStatus::Draft => strings.config_state_draft(),
-                    },
-                    tone_for_enabled(enabled),
-                )
-                .enabled(enabled)
-                .summary(hook.description.clone().unwrap_or_default())
-                .detail(strings.config_field_id(), hook.id.as_str())
-                .detail(
-                    strings.config_field_provider(),
-                    hook.provider_kind.to_string(),
-                )
-                .detail(
-                    strings.config_field_event(),
-                    format!("{:?}", hook.event_kind),
-                )
-                .detail(
-                    strings.config_field_command(),
-                    hook.command_preview.clone().unwrap_or_default(),
-                )
-                .detail(strings.config_field_marker(), hook.managed_marker.clone())
-                .detail(strings.config_field_updated(), stamp(hook.updated_at_ms))
-                .actions(&[
-                    ConfigAction::Toggle,
-                    ConfigAction::Edit,
-                    ConfigAction::Preview,
-                    ConfigAction::Delete,
-                ])
-        })
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // forms
 // ---------------------------------------------------------------------------
@@ -1648,9 +1500,6 @@ pub enum FormPurpose {
     Prompt {
         prompt_id: Option<String>,
     },
-    Hook {
-        hook_id: Option<String>,
-    },
     ProviderProfile {
         agent_id: String,
         profile_id: String,
@@ -1672,7 +1521,6 @@ impl FormPurpose {
             Self::McpServer { server_id: None }
                 | Self::Skill { skill_id: None }
                 | Self::Prompt { prompt_id: None }
-                | Self::Hook { hook_id: None }
         )
     }
 }
@@ -2125,96 +1973,6 @@ pub fn prompt_form(prompt: Option<&vibex_core::Prompt>, strings: Strings) -> Con
         strings.config_form_edit_prompt()
     } else {
         strings.config_form_new_prompt()
-    };
-    ConfigForm::new(purpose, title, fields)
-}
-
-/// A hook editor.
-pub fn hook_form(hook: Option<&vibex_core::Hook>, strings: Strings) -> ConfigForm {
-    let provider = hook
-        .map(|hook| hook.provider_kind.to_string())
-        .unwrap_or_else(|| "acp".to_string());
-    let event = hook
-        .map(|hook| match hook.event_kind {
-            vibex_core::HookEventKind::TerminalActivity => "terminal_activity",
-            vibex_core::HookEventKind::SessionStart => "session_start",
-            vibex_core::HookEventKind::SessionStop => "session_stop",
-            vibex_core::HookEventKind::PermissionRequest => "permission_request",
-        })
-        .unwrap_or("permission_request");
-    let status = hook
-        .map(|hook| match hook.status {
-            vibex_core::HookStatus::Draft => "draft",
-            vibex_core::HookStatus::Enabled => "enabled",
-            vibex_core::HookStatus::Disabled => "disabled",
-        })
-        .unwrap_or("draft");
-    let fields = vec![
-        FormField::text(
-            "name",
-            strings.config_form_name(),
-            hook.map(|hook| hook.display_name.clone())
-                .unwrap_or_default(),
-        ),
-        FormField::choice(
-            "provider",
-            strings.config_field_provider(),
-            vec!["acp", "claude", "codex"],
-            vec!["acp", "claude", "codex"],
-            match provider.as_str() {
-                "claude" => "claude",
-                "codex" => "codex",
-                _ => "acp",
-            },
-        ),
-        FormField::choice(
-            "event",
-            strings.config_field_event(),
-            vec![
-                "permission_request",
-                "session_start",
-                "session_stop",
-                "terminal_activity",
-            ],
-            vec![
-                strings.config_event_permission(),
-                strings.config_event_session_start(),
-                strings.config_event_session_stop(),
-                strings.config_event_terminal(),
-            ],
-            event,
-        ),
-        FormField::text(
-            "command",
-            strings.config_field_command(),
-            hook.and_then(|hook| hook.command_preview.clone())
-                .unwrap_or_default(),
-        ),
-        FormField::text(
-            "description",
-            strings.config_field_description(),
-            hook.and_then(|hook| hook.description.clone())
-                .unwrap_or_default(),
-        ),
-        FormField::choice(
-            "status",
-            strings.config_col_state(),
-            vec!["draft", "enabled", "disabled"],
-            vec![
-                strings.config_state_draft(),
-                strings.config_state_enabled(),
-                strings.config_state_disabled(),
-            ],
-            status,
-        ),
-    ];
-    let purpose = FormPurpose::Hook {
-        hook_id: hook.map(|hook| hook.id.as_str().to_string()),
-    };
-    let title = if hook.is_some() {
-        strings.config_form_edit_hook()
-    } else {
-        strings.config_form_new_hook()
     };
     ConfigForm::new(purpose, title, fields)
 }

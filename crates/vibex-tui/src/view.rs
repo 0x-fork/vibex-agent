@@ -3876,11 +3876,16 @@ fn strings_of(_app: &App) -> Strings {
 
 /// The configuration centre: modules, areas, records and the detail pane.
 ///
-/// Four bands rather than one, because the centre is a hierarchy and a flat
+/// Three bands rather than one, because the centre is a hierarchy and a flat
 /// list cannot show one: the tab strip is the module, the rail is the function
-/// area inside it, the table is the area's records, and the pane under it is
-/// the highlighted record. Every band is drawn from the same cursor the keys
-/// move, so the pane that is lit and the pane a key acts on cannot disagree.
+/// area inside it, and the records pane holds both the table and the detail
+/// under it. Every band is drawn from the same cursor the keys move, so the
+/// pane that is lit and the pane a key acts on cannot disagree.
+///
+/// Which pane is lit is drawn three times over, because one cue is a cue the
+/// reader misses: the focused pane's own edge takes the accent colour, its
+/// selected row wears the focus bar, and the footer names it. `←`/`→` walk the
+/// three and wrap.
 fn render_config_center(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3904,10 +3909,20 @@ fn render_config_center(
         ])
         .split(area);
     render_config_tabs(frame, bands[0], app, theme, strings);
+    // The rule under the tabs is the tab strip's own bottom edge: it takes the
+    // accent colour while the modules own the keyboard, so the strip reads as
+    // the pane that is lit rather than as page chrome.
+    let modules_focused = app.config_center.zone == crate::config_center::ConfigZone::Modules;
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "─".repeat(usize::from(bands[1].width)),
-            Style::default().fg(theme.roles.gray_dim),
+            if modules_focused { "━" } else { "─" }.repeat(usize::from(bands[1].width)),
+            if modules_focused {
+                Style::default()
+                    .fg(theme.roles.accent_user)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.roles.gray_dim)
+            },
         ))),
         bands[1],
     );
@@ -3921,9 +3936,23 @@ fn render_config_center(
         .split(bands[2]);
     render_config_rail(frame, body[0], app, theme, strings);
     // A rule between the rail and the records, so the two panes read as two
-    // panes rather than as one wide table with a stray column.
+    // panes rather than as one wide table with a stray column. It is the
+    // rail's own right edge, so it takes the accent colour — and a heavier
+    // glyph — while the areas own the keyboard.
+    let rail_focused = app.config_center.zone == crate::config_center::ConfigZone::Rail;
     let rule = (body[1].y..body[1].bottom())
-        .map(|_| Line::from(Span::styled("│", Style::default().fg(theme.roles.gray_dim))))
+        .map(|_| {
+            Line::from(Span::styled(
+                if rail_focused { "┃" } else { "│" },
+                if rail_focused {
+                    Style::default()
+                        .fg(theme.roles.accent_user)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.roles.gray_dim)
+                },
+            ))
+        })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(rule), body[1]);
     render_config_records(frame, body[2], app, &rows, theme, strings);
@@ -3936,7 +3965,7 @@ fn rail_width(width: u16) -> u16 {
 }
 
 /// The module strip: four tabs, drawn as pills, clickable and switchable with
-/// `[`/`]` or `Tab` from the module zone.
+/// `[`/`]` or `←`/`→` from the module zone.
 fn render_config_tabs(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3944,9 +3973,14 @@ fn render_config_tabs(
     theme: &TuiTheme,
     strings: Strings,
 ) {
-    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    let mut used = 1u16;
     let focused = app.config_center.zone == crate::config_center::ConfigZone::Modules;
+    // The focus bar in the strip's first column, the same mark every pane
+    // draws on its own leading edge.
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(
+        if focused { "▌" } else { " " },
+        Style::default().fg(theme.roles.accent_user),
+    )];
+    let mut used = 1u16;
     for module in crate::config_center::ConfigModule::ALL {
         let active = module == app.config_center.module;
         let label = format!(" {} ", module.label(strings));
@@ -3955,12 +3989,17 @@ fn render_config_tabs(
             break;
         }
         let style = if active {
+            // The current module is a filled chip even when the strip is not
+            // focused: it says where the reader is, which is worth knowing
+            // whatever owns the keyboard.
             Style::default()
                 .fg(theme.roles.background)
                 .bg(theme.roles.accent_user)
                 .add_modifier(Modifier::BOLD)
         } else if focused {
-            Style::default().fg(theme.roles.gray_bright)
+            Style::default()
+                .fg(theme.roles.foreground)
+                .bg(theme.roles.surface)
         } else {
             Style::default().fg(theme.roles.gray)
         };
@@ -4006,21 +4045,33 @@ fn render_config_rail(
     let counts = app.config_center.counts(&app.management_data, strings);
     let focused = app.config_center.zone == crate::config_center::ConfigZone::Rail;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(sections.len() + 2);
+    // The heading is the rail's title, so it brightens with the pane: a rail
+    // that is lit only on its rows is a rail whose selection can be missed.
     lines.push(Line::from(Span::styled(
         format!(" {}", strings.config_section_label().to_uppercase()),
-        Style::default()
-            .fg(theme.roles.gray_dim)
-            .add_modifier(Modifier::BOLD),
+        if focused {
+            Style::default()
+                .fg(theme.roles.accent_user)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme.roles.gray_dim)
+                .add_modifier(Modifier::BOLD)
+        },
     )));
     for (index, section) in sections.iter().enumerate() {
         let active = *section == app.config_center.section;
-        let marker = if active { "▸" } else { " " };
         let count = counts.get(index).copied().unwrap_or(0);
-        let label = format!("{marker} {}", section.label(strings));
+        let label = section.label(strings);
         let count_label = format!("{count} ");
+        // The focus bar is the leading column; the pointer follows it, so the
+        // two marks read as one row rather than as two.
+        let bar = if focused { "▌" } else { " " };
+        let marker = if active { "▸" } else { " " };
+        let body = format!("{marker} {label}");
         let width = usize::from(area.width).saturating_sub(3);
-        let label = truncate_to_width(
-            &label,
+        let body = truncate_to_width(
+            &body,
             width.saturating_sub(display_width(&count_label)),
             "…",
         );
@@ -4029,14 +4080,19 @@ fn render_config_rail(
                 .fg(theme.roles.foreground)
                 .bg(theme.roles.surface_highlight)
                 .add_modifier(Modifier::BOLD)
+        } else if focused {
+            Style::default().fg(theme.roles.foreground)
         } else {
             Style::default().fg(theme.roles.text_secondary)
         };
         let mut spans = vec![
-            Span::styled(" ", Style::default()),
-            Span::styled(label, style),
+            Span::styled(
+                bar.to_string(),
+                Style::default().fg(theme.roles.accent_user),
+            ),
+            Span::styled(body, style),
         ];
-        let used = 2 + display_width(&spans[1].content);
+        let used = 1 + display_width(&spans[1].content);
         if used + display_width(&count_label) < usize::from(area.width) {
             spans.push(Span::styled(
                 " ".repeat(usize::from(area.width) - used - display_width(&count_label)),
@@ -4108,10 +4164,20 @@ fn render_config_records(
         .split(area);
     render_config_table(frame, bands[0], app, rows, theme, strings);
     if detail_rows > 0 {
+        // The table's own bottom edge: it takes the accent while the records
+        // own the keyboard, which is what makes the table-and-detail column
+        // read as one lit pane.
+        let focused = app.config_center.zone == crate::config_center::ConfigZone::Rows;
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "─".repeat(usize::from(bands[1].width)),
-                Style::default().fg(theme.roles.gray_dim),
+                if focused { "━" } else { "─" }.repeat(usize::from(bands[1].width)),
+                if focused {
+                    Style::default()
+                        .fg(theme.roles.accent_user)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.roles.gray_dim)
+                },
             ))),
             Rect {
                 height: 1,
@@ -4172,23 +4238,36 @@ fn render_config_table(
     // cells use so a heading sits over its own column.
     let columns =
         crate::config_center::columns(app.config_center.module, app.config_center.section, strings);
-    let widths = column_widths(area.width, &columns);
+    let layout = column_widths(area.width, &columns);
     if lines.len() < usize::from(area.height) {
         let mut spans = vec![
-            Span::styled("   ", Style::default()),
-            // The status column has no heading of its own: its cells are
-            // chips, and a chip already says what it is.
+            // The focus bar, the status mark and a space — the same prefix the
+            // cells carry, so every heading starts where its cells start.
+            Span::styled(" ".repeat(TABLE_PREFIX), Style::default()),
+            // The record's own name column has no heading: the module and the
+            // area already say what the table is of. Its width is still spent,
+            // or every heading after it would sit under the wrong cell.
             Span::styled(
-                format!("{:<width$}", "", width = CHIP_COLUMN),
+                config_cell("", layout.title),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            // The status column is the same: its cells are chips, and a chip
+            // already says what it is.
+            Span::styled(
+                config_cell("", CHIP_COLUMN),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ];
         for (index, column) in columns.iter().enumerate() {
-            let width = widths.get(index).copied().unwrap_or(0);
+            let width = layout.cell(index);
             spans.push(Span::styled(
-                format!("{:<width$}", truncate_to_width(column, width, "…")),
+                config_cell(column, width),
                 Style::default()
-                    .fg(theme.roles.gray_dim)
+                    .fg(if focused {
+                        theme.roles.text_secondary
+                    } else {
+                        theme.roles.gray_dim
+                    })
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -4198,7 +4277,8 @@ fn render_config_table(
     if rows.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(
-                "   {}",
+                "{}  {}",
+                " ".repeat(TABLE_PREFIX),
                 if app.config_center.filter.trim().is_empty() {
                     strings.config_empty()
                 } else {
@@ -4231,39 +4311,33 @@ fn render_config_table(
         };
         let marker = if row.enabled { "●" } else { "○" };
         let mut spans = vec![
+            // The focus bar marks the row the keys act on: accent while the
+            // records pane owns the keyboard, a plain space while it does not.
+            // The row keeps its selection background either way, so the cursor
+            // never disappears — it stops being lit.
             Span::styled(
-                format!(" {marker} "),
+                if focused && is_selected { "▌" } else { " " },
+                Style::default().fg(theme.roles.accent_user),
+            ),
+            Span::styled(
+                format!(" {marker}"),
                 if row.enabled {
                     Style::default().fg(theme.roles.success)
                 } else {
                     Style::default().fg(theme.roles.gray_dim)
                 },
             ),
+            Span::styled(config_cell(&row.title, layout.title), base),
+            // The status column is always emitted, chip or not: a row that
+            // skipped it would slide its cells under the wrong headings.
             Span::styled(
-                format!(
-                    "{:<width$}",
-                    truncate_to_width(&row.title, widths[0], "…"),
-                    width = widths[0]
-                ),
-                base,
+                config_cell(&row.chip, CHIP_COLUMN),
+                chip_style(row.tone, theme).patch(base),
             ),
         ];
-        if !row.chip.is_empty() {
-            spans.push(Span::styled(
-                format!(
-                    "{:<width$}",
-                    truncate_to_width(&row.chip, CHIP_COLUMN, "…"),
-                    width = CHIP_COLUMN
-                ),
-                chip_style(row.tone, theme).patch(base),
-            ));
-        }
         for (column, cell) in row.cells.iter().enumerate() {
-            let width = widths.get(column + 1).copied().unwrap_or(10);
-            spans.push(Span::styled(
-                format!("{:<width$}", truncate_to_width(cell, width, "…")),
-                base,
-            ));
+            let width = layout.cell(column);
+            spans.push(Span::styled(config_cell(cell, width), base));
         }
         lines.push(Line::from(spans));
     }
@@ -4282,22 +4356,63 @@ fn render_config_table(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// The columns the table lays out, in display columns.
+///
+/// `headings` is what the header draws and `cells` is what each row draws;
+/// both are the same list, and one width is measured per column, so a heading
+/// sits over the cells it names.
+struct TableLayout {
+    title: usize,
+    /// One width per entry of [`crate::config_center::columns`].
+    cells: Vec<usize>,
+}
+
+impl TableLayout {
+    fn cell(&self, index: usize) -> usize {
+        self.cells.get(index).copied().unwrap_or(self.title)
+    }
+}
+
+/// One cell of the table: truncated to its column and padded to it.
+///
+/// Padding counts display columns, not characters, because `format!("{:<n$}")`
+/// pads by `char` — a CJK label is two columns wide and would leave the cells
+/// under it one column short each, which is exactly the drift a table cannot
+/// have.
+fn config_cell(text: &str, width: usize) -> String {
+    pad_to_width(&truncate_to_width(text, width, "…"), width)
+}
+
 /// The width of the status column, which sits between the title and the cells.
 const CHIP_COLUMN: usize = 12;
 
-/// The column widths: the title takes what is left after the fixed columns.
-fn column_widths(width: u16, columns: &[&'static str]) -> Vec<usize> {
+/// What the table's leading columns cost: the focus bar, the status mark and
+/// the space before the title. The status chip is a column of its own, counted
+/// separately in [`column_widths`].
+const TABLE_PREFIX: usize = 3;
+
+/// Share the row out: the title takes a third of what is left, and every named
+/// column takes an equal share of the rest, so no column is squeezed to the
+/// point where its heading is the only thing that fits.
+fn column_widths(width: u16, columns: &[&'static str]) -> TableLayout {
     let total = usize::from(width);
+    let available = total.saturating_sub(TABLE_PREFIX + CHIP_COLUMN);
     if columns.is_empty() {
-        return Vec::new();
+        return TableLayout {
+            title: available,
+            cells: Vec::new(),
+        };
     }
-    // The status chip owns a fixed column of its own, between the title and
-    // the cells, so the title's share is what is left after everything else.
-    let fixed = 3 + CHIP_COLUMN + (columns.len().saturating_sub(1)) * 14;
-    let title = total.saturating_sub(fixed).clamp(12, 48);
-    let mut widths = vec![title];
-    widths.extend(std::iter::repeat_n(14, columns.len().saturating_sub(1)));
-    widths
+    // The title names the record, so it keeps the widest fixed share; the rest
+    // is split evenly. Both have a floor, because a column narrower than its
+    // own heading is a column the reader cannot read.
+    let title = (available / 3).clamp(12, 36);
+    let each = available.saturating_sub(title) / columns.len();
+    let each = each.max(8);
+    TableLayout {
+        title,
+        cells: vec![each; columns.len()],
+    }
 }
 
 fn chip_style(tone: crate::config_center::ConfigTone, theme: &TuiTheme) -> Style {
@@ -4323,16 +4438,22 @@ fn render_config_detail(
     let Some(row) = rows.get(app.config_center.cursor(rows.len())) else {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!(" {}", strings.config_no_selection()),
+                format!("  {}", strings.config_no_selection()),
                 Style::default().fg(theme.roles.gray_dim),
             ))),
             area,
         );
         return;
     };
+    // The detail belongs to the records pane, so its title carries the same
+    // focus bar: the pane is lit across both halves or not at all.
+    let focused = app.config_center.zone == crate::config_center::ConfigZone::Rows;
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled(" ", Style::default()),
+        Span::styled(
+            if focused { "▌" } else { " " },
+            Style::default().fg(theme.roles.accent_user),
+        ),
         Span::styled(
             row.title.clone(),
             Style::default()
@@ -4397,8 +4518,8 @@ fn render_config_detail(
     frame.render_widget(Paragraph::new(visible), area);
 }
 
-/// The footer: what the highlighted record can do, as buttons the mouse can
-/// press, plus whatever the last write had to say.
+/// The footer: which pane owns the keyboard, what the highlighted record can
+/// do as buttons the mouse can press, and whatever the last write had to say.
 fn render_config_footer(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -4408,8 +4529,19 @@ fn render_config_footer(
     strings: Strings,
 ) {
     let row = rows.get(app.config_center.cursor(rows.len()));
-    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    let mut used = 1u16;
+    // The focused pane is named here as well as lit above: the reader who has
+    // lost track of where the keys are going reads it rather than deducing it
+    // from a colour.
+    let focused = app.config_center.zone;
+    let badge = format!(" {} · {} ", strings.config_focus(), focused.label(strings));
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(
+        badge.clone(),
+        Style::default()
+            .fg(theme.roles.background)
+            .bg(theme.roles.accent_user)
+            .add_modifier(Modifier::BOLD),
+    )];
+    let mut used = display_width(&badge) as u16;
     if let Some(row) = row {
         for action in &row.actions {
             let label = format!(" {} ", action.label(strings));
