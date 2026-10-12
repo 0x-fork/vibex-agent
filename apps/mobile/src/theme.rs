@@ -511,10 +511,6 @@ pub fn bg_popover() -> Hsla {
     tone("popover")
 }
 
-pub fn bg_composer() -> Hsla {
-    tone("composer-surface")
-}
-
 pub fn text_primary() -> Hsla {
     tone("foreground")
 }

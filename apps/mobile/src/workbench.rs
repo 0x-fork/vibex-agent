@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use gpui::{
     Context, Entity, FontWeight, IntoElement, MouseButton, MouseUpEvent, ParentElement as _,
-    Render, ScrollDelta, ScrollWheelEvent, Styled as _, Task, WeakEntity, Window, canvas, div,
-    prelude::*, px, rgb, svg,
+    Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, WeakEntity, Window,
+    canvas, div, prelude::*, px, relative, rgb, svg,
 };
 use vibex_backend::{
     BackendError, BackendOperation, BackendResult, MutationRequest, TerminalBackend as _,
@@ -53,6 +53,15 @@ pub enum WorkbenchSurface {
     Files,
     Git,
     Terminal,
+}
+
+/// Which side of a unified diff a line belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+    Hunk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +168,15 @@ pub struct MobileWorkbench {
     /// theirs to make first.
     file_discard_prompt: Option<String>,
     git_diff: Option<GitDiffResponse>,
+    /// The scroll handle for the diff sheet, so a freshly opened diff starts at
+    /// its first line instead of wherever the tree behind it was scrolled to.
+    git_diff_scroll: ScrollHandle,
+    /// Paths awaiting confirmation before a rollback. The desktop confirms this
+    /// too; the phone used to discard local edits on a single tap.
+    git_revert_confirmation: Option<Vec<String>>,
+    /// The last status failure. A failed load used to keep the loading label on
+    /// screen forever, next to "No repository", with no way to tell them apart.
+    git_status_error: Option<String>,
     /// One commit opened from the Commits list takes over the Git surface as
     /// its own full-screen view with a back button.
     git_commit_detail: Option<GitCommitDetail>,
@@ -226,6 +244,9 @@ impl MobileWorkbench {
             file_editor_path: None,
             file_discard_prompt: None,
             git_diff: None,
+            git_diff_scroll: ScrollHandle::new(),
+            git_revert_confirmation: None,
+            git_status_error: None,
             git_commit_detail: None,
             git_commit_detail_loading: false,
             git_commit_confirmation: false,
@@ -269,6 +290,8 @@ impl MobileWorkbench {
         self.file_editor_path = None;
         self.file_screen_open = false;
         self.git_diff = None;
+        self.git_revert_confirmation = None;
+        self.git_status_error = None;
         self.git_commit_detail = None;
         self.git_commit_detail_loading = false;
         self.terminal_render_sequence = 0;
@@ -602,8 +625,19 @@ impl MobileWorkbench {
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
+                let failed = outcome.is_err();
                 this.git.apply_status(&ticket, outcome);
                 this.error = this.git.state.last_error.clone();
+                this.git_status_error = failed
+                    .then(|| {
+                        this.error
+                            .as_ref()
+                            .map(|error| error.message.clone())
+                            .unwrap_or_else(|| {
+                                locale::common("Could not read the repository").to_string()
+                            })
+                    })
+                    .filter(|_| this.git.state.model.status.is_none());
                 if let Some(status) = this.git.state.model.status.as_ref() {
                     this.files.state.tree.set_git_changes(&status.changes);
                 }
@@ -888,7 +922,7 @@ impl MobileWorkbench {
             || !self
                 .git
                 .capabilities()
-                .supports(BackendOperation::GitStatus)
+                .supports(BackendOperation::GitRemoteAction)
             || !self.can_mutate_git()
         {
             return;
@@ -924,18 +958,43 @@ impl MobileWorkbench {
         cx.notify();
     }
 
+    /// Asks before discarding local edits. The confirmation names the file
+    /// count, because a rollback is the one Git action here that destroys work
+    /// the user cannot recover from the phone.
     fn revert_selected_git(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.busy
             || !self
                 .git
                 .capabilities()
-                .supports(BackendOperation::GitStatus)
+                .supports(BackendOperation::GitRevert)
             || !self.can_mutate_git()
         {
             return;
         }
         let paths = self.git.state.model.selected_change_paths();
         if paths.is_empty() {
+            return;
+        }
+        self.git_revert_confirmation = Some(paths);
+        cx.notify();
+    }
+
+    fn cancel_revert_git(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.git_revert_confirmation = None;
+        cx.notify();
+    }
+
+    fn confirm_revert_git(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(paths) = self.git_revert_confirmation.take() else {
+            return;
+        };
+        if self.busy
+            || !self
+                .git
+                .capabilities()
+                .supports(BackendOperation::GitRevert)
+            || !self.can_mutate_git()
+        {
             return;
         }
         let request = GitStageRequest {
@@ -980,7 +1039,11 @@ impl MobileWorkbench {
             let display = outcome.as_ref().ok().cloned();
             let _ = entity.update(cx, |this, cx| {
                 this.git.apply_diff(&ticket, outcome);
+                let opened = display.is_some();
                 this.git_diff = display;
+                if opened {
+                    this.git_diff_scroll.set_offset(gpui::Point::default());
+                }
                 this.error = this.git.state.last_error.clone();
                 cx.notify();
             });
@@ -1026,35 +1089,6 @@ impl MobileWorkbench {
     ) {
         self.git_commit_detail = None;
         self.git_commit_detail_loading = false;
-        cx.notify();
-    }
-
-    fn mutate_git_path(&mut self, path: String, stage: bool, cx: &mut Context<Self>) {
-        let operation = if stage {
-            self.git.begin_stage(vec![path])
-        } else {
-            self.git.begin_unstage(vec![path])
-        };
-        let operation = match operation {
-            Ok(operation) => operation,
-            Err(error) => {
-                self.error = Some(error);
-                cx.notify();
-                return;
-            }
-        };
-        self.busy = true;
-        let runner = gpui_tokio::Tokio::spawn(cx, self.git.run_paths_mutation(operation.clone()));
-        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let outcome = flatten_join(runner.await);
-            let _ = entity.update(cx, |this, cx| {
-                this.git.apply_paths_mutation(&operation, outcome);
-                this.busy = false;
-                this.error = this.git.state.last_error.clone();
-                cx.notify();
-            });
-        });
-        self.tasks.push(task);
         cx.notify();
     }
 
@@ -1753,7 +1787,14 @@ impl MobileWorkbench {
             .files
             .capabilities()
             .supports(BackendOperation::FileWrite);
-        let path = view.selected_path.clone().unwrap_or_default();
+        // The buffer's own path, not the row that happens to be selected: while
+        // a read is in flight those differ, and the header used to announce the
+        // new file over the old file's unsaved content.
+        let path = self
+            .file_editor_path
+            .clone()
+            .or_else(|| view.selected_path.clone())
+            .unwrap_or_default();
         let file_name = path.rsplit('/').next().unwrap_or(&path).to_string();
         let icon = file_icon_descriptor(&file_name, FileEntryKind::File);
 
@@ -2008,6 +2049,41 @@ impl MobileWorkbench {
                         ),
                     ),
             )
+            // The path bar: the tree ellipsises long names, so the full path
+            // of the open file lives here and scrolls instead of truncating.
+            .child(
+                div()
+                    .id("mobile-files-path-bar")
+                    .flex_shrink_0()
+                    .h(px(32.0))
+                    .px(px(theme::SPACING_MD))
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
+                    .overflow_x_scroll()
+                    .restrict_scroll_to_axis()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .child(
+                        svg()
+                            .path("icons/folder-open.svg")
+                            .size(px(12.0))
+                            .flex_shrink_0()
+                            .text_color(theme::text_muted()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .whitespace_nowrap()
+                            .font_family("IBM Plex Mono")
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_muted())
+                            .child(selected_path.clone().unwrap_or_else(|| {
+                                locale::text("Workspace root", "工作区根目录", "工作區根目錄")
+                                    .to_string()
+                            })),
+                    ),
+            )
             .child(
                 div()
                     .id("mobile-files-scroll")
@@ -2197,7 +2273,9 @@ impl MobileWorkbench {
         div()
             .id(format!("file:{}", row.id))
             .relative()
-            .min_h(px(30.0))
+            // A file row is a touch target like every other list row; 30px was
+            // below the platform minimum and made the tree feel cramped.
+            .min_h(px(theme::TOUCH_TARGET))
             .px_2()
             .flex()
             .items_center()
@@ -2212,8 +2290,8 @@ impl MobileWorkbench {
             .child(div().w(px(row.depth as f32 * 20.0)).flex_none())
             .child(
                 div()
-                    .w(px(14.0))
-                    .h(px(20.0))
+                    .w(px(18.0))
+                    .h(px(24.0))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -2313,16 +2391,25 @@ impl MobileWorkbench {
             .capabilities()
             .supports(BackendOperation::GitCommit)
             && self.can_mutate_git();
+        // Revert and the remote actions are separate capabilities. Gating all
+        // three on `GitStatus` showed a live button on a runtime that would
+        // fail the mutation when it was pressed.
         let can_remote = self
             .git
             .capabilities()
-            .supports(BackendOperation::GitStatus)
+            .supports(BackendOperation::GitRemoteAction)
+            && self.can_mutate_git();
+        let can_revert = self
+            .git
+            .capabilities()
+            .supports(BackendOperation::GitRevert)
             && self.can_mutate_git();
         let has_selected_paths = self.git.state.model.selected_path_count() > 0;
-        let can_revert = can_remote && has_selected_paths;
+        let can_revert = can_revert && has_selected_paths;
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .child(
@@ -2550,7 +2637,14 @@ impl MobileWorkbench {
                                         .as_ref()
                                         .and_then(|status| status.branch.clone())
                                         .unwrap_or_else(|| {
-                                            locale::common("No repository").to_string()
+                                            if self.git_status_error.is_some() {
+                                                locale::common("Could not read the repository")
+                                                    .to_string()
+                                            } else if status_loading {
+                                                locale::common("Loading…").to_string()
+                                            } else {
+                                                locale::common("No repository").to_string()
+                                            }
                                         }),
                                 ),
                         )
@@ -2559,7 +2653,10 @@ impl MobileWorkbench {
                                 .font_family("monospace")
                                 .text_size(theme::font_micro())
                                 .text_color(theme::text_muted())
-                                .child(format!("{} files", change_count)),
+                                .child(
+                                    locale::text("{} files", "{} 个文件", "{} 個檔案")
+                                        .replace("{}", &change_count.to_string()),
+                                ),
                         )
                         .child(
                             div()
@@ -2594,28 +2691,62 @@ impl MobileWorkbench {
                     .restrict_scroll_to_axis()
                     .when(changes_active, |body| {
                         let row_count = self.git.state.model.change_tree_row_count();
-                        body.when(row_count == 0, |body| {
-                            body.child(empty_label(if status_loading {
-                                "Loading repository status..."
-                            } else {
-                                "Working tree is clean"
-                            }))
-                        })
-                        .children((0..row_count).filter_map(|index| {
-                            self.git
-                                .state
-                                .model
-                                .change_tree_row(index)
-                                .map(|(row, change)| {
-                                    self.render_git_tree_row_mobile(
-                                        row.clone(),
-                                        change.cloned(),
-                                        cx,
+                        body.when_some(self.git_status_error.clone(), |body, message| {
+                            body.child(
+                                div()
+                                    .m(px(theme::SPACING_MD))
+                                    .p(px(theme::SPACING_MD))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .border_1()
+                                    .border_color(theme::accent_red())
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(theme::SPACING_SM))
+                                    .child(
+                                        div()
+                                            .text_size(theme::font_caption())
+                                            .text_color(theme::accent_red())
+                                            .child(locale::common("Could not read the repository")),
                                     )
-                                })
-                        }))
-                        .when_some(self.git_diff.clone(), |body, diff| {
-                            body.child(self.render_git_diff(diff))
+                                    .child(
+                                        div()
+                                            .text_size(theme::font_micro())
+                                            .text_color(theme::text_muted())
+                                            .child(message),
+                                    )
+                                    .child(
+                                        action_button("git-retry-status", locale::common("Retry"))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.git_status_error = None;
+                                                    this.refresh_git(cx);
+                                                }),
+                                            ),
+                                    ),
+                            )
+                        })
+                        .when(self.git_status_error.is_none(), |body| {
+                            body.when(row_count == 0, |body| {
+                                body.child(empty_label(if status_loading {
+                                    locale::common("Loading repository status...")
+                                } else {
+                                    locale::common("Working tree is clean")
+                                }))
+                            })
+                            .children((0..row_count).filter_map(|index| {
+                                self.git
+                                    .state
+                                    .model
+                                    .change_tree_row(index)
+                                    .map(|(row, change)| {
+                                        self.render_git_tree_row_mobile(
+                                            row.clone(),
+                                            change.cloned(),
+                                            cx,
+                                        )
+                                    })
+                            }))
                         })
                     })
                     .when(history_active, |body| {
@@ -2625,6 +2756,127 @@ impl MobileWorkbench {
             .when(changes_active, |root| {
                 root.child(self.render_git_commit_panel(can_commit, has_selected_paths, cx))
             })
+            .when_some(self.git_revert_confirmation.clone(), |root, paths| {
+                root.child(self.render_git_revert_confirmation(&paths, cx))
+            })
+            // The diff is a sheet, not another row at the end of a long tree:
+            // it opens where the eye already is, scrolls on its own, and has a
+            // visible way out.
+            .when_some(self.git_diff.clone(), |root, diff| {
+                root.child(self.render_git_diff(diff, cx))
+            })
+            .into_any_element()
+    }
+
+    /// The rollback guard. Naming every path would overflow the sheet, so it
+    /// reports the count and lists the first few.
+    fn render_git_revert_confirmation(
+        &self,
+        paths: &[String],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let listed = paths.iter().take(4).cloned().collect::<Vec<_>>().join("\n");
+        div()
+            .id("mobile-git-revert-confirmation")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.62))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.git_revert_confirmation = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .bg(theme::bg_popover())
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .p(px(theme::SPACING_LG))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACING_SM))
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_size(theme::font_heading())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(
+                                locale::text(
+                                    "Roll back selected changes?",
+                                    "回滚所选更改？",
+                                    "回滾所選變更？",
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::font_caption())
+                            .text_color(theme::text_muted())
+                            .child(
+                                locale::text(
+                                    "These files go back to the committed version and local edits are lost.",
+                                    "这些文件会回到已提交版本，本地修改将丢失。",
+                                    "這些檔案會回到已提交版本，本機修改將遺失。",
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .font_family("IBM Plex Mono")
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_secondary())
+                            .child(listed),
+                    )
+                    .when(paths.len() > 4, |sheet| {
+                        sheet.child(
+                            div()
+                                .text_size(theme::font_micro())
+                                .text_color(theme::text_muted())
+                                .child(
+                                    locale::text(
+                                        "and more",
+                                        "以及更多",
+                                        "以及更多",
+                                    )
+                                    .to_string()
+                                        + &format!(" ({} total)", paths.len()),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .mt(px(theme::SPACING_SM))
+                            .flex()
+                            .gap(px(theme::SPACING_SM))
+                            .child(
+                                action_button("git-revert-cancel", locale::common("Cancel"))
+                                    .flex_1()
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::cancel_revert_git),
+                                    ),
+                            )
+                            .child(
+                                action_button(
+                                    "git-revert-confirm",
+                                    locale::text("Roll back", "回滚", "回滾"),
+                                )
+                                .flex_1()
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::confirm_revert_git),
+                                ),
+                            ),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -2677,7 +2929,7 @@ impl MobileWorkbench {
         div()
             .id(format!("git-tree:{row_id}"))
             .relative()
-            .min_h(px(32.0))
+            .min_h(px(theme::TOUCH_TARGET))
             .px_2()
             .flex()
             .items_center()
@@ -3067,7 +3319,7 @@ impl MobileWorkbench {
             deletions: file.deletions,
         });
         div()
-            .min_h(px(32.0))
+            .min_h(px(theme::TOUCH_TARGET))
             .px_3()
             .py_1()
             .flex()
@@ -3171,41 +3423,160 @@ impl MobileWorkbench {
             .into_any_element()
     }
 
-    fn render_git_diff(&self, diff: GitDiffResponse) -> gpui::AnyElement {
+    /// The diff sheet: a header with the path and a way out, then the patch
+    /// with the old/new line numbers the desktop shows. Long lines wrap with a
+    /// hanging indent so a continuation cannot be mistaken for a new line.
+    fn render_git_diff(&self, diff: GitDiffResponse, cx: &mut Context<Self>) -> gpui::AnyElement {
+        const MAX_DIFF_LINES: usize = 800;
+        let mut old_line = 0u32;
+        let mut new_line = 0u32;
+        let lines = diff
+            .diff
+            .lines()
+            .take(MAX_DIFF_LINES)
+            .map(|raw| {
+                let raw = raw.to_string();
+                let (kind, number) = if raw.starts_with("@@") {
+                    (DiffLineKind::Hunk, String::new())
+                } else if raw.starts_with('+') && !raw.starts_with("+++") {
+                    new_line += 1;
+                    (DiffLineKind::Added, new_line.to_string())
+                } else if raw.starts_with('-') && !raw.starts_with("---") {
+                    old_line += 1;
+                    (DiffLineKind::Removed, old_line.to_string())
+                } else {
+                    old_line += 1;
+                    new_line += 1;
+                    (DiffLineKind::Context, new_line.to_string())
+                };
+                (kind, number, raw)
+            })
+            .collect::<Vec<_>>();
+        let truncated = diff.diff.lines().count() > MAX_DIFF_LINES;
+        let path = diff.path.clone();
         div()
-            .px_3()
-            .py_2()
+            .id("mobile-git-diff-sheet")
+            .debug_selector(|| "mobile-git-diff-sheet".to_string())
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .max_h(relative(0.62))
+            .rounded_t(px(theme::RADIUS_CARD))
             .border_t_1()
-            .border_color(theme::border_subtle())
+            .border_color(theme::border_default())
+            .bg(theme::bg_popover())
             .flex()
             .flex_col()
-            .gap_1()
             .child(
                 div()
-                    .text_size(theme::font_caption())
-                    .text_color(theme::text_secondary())
-                    .child(diff.path),
+                    .h(px(theme::DRAWER_HEADER_HEIGHT))
+                    .flex_shrink_0()
+                    .px(px(theme::SPACING_MD))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
+                    .child(
+                        svg()
+                            .path("icons/file-code.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::accent_blue()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(theme::font_caption())
+                            .text_color(theme::text_primary())
+                            .child(path),
+                    )
+                    .child(
+                        icon_button("git-diff-close", "icons/x.svg", "Close").on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.git_diff = None;
+                                cx.notify();
+                            }),
+                        ),
+                    ),
             )
-            .children(diff.diff.lines().take(500).map(|line| {
-                let line = line.to_string();
-                let color = if line.starts_with('+') && !line.starts_with("+++") {
-                    theme::accent_green()
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    theme::accent_red()
-                } else {
-                    theme::text_muted()
-                };
+            .child(
                 div()
-                    .font_family("IBM Plex Mono")
-                    .text_size(theme::font_micro())
-                    .text_color(color)
-                    .whitespace_normal()
-                    .child(if line.is_empty() {
-                        " ".to_string()
-                    } else {
-                        line
-                    })
-            }))
+                    .id("mobile-git-diff-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .track_scroll(&self.git_diff_scroll)
+                    .overflow_y_scroll()
+                    .overflow_x_scroll()
+                    .restrict_scroll_to_axis()
+                    .py(px(theme::SPACING_SM))
+                    .children(lines.into_iter().map(|(kind, number, raw)| {
+                        let color = match kind {
+                            DiffLineKind::Added => theme::accent_success(),
+                            DiffLineKind::Removed => theme::accent_red(),
+                            DiffLineKind::Hunk => theme::accent_blue(),
+                            DiffLineKind::Context => theme::text_secondary(),
+                        };
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap(px(theme::SPACING_SM))
+                            .px(px(theme::SPACING_MD))
+                            .child(
+                                div()
+                                    .w(px(34.0))
+                                    .flex_shrink_0()
+                                    .text_right()
+                                    .font_family("IBM Plex Mono")
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_muted())
+                                    .child(number),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .pl(px(if matches!(kind, DiffLineKind::Hunk) {
+                                        0.0
+                                    } else {
+                                        8.0
+                                    }))
+                                    .border_l_1()
+                                    .border_color(match kind {
+                                        DiffLineKind::Added => theme::accent_success(),
+                                        DiffLineKind::Removed => theme::accent_red(),
+                                        _ => theme::border_subtle(),
+                                    })
+                                    .font_family("IBM Plex Mono")
+                                    .text_size(theme::font_micro())
+                                    .text_color(color)
+                                    .whitespace_normal()
+                                    .child(if raw.is_empty() { " ".to_string() } else { raw }),
+                            )
+                    })),
+            )
+            .when(truncated, |sheet| {
+                sheet.child(
+                    div()
+                        .flex_shrink_0()
+                        .px(px(theme::SPACING_MD))
+                        .py(px(theme::SPACING_SM))
+                        .border_t_1()
+                        .border_color(theme::border_subtle())
+                        .text_size(theme::font_micro())
+                        .text_color(theme::text_muted())
+                        .child(locale::text(
+                            "Diff truncated on the phone. Open it on the desktop for the rest.",
+                            "移动端已截断差异，完整内容请在桌面端查看。",
+                            "行動端已截斷差異，完整內容請在桌面版檢視。",
+                        )),
+                )
+            })
             .into_any_element()
     }
 
@@ -4555,30 +4926,6 @@ fn compact_action(
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
         .child(label.into())
-}
-
-fn choice_button(
-    id: impl Into<gpui::ElementId>,
-    label: impl Into<String>,
-    selected: bool,
-) -> gpui::Stateful<gpui::Div> {
-    compact_action(id, label).when(selected, |button| {
-        button
-            .border_color(theme::accent_blue())
-            .bg(theme::bg_card())
-            .text_color(theme::text_primary())
-    })
-}
-
-fn section_heading(label: &'static str) -> gpui::Div {
-    div()
-        .h(px(34.0))
-        .px_3()
-        .flex()
-        .items_center()
-        .text_size(theme::font_caption())
-        .text_color(theme::text_muted())
-        .child(locale::common(label))
 }
 
 fn empty_label(label: &str) -> gpui::Div {

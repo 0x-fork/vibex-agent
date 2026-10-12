@@ -1287,6 +1287,8 @@ pub struct MobileApp {
     sidebar_drag_candidate: Option<SidebarDragCandidate>,
     sidebar_drag_long_press: Option<Task<()>>,
     sidebar_batch_mode: bool,
+    /// Whether the batch-delete confirmation sheet is up.
+    sidebar_batch_delete_confirmation: bool,
     /// Top edge and right edge of the row list in window space, recorded during
     /// paint so a touch pan can be resolved to a row without hit-test plumbing.
     sidebar_list_frame: Rc<Cell<(f32, f32)>>,
@@ -2081,6 +2083,7 @@ impl MobileApp {
             sidebar_drag_candidate: None,
             sidebar_drag_long_press: None,
             sidebar_batch_mode: false,
+            sidebar_batch_delete_confirmation: false,
             sidebar_list_frame: Rc::new(Cell::new((0.0, 0.0))),
             session_action_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(locale::text(
@@ -5659,6 +5662,7 @@ impl MobileApp {
         self.sidebar_drag_candidate = None;
         self.sidebar_drag_long_press = None;
         self.sidebar_batch_mode = false;
+        self.sidebar_batch_delete_confirmation = false;
         self.sidebar_row_menu = None;
         self.sidebar_name_prompt = None;
         self.workspace_action = None;
@@ -5738,18 +5742,19 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// Selects every session the user can currently see.
+    ///
+    /// "All" used to mean every session the controller holds, filtered or not,
+    /// so a search for one project reported "12 selected" over three visible
+    /// rows and a delete removed names the user never saw.
     fn toggle_all_sidebar_sessions(
         &mut self,
         _: &MouseUpEvent,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let session_ids = self
-            .sessions()
-            .iter()
-            .filter(|session| session.deleted_at_ms.is_none())
-            .map(|session| session.id.as_str().to_string())
-            .collect::<BTreeSet<_>>();
+        let query = self.sidebar_search_input.read(cx).value().to_string();
+        let session_ids = self.visible_sidebar_session_ids(&query);
         if session_ids.is_empty() {
             return;
         }
@@ -5761,6 +5766,19 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// The sessions the drawer is actually listing for `query`.
+    fn visible_sidebar_session_ids(&self, query: &str) -> BTreeSet<String> {
+        let normalized = query.trim().to_lowercase();
+        self.sessions()
+            .iter()
+            .filter(|session| session.deleted_at_ms.is_none())
+            .filter(|session| {
+                normalized.is_empty() || crate::sidebar::session_matches_query(session, &normalized)
+            })
+            .map(|session| session.id.as_str().to_string())
+            .collect()
+    }
+
     fn toggle_sidebar_row_selection(&mut self, session_id: String, cx: &mut Context<Self>) {
         if self.sidebar_batch_mode {
             self.sidebar_state.toggle_selected(session_id);
@@ -5768,12 +5786,29 @@ impl MobileApp {
         }
     }
 
+    /// Asks before a batch delete. The single-session path always confirmed;
+    /// "select all" followed by Delete did not, and could take the session the
+    /// user was reading with it.
     fn delete_selected_sessions(
         &mut self,
         _: &MouseUpEvent,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.operation_busy || self.sidebar_state.selected_ids.is_empty() {
+            return;
+        }
+        self.sidebar_batch_delete_confirmation = true;
+        cx.notify();
+    }
+
+    fn cancel_batch_delete(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_batch_delete_confirmation = false;
+        cx.notify();
+    }
+
+    fn confirm_batch_delete(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_batch_delete_confirmation = false;
         if self.operation_busy {
             return;
         }
@@ -6085,6 +6120,11 @@ impl MobileApp {
         // A connection attempt can outlive the transport RPC budget (30s/120s)
         // with every button on the page disabled. Back has to be able to leave
         // it, otherwise the screen is a dead end for the whole timeout.
+        if self.sidebar_batch_delete_confirmation {
+            self.sidebar_batch_delete_confirmation = false;
+            cx.notify();
+            return;
+        }
         if matches!(self.mode, RootMode::Connecting) {
             self.stop_connection_tasks();
             self.operation_busy = false;
@@ -9443,6 +9483,9 @@ impl MobileApp {
                 .when_some(self.workspace_action.as_ref(), |root, prompt| {
                     root.child(self.render_workspace_action_prompt(prompt, cx))
                 })
+                .when(self.sidebar_batch_delete_confirmation, |root| {
+                    root.child(self.render_batch_delete_confirmation(cx))
+                })
                 // Ordering is z-order in GPUI. The runtime sheet is opened
                 // from the new-session page (which is itself an overlay), so it
                 // has to be painted after the overlay or it lands underneath
@@ -9920,6 +9963,131 @@ impl MobileApp {
                             ),
                     ),
             )
+    }
+
+    /// The batch-delete guard. It names the count and admits that the open
+    /// session is included, because the selection can hold both.
+    fn render_batch_delete_confirmation(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let count = self.sidebar_state.selected_ids.len();
+        let deletes_open_session = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.as_ref())
+            .is_some_and(|session_id| {
+                self.sidebar_state
+                    .selected_ids
+                    .contains(session_id.as_str())
+            });
+        div()
+            .id("mobile-batch-delete-confirmation")
+            .debug_selector(|| "mobile-batch-delete-confirmation".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.62))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.sidebar_batch_delete_confirmation = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .bg(theme::bg_popover())
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .p(px(theme::SPACING_LG))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACING_SM))
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_size(theme::font_heading())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(locale::text(
+                                "Delete the selected sessions?",
+                                "删除所选会话？",
+                                "刪除所選工作階段？",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::font_caption())
+                            .text_color(theme::text_muted())
+                            .child(
+                                locale::text("{} sessions", "{} 个会话", "{} 個工作階段")
+                                    .replace("{}", &count.to_string()),
+                            ),
+                    )
+                    .when(deletes_open_session, |sheet| {
+                        sheet.child(
+                            div()
+                                .text_size(theme::font_caption())
+                                .text_color(theme::accent_yellow())
+                                .child(locale::text(
+                                    "This includes the session you are reading.",
+                                    "其中包含你正在阅读的会话。",
+                                    "其中包含你正在閱讀的工作階段。",
+                                )),
+                        )
+                    })
+                    .child(
+                        div()
+                            .mt(px(theme::SPACING_SM))
+                            .flex()
+                            .gap(px(theme::SPACING_SM))
+                            .child(
+                                div()
+                                    .id("batch-delete-cancel")
+                                    .flex_1()
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .border_1()
+                                    .border_color(theme::border_default())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(theme::font_body())
+                                    .text_color(theme::text_secondary())
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::cancel_batch_delete),
+                                    )
+                                    .child(locale::common("Cancel")),
+                            )
+                            .child(
+                                div()
+                                    .id("batch-delete-confirm")
+                                    .flex_1()
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(theme::accent_red())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(theme::font_body())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::bg_primary())
+                                    .cursor_pointer()
+                                    .active(|style| style.opacity(0.8))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::confirm_batch_delete),
+                                    )
+                                    .child(locale::common("Delete")),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_session_action_prompt(
@@ -11350,19 +11518,46 @@ impl MobileApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .gap_3()
-            .when(!is_first, |turn| turn.pt_2())
+            // One rhythm for every child used to flatten the turn: the user
+            // message, the activity stream, and the answer all sat 12px apart.
+            // The grouping gaps below give the answer the weight it has on the
+            // desktop without inventing a second layout.
+            .gap(px(theme::SPACING_SM))
+            // A turn is a unit, so the separation between turns is clearly
+            // larger than any gap inside one. The list item already carries
+            // `pb`, so only the leading edge is added here.
+            .when(!is_first, |turn| turn.pt(px(theme::SPACING_LG)))
             .when_some(turn.user_row.as_ref(), |container, row| {
                 container.child(self.render_user_message_row(row, cx))
             })
             .when(!turn.process_rows.is_empty(), |container| {
-                container.child(self.render_turn_process_header(turn, expanded, cx))
+                container.child(
+                    div()
+                        .pt(px(theme::SPACING_SM))
+                        .child(self.render_turn_process_header(turn, expanded, cx)),
+                )
             })
             .when(expanded && !turn.process_rows.is_empty(), |container| {
-                container.children(self.render_timeline_process_rows(turn, cx))
+                container.child(
+                    div().flex().flex_col().gap(px(2.0)).child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .children(self.render_timeline_process_rows(turn, cx)),
+                    ),
+                )
             })
             .when_some(conclusion_row, |container, row| {
-                container.child(self.render_timeline_row(turn, row, true, cx))
+                // The answer gets air above it and a left rail, so it reads as
+                // the point of the turn instead of the next process line.
+                container.child(
+                    div()
+                        .mt(px(theme::SPACING_SM))
+                        .pl(px(theme::SPACING_SM))
+                        .border_l_2()
+                        .border_color(theme::border_default())
+                        .child(self.render_timeline_row(turn, row, true, cx)),
+                )
             })
             .when_some(
                 self.render_turn_file_changes_card(turn, cx),
@@ -11781,11 +11976,13 @@ impl MobileApp {
                         .text_color(theme::text_muted()),
                 )
         });
+        let submitted_at = (row.timestamp_ms > 0).then_some(row.timestamp_ms);
         div()
             .id(row.id.clone())
             .w_full()
             .flex()
-            .justify_end()
+            .flex_col()
+            .items_end()
             .child(
                 div()
                     .w(gpui::relative(0.78))
@@ -11796,13 +11993,25 @@ impl MobileApp {
                     .bg(theme::bg_card())
                     .px_3()
                     .py_2()
-                    .text_size(theme::font_heading())
-                    .line_height(px(19.0))
+                    .text_size(theme::font_body())
+                    .line_height(px(22.0))
                     .text_color(theme::text_primary())
                     .whitespace_normal()
                     .child(row.body.clone())
                     .children(attachment_elements),
             )
+            // A permanent timestamp. The desktop reveals its actions on hover;
+            // a phone has no hover, and the row's duration hint needed a press.
+            .when_some(submitted_at, |container, submitted_at| {
+                container.child(
+                    div()
+                        .mt(px(2.0))
+                        .pr(px(2.0))
+                        .text_size(theme::font_micro())
+                        .text_color(theme::text_muted())
+                        .child(session_sidebar_time_label(submitted_at)),
+                )
+            })
             .into_any_element()
     }
 
@@ -13747,10 +13956,16 @@ impl MobileApp {
                     theme::SIDEBAR_LIST_PADDING
                 }
             }
-            SidebarRowKind::Folder | SidebarRowKind::Project | SidebarRowKind::Workspace => {
-                theme::SIDEBAR_ACTION_CONTENT_INSET
+            // Project and workspace rows carry an inline create button in the
+            // trailing column, and the row menu is absolutely positioned over
+            // the same strip. Reserving the whole action column is what keeps
+            // the two from sharing a hitbox — the "+" used to sit entirely
+            // under the menu, so tapping it opened the menu instead.
+            SidebarRowKind::Project | SidebarRowKind::Workspace => {
+                theme::SIDEBAR_ACTION_WIDTH + theme::SIDEBAR_CARD_INSET
             }
-            SidebarRowKind::Group => theme::SIDEBAR_ACTION_CONTENT_INSET,
+            SidebarRowKind::Folder => theme::SIDEBAR_ACTION_CONTENT_INSET,
+            SidebarRowKind::Group => 0.0,
             SidebarRowKind::EmptyWorkspace => 0.0,
         }
     }
@@ -14360,8 +14575,10 @@ impl MobileApp {
         );
         let needs_approval = session_state == AgentSessionState::NeedsInput;
         let has_error = session_state == AgentSessionState::Error;
-        let show_status = !row.pinned
-            && !needs_approval
+        // A pinned row keeps its pin *and* its state: the pin is drawn after
+        // the state mark rather than in place of it. Losing the state to the
+        // pin hid exactly the rows the user cared enough to pin.
+        let show_status = !needs_approval
             && !row.unread
             && !has_error
             && session_state != AgentSessionState::Idle;
@@ -14409,17 +14626,57 @@ impl MobileApp {
                     .flex()
                     .items_center()
                     .gap(px(theme::SPACING_SM))
-                    .child(
-                        svg()
-                            .path(agent_icon_path(&session.agent_id.to_string()))
-                            .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
-                            .flex_shrink_0()
-                            .text_color(theme::sidebar_foreground(if is_selected {
-                                0.80
-                            } else {
-                                0.58
-                            })),
-                    )
+                    // In batch mode the agent mark becomes the selection
+                    // control: the phone had no checkbox at all, so the only
+                    // evidence of what was selected was the row fill, which is
+                    // the same fill the open session wears.
+                    .when(self.sidebar_batch_mode, |title| {
+                        let batch_selected = self
+                            .sidebar_state
+                            .selected_ids
+                            .contains(session_id.as_str());
+                        title.child(
+                            div()
+                                .size(px(20.0))
+                                .flex_shrink_0()
+                                .rounded(px(4.0))
+                                .border_1()
+                                .border_color(if batch_selected {
+                                    theme::primary()
+                                } else {
+                                    theme::border_default()
+                                })
+                                .bg(if batch_selected {
+                                    theme::primary()
+                                } else {
+                                    theme::bg_primary()
+                                })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(batch_selected, |mark| {
+                                    mark.child(
+                                        svg()
+                                            .path("icons/check.svg")
+                                            .size(px(14.0))
+                                            .text_color(theme::primary_foreground()),
+                                    )
+                                }),
+                        )
+                    })
+                    .when(!self.sidebar_batch_mode, |title| {
+                        title.child(
+                            svg()
+                                .path(agent_icon_path(&session.agent_id.to_string()))
+                                .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
+                                .flex_shrink_0()
+                                .text_color(theme::sidebar_foreground(if is_selected {
+                                    0.80
+                                } else {
+                                    0.58
+                                })),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -14439,7 +14696,14 @@ impl MobileApp {
             )
             .child(
                 div()
-                    .w(px(theme::SIDEBAR_SESSION_META_WIDTH))
+                    // A pin takes a fixed 20px out of this column, so the column
+                    // grows with it instead of clipping the timestamp it was
+                    // already too narrow to show.
+                    .w(px(if row.pinned {
+                        theme::SIDEBAR_SESSION_META_WIDTH + 20.0
+                    } else {
+                        theme::SIDEBAR_SESSION_META_WIDTH
+                    }))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
@@ -14447,33 +14711,8 @@ impl MobileApp {
                     .gap(px(6.0))
                     .text_size(theme::font_sidebar_meta())
                     .text_color(theme::sidebar_session_meta())
-                    .when(row.pinned, |right| {
-                        right.child(
-                            svg()
-                                .path("icons/pin.svg")
-                                .size(px(14.0))
-                                .flex_shrink_0()
-                                .text_color(theme::accent_yellow()),
-                        )
-                    })
-                    .when(show_status, |right| {
-                        right.child(sidebar_session_status_indicator(
-                            session_state,
-                            row.auto_continue,
-                        ))
-                    })
-                    .when(!row.pinned && needs_approval, |right| {
-                        right.child(
-                            svg()
-                                .path("icons/triangle-alert.svg")
-                                .size(px(14.0))
-                                .flex_shrink_0()
-                                .text_color(theme::accent_yellow()),
-                        )
-                    })
                     .when(
-                        !row.pinned
-                            && !needs_approval
+                        !needs_approval
                             && !generating
                             && !row.unread
                             && !has_error
@@ -14488,17 +14727,44 @@ impl MobileApp {
                             )
                         },
                     )
+                    .when(show_status, |right| {
+                        right.child(sidebar_session_status_indicator(
+                            session_state,
+                            row.auto_continue,
+                        ))
+                    })
+                    .when(needs_approval, |right| {
+                        right.child(
+                            svg()
+                                .path("icons/triangle-alert.svg")
+                                .size(px(14.0))
+                                .flex_shrink_0()
+                                .text_color(theme::accent_yellow()),
+                        )
+                    })
+                    .when(has_error, |right| {
+                        right.child(sidebar_status_dot(theme::accent_red()))
+                    })
                     .when(row.unread, |right| {
                         right.child(
                             div()
                                 .size(px(theme::SIDEBAR_UNREAD_DOT))
                                 .flex_shrink_0()
                                 .rounded_full()
-                                .bg(theme::accent_blue()),
+                                // Desktop parity: unread is the primary accent,
+                                // not a chart-category blue that reads as a
+                                // different state from the one above it.
+                                .bg(theme::primary()),
                         )
                     })
-                    .when(has_error, |right| {
-                        right.child(sidebar_status_dot(theme::accent_red()))
+                    .when(row.pinned, |right| {
+                        right.child(
+                            svg()
+                                .path("icons/pin.svg")
+                                .size(px(14.0))
+                                .flex_shrink_0()
+                                .text_color(theme::accent_yellow()),
+                        )
                     }),
             )
             .into_any_element()
@@ -14587,12 +14853,23 @@ impl MobileApp {
 
 impl MobileApp {
     fn render_drawer(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let sessions = self
+        let sessions_state = self
             .controller
             .as_ref()
-            .and_then(|controller| controller.state.sessions.value.as_ref())
+            .map(|controller| controller.state.sessions.clone());
+        let sessions = sessions_state
+            .as_ref()
+            .and_then(|sessions| sessions.value.as_ref())
             .cloned()
             .unwrap_or_default();
+        // A first load, a failed load, and a genuinely empty list all used to
+        // render as "No sessions yet". They are three different things and only
+        // one of them is the user's to act on.
+        let sessions_phase = sessions_state.as_ref().map(|sessions| sessions.phase);
+        let sessions_error = sessions_state
+            .as_ref()
+            .and_then(|sessions| sessions.error.as_ref())
+            .map(|error| error.message.clone());
         let search_query = self.sidebar_search_input.read(cx).value().to_string();
         let rows = self.mobile_sidebar_rows(&search_query);
         let capabilities = self
@@ -15134,8 +15411,70 @@ impl MobileApp {
                         )
                     })
                     .when(rows.is_empty(), |body| {
-                        body.child(
-                            div()
+                        body.child(match (&sessions_error, sessions_phase) {
+                            (Some(message), _) => div()
+                                .mx(px(theme::SPACING_LG))
+                                .mt(px(theme::SPACING_LG))
+                                .p(px(theme::SPACING_MD))
+                                .rounded(px(theme::RADIUS_CARD))
+                                .border_1()
+                                .border_color(theme::accent_red())
+                                .flex()
+                                .flex_col()
+                                .gap(px(theme::SPACING_SM))
+                                .child(
+                                    div()
+                                        .text_size(theme::font_caption())
+                                        .text_color(theme::accent_red())
+                                        .child(locale::text(
+                                            "Could not load sessions",
+                                            "无法加载会话",
+                                            "無法載入工作階段",
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme::font_micro())
+                                        .text_color(theme::sidebar_text_muted())
+                                        .child(message.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .id("sidebar-retry-sessions")
+                                        .debug_selector(|| "sidebar-retry-sessions".to_string())
+                                        .h(px(theme::TOUCH_TARGET))
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .border_1()
+                                        .border_color(theme::border_default())
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(theme::font_caption())
+                                        .text_color(theme::text_secondary())
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| this.refresh_sessions(cx)),
+                                        )
+                                        .child(locale::common("Retry")),
+                                )
+                                .into_any_element(),
+                            (None, Some(AsyncPhase::Loading)) if !has_search_query => div()
+                                .mx(px(theme::SPACING_LG))
+                                .mt(px(theme::SPACING_LG))
+                                .flex()
+                                .flex_col()
+                                .gap(px(theme::SPACING_SM))
+                                .children((0..3).map(|_| {
+                                    div()
+                                        .h(px(theme::SIDEBAR_ROW_HEIGHT))
+                                        .w_full()
+                                        .rounded(px(theme::SIDEBAR_ROW_RADIUS))
+                                        .bg(theme::bg_card_dim())
+                                }))
+                                .into_any_element(),
+                            _ => div()
                                 .mx(px(theme::SPACING_LG))
                                 .mt(px(theme::SPACING_LG))
                                 .text_size(theme::font_caption())
@@ -15144,8 +15483,9 @@ impl MobileApp {
                                     locale::common("No matching sessions")
                                 } else {
                                     locale::text("No sessions yet", "还没有会话", "尚無工作階段")
-                                }),
-                        )
+                                })
+                                .into_any_element(),
+                        })
                     })
                     .child(
                         div()
@@ -20201,21 +20541,6 @@ fn process_title(row: &TimelineRow) -> String {
         TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage => "Message",
     })
     .to_string()
-}
-
-fn timeline_row_preview(body: &str) -> String {
-    const MAX_CHARS: usize = 96;
-
-    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= MAX_CHARS {
-        return collapsed;
-    }
-    let mut preview = collapsed
-        .chars()
-        .take(MAX_CHARS.saturating_sub(3))
-        .collect::<String>();
-    preview.push_str("...");
-    preview
 }
 
 fn bounded_timeline_detail(value: &str) -> String {

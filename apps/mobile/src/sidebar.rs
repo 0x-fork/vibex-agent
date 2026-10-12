@@ -134,10 +134,23 @@ fn group_ids_for(
         .collect()
 }
 
-fn session_matches(session: &AgentSession, query: &str) -> bool {
+/// Whether a session answers the drawer's query.
+///
+/// Mirrors the desktop's shared matcher (`session_matches_query`): the Agent id
+/// and the session state are searchable too, so typing "claude" or "running"
+/// finds what the row is actually showing.
+pub fn session_matches_query(session: &AgentSession, query: &str) -> bool {
     query.is_empty()
-        || session.title.to_lowercase().contains(query)
-        || session.workspace_root.to_lowercase().contains(query)
+        || [
+            session.title.as_str(),
+            session.agent_id.as_str(),
+            session.workspace_root.as_str(),
+        ]
+        .iter()
+        .any(|value| value.to_lowercase().contains(query))
+        || format!("{:?}", session.state)
+            .to_lowercase()
+            .contains(query)
 }
 
 fn ordered_ids(ids: &[String], preferred: &[String]) -> Vec<String> {
@@ -214,12 +227,15 @@ fn workspace_status(
     let unread = sessions
         .iter()
         .any(|session| view.unread_session_ids.contains(session.id.as_str()));
-    let state = if running {
-        Some(AgentSessionState::Running)
+    // The call to action outranks the spinner: a worktree with both a running
+    // session and one waiting on approval reports the approval, exactly as the
+    // desktop's aggregate does.
+    let state = if needs_input {
+        Some(AgentSessionState::NeedsInput)
     } else if error {
         Some(AgentSessionState::Error)
-    } else if needs_input {
-        Some(AgentSessionState::NeedsInput)
+    } else if running {
+        Some(AgentSessionState::Running)
     } else if unread {
         // Idle is rendered with the completed/unread treatment by the mobile
         // row; keeping the state typed avoids inventing a second wire enum.
@@ -344,7 +360,7 @@ pub fn sidebar_rows(input: SidebarRowInput<'_>) -> Vec<SidebarRow> {
                 .is_some_and(|sessions| {
                     sessions
                         .iter()
-                        .any(|session| session_matches(session, &query))
+                        .any(|session| session_matches_query(session, &query))
                 })
         })
         .cloned()
@@ -553,7 +569,7 @@ fn push_project_children(
     let project_sessions = ordered_sessions(project_sessions, input.view);
     let session_ids = project_sessions
         .iter()
-        .filter(|session| session_matches(session, query))
+        .filter(|session| session_matches_query(session, query))
         .map(|session| session.id.as_str().to_string())
         .collect::<Vec<_>>();
     let group_ids = group_ids_for(organization, project_id, None);
@@ -657,7 +673,7 @@ fn push_project_children(
                     .is_some_and(|sessions| {
                         sessions
                             .iter()
-                            .any(|session| session_matches(session, query))
+                            .any(|session| session_matches_query(session, query))
                     })
         })
         .map(|workspace| workspace.id.clone())
@@ -686,7 +702,7 @@ fn push_project_children(
         let workspace_sessions = ordered_sessions(workspace_sessions, input.view);
         let session_ids = workspace_sessions
             .iter()
-            .filter(|session| session_matches(session, query))
+            .filter(|session| session_matches_query(session, query))
             .map(|session| session.id.as_str().to_string())
             .collect::<Vec<_>>();
         rows.push(SidebarRow {
@@ -885,7 +901,7 @@ fn push_group_rows(
         .collect::<Vec<_>>();
     let visible = members
         .iter()
-        .filter(|session| session_matches(session, query))
+        .filter(|session| session_matches_query(session, query))
         .count();
     if !query.is_empty() && visible == 0 {
         return;
