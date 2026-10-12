@@ -138,99 +138,138 @@ impl LayoutPlan {
     }
 }
 
-/// A palette entry: a label plus the intent it runs.
+/// Columns the palette spends on a command's name before its hint starts.
+///
+/// Wide enough for the longest English name with room to spare. It is a column
+/// budget rather than a character count because a Chinese glyph takes two
+/// columns, and the hints must line up in every language.
+const PALETTE_NAME_WIDTH: usize = 24;
+
+/// A palette entry: the intent it runs.
+///
+/// The name and the one-line explanation are read from the locale table
+/// through [`PaletteEntry::label`] and [`PaletteEntry::hint`] rather than
+/// stored here, so the list follows the reader's language the way the rest of
+/// the interface does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaletteEntry {
-    pub label: &'static str,
-    pub hint: &'static str,
     pub intent: Intent,
+}
+
+impl PaletteEntry {
+    /// The name this command is listed under.
+    pub fn label(self, strings: Strings) -> &'static str {
+        palette_label(self.intent, strings)
+    }
+
+    /// The one-line explanation drawn beside the name.
+    pub fn hint(self, strings: Strings) -> &'static str {
+        palette_hint(self.intent, strings)
+    }
+}
+
+/// The palette's name for one command.
+///
+/// Every entry in [`PALETTE`] is named here. A command the palette never lists
+/// falls back to the key bar's own label, so a row can never be drawn blank.
+fn palette_label(intent: Intent, strings: Strings) -> &'static str {
+    match intent {
+        Intent::GotoSessions => strings.palette_cmd_sessions(),
+        Intent::GotoManagement => strings.palette_cmd_management(),
+        Intent::OpenSettings => strings.palette_cmd_settings(),
+        Intent::ToggleHelp => strings.palette_cmd_help(),
+        Intent::NewSession => strings.palette_cmd_new_session(),
+        Intent::BeginRenameSession => strings.palette_cmd_rename_session(),
+        Intent::ForkSession => strings.palette_cmd_fork_session(),
+        Intent::ArchiveSession => strings.palette_cmd_archive_session(),
+        Intent::UnarchiveSession => strings.palette_cmd_restore_session(),
+        Intent::DeleteSession => strings.palette_cmd_delete_session(),
+        Intent::SwitchAgentRuntime => strings.palette_cmd_switch_runtime(),
+        Intent::ProbeAgentRuntime => strings.palette_cmd_probe_runtimes(),
+        Intent::OpenManagementSection => strings.palette_cmd_devices(),
+        Intent::CreatePairingCode => strings.palette_cmd_pair_device(),
+        Intent::ReloadKeymap => strings.palette_cmd_reload_keys(),
+        Intent::Refresh => strings.palette_cmd_refresh(),
+        Intent::RequestQuit => strings.palette_cmd_quit(),
+        _ => intent.default_label(),
+    }
+}
+
+/// The palette's one-line explanation for one command.
+fn palette_hint(intent: Intent, strings: Strings) -> &'static str {
+    match intent {
+        Intent::GotoSessions => strings.palette_hint_sessions(),
+        Intent::GotoManagement => strings.palette_hint_management(),
+        Intent::OpenSettings => strings.palette_hint_settings(),
+        Intent::ToggleHelp => strings.palette_hint_help(),
+        Intent::NewSession => strings.palette_hint_new_session(),
+        Intent::BeginRenameSession => strings.palette_hint_rename_session(),
+        Intent::ForkSession => strings.palette_hint_fork_session(),
+        Intent::ArchiveSession => strings.palette_hint_archive_session(),
+        Intent::UnarchiveSession => strings.palette_hint_restore_session(),
+        Intent::DeleteSession => strings.palette_hint_delete_session(),
+        Intent::SwitchAgentRuntime => strings.palette_hint_switch_runtime(),
+        Intent::ProbeAgentRuntime => strings.palette_hint_probe_runtimes(),
+        Intent::OpenManagementSection => strings.palette_hint_devices(),
+        Intent::CreatePairingCode => strings.palette_hint_pair_device(),
+        Intent::ReloadKeymap => strings.palette_hint_reload_keys(),
+        Intent::Refresh => strings.palette_hint_refresh(),
+        Intent::RequestQuit => strings.palette_hint_quit(),
+        _ => intent.help(),
+    }
 }
 
 /// Every command the palette can run.
 pub const PALETTE: &[PaletteEntry] = &[
     PaletteEntry {
-        label: "Sessions",
-        hint: "Open the session list",
         intent: Intent::GotoSessions,
     },
     PaletteEntry {
-        label: "Management",
-        hint: "Open the management index",
         intent: Intent::GotoManagement,
     },
     PaletteEntry {
-        label: "Settings",
-        hint: "Theme, language, keys",
         intent: Intent::OpenSettings,
     },
     PaletteEntry {
-        label: "Help",
-        hint: "Contextual key help",
         intent: Intent::ToggleHelp,
     },
     PaletteEntry {
-        label: "New session",
-        hint: "Create a session",
         intent: Intent::NewSession,
     },
     PaletteEntry {
-        label: "Rename session",
-        hint: "Rename the open session",
         intent: Intent::BeginRenameSession,
     },
     PaletteEntry {
-        label: "Fork session",
-        hint: "Copy the session",
         intent: Intent::ForkSession,
     },
     PaletteEntry {
-        label: "Archive session",
-        hint: "Archive the open session",
         intent: Intent::ArchiveSession,
     },
     PaletteEntry {
-        label: "Restore session",
-        hint: "Restore an archived session",
         intent: Intent::UnarchiveSession,
     },
     PaletteEntry {
-        label: "Delete session",
-        hint: "Delete the open session",
         intent: Intent::DeleteSession,
     },
     PaletteEntry {
-        label: "Switch runtime",
-        hint: "Pick the Agent runtime and model",
         intent: Intent::SwitchAgentRuntime,
     },
     PaletteEntry {
-        label: "Probe runtimes",
-        hint: "Re-discover available Agents",
         intent: Intent::ProbeAgentRuntime,
     },
     PaletteEntry {
-        label: "Devices",
-        hint: "Pair and revoke devices",
         intent: Intent::OpenManagementSection,
     },
     PaletteEntry {
-        label: "Pair a device",
-        hint: "Issue a one-time pairing code",
         intent: Intent::CreatePairingCode,
     },
     PaletteEntry {
-        label: "Reload key bindings",
-        hint: "Re-read tui-keys.toml",
         intent: Intent::ReloadKeymap,
     },
     PaletteEntry {
-        label: "Refresh",
-        hint: "Re-read the current page",
         intent: Intent::Refresh,
     },
     PaletteEntry {
-        label: "Quit",
-        hint: "Leave the TUI",
         intent: Intent::RequestQuit,
     },
 ];
@@ -238,7 +277,6 @@ pub const PALETTE: &[PaletteEntry] = &[
 /// The heading a palette command is filed under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PaletteGroup {
-    Recent,
     Session,
     Workbench,
     Management,
@@ -250,7 +288,6 @@ pub enum PaletteGroup {
 impl PaletteGroup {
     pub fn label(self, strings: Strings) -> &'static str {
         match self {
-            PaletteGroup::Recent => strings.palette_group_recent(),
             PaletteGroup::Session => strings.palette_group_session(),
             PaletteGroup::Workbench => strings.palette_group_workbench(),
             PaletteGroup::Management => strings.palette_group_management(),
@@ -345,67 +382,21 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i32> {
 /// One palette command, together with the heading it is drawn under.
 ///
 /// The grouping travels with the entry rather than being read back from its
-/// position, because the same command can be listed under two headings: the
-/// `Recent` band is a shortcut, not a move.
+/// position, so the frame can insert a heading whenever the group changes
+/// without the list and the drawing disagreeing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaletteListing {
     pub group: PaletteGroup,
     pub entry: PaletteEntry,
 }
 
-/// Palette entries matching `query`, best first, with `recent` boosted.
+/// Palette entries matching `query`, each with the heading it is drawn under.
 ///
-/// With nothing typed the remembered commands lead the list under `Recent` — and
-/// are still filed under their own heading further down. Hoisting a command out
-/// of its section the first time it is used empties the section the reader
-/// learned to find it in: `Rename session` is a session command before it is a
-/// recent one, and the recents band is there to save a search, not to take the
-/// command away.
-pub fn palette_matches_recent(
-    query: &str,
-    strings: Strings,
-    recent: &[String],
-) -> Vec<PaletteListing> {
-    let needle = query.trim().to_lowercase();
-    let mut entries = palette_matches(&needle, strings);
-    if needle.is_empty() && !recent.is_empty() {
-        // With nothing typed the palette opens on what was just used, which is
-        // the whole point of remembering it.
-        let mut listings = recent
-            .iter()
-            .filter_map(|id| {
-                let intent = Intent::from_id(id)?;
-                PALETTE.iter().find(|entry| entry.intent == intent).copied()
-            })
-            .map(|entry| PaletteListing {
-                group: PaletteGroup::Recent,
-                entry,
-            })
-            .collect::<Vec<_>>();
-        listings.dedup_by_key(|listing| listing.entry.intent);
-        listings.extend(entries.into_iter().map(|entry| PaletteListing {
-            group: palette_group(entry.intent),
-            entry,
-        }));
-        return listings;
-    }
-    if !needle.is_empty() {
-        // Recent use is a tie-break, not a filter: a command the reader has
-        // used before rises among equally good matches.
-        entries.sort_by_key(|entry| {
-            let rank = recent
-                .iter()
-                .position(|id| id == entry.intent.id())
-                .unwrap_or(usize::MAX);
-            (
-                palette_group(entry.intent),
-                usize::from(rank == usize::MAX),
-                rank,
-                entry.label,
-            )
-        });
-    }
-    entries
+/// A command is listed exactly once and always under its own heading: the list
+/// a reader learns is the list they get, on the first open as much as on the
+/// hundredth.
+pub fn palette_listings(query: &str, strings: Strings) -> Vec<PaletteListing> {
+    palette_matches(query, strings)
         .into_iter()
         .map(|entry| PaletteListing {
             group: palette_group(entry.intent),
@@ -415,7 +406,12 @@ pub fn palette_matches_recent(
 }
 
 /// Palette entries matching `query`.
+///
+/// The query is matched against the reader's own names and the English ones
+/// alike: a reader who knows a command as `Settings` can find it in a Chinese
+/// interface, and one who learned 用量 does not have to translate in their head.
 pub fn palette_matches(query: &str, strings: Strings) -> Vec<PaletteEntry> {
+    let english = Strings::for_locale(crate::locale::Locale::En);
     let needle = query.trim().to_lowercase();
     let mut scored = PALETTE
         .iter()
@@ -423,11 +419,13 @@ pub fn palette_matches(query: &str, strings: Strings) -> Vec<PaletteEntry> {
         .filter_map(|entry| {
             // The label is what the reader is typing at; the hint is what they
             // are reading, so a hit there scores lower but still counts.
-            let label = fuzzy_score(entry.label, &needle);
+            let label = fuzzy_score(entry.label(strings), &needle)
+                .max(fuzzy_score(entry.label(english), &needle));
             let hint = if needle.is_empty() {
                 None
             } else {
-                fuzzy_score(entry.hint, &needle)
+                fuzzy_score(entry.hint(strings), &needle)
+                    .max(fuzzy_score(entry.hint(english), &needle))
             };
             let score = match (label, hint) {
                 (Some(score), _) => score,
@@ -437,34 +435,15 @@ pub fn palette_matches(query: &str, strings: Strings) -> Vec<PaletteEntry> {
             Some((score, entry))
         })
         .collect::<Vec<_>>();
-    // Best first, then by group so the list reads in sections, then by label.
+    // Best first, then by group so the list reads in sections, then by name.
     scored.sort_by(|left, right| {
         right
             .0
             .cmp(&left.0)
             .then_with(|| palette_group(left.1.intent).cmp(&palette_group(right.1.intent)))
-            .then_with(|| left.1.label.cmp(right.1.label))
+            .then_with(|| left.1.label(strings).cmp(right.1.label(strings)))
     });
-    let mut entries = scored
-        .into_iter()
-        .map(|(_, entry)| entry)
-        .collect::<Vec<_>>();
-    // The palette also offers the localised destination names, so a user who
-    // reads Chinese can find 用量 without knowing the English label.
-    for (intent, label) in [
-        (Intent::GotoSessions, strings.nav_sessions()),
-        (Intent::GotoManagement, strings.nav_management()),
-        (Intent::OpenSettings, strings.nav_settings()),
-        (Intent::ToggleHelp, strings.nav_help()),
-    ] {
-        if (needle.is_empty() || label.to_lowercase().contains(&needle))
-            && let Some(entry) = PALETTE.iter().find(|entry| entry.intent == intent)
-            && !entries.iter().any(|candidate| candidate.intent == intent)
-        {
-            entries.push(*entry);
-        }
-    }
-    entries
+    scored.into_iter().map(|(_, entry)| entry).collect()
 }
 
 /// The transcript band's width at a terminal `columns` wide.
@@ -5088,8 +5067,14 @@ fn render_overlay(
                 };
                 lines.push(Line::from(vec![
                     Span::styled(if selected_here { "▸ " } else { "  " }, style),
-                    Span::styled(format!("{:<24}", listing.entry.label), style),
-                    Span::styled(listing.entry.hint, theme.muted()),
+                    // Padded by columns, not characters: a Chinese name is two
+                    // columns a glyph, and the hints have to line up under one
+                    // another in every language.
+                    Span::styled(
+                        pad_to_width(listing.entry.label(strings), PALETTE_NAME_WIDTH),
+                        style,
+                    ),
+                    Span::styled(listing.entry.hint(strings), theme.muted()),
                 ]));
                 row_of_line.push(Some(index));
             }
@@ -6407,7 +6392,7 @@ mod tests {
     fn palette_ranks_prefix_matches_first() {
         let matches = palette_matches("he", strings());
         assert!(!matches.is_empty());
-        assert!(matches[0].label.to_lowercase().starts_with("he"));
+        assert!(matches[0].label(strings()).to_lowercase().starts_with("he"));
     }
 
     #[test]
@@ -6427,6 +6412,39 @@ mod tests {
     }
 
     #[test]
+    fn palette_names_follow_the_reader_s_language() {
+        let english = Strings::for_locale(Locale::En);
+        let chinese = Strings::for_locale(Locale::ZhCn);
+        let traditional = Strings::for_locale(Locale::ZhTw);
+        // An English name still finds its command in a Chinese interface, and
+        // a Chinese one does not have to be translated in the reader's head.
+        assert!(
+            palette_matches("settings", chinese)
+                .iter()
+                .any(|entry| entry.intent == Intent::OpenSettings),
+            "an English name stopped finding its command"
+        );
+        for entry in PALETTE {
+            assert!(!entry.label(english).is_empty());
+            assert!(!entry.hint(english).is_empty());
+            // Every command carries its own copy rather than falling back to
+            // the key bar's English label.
+            assert_ne!(
+                entry.label(chinese),
+                entry.label(english),
+                "{:?} has no zh-CN name",
+                entry.intent
+            );
+            assert_ne!(
+                entry.label(traditional),
+                entry.label(english),
+                "{:?} has no zh-TW name",
+                entry.intent
+            );
+        }
+    }
+
+    #[test]
     fn palette_does_not_duplicate_destinations() {
         let matches = palette_matches("", strings());
         let mut seen = std::collections::BTreeSet::new();
@@ -6438,8 +6456,6 @@ mod tests {
     #[test]
     fn every_palette_entry_maps_to_a_real_intent() {
         for entry in PALETTE {
-            assert!(!entry.label.is_empty());
-            assert!(!entry.hint.is_empty());
             // The intent must round-trip through its stable id.
             assert_eq!(Intent::from_id(entry.intent.id()), Some(entry.intent));
         }

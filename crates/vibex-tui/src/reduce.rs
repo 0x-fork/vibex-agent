@@ -1484,7 +1484,6 @@ impl App {
                     return Outcome::quiet();
                 };
                 self.overlay = None;
-                self.remember_command(listing.entry.intent);
                 self.perform(listing.entry.intent)
             }
             Intent::SelectNext => {

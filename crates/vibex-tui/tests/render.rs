@@ -3068,8 +3068,9 @@ fn folding_a_category_hides_its_bindings_but_keeps_its_header() {
 }
 
 #[test]
-fn the_palette_groups_commands_and_remembers_recent_ones() {
+fn the_palette_groups_commands_under_their_headings() {
     use vibex_tui::action::Intent;
+    use vibex_tui::view::PaletteGroup;
     let mut app = app(120, 40);
     app.perform(Intent::OpenCommandPalette);
     let screen = text(&render(&mut app, 120, 40));
@@ -3079,32 +3080,23 @@ fn the_palette_groups_commands_and_remembers_recent_ones() {
         "{screen}"
     );
 
-    // Running a command remembers it, and the next open leads with it.
-    app.remember_command(Intent::GotoManagement);
+    // Every command is listed once, under its own heading: nothing is hoisted
+    // to the top, so the row a reader learned is the row it stays on.
     let entries = app.palette_entries("");
-    assert_eq!(entries[0].entry.intent, Intent::GotoManagement);
-    assert_eq!(entries[0].group, vibex_tui::view::PaletteGroup::Recent);
-    let screen = text(&render(&mut app, 120, 40));
-    assert!(screen.contains("Recent"), "{screen}");
-
-    // The `Recent` band is a shortcut, not a move: the command is still filed
-    // under its own heading, so a section never empties as it is used.
-    let groups = entries
+    assert_eq!(entries.len(), vibex_tui::view::PALETTE.len());
+    let listed = entries
         .iter()
         .filter(|listing| listing.entry.intent == Intent::GotoManagement)
         .map(|listing| listing.group)
         .collect::<Vec<_>>();
     assert_eq!(
-        groups,
-        vec![
-            vibex_tui::view::PaletteGroup::Recent,
-            vibex_tui::view::PaletteGroup::View
-        ],
-        "the remembered command left its own section"
+        listed,
+        vec![PaletteGroup::View],
+        "a command is listed twice"
     );
 
-    // The frame draws it twice, under the two headings those listings name: the
-    // rows the frame published say which line each one landed on.
+    // The frame draws the heading the listing names, and draws every heading
+    // once: a section cannot be split by a command that moved.
     let buffer = render_buffer(&mut app, 120, 40);
     let region = app
         .regions
@@ -3117,45 +3109,53 @@ fn the_palette_groups_commands_and_remembers_recent_ones() {
             .map(|cell| cell.symbol().to_string())
             .collect()
     };
-    let line_of = |index: usize| -> usize {
-        region
-            .rows
-            .iter()
-            .position(|row| *row == Some(index))
-            .unwrap_or_else(|| panic!("entry {index} was not drawn:\n{screen}"))
-    };
-    let heading_above = |mut line: usize| -> String {
-        while line > 0 {
-            line -= 1;
-            if region.rows[line].is_none() {
-                return line_text(line).trim().to_string();
-            }
+    let mut headings = Vec::new();
+    for (line, row) in region.rows.iter().enumerate() {
+        if row.is_none() {
+            headings.push(line_text(line).trim().to_string());
         }
-        panic!("no heading above line {line}:\n{screen}");
-    };
-    let recent = entries
+    }
+    let management = entries
         .iter()
-        .position(|listing| {
-            listing.entry.intent == Intent::GotoManagement
-                && listing.group == vibex_tui::view::PaletteGroup::Recent
-        })
-        .expect("no remembered listing");
-    let filed = entries
+        .position(|listing| listing.entry.intent == Intent::GotoManagement)
+        .expect("no management listing");
+    let line = region
+        .rows
         .iter()
-        .position(|listing| {
-            listing.entry.intent == Intent::GotoManagement
-                && listing.group == vibex_tui::view::PaletteGroup::View
-        })
-        .expect("no `View` listing");
+        .position(|row| *row == Some(management))
+        .expect("the command was not drawn");
+    let heading = (0..line)
+        .rev()
+        .find(|above| region.rows[*above].is_none())
+        .map(|above| line_text(above).trim().to_string())
+        .expect("no heading above the command");
     assert_eq!(
-        heading_above(line_of(recent)),
-        "Recent",
-        "the remembered command is not drawn under `Recent`:\n{screen}"
+        heading, "View",
+        "the command is not drawn under `View`:\n{screen}"
     );
     assert_eq!(
-        heading_above(line_of(filed)),
-        "View",
-        "`Management` is no longer drawn in the `View` section:\n{screen}"
+        headings.iter().filter(|heading| *heading == "View").count(),
+        1,
+        "the `View` section is drawn twice:\n{screen}"
+    );
+}
+
+#[test]
+fn the_palette_names_its_commands_in_the_reader_s_language() {
+    let mut app = app(120, 40);
+    app.strings = Strings::for_locale(Locale::ZhCn);
+    app.perform(vibex_tui::action::Intent::OpenCommandPalette);
+    let lines = render(&mut app, 120, 40);
+    let screen = text(&lines);
+    // Reading a wide glyph back inserts a cell of padding after it, so the
+    // spaces come out before a Chinese name is searched for.
+    assert!(
+        screen.replace(' ', "").contains("重新加载键位"),
+        "the palette is still English:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Reload key bindings"),
+        "the palette names are not translated:\n{screen}"
     );
 }
 
@@ -3164,9 +3164,14 @@ fn palette_fuzzy_matching_finds_a_two_word_query() {
     let strings = Strings::for_locale(Locale::En);
     let matches = vibex_tui::view::palette_matches("newsess", strings);
     assert!(
-        matches.iter().any(|entry| entry.label == "New session"),
+        matches
+            .iter()
+            .any(|entry| entry.label(strings) == "New session"),
         "a subsequence query must match: {:?}",
-        matches.iter().map(|entry| entry.label).collect::<Vec<_>>()
+        matches
+            .iter()
+            .map(|entry| entry.label(strings))
+            .collect::<Vec<_>>()
     );
 }
 

@@ -1,8 +1,7 @@
 //! What the interface remembers about itself between runs.
 //!
 //! The settings surface offers a theme, an appearance, an icon set, the landing
-//! logo and its two effects, a language and a default workspace, and the
-//! command palette leads with the commands the reader reached for last. None of
+//! logo and its two effects, a language and a default workspace. None of
 //! that is the runtime's to keep, so it is written beside the session-list
 //! arrangement and the switcher's memory under the same home: a reader who
 //! wants the interface to forget clears one directory.
@@ -25,13 +24,6 @@ use vibex_ui::GpuiThemeMode;
 use crate::locale::Locale;
 use crate::logo::MarkStyle;
 use crate::theme::GlyphMode;
-
-/// How many palette commands the file keeps.
-///
-/// The list is a recency record, not a history. The bound is the one the
-/// palette draws, so a remembered command the list stopped showing is not kept
-/// forever.
-pub const RECENT_COMMAND_LIMIT: usize = 8;
 
 /// The interface's own remembered state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,9 +73,6 @@ pub struct InterfacePreferences {
     /// choosing where to run the command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
-    /// Palette action ids, most recently used first.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub recent_commands: Vec<String>,
 }
 
 impl InterfacePreferences {
@@ -176,17 +165,6 @@ impl InterfacePreferences {
             _ => None,
         }
     }
-
-    /// Remember one command, most recent first.
-    ///
-    /// A command that was already in the list moves to the front rather than
-    /// being written twice: the list is what the palette lifts to the top, and
-    /// one row per command is the only shape that can be drawn.
-    pub fn remember_command(&mut self, id: &str) {
-        self.recent_commands.retain(|candidate| candidate != id);
-        self.recent_commands.insert(0, id.to_string());
-        self.recent_commands.truncate(RECENT_COMMAND_LIMIT);
-    }
 }
 
 /// Whether both appearance slots are empty, so the field can be left out.
@@ -217,7 +195,6 @@ mod tests {
             reasoning_expansion_mode: Some("full".to_string()),
             locale: Some("zh-CN".to_string()),
             workspace: Some("/tmp/vibex-workspace".to_string()),
-            recent_commands: vec!["open_settings".to_string()],
         };
 
         preferences.save(Some(&path));
@@ -316,29 +293,6 @@ mod tests {
         assert_eq!(
             InterfacePreferences::load(Some(&path)),
             InterfacePreferences::default()
-        );
-    }
-
-    #[test]
-    fn remembered_commands_are_most_recent_first_and_bounded() {
-        let mut preferences = InterfacePreferences::default();
-        for index in 0..RECENT_COMMAND_LIMIT + 4 {
-            preferences.remember_command(&format!("command_{index}"));
-        }
-        assert_eq!(preferences.recent_commands.len(), RECENT_COMMAND_LIMIT);
-        assert_eq!(preferences.recent_commands[0], "command_11");
-
-        // Reaching for a command already in the list moves it to the front
-        // instead of listing it twice.
-        preferences.remember_command("command_4");
-        assert_eq!(preferences.recent_commands[0], "command_4");
-        assert_eq!(
-            preferences
-                .recent_commands
-                .iter()
-                .filter(|id| *id == "command_4")
-                .count(),
-            1
         );
     }
 }

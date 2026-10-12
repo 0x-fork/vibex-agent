@@ -856,13 +856,89 @@ strings! {
     // ---- command palette / overlays --------------------------------------
     palette_title => { "Command palette", "命令面板", "命令面板" },
     palette_placeholder => { "Type a command…", "输入命令…", "輸入命令…" },
-    palette_group_recent => { "Recent", "最近", "最近" },
     palette_group_session => { "Session", "会话", "工作階段" },
     palette_group_workbench => { "Workbench", "工作台", "工作台" },
     palette_group_management => { "Management", "管理", "管理" },
     palette_group_device => { "Devices", "设备", "裝置" },
     palette_group_view => { "View", "视图", "檢視" },
     palette_group_app => { "App", "应用", "應用" },
+    // The palette's own names and one-line explanations. They are longer than
+    // the key bar's labels because the palette is read as a menu rather than
+    // glanced at as a legend.
+    palette_cmd_sessions => { "Sessions", "会话", "工作階段" },
+    palette_hint_sessions => { "Open the session list", "打开会话列表", "開啟工作階段清單" },
+    palette_cmd_management => { "Management", "管理", "管理" },
+    palette_hint_management => { "Open the management index", "打开管理索引", "開啟管理索引" },
+    palette_cmd_settings => { "Settings", "设置", "設定" },
+    palette_hint_settings => { "Theme, language, keys", "主题、语言、键位", "主題、語言、鍵位" },
+    palette_cmd_help => { "Help", "帮助", "說明" },
+    palette_hint_help => { "Contextual key help", "查看当前键位说明", "檢視目前鍵位說明" },
+    palette_cmd_new_session => { "New session", "新建会话", "新增工作階段" },
+    palette_hint_new_session => { "Create a session", "创建一个会话", "建立一個工作階段" },
+    palette_cmd_rename_session => { "Rename session", "重命名会话", "重新命名工作階段" },
+    palette_hint_rename_session => {
+        "Rename the open session",
+        "重命名当前会话",
+        "重新命名目前的工作階段"
+    },
+    palette_cmd_fork_session => { "Fork session", "复制会话分支", "複製工作階段分支" },
+    palette_hint_fork_session => {
+        "Copy the session",
+        "复制当前会话",
+        "複製目前的工作階段"
+    },
+    palette_cmd_archive_session => { "Archive session", "归档会话", "封存工作階段" },
+    palette_hint_archive_session => {
+        "Archive the open session",
+        "归档当前会话",
+        "封存目前的工作階段"
+    },
+    palette_cmd_restore_session => { "Restore session", "恢复会话", "還原工作階段" },
+    palette_hint_restore_session => {
+        "Restore an archived session",
+        "恢复已归档的会话",
+        "還原已封存的工作階段"
+    },
+    palette_cmd_delete_session => { "Delete session", "删除会话", "刪除工作階段" },
+    palette_hint_delete_session => {
+        "Delete the open session",
+        "删除当前会话",
+        "刪除目前的工作階段"
+    },
+    palette_cmd_switch_runtime => { "Switch runtime", "切换运行时", "切換執行階段" },
+    palette_hint_switch_runtime => {
+        "Pick the Agent runtime and model",
+        "选择 Agent 运行时和模型",
+        "選擇 Agent 執行階段與模型"
+    },
+    palette_cmd_probe_runtimes => { "Probe runtimes", "探测运行时", "探測執行階段" },
+    palette_hint_probe_runtimes => {
+        "Re-discover available Agents",
+        "重新发现可用的 Agent",
+        "重新探索可用的 Agent"
+    },
+    palette_cmd_devices => { "Devices", "设备", "裝置" },
+    palette_hint_devices => { "Pair and revoke devices", "配对与吊销设备", "配對與撤銷裝置" },
+    palette_cmd_pair_device => { "Pair a device", "配对设备", "配對裝置" },
+    palette_hint_pair_device => {
+        "Issue a one-time pairing code",
+        "生成一次性配对码",
+        "產生一次性配對碼"
+    },
+    palette_cmd_reload_keys => { "Reload key bindings", "重新加载键位", "重新載入鍵位" },
+    palette_hint_reload_keys => {
+        "Re-read tui-keys.toml",
+        "重新读取 tui-keys.toml",
+        "重新讀取 tui-keys.toml"
+    },
+    palette_cmd_refresh => { "Refresh", "刷新", "重新整理" },
+    palette_hint_refresh => {
+        "Re-read the current page",
+        "重新读取当前页面",
+        "重新讀取目前頁面"
+    },
+    palette_cmd_quit => { "Quit", "退出", "結束" },
+    palette_hint_quit => { "Leave the TUI", "离开 TUI", "離開 TUI" },
     overlay_confirm_title => { "Please confirm", "请确认", "請確認" },
     overlay_prompt_title => { "Input", "输入", "輸入" },
     toast_permission_denied => {

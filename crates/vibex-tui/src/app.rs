@@ -873,8 +873,6 @@ pub struct App {
     pub hovered_modal_close: bool,
     /// Which sent message the composer's history drawer points at.
     pub history_selection: usize,
-    /// Commands run from the palette, most recent first.
-    pub recent_commands: Vec<String>,
     /// The mouse selection over the transcript, while it is being made or after
     /// it has been copied.
     pub text_selection: Option<TextSelection>,
@@ -1463,7 +1461,6 @@ impl App {
             hovered_row_action: None,
             hovered_modal_close: false,
             history_selection: 0,
-            recent_commands: options.remembered.recent_commands.clone(),
             text_selection: None,
             draft_selecting: false,
             dock_open: false,
@@ -2282,8 +2279,8 @@ impl App {
     /// Where the interface's own settings are written.
     ///
     /// Beside the arrangement and the switcher's memory, for the same reason.
-    /// This is the file the settings surface keeps: the look, the language, the
-    /// standing workspace and the palette's recents.
+    /// This is the file the settings surface keeps: the look, the language and
+    /// the standing workspace.
     pub fn interface_preferences_path() -> Option<std::path::PathBuf> {
         if let Ok(explicit) = std::env::var("VIBEX_TUI_INTERFACE")
             && !explicit.trim().is_empty()
@@ -2375,7 +2372,6 @@ impl App {
             ),
             locale: Some(self.settings.locale.tag().to_string()),
             workspace: self.preferred_workspace.clone(),
-            recent_commands: self.recent_commands.clone(),
         }
     }
 
@@ -4334,18 +4330,7 @@ impl App {
 
     /// The palette's entries, each with the heading it is drawn under.
     pub fn palette_entries(&self, query: &str) -> Vec<crate::view::PaletteListing> {
-        crate::view::palette_matches_recent(query, self.strings, &self.recent_commands)
-    }
-
-    /// Remember a command so the palette can offer it first next time.
-    pub fn remember_command(&mut self, intent: Intent) {
-        let id = intent.id().to_string();
-        self.recent_commands.retain(|candidate| candidate != &id);
-        self.recent_commands.insert(0, id);
-        self.recent_commands.truncate(MAX_RECENT_COMMANDS);
-        // The palette leads with these next time, so they are written down
-        // where the next run reads them.
-        self.save_interface_preferences();
+        crate::view::palette_listings(query, self.strings)
     }
 
     /// Whether this click is the second of a double click.
@@ -5416,9 +5401,6 @@ impl App {
 /// How many history entries the composer's drawer will show.
 pub const MAX_HISTORY_MATCHES: usize = 100;
 
-/// How many palette commands are remembered.
-pub const MAX_RECENT_COMMANDS: usize = 8;
-
 /// Frames a first `Ctrl+C` waits for its second before forgetting.
 ///
 /// The hint on the status band counts down on the same number, so the reader
@@ -5472,7 +5454,7 @@ pub struct AppOptions {
     pub mode: vibex_ui::GpuiThemeMode,
     pub locale: Locale,
     /// What the interface itself remembered last time: the theme per
-    /// appearance, the standing workspace and the palette's recents.
+    /// appearance and the standing workspace.
     ///
     /// The composition root loads this, the way it decides the seat, so a test
     /// or a preview starts from a shape it names rather than from a home
@@ -6095,23 +6077,6 @@ mod tests {
         assert_eq!(
             theme_slot(&app.settings.themes, vibex_ui::GpuiThemeMode::Light),
             Some(light)
-        );
-    }
-
-    #[test]
-    fn remembering_a_palette_command_writes_it_for_the_next_run() {
-        use crate::interface_prefs::InterfacePreferences;
-
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("tui-interface.json");
-        let mut app = settings_app(&path);
-        app.remember_command(Intent::OpenSettings);
-        app.remember_command(Intent::GotoSessions);
-
-        let remembered = InterfacePreferences::load(Some(&path));
-        assert_eq!(
-            remembered.recent_commands,
-            vec!["goto_sessions".to_string(), "open_settings".to_string()]
         );
     }
 
