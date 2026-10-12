@@ -15,7 +15,7 @@
 
 use gpui::{
     App, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
-    Window, div, px,
+    Window, div,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::notification::{Notification, NotificationType};
@@ -111,7 +111,7 @@ pub fn push(window: &mut Window, cx: &mut App, hint: &Hint) {
             div()
                 .w_full()
                 .min_w_0()
-                .text_size(px(theme::FONT_BODY))
+                .text_size(theme::font_body())
                 .debug_selector({
                     let key = key.to_string();
                     move || key.clone()

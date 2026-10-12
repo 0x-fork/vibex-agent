@@ -25,6 +25,9 @@ pub enum SidebarRowKind {
     Folder,
     Project,
     Workspace,
+    /// A session group row. Like a folder it collapses, but its children are
+    /// the members of a desktop pane layout rather than a directory tree.
+    Group,
     /// Presentation-only child for an expanded workspace with nothing visible
     /// beneath it. It must never become a sidebar organization item.
     EmptyWorkspace,
@@ -104,6 +107,31 @@ pub struct SidebarRowInput<'a> {
     pub sessions: &'a [AgentSession],
     pub selected_session_id: Option<&'a VibexSessionId>,
     pub query: &'a str,
+}
+
+/// The groups the desktop would draw in one scope, in its own placement order.
+///
+/// A group is scoped to a worktree: the project-level list only offers the
+/// groups the compact hierarchy shows there, and each worktree card offers its
+/// own. Passing them to the shared projection is what makes the phone group
+/// rows land in the same order as the desktop's.
+fn group_ids_for(
+    organization: &vibex_desktop_model::SidebarOrganizationState,
+    project_id: &str,
+    workspace_id: Option<&str>,
+) -> Vec<String> {
+    organization
+        .groups
+        .iter()
+        .filter(|(_, group)| {
+            group.project_id == project_id
+                && match workspace_id {
+                    Some(workspace_id) => group.workspace_id == workspace_id,
+                    None => true,
+                }
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 fn session_matches(session: &AgentSession, query: &str) -> bool {
@@ -528,9 +556,7 @@ fn push_project_children(
         .filter(|session| session_matches(session, query))
         .map(|session| session.id.as_str().to_string())
         .collect::<Vec<_>>();
-    // Compact clients have no group row yet, so they list a group's members as
-    // ordinary sessions rather than hiding them behind a row they cannot draw.
-    let group_ids = Vec::new();
+    let group_ids = group_ids_for(organization, project_id, None);
     let project_items = sidebar_project_items_for_workspace(
         organization,
         project_id,
@@ -594,7 +620,20 @@ fn push_project_children(
                     false,
                 );
             }
-            SidebarOrganizationItem::Project(_) | SidebarOrganizationItem::Group(_) => {}
+            SidebarOrganizationItem::Group(group_id) => {
+                push_group_rows(
+                    rows,
+                    input,
+                    organization,
+                    project_id,
+                    &group_id,
+                    &project_sessions,
+                    query,
+                    depth,
+                    indent,
+                );
+            }
+            SidebarOrganizationItem::Project(_) => {}
         }
     }
 
@@ -734,7 +773,7 @@ fn push_workspace_children(
     if depth > MAX_FOLDER_DEPTH {
         return;
     }
-    let group_ids = Vec::new();
+    let group_ids = group_ids_for(organization, project_id, Some(workspace_id));
     let workspace_items = sidebar_project_items_for_workspace(
         organization,
         project_id,
@@ -797,9 +836,114 @@ fn push_workspace_children(
                     indent + theme::SIDEBAR_FOLDER_CHILD_INDENT,
                 );
             }
-            SidebarOrganizationItem::Project(_) | SidebarOrganizationItem::Group(_) => {}
+            SidebarOrganizationItem::Group(group_id) => {
+                push_group_rows(
+                    rows,
+                    input,
+                    organization,
+                    project_id,
+                    &group_id,
+                    workspace_sessions,
+                    query,
+                    depth,
+                    indent,
+                );
+            }
+            SidebarOrganizationItem::Project(_) => {}
         }
     }
+}
+
+/// One group row, plus its member sessions while it is expanded.
+///
+/// The members are the same session rows the rest of the tree draws — the phone
+/// never splits a group across panes, so there is nothing else to project.
+#[allow(clippy::too_many_arguments)]
+fn push_group_rows(
+    rows: &mut Vec<SidebarRow>,
+    input: &SidebarRowInput<'_>,
+    organization: &vibex_desktop_model::SidebarOrganizationState,
+    project_id: &str,
+    group_id: &str,
+    scope_sessions: &[&AgentSession],
+    query: &str,
+    depth: usize,
+    indent: f32,
+) {
+    let Some(group) = organization.groups.get(group_id) else {
+        return;
+    };
+    let members = group
+        .member_session_ids
+        .iter()
+        .filter_map(|session_id| {
+            scope_sessions
+                .iter()
+                .find(|session| session.id.as_str() == session_id)
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    let visible = members
+        .iter()
+        .filter(|session| session_matches(session, query))
+        .count();
+    if !query.is_empty() && visible == 0 {
+        return;
+    }
+    let collapsed = organization.collapsed_group_ids.contains(group_id);
+    rows.push(SidebarRow {
+        item: SidebarOrganizationItem::Group(group_id.to_string()),
+        kind: SidebarRowKind::Group,
+        depth,
+        indent,
+        label: group.name.clone(),
+        project_id: Some(project_id.to_string()),
+        workspace_id: Some(group.workspace_id.clone()),
+        detail: None,
+        child_count: members.len(),
+        collapsed,
+        pinned: group.pinned,
+        selected: input
+            .selected_session_id
+            .is_some_and(|selected| members.iter().any(|session| session.id == *selected)),
+        state: group_status(&members),
+        session_id: None,
+        unread: input.view.unread_session_ids.iter().any(|session_id| {
+            members
+                .iter()
+                .any(|session| session.id.as_str() == session_id)
+        }),
+        auto_continue: group.auto_continue.unwrap_or(false),
+    });
+    if collapsed && query.is_empty() {
+        return;
+    }
+    for session in members {
+        rows.push(session_row(
+            input,
+            project_id,
+            session,
+            depth + 1,
+            indent + theme::SIDEBAR_FOLDER_CHILD_INDENT,
+        ));
+    }
+}
+
+/// The state a group reports: waiting on the user outranks running, exactly as
+/// the worktree card's aggregate does.
+fn group_status(members: &[&AgentSession]) -> Option<AgentSessionState> {
+    let mut state = None;
+    for member in members {
+        match member.state {
+            AgentSessionState::NeedsInput => return Some(AgentSessionState::NeedsInput),
+            AgentSessionState::Error => state = Some(AgentSessionState::Error),
+            AgentSessionState::Running if state != Some(AgentSessionState::Error) => {
+                state = Some(AgentSessionState::Running);
+            }
+            _ => {}
+        }
+    }
+    state
 }
 
 fn session_row(
@@ -1080,6 +1224,7 @@ mod tests {
             SidebarRowKind::Folder => SidebarOrganizationItem::Folder(id.to_string()),
             SidebarRowKind::Project => SidebarOrganizationItem::Project(id.to_string()),
             SidebarRowKind::Workspace => SidebarOrganizationItem::Project(id.to_string()),
+            SidebarRowKind::Group => SidebarOrganizationItem::Group(id.to_string()),
             SidebarRowKind::EmptyWorkspace => SidebarOrganizationItem::Project(id.to_string()),
             SidebarRowKind::Session => SidebarOrganizationItem::Session(id.to_string()),
         };

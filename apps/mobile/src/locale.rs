@@ -351,9 +351,55 @@ pub fn common_for(locale: Locale, en: &'static str) -> &'static str {
         "Cut" => ("剪切", "剪下"),
         "Copy" => ("复制", "複製"),
         "Paste" => ("粘贴", "貼上"),
+        "Conversation" => ("会话", "會話"),
+        "Palette" => ("调色板", "調色盤"),
+        "Switch runtime" => ("切换运行时", "切換執行環境"),
+        "Reconnect" => ("重新连接", "重新連線"),
+        "Platform" => ("平台", "平台"),
+        "License" => ("许可协议", "授權條款"),
+        "Source code" => ("源代码", "原始碼"),
+        "Running" => ("运行中", "執行中"),
+        "Idle" => ("空闲", "閒置"),
+        "Closed" => ("已关闭", "已關閉"),
+        "Failed" => ("失败", "失敗"),
+        "Archived" => ("已归档", "已封存"),
+        "No session" => ("无会话", "無工作階段"),
+        "Optional" => ("可选", "選填"),
+        "Project" => ("项目", "專案"),
+        "Workspace" => ("工作区", "工作區"),
+        "Location" => ("位置", "位置"),
+        "Start session" => ("开始会话", "開始工作階段"),
+        "Creating..." => ("创建中…", "建立中…"),
+        "Confirm" => ("确认", "確認"),
+        "Discard" => ("放弃", "放棄"),
+        "Latest" => ("最新", "最新"),
+        "Unread" => ("未读", "未讀"),
+        "Unpin" => ("取消置顶", "取消置頂"),
+        "Searching" => ("搜索中", "搜尋中"),
+        "No matching items" => ("没有匹配项", "沒有符合的項目"),
+        "No matching files" => ("没有匹配的文件", "沒有符合的檔案"),
+        "All authors" => ("全部作者", "全部作者"),
+        "No repository" => ("没有仓库", "沒有儲存庫"),
+        "Loading history" => ("正在加载历史", "正在載入歷史"),
+        "No commits found" => ("没有找到提交", "找不到提交"),
+        "results" => ("条结果", "筆結果"),
+        "Select changes" => ("选择更改", "選擇變更"),
+        "Unknown" => ("未知", "未知"),
+        "Device name" => ("设备名称", "裝置名稱"),
+        "Load more" => ("加载更多", "載入更多"),
+        "Loading..." => ("加载中…", "載入中…"),
         _ => return en,
     };
     text_for(locale, en, zh_cn, zh_tw)
+}
+
+/// A value label that came from a `label()` accessor rather than a locale key.
+///
+/// `AppearanceMode::label` and `LanguagePreference::label` are identifiers, not
+/// copy: the theme row localized "System" and the language row next to it
+/// printed the raw English, in the same list.
+pub fn localized_label(label: &'static str) -> String {
+    common(label).to_string()
 }
 
 pub fn common(en: &'static str) -> &'static str {

@@ -7,8 +7,9 @@
 //! these accessors instead of hardcoding colors.
 
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::time::Duration;
 
-use gpui::{Anchor, App, Hsla, Pixels, Rgba, Window, hsla, px, rgb};
+use gpui::{Anchor, App, Hsla, Pixels, Rems, Rgba, Window, hsla, px, rems, rgb};
 use gpui_component::{Edges, Theme, ThemeMode as ComponentThemeMode};
 use vibex_desktop_model::ThemeSelection;
 use vibex_ui::{
@@ -144,6 +145,11 @@ fn mode_slot(mode: GpuiThemeMode) -> &'static AtomicUsize {
     }
 }
 
+/// The catalog mode the current appearance resolves to.
+pub fn mode(dark: bool) -> GpuiThemeMode {
+    model_mode(dark)
+}
+
 fn model_mode(dark: bool) -> GpuiThemeMode {
     if dark {
         GpuiThemeMode::Dark
@@ -240,45 +246,158 @@ pub const TOAST_MAX_WIDTH: f32 = 420.0;
 /// they cover the content they are talking about.
 pub const TOAST_MAX_VISIBLE: usize = 3;
 
-pub const FONT_APP_TITLE: f32 = 28.0;
-pub const FONT_HEADING: f32 = 13.0;
-pub const FONT_BODY: f32 = 12.0;
-pub const FONT_DETAIL: f32 = 12.0;
-pub const FONT_CAPTION: f32 = 11.0;
-/// Metadata that must not compete with the caption it annotates (timestamps,
-/// workspace paths, row counts).
-pub const FONT_MICRO: f32 = 10.0;
+/// The rem the ladder below is expressed against. Every value in the type
+/// scale is a logical pixel *at the default rem*; [`ui_rems`] converts it, so
+/// the whole interface tracks the platform's accessibility text scaling the
+/// same way `apps/desktop/src/typography.rs` makes the shell track it.
+pub const UI_REM: f32 = 16.0;
+
+/// Page-level title on a full-screen surface (a settings sub-page, the new
+/// session page). One step above [`FONT_TITLE`].
+pub const FONT_APP_TITLE: f32 = 22.0;
+/// The title of a surface or a hero row.
+pub const FONT_TITLE: f32 = 20.0;
+/// A section's own heading — strictly above the rows it groups.
+pub const FONT_HEADING: f32 = 17.0;
+/// Conversation text and every primary row label.
+pub const FONT_BODY: f32 = 16.0;
+/// Supporting text under a primary label: row details, timeline metadata.
+pub const FONT_DETAIL: f32 = 14.0;
+/// Captions, chips, and button labels.
+pub const FONT_CAPTION: f32 = 13.0;
+/// The floor of the ladder: timestamps, counts, badges. Never below the
+/// 12sp Android minimum.
+pub const FONT_MICRO: f32 = 12.0;
 
 // The sidebar preserves the desktop hierarchy at one denser mobile type step
 // so a full project tree remains scannable on a phone.
-pub const FONT_SIDEBAR_TITLE: f32 = 15.0;
-pub const FONT_SIDEBAR_ROW: f32 = 13.0;
-pub const FONT_SIDEBAR_META: f32 = 11.0;
+pub const FONT_SIDEBAR_TITLE: f32 = 17.0;
+pub const FONT_SIDEBAR_ROW: f32 = 15.0;
+pub const FONT_SIDEBAR_META: f32 = 13.0;
+
+/// The rem ladder. Views must reach for these instead of `px(theme::FONT_*)`,
+/// which ignores the platform's text-scaling setting.
+pub fn ui_rems(value: f32) -> Rems {
+    rems(value / UI_REM)
+}
+
+pub fn font_app_title() -> Rems {
+    ui_rems(FONT_APP_TITLE)
+}
+
+pub fn font_title() -> Rems {
+    ui_rems(FONT_TITLE)
+}
+
+pub fn font_heading() -> Rems {
+    ui_rems(FONT_HEADING)
+}
+
+pub fn font_body() -> Rems {
+    ui_rems(FONT_BODY)
+}
+
+pub fn font_detail() -> Rems {
+    ui_rems(FONT_DETAIL)
+}
+
+pub fn font_caption() -> Rems {
+    ui_rems(FONT_CAPTION)
+}
+
+pub fn font_micro() -> Rems {
+    ui_rems(FONT_MICRO)
+}
+
+pub fn font_sidebar_title() -> Rems {
+    ui_rems(FONT_SIDEBAR_TITLE)
+}
+
+pub fn font_sidebar_row() -> Rems {
+    ui_rems(FONT_SIDEBAR_ROW)
+}
+
+pub fn font_sidebar_meta() -> Rems {
+    ui_rems(FONT_SIDEBAR_META)
+}
+
+/// Line height for a step of the ladder: 1.45× the font, rounded to a whole
+/// logical pixel so baselines land on the touch grid.
+pub fn line_height_for(font: f32) -> Pixels {
+    px((font * 1.45).round())
+}
 
 pub const ICON_MD: f32 = 18.0;
 pub const ICON_SM: f32 = 16.0;
 pub const ICON_STATUS: f32 = 6.0;
+/// The plate behind a settings row's glyph.
+pub const ICON_SLOT: f32 = 34.0;
+/// A settings row is title + detail, so it is taller than a single-line list
+/// row while staying a single touch target.
+pub const SETTINGS_ROW_HEIGHT: f32 = 60.0;
 
 // ---------------------------------------------------------------------------
 // Layout
 // ---------------------------------------------------------------------------
 
 /// The compact top bar stays below the native status-bar inset supplied by GPUI.
-pub const HEADER_HEIGHT: f32 = 40.0;
-pub const HEADER_BUTTON_SIZE: f32 = 40.0;
+pub const HEADER_HEIGHT: f32 = 48.0;
+/// Every header control is a full touch target, not the 40px the phone used to
+/// reserve: the audit measured those under the platform minimum.
+pub const HEADER_BUTTON_SIZE: f32 = 44.0;
 /// Drawer and overlay headers have a little more room for the compact action
 /// cluster while the session page keeps the shorter workbench header.
-pub const DRAWER_HEADER_HEIGHT: f32 = 52.0;
+pub const DRAWER_HEADER_HEIGHT: f32 = 56.0;
 /// Minimum tappable edge for controls that are not header buttons.
 pub const TOUCH_TARGET: f32 = 44.0;
 /// Caps centered panel content so tablets do not stretch a phone layout.
 pub const CARD_WIDTH: f32 = 300.0;
 
-pub const RADIUS_CARD: f32 = 8.0;
-pub const RADIUS_CONTROL: f32 = 6.0;
+pub const RADIUS_CARD: f32 = 10.0;
+pub const RADIUS_CONTROL: f32 = 8.0;
+/// Pills, chips, and the composer's own container.
+pub const RADIUS_PILL: f32 = 999.0;
 
-pub const DRAWER_ROW_HEIGHT: f32 = 52.0;
-pub const SIDEBAR_ROW_HEIGHT: f32 = 44.0;
+pub const DRAWER_ROW_HEIGHT: f32 = 56.0;
+/// A phone row is a touch target first: the desktop's 32/40px rows put the
+/// label and the trailing metadata within a few pixels of each other.
+pub const SIDEBAR_ROW_HEIGHT: f32 = 48.0;
+
+// ---------------------------------------------------------------------------
+// Motion
+//
+// Every animation runs through [`motion_ms`], so the Reduce Motion preference
+// collapses the whole interface in one place instead of per call site.
+// ---------------------------------------------------------------------------
+
+/// The fastest transition the phone uses: a pressed plate, a chip selection.
+pub const MOTION_FAST_MS: u64 = 120;
+/// A page or sheet entering or leaving.
+pub const MOTION_BASE_MS: u64 = 200;
+/// A large surface travelling the width of the viewport.
+pub const MOTION_SLOW_MS: u64 = 280;
+
+static REDUCE_MOTION: AtomicU8 = AtomicU8::new(0);
+
+/// Applies the persisted Reduce Motion preference. Called at startup and when
+/// the setting changes.
+pub fn set_reduce_motion(reduce: bool) {
+    REDUCE_MOTION.store(reduce as u8, Ordering::Relaxed);
+}
+
+pub fn reduce_motion() -> bool {
+    REDUCE_MOTION.load(Ordering::Relaxed) == 1
+}
+
+/// A duration honouring Reduce Motion: zero when the preference is on, so
+/// `with_animation` paints the final frame immediately.
+pub fn motion_ms(base: u64) -> Duration {
+    if reduce_motion() {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(base)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Sidebar tree geometry
@@ -463,8 +582,17 @@ pub fn primary_foreground() -> Hsla {
 
 /// Status and chart accents stay identical across both appearances, matching
 /// the desktop right-rail tones.
-pub fn accent_green() -> Hsla {
+///
+/// `accent_success` names the role a successful/connected state paints with.
+/// The shared catalog has no `success` semantic token yet, so it resolves the
+/// same `chart-2` tone the desktop right rail uses for the same state — the
+/// name is what the call sites should depend on, not the token behind it.
+pub fn accent_success() -> Hsla {
     tone("chart-2")
+}
+
+pub fn accent_green() -> Hsla {
+    accent_success()
 }
 
 pub fn accent_blue() -> Hsla {
@@ -550,6 +678,30 @@ pub fn sidebar_foreground(alpha: f32) -> Hsla {
     color
 }
 
+// The ladder below replaces the flat 56%/48%/45%/35% the drawer used to fade
+// with. At 11–13px those shades measured 3.7:1 down to 2.1:1 on the light
+// palette; the desktop's own session row runs 88% light / 72% dark, which is
+// where these values come from.
+/// A session row's title.
+pub fn sidebar_session_title() -> Hsla {
+    sidebar_foreground(if is_dark() { 0.72 } else { 0.88 })
+}
+
+/// The timestamp, path, or count trailing a session row.
+pub fn sidebar_session_meta() -> Hsla {
+    sidebar_foreground(if is_dark() { 0.62 } else { 0.66 })
+}
+
+/// A placeholder written where content will be ("No sessions yet").
+pub fn sidebar_placeholder() -> Hsla {
+    sidebar_foreground(if is_dark() { 0.54 } else { 0.58 })
+}
+
+/// A row that is present but deliberately recessive (an archived session).
+pub fn sidebar_archived() -> Hsla {
+    sidebar_foreground(if is_dark() { 0.46 } else { 0.52 })
+}
+
 pub fn sidebar_card_focus_border() -> Hsla {
     let mut color = tone("sidebar-ring");
     color.a = if is_dark() { 0.42 } else { 0.45 };
@@ -561,6 +713,21 @@ pub fn sidebar_tree_guide() -> Hsla {
     let mut color = opaque("sidebar-border", "sidebar");
     color.a = 0.70;
     color
+}
+
+/// The switch track when it is on.
+pub fn switch_track_on() -> Hsla {
+    tone("primary")
+}
+
+/// The switch track when it is off.
+pub fn switch_track_off() -> Hsla {
+    opaque("muted", "card")
+}
+
+/// The switch knob: the surface colour, so it reads as a hole in the track.
+pub fn switch_thumb() -> Hsla {
+    tone("background")
 }
 
 pub fn backdrop(opacity: f32) -> Hsla {

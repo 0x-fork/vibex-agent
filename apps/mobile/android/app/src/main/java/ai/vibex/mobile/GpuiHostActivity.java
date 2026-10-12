@@ -236,8 +236,23 @@ public final class GpuiHostActivity extends Activity {
                     event.getKeyCode(),
                     action == KeyEvent.ACTION_DOWN ? 0 : 1,
                     event.getMetaState());
+            // Every key is consumed so GPUI sees it, BACK included. When the
+            // app has nothing left to close it calls gpuiBackgroundApp()
+            // instead of relying on the framework's own back handling, which
+            // this branch would otherwise swallow.
         }
         return true;
+    }
+
+    /**
+     * Moves the task to the background.
+     *
+     * Called by the Rust shell when the back key/gesture reaches the root with
+     * no screen left to close. Without it the Activity consumed BACK forever
+     * and the app could not be left with the back gesture at all.
+     */
+    public void gpuiBackgroundApp() {
+        runOnUiThread(() -> moveTaskToBack(true));
     }
 
     // ── software keyboard ────────────────────────────────────────────────────

@@ -18,7 +18,7 @@ use gpui::{
     ListAlignment, ListOffset, ListState, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _,
     Pixels, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchPhase,
     Transformation, UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint,
-    img, list, percentage, point, prelude::*, px, rgb, svg, uniform_list,
+    img, list, percentage, point, prelude::*, px, relative, rgb, svg, uniform_list,
 };
 use vibex_app_update::{UpdateSnapshot, UpdateState};
 use vibex_backend::{
@@ -46,7 +46,7 @@ use vibex_core::{
 use vibex_desktop_model::{
     NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice, RuntimeCascadeProjection,
     SidebarHierarchyMode, SidebarOrganizationItem, SidebarOrganizationView, SidebarProjectLogo,
-    SidebarProjectLogoColor, SidebarState, TimelineConversationTurn, TimelineModel,
+    SidebarProjectLogoColor, SidebarState, ThemeSelection, TimelineConversationTurn, TimelineModel,
     TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
 };
 use vibex_remote_client::{
@@ -82,6 +82,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader};
 use gpui_component::input::TextareaState;
 use gpui_component::input::{Input, InputState, Textarea};
+use gpui_component::progress::ProgressCircle;
 use gpui_component::shimmer::ShimmerText;
 use gpui_component::{Disableable as _, StyledExt as _};
 
@@ -167,6 +168,11 @@ fn install_timeline_scroll_handler(state: &ListState, owner: WeakEntity<MobileAp
         };
         let _ = owner.update(cx, |app, cx| {
             app.timeline_viewport = Some(viewport);
+            // Follow is the reader's decision, not a measurement taken while
+            // the Agent is streaming: a turn that grows by a line per frame
+            // kept re-qualifying as "near the bottom" and pulled the list back
+            // under a finger that had just scrolled up.
+            app.timeline_follow = app.timeline_is_near_bottom();
             app.prefetch_older_history_if_near_top(cx);
         });
     });
@@ -193,8 +199,47 @@ fn should_present_agent_notification(
     workbench_open: bool,
     selected_session_id: Option<&VibexSessionId>,
     target_session_id: &VibexSessionId,
+    preferences: &NotificationPreferences,
 ) -> bool {
-    app_backgrounded || workbench_open || selected_session_id != Some(target_session_id)
+    if !preferences.enabled {
+        return false;
+    }
+    if !(app_backgrounded || workbench_open || selected_session_id != Some(target_session_id)) {
+        return false;
+    }
+    true
+}
+
+/// The notification categories the phone is allowed to raise.
+#[derive(Clone, Copy, Debug)]
+struct NotificationPreferences {
+    enabled: bool,
+    completed: bool,
+    needs_input: bool,
+    failed: bool,
+}
+
+impl From<&AppSettings> for NotificationPreferences {
+    fn from(settings: &AppSettings) -> Self {
+        Self {
+            enabled: settings.notifications,
+            completed: settings.notify_completed,
+            needs_input: settings.notify_needs_input,
+            failed: settings.notify_failed,
+        }
+    }
+}
+
+impl NotificationPreferences {
+    /// Whether one event's category is switched on.
+    fn allows(&self, notification: &vibex_core::AgentNotificationIntent) -> bool {
+        use vibex_core::AgentNotificationKind as Kind;
+        match notification.kind {
+            Kind::TurnCompleted => self.completed,
+            Kind::ApprovalRequired { .. } | Kind::InputRequired { .. } => self.needs_input,
+            Kind::TurnFailed => self.failed,
+        }
+    }
 }
 
 fn sidebar_refresh_required(event: &BackendEvent) -> bool {
@@ -554,8 +599,10 @@ enum DrawerPage {
 /// `InputState` only accepts programmatic edits through a `&mut Window`, and
 /// several call sites live in paths that have none. Those record the write here
 /// and `MobileApp::render` lands it on the next paint.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputField {
+    /// The session composer's own draft, restored when a session is opened.
+    Composer,
     PairingServerUrl,
     PairingCode,
     NewSessionTitle,
@@ -564,6 +611,47 @@ enum InputField {
     SessionAction,
     /// The runtime rename sheet's field.
     HostName,
+}
+
+/// Which page of Settings is on screen.
+///
+/// Settings used to be one flat scroll that could not grow: everything the
+/// phone needed had to fit between Connection and About. A page per topic keeps
+/// each one short enough to read on a phone and lets a topic gain rows without
+/// pushing another off the bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    Root,
+    Connection,
+    Appearance,
+    Conversation,
+    Notifications,
+    About,
+}
+
+impl SettingsPage {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Root => "Settings",
+            Self::Connection => "Runtime",
+            Self::Appearance => "Appearance",
+            Self::Conversation => "Conversation",
+            Self::Notifications => "Notifications",
+            Self::About => "About",
+        }
+    }
+
+    /// The localized page title as a `'static` string.
+    fn title_copy(self) -> &'static str {
+        match self {
+            Self::Root => locale::common("Settings"),
+            Self::Connection => locale::common("Runtime"),
+            Self::Appearance => locale::common("Appearance"),
+            Self::Conversation => locale::common("Conversation"),
+            Self::Notifications => locale::common("Notifications"),
+            Self::About => locale::common("About"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -949,10 +1037,17 @@ fn system_appearance_is_dark(cx: &App) -> bool {
 /// process-wide resolvers. Called at startup and whenever a setting changes.
 /// Mobile settings take precedence when they exist; absent values follow the
 /// platform.
-fn apply_app_settings(settings: &AppSettings, cx: &App) {
+fn apply_app_settings(settings: &AppSettings, window: &mut Window, cx: &mut App) {
     theme::set_appearance_mode(settings.theme.unwrap_or_default());
     theme::set_system_dark(system_appearance_is_dark(cx));
     locale::set_preference(settings.language.unwrap_or_default());
+    theme::set_reduce_motion(settings.reduce_motion);
+    theme::set_theme_selection(&settings.theme_selection);
+    // The kit's own components (inputs, sheets, notification layer) read the
+    // theme global, and it was only ever applied at startup: changing the
+    // appearance repainted the hand-built rows and left every kit control on
+    // the palette the process booted with.
+    theme::apply_component_theme(Some(window), cx);
 }
 
 // Pops the topmost screen from the app's back-navigation stack. Bound to the
@@ -965,8 +1060,8 @@ pub fn bind_keys(cx: &mut App) {
         // gpui-pre-mobile reports Android's back key/gesture as "escape" (see
         // `gpui_mobile::android::keyboard`); the "back" alias stays bound so the
         // same action still works anywhere that emits it. It pops the topmost
-        // screen; at the root the host Activity already falls back to its own
-        // back behavior.
+        // screen, and at the root it backgrounds the app itself
+        // (`crate::platform::leave_app`).
         KeyBinding::new("escape", NavigateBack, None),
         KeyBinding::new("back", NavigateBack, None),
     ]);
@@ -1034,9 +1129,22 @@ pub struct MobileApp {
     /// observed in an async task with no window, so the check-and-write is
     /// deferred to the next paint.
     pending_composer_restore: Option<String>,
+    /// One draft per session.
+    ///
+    /// The composer used to be a single buffer that survived a session switch,
+    /// so half a sentence typed in A was sent to B's agent on the next Send.
+    /// Drafts are held per session id and swapped on open, the way the desktop
+    /// composer store does it.
+    composer_drafts: BTreeMap<String, String>,
     timeline_turns: Arc<Vec<TimelineConversationTurn>>,
     timeline_markdown_views: TimelineMarkdownViews,
     pending_user_message: Option<PendingMobileUserMessage>,
+    /// The open session's token counters, as last reported by the desktop.
+    /// The composer's ring is the only surface for them on a phone.
+    token_usage: Option<vibex_core::AgentTokenUsage>,
+    /// Guards an out-of-order token-usage answer from a session that is no
+    /// longer open.
+    token_usage_generation: u64,
     timeline_metadata_tip: Option<TimelineMetadataTip>,
     attachment_preview: Option<MobileAttachmentPreview>,
     attachment_preview_loading: Option<String>,
@@ -1056,12 +1164,21 @@ pub struct MobileApp {
     /// while its state is borrowed, so the prefetch path reads this instead of
     /// asking the list where it is.
     timeline_viewport: Option<TimelineViewport>,
+    /// Whether the transcript keeps following new output. Set by the reader's
+    /// own scrolling, so streaming cannot drag the list back to the end while
+    /// they are reading something above it.
+    timeline_follow: bool,
     /// The rows that have already had their detail read back, and the ones
     /// being read now. Opening the same activity twice pays for one read.
     timeline_detail_ready: BTreeSet<i64>,
     timeline_detail_in_flight: BTreeSet<i64>,
     drawer_scroll: UniformListScrollHandle,
     settings_scroll: ScrollHandle,
+    /// The Settings page on screen. Reset to the root every time the overlay
+    /// opens, so the sheet never reappears three levels deep.
+    settings_page: SettingsPage,
+    /// Whether the palette picker is over the Appearance page.
+    settings_palette_open: bool,
     sidebar_search_input: Entity<InputState>,
     sidebar_search_open: bool,
     sidebar_projects_initialized: bool,
@@ -1107,9 +1224,14 @@ pub struct MobileApp {
     /// The runtime a host overlay (detail, actions, rename, remove) refers to.
     host_overlay_target: Option<String>,
     host_name_input: Entity<InputState>,
-    elicitation_request_id: Option<RequestId>,
-    elicitation_inputs: BTreeMap<String, Entity<InputState>>,
-    elicitation_draft: Option<ElicitationFormDraft>,
+    /// Requests whose fields have live inputs, so a second elicitation that
+    /// arrives while the first is open gets its own form instead of a blank
+    /// rectangle.
+    elicitation_form_requests: BTreeSet<String>,
+    /// Keyed by request id and field id: the same field id appears in more
+    /// than one concurrent request.
+    elicitation_inputs: BTreeMap<(String, String), Entity<InputState>>,
+    elicitation_drafts: BTreeMap<String, ElicitationFormDraft>,
     pending_input_writes: Vec<(InputField, String)>,
     pairing_busy: bool,
     pairing_action: Option<PairingAction>,
@@ -1141,7 +1263,7 @@ pub struct MobileApp {
     new_session_workspace_mode: WorkspaceMode,
     new_session_runtime: Option<SessionRuntimeSelection>,
     new_session_title_input: Entity<InputState>,
-    new_session_prompt_input: Entity<InputState>,
+    new_session_prompt_input: Entity<TextareaState>,
     new_project_input: Entity<InputState>,
     new_project_busy: bool,
     new_project_error: Option<String>,
@@ -1238,6 +1360,387 @@ impl Focusable for MobileApp {
     }
 }
 
+/// One member of the open session's group, as the tab strip draws it.
+type SessionGroupTabs = (String, Vec<(VibexSessionId, String, AgentSessionState)>);
+
+/// The colour a session state paints with, shared by every status surface so
+/// "waiting on you" never looks like "idle".
+fn session_state_color(state: AgentSessionState) -> gpui::Hsla {
+    match state {
+        AgentSessionState::Running => theme::accent_success(),
+        AgentSessionState::NeedsInput => theme::accent_yellow(),
+        AgentSessionState::Error => theme::accent_red(),
+        AgentSessionState::Archived => theme::sidebar_archived(),
+        _ => theme::text_muted(),
+    }
+}
+
+/// How full the reported context window is, when the Agent reported both ends.
+fn token_usage_fraction(usage: &vibex_core::AgentTokenUsage) -> Option<f32> {
+    let used = usage.context_window_used_tokens?;
+    let size = usage.context_window_size_tokens?;
+    if size == 0 {
+        return None;
+    }
+    Some(((used as f64 / size as f64).clamp(0.0, 1.0)) as f32)
+}
+
+/// `12345` reads as `12.3k`: a ring on a phone has no room for a digit run.
+fn format_compact_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// The palette id a `ThemeSelection` names for one appearance, if any.
+fn theme_selection_id(selection: &ThemeSelection, dark: bool) -> Option<&str> {
+    if dark {
+        selection.dark()
+    } else {
+        selection.light()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settings row primitives
+//
+// Every settings surface is built from these four rows, so a reader learns one
+// row shape instead of the six the flat list used to mix. A row that opens a
+// page always shows a chevron; a row that only reports never does.
+// ---------------------------------------------------------------------------
+
+/// The switch a settings row ends with. The track fades toward the primary
+/// role when it is on instead of flipping between two unrelated accents.
+fn settings_toggle(value: bool) -> gpui::AnyElement {
+    div()
+        .flex_shrink_0()
+        .w(px(44.0))
+        .h(px(26.0))
+        .rounded_full()
+        .bg(if value {
+            theme::switch_track_on()
+        } else {
+            theme::switch_track_off()
+        })
+        .border_1()
+        .border_color(theme::border_default())
+        .flex()
+        .items_center()
+        .when(value, |track| track.justify_end())
+        .when(!value, |track| track.justify_start())
+        .px(px(2.0))
+        .child(
+            div()
+                .size(px(20.0))
+                .rounded_full()
+                .bg(theme::switch_thumb())
+                .when(value, |thumb| {
+                    thumb.shadow(vec![gpui::BoxShadow {
+                        color: theme::backdrop(0.25),
+                        offset: gpui::point(px(0.0), px(1.0)),
+                        blur_radius: px(2.0),
+                        spread_radius: px(0.0),
+                        inset: false,
+                    }])
+                }),
+        )
+        .into_any_element()
+}
+
+/// A titled group of rows. The rows inside share one plate and are separated by
+/// inset dividers instead of each carrying its own border.
+fn settings_group(
+    title: impl Into<gpui::SharedString>,
+    rows: Vec<gpui::AnyElement>,
+) -> gpui::AnyElement {
+    div()
+        .w_full()
+        .mb(px(theme::SPACING_LG))
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .px(px(theme::SPACING_XS))
+                .pb(px(theme::SPACING_SM))
+                .text_size(theme::font_caption())
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::text_muted())
+                .child(title.into()),
+        )
+        .child(
+            div()
+                .w_full()
+                .rounded(px(theme::RADIUS_CARD))
+                .border_1()
+                .border_color(theme::border_subtle())
+                .bg(theme::bg_card())
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .children(rows),
+        )
+        .into_any_element()
+}
+
+/// The leading glyph slot every settings row shares.
+fn settings_row_icon(path: &'static str, accent: gpui::Hsla) -> gpui::AnyElement {
+    div()
+        .size(px(theme::ICON_SLOT))
+        .flex_shrink_0()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .bg(accent.opacity(0.14))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(svg().path(path).size(px(theme::ICON_SM)).text_color(accent))
+        .into_any_element()
+}
+
+/// Title over detail, the shape every row in this page uses.
+fn settings_row_labels(title: String, detail: String) -> gpui::AnyElement {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_size(theme::font_body())
+                .text_color(theme::text_primary())
+                .child(title),
+        )
+        .when(!detail.is_empty(), |labels| {
+            labels.child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(theme::font_micro())
+                    .text_color(theme::text_muted())
+                    .child(detail),
+            )
+        })
+        .into_any_element()
+}
+
+fn settings_row_frame(id: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .w_full()
+        .min_h(px(theme::SETTINGS_ROW_HEIGHT))
+        .px(px(theme::SPACING_MD))
+        .py(px(theme::SPACING_SM))
+        .flex()
+        .items_center()
+        .gap(px(theme::SPACING_MD))
+        .border_b_1()
+        .border_color(theme::border_subtle())
+}
+
+/// A row that opens a page or runs an action.
+fn settings_nav_row(
+    id: &'static str,
+    icon: &'static str,
+    title: String,
+    detail: String,
+    accent: gpui::Hsla,
+    handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::AnyElement {
+    settings_row_frame(id)
+        .cursor_pointer()
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .on_mouse_up(MouseButton::Left, handler)
+        .child(settings_row_icon(icon, accent))
+        .child(settings_row_labels(title, detail))
+        .child(
+            svg()
+                .path("icons/chevron-right.svg")
+                .size(px(theme::ICON_SM))
+                .text_color(theme::text_muted()),
+        )
+        .into_any_element()
+}
+
+/// A row that only reports a value.
+fn settings_value_row(
+    id: &'static str,
+    icon: &'static str,
+    title: String,
+    detail: String,
+    accent: gpui::Hsla,
+) -> gpui::AnyElement {
+    settings_row_frame(id)
+        .child(settings_row_icon(icon, accent))
+        .child(settings_row_labels(title, detail))
+        .into_any_element()
+}
+
+/// A row whose control is the switch itself.
+fn settings_switch_row(
+    id: &'static str,
+    icon: &'static str,
+    title: String,
+    detail: String,
+    value: bool,
+    enabled: bool,
+    handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::AnyElement {
+    let frame = settings_row_frame(id)
+        .child(settings_row_icon(
+            icon,
+            if value {
+                theme::primary()
+            } else {
+                theme::text_muted()
+            },
+        ))
+        .child(settings_row_labels(title, detail))
+        .child(settings_toggle(value));
+    if enabled {
+        frame
+            .cursor_pointer()
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .on_mouse_up(MouseButton::Left, handler)
+            .into_any_element()
+    } else {
+        frame.opacity(0.45).into_any_element()
+    }
+}
+
+/// A destructive row, visually separated from the rest of its page.
+fn settings_danger_note(
+    id: &'static str,
+    title: &'static str,
+    detail: &'static str,
+    handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .debug_selector(|| "mobile-settings-disconnect".to_string())
+        .w_full()
+        .min_h(px(theme::TOUCH_TARGET))
+        .mb(px(theme::SPACING_LG))
+        .rounded(px(theme::RADIUS_CARD))
+        .border_1()
+        .border_color(theme::accent_red().opacity(0.55))
+        .px(px(theme::SPACING_MD))
+        .py(px(theme::SPACING_SM))
+        .flex()
+        .flex_col()
+        .justify_center()
+        .gap(px(2.0))
+        .cursor_pointer()
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .on_mouse_up(MouseButton::Left, handler)
+        .child(
+            div()
+                .text_size(theme::font_body())
+                .text_color(theme::accent_red())
+                .child(title),
+        )
+        .child(
+            div()
+                .text_size(theme::font_micro())
+                .text_color(theme::text_muted())
+                .child(detail),
+        )
+        .into_any_element()
+}
+
+/// One choice on the new-session page: an icon, a label, and the value it is
+/// currently set to. Chips rather than full rows, so the page reads as a
+/// composer with options instead of a form.
+fn new_session_chip(
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    value: String,
+    warn: bool,
+    handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .max_w_full()
+        .h(px(theme::TOUCH_TARGET))
+        .px(px(theme::SPACING_MD))
+        .rounded_full()
+        .border_1()
+        .border_color(if warn {
+            theme::accent_yellow()
+        } else {
+            theme::border_default()
+        })
+        .bg(theme::bg_card())
+        .flex()
+        .items_center()
+        .gap(px(theme::SPACING_SM))
+        .cursor_pointer()
+        .aria_label(value.clone())
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .on_mouse_up(MouseButton::Left, handler)
+        .child(
+            svg()
+                .path(icon)
+                .size(px(theme::ICON_SM))
+                .text_color(theme::text_muted()),
+        )
+        .child(
+            div()
+                .text_size(theme::font_micro())
+                .text_color(theme::text_muted())
+                .child(label),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .max_w(px(180.0))
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_size(theme::font_caption())
+                .text_color(if warn {
+                    theme::accent_yellow()
+                } else {
+                    theme::text_primary()
+                })
+                .child(value),
+        )
+}
+
+fn settings_hint_note(text: &'static str) -> gpui::AnyElement {
+    div()
+        .w_full()
+        .px(px(theme::SPACING_XS))
+        .pb(px(theme::SPACING_LG))
+        .text_size(theme::font_micro())
+        .text_color(theme::text_muted())
+        .child(text)
+        .into_any_element()
+}
+
+fn settings_empty_note(text: &'static str) -> gpui::AnyElement {
+    div()
+        .w_full()
+        .py(px(theme::SPACING_XL))
+        .px(px(theme::SPACING_XS))
+        .text_size(theme::font_detail())
+        .text_color(theme::text_muted())
+        .child(text)
+        .into_any_element()
+}
+
 fn timeline_action_button(
     id: impl Into<ElementId>,
     icon: &'static str,
@@ -1275,13 +1778,45 @@ impl MobileApp {
         // The System preference follows the platform, so the observer only needs
         // to run while the stored preference defers to the OS.
         self._appearance_subscription = if theme::follows_system() {
-            Some(cx.observe_window_appearance(_window, |_this, _window, cx| {
+            Some(cx.observe_window_appearance(_window, |_this, window, cx| {
                 theme::set_system_dark(system_appearance_is_dark(cx));
+                theme::apply_component_theme(Some(window), cx);
                 cx.notify();
             }))
         } else {
             None
         };
+        theme::apply_component_theme(Some(_window), cx);
+        self.persist_app_settings(cx);
+    }
+
+    /// Records a light or dark palette choice and repaints both the hand-built
+    /// rows and the kit components from it.
+    fn update_theme_selection(
+        &mut self,
+        select: impl FnOnce(&mut ThemeSelection),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut selection = self.app_settings.theme_selection.clone();
+        select(&mut selection);
+        self.app_settings.theme_selection = selection;
+        theme::set_theme_selection(&self.app_settings.theme_selection);
+        theme::apply_component_theme(Some(window), cx);
+        self.persist_app_settings(cx);
+    }
+
+    /// Cycles the language from a settings row, which has no window to give.
+    fn cycle_language_setting(&mut self, cx: &mut Context<Self>) {
+        let current = self.app_settings.language.unwrap_or_default();
+        let next = match current {
+            locale::LanguagePreference::System => locale::LanguagePreference::En,
+            locale::LanguagePreference::En => locale::LanguagePreference::ZhCn,
+            locale::LanguagePreference::ZhCn => locale::LanguagePreference::ZhTw,
+            locale::LanguagePreference::ZhTw => locale::LanguagePreference::System,
+        };
+        self.app_settings.language = Some(next);
+        locale::set_preference(next);
         self.persist_app_settings(cx);
     }
 
@@ -1330,7 +1865,7 @@ impl MobileApp {
         let app_settings = storage
             .load_app_settings()
             .unwrap_or_else(|_| AppSettings::default());
-        apply_app_settings(&app_settings, cx);
+        apply_app_settings(&app_settings, window, cx);
         let appearance_subscription = if theme::follows_system() {
             Some(cx.observe_window_appearance(window, |_this, _window, cx| {
                 theme::set_system_dark(system_appearance_is_dark(cx));
@@ -1400,9 +1935,12 @@ impl MobileApp {
             composer_input,
             selection_menu,
             pending_composer_restore: None,
+            composer_drafts: BTreeMap::new(),
             timeline_turns: Arc::new(Vec::new()),
             timeline_markdown_views: RefCell::new(BTreeMap::new()),
             pending_user_message: None,
+            token_usage: None,
+            token_usage_generation: 0,
             timeline_metadata_tip: None,
             attachment_preview: None,
             attachment_preview_loading: None,
@@ -1416,10 +1954,13 @@ impl MobileApp {
             },
             timeline_cache_timeline: None,
             timeline_viewport: None,
+            timeline_follow: true,
             timeline_detail_ready: BTreeSet::new(),
             timeline_detail_in_flight: BTreeSet::new(),
             drawer_scroll: UniformListScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
+            settings_page: SettingsPage::Root,
+            settings_palette_open: false,
             sidebar_search_input,
             sidebar_search_open: false,
             sidebar_projects_initialized: false,
@@ -1454,9 +1995,9 @@ impl MobileApp {
                     "執行環境名稱",
                 ))
             }),
-            elicitation_request_id: None,
+            elicitation_form_requests: BTreeSet::new(),
             elicitation_inputs: BTreeMap::new(),
-            elicitation_draft: None,
+            elicitation_drafts: BTreeMap::new(),
             pending_input_writes: Vec::new(),
             pairing_busy: false,
             pairing_action: None,
@@ -1499,10 +2040,12 @@ impl MobileApp {
                 ))
             }),
             new_session_prompt_input: cx.new(|cx| {
-                InputState::new(window, cx).placeholder(locale::text(
-                    "Initial prompt",
-                    "初始提示词",
-                    "初始提示詞",
+                // The first message *is* the session, so it is a textarea that
+                // fills the page rather than a one-line field in a tall box.
+                TextareaState::new(window, cx).placeholder(locale::text(
+                    "Describe what you want to build…",
+                    "描述你想完成的事情…",
+                    "描述你想完成的事情…",
                 ))
             }),
             new_project_input: cx.new(|cx| {
@@ -2247,7 +2790,7 @@ impl MobileApp {
         if self.overlay == Some(MobileOverlay::Team) && !self.team_busy {
             self.refresh_team(false, cx);
         }
-        let should_follow = self.timeline_is_near_bottom();
+        let should_follow = self.timeline_follow;
         let mut timeline_changed = false;
         let mut sessions_need_refresh = false;
         let mut sidebar_needs_refresh = false;
@@ -2261,12 +2804,15 @@ impl MobileApp {
                     .controller
                     .as_ref()
                     .and_then(|controller| controller.state.selected_session_id.as_ref());
+                let preferences = NotificationPreferences::from(&self.app_settings);
                 if should_present_agent_notification(
                     self.app_backgrounded,
                     self.workbench_open,
                     selected,
                     &notification.session_id,
-                ) {
+                    &preferences,
+                ) && preferences.allows(notification)
+                {
                     notifications::present(notification);
                 }
             }
@@ -2330,6 +2876,9 @@ impl MobileApp {
                 self.timeline_list
                     .remeasure_items(turn_count - 1..turn_count);
             }
+            // The counters move with the conversation; the composer's ring is
+            // only ever one event behind.
+            self.refresh_token_usage(cx);
             if should_follow {
                 self.timeline_list.scroll_to_end();
             }
@@ -2884,16 +3433,14 @@ impl MobileApp {
                         Err(error) => this.fail(error),
                     },
                     Ok(Err(error)) => this.fail(error),
-                    Err(_) => {
-                        this.fail(BackendError::failed(
-                            "remote_pairing_task_failed",
-                            locale::text(
-                                "Pairing stopped unexpectedly.",
-                                "配对意外停止。",
-                                "配對意外停止。",
-                            ),
-                        ))
-                    }
+                    Err(_) => this.fail(BackendError::failed(
+                        "remote_pairing_task_failed",
+                        locale::text(
+                            "Pairing stopped unexpectedly.",
+                            "配对意外停止。",
+                            "配對意外停止。",
+                        ),
+                    )),
                 }
                 cx.notify();
             });
@@ -2977,16 +3524,14 @@ impl MobileApp {
                         }
                     }
                     Ok(Err(error)) => this.fail(describe_pairing_error(error)),
-                    Err(_) => {
-                        this.fail(BackendError::failed(
-                            "remote_pairing_task_failed",
-                            locale::text(
-                                "Pairing stopped unexpectedly.",
-                                "配对意外停止。",
-                                "配對意外停止。",
-                            ),
-                        ))
-                    }
+                    Err(_) => this.fail(BackendError::failed(
+                        "remote_pairing_task_failed",
+                        locale::text(
+                            "Pairing stopped unexpectedly.",
+                            "配对意外停止。",
+                            "配對意外停止。",
+                        ),
+                    )),
                 }
                 cx.notify();
             });
@@ -3626,7 +4171,12 @@ impl MobileApp {
                         }
                     }
                     Ok(_) => {}
-                    Err(error) => { let _ = current; this.fail(error) }
+                    // A refresh that belonged to a connection the user has
+                    // since left has nothing to say on whatever screen replaced
+                    // it. The guard used to be dead code: the arm swallowed
+                    // every error into `fail` and the branch below it was
+                    // unreachable.
+                    Err(error) if current => this.fail(error),
                     Err(_) => {}
                 }
                 if this.workspace_sync_queued {
@@ -3649,7 +4199,6 @@ impl MobileApp {
         if let Some(workbench) = self.workbench.as_ref() {
             workbench.update(cx, |workbench, cx| {
                 workbench.set_workspace(workspace_id, cx);
-                workbench.set_session(session_id, cx);
                 if let Some(surface) = pending_surface {
                     workbench.set_surface(surface, cx);
                 }
@@ -4118,10 +4667,6 @@ impl MobileApp {
                             this.attachment_preview = None;
                             this.attachment_preview_loading = None;
                             this.timeline_list.reset(0);
-                            if let Some(workbench) = this.workbench.as_ref() {
-                                workbench
-                                    .update(cx, |workbench, cx| workbench.set_session(None, cx));
-                            }
                         }
                         this.session_action = None;
                         this.hint(
@@ -4291,12 +4836,32 @@ impl MobileApp {
             .insert(session_id.as_str().to_string());
         // Switching away is the last chance to keep this conversation for the
         // next cold start: the controller drops its projection on the way out.
-        let switching_session = self.controller.as_ref().is_some_and(|controller| {
-            controller.state.selected_session_id.as_ref() != Some(&session_id)
-        });
+        let previous_session = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone());
+        let switching_session = previous_session.as_ref() != Some(&session_id);
         if switching_session {
             self.persist_active_session_timeline();
+            // Park the draft with the session it was typed in and restore the
+            // target's own draft before the first frame of the new conversation.
+            let current = self.composer_input.read(cx).value().to_string();
+            if let Some(previous) = previous_session {
+                self.composer_drafts
+                    .insert(previous.as_str().to_string(), current);
+            } else if !current.trim().is_empty() {
+                self.composer_drafts
+                    .insert(Self::unsessioned_draft_key(), current);
+            }
+            self.composer_drafts.remove(session_id.as_str());
         }
+        let draft = self
+            .composer_drafts
+            .get(session_id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        self.pending_input_writes
+            .push((InputField::Composer, draft));
         let Some(controller) = self.controller.as_mut() else {
             return;
         };
@@ -4331,6 +4896,9 @@ impl MobileApp {
             None
         };
         self.reset_drawers();
+        self.timeline_follow = true;
+        self.token_usage = None;
+        self.refresh_token_usage(cx);
         self.expanded_process.clear();
         self.expanded_timeline_rows.clear();
         self.collapsed_timeline_rows.clear();
@@ -4426,6 +4994,28 @@ impl MobileApp {
     ///
     /// Best effort on purpose: the cache is an optimization, and a full or
     /// read-only data dir must not surface an error for it.
+    /// The key a draft is parked under while no session is selected.
+    fn unsessioned_draft_key() -> String {
+        "\u{0}vibex:no-session".to_string()
+    }
+
+    /// Records the composer's current text against the open session, so a
+    /// refresh of the same session never loses what is half-typed.
+    fn stash_composer_draft(&mut self, cx: &gpui::App) {
+        let key = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.as_ref())
+            .map(|session_id| session_id.as_str().to_string())
+            .unwrap_or_else(Self::unsessioned_draft_key);
+        let current = self.composer_input.read(cx).value().to_string();
+        if current.trim().is_empty() {
+            self.composer_drafts.remove(&key);
+        } else {
+            self.composer_drafts.insert(key, current);
+        }
+    }
+
     fn persist_active_session_timeline(&mut self) {
         let Some(host_id) = self.active_host_id.clone() else {
             return;
@@ -4458,6 +5048,107 @@ impl MobileApp {
 
     /// Pulls the Desktop's sidebar tree. The phone never invents folders or
     /// ordering of its own; it renders what the Desktop reports.
+    /// The group the open session belongs to, with its members in group order.
+    ///
+    /// The phone shows one member at a time — there is no split view here — so
+    /// the group becomes a tab strip on the session page instead of a layout.
+    fn active_session_group(&self) -> Option<SessionGroupTabs> {
+        let session_id = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())?;
+        let organization = &self.sidebar_view.organization;
+        let group_id = organization.group_of_session(session_id.as_str())?;
+        let group = organization.groups.get(group_id)?;
+        if group.member_session_ids.len() < 2 {
+            return None;
+        }
+        let sessions = self.sessions();
+        let members = group
+            .member_session_ids
+            .iter()
+            .filter_map(|member_id| {
+                sessions
+                    .iter()
+                    .find(|session| session.id.as_str() == member_id.as_str())
+                    .map(|session| (session.id.clone(), session.title.clone(), session.state))
+            })
+            .collect::<Vec<_>>();
+        (members.len() >= 2).then(|| (group.name.clone(), members))
+    }
+
+    /// Reads the open session's token counters. The desktop owns them; the
+    /// phone only mirrors what it reports for the composer's ring.
+    fn refresh_token_usage(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            self.token_usage = None;
+            return;
+        };
+        self.token_usage_generation = self.token_usage_generation.wrapping_add(1);
+        let generation = self.token_usage_generation;
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let usage = backend.session_token_usage(session_id.clone()).await;
+            let _ = entity.update(cx, |this, cx| {
+                if generation != this.token_usage_generation
+                    || this
+                        .controller
+                        .as_ref()
+                        .and_then(|controller| controller.state.selected_session_id.as_ref())
+                        != Some(&session_id)
+                {
+                    return;
+                }
+                if let Ok(usage) = usage {
+                    this.token_usage = usage;
+                    cx.notify();
+                }
+            });
+        });
+        self.tasks.push(task);
+    }
+
+    /// Names the numbers the ring is showing, for the readers who cannot see a
+    /// 3px arc.
+    fn show_token_usage(&mut self, cx: &mut Context<Self>) {
+        let message = match self.token_usage.as_ref() {
+            Some(usage) => match (
+                usage.context_window_used_tokens,
+                usage.context_window_size_tokens,
+            ) {
+                (Some(used), Some(size)) if size > 0 => {
+                    locale::text("Context used", "上下文已用", "上下文已用").to_string()
+                        + &format!(
+                            " {}% · {} / {}",
+                            ((used as f64 / size as f64) * 100.0).round() as u64,
+                            format_compact_tokens(used),
+                            format_compact_tokens(size)
+                        )
+                }
+                _ => format!(
+                    "{} {} / {}",
+                    locale::text("Tokens", "Token", "Token"),
+                    format_compact_tokens(usage.input_tokens.unwrap_or_default()),
+                    format_compact_tokens(usage.output_tokens.unwrap_or_default())
+                ),
+            },
+            None => locale::text(
+                "The desktop has not reported token usage yet.",
+                "桌面端尚未上报 token 使用情况。",
+                "桌面端尚未回報 token 使用情況。",
+            )
+            .to_string(),
+        };
+        self.hint(Tone::Info, message);
+        cx.notify();
+    }
+
     fn refresh_sidebar_organization(&mut self, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
@@ -4641,6 +5332,24 @@ impl MobileApp {
             cx,
         );
         cx.notify();
+    }
+
+    /// Collapses or expands a session group. The desktop owns the flag, so the
+    /// phone sends the same organization mutation it would for a folder.
+    fn toggle_sidebar_group(&mut self, group_id: String, cx: &mut Context<Self>) {
+        let collapsed = self
+            .sidebar_view
+            .organization
+            .collapsed_group_ids
+            .contains(&group_id);
+        self.send_sidebar_mutation(
+            RemoteSidebarOrganizationMutation::SetGroupCollapsed {
+                group_id,
+                collapsed: !collapsed,
+            },
+            false,
+            cx,
+        );
     }
 
     fn toggle_folder(&mut self, folder_id: String, cx: &mut Context<Self>) {
@@ -5266,6 +5975,18 @@ impl MobileApp {
     }
 
     fn clear_overlay(&mut self) {
+        // The new-session page is a page, not a flag the next render can
+        // resurrect: leaving it by any route (the X, the back key, a drawer
+        // swipe) has to retire everything it opened, or the runtime sheet stays
+        // on screen over a page that no longer exists.
+        if self.overlay == Some(MobileOverlay::NewSession)
+            || self.overlay_parents.contains(&MobileOverlay::NewSession)
+        {
+            self.new_session_open = false;
+            self.runtime_options_open = false;
+            self.new_session_project_id = None;
+            self.new_session_workspace_id = None;
+        }
         self.overlay = None;
         self.overlay_parents.clear();
         self.overlay_returns_to_drawer = false;
@@ -5300,8 +6021,25 @@ impl MobileApp {
         let settled_target = self.settled_drawer_target();
         let sidebar_search_open = self.sidebar_search_open;
         let sidebar_batch_mode = self.sidebar_batch_mode;
-        self.back_stack.retain(|screen| match *screen {
-            BackScreen::Overlay(_) => false,
+        // The overlay chain is rebuilt in place rather than being removed and
+        // appended: dropping it first and pushing it back at the end moved the
+        // pages the user was looking at *below* the drawer entries, so one back
+        // press closed the page underneath the sheet that was on screen.
+        let overlay_chain = self
+            .overlay_parents
+            .iter()
+            .copied()
+            .chain(self.overlay)
+            .collect::<Vec<_>>();
+        let mut overlay_index = 0usize;
+        self.back_stack.retain_mut(|screen| match *screen {
+            BackScreen::Overlay(current) => {
+                let keep = overlay_chain.get(overlay_index) == Some(&current);
+                if keep {
+                    overlay_index += 1;
+                }
+                keep
+            }
             BackScreen::SessionAction => session_action_open,
             BackScreen::RuntimeOptions => runtime_options_open,
             BackScreen::SessionsDrawer => settled_target == DrawerPage::Sessions.open_offset(),
@@ -5309,21 +6047,15 @@ impl MobileApp {
             BackScreen::SidebarSearch => sidebar_search_open,
             BackScreen::SidebarBatchMode => sidebar_batch_mode,
         });
-        self.back_stack.extend(
-            self.overlay_parents
-                .iter()
-                .copied()
-                .map(BackScreen::Overlay),
-        );
-        if let Some(overlay) = self.overlay {
+        for overlay in overlay_chain.into_iter().skip(overlay_index) {
             self.push_back_screen(BackScreen::Overlay(overlay));
         }
     }
 
     /// The Android back key/gesture: close the topmost screen and keep the app
-    /// in the foreground. The host Activity backgrounding remains the fallback
-    /// for an empty stack because gpui_android reports unhandled keystrokes to
-    /// the framework by never mapping unknown keys.
+    /// in the foreground. An empty stack hands the app to the system through
+    /// [`crate::platform::leave_app`] — the host Activity consumes every key, so
+    /// nothing else would.
     fn handle_navigate_back(
         &mut self,
         _: &NavigateBack,
@@ -5350,11 +6082,37 @@ impl MobileApp {
             }
             return;
         }
+        // A connection attempt can outlive the transport RPC budget (30s/120s)
+        // with every button on the page disabled. Back has to be able to leave
+        // it, otherwise the screen is a dead end for the whole timeout.
         if matches!(self.mode, RootMode::Connecting) {
+            self.stop_connection_tasks();
+            self.operation_busy = false;
+            self.mode = RootMode::Pairing;
+            crate::platform::hide_keyboard();
+            self.refresh_host_reachability(cx);
+            cx.notify();
             return;
+        }
+        // A settings sub-page is a screen of its own: back returns to the list
+        // of topics before it leaves Settings.
+        if self.overlay == Some(MobileOverlay::Settings) {
+            if self.settings_palette_open {
+                self.settings_palette_open = false;
+                cx.notify();
+                return;
+            }
+            if self.settings_page != SettingsPage::Root {
+                self.open_settings_page(SettingsPage::Root, cx);
+                return;
+            }
         }
         self.sync_back_stack_with_ui();
         let Some(screen) = self.back_stack.pop() else {
+            // The stack is empty: the platform's own back behaviour is the only
+            // thing left, so hand the app back to the system. The Activity
+            // consumes every key and never does this itself.
+            crate::platform::leave_app();
             return;
         };
         crate::platform::hide_keyboard();
@@ -5396,6 +6154,16 @@ impl MobileApp {
             return;
         }
         let return_to_drawer = self.overlay_returns_to_drawer;
+        if self.overlay == Some(MobileOverlay::Settings) {
+            self.settings_page = SettingsPage::Root;
+            self.settings_palette_open = false;
+        }
+        if self.overlay == Some(MobileOverlay::NewSession) {
+            self.new_session_open = false;
+            self.runtime_options_open = false;
+            self.new_session_project_id = None;
+            self.new_session_workspace_id = None;
+        }
         self.overlay = None;
         self.overlay_returns_to_drawer = false;
         self.host_overlay_target = None;
@@ -5557,12 +6325,10 @@ impl MobileApp {
                             this.persist_known_hosts();
                         }
                         Ok(Err(error)) => this.fail(error),
-                        Err(_) => {
-                            this.fail(BackendError::failed(
-                                "mobile_host_rename_failed",
-                                "the runtime rename task failed",
-                            ))
-                        }
+                        Err(_) => this.fail(BackendError::failed(
+                            "mobile_host_rename_failed",
+                            "the runtime rename task failed",
+                        )),
                     }
                     cx.notify();
                 });
@@ -5619,9 +6385,9 @@ impl MobileApp {
         self.collapsed_timeline_rows.clear();
         self.full_reasoning_rows.clear();
         self.expanded_approval.clear();
-        self.elicitation_request_id = None;
+        self.elicitation_form_requests.clear();
         self.elicitation_inputs.clear();
-        self.elicitation_draft = None;
+        self.elicitation_drafts.clear();
         self.reset_runtime_options();
     }
 
@@ -5676,6 +6442,9 @@ impl MobileApp {
 
     fn show_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_battery_allowlist(cx);
+        self.settings_page = SettingsPage::Root;
+        self.settings_palette_open = false;
+        self.settings_scroll.set_offset(gpui::Point::default());
         self.show_overlay(MobileOverlay::Settings, window, cx);
     }
 
@@ -5779,6 +6548,50 @@ impl MobileApp {
         self.start_drawer_snap(DrawerPage::Workbench.open_offset(), Some(window), cx);
     }
 
+    /// The header's right-rail button. Tapping it when the rail is already
+    /// open closes it again, so the same control both enters and leaves.
+    fn toggle_right_rail(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if visible_drawer_page(self.drawer_offset, self.drawer_snap) == Some(DrawerPage::Workbench)
+        {
+            self.start_drawer_snap(0.0, Some(window), cx);
+            return;
+        }
+        match self.workbench.as_ref() {
+            Some(workbench) => {
+                let surface = workbench.read(cx).surface();
+                self.open_workbench_surface(surface, window, cx);
+            }
+            None => self.open_workbench_surface(WorkbenchSurface::Files, window, cx),
+        }
+    }
+
+    /// Opens the right rail on a file the conversation pointed at.
+    fn open_timeline_file(
+        &mut self,
+        path: String,
+        _: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workbench) = self.workbench.clone() else {
+            self.hint(
+                Tone::Error,
+                locale::text(
+                    "No workspace is open for this session.",
+                    "此会话没有打开的工作区。",
+                    "此會話沒有開啟的工作區。",
+                ),
+            );
+            cx.notify();
+            return;
+        };
+        workbench.update(cx, |workbench, cx| {
+            workbench.open_file(path, cx);
+        });
+        self.clear_overlay();
+        self.start_drawer_snap(DrawerPage::Workbench.open_offset(), Some(window), cx);
+    }
+
     /// Ends the live connection and returns to the pairing page, leaving every
     /// stored pairing alone: the runtimes this lands on keep their credentials,
     /// so their own cards are what connect again. Deleting a credential is the
@@ -5786,7 +6599,6 @@ impl MobileApp {
     fn disconnect_host(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.teardown_active_connection(cx);
         self.mode = RootMode::Pairing;
-        self.hint(Tone::Error, "PROBE: stale transport failure");
         crate::platform::hide_keyboard();
         // The page about to show is the one that reports which saved runtimes
         // answer, so it asks as soon as it is on screen.
@@ -5864,7 +6676,7 @@ impl MobileApp {
         let Some(session_id) = selected else {
             return;
         };
-        let should_follow = self.timeline_is_near_bottom();
+        let should_follow = self.timeline_follow;
         let Some(controller) = self.controller.as_mut() else {
             return;
         };
@@ -5908,6 +6720,11 @@ impl MobileApp {
         if text.is_empty() {
             return;
         }
+        let running = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.active_session.value.as_ref())
+            .is_some_and(|session| session.state == AgentSessionState::Running);
         let Some(controller) = self.controller.as_mut() else {
             return;
         };
@@ -5959,7 +6776,15 @@ impl MobileApp {
             attachments,
             reasoning_effort: runtime.desired.reasoning_effort.clone(),
             correlation_id: None,
-            delivery: UserMessageDelivery::Prompt,
+            // A message sent into a running turn is an interruption of that
+            // turn's context, not a new prompt behind it: the desktop steers
+            // and so does the phone. The manager answers `PromptRequired` when
+            // the provider cannot take one, so this never has to guess.
+            delivery: if running {
+                UserMessageDelivery::Steer
+            } else {
+                UserMessageDelivery::Prompt
+            },
             prompt_context: None,
             provenance: vibex_core::MessageProvenance::HumanInput,
         });
@@ -5974,6 +6799,14 @@ impl MobileApp {
         let future = controller.send_message(request);
         self.pending_user_message = Some(pending_user_message);
         self.timeline_metadata_tip = None;
+        if let Some(draft_key) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.as_ref())
+            .map(|session_id| session_id.as_str().to_string())
+        {
+            self.composer_drafts.remove(&draft_key);
+        }
         self.composer_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.spawn_timeline_mutation(ticket, future, Some(restore_text), cx);
@@ -6148,53 +6981,82 @@ impl MobileApp {
     }
 
     fn sync_elicitation_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let request = self.controller.as_ref().and_then(|controller| {
-            controller
-                .state
-                .elicitation_surfaces(ShellKind::Compact)
-                .into_iter()
-                .next()
-                .map(|surface| surface.request)
-        });
-        let Some(request) = request else {
-            self.elicitation_request_id = None;
+        let requests = self
+            .controller
+            .as_ref()
+            .map(|controller| {
+                controller
+                    .state
+                    .elicitation_surfaces(ShellKind::Compact)
+                    .into_iter()
+                    .map(|surface| surface.request)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if requests.is_empty() {
+            self.elicitation_form_requests.clear();
             self.elicitation_inputs.clear();
-            self.elicitation_draft = None;
-            return;
-        };
-        if self.elicitation_request_id.as_ref() == Some(&request.id) {
+            self.elicitation_drafts.clear();
             return;
         }
-
-        let draft = ElicitationFormDraft::from_request(&request);
-        self.elicitation_inputs = request
-            .fields
+        // An agent can raise more than one elicitation at a time. The form is
+        // built per request so the second one is as fillable as the first,
+        // instead of rendering an empty box because the first had claimed the
+        // single slot.
+        let live = requests
             .iter()
-            .filter_map(|field| {
+            .map(|request| request.id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        self.elicitation_inputs
+            .retain(|(request_id, _), _| live.contains(request_id));
+        self.elicitation_drafts
+            .retain(|request_id, _| live.contains(request_id));
+        self.elicitation_form_requests = live;
+        for request in requests {
+            let request_id = request.id.as_str().to_string();
+            if !self.elicitation_drafts.contains_key(&request_id) {
+                self.elicitation_drafts.insert(
+                    request_id.clone(),
+                    ElicitationFormDraft::from_request(&request),
+                );
+            }
+            let draft = self.elicitation_drafts.get(&request_id).cloned();
+            for field in &request.fields {
+                if self
+                    .elicitation_inputs
+                    .contains_key(&(request_id.clone(), field.id.clone()))
+                {
+                    continue;
+                }
                 let placeholder = if field.required {
                     format!("{} (required)", field.title)
                 } else {
                     field.title.clone()
                 };
                 let initial = match &field.kind {
-                    ElicitationFieldKind::Text { options, .. } if options.is_empty() => {
-                        draft.text(&field.id).unwrap_or_default().to_string()
-                    }
+                    ElicitationFieldKind::Text { options, .. } if options.is_empty() => draft
+                        .as_ref()
+                        .and_then(|draft| draft.text(&field.id))
+                        .unwrap_or_default()
+                        .to_string(),
                     ElicitationFieldKind::Number { .. } | ElicitationFieldKind::Integer { .. } => {
-                        draft.text(&field.id).unwrap_or_default().to_string()
+                        draft
+                            .as_ref()
+                            .and_then(|draft| draft.text(&field.id))
+                            .unwrap_or_default()
+                            .to_string()
                     }
-                    _ => return None,
+                    _ => continue,
                 };
                 let input = cx.new(|cx| {
                     InputState::new(window, cx)
                         .placeholder(placeholder)
                         .default_value(initial)
                 });
-                Some((field.id.clone(), input))
-            })
-            .collect();
-        self.elicitation_request_id = Some(request.id);
-        self.elicitation_draft = Some(draft);
+                self.elicitation_inputs
+                    .insert((request_id.clone(), field.id.clone()), input);
+            }
+        }
     }
 
     fn set_elicitation_option(
@@ -6204,10 +7066,7 @@ impl MobileApp {
         value: String,
         cx: &mut Context<Self>,
     ) {
-        if self.elicitation_request_id.as_ref() != Some(&request_id) {
-            return;
-        }
-        if let Some(draft) = self.elicitation_draft.as_mut() {
+        if let Some(draft) = self.elicitation_drafts.get_mut(request_id.as_str()) {
             draft.select_option(field_id, value);
             cx.notify();
         }
@@ -6220,10 +7079,7 @@ impl MobileApp {
         value: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.elicitation_request_id.as_ref() != Some(&request_id) {
-            return;
-        }
-        if let Some(draft) = self.elicitation_draft.as_mut() {
+        if let Some(draft) = self.elicitation_drafts.get_mut(request_id.as_str()) {
             draft.set_boolean(field_id, value);
             cx.notify();
         }
@@ -6236,10 +7092,7 @@ impl MobileApp {
         value: String,
         cx: &mut Context<Self>,
     ) {
-        if self.elicitation_request_id.as_ref() != Some(&request_id) {
-            return;
-        }
-        if let Some(draft) = self.elicitation_draft.as_mut() {
+        if let Some(draft) = self.elicitation_drafts.get_mut(request_id.as_str()) {
             draft.toggle_multi_option(field_id, value);
             cx.notify();
         }
@@ -6268,13 +7121,17 @@ impl MobileApp {
         }) else {
             return;
         };
+        let request_key = request_id.as_str().to_string();
         let mut draft = self
-            .elicitation_draft
-            .clone()
-            .filter(|draft| draft.request_id == request_id)
+            .elicitation_drafts
+            .get(&request_key)
+            .cloned()
             .unwrap_or_else(|| ElicitationFormDraft::from_request(&request));
         for field in &request.fields {
-            if let Some(input) = self.elicitation_inputs.get(&field.id) {
+            if let Some(input) = self
+                .elicitation_inputs
+                .get(&(request_key.clone(), field.id.clone()))
+            {
                 draft.set_text(field.id.clone(), input.read(cx).value().to_string());
             }
         }
@@ -7544,7 +8401,7 @@ impl MobileApp {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(theme::FONT_SIDEBAR_ROW))
+                    .text_size(theme::font_sidebar_row())
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(if selected {
                         theme::text_primary()
@@ -7704,7 +8561,7 @@ impl MobileApp {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(theme::FONT_HEADING))
+                    .text_size(theme::font_heading())
                     .text_color(theme::text_primary())
                     .child(title),
             )
@@ -7936,7 +8793,7 @@ impl MobileApp {
                             .flex_none()
                             .items_center()
                             .justify_center()
-                            .text_size(px(theme::FONT_DETAIL))
+                            .text_size(theme::font_detail())
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text_primary())
                             .cursor_pointer()
@@ -7947,7 +8804,7 @@ impl MobileApp {
             )
             .child(
                 div()
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(theme::font_caption())
                     .text_color(theme::text_muted())
                     .child(locale::text(
                         "Paste the whole line, including the vibex:// prefix",
@@ -8015,7 +8872,7 @@ impl MobileApp {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .text_size(px(theme::FONT_DETAIL))
+                                .text_size(theme::font_detail())
                                 .text_color(theme::text_muted())
                                 .child(if empty {
                                     locale::common("No nearby desktops found")
@@ -8070,7 +8927,7 @@ impl MobileApp {
                                             )
                                             .child(
                                                 div()
-                                                    .text_size(px(theme::FONT_MICRO))
+                                                    .text_size(theme::font_micro())
                                                     .text_color(theme::text_muted())
                                                     .child(locale::text(
                                                         "Same Wi-Fi",
@@ -8082,7 +8939,7 @@ impl MobileApp {
                                     .child(
                                         div()
                                             .flex_none()
-                                            .text_size(px(theme::FONT_DETAIL))
+                                            .text_size(theme::font_detail())
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(theme::text_primary())
                                             .child(locale::common("Pair")),
@@ -8132,7 +8989,7 @@ impl MobileApp {
                     )
                     .child(
                         div()
-                            .text_size(px(theme::FONT_DETAIL))
+                            .text_size(theme::font_detail())
                             .text_color(theme::text_muted())
                             .child(locale::text(
                                 "Confirm the same code on the computer",
@@ -8152,7 +9009,7 @@ impl MobileApp {
                     )
                     .child(
                         div()
-                            .text_size(px(theme::FONT_MICRO))
+                            .text_size(theme::font_micro())
                             .text_color(theme::text_muted())
                             .child(format!(
                                 "{} {remaining}s",
@@ -8188,7 +9045,7 @@ impl MobileApp {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(theme::FONT_HEADING))
+                        .text_size(theme::font_heading())
                         .text_color(theme::text_primary())
                         .cursor_pointer()
                         .active(|style| style.opacity(0.7))
@@ -8226,7 +9083,7 @@ impl MobileApp {
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(theme::FONT_DETAIL))
+            .text_size(theme::font_detail())
             .text_color(theme::text_muted())
             .when(error, |message| message.text_color(theme::accent_red()))
             .child(message.into())
@@ -8259,7 +9116,7 @@ impl MobileApp {
                     .flex_col()
                     .items_center()
                     .gap(px(theme::SPACING_MD))
-                    .text_size(px(theme::FONT_DETAIL))
+                    .text_size(theme::font_detail())
                     .child(
                         div()
                             .flex()
@@ -8411,6 +9268,9 @@ impl MobileApp {
                         .flex()
                         .flex_col()
                         .child(self.render_header(&title, state, cx))
+                        .when_some(self.active_session_group(), |page, (name, members)| {
+                            page.child(self.render_session_group_tabs(&name, &members, cx))
+                        })
                         .child(
                             div()
                                 .flex_1()
@@ -8423,7 +9283,7 @@ impl MobileApp {
                                     timeline.child(
                                         div()
                                             .py_8()
-                                            .text_size(px(theme::FONT_BODY))
+                                            .text_size(theme::font_body())
                                             .text_color(theme::text_muted())
                                             .text_center()
                                             .child(locale::common("Loading conversation...")),
@@ -8438,7 +9298,7 @@ impl MobileApp {
                                             .header(
                                                 EmptyHeader::new().max_w_full().description(
                                                     EmptyDescription::new()
-                                                        .text_size(px(theme::FONT_BODY))
+                                                        .text_size(theme::font_body())
                                                         .text_color(theme::text_muted())
                                                         .child(locale::common("No messages yet")),
                                                 ),
@@ -8446,7 +9306,7 @@ impl MobileApp {
                                             .content(EmptyContent::new().when(
                                                 no_selected_session,
                                                 |content| {
-                                                    content.text_size(px(theme::FONT_BODY)).child(
+                                                    content.text_size(theme::font_body()).child(
                                                         div()
                                                             .id("create-first-session")
                                                             .h(px(theme::TOUCH_TARGET))
@@ -8520,7 +9380,9 @@ impl MobileApp {
                         );
                     let drawer_base = match page {
                         DrawerPage::Sessions => self.render_drawer(cx),
-                        DrawerPage::Workbench => self.render_workbench_drawer(workbench.clone()),
+                        DrawerPage::Workbench => {
+                            self.render_workbench_drawer(workbench.clone(), cx)
+                        }
                     }
                     .w(px(page_width))
                     .block_mouse_except_scroll();
@@ -8581,11 +9443,15 @@ impl MobileApp {
                 .when_some(self.workspace_action.as_ref(), |root, prompt| {
                     root.child(self.render_workspace_action_prompt(prompt, cx))
                 })
-                .when(self.runtime_options_open, |root| {
-                    root.child(self.render_runtime_options_sheet(cx))
-                })
+                // Ordering is z-order in GPUI. The runtime sheet is opened
+                // from the new-session page (which is itself an overlay), so it
+                // has to be painted after the overlay or it lands underneath
+                // the page that asked for it.
                 .when_some(overlay, |root, overlay| {
                     root.child(self.render_mobile_overlay(overlay, window, cx))
+                })
+                .when(self.runtime_options_open, |root| {
+                    root.child(self.render_runtime_options_sheet(cx))
                 })
                 .when_some(attachment_preview, |root, preview| {
                     root.child(self.render_attachment_preview(preview, cx))
@@ -8646,7 +9512,7 @@ impl MobileApp {
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(theme::FONT_BODY))
+            .text_size(theme::font_body())
             .text_color(theme::text_primary())
             .child(format!("{}: {}", locale::common("Loading"), label))
             .into_any_element()
@@ -8678,7 +9544,7 @@ impl MobileApp {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(theme::font_caption())
                     .text_color(theme::text_muted())
                     .child(row.label.clone()),
             );
@@ -8697,7 +9563,7 @@ impl MobileApp {
                     .items_center()
                     .cursor_pointer()
                     .active(|style| style.bg(theme::row_pressed_bg()))
-                    .text_size(px(theme::FONT_BODY))
+                    .text_size(theme::font_body())
                     .text_color(if destructive {
                         theme::accent_red()
                     } else {
@@ -8927,6 +9793,7 @@ impl MobileApp {
                     );
                 }
             }
+            SidebarRowKind::Group => return div().into_any_element(),
             SidebarRowKind::EmptyWorkspace => return div().into_any_element(),
         }
 
@@ -8986,7 +9853,7 @@ impl MobileApp {
                     .gap_3()
                     .child(
                         div()
-                            .text_size(px(theme::FONT_HEADING))
+                            .text_size(theme::font_heading())
                             .text_color(theme::text_primary())
                             .child(heading),
                     )
@@ -9020,7 +9887,7 @@ impl MobileApp {
                                     .justify_center()
                                     .cursor_pointer()
                                     .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .text_size(px(theme::FONT_BODY))
+                                    .text_size(theme::font_body())
                                     .text_color(theme::text_secondary())
                                     .on_mouse_up(
                                         MouseButton::Left,
@@ -9043,7 +9910,7 @@ impl MobileApp {
                                     .justify_center()
                                     .cursor_pointer()
                                     .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .text_size(px(theme::FONT_BODY))
+                                    .text_size(theme::font_body())
                                     .text_color(theme::text_primary())
                                     .on_mouse_up(
                                         MouseButton::Left,
@@ -9111,13 +9978,13 @@ impl MobileApp {
                     .gap_3()
                     .child(
                         div()
-                            .text_size(px(theme::FONT_HEADING))
+                            .text_size(theme::font_heading())
                             .text_color(theme::text_primary())
                             .child(heading),
                     )
                     .child(
                         div()
-                            .text_size(px(theme::FONT_CAPTION))
+                            .text_size(theme::font_caption())
                             .text_color(theme::text_muted())
                             .child(detail),
                     )
@@ -9137,7 +10004,7 @@ impl MobileApp {
                     .when(prompt.kind != SessionActionKind::Rename, |dialog| {
                         dialog.child(
                             div()
-                                .text_size(px(theme::FONT_BODY))
+                                .text_size(theme::font_body())
                                 .text_color(theme::text_secondary())
                                 .child(prompt.current_title.clone()),
                         )
@@ -9158,7 +10025,7 @@ impl MobileApp {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .text_size(px(theme::FONT_BODY))
+                                    .text_size(theme::font_body())
                                     .text_color(theme::text_secondary())
                                     .when(!self.session_action_busy, |button| {
                                         button.cursor_pointer().on_mouse_up(
@@ -9182,7 +10049,7 @@ impl MobileApp {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .text_size(px(theme::FONT_BODY))
+                                    .text_size(theme::font_body())
                                     .text_color(theme::bg_primary())
                                     .when(
                                         !self.session_action_busy && can_manage_session,
@@ -9251,13 +10118,13 @@ impl MobileApp {
                     .gap_3()
                     .child(
                         div()
-                            .text_size(px(theme::FONT_HEADING))
+                            .text_size(theme::font_heading())
                             .text_color(theme::text_primary())
                             .child(heading),
                     )
                     .child(
                         div()
-                            .text_size(px(theme::FONT_CAPTION))
+                            .text_size(theme::font_caption())
                             .text_color(theme::text_muted())
                             .child(detail),
                     )
@@ -9277,7 +10144,7 @@ impl MobileApp {
                     .when(!rename, |dialog| {
                         dialog.child(
                             div()
-                                .text_size(px(theme::FONT_BODY))
+                                .text_size(theme::font_body())
                                 .text_color(theme::text_secondary())
                                 .child(prompt.current_title.clone()),
                         )
@@ -9435,7 +10302,7 @@ impl MobileApp {
                                 .border_color(theme::accent_red())
                                 .bg(theme::bg_card_dim())
                                 .p_3()
-                                .text_size(px(theme::FONT_CAPTION))
+                                .text_size(theme::font_caption())
                                 .text_color(theme::accent_red())
                                 .child(error.message.clone()),
                         )
@@ -9509,7 +10376,7 @@ impl MobileApp {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(theme::FONT_HEADING))
+                    .text_size(theme::font_heading())
                     .text_color(theme::text_primary())
                     .child(locale::text("Session settings", "会话设置", "工作階段設定")),
             )
@@ -9728,7 +10595,7 @@ impl MobileApp {
                 .border_b_1()
                 .border_color(theme::border_subtle())
                 .p_4()
-                .text_size(px(theme::FONT_CAPTION))
+                .text_size(theme::font_caption())
                 .text_color(theme::text_muted())
                 .child(locale::text(
                     "Loading session settings...",
@@ -9812,7 +10679,7 @@ impl MobileApp {
                                 .overflow_hidden()
                                 .text_ellipsis()
                                 .whitespace_nowrap()
-                                .text_size(px(theme::FONT_CAPTION))
+                                .text_size(theme::font_caption())
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::sidebar_foreground(0.84))
                                 .child(runtime_auth_source_display_label(&source)),
@@ -9820,7 +10687,7 @@ impl MobileApp {
                         .child(
                             div()
                                 .flex_shrink_0()
-                                .text_size(px(theme::FONT_MICRO))
+                                .text_size(theme::font_micro())
                                 .text_color(theme::text_muted())
                                 .child(status),
                         ),
@@ -9886,7 +10753,7 @@ impl MobileApp {
                     div()
                         .px_4()
                         .py(px(28.0))
-                        .text_size(px(theme::FONT_CAPTION))
+                        .text_size(theme::font_caption())
                         .text_color(theme::text_muted())
                         .child(if query.is_empty() {
                             locale::text("No configuration", "暂无配置", "暫無配置")
@@ -9935,7 +10802,7 @@ impl MobileApp {
                         .border_color(theme::accent_yellow())
                         .bg(theme::bg_card_dim())
                         .p_3()
-                        .text_size(px(theme::FONT_CAPTION))
+                        .text_size(theme::font_caption())
                         .text_color(theme::accent_yellow())
                         .child(locale::text(
                             "The current session settings are unavailable. Select an available option.",
@@ -10084,14 +10951,14 @@ impl MobileApp {
             .gap_2()
             .child(
                 div()
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(theme::font_caption())
                     .text_color(theme::text_secondary())
                     .child(feature.label.clone()),
             )
             .when_some(feature.description.clone(), |row, description| {
                 row.child(
                     div()
-                        .text_size(px(theme::FONT_MICRO))
+                        .text_size(theme::font_micro())
                         .text_color(theme::text_muted())
                         .child(description),
                 )
@@ -10102,7 +10969,7 @@ impl MobileApp {
                 None => row
                     .child(
                         div()
-                            .text_size(px(theme::FONT_MICRO))
+                            .text_size(theme::font_micro())
                             .text_color(theme::text_muted())
                             .child(locale::common("Loading value...")),
                     )
@@ -10157,12 +11024,34 @@ impl MobileApp {
         state: Option<AgentSessionState>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let status_color = match state {
-            Some(AgentSessionState::Running) => theme::accent_green(),
-            Some(AgentSessionState::Error) => theme::accent_red(),
-            Some(_) => theme::text_muted(),
-            None => theme::accent_yellow(),
+        // A state the user has to act on is named, not just tinted: the phone
+        // used to draw a 6px dot and leave the reader to guess which of the
+        // session states it stood for.
+        let (status_color, status_label) = match state {
+            Some(AgentSessionState::Running) => {
+                (theme::accent_success(), locale::common("Running"))
+            }
+            Some(AgentSessionState::NeedsInput) => (
+                theme::accent_yellow(),
+                locale::text("Needs you", "需要你操作", "需要你操作"),
+            ),
+            Some(AgentSessionState::Error) => (theme::accent_red(), locale::common("Failed")),
+            Some(AgentSessionState::Idle) => (theme::text_muted(), locale::common("Idle")),
+            Some(AgentSessionState::Archived) => (theme::text_muted(), locale::common("Archived")),
+            Some(_) => (theme::text_muted(), locale::common("Closed")),
+            None => (theme::accent_yellow(), locale::common("No session")),
         };
+        let (badge, terminal_running) = self
+            .workbench
+            .as_ref()
+            .map(|workbench| {
+                let workbench = workbench.read(cx);
+                (
+                    workbench.right_rail_badge(),
+                    workbench.terminal_is_running(),
+                )
+            })
+            .unwrap_or((0, false));
         div()
             .h(px(theme::HEADER_HEIGHT))
             .flex_shrink_0()
@@ -10179,7 +11068,8 @@ impl MobileApp {
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .active(|style| style.opacity(0.6))
+                    .aria_label(locale::text("Sessions", "会话", "會話"))
+                    .active(|style| style.bg(theme::row_pressed_bg()))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_drawer))
                     .child(
                         svg()
@@ -10193,36 +11083,51 @@ impl MobileApp {
                     .flex_1()
                     .min_w_0()
                     .flex()
-                    .items_center()
+                    .flex_col()
                     .justify_center()
-                    .gap(px(theme::SPACING_SM))
-                    .child(
-                        div()
-                            .size(px(theme::ICON_STATUS))
-                            .flex_shrink_0()
-                            .rounded_full()
-                            .bg(status_color),
-                    )
+                    .items_center()
                     .child(
                         div()
                             .max_w_full()
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(px(theme::FONT_BODY))
-                            .text_color(theme::text_secondary())
+                            .text_size(theme::font_detail())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
                             .child(title.to_string()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_XS))
+                            .child(
+                                div()
+                                    .size(px(theme::ICON_STATUS))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .bg(status_color),
+                            )
+                            .child(
+                                div()
+                                    .text_size(theme::font_micro())
+                                    .text_color(status_color)
+                                    .child(status_label),
+                            ),
                     ),
             )
             .child(
                 div()
                     .id("refresh-session")
                     .size(px(theme::HEADER_BUTTON_SIZE))
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .active(|style| style.opacity(0.6))
+                    .aria_label(locale::common("Refresh"))
+                    .active(|style| style.bg(theme::row_pressed_bg()))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::refresh))
                     .child(
                         svg()
@@ -10239,7 +11144,7 @@ impl MobileApp {
                     header.child(
                         Button::new("open-team")
                             .ghost()
-                            .h_10()
+                            .h(px(theme::HEADER_BUTTON_SIZE))
                             .label(locale::text("Team…", "团队…", "團隊…"))
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.open_team(window, cx)),
@@ -10247,6 +11152,182 @@ impl MobileApp {
                     )
                 },
             )
+            // The right rail's only entry point. It was reachable exclusively
+            // from an unhinted swipe; a phone user has no reason to discover
+            // that a screen with Files, Git, and a terminal exists at all.
+            .child(
+                div()
+                    .id("open-right-rail")
+                    .size(px(theme::HEADER_BUTTON_SIZE))
+                    .flex_shrink_0()
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .aria_label(locale::text(
+                        "Files, Git, and terminal",
+                        "文件、Git 与终端",
+                        "檔案、Git 與終端機",
+                    ))
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_right_rail))
+                    .child(
+                        svg()
+                            .path("icons/panel-right.svg")
+                            .size(px(theme::ICON_MD))
+                            .text_color(if terminal_running || badge > 0 {
+                                theme::text_primary()
+                            } else {
+                                theme::text_secondary()
+                            }),
+                    )
+                    .when(badge > 0, |button| {
+                        button.child(
+                            div()
+                                .absolute()
+                                .top(px(8.0))
+                                .right(px(6.0))
+                                .min_w(px(16.0))
+                                .h(px(16.0))
+                                .px(px(3.0))
+                                .rounded_full()
+                                .bg(theme::accent_blue())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(theme::font_micro())
+                                .text_color(theme::bg_primary())
+                                .child(badge.min(99).to_string()),
+                        )
+                    })
+                    .when(terminal_running && badge == 0, |button| {
+                        button.child(
+                            div()
+                                .absolute()
+                                .top(px(10.0))
+                                .right(px(10.0))
+                                .size(px(8.0))
+                                .rounded_full()
+                                .bg(theme::accent_success()),
+                        )
+                    }),
+            )
+    }
+
+    /// The open session's group as a tab strip.
+    ///
+    /// Desktop renders a group as side-by-side panes. A phone cannot show two
+    /// conversations at once, so the same membership becomes tabs: the desktop
+    /// grouping survives, the split layout does not.
+    fn render_session_group_tabs(
+        &self,
+        name: &str,
+        members: &[(VibexSessionId, String, AgentSessionState)],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let selected = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone());
+        div()
+            .id("mobile-session-group-tabs")
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(theme::SPACING_MD))
+                    .pt(px(theme::SPACING_SM))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .child(
+                        svg()
+                            .path("icons/layers.svg")
+                            .size(px(12.0))
+                            .text_color(theme::accent_purple()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_muted())
+                            .child(name.to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .id("mobile-session-group-tabs-scroll")
+                    .overflow_x_scroll()
+                    .restrict_scroll_to_axis()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .px(px(theme::SPACING_MD))
+                    .py(px(theme::SPACING_SM))
+                    .children(members.iter().map(|(session_id, title, state)| {
+                        let active = selected.as_ref() == Some(session_id);
+                        let open_id = session_id.clone();
+                        div()
+                            .id(format!("session-group-tab:{}", session_id.as_str()))
+                            .flex_shrink_0()
+                            .max_w(px(180.0))
+                            .h(px(36.0))
+                            .px(px(theme::SPACING_MD))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(if active {
+                                theme::accent_purple()
+                            } else {
+                                theme::border_subtle()
+                            })
+                            .bg(if active {
+                                theme::accent_purple().opacity(0.14)
+                            } else {
+                                theme::bg_card()
+                            })
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_XS))
+                            .cursor_pointer()
+                            .aria_label(title.clone())
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.open_session(open_id.clone(), cx)
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .size(px(6.0))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .bg(session_state_color(*state)),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(theme::font_caption())
+                                    .text_color(if active {
+                                        theme::text_primary()
+                                    } else {
+                                        theme::text_secondary()
+                                    })
+                                    .child(title.clone()),
+                            )
+                    })),
+            )
+            .into_any_element()
     }
 
     fn render_turn(
@@ -10688,7 +11769,7 @@ impl MobileApp {
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
-                        .text_size(px(theme::FONT_CAPTION))
+                        .text_size(theme::font_caption())
                         .text_color(theme::text_secondary())
                         .child(label),
                 )
@@ -10715,7 +11796,7 @@ impl MobileApp {
                     .bg(theme::bg_card())
                     .px_3()
                     .py_2()
-                    .text_size(px(theme::FONT_HEADING))
+                    .text_size(theme::font_heading())
                     .line_height(px(19.0))
                     .text_color(theme::text_primary())
                     .whitespace_normal()
@@ -10856,7 +11937,7 @@ impl MobileApp {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .text_size(px(theme::FONT_MICRO))
+                .text_size(theme::font_micro())
                 .text_color(theme::text_muted())
                 .child(
                     div()
@@ -11189,7 +12270,7 @@ impl MobileApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(px(theme::FONT_CAPTION))
+                            .text_size(theme::font_caption())
                             .text_color(theme::text_primary())
                             .child(title),
                     )
@@ -11309,7 +12390,7 @@ impl MobileApp {
                 .flex()
                 .items_start()
                 .gap_2()
-                .text_size(px(theme::FONT_BODY))
+                .text_size(theme::font_body())
                 .line_height(px(18.0))
                 .text_color(color)
                 .child(
@@ -11335,7 +12416,7 @@ impl MobileApp {
             .flex()
             .items_start()
             .gap_2()
-            .text_size(px(theme::FONT_CAPTION))
+            .text_size(theme::font_caption())
             .line_height(px(17.0))
             .text_color(color)
             .child(
@@ -11363,7 +12444,7 @@ impl MobileApp {
             .flex()
             .items_center()
             .gap_2()
-            .text_size(px(theme::FONT_CAPTION))
+            .text_size(theme::font_caption())
             .text_color(theme::text_muted())
             .child(
                 svg()
@@ -11393,7 +12474,7 @@ impl MobileApp {
             .gap_1()
             .child(
                 div()
-                    .text_size(px(theme::FONT_MICRO))
+                    .text_size(theme::font_micro())
                     .text_color(theme::text_muted())
                     .child(label.to_string()),
             )
@@ -11405,7 +12486,7 @@ impl MobileApp {
                     .bg(theme::bg_primary())
                     .px_2()
                     .py_1()
-                    .text_size(px(theme::FONT_MICRO))
+                    .text_size(theme::font_micro())
                     .line_height(px(16.0))
                     .text_color(theme::text_secondary())
                     .whitespace_normal()
@@ -11499,7 +12580,7 @@ impl MobileApp {
                             div()
                                 .min_w_0()
                                 .flex_1()
-                                .text_size(px(theme::FONT_CAPTION))
+                                .text_size(theme::font_caption())
                                 .text_color(theme::text_secondary())
                                 .child(format!(
                                     "{} {}",
@@ -11531,14 +12612,14 @@ impl MobileApp {
                             changed_rows
                                 .iter()
                                 .take(visible_count)
-                                .map(|row| self.render_turn_file_change_row(row)),
+                                .map(|row| self.render_turn_file_change_row(row, cx)),
                         )
                         .when(hidden_count > 0, |rows| {
                             rows.child(
                                 div()
                                     .px_3()
                                     .py_2()
-                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_size(theme::font_micro())
                                     .text_color(theme::text_muted())
                                     .child(format!(
                                         "{} {}",
@@ -11552,28 +12633,58 @@ impl MobileApp {
         )
     }
 
-    fn render_turn_file_change_row(&self, row: &TimelineRow) -> gpui::AnyElement {
-        let title = self
-            .timeline_row_latest_payload(row)
-            .and_then(|payload| match payload {
-                TimelinePayload::FileOperation(operation) => Some(format!(
-                    "{} {}",
-                    file_operation_verb(operation.operation),
-                    operation.path
-                )),
-                _ => None,
-            })
-            .unwrap_or_else(|| process_title(row));
-        div()
+    fn render_turn_file_change_row(
+        &self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let operation_path =
+            self.timeline_row_latest_payload(row)
+                .and_then(|payload| match payload {
+                    TimelinePayload::FileOperation(operation) => Some(operation.path.clone()),
+                    _ => None,
+                });
+        let title = match &operation_path {
+            Some(path) => format!(
+                "{} {}",
+                self.timeline_row_latest_payload(row)
+                    .and_then(|payload| match payload {
+                        TimelinePayload::FileOperation(operation) => {
+                            Some(file_operation_verb(operation.operation))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                path
+            ),
+            None => process_title(row),
+        };
+        let mut element = div()
+            .id(format!("timeline-file-row:{title}"))
             .w_full()
             .min_w_0()
-            .min_h(px(34.0))
+            .min_h(px(44.0))
             .px_3()
             .flex()
             .items_center()
             .gap_2()
             .border_b_1()
-            .border_color(theme::border_subtle())
+            .border_color(theme::border_subtle());
+        // A path the agent wrote is a door, not a label: the desktop opens the
+        // file, and so does the phone — into the right rail's editor.
+        if let Some(path) = operation_path {
+            element = element
+                .cursor_pointer()
+                .aria_label(path.clone())
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, event, window, cx| {
+                        this.open_timeline_file(path.clone(), event, window, cx)
+                    }),
+                );
+        }
+        element
             .child(
                 svg()
                     .path("icons/file-code.svg")
@@ -11588,7 +12699,7 @@ impl MobileApp {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(theme::FONT_MICRO))
+                    .text_size(theme::font_micro())
                     .text_color(theme::text_secondary())
                     .child(title),
             )
@@ -11661,14 +12772,14 @@ impl MobileApp {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(theme::FONT_BODY))
+                            .text_size(theme::font_body())
                             .text_color(theme::text_primary())
                             .child(approval.title.clone()),
                     )
                     .child(
                         div()
                             .flex_shrink_0()
-                            .text_size(px(theme::FONT_MICRO))
+                            .text_size(theme::font_micro())
                             .text_color(theme::accent_yellow())
                             .child(permission_risk_label(approval.risk_category)),
                     ),
@@ -11682,7 +12793,7 @@ impl MobileApp {
                         div()
                             .flex()
                             .gap_2()
-                            .text_size(px(theme::FONT_CAPTION))
+                            .text_size(theme::font_caption())
                             .child(div().text_color(theme::text_muted()).child(label.clone()))
                             .child(
                                 div()
@@ -11700,7 +12811,7 @@ impl MobileApp {
                         .h(px(36.0))
                         .flex()
                         .items_center()
-                        .text_size(px(theme::FONT_CAPTION))
+                        .text_size(theme::font_caption())
                         .text_color(theme::text_muted())
                         .cursor_pointer()
                         .on_mouse_up(
@@ -11733,7 +12844,7 @@ impl MobileApp {
                                 .h(px(theme::TOUCH_TARGET))
                                 .flex()
                                 .items_center()
-                                .text_size(px(theme::FONT_BODY))
+                                .text_size(theme::font_body())
                                 .text_color(theme::text_muted())
                                 .child(locale::common("Resolving...")),
                         )
@@ -11749,7 +12860,7 @@ impl MobileApp {
                                 .rounded(px(theme::RADIUS_CONTROL))
                                 .border_1()
                                 .border_color(theme::border_default())
-                                .text_size(px(theme::FONT_BODY))
+                                .text_size(theme::font_body())
                                 .text_color(theme::text_secondary())
                                 .cursor_pointer()
                                 .on_mouse_up(
@@ -11776,7 +12887,7 @@ impl MobileApp {
                                 .rounded(px(theme::RADIUS_CONTROL))
                                 .border_1()
                                 .border_color(theme::border_default())
-                                .text_size(px(theme::FONT_BODY))
+                                .text_size(theme::font_body())
                                 .text_color(theme::text_secondary())
                                 .cursor_pointer()
                                 .on_mouse_up(
@@ -11802,7 +12913,7 @@ impl MobileApp {
                                 .items_center()
                                 .rounded(px(theme::RADIUS_CONTROL))
                                 .bg(theme::text_primary())
-                                .text_size(px(theme::FONT_BODY))
+                                .text_size(theme::font_body())
                                 .text_color(theme::bg_primary())
                                 .cursor_pointer()
                                 .on_mouse_up(
@@ -11844,8 +12955,8 @@ impl MobileApp {
                         let field_id = field.id.clone();
                         let value = option.value.clone();
                         let selected = self
-                            .elicitation_draft
-                            .as_ref()
+                            .elicitation_drafts
+                            .get(request.id.as_str())
                             .and_then(|draft| draft.text(&field.id))
                             == Some(option.value.as_str());
                         div()
@@ -11862,7 +12973,7 @@ impl MobileApp {
                             .when(selected, |choice| choice.bg(theme::bg_card_dim()))
                             .flex()
                             .items_center()
-                            .text_size(px(theme::FONT_CAPTION))
+                            .text_size(theme::font_caption())
                             .text_color(theme::text_secondary())
                             .cursor_pointer()
                             .on_mouse_up(
@@ -11883,7 +12994,7 @@ impl MobileApp {
                 | ElicitationFieldKind::Number { .. }
                 | ElicitationFieldKind::Integer { .. } => self
                     .elicitation_inputs
-                    .get(&field.id)
+                    .get(&(request.id.as_str().to_string(), field.id.clone()))
                     .cloned()
                     .map(|input| {
                         div()
@@ -11906,8 +13017,8 @@ impl MobileApp {
                                 let request_id = request.id.clone();
                                 let field_id = field.id.clone();
                                 let selected = self
-                                    .elicitation_draft
-                                    .as_ref()
+                                    .elicitation_drafts
+                                    .get(request.id.as_str())
                                     .and_then(|draft| draft.boolean(&field.id))
                                     == Some(value);
                                 div()
@@ -11924,7 +13035,7 @@ impl MobileApp {
                                     .when(selected, |choice| choice.bg(theme::bg_card_dim()))
                                     .flex()
                                     .items_center()
-                                    .text_size(px(theme::FONT_CAPTION))
+                                    .text_size(theme::font_caption())
                                     .text_color(theme::text_secondary())
                                     .cursor_pointer()
                                     .on_mouse_up(
@@ -11951,8 +13062,8 @@ impl MobileApp {
                         let field_id = field.id.clone();
                         let value = option.value.clone();
                         let selected = self
-                            .elicitation_draft
-                            .as_ref()
+                            .elicitation_drafts
+                            .get(request.id.as_str())
                             .is_some_and(|draft| draft.multi_selected(&field.id, &option.value));
                         div()
                             .id(format!("elicitation:{}:{}", field.id, option.value))
@@ -11968,7 +13079,7 @@ impl MobileApp {
                             .when(selected, |choice| choice.bg(theme::bg_card_dim()))
                             .flex()
                             .items_center()
-                            .text_size(px(theme::FONT_CAPTION))
+                            .text_size(theme::font_caption())
                             .text_color(theme::text_secondary())
                             .cursor_pointer()
                             .on_mouse_up(
@@ -11986,7 +13097,7 @@ impl MobileApp {
                     }))
                     .into_any_element(),
                 ElicitationFieldKind::Unsupported { schema_type } => div()
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(theme::font_caption())
                     .text_color(theme::accent_red())
                     .child(format!(
                         "{}: {schema_type}",
@@ -12005,7 +13116,7 @@ impl MobileApp {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(theme::FONT_CAPTION))
+                            .text_size(theme::font_caption())
                             .text_color(theme::text_secondary())
                             .child(if field.required {
                                 format!("{} *", field.title)
@@ -12016,7 +13127,7 @@ impl MobileApp {
                     .when_some(field.description.as_ref(), |container, description| {
                         container.child(
                             div()
-                                .text_size(px(theme::FONT_MICRO))
+                                .text_size(theme::font_micro())
                                 .text_color(theme::text_muted())
                                 .child(description.clone()),
                         )
@@ -12043,7 +13154,7 @@ impl MobileApp {
             .gap_3()
             .child(
                 div()
-                    .text_size(px(theme::FONT_BODY))
+                    .text_size(theme::font_body())
                     .text_color(theme::text_primary())
                     .child(
                         request
@@ -12054,7 +13165,7 @@ impl MobileApp {
             )
             .child(
                 div()
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(theme::font_caption())
                     .text_color(theme::text_secondary())
                     .child(request.message.clone()),
             )
@@ -12085,7 +13196,7 @@ impl MobileApp {
                             .border_color(theme::border_default())
                             .flex()
                             .items_center()
-                            .text_size(px(theme::FONT_BODY))
+                            .text_size(theme::font_body())
                             .text_color(theme::text_secondary())
                             .when(!pending, |button| {
                                 button.cursor_pointer().on_mouse_up(
@@ -12110,7 +13221,7 @@ impl MobileApp {
                             .bg(theme::text_primary())
                             .flex()
                             .items_center()
-                            .text_size(px(theme::FONT_BODY))
+                            .text_size(theme::font_body())
                             .text_color(theme::bg_primary())
                             .when(!pending, |button| {
                                 button.cursor_pointer().on_mouse_up(
@@ -12147,8 +13258,17 @@ impl MobileApp {
             agent_session_turn_requires_continuation(state, latest_ended_normally)
         });
         let runtime_switch_pending = self.runtime_switch_busy_generation.is_some();
-        let action_enabled =
-            state.is_some() && !self.operation_busy && (running || !runtime_switch_pending);
+        let has_text = !self.composer_input.read(cx).value().trim().is_empty();
+        let send_enabled = has_text && state.is_some() && !self.operation_busy;
+        let stop_enabled = state.is_some() && !self.operation_busy && !runtime_switch_pending;
+        let usage_fraction = self.token_usage.as_ref().and_then(token_usage_fraction);
+        let usage_percent = usage_fraction.unwrap_or(0.0) * 100.0;
+        let usage_color = match usage_fraction {
+            Some(fraction) if fraction > 0.9 => theme::accent_red(),
+            Some(fraction) if fraction >= 0.7 => theme::accent_yellow(),
+            _ => theme::text_muted(),
+        };
+        let usage_reported = self.token_usage.is_some();
         let runtime_selection = self.controller.as_ref().and_then(|controller| {
             controller
                 .state
@@ -12188,7 +13308,7 @@ impl MobileApp {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(theme::FONT_BODY))
+                        .text_size(theme::font_body())
                         .text_color(if self.operation_busy {
                             theme::text_muted()
                         } else {
@@ -12201,7 +13321,7 @@ impl MobileApp {
                                 .on_mouse_up(MouseButton::Left, cx.listener(Self::continue_turn))
                         })
                         .child(if self.operation_busy {
-                            "Continuing\u{2026}"
+                            locale::text("Continuing…", "继续中…", "繼續中…")
                         } else {
                             locale::common("Continue")
                         }),
@@ -12241,45 +13361,73 @@ impl MobileApp {
                                     }),
                             ),
                     )
+                    // Stop is its own control while a turn runs. It used to
+                    // replace Send, which left the user with no way to say
+                    // anything to a turn that was already going: now Send
+                    // steers the running turn and Stop pauses it.
+                    .when(running, |row| {
+                        row.child(
+                            div()
+                                .id("stop-turn")
+                                .size(px(theme::TOUCH_TARGET))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .aria_label(locale::common("Stop"))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .when(stop_enabled, |button| {
+                                    button
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(Self::interrupt),
+                                        )
+                                })
+                                .when(!stop_enabled, |button| button.opacity(0.45))
+                                .child(
+                                    svg()
+                                        .path("icons/stop.svg")
+                                        .size(px(theme::ICON_SM))
+                                        .text_color(if stop_enabled {
+                                            theme::accent_red()
+                                        } else {
+                                            theme::text_muted()
+                                        }),
+                                ),
+                        )
+                    })
                     .child(
                         div()
-                            .id(if running { "stop-turn" } else { "send-message" })
+                            .id("send-message")
                             .size(px(theme::TOUCH_TARGET))
                             .flex_shrink_0()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .when(action_enabled, |button| {
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .aria_label(if running {
+                                locale::text("Steer the turn", "引导当前回合", "引導目前回合")
+                            } else {
+                                locale::common("Send")
+                            })
+                            .when(send_enabled, |button| {
                                 button
                                     .cursor_pointer()
-                                    .active(|style| style.opacity(0.6))
-                                    .when(running, |button| {
-                                        button.on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(Self::interrupt),
-                                        )
-                                    })
-                                    .when(!running, |button| {
-                                        button.on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(Self::send_message),
-                                        )
-                                    })
+                                    .bg(theme::primary())
+                                    .active(|style| style.opacity(0.72))
+                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::send_message))
                             })
+                            .when(!send_enabled, |button| button.opacity(0.45))
                             .child(
                                 svg()
-                                    .path(if running {
-                                        "icons/stop.svg"
-                                    } else {
-                                        "icons/send.svg"
-                                    })
+                                    .path("icons/send.svg")
                                     .size(px(theme::ICON_SM))
-                                    .text_color(if !action_enabled {
-                                        theme::text_muted()
-                                    } else if running {
-                                        theme::accent_red()
+                                    .text_color(if send_enabled {
+                                        theme::primary_foreground()
                                     } else {
-                                        theme::text_secondary()
+                                        theme::text_muted()
                                     }),
                             ),
                     ),
@@ -12305,7 +13453,7 @@ impl MobileApp {
                     .child(
                         div()
                             .flex_shrink_0()
-                            .text_size(px(theme::FONT_MICRO))
+                            .text_size(theme::font_micro())
                             .text_color(theme::text_muted())
                             .child(locale::common("Runtime")),
                     )
@@ -12319,7 +13467,7 @@ impl MobileApp {
                                 div()
                                     .w_full()
                                     .truncate()
-                                    .text_size(px(theme::FONT_CAPTION))
+                                    .text_size(theme::font_caption())
                                     .text_color(if runtime_summary.available {
                                         theme::text_primary()
                                     } else {
@@ -12332,18 +13480,106 @@ impl MobileApp {
                                     div()
                                         .w_full()
                                         .truncate()
-                                        .text_size(px(theme::FONT_MICRO))
+                                        .text_size(theme::font_micro())
                                         .text_color(theme::text_muted())
                                         .child(runtime_summary.secondary),
                                 )
                             }),
                     )
                     .child(
+                        svg()
+                            .path("icons/chevron-right.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::text_muted()),
+                    ),
+            )
+            // The token ring: the one usage surface a phone gets, and the only
+            // place the reader can tell how full the context window is before
+            // the next turn fails on it.
+            .child(
+                div()
+                    .id("composer-token-usage")
+                    .mt(px(theme::SPACING_SM))
+                    .h(px(theme::TOUCH_TARGET))
+                    .px(px(theme::SPACING_MD))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(theme::border_subtle())
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .cursor_pointer()
+                    .aria_label(locale::text(
+                        "Token usage",
+                        "Token 使用情况",
+                        "Token 使用情況",
+                    ))
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.show_token_usage(cx)),
+                    )
+                    .child(
+                        ProgressCircle::new("composer-token-ring")
+                            .value(usage_percent)
+                            .color(usage_color),
+                    )
+                    .child(
                         div()
-                            .flex_shrink_0()
-                            .text_size(px(theme::FONT_BODY))
-                            .text_color(theme::text_muted())
-                            .child(if runtime_switch_pending { "..." } else { ">" }),
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(theme::font_caption())
+                                    .text_color(if usage_reported {
+                                        theme::text_secondary()
+                                    } else {
+                                        theme::text_muted()
+                                    })
+                                    .child(match (usage_fraction, self.token_usage.as_ref()) {
+                                        (Some(fraction), Some(usage)) => format!(
+                                            "{}% · {} / {}",
+                                            (fraction * 100.0).round() as u64,
+                                            format_compact_tokens(
+                                                usage
+                                                    .context_window_used_tokens
+                                                    .unwrap_or_default()
+                                            ),
+                                            format_compact_tokens(
+                                                usage
+                                                    .context_window_size_tokens
+                                                    .unwrap_or_default()
+                                            )
+                                        ),
+                                        (None, Some(usage)) => format!(
+                                            "{} / {}",
+                                            format_compact_tokens(
+                                                usage.input_tokens.unwrap_or_default()
+                                            ),
+                                            format_compact_tokens(
+                                                usage.output_tokens.unwrap_or_default()
+                                            )
+                                        ),
+                                        _ => locale::text(
+                                            "Token usage not reported yet",
+                                            "尚未上报 token 使用情况",
+                                            "尚未回報 token 使用情況",
+                                        )
+                                        .to_string(),
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_muted())
+                                    .child(locale::text(
+                                        "Context window",
+                                        "上下文窗口",
+                                        "上下文視窗",
+                                    )),
+                            ),
                     ),
             )
     }
@@ -12390,6 +13626,7 @@ impl MobileApp {
             }
             SidebarRowKind::Project => self.render_sidebar_project_row(row, cx),
             SidebarRowKind::Workspace => self.render_sidebar_workspace_row(row, cx),
+            SidebarRowKind::Group => self.render_sidebar_group_row(row, cx),
             SidebarRowKind::EmptyWorkspace => self.render_sidebar_empty_workspace_row(row),
             SidebarRowKind::Session => {
                 self.render_sidebar_session_row(row, session_selected, inside_workspace_card, cx)
@@ -12513,6 +13750,7 @@ impl MobileApp {
             SidebarRowKind::Folder | SidebarRowKind::Project | SidebarRowKind::Workspace => {
                 theme::SIDEBAR_ACTION_CONTENT_INSET
             }
+            SidebarRowKind::Group => theme::SIDEBAR_ACTION_CONTENT_INSET,
             SidebarRowKind::EmptyWorkspace => 0.0,
         }
     }
@@ -12545,6 +13783,7 @@ impl MobileApp {
                         })
                     })
             }
+            SidebarRowKind::Group => false,
             SidebarRowKind::EmptyWorkspace => false,
         }
     }
@@ -12708,13 +13947,98 @@ impl MobileApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(px(theme::FONT_SIDEBAR_ROW))
+                            .text_size(theme::font_sidebar_row())
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme::sidebar_foreground(0.78))
                             .child(row.label.clone()),
                     )
                     // The expander trails the name here, exactly as on the
                     // desktop, so a folder never lines up with a project logo.
+                    .child(
+                        svg()
+                            .path(if row.collapsed {
+                                "icons/chevron-right.svg"
+                            } else {
+                                "icons/chevron-down.svg"
+                            })
+                            .size(px(12.0))
+                            .flex_shrink_0()
+                            .text_color(theme::sidebar_foreground(0.78)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// A session group, drawn the way the desktop draws it: a stack mark, the
+    /// group's name, its member count, and a disclosure chevron. The phone
+    /// shows one member at a time, so this row is also the way into the group's
+    /// tab strip.
+    fn render_sidebar_group_row(
+        &self,
+        row: &SidebarRow,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let group_id = row.id().to_string();
+        let toggle_id = group_id.clone();
+        div()
+            .id(format!("mobile-group-row-{group_id}"))
+            .h_full()
+            .relative()
+            .left(px(-theme::SIDEBAR_ICON_SLOT_OVERHANG))
+            .mx(px(theme::SIDEBAR_LIST_PADDING))
+            .pl(px(row.indent))
+            .pr(px(theme::SIDEBAR_ACTION_CONTENT_INSET))
+            .rounded(px(theme::SIDEBAR_ROW_RADIUS))
+            .flex()
+            .items_center()
+            .gap(px(theme::SIDEBAR_ICON_TITLE_GAP))
+            .cursor_pointer()
+            .aria_label(row.label.clone())
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.toggle_sidebar_group(toggle_id.clone(), cx)),
+            )
+            .child(Self::sidebar_icon_slot(
+                svg()
+                    .path("icons/layers.svg")
+                    .size(px(theme::SIDEBAR_PROJECT_LOGO_SIZE))
+                    .text_color(theme::accent_purple())
+                    .into_any_element(),
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SIDEBAR_ICON_TITLE_GAP))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(theme::font_sidebar_row())
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::sidebar_foreground(0.78))
+                            .child(row.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .min_w(px(20.0))
+                            .h(px(18.0))
+                            .px(px(4.0))
+                            .rounded_full()
+                            .bg(theme::bg_card_dim())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_muted())
+                            .child(row.child_count.to_string()),
+                    )
                     .child(
                         svg()
                             .path(if row.collapsed {
@@ -12791,7 +14115,7 @@ impl MobileApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(px(theme::FONT_SIDEBAR_TITLE))
+                            .text_size(theme::font_sidebar_title())
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(if row.selected {
                                 theme::sidebar_foreground(1.0)
@@ -12810,7 +14134,7 @@ impl MobileApp {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(theme::FONT_SIDEBAR_META))
+                            .text_size(theme::font_sidebar_meta())
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme::sidebar_text_muted())
                             .bg(theme::bg_card_dim())
@@ -12936,7 +14260,7 @@ impl MobileApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(px(theme::FONT_SIDEBAR_TITLE))
+                            .text_size(theme::font_sidebar_title())
                             .text_color(if workspace_selected {
                                 theme::sidebar_foreground(1.0)
                             } else {
@@ -12950,8 +14274,8 @@ impl MobileApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(px(theme::FONT_SIDEBAR_META))
-                            .text_color(theme::sidebar_foreground(0.48))
+                            .text_size(theme::font_sidebar_meta())
+                            .text_color(theme::sidebar_session_meta())
                             .child(detail),
                     ),
             )
@@ -13002,14 +14326,14 @@ impl MobileApp {
             .flex()
             .items_center()
             .gap(px(theme::SPACING_SM))
-            .text_size(px(theme::FONT_SIDEBAR_ROW))
-            .text_color(theme::sidebar_foreground(0.45))
+            .text_size(theme::font_sidebar_row())
+            .text_color(theme::sidebar_placeholder())
             .child(
                 svg()
                     .path("icons/message-square.svg")
                     .size(px(14.0))
                     .flex_shrink_0()
-                    .text_color(theme::sidebar_foreground(0.45)),
+                    .text_color(theme::sidebar_placeholder()),
             )
             .child(locale::text("No sessions", "暂无会话", "暫無會話"))
             .into_any_element()
@@ -13103,12 +14427,12 @@ impl MobileApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(px(theme::FONT_SIDEBAR_ROW))
+                            .text_size(theme::font_sidebar_row())
                             .when(is_selected, |title| title.font_weight(FontWeight::SEMIBOLD))
                             .text_color(if is_selected {
                                 theme::sidebar_foreground(1.0)
                             } else {
-                                theme::sidebar_foreground(0.56)
+                                theme::sidebar_session_title()
                             })
                             .child(row.label.clone()),
                     ),
@@ -13121,8 +14445,8 @@ impl MobileApp {
                     .items_center()
                     .justify_end()
                     .gap(px(6.0))
-                    .text_size(px(theme::FONT_SIDEBAR_META))
-                    .text_color(theme::sidebar_foreground(0.48))
+                    .text_size(theme::font_sidebar_meta())
+                    .text_color(theme::sidebar_session_meta())
                     .when(row.pinned, |right| {
                         right.child(
                             svg()
@@ -13180,7 +14504,15 @@ impl MobileApp {
             .into_any_element()
     }
 
-    fn render_workbench_drawer(&self, workbench: Option<Entity<MobileWorkbench>>) -> gpui::Div {
+    fn render_workbench_drawer(
+        &self,
+        workbench: Option<Entity<MobileWorkbench>>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let surface = workbench
+            .as_ref()
+            .map(|workbench| workbench.read(cx).surface())
+            .unwrap_or(WorkbenchSurface::Files);
         let body = match workbench {
             Some(workbench) => div().flex_1().min_h_0().child(workbench),
             None => div()
@@ -13189,7 +14521,7 @@ impl MobileApp {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(theme::FONT_BODY))
+                .text_size(theme::font_body())
                 .text_color(theme::text_muted())
                 .child(locale::common("Loading")),
         };
@@ -13203,6 +14535,52 @@ impl MobileApp {
             .border_color(theme::border_default())
             .flex()
             .flex_col()
+            // The rail carries its own header: a phone has no cursor to hover
+            // the drawer edge and no hardware back key rooted in this page, so
+            // the visible way out is part of the surface, not a gesture.
+            .child(
+                div()
+                    .h(px(theme::DRAWER_HEADER_HEIGHT))
+                    .flex_shrink_0()
+                    .px(px(theme::SPACING_SM))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .child(
+                        div()
+                            .id("close-right-rail")
+                            .size(px(theme::HEADER_BUTTON_SIZE))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .cursor_pointer()
+                            .aria_label(locale::text("Close", "关闭", "關閉"))
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.start_drawer_snap(0.0, Some(window), cx);
+                                }),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/chevron-right.svg")
+                                    .size(px(theme::ICON_MD))
+                                    .text_color(theme::text_secondary()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .text_size(theme::font_heading())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(surface.localized_label()),
+                    ),
+            )
             .child(body)
     }
 }
@@ -13392,7 +14770,7 @@ impl MobileApp {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .text_size(px(theme::FONT_CAPTION))
+                                    .text_size(theme::font_caption())
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme::sidebar_text_muted())
                                     .child(locale::common("Projects")),
@@ -13662,12 +15040,19 @@ impl MobileApp {
                                 .child(
                                     div()
                                         .flex_1()
-                                        .text_size(px(theme::FONT_CAPTION))
+                                        .text_size(theme::font_caption())
                                         .text_color(theme::sidebar_text_muted())
-                                        .child(format!(
-                                            "{} selected",
-                                            self.sidebar_state.selected_ids.len()
-                                        )),
+                                        .child(
+                                            locale::text("{} selected", "已选 {} 项", "已選 {} 項")
+                                                .replace(
+                                                    "{}",
+                                                    &self
+                                                        .sidebar_state
+                                                        .selected_ids
+                                                        .len()
+                                                        .to_string(),
+                                                ),
+                                        ),
                                 )
                                 .child(
                                     div()
@@ -13753,7 +15138,7 @@ impl MobileApp {
                             div()
                                 .mx(px(theme::SPACING_LG))
                                 .mt(px(theme::SPACING_LG))
-                                .text_size(px(theme::FONT_CAPTION))
+                                .text_size(theme::font_caption())
                                 .text_color(theme::sidebar_text_muted())
                                 .child(if has_search_query {
                                     locale::common("No matching sessions")
@@ -13902,7 +15287,7 @@ impl MobileApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(px(theme::FONT_BODY))
+                            .text_size(theme::font_body())
                             .text_color(theme::sidebar_text_secondary())
                             .child(label),
                     ),
@@ -13962,7 +15347,7 @@ impl MobileApp {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(theme::FONT_HEADING))
+                    .text_size(theme::font_heading())
                     .text_color(theme::text_primary())
                     .child(locale::common(title)),
             )
@@ -14089,7 +15474,7 @@ impl MobileApp {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(theme::font_caption())
                     .text_color(theme::text_muted())
                     .child(host.display_label()),
             );
@@ -14210,13 +15595,13 @@ impl MobileApp {
                     .gap_3()
                     .child(
                         div()
-                            .text_size(px(theme::FONT_HEADING))
+                            .text_size(theme::font_heading())
                             .text_color(theme::text_primary())
                             .child(heading),
                     )
                     .child(
                         div()
-                            .text_size(px(theme::FONT_CAPTION))
+                            .text_size(theme::font_caption())
                             .text_color(theme::text_muted())
                             .child(locale::common(
                                 "Leave this empty to use the name from the runtime.",
@@ -14237,7 +15622,7 @@ impl MobileApp {
                     )
                     .child(
                         div()
-                            .text_size(px(theme::FONT_MICRO))
+                            .text_size(theme::font_micro())
                             .text_color(theme::text_muted())
                             .child(host.label.clone()),
                     )
@@ -14314,13 +15699,13 @@ impl MobileApp {
                     .gap_3()
                     .child(
                         div()
-                            .text_size(px(theme::FONT_HEADING))
+                            .text_size(theme::font_heading())
                             .text_color(theme::text_primary())
                             .child(heading),
                     )
                     .child(
                         div()
-                            .text_size(px(theme::FONT_CAPTION))
+                            .text_size(theme::font_caption())
                             .text_color(theme::text_muted())
                             .child(locale::common(
                                 "Deletes the credential stored on this phone. The device authorization on the server is not revoked by this; revoke it there.",
@@ -14432,7 +15817,12 @@ impl MobileApp {
                         // in its paired-device list is what this shows. It is
                         // read from the last handshake, so it appears once the
                         // runtime has been reached in this session.
-                        body.child(host_detail_field("Device name", &device_name, false, false))
+                        body.child(host_detail_field(
+                            locale::common("Device name"),
+                            &device_name,
+                            false,
+                            false,
+                        ))
                     })
                     .when_some(added, |body, added| {
                         body.child(host_detail_field("Added", &added, false, false))
@@ -14478,12 +15868,28 @@ impl Render for MobileApp {
         }
         // Writes recorded by paths that have no window. `InputState` refuses a
         // programmatic edit without one, so they land here instead.
-        for (field, value) in std::mem::take(&mut self.pending_input_writes) {
+        let mut pending_writes = std::mem::take(&mut self.pending_input_writes);
+        // The composer is a textarea rather than a single-line input, so its
+        // draft is applied on its own before the shared loop.
+        for textarea_field in [InputField::Composer, InputField::NewSessionPrompt] {
+            if let Some(index) = pending_writes
+                .iter()
+                .position(|(field, _)| *field == textarea_field)
+            {
+                let (_, value) = pending_writes.remove(index);
+                let target = match textarea_field {
+                    InputField::Composer => self.composer_input.clone(),
+                    _ => self.new_session_prompt_input.clone(),
+                };
+                target.update(cx, |input, cx| input.set_value(value, window, cx));
+            }
+        }
+        for (field, value) in pending_writes {
             let input = match field {
+                InputField::Composer | InputField::NewSessionPrompt => continue,
                 InputField::PairingServerUrl => &self.pairing_server_url_input,
                 InputField::PairingCode => &self.pairing_code_input,
                 InputField::NewSessionTitle => &self.new_session_title_input,
-                InputField::NewSessionPrompt => &self.new_session_prompt_input,
                 InputField::SidebarName => &self.sidebar_name_input,
                 InputField::SessionAction => &self.session_action_input,
                 InputField::HostName => &self.host_name_input,
@@ -14600,7 +16006,7 @@ fn overlay_section_heading(label: &'static str) -> gpui::AnyElement {
     div()
         .mt(px(theme::SPACING_LG))
         .mb(px(theme::SPACING_SM))
-        .text_size(px(theme::FONT_CAPTION))
+        .text_size(theme::font_caption())
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme::text_muted())
         .child(locale::common(label))
@@ -14725,7 +16131,7 @@ fn settings_info_row_base(
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
-                        .text_size(px(theme::FONT_BODY))
+                        .text_size(theme::font_body())
                         .text_color(theme::text_secondary())
                         .child(title),
                 )
@@ -14734,7 +16140,7 @@ fn settings_info_row_base(
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
-                        .text_size(px(theme::FONT_MICRO))
+                        .text_size(theme::font_micro())
                         .text_color(theme::text_muted())
                         .child(detail),
                 ),
@@ -14771,7 +16177,7 @@ fn update_card_button(id: &'static str, label: String, primary: bool) -> gpui::S
         .items_center()
         .justify_center()
         .px(px(theme::SPACING_SM))
-        .text_size(px(theme::FONT_BODY))
+        .text_size(theme::font_body())
         .text_color(if primary {
             theme::accent_foreground()
         } else {
@@ -15132,7 +16538,7 @@ impl MobileApp {
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(theme::FONT_CAPTION))
+            .text_size(theme::font_caption())
             .text_color(if !available {
                 theme::text_muted()
             } else if self.new_session_workspace_mode == mode {
@@ -15159,6 +16565,14 @@ impl MobileApp {
             .into_any_element()
     }
 
+    /// The new-session page.
+    ///
+    /// It is a conversation page, not a configuration form: the first message
+    /// occupies the page the way the composer occupies a session, and the
+    /// choices that shape it (runtime, location, title) are chips along its
+    /// bottom edge. The desktop's creation panel reads the same way, which is
+    /// the point — the phone used to open on two cycling pickers and a pair of
+    /// unlabelled text boxes.
     fn render_new_session(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let project_label = self
             .new_session_project_id
@@ -15199,16 +16613,19 @@ impl MobileApp {
                 .map(|state| &state.desired)
         });
         let runtime_summary = runtime_selection_summary(runtime_catalog, runtime_selection);
-        let runtime_summary_detail = if runtime_summary.secondary.is_empty() {
-            locale::text(
-                "Select an Agent runtime",
-                "选择 Agent 运行时",
-                "選擇 Agent 執行環境",
-            )
-            .to_string()
-        } else {
-            runtime_summary.secondary.clone()
-        };
+        let prompt = self.new_session_prompt_input.read(cx).value();
+        let can_submit = !prompt.trim().is_empty() && !self.new_session_busy;
+        let worktree_supported = self.supports_new_session_worktree();
+        let mode = self.normalize_new_session_workspace_mode(self.new_session_workspace_mode);
+        let can_create_session = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentCreateSession)
+        });
+        let runtime_ready = runtime_summary.available && can_create_session;
+        let title_value = self.new_session_title_input.read(cx).value().to_string();
+
         div()
             .absolute()
             .inset_0()
@@ -15226,194 +16643,223 @@ impl MobileApp {
                     .restrict_scroll_to_axis()
                     .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
                     .px(px(theme::SPACING_LG))
-                    .py(px(theme::SPACING_MD))
-                    .child(overlay_section_heading("Project"))
+                    .py(px(theme::SPACING_LG))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACING_MD))
+                    // ── the first message ────────────────────────────────────
                     .child(
                         div()
-                            .id("mobile-new-session-project")
-                            .h(px(theme::TOUCH_TARGET))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_default())
-                            .bg(theme::bg_card_dim())
-                            .px(px(theme::SPACING_MD))
-                            .flex()
-                            .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::cycle_new_session_project),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/folder.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_muted()),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(px(theme::FONT_BODY))
-                                    .text_color(theme::text_primary())
-                                    .child(project_label),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/chevron-right.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_muted()),
-                            ),
-                    )
-                    .child(overlay_section_heading("Workspace"))
-                    .child(
-                        div()
-                            .id("mobile-new-session-workspace")
-                            .h(px(theme::TOUCH_TARGET))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_default())
-                            .bg(theme::bg_card_dim())
-                            .px(px(theme::SPACING_MD))
-                            .flex()
-                            .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::cycle_new_session_workspace),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/git-branch.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_muted()),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(px(theme::FONT_BODY))
-                                    .text_color(theme::text_primary())
-                                    .child(workspace_display),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/chevron-right.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_muted()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt(px(theme::SPACING_SM))
                             .w_full()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .bg(theme::bg_card_dim())
-                            .p(px(2.0))
+                            .rounded(px(theme::RADIUS_CARD))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::bg_card())
+                            .p(px(theme::SPACING_MD))
                             .flex()
-                            .gap(px(2.0))
+                            .flex_col()
+                            .gap(px(theme::SPACING_SM))
+                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                             .child(
-                                self.render_new_session_mode_button(
-                                    "mobile-new-session-current",
-                                    WorkspaceMode::CurrentCheckout,
-                                    locale::text("Current Checkout", "当前检出", "目前檢出")
-                                        .to_string(),
-                                    cx,
-                                ),
+                                div()
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_muted())
+                                    .child(locale::text(
+                                        "FIRST MESSAGE",
+                                        "第一条消息",
+                                        "第一條訊息",
+                                    )),
                             )
                             .child(
-                                self.render_new_session_mode_button(
-                                    "mobile-new-session-worktree",
-                                    WorkspaceMode::VibexWorktree,
-                                    locale::text("New Worktree", "新建 Worktree", "新建 Worktree")
-                                        .to_string(),
-                                    cx,
-                                ),
+                                div()
+                                    .w_full()
+                                    .min_h_0()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        resume_keyboard_on_tap,
+                                    )
+                                    .child(
+                                        Textarea::new(&self.new_session_prompt_input)
+                                            .appearance(false),
+                                    ),
                             ),
                     )
-                    .child(overlay_section_heading("Runtime"))
-                    .child(
-                        settings_info_row_base(
-                            "mobile-new-session-runtime",
-                            "icons/activity.svg",
-                            runtime_summary.primary,
-                            runtime_summary_detail,
-                            theme::text_muted(),
-                        )
-                        .cursor_pointer()
-                        .active(|style| style.bg(theme::row_pressed_bg()))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(Self::open_new_session_runtime_options),
-                        )
-                        .child(
-                            svg()
-                                .path("icons/chevron-right.svg")
-                                .size(px(theme::ICON_SM))
-                                .text_color(theme::text_muted()),
-                        ),
-                    )
-                    .child(overlay_section_heading("Details"))
+                    // ── title, only when the user wants one ──────────────────
                     .child(
                         div()
-                            .h(px(theme::TOUCH_TARGET))
-                            .rounded(px(theme::RADIUS_CONTROL))
+                            .w_full()
+                            .rounded(px(theme::RADIUS_CARD))
                             .border_1()
-                            .border_color(theme::border_default())
+                            .border_color(theme::border_subtle())
                             .bg(theme::bg_card())
-                            .px(px(2.0))
+                            .px(px(theme::SPACING_MD))
+                            .py(px(theme::SPACING_SM))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
                             .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
-                            .child(Input::new(&self.new_session_title_input).appearance(false)),
+                            .child(
+                                svg()
+                                    .path("icons/pencil.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        resume_keyboard_on_tap,
+                                    )
+                                    .child(
+                                        Input::new(&self.new_session_title_input)
+                                            .appearance(false),
+                                    ),
+                            )
+                            .when(!title_value.is_empty(), |row| {
+                                row.child(
+                                    div()
+                                        .text_size(theme::font_micro())
+                                        .text_color(theme::text_muted())
+                                        .child(locale::common("Optional")),
+                                )
+                            }),
+                    )
+                    // ── the choices that shape it ────────────────────────────
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(theme::SPACING_SM))
+                            .child(new_session_chip(
+                                "mobile-new-session-runtime",
+                                "icons/bot.svg",
+                                locale::common("Runtime"),
+                                runtime_summary.primary.clone(),
+                                !runtime_summary.available,
+                                cx.listener(|this, event, window, cx| {
+                                    this.open_new_session_runtime_options(event, window, cx)
+                                }),
+                            ))
+                            .child(new_session_chip(
+                                "mobile-new-session-location",
+                                if mode == WorkspaceMode::VibexWorktree {
+                                    "icons/git-branch.svg"
+                                } else {
+                                    "icons/folder-open.svg"
+                                },
+                                locale::common("Location"),
+                                if mode == WorkspaceMode::VibexWorktree {
+                                    locale::text("New worktree", "新建 Worktree", "新建 Worktree")
+                                        .to_string()
+                                } else {
+                                    locale::text("Current checkout", "当前检出", "目前檢出")
+                                        .to_string()
+                                },
+                                !worktree_supported,
+                                cx.listener(move |this, _event, window, cx| {
+                                    let next = if mode == WorkspaceMode::VibexWorktree {
+                                        WorkspaceMode::CurrentCheckout
+                                    } else {
+                                        WorkspaceMode::VibexWorktree
+                                    };
+                                    this.toggle_new_session_workspace_mode(next, _event, window, cx)
+                                }),
+                            ))
+                            .child(new_session_chip(
+                                "mobile-new-session-project",
+                                "icons/folder.svg",
+                                locale::common("Project"),
+                                project_label,
+                                false,
+                                cx.listener(Self::cycle_new_session_project),
+                            ))
+                            .child(new_session_chip(
+                                "mobile-new-session-workspace",
+                                "icons/layers.svg",
+                                locale::common("Workspace"),
+                                workspace_display,
+                                false,
+                                cx.listener(Self::cycle_new_session_workspace),
+                            )),
                     )
                     .child(
                         div()
-                            .h(px(120.0))
-                            .mt(px(theme::SPACING_SM))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_default())
-                            .bg(theme::bg_card())
-                            .px(px(2.0))
-                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
-                            .child(Input::new(&self.new_session_prompt_input).appearance(false)),
-                    )
+                            .w_full()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_muted())
+                            .child(if worktree_supported {
+                                locale::text(
+                                    "Worktrees are created from the desktop's branch state; pick one here and the session starts in it.",
+                                    "Worktree 由桌面端的分支状态创建；在此选择后会话将在其中启动。",
+                                    "Worktree 由桌面版的分支狀態建立；在此選擇後工作階段將在其中啟動。",
+                                )
+                            } else {
+                                locale::text(
+                                    "This runtime cannot create worktrees, so the session starts in the current checkout.",
+                                    "该运行时不支持创建 worktree，会话将在当前检出中启动。",
+                                    "該執行環境不支援建立 worktree，工作階段將在目前檢出中啟動。",
+                                )
+                            }),
+                    ),
+            )
+            // ── start ────────────────────────────────────────────────────────
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(theme::border_subtle())
+                    .p(px(theme::SPACING_MD))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACING_SM))
+                    .when(!runtime_ready, |bar| {
+                        bar.child(
+                            div()
+                                .text_size(theme::font_micro())
+                                .text_color(theme::accent_yellow())
+                                .child(locale::text(
+                                    "Select an Agent runtime before starting.",
+                                    "开始前请先选择 Agent 运行时。",
+                                    "開始前請先選擇 Agent 執行環境。",
+                                )),
+                        )
+                    })
                     .child(
                         div()
                             .id("mobile-new-session-submit")
-                            .h(px(theme::TOUCH_TARGET))
+                            .debug_selector(|| "mobile-new-session-submit".to_string())
                             .w_full()
-                            .mt(px(theme::SPACING_LG))
+                            .h(px(theme::TOUCH_TARGET + 4.0))
                             .rounded(px(theme::RADIUS_CONTROL))
-                            .bg(theme::sidebar_selected_bg())
+                            .bg(if can_submit && runtime_ready {
+                                theme::primary()
+                            } else {
+                                theme::bg_card_dim()
+                            })
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(theme::FONT_BODY))
-                            .text_color(theme::text_primary())
-                            .when(!self.new_session_busy, |button| {
-                                button
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::submit_new_session),
-                                    )
+                            .gap(px(theme::SPACING_SM))
+                            .text_size(theme::font_body())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if can_submit && runtime_ready {
+                                theme::primary_foreground()
+                            } else {
+                                theme::text_muted()
                             })
-                            .when(self.new_session_busy, |button| button.opacity(0.55))
+                            .when(can_submit && runtime_ready, |button| {
+                                button.cursor_pointer().active(|style| style.opacity(0.8)).on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::submit_new_session),
+                                )
+                            })
                             .child(if self.new_session_busy {
                                 locale::common("Creating...")
                             } else {
-                                locale::common("Create session")
+                                locale::common("Start session")
                             }),
                     ),
             )
@@ -15444,7 +16890,7 @@ impl MobileApp {
                     .child(
                         div()
                             .mb(px(theme::SPACING_SM))
-                            .text_size(px(theme::FONT_CAPTION))
+                            .text_size(theme::font_caption())
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text_muted())
                             .child(locale::common("Project path")),
@@ -15464,7 +16910,7 @@ impl MobileApp {
                         body.child(
                             div()
                                 .mt(px(theme::SPACING_SM))
-                                .text_size(px(theme::FONT_CAPTION))
+                                .text_size(theme::font_caption())
                                 .text_color(theme::accent_red())
                                 .child(error.clone()),
                         )
@@ -15482,7 +16928,7 @@ impl MobileApp {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(theme::FONT_BODY))
+                            .text_size(theme::font_body())
                             .text_color(theme::text_primary())
                             .when(can_open_project && !self.new_project_busy, |button| {
                                 button
@@ -15644,13 +17090,13 @@ impl MobileApp {
                     .gap(px(1.0))
                     .child(
                         div()
-                            .text_size(px(theme::FONT_BODY))
+                            .text_size(theme::font_body())
                             .text_color(theme::text_secondary())
                             .child(locale::common("Theme")),
                     )
                     .child(
                         div()
-                            .text_size(px(theme::FONT_MICRO))
+                            .text_size(theme::font_micro())
                             .text_color(theme::text_muted())
                             .child(detail.to_string()),
                     ),
@@ -15660,7 +17106,7 @@ impl MobileApp {
                     .flex()
                     .items_center()
                     .gap(px(theme::SPACING_XS))
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(theme::font_caption())
                     .text_color(theme::text_primary())
                     .child(mode_label(preference)),
             )
@@ -15711,14 +17157,14 @@ impl MobileApp {
                     .gap(px(1.0))
                     .child(
                         div()
-                            .text_size(px(theme::FONT_BODY))
+                            .text_size(theme::font_body())
                             .text_color(theme::text_secondary())
                             .child(locale::common("Language")),
                     )
                     .when(!detail.is_empty(), |body| {
                         body.child(
                             div()
-                                .text_size(px(theme::FONT_MICRO))
+                                .text_size(theme::font_micro())
                                 .text_color(theme::text_muted())
                                 .child(detail.to_string()),
                         )
@@ -15726,7 +17172,7 @@ impl MobileApp {
             )
             .child(
                 div()
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(theme::font_caption())
                     .text_color(theme::text_primary())
                     .child(preference.label().to_string()),
             )
@@ -15917,7 +17363,7 @@ impl MobileApp {
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .whitespace_nowrap()
-                                    .text_size(px(theme::FONT_BODY))
+                                    .text_size(theme::font_body())
                                     .text_color(theme::text_primary())
                                     .child(title),
                             )
@@ -15926,7 +17372,7 @@ impl MobileApp {
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .whitespace_nowrap()
-                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_size(theme::font_micro())
                                     .text_color(theme::text_muted())
                                     .child(card.detail.clone()),
                             ),
@@ -15943,112 +17389,7 @@ impl MobileApp {
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        // The pairing page opens Settings too (an update notification can beat
-        // the first pairing), and a phone with no runtime has nothing to say in
-        // the Connection section.
-        let connection_section = self.active_host_entry().is_some().then(|| {
-            let host_label = self.active_host_label();
-            let host_url = self.active_host_url();
-            let server_id = self
-                .active_host_id
-                .as_deref()
-                .and_then(|id| self.known_hosts.iter().find(|host| host.id == id))
-                .map(|host| host.bundle.expected_server_id.clone())
-                .unwrap_or_default();
-            let connection_online = self.backend.as_ref().is_some_and(|backend| {
-                backend.connection_state().state == RemoteConnectionState::Online
-            });
-            div()
-                .flex()
-                .flex_col()
-                .child(overlay_section_heading("Connection"))
-                .child(settings_info_row(
-                    "mobile-settings-host",
-                    "icons/server.svg",
-                    host_label,
-                    if connection_online {
-                        locale::common("Connected").to_string()
-                    } else {
-                        locale::common("Offline").to_string()
-                    },
-                    if connection_online {
-                        theme::accent_green()
-                    } else {
-                        theme::accent_red()
-                    },
-                ))
-                .child(settings_info_row(
-                    "mobile-settings-host-url",
-                    "icons/server.svg",
-                    locale::text("Host", "主机", "主機").to_string(),
-                    host_url,
-                    theme::text_muted(),
-                ))
-                .when(!server_id.is_empty(), |body| {
-                    body.child(settings_info_row(
-                        "mobile-settings-server-id",
-                        "icons/server.svg",
-                        "Server ID".to_string(),
-                        server_id,
-                        theme::text_muted(),
-                    ))
-                })
-                .child(
-                    div()
-                        .id("mobile-settings-switch-host")
-                        .w_full()
-                        .min_h(px(theme::TOUCH_TARGET))
-                        .mb(px(theme::SPACING_XS))
-                        .rounded(px(theme::RADIUS_CONTROL))
-                        .border_1()
-                        .border_color(theme::border_default())
-                        .px(px(theme::SPACING_MD))
-                        .flex()
-                        .items_center()
-                        .gap(px(theme::SPACING_SM))
-                        .cursor_pointer()
-                        .active(|style| style.bg(theme::row_pressed_bg()))
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::open_pairing))
-                        .child(
-                            svg()
-                                .path("icons/server.svg")
-                                .size(px(theme::ICON_SM))
-                                .text_color(theme::text_secondary()),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(theme::FONT_BODY))
-                                .text_color(theme::text_secondary())
-                                .child(locale::common("Switch host")),
-                        )
-                        .child(
-                            svg()
-                                .path("icons/chevron-right.svg")
-                                .size(px(theme::ICON_SM))
-                                .text_color(theme::text_muted()),
-                        ),
-                )
-                .into_any_element()
-        });
-        let timeline_settings = self.effective_timeline_display_settings();
-        let timeline_override = self.active_timeline_display_override();
-        let has_timeline_override = timeline_override.is_some();
-        let show_generation_override = timeline_override
-            .and_then(|settings| settings.show_agent_generation_status)
-            .is_some();
-        let reasoning_mode_override = timeline_override
-            .and_then(|settings| settings.reasoning_display_mode)
-            .is_some();
-        let reasoning_expanded_override = timeline_override
-            .and_then(|settings| settings.reasoning_expanded_by_default)
-            .is_some();
-        let command_display_override = timeline_override
-            .and_then(|settings| settings.enhanced_command_execution_display)
-            .is_some();
-        let file_display_override = timeline_override
-            .and_then(|settings| settings.enhanced_file_operation_display)
-            .is_some();
+        let page = self.settings_page;
         div()
             .absolute()
             .inset_0()
@@ -16056,7 +17397,11 @@ impl MobileApp {
             .block_mouse_except_scroll()
             .flex()
             .flex_col()
-            .child(self.render_overlay_header("mobile-settings", "Settings", None, cx))
+            .child(if page == SettingsPage::Root {
+                self.render_overlay_header("mobile-settings", page.title(), None, cx)
+            } else {
+                self.render_settings_page_header(page, cx)
+            })
             .child(
                 div()
                     .id("mobile-settings-scroll")
@@ -16068,242 +17413,813 @@ impl MobileApp {
                     .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
                     .px(px(theme::SPACING_LG))
                     .py(px(theme::SPACING_MD))
-                    .when_some(connection_section, |body, section| body.child(section))
-                    .child(overlay_section_heading("Session timeline"))
-                    .child(self.render_timeline_boolean_setting_row(
-                        timeline_settings.show_agent_generation_status,
-                        show_generation_override,
-                        TimelineBooleanSetting::ShowAgentGenerationStatus,
-                        cx,
-                    ))
-                    .child(self.render_timeline_reasoning_setting_row(
-                        timeline_settings.reasoning_display_mode,
-                        reasoning_mode_override,
-                        cx,
-                    ))
-                    .child(self.render_timeline_boolean_setting_row(
-                        timeline_settings.reasoning_expanded_by_default,
-                        reasoning_expanded_override,
-                        TimelineBooleanSetting::ReasoningExpandedByDefault,
-                        cx,
-                    ))
-                    .child(self.render_timeline_boolean_setting_row(
-                        timeline_settings.enhanced_command_execution_display,
-                        command_display_override,
-                        TimelineBooleanSetting::EnhancedCommandExecutionDisplay,
-                        cx,
-                    ))
-                    .child(self.render_timeline_boolean_setting_row(
-                        timeline_settings.enhanced_file_operation_display,
-                        file_display_override,
-                        TimelineBooleanSetting::EnhancedFileOperationDisplay,
-                        cx,
-                    ))
-                    .child(
-                        settings_info_row_base(
-                            "mobile-settings-follow-desktop-timeline",
-                            "icons/rotate-ccw.svg",
-                            locale::text(
-                                "Use desktop timeline settings",
-                                "跟随桌面端时间线设置",
-                                "跟隨桌面版時間線設定",
-                            )
-                            .to_string(),
-                            if self.timeline_display_settings_sync_busy {
-                                locale::text("Syncing...", "同步中...", "同步中...").to_string()
-                            } else if has_timeline_override {
-                                locale::text(
-                                    "Clear mobile overrides",
-                                    "清除移动端单独设置",
-                                    "清除行動端個別設定",
-                                )
-                                .to_string()
-                            } else {
-                                locale::text(
-                                    "Already following desktop",
-                                    "当前跟随桌面端",
-                                    "目前跟隨桌面版",
-                                )
-                                .to_string()
-                            },
-                            theme::text_muted(),
-                        )
-                        .when(has_timeline_override, |row| {
-                            row.cursor_pointer()
-                                .active(|style| style.bg(theme::row_pressed_bg()))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.clear_timeline_display_overrides(cx)
-                                    }),
-                                )
-                        })
-                        .when(!has_timeline_override, |row| row.opacity(0.6))
-                        .child(
-                            svg()
-                                .path("icons/chevron-right.svg")
-                                .size(px(theme::ICON_SM))
-                                .text_color(theme::text_muted()),
-                        ),
+                    .children(match page {
+                        SettingsPage::Root => self.render_settings_root(cx),
+                        SettingsPage::Connection => self.render_settings_connection(cx),
+                        SettingsPage::Appearance => self.render_settings_appearance(cx),
+                        SettingsPage::Conversation => self.render_settings_conversation(cx),
+                        SettingsPage::Notifications => self.render_settings_notifications(cx),
+                        SettingsPage::About => self.render_settings_about(cx),
+                    }),
+            )
+            .when(self.settings_palette_open, |settings| {
+                settings.child(self.render_settings_palette_sheet(cx))
+            })
+            .into_any_element()
+    }
+
+    /// A sub-page's header: the same back chevron the rest of the app uses,
+    /// then the topic's own name.
+    fn render_settings_page_header(
+        &self,
+        page: SettingsPage,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .h(px(theme::HEADER_HEIGHT))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .px(px(theme::SPACING_XS))
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_XS))
+            .child(
+                div()
+                    .id("mobile-settings-back")
+                    .debug_selector(|| "mobile-settings-back".to_string())
+                    .size(px(theme::HEADER_BUTTON_SIZE))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .cursor_pointer()
+                    .aria_label(locale::common("Back"))
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.open_settings_page(SettingsPage::Root, cx)
+                        }),
                     )
-                    .child(overlay_section_heading("Appearance"))
-                    .child(self.render_theme_setting_row(cx))
-                    .child(self.render_language_setting_row(cx))
-                    .child(overlay_section_heading("Notifications"))
+                    .child(
+                        svg()
+                            .path("icons/chevron-left.svg")
+                            .size(px(theme::ICON_MD))
+                            .text_color(theme::text_secondary()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(theme::font_heading())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text_primary())
+                    .child(locale::common(page.title())),
+            )
+            .into_any_element()
+    }
+
+    fn open_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        self.settings_page = page;
+        self.settings_palette_open = false;
+        self.settings_scroll.set_offset(gpui::Point::default());
+        cx.notify();
+    }
+
+    /// The top level: one row per topic, no settings of its own.
+    fn render_settings_root(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let mut sections = Vec::new();
+        // A pending update is the one thing on this page the user has to act
+        // on, so it leads instead of waiting at the bottom of About.
+        let update_leads = self
+            .update_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.state.clone())
+            .and_then(|state| update_card_model(&state))
+            .is_some();
+        if update_leads {
+            sections.push(self.render_update_section(cx));
+        }
+        let host_label = self.active_host_label();
+        let host_status = self
+            .active_host_status()
+            .unwrap_or_else(RuntimeStatusView::inactive);
+        let connected = self.backend.as_ref().is_some_and(|backend| {
+            backend.connection_state().state == RemoteConnectionState::Online
+        });
+        let appearance = self.app_settings.theme.unwrap_or_default();
+        let language = self.app_settings.language.unwrap_or_default();
+        let palette_name = theme_selection_id(&self.app_settings.theme_selection, theme::is_dark())
+            .and_then(|id| {
+                vibex_ui::themes_for(theme::mode(theme::is_dark()))
+                    .find(|theme| theme.id == id)
+                    .map(|theme| theme.name.to_string())
+            });
+        sections.extend([
+            settings_group(
+                locale::text("Runtime", "运行时", "執行環境"),
+                vec![settings_nav_row(
+                    "mobile-settings-runtime",
+                    "icons/server.svg",
+                    locale::common("This phone's runtimes").to_string(),
+                    format!("{host_label} · {}", host_status.label()),
+                    if connected {
+                        theme::accent_success()
+                    } else {
+                        theme::text_muted()
+                    },
+                    cx.listener(|this, _, _, cx| {
+                        this.open_settings_page(SettingsPage::Connection, cx)
+                    }),
+                )],
+            ),
+            settings_group(
+                locale::text("This app", "本应用", "本應用"),
+                vec![
+                    settings_nav_row(
+                        "mobile-settings-appearance",
+                        "icons/palette.svg",
+                        locale::common("Appearance").to_string(),
+                        match palette_name {
+                            Some(name) => {
+                                format!("{} · {name}", locale::common(appearance.label()))
+                            }
+                            None => locale::common(appearance.label()).to_string(),
+                        },
+                        theme::accent_purple(),
+                        cx.listener(|this, _, _, cx| {
+                            this.open_settings_page(SettingsPage::Appearance, cx)
+                        }),
+                    ),
+                    settings_nav_row(
+                        "mobile-settings-conversation",
+                        "icons/message-square.svg",
+                        locale::text("Conversation", "会话", "會話").to_string(),
+                        locale::text("Timeline display", "时间线显示", "時間線顯示").to_string(),
+                        theme::accent_blue(),
+                        cx.listener(|this, _, _, cx| {
+                            this.open_settings_page(SettingsPage::Conversation, cx)
+                        }),
+                    ),
+                    settings_nav_row(
+                        "mobile-settings-notifications",
+                        "icons/activity.svg",
+                        locale::common("Notifications").to_string(),
+                        if self.app_settings.notifications {
+                            locale::common("On").to_string()
+                        } else {
+                            locale::common("Off").to_string()
+                        },
+                        theme::accent_yellow(),
+                        cx.listener(|this, _, _, cx| {
+                            this.open_settings_page(SettingsPage::Notifications, cx)
+                        }),
+                    ),
+                    settings_nav_row(
+                        "mobile-settings-language",
+                        "icons/globe.svg",
+                        locale::common("Language").to_string(),
+                        locale::localized_label(language.label()),
+                        theme::accent_chart3(),
+                        cx.listener(|this, _, _, cx| this.cycle_language_setting(cx)),
+                    ),
+                ],
+            ),
+            settings_group(
+                locale::common("About"),
+                vec![settings_nav_row(
+                    "mobile-settings-about",
+                    "icons/vibex-mark.svg",
+                    locale::common("About").to_string(),
+                    env!("CARGO_PKG_VERSION").to_string(),
+                    theme::text_muted(),
+                    cx.listener(|this, _, _, cx| this.open_settings_page(SettingsPage::About, cx)),
+                )],
+            ),
+        ]);
+        sections
+    }
+
+    /// Runtime: what this phone is paired with, and how to leave it.
+    fn render_settings_connection(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let Some(entry) = self.active_host_entry() else {
+            return vec![settings_empty_note(locale::text(
+                "No runtime is connected. Pair one to start a session.",
+                "尚未连接运行时。配对后即可开始会话。",
+                "尚未連線執行環境。配對後即可開始工作階段。",
+            ))];
+        };
+        let host_label = self.active_host_label();
+        let host_url = self.active_host_url();
+        let server_id = entry.bundle.expected_server_id.clone();
+        let connected = self.backend.as_ref().is_some_and(|backend| {
+            backend.connection_state().state == RemoteConnectionState::Online
+        });
+        let mut rows = vec![settings_group(
+            locale::common("Connection"),
+            vec![
+                settings_value_row(
+                    "mobile-settings-host",
+                    "icons/server.svg",
+                    host_label,
+                    if connected {
+                        locale::common("Connected").to_string()
+                    } else {
+                        locale::common("Offline").to_string()
+                    },
+                    if connected {
+                        theme::accent_success()
+                    } else {
+                        theme::accent_red()
+                    },
+                ),
+                settings_value_row(
+                    "mobile-settings-host-url",
+                    "icons/globe.svg",
+                    locale::common("Address").to_string(),
+                    host_url,
+                    theme::text_muted(),
+                ),
+                settings_value_row(
+                    "mobile-settings-server-id",
+                    "icons/hash.svg",
+                    locale::common("Server ID").to_string(),
+                    server_id,
+                    theme::text_muted(),
+                ),
+            ],
+        )];
+        rows.push(settings_group(
+            locale::text("Manage", "管理", "管理"),
+            vec![
+                settings_nav_row(
+                    "mobile-settings-switch-host",
+                    "icons/chevrons-right-left.svg",
+                    locale::text("Switch runtime", "切换运行时", "切換執行環境").to_string(),
+                    locale::text(
+                        "Pair, rename, or remove a desktop",
+                        "配对、重命名或移除桌面端",
+                        "配對、重新命名或移除桌面版",
+                    )
+                    .to_string(),
+                    theme::text_muted(),
+                    cx.listener(Self::open_pairing),
+                ),
+                settings_nav_row(
+                    "mobile-settings-reconnect-host",
+                    "icons/plug-zap.svg",
+                    locale::text("Reconnect", "重新连接", "重新連線").to_string(),
+                    locale::text(
+                        "Retry this runtime without re-pairing",
+                        "无需重新配对即可重试",
+                        "無需重新配對即可重試",
+                    )
+                    .to_string(),
+                    theme::text_muted(),
+                    cx.listener(Self::reconnect_active_host),
+                ),
+            ],
+        ));
+        if self.backend.is_some() {
+            rows.push(settings_danger_note(
+                "mobile-settings-disconnect",
+                locale::text("Disconnect desktop", "断开桌面端", "中斷桌面版連線"),
+                locale::text(
+                    "Ends this connection. Nothing is unpaired.",
+                    "仅结束本次连接，不会解除配对。",
+                    "僅結束本次連線，不會解除配對。",
+                ),
+                cx.listener(|this, event, window, cx| this.disconnect_host(event, window, cx)),
+            ));
+        }
+        rows
+    }
+
+    /// Appearance: the mode, the palette, motion, and the language.
+    fn render_settings_appearance(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let preference = self.app_settings.theme.unwrap_or_default();
+        let mode_detail = match preference {
+            theme::AppearanceMode::System => locale::common("Match the system appearance"),
+            theme::AppearanceMode::Light => locale::common("Always light"),
+            theme::AppearanceMode::Dark => locale::common("Always dark"),
+        };
+        let is_dark = theme::is_dark();
+        let palette_id = theme_selection_id(&self.app_settings.theme_selection, is_dark)
+            .map(str::to_string)
+            .unwrap_or_else(|| vibex_ui::default_theme_id(theme::mode(is_dark)).to_string());
+        let palette_name = vibex_ui::themes_for(theme::mode(is_dark))
+            .find(|theme| theme.id == palette_id)
+            .map(|theme| theme.name.to_string())
+            .unwrap_or_else(|| palette_id.clone());
+        vec![
+            settings_group(
+                locale::common("Appearance"),
+                vec![settings_nav_row(
+                    "mobile-settings-theme",
+                    "icons/sun.svg",
+                    locale::common("Theme").to_string(),
+                    mode_detail.to_string(),
+                    theme::accent_yellow(),
+                    cx.listener(|this, _, window, cx| {
+                        let current = this.app_settings.theme.unwrap_or_default();
+                        let next = match current {
+                            theme::AppearanceMode::System => theme::AppearanceMode::Light,
+                            theme::AppearanceMode::Light => theme::AppearanceMode::Dark,
+                            theme::AppearanceMode::Dark => theme::AppearanceMode::System,
+                        };
+                        this.update_theme_mode(next, window, cx);
+                    }),
+                )],
+            ),
+            settings_group(
+                locale::common("Palette"),
+                vec![settings_nav_row(
+                    "mobile-settings-palette",
+                    "icons/palette.svg",
+                    palette_name.clone(),
+                    locale::text(
+                        "Choose the light and dark palettes",
+                        "选择浅色与深色调色板",
+                        "選擇淺色與深色調色盤",
+                    )
+                    .to_string(),
+                    theme::accent_purple(),
+                    cx.listener(|this, _, _, cx| {
+                        this.settings_palette_open = true;
+                        cx.notify();
+                    }),
+                )],
+            ),
+            settings_group(
+                locale::text("Motion", "动效", "動效"),
+                vec![settings_switch_row(
+                    "mobile-settings-reduce-motion",
+                    "icons/zap.svg",
+                    locale::text("Reduce motion", "减少动效", "減少動效").to_string(),
+                    locale::text(
+                        "Skip page and sheet transitions",
+                        "跳过页面与弹层的过渡动画",
+                        "跳過頁面與彈層的轉場動畫",
+                    )
+                    .to_string(),
+                    self.app_settings.reduce_motion,
+                    true,
+                    cx.listener(|this, _, _, cx| {
+                        this.app_settings.reduce_motion = !this.app_settings.reduce_motion;
+                        theme::set_reduce_motion(this.app_settings.reduce_motion);
+                        this.persist_app_settings(cx);
+                    }),
+                )],
+            ),
+            settings_group(
+                locale::common("Language"),
+                vec![settings_nav_row(
+                    "mobile-settings-language-page",
+                    "icons/globe.svg",
+                    locale::common("Language").to_string(),
+                    locale::localized_label(self.app_settings.language.unwrap_or_default().label()),
+                    theme::accent_chart3(),
+                    cx.listener(|this, _, _, cx| this.cycle_language_setting(cx)),
+                )],
+            ),
+        ]
+    }
+
+    /// Conversation: only the timeline settings the phone can act on, plus the
+    /// per-device overrides the desktop publishes.
+    fn render_settings_conversation(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let timeline_settings = self.effective_timeline_display_settings();
+        let timeline_override = self.active_timeline_display_override();
+        let has_timeline_override = timeline_override.is_some();
+        let reasoning_mode_override = timeline_override
+            .and_then(|settings| settings.reasoning_display_mode)
+            .is_some();
+        vec![
+            settings_group(
+                locale::text("Generation", "生成", "生成"),
+                vec![settings_switch_row(
+                    "mobile-settings-generation-status",
+                    "icons/activity.svg",
+                    locale::common(TimelineBooleanSetting::ShowAgentGenerationStatus.row_title())
+                        .to_string(),
+                    locale::text(
+                        "Show a live line while the Agent works",
+                        "Agent 工作时显示实时状态行",
+                        "Agent 工作時顯示即時狀態列",
+                    )
+                    .to_string(),
+                    timeline_settings.show_agent_generation_status,
+                    true,
+                    cx.listener(move |this, _, _, cx| {
+                        this.toggle_timeline_boolean_setting(
+                            TimelineBooleanSetting::ShowAgentGenerationStatus,
+                            cx,
+                        )
+                    }),
+                )],
+            ),
+            settings_group(
+                locale::text("Reasoning", "推理", "推理"),
+                vec![
+                    settings_nav_row(
+                        "mobile-settings-reasoning-display",
+                        "icons/brain.svg",
+                        locale::common("Reasoning display").to_string(),
+                        format!(
+                            "{} · {}",
+                            timeline_reasoning_mode_label(timeline_settings.reasoning_display_mode),
+                            timeline_setting_source_label(reasoning_mode_override),
+                        ),
+                        theme::accent_purple(),
+                        cx.listener(|this, _, _, cx| {
+                            this.cycle_timeline_reasoning_display_mode(cx)
+                        }),
+                    ),
+                    settings_switch_row(
+                        "mobile-settings-reasoning-expanded",
+                        "icons/book-open.svg",
+                        locale::common(
+                            TimelineBooleanSetting::ReasoningExpandedByDefault.row_title(),
+                        )
+                        .to_string(),
+                        locale::text(
+                            "Open reasoning blocks by default",
+                            "默认展开推理内容",
+                            "預設展開推理內容",
+                        )
+                        .to_string(),
+                        timeline_settings.reasoning_expanded_by_default,
+                        true,
+                        cx.listener(move |this, _, _, cx| {
+                            this.toggle_timeline_boolean_setting(
+                                TimelineBooleanSetting::ReasoningExpandedByDefault,
+                                cx,
+                            )
+                        }),
+                    ),
+                ],
+            ),
+            settings_group(
+                locale::text("Tool activity", "工具活动", "工具活動"),
+                vec![
+                    settings_switch_row(
+                        "mobile-settings-command-cards",
+                        "icons/square-terminal.svg",
+                        locale::common(
+                            TimelineBooleanSetting::EnhancedCommandExecutionDisplay.row_title(),
+                        )
+                        .to_string(),
+                        locale::text(
+                            "Group command output into one card",
+                            "将命令输出聚合为一张卡片",
+                            "將命令輸出聚合為一張卡片",
+                        )
+                        .to_string(),
+                        timeline_settings.enhanced_command_execution_display,
+                        true,
+                        cx.listener(move |this, _, _, cx| {
+                            this.toggle_timeline_boolean_setting(
+                                TimelineBooleanSetting::EnhancedCommandExecutionDisplay,
+                                cx,
+                            )
+                        }),
+                    ),
+                    settings_switch_row(
+                        "mobile-settings-file-cards",
+                        "icons/file-code.svg",
+                        locale::common(
+                            TimelineBooleanSetting::EnhancedFileOperationDisplay.row_title(),
+                        )
+                        .to_string(),
+                        locale::text(
+                            "Group file edits into one card",
+                            "将文件修改聚合为一张卡片",
+                            "將檔案修改聚合為一張卡片",
+                        )
+                        .to_string(),
+                        timeline_settings.enhanced_file_operation_display,
+                        true,
+                        cx.listener(move |this, _, _, cx| {
+                            this.toggle_timeline_boolean_setting(
+                                TimelineBooleanSetting::EnhancedFileOperationDisplay,
+                                cx,
+                            )
+                        }),
+                    ),
+                ],
+            ),
+            settings_group(
+                locale::text("Source of truth", "设置来源", "設定來源"),
+                vec![settings_nav_row(
+                    "mobile-settings-follow-desktop-timeline",
+                    "icons/rotate-ccw.svg",
+                    locale::common("Use desktop timeline settings").to_string(),
+                    if self.timeline_display_settings_sync_busy {
+                        locale::text("Syncing...", "同步中...", "同步中...").to_string()
+                    } else if has_timeline_override {
+                        locale::text(
+                            "Clear mobile overrides",
+                            "清除移动端单独设置",
+                            "清除行動端個別設定",
+                        )
+                        .to_string()
+                    } else {
+                        locale::text(
+                            "Already following desktop",
+                            "当前跟随桌面端",
+                            "目前跟隨桌面版",
+                        )
+                        .to_string()
+                    },
+                    theme::text_muted(),
+                    cx.listener(|this, _, _, cx| this.clear_timeline_display_overrides(cx)),
+                )],
+            ),
+            settings_hint_note(locale::text(
+                "The rows marked with a dot override the desktop for this phone only.",
+                "带圆点的行仅在本手机覆盖桌面端设置。",
+                "帶圓點的行僅在本手機覆寫桌面版設定。",
+            )),
+        ]
+    }
+
+    fn render_settings_notifications(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let master = self.app_settings.notifications;
+        let mut rows = vec![settings_group(
+            locale::common("Notifications"),
+            vec![
+                settings_switch_row(
+                    "mobile-settings-notifications-master",
+                    "icons/activity.svg",
+                    locale::common("Enable notifications").to_string(),
+                    locale::text(
+                        "Allow Vibex to alert you outside the app",
+                        "允许 Vibex 在应用外提醒你",
+                        "允許 Vibex 在應用外提醒你",
+                    )
+                    .to_string(),
+                    master,
+                    true,
+                    cx.listener(|this, _, _, cx| {
+                        this.app_settings.notifications = !this.app_settings.notifications;
+                        if this.app_settings.notifications {
+                            notifications::request_authorization();
+                        }
+                        this.persist_app_settings(cx);
+                    }),
+                ),
+                settings_switch_row(
+                    "mobile-settings-notify-completed",
+                    "icons/check.svg",
+                    locale::common("Agent completed").to_string(),
+                    locale::text(
+                        "A turn finished while you were away",
+                        "你离开时回合已完成",
+                        "你離開時回合已完成",
+                    )
+                    .to_string(),
+                    self.app_settings.notify_completed,
+                    master,
+                    cx.listener(|this, _, _, cx| {
+                        this.app_settings.notify_completed = !this.app_settings.notify_completed;
+                        this.persist_app_settings(cx);
+                    }),
+                ),
+                settings_switch_row(
+                    "mobile-settings-notify-needs-input",
+                    "icons/triangle-alert.svg",
+                    locale::common("Needs input").to_string(),
+                    locale::text(
+                        "An approval or an answer is waiting",
+                        "有审批或回答在等待",
+                        "有核准或回答在等待",
+                    )
+                    .to_string(),
+                    self.app_settings.notify_needs_input,
+                    master,
+                    cx.listener(|this, _, _, cx| {
+                        this.app_settings.notify_needs_input =
+                            !this.app_settings.notify_needs_input;
+                        this.persist_app_settings(cx);
+                    }),
+                ),
+                settings_switch_row(
+                    "mobile-settings-notify-failed",
+                    "icons/x.svg",
+                    locale::common("Failed").to_string(),
+                    locale::text(
+                        "A turn stopped with an error",
+                        "回合因错误停止",
+                        "回合因錯誤停止",
+                    )
+                    .to_string(),
+                    self.app_settings.notify_failed,
+                    master,
+                    cx.listener(|this, _, _, cx| {
+                        this.app_settings.notify_failed = !this.app_settings.notify_failed;
+                        this.persist_app_settings(cx);
+                    }),
+                ),
+            ],
+        )];
+        if !self.battery_allowlist_ok {
+            rows.push(settings_nav_row(
+                "mobile-settings-battery-allowlist",
+                "icons/plug-zap.svg",
+                locale::text(
+                    "Allow background battery use",
+                    "允许后台使用电池",
+                    "允許背景使用電池",
+                )
+                .to_string(),
+                locale::text(
+                    "Keep alerts arriving while the screen is off",
+                    "息屏后仍能收到提醒",
+                    "息屏後仍能收到提醒",
+                )
+                .to_string(),
+                theme::accent_yellow(),
+                cx.listener(|_, _, _, cx| {
+                    power::request_ignore_battery_optimizations();
+                    cx.notify();
+                }),
+            ));
+        }
+        rows
+    }
+
+    fn render_settings_about(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let mut rows = vec![self.render_update_section(cx)];
+        rows.push(settings_group(
+            locale::common("About"),
+            vec![
+                settings_value_row(
+                    "mobile-settings-platform",
+                    "icons/monitor.svg",
+                    locale::common("Platform").to_string(),
+                    if cfg!(target_os = "android") {
+                        "Android".to_string()
+                    } else if cfg!(target_os = "ios") {
+                        "iOS".to_string()
+                    } else {
+                        std::env::consts::OS.to_string()
+                    },
+                    theme::text_muted(),
+                ),
+                settings_value_row(
+                    "mobile-settings-license",
+                    "icons/book-open.svg",
+                    locale::common("License").to_string(),
+                    "AGPL-3.0-or-later".to_string(),
+                    theme::text_muted(),
+                ),
+                settings_nav_row(
+                    "mobile-settings-source",
+                    "icons/globe.svg",
+                    locale::common("Source code").to_string(),
+                    "github.com/vibex".to_string(),
+                    theme::text_muted(),
+                    cx.listener(|this, _, _, cx| {
+                        this.hint(Tone::Info, "https://github.com/vibex".to_string());
+                        cx.notify();
+                    }),
+                ),
+            ],
+        ));
+        rows
+    }
+
+    /// The palette picker: every catalog palette for the current appearance.
+    fn render_settings_palette_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let dark = theme::is_dark();
+        let mode = theme::mode(dark);
+        let selected = theme_selection_id(&self.app_settings.theme_selection, dark)
+            .map(str::to_string)
+            .unwrap_or_else(|| vibex_ui::default_theme_id(mode).to_string());
+        let themes = vibex_ui::themes_for(mode)
+            .map(|theme| (theme.id.to_string(), theme.name.to_string()))
+            .collect::<Vec<_>>();
+        div()
+            .id("mobile-settings-palette")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.62))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.settings_palette_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .max_h(relative(0.72))
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .bg(theme::bg_popover())
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .flex()
+                    .flex_col()
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         div()
-                            .id("mobile-settings-notifications")
-                            .w_full()
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .mb(px(theme::SPACING_XS))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_subtle())
-                            .bg(theme::bg_card_dim())
-                            .px(px(theme::SPACING_MD))
+                            .h(px(theme::DRAWER_HEADER_HEIGHT))
+                            .flex_shrink_0()
+                            .px(px(theme::SPACING_LG))
                             .flex()
                             .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|_, _, _, cx| {
-                                    notifications::request_authorization();
-                                    cx.notify();
-                                }),
-                            )
+                            .justify_between()
                             .child(
-                                svg()
-                                    .path("icons/activity.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_secondary()),
+                                div()
+                                    .text_size(theme::font_heading())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_primary())
+                                    .child(locale::common("Palette")),
                             )
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
+                                    .text_size(theme::font_caption())
+                                    .text_color(theme::text_muted())
+                                    .child(locale::common(if dark { "Dark" } else { "Light" })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("mobile-settings-palette-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .restrict_scroll_to_axis()
+                            .px(px(theme::SPACING_MD))
+                            .pb(px(theme::SPACING_LG))
+                            .children(themes.into_iter().map(|(id, name)| {
+                                let active = id == selected;
+                                let select_id = id.clone();
+                                div()
+                                    .id(format!("palette:{id}"))
+                                    .h(px(theme::TOUCH_TARGET + 8.0))
+                                    .mb(px(theme::SPACING_XS))
+                                    .px(px(theme::SPACING_MD))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .border_1()
+                                    .border_color(if active {
+                                        theme::primary()
+                                    } else {
+                                        theme::border_subtle()
+                                    })
+                                    .bg(if active {
+                                        theme::sidebar_selected_bg()
+                                    } else {
+                                        theme::bg_card()
+                                    })
                                     .flex()
-                                    .flex_col()
-                                    .gap(px(1.0))
-                                    .child(
-                                        div()
-                                            .text_size(px(theme::FONT_BODY))
-                                            .text_color(theme::text_secondary())
-                                            .child(locale::common("Enable notifications")),
+                                    .items_center()
+                                    .gap(px(theme::SPACING_SM))
+                                    .cursor_pointer()
+                                    .aria_label(name.clone())
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            let select_id = select_id.clone();
+                                            this.update_theme_selection(
+                                                move |selection| {
+                                                    if dark {
+                                                        selection.select_dark(select_id.clone())
+                                                    } else {
+                                                        selection.select_light(select_id.clone())
+                                                    }
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                            this.settings_palette_open = false;
+                                            cx.notify();
+                                        }),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(theme::FONT_MICRO))
-                                            .text_color(theme::text_muted())
-                                            .child(locale::text(
-                                                "Allow approval and Agent completion alerts",
-                                                "允许审批和 Agent 完成通知",
-                                                "允許核准與 Agent 完成通知",
-                                            )),
-                                    ),
-                            ),
-                    )
-                    .when(!self.battery_allowlist_ok, |section| {
-                        section.child(
-                            div()
-                                .id("mobile-settings-battery-allowlist")
-                                .w_full()
-                                .min_h(px(theme::TOUCH_TARGET))
-                                .mb(px(theme::SPACING_XS))
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .border_1()
-                                .border_color(theme::border_subtle())
-                                .bg(theme::bg_card_dim())
-                                .px(px(theme::SPACING_MD))
-                                .flex()
-                                .items_center()
-                                .gap(px(theme::SPACING_SM))
-                                .cursor_pointer()
-                                .active(|style| style.bg(theme::row_pressed_bg()))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|_, _, _, cx| {
-                                        power::request_ignore_battery_optimizations();
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(
-                                    svg()
-                                        .path("icons/triangle-alert.svg")
-                                        .size(px(theme::ICON_SM))
-                                        .text_color(theme::text_secondary()),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(1.0))
-                                        .child(
-                                            div()
-                                                .text_size(px(theme::FONT_BODY))
-                                                .text_color(theme::text_secondary())
-                                                .child(locale::text(
-                                                    "Allow background battery use",
-                                                    "允许后台使用电池",
-                                                    "允許背景使用電池",
-                                                )),
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_size(theme::font_body())
+                                            .text_color(theme::text_primary())
+                                            .child(name),
+                                    )
+                                    .when(active, |row| {
+                                        row.child(
+                                            svg()
+                                                .path("icons/check.svg")
+                                                .size(px(theme::ICON_SM))
+                                                .text_color(theme::primary()),
                                         )
-                                        .child(
-                                            div()
-                                                .text_size(px(theme::FONT_MICRO))
-                                                .text_color(theme::text_muted())
-                                                .child(locale::text(
-                                                    "Exempt Vibex from battery optimization so background alerts keep arriving",
-                                                    "将 Vibex 加入电池优化白名单，保证后台通知不中断",
-                                                    "將 Vibex 加入電池最佳化白名單，確保背景通知不中斷",
-                                                )),
-                                        ),
-                                ),
-                        )
-                    })
-                    .child(overlay_section_heading("About"))
-                    .child(self.render_update_section(cx))
-                    // Without a runtime there is no connection to end, so the
-                    // pairing page's Settings page stops at About.
-                    .when(self.backend.is_some(), |body| {
-                        body.child(
-                            div()
-                                .id("mobile-settings-disconnect")
-                                .debug_selector(|| "mobile-settings-disconnect".to_string())
-                                .mt(px(theme::SPACING_LG))
-                                .mb(px(theme::SPACING_XL))
-                                .h(px(theme::TOUCH_TARGET))
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .border_1()
-                                .border_color(theme::accent_red())
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_size(px(theme::FONT_BODY))
-                                .text_color(theme::accent_red())
-                                .cursor_pointer()
-                                .active(|style| style.bg(theme::row_pressed_bg()))
-                                // The row above switches runtime; this one ends
-                                // the connection. Neither is a deletion: every
-                                // saved runtime keeps its credential, and
-                                // removing one is its own confirmed action on
-                                // the pairing page.
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|this, event, window, cx| {
-                                        this.disconnect_host(event, window, cx);
-                                    }),
-                                )
-                                .child(locale::text(
-                                    "Disconnect desktop",
-                                    "断开桌面端",
-                                    "中斷桌面版連線",
-                                )),
-                        )
-                    }),
+                                    })
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -16698,7 +18614,7 @@ fn runtime_section_heading(label: impl Into<String>) -> gpui::Div {
         .px_3()
         .flex()
         .items_center()
-        .text_size(px(theme::FONT_CAPTION))
+        .text_size(theme::font_caption())
         .text_color(theme::text_muted())
         .child(label.into())
 }
@@ -16746,7 +18662,7 @@ fn runtime_sheet_row(
                 .overflow_hidden()
                 .text_ellipsis()
                 .whitespace_nowrap()
-                .text_size(px(theme::FONT_BODY))
+                .text_size(theme::font_body())
                 .text_color(if selected {
                     theme::text_primary()
                 } else {
@@ -17545,7 +19461,7 @@ fn runtime_choice_button(
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(theme::FONT_CAPTION))
+        .text_size(theme::font_caption())
         .text_color(if selected {
             theme::text_primary()
         } else {
@@ -17585,7 +19501,7 @@ fn runtime_sheet_action_button(
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(theme::FONT_BODY))
+        .text_size(theme::font_body())
         .text_color(if primary {
             theme::bg_primary()
         } else {
@@ -17614,7 +19530,7 @@ fn runtime_status_line(status: &RuntimeStatusView, text_color: gpui::Hsla) -> gp
                 .overflow_hidden()
                 .text_ellipsis()
                 .whitespace_nowrap()
-                .text_size(px(theme::FONT_CAPTION))
+                .text_size(theme::font_caption())
                 .text_color(text_color)
                 .child(status.label()),
         )
@@ -17638,7 +19554,7 @@ fn host_sheet_action_row(
         .items_center()
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
-        .text_size(px(theme::FONT_BODY))
+        .text_size(theme::font_body())
         .text_color(if danger {
             theme::accent_red()
         } else {
@@ -17684,11 +19600,11 @@ fn host_detail_field(
 ) -> gpui::AnyElement {
     let mut value_element = div()
         .min_w_0()
-        .text_size(px(if muted {
-            theme::FONT_CAPTION
+        .text_size(if muted {
+            theme::font_caption()
         } else {
-            theme::FONT_BODY
-        }))
+            theme::font_body()
+        })
         .text_color(if muted {
             theme::text_muted()
         } else {
@@ -17712,7 +19628,7 @@ fn host_detail_field(
             div()
                 .w(px(96.0))
                 .flex_shrink_0()
-                .text_size(px(theme::FONT_CAPTION))
+                .text_size(theme::font_caption())
                 .text_color(theme::text_muted())
                 .child(locale::common(label)),
         )
@@ -17961,7 +19877,7 @@ fn pairing_action_button(
                 .overflow_hidden()
                 .text_ellipsis()
                 .whitespace_nowrap()
-                .text_size(px(theme::FONT_DETAIL))
+                .text_size(theme::font_detail())
                 .font_weight(if primary {
                     FontWeight::SEMIBOLD
                 } else {
@@ -17986,7 +19902,7 @@ fn pairing_sheet_header_action(
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(theme::FONT_DETAIL))
+        .text_size(theme::font_detail())
         .font_weight(FontWeight::MEDIUM)
         .text_color(theme::text_primary())
         .cursor_pointer()
@@ -17997,7 +19913,7 @@ fn pairing_sheet_header_action(
 fn pairing_field_label(label: &'static str) -> gpui::AnyElement {
     div()
         .mb(px(theme::SPACING_XS))
-        .text_size(px(theme::FONT_CAPTION))
+        .text_size(theme::font_caption())
         .font_weight(FontWeight::MEDIUM)
         .text_color(theme::text_muted())
         .child(label)
@@ -18505,7 +20421,7 @@ fn render_mobile_thinking_indicator(turn_id: &str, label: &str) -> gpui::AnyElem
                 .flex_1()
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .text_size(px(theme::FONT_CAPTION))
+                .text_size(theme::font_caption())
                 .child(
                     ShimmerText::new(truncate_agent_thinking_label(label))
                         .id(format!("timeline-progress-animation:{turn_id}"))
@@ -18783,7 +20699,7 @@ fn timeline_status_badge(label: String, color: gpui::Hsla) -> gpui::AnyElement {
         .items_center()
         .rounded_full()
         .px_2()
-        .text_size(px(theme::FONT_MICRO))
+        .text_size(theme::font_micro())
         .font_weight(FontWeight::MEDIUM)
         .when(color == theme::accent_red(), |badge| {
             badge.bg(color.opacity(0.20)).text_color(color)
@@ -18837,30 +20753,53 @@ mod tests {
     fn agent_notification_is_suppressed_only_for_the_visible_session() {
         let selected = VibexSessionId::new();
         let other = VibexSessionId::new();
+        let on = NotificationPreferences {
+            enabled: true,
+            completed: true,
+            needs_input: true,
+            failed: true,
+        };
 
         assert!(!should_present_agent_notification(
             false,
             false,
             Some(&selected),
             &selected,
+            &on,
         ));
         assert!(should_present_agent_notification(
             true,
             false,
             Some(&selected),
             &selected,
+            &on,
         ));
         assert!(should_present_agent_notification(
             false,
             true,
             Some(&selected),
             &selected,
+            &on,
         ));
         assert!(should_present_agent_notification(
             false,
             false,
             Some(&selected),
             &other,
+            &on,
+        ));
+        // The master switch silences everything, including a background alert
+        // about another session.
+        let off = NotificationPreferences {
+            enabled: false,
+            ..on
+        };
+        assert!(!should_present_agent_notification(
+            true,
+            true,
+            Some(&selected),
+            &other,
+            &off,
         ));
     }
 
@@ -19551,10 +21490,10 @@ mod tests {
     /// asserts one was announced — or that none was — has to open its window
     /// exactly as `open_root_window` does. The app is built inside the window
     /// because `MobileApp::new` needs one, and handed back through the slot.
-    fn add_rooted_window_view<'a>(
-        cx: &'a mut TestAppContext,
+    fn add_rooted_window_view(
+        cx: &mut TestAppContext,
         build: impl FnOnce(&mut Window, &mut Context<MobileApp>) -> MobileApp,
-    ) -> (Entity<MobileApp>, &'a mut gpui::VisualTestContext) {
+    ) -> (Entity<MobileApp>, &mut gpui::VisualTestContext) {
         let slot: Rc<RefCell<Option<Entity<MobileApp>>>> = Rc::new(RefCell::new(None));
         let handle = slot.clone();
         let (_, cx) = cx.add_window_view(|window, cx| {
@@ -19562,7 +21501,10 @@ mod tests {
             *handle.borrow_mut() = Some(app.clone());
             gpui_component::Root::new(app, window, cx)
         });
-        let app = slot.borrow().clone().expect("the rooted window built its app");
+        let app = slot
+            .borrow()
+            .clone()
+            .expect("the rooted window built its app");
         (app, cx)
     }
 
@@ -19951,8 +21893,9 @@ mod tests {
             app
         });
         cx.run_until_parked();
-        // The row sits at the bottom of the page, so make sure it is on screen
-        // whatever size the test window has.
+        // Disconnect lives on the Runtime page, behind the root list.
+        click_mobile_control(cx, "mobile-settings-runtime");
+        cx.run_until_parked();
         app.update(cx, |app, cx| {
             app.settings_scroll.scroll_to_bottom();
             cx.notify();
@@ -22237,6 +24180,9 @@ mod tests {
             app.open_settings(&noop_mouse_up(), window, cx);
             app
         });
+        cx.run_until_parked();
+        // About is its own page now, so the rows are one tap in.
+        click_mobile_control(cx, "mobile-settings-about");
         cx.run_until_parked();
         app.update(cx, |app, cx| {
             app.settings_scroll.scroll_to_bottom();

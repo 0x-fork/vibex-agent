@@ -8,6 +8,7 @@ use vibex_backend::{BackendError, BackendResult};
 use vibex_core::{
     AgentTimelineReasoningDisplayMode, RemoteServerKind, TimelineItem, VibexSessionId,
 };
+use vibex_desktop_model::ThemeSelection;
 use vibex_remote_client::ClientDeviceIdentity;
 
 use crate::pairing::MobileCredentialBundle;
@@ -66,6 +67,19 @@ const MAX_APP_SETTINGS_VALUE_BYTES: usize = 32;
 pub struct AppSettings {
     pub theme: Option<crate::theme::AppearanceMode>,
     pub language: Option<crate::locale::LanguagePreference>,
+    /// The light/dark palette pair, mirroring what the desktop selected so the
+    /// phone can paint the same catalog entries instead of always falling back
+    /// to the catalog default.
+    pub theme_selection: ThemeSelection,
+    /// Collapses every transition in the interface. Mobile is the one surface
+    /// where the OS setting is not automatically the app's.
+    pub reduce_motion: bool,
+    /// The notification categories the user wants to hear about. `notifications`
+    /// is the master switch; the three below gate the individual events.
+    pub notifications: bool,
+    pub notify_completed: bool,
+    pub notify_needs_input: bool,
+    pub notify_failed: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -76,6 +90,18 @@ struct StoredAppSettings {
     theme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    theme_selection: Option<ThemeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reduce_motion: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notifications: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notify_completed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notify_needs_input: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notify_failed: Option<bool>,
 }
 
 /// One paired runtime: the credential plus the mobile-owned metadata the
@@ -619,7 +645,16 @@ impl CredentialStorage {
                 _ => return self.reject_invalid_app_settings(&path),
             },
         };
-        Ok(AppSettings { theme, language })
+        Ok(AppSettings {
+            theme,
+            language,
+            theme_selection: stored.theme_selection.unwrap_or_default(),
+            reduce_motion: stored.reduce_motion.unwrap_or(false),
+            notifications: stored.notifications.unwrap_or(true),
+            notify_completed: stored.notify_completed.unwrap_or(true),
+            notify_needs_input: stored.notify_needs_input.unwrap_or(true),
+            notify_failed: stored.notify_failed.unwrap_or(true),
+        })
     }
 
     pub fn save_app_settings(&self, settings: &AppSettings) -> BackendResult<()> {
@@ -631,6 +666,13 @@ impl CredentialStorage {
             language: settings
                 .language
                 .map(|language| language.to_storage().to_string()),
+            theme_selection: Some(settings.theme_selection.clone())
+                .filter(|selection| selection.light.is_some() || selection.dark.is_some()),
+            reduce_motion: Some(settings.reduce_motion),
+            notifications: Some(settings.notifications),
+            notify_completed: Some(settings.notify_completed),
+            notify_needs_input: Some(settings.notify_needs_input),
+            notify_failed: Some(settings.notify_failed),
         };
         let encoded = serde_json::to_vec(&stored)
             .map_err(|_| storage_error("mobile_app_settings_encode_failed"))?;
@@ -1266,6 +1308,7 @@ mod tests {
         let settings = AppSettings {
             theme: Some(crate::theme::AppearanceMode::Light),
             language: Some(crate::locale::LanguagePreference::ZhCn),
+            ..AppSettings::default()
         };
         storage.save_app_settings(&settings).unwrap();
         assert_eq!(storage.load_app_settings().unwrap(), settings);
@@ -1282,6 +1325,7 @@ mod tests {
             .save_app_settings(&AppSettings {
                 theme: Some(crate::theme::AppearanceMode::Dark),
                 language: None,
+                ..AppSettings::default()
             })
             .unwrap();
         let loaded = storage.load_app_settings().unwrap();

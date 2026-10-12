@@ -31,7 +31,7 @@ use vibex_ui::{
 
 use crate::locale;
 use crate::theme;
-use gpui_component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(600);
 /// Cell metrics copied from the desktop terminal surface so both clients
@@ -91,6 +91,16 @@ impl WorkbenchSurface {
     pub fn localized_label(self) -> &'static str {
         locale::common(self.label())
     }
+
+    /// The glyph the surface switcher draws, so the three tabs are
+    /// distinguishable before their labels are read.
+    pub const fn icon(self) -> &'static str {
+        match self {
+            Self::Files => "icons/folder-open.svg",
+            Self::Git => "icons/git-branch.svg",
+            Self::Terminal => "icons/square-terminal.svg",
+        }
+    }
 }
 
 pub struct MobileWorkbench {
@@ -101,6 +111,8 @@ pub struct MobileWorkbench {
     git: GitWorkflowController,
     terminal: TerminalWorkflowController,
     file_search_input: Option<Entity<InputState>>,
+    /// Installed on first paint so the keyboard's action key submits a search.
+    file_search_subscription: Option<gpui::Subscription>,
     file_search_mode: MobileFileSearchMode,
     file_editor_input: Option<Entity<TextareaState>>,
     /// A chosen file takes over the whole Files surface as its own screen
@@ -108,7 +120,28 @@ pub struct MobileWorkbench {
     file_screen_open: bool,
     git_commit_input: Option<Entity<InputState>>,
     git_history_query_input: Option<Entity<InputState>>,
+    /// The focused sink the software keyboard writes into.
+    ///
+    /// A hardware keyboard can hand a focused element raw key events, but an
+    /// Android IME only ever commits text into a real text field. Rendering an
+    /// invisible one-line input behind the grid is what makes the terminal
+    /// typeable with the phone's own keyboard: every committed character is
+    /// forwarded to the PTY and the field is emptied again.
     terminal_input: Option<Entity<InputState>>,
+    /// Subscription to the sink's change events, installed on first paint.
+    terminal_sink_subscription: Option<gpui::Subscription>,
+    /// What the sink held after the last forwarded edit, so the next change can
+    /// be reduced to the characters the user actually typed or deleted.
+    terminal_sink_previous: String,
+    /// Focus handle the grid takes when it is tapped, so key events and the IME
+    /// both land on the terminal instead of the composer.
+    terminal_focus: gpui::FocusHandle,
+    /// Whether Ctrl is latched from the accessory bar (⌃ on a phone keyboard
+    /// has no physical key to hold).
+    terminal_alt_latched: bool,
+    /// Set while the grid is scrolled away from the live bottom, so the
+    /// "jump to latest" affordance only appears when it can do something.
+    terminal_scrolled_back: bool,
     // Programmatic edits need a window and the async paths below have none,
     // so a clear is recorded here and applied on the next paint.
     file_search_clear_pending: bool,
@@ -118,7 +151,13 @@ pub struct MobileWorkbench {
     /// File content waiting to be written into the editor. Loading a file
     /// happens in an async task with no window.
     pending_file_editor_content: Option<String>,
+    /// The path of the buffer the editor is holding, which is not always the
+    /// selected path: a read that returned nothing must not claim the screen.
     file_editor_path: Option<String>,
+    /// A file the user asked to open while the editor still had unsaved edits.
+    /// Opening it immediately would overwrite the buffer, so the choice is
+    /// theirs to make first.
+    file_discard_prompt: Option<String>,
     git_diff: Option<GitDiffResponse>,
     /// One commit opened from the Commits list takes over the Git surface as
     /// its own full-screen view with a back button.
@@ -133,7 +172,9 @@ pub struct MobileWorkbench {
     terminal_close_confirmation: Option<TerminalId>,
     /// Rows/cols this client last requested, so repeated fits are no-ops.
     terminal_fit_size: Option<(u16, u16)>,
-    agent_summaries: Vec<vibex_core::RemoteAgentConfigSummary>,
+    /// The first auto-fit failure, kept so the paint-time fit reports it once
+    /// instead of re-notifying on every frame.
+    terminal_fit_error: Option<String>,
     terminal_poll_generation: u64,
     busy: bool,
     notice: Option<String>,
@@ -142,10 +183,6 @@ pub struct MobileWorkbench {
 }
 
 impl MobileWorkbench {
-    /// The session is tracked by the app-level session-settings sheet; the
-    /// workbench keeps the method for workspace lifecycle parity.
-    pub fn set_session(&mut self, _session_id: Option<VibexSessionId>, _: &mut Context<Self>) {}
-
     pub fn new(
         backend: Arc<WebRemoteBackend>,
         workspace_id: WorkspaceId,
@@ -169,18 +206,25 @@ impl MobileWorkbench {
             git,
             terminal,
             file_search_input: None,
+            file_search_subscription: None,
             file_search_mode: MobileFileSearchMode::Name,
             file_editor_input: None,
             file_screen_open: false,
             git_commit_input: None,
             git_history_query_input: None,
             terminal_input: None,
+            terminal_sink_subscription: None,
+            terminal_sink_previous: String::new(),
+            terminal_focus: cx.focus_handle(),
+            terminal_alt_latched: false,
+            terminal_scrolled_back: false,
             file_search_clear_pending: false,
             git_commit_clear_pending: false,
             git_history_query_clear_pending: false,
             terminal_clear_pending: false,
             pending_file_editor_content: None,
             file_editor_path: None,
+            file_discard_prompt: None,
             git_diff: None,
             git_commit_detail: None,
             git_commit_detail_loading: false,
@@ -190,7 +234,7 @@ impl MobileWorkbench {
             terminal_render_sequence: 0,
             terminal_close_confirmation: None,
             terminal_fit_size: None,
-            agent_summaries: Vec::new(),
+            terminal_fit_error: None,
             terminal_poll_generation: 0,
             busy: false,
             notice: None,
@@ -229,6 +273,7 @@ impl MobileWorkbench {
         self.git_commit_detail_loading = false;
         self.terminal_render_sequence = 0;
         self.terminal_fit_size = None;
+        self.terminal_fit_error = None;
         self.terminal_close_confirmation = None;
         self.git_history_loading = false;
         self.git_history_request_generation = self.git_history_request_generation.wrapping_add(1);
@@ -243,6 +288,30 @@ impl MobileWorkbench {
 
     pub fn resume(&mut self, cx: &mut Context<Self>) {
         self.refresh_all(cx);
+    }
+
+    /// Which surface the rail is showing. The app header reads it so tapping
+    /// the rail button returns to the tab the user left it on.
+    pub fn surface(&self) -> WorkbenchSurface {
+        self.surface
+    }
+
+    /// Changed files plus live terminals: enough for one badge on the rail's
+    /// entry point without a second trip into the panel to find out.
+    pub fn right_rail_badge(&self) -> usize {
+        self.git
+            .state
+            .model
+            .change_row_count()
+            .saturating_add(self.terminal_is_running() as usize)
+    }
+
+    pub fn terminal_is_running(&self) -> bool {
+        self.terminal
+            .state
+            .sessions
+            .iter()
+            .any(|session| session.status == TerminalStatus::Running)
     }
 
     fn refresh_all(&mut self, cx: &mut Context<Self>) {
@@ -289,7 +358,28 @@ impl MobileWorkbench {
         self.tasks.push(task);
     }
 
+    /// Whether the editor holds edits the desktop copy does not have.
+    fn file_editor_is_dirty(&self, cx: &gpui::App) -> bool {
+        self.files
+            .state
+            .view()
+            .editor_content
+            .is_some_and(|content| textarea_value(&self.file_editor_input, cx).as_ref() != content)
+    }
+
     fn select_file(&mut self, path: String, cx: &mut Context<Self>) {
+        // Opening a file replaces the editor buffer outright, so a dirty buffer
+        // has to be resolved first (blocker: opening any file silently threw
+        // away unsaved edits).
+        if self.file_editor_is_dirty(cx) {
+            self.file_discard_prompt = Some(path);
+            cx.notify();
+            return;
+        }
+        self.open_file_now(path, cx);
+    }
+
+    fn open_file_now(&mut self, path: String, cx: &mut Context<Self>) {
         let ticket = match self.files.begin_open_file(path) {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -313,11 +403,6 @@ impl MobileWorkbench {
             });
         });
         self.tasks.push(task);
-    }
-
-    /// Opens a workspace-relative file from another mobile surface.
-    pub fn open_file(&mut self, path: String, cx: &mut Context<Self>) {
-        self.select_file(path, cx);
     }
 
     fn activate_file_row(
@@ -442,8 +527,45 @@ impl MobileWorkbench {
     /// Returns from the full-screen file view to the file tree. The editor
     /// keeps its loaded content so re-opening the file is instant.
     fn close_file_screen(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.file_editor_is_dirty(cx) {
+            // Leaving the screen keeps the buffer, so the only thing to warn
+            // about is losing sight of it; the file stays open behind the tree.
+            self.notice = Some(
+                locale::text(
+                    "Unsaved edits stay in the editor",
+                    "未保存的修改仍保留在编辑器中",
+                    "未儲存的修改仍保留在編輯器中",
+                )
+                .to_string(),
+            );
+        }
         self.file_screen_open = false;
         cx.notify();
+    }
+
+    /// Confirms discarding the dirty buffer and opens the queued file.
+    fn confirm_file_discard(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.file_discard_prompt.take() else {
+            return;
+        };
+        self.open_file_now(path, cx);
+    }
+
+    fn cancel_file_discard(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.file_discard_prompt = None;
+        cx.notify();
+    }
+
+    /// Opens `path` in the Files surface, taking the surface over with the
+    /// editor. Used by the timeline, where a file the agent wrote is a link.
+    pub fn open_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.surface = WorkbenchSurface::Files;
+        if self.file_editor_is_dirty(cx) {
+            self.file_discard_prompt = Some(path);
+            cx.notify();
+            return;
+        }
+        self.open_file_now(path, cx);
     }
 
     fn reload_desktop_file(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -605,6 +727,23 @@ impl MobileWorkbench {
                 ))
             }));
         }
+        if self.file_search_subscription.is_none()
+            && let Some(search) = self.file_search_input.clone()
+        {
+            self.file_search_subscription = Some(cx.subscribe_in(
+                &search,
+                window,
+                |this: &mut Self,
+                 _: &Entity<InputState>,
+                 event: &InputEvent,
+                 _: &mut Window,
+                 cx: &mut Context<Self>| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.start_file_search(cx);
+                    }
+                },
+            ));
+        }
         if self.git_commit_input.is_none() {
             self.git_commit_input = Some(cx.new(|cx| {
                 InputState::new(window, cx).placeholder(locale::text(
@@ -633,13 +772,33 @@ impl MobileWorkbench {
             }));
         }
         if self.terminal_input.is_none() {
-            self.terminal_input = Some(cx.new(|cx| {
-                InputState::new(window, cx).placeholder(locale::text(
-                    "Type a command",
-                    "输入命令",
-                    "輸入命令",
-                ))
-            }));
+            self.terminal_input = Some(cx.new(|cx| InputState::new(window, cx)));
+            // Every committed character is forwarded to the PTY as it lands, so
+            // the field never keeps a value the terminal has not already seen.
+            if let Some(sink) = self.terminal_input.clone() {
+                self.terminal_sink_subscription = Some(cx.subscribe_in(
+                    &sink,
+                    window,
+                    |this: &mut Self,
+                     _: &Entity<InputState>,
+                     event: &InputEvent,
+                     window: &mut Window,
+                     cx: &mut Context<Self>| {
+                        match event {
+                            InputEvent::Change => this.forward_terminal_sink(window, cx),
+                            InputEvent::PressEnter { .. } => this.send_terminal_value(
+                                TerminalInput::Key(
+                                    TerminalKey::Enter,
+                                    TerminalKeyModifiers::default(),
+                                ),
+                                false,
+                                cx,
+                            ),
+                            _ => {}
+                        }
+                    },
+                ));
+            }
         }
 
         let clears = [
@@ -974,6 +1133,16 @@ impl MobileWorkbench {
 
     fn refresh_terminals(&mut self, cx: &mut Context<Self>) {
         self.stop_terminal_poll();
+        // `begin_refresh` clears the attached session, so remember which one
+        // the user was looking at and put it back when the list returns. A
+        // refresh that dropped the attachment left the panel on "Select or
+        // create a terminal" until the user found the chip row.
+        let previous = self
+            .terminal
+            .state
+            .active_session
+            .as_ref()
+            .map(|session| session.id.clone());
         let ticket = match self.terminal.begin_refresh(self.workspace_id.clone()) {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -988,6 +1157,34 @@ impl MobileWorkbench {
             let _ = entity.update(cx, |this, cx| {
                 this.terminal.apply_refresh(&ticket, outcome);
                 this.error = this.terminal.state.last_error.clone();
+                if this.terminal.state.active_session.is_none() {
+                    let next = previous
+                        .filter(|id| {
+                            this.terminal
+                                .state
+                                .sessions
+                                .iter()
+                                .any(|session| &session.id == id)
+                        })
+                        .or_else(|| {
+                            this.terminal
+                                .state
+                                .sessions
+                                .iter()
+                                .find(|session| session.status == TerminalStatus::Running)
+                                .map(|session| session.id.clone())
+                        })
+                        .or_else(|| {
+                            this.terminal
+                                .state
+                                .sessions
+                                .first()
+                                .map(|session| session.id.clone())
+                        });
+                    if let Some(terminal_id) = next {
+                        this.attach_terminal(terminal_id, cx);
+                    }
+                }
                 cx.notify();
             });
         });
@@ -1035,6 +1232,7 @@ impl MobileWorkbench {
         match self.terminal.attach(terminal_id.clone()) {
             Ok(()) => {
                 self.error = None;
+                self.terminal_fit_error = None;
                 self.terminal_render_sequence = 0;
                 self.terminal_fit_size = None;
                 self.start_terminal_poll(terminal_id, cx);
@@ -1157,9 +1355,16 @@ impl MobileWorkbench {
         let operation = match self.terminal.begin_resize(rows, cols) {
             Ok(operation) => operation,
             Err(error) => {
-                self.terminal_fit_size = None;
-                self.error = Some(error);
-                cx.notify();
+                // This runs from the grid's paint closure. Recording the error
+                // and notifying here would schedule the next frame from inside
+                // this one and the surface would repaint forever on a runtime
+                // that does not implement `TerminalResize`; the fit is simply
+                // marked unavailable and reported once.
+                self.terminal_fit_size = Some((rows, cols));
+                if self.terminal_fit_error.is_none() {
+                    self.terminal_fit_error = Some(error.message.clone());
+                    self.error = Some(error);
+                }
                 return;
             }
         };
@@ -1194,12 +1399,79 @@ impl MobileWorkbench {
         cx.notify();
     }
 
-    fn send_terminal_input(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let value = input_value(&self.terminal_input, cx).to_string();
-        if value.is_empty() {
+    /// The sink's value changed: forward only what the user just typed or
+    /// deleted, then empty the field again so the PTY stays the only buffer.
+    fn forward_terminal_sink(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let next = input_value(&self.terminal_input, cx).to_string();
+        let previous = std::mem::replace(&mut self.terminal_sink_previous, next.clone());
+        if next == previous {
             return;
         }
-        self.send_terminal_value(TerminalInput::Text(format!("{value}\r")), true, cx);
+        self.terminal_clear_pending = true;
+        if let Some(typed) = next.strip_prefix(previous.as_str()) {
+            if !typed.is_empty() {
+                let input = TerminalInput::Text(self.apply_terminal_latches(typed));
+                self.send_terminal_value(input, false, cx);
+            }
+            return;
+        }
+        // A deletion (backspace, or a selection replaced by nothing) arrives as
+        // a shorter value; send one DEL per removed character.
+        if let Some(remaining) = previous.strip_prefix(next.as_str()) {
+            let deletes = remaining.chars().count().min(64);
+            if deletes > 0 {
+                self.send_terminal_value(TerminalInput::Text("\u{7f}".repeat(deletes)), false, cx);
+            }
+        }
+        // Anything else (an IME rewriting the whole buffer) is not a keystroke
+        // the PTY can be told about; drop it rather than duplicating input.
+    }
+
+    /// Applies the accessory bar's latched modifiers to text typed on the
+    /// keyboard. The shared encoder applies the Ctrl latch to key events only,
+    /// and a soft keyboard produces text, so the byte has to be built here —
+    /// otherwise the highlighted ⌃ chip would be decoration.
+    fn apply_terminal_latches(&mut self, typed: &str) -> String {
+        let alt = std::mem::take(&mut self.terminal_alt_latched);
+        let control = std::mem::take(&mut self.terminal.state.control_latched);
+        let mut out = String::new();
+        if alt {
+            out.push('\u{1b}');
+        }
+        if control {
+            for character in typed.chars() {
+                let byte = character as u32;
+                if byte < 0x80 && character.is_ascii_alphabetic() {
+                    out.push(char::from_u32(byte & 0x1f).unwrap_or(character));
+                } else if character == ' ' {
+                    out.push('\0');
+                } else {
+                    out.push(character);
+                }
+            }
+        } else {
+            out.push_str(typed);
+        }
+        out
+    }
+
+    /// Tapping the grid puts the software keyboard on the terminal.
+    fn focus_terminal(
+        &mut self,
+        _: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_terminal_keyboard(window, cx);
+    }
+
+    /// Focuses the terminal's key sink and raises the software keyboard.
+    fn show_terminal_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(sink) = self.terminal_input.clone() {
+            sink.update(cx, |sink, cx| sink.focus(window, cx));
+        }
+        crate::platform::show_keyboard();
+        cx.notify();
     }
 
     fn send_terminal_key(&mut self, key: TerminalKey, cx: &mut Context<Self>) {
@@ -1226,21 +1498,43 @@ impl MobileWorkbench {
         if lines == 0.0 {
             return;
         }
+        cx.stop_propagation();
+        // An application that turned on mouse reporting (vim, less, htop,
+        // tmux) owns the wheel: the gesture has to reach the PTY as a wheel
+        // event instead of moving this client's own viewport, which the
+        // application would immediately repaint away.
+        let mouse_reporting = self
+            .terminal
+            .state
+            .render
+            .as_ref()
+            .is_some_and(|render| render.frame.modes.mouse_reporting);
+        if mouse_reporting {
+            let (row, column) = self
+                .terminal
+                .state
+                .render
+                .as_ref()
+                .map(|render| {
+                    (
+                        render.frame.cursor.map(|cursor| cursor.row).unwrap_or(0),
+                        render.frame.cursor.map(|cursor| cursor.column).unwrap_or(0),
+                    )
+                })
+                .unwrap_or((0, 0));
+            let button = if lines > 0.0 { 65 } else { 64 };
+            let sequence = format!("\u{1b}[<{};{};{}M", button, column + 1, row + 1);
+            self.send_terminal_value(TerminalInput::Text(sequence), false, cx);
+            return;
+        }
         let Some(render) = self.terminal.state.render.as_mut() else {
             return;
         };
-        let frame = &render.frame;
-        if frame.modes.mouse_reporting {
-            // Applications handling their own mouse events also own scroll;
-            // do not fight them with local viewport movement.
-            cx.stop_propagation();
-            return;
-        }
-        if frame.display_offset == 0 && lines < 0.0 {
+        if render.frame.display_offset == 0 && lines < 0.0 {
             return;
         }
         render.scroll(lines as i32);
-        cx.stop_propagation();
+        self.terminal_scrolled_back = render.frame.display_offset != 0;
         cx.notify();
     }
 
@@ -1249,6 +1543,7 @@ impl MobileWorkbench {
             && render.frame.display_offset != 0
         {
             render.scroll_to_bottom();
+            self.terminal_scrolled_back = false;
             cx.notify();
         }
     }
@@ -1364,10 +1659,75 @@ impl MobileWorkbench {
     }
 
     fn render_files(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        if self.file_screen_open {
-            return self.render_file_screen(cx);
+        let body = if self.file_screen_open {
+            self.render_file_screen(cx)
+        } else {
+            self.render_file_tree(cx)
+        };
+        if self.file_discard_prompt.is_none() {
+            return body;
         }
-        self.render_file_tree(cx)
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(self.render_file_discard_prompt(cx))
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
+    }
+
+    /// The unsaved-edits guard: the only way past it is an explicit choice.
+    fn render_file_discard_prompt(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .id("file-discard-prompt")
+            .flex_shrink_0()
+            .m(px(theme::SPACING_MD))
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            .border_color(theme::accent_yellow())
+            .bg(theme::bg_card())
+            .p(px(theme::SPACING_MD))
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACING_SM))
+            .child(
+                div()
+                    .text_size(theme::font_detail())
+                    .text_color(theme::text_primary())
+                    .child(locale::text(
+                        "Discard unsaved edits?",
+                        "放弃未保存的修改？",
+                        "放棄未儲存的修改？",
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(theme::font_micro())
+                    .text_color(theme::text_muted())
+                    .child(locale::text(
+                        "Opening another file replaces what you typed here.",
+                        "打开其它文件会替换你在此处的输入。",
+                        "開啟其他檔案會取代你在此處的輸入。",
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        action_button("file-discard-cancel", locale::common("Cancel"))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_file_discard)),
+                    )
+                    .child(
+                        action_button(
+                            "file-discard-confirm",
+                            locale::text("Discard", "放弃", "放棄"),
+                        )
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::confirm_file_discard)),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// Full-screen file view opened from the file panel: a header with a back
@@ -1379,7 +1739,7 @@ impl MobileWorkbench {
             .editor_content
             .is_some_and(|content| textarea_value(&self.file_editor_input, cx).as_ref() != content);
         let status = if input_dirty {
-            "Unsaved"
+            locale::common("Unsaved")
         } else {
             file_status_label(view.status)
         };
@@ -1444,7 +1804,7 @@ impl MobileWorkbench {
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .whitespace_nowrap()
-                                    .text_size(px(theme::FONT_BODY))
+                                    .text_size(theme::font_body())
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme::text_primary())
                                     .child(file_name),
@@ -1455,7 +1815,7 @@ impl MobileWorkbench {
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .whitespace_nowrap()
-                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_size(theme::font_micro())
                                     .text_color(theme::text_muted())
                                     .child(path),
                             ),
@@ -1468,7 +1828,7 @@ impl MobileWorkbench {
                                 .py(px(2.0))
                                 .rounded(px(theme::RADIUS_CONTROL))
                                 .bg(theme::bg_card_dim())
-                                .text_size(px(theme::FONT_MICRO))
+                                .text_size(theme::font_micro())
                                 .text_color(status_color)
                                 .child(status),
                         ),
@@ -1485,6 +1845,10 @@ impl MobileWorkbench {
                     .border_color(theme::border_default())
                     .bg(theme::bg_card())
                     .overflow_hidden()
+                    // A code buffer in the interface font reads as prose; the
+                    // desktop editor is monospace and so is this one.
+                    .font_family("IBM Plex Mono")
+                    .text_size(px(13.0))
                     .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
                     .child(textarea_element(self.file_editor_input.as_ref())),
             )
@@ -1540,7 +1904,7 @@ impl MobileWorkbench {
             .editor_content
             .is_some_and(|content| textarea_value(&self.file_editor_input, cx).as_ref() != content);
         let status = if input_dirty {
-            "Unsaved"
+            locale::common("Unsaved")
         } else {
             file_status_label(view.status)
         };
@@ -1571,7 +1935,7 @@ impl MobileWorkbench {
                     .gap_1()
                     .child(
                         div()
-                            .h(px(32.0))
+                            .h(px(theme::TOUCH_TARGET))
                             .min_w_0()
                             .flex_1()
                             .rounded(px(theme::RADIUS_CONTROL))
@@ -1617,23 +1981,31 @@ impl MobileWorkbench {
                             }),
                     )
                     .child(
+                        // The mode chip doubles as the search trigger: on a
+                        // phone the keyboard's own action key commits, and this
+                        // is the visible way to ask again after an edit.
                         compact_action(
                             "toggle-file-search-mode",
                             self.file_search_mode.label().to_string(),
                         )
-                        .h(px(32.0))
-                        .when(query_present, |button| {
-                            button.on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::toggle_file_search_mode),
-                            )
-                        })
-                        .when(!query_present, |button| {
-                            button.on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::toggle_file_search_mode),
-                            )
-                        }),
+                        .h(px(theme::TOUCH_TARGET))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(Self::toggle_file_search_mode),
+                        ),
+                    )
+                    .child(
+                        icon_button("submit-file-search", "icons/search.svg", "Search")
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::search_files)),
+                    )
+                    .child(
+                        icon_button("refresh-files", "icons/refresh.svg", "Refresh").on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.refresh_files(cx);
+                                cx.notify();
+                            }),
+                        ),
                     ),
             )
             .child(
@@ -1653,18 +2025,18 @@ impl MobileWorkbench {
                         )
                     })
                     .when(query_present && search_loading, |body| {
-                        body.child(empty_label("Searching"))
+                        body.child(empty_label(locale::common("Searching")))
                     })
                     .when(
                         query_present && !search_loading && !search_has_results,
                         |body| {
-                            body.child(empty_label(
+                            body.child(empty_label(locale::common(
                                 if self.file_search_mode == MobileFileSearchMode::Name {
                                     "No matching items"
                                 } else {
                                     "No matching files"
                                 },
-                            ))
+                            )))
                         },
                     )
                     .when(query_present && search_has_results, |body| {
@@ -1677,7 +2049,7 @@ impl MobileWorkbench {
                                 .border_t_1()
                                 .border_b_1()
                                 .border_color(theme::border_subtle())
-                                .text_size(px(theme::FONT_MICRO))
+                                .text_size(theme::font_micro())
                                 .text_color(theme::text_muted())
                                 .child(format!("{} {}", search.len(), locale::common("results"))),
                         )
@@ -1718,7 +2090,7 @@ impl MobileWorkbench {
                                         .overflow_hidden()
                                         .text_ellipsis()
                                         .whitespace_nowrap()
-                                        .text_size(px(theme::FONT_CAPTION))
+                                        .text_size(theme::font_caption())
                                         .text_color(theme::text_secondary())
                                         .child(display_path)
                                 })
@@ -1729,7 +2101,7 @@ impl MobileWorkbench {
                                             .overflow_hidden()
                                             .text_ellipsis()
                                             .whitespace_nowrap()
-                                            .text_size(px(theme::FONT_MICRO))
+                                            .text_size(theme::font_micro())
                                             .text_color(theme::text_muted())
                                             .child(snippet),
                                     )
@@ -1774,14 +2146,14 @@ impl MobileWorkbench {
                                             .overflow_hidden()
                                             .text_ellipsis()
                                             .whitespace_nowrap()
-                                            .text_size(px(theme::FONT_CAPTION))
+                                            .text_size(theme::font_caption())
                                             .text_color(theme::text_secondary())
                                             .child(path),
                                     )
                                     .child(
                                         div()
                                             .flex_shrink_0()
-                                            .text_size(px(theme::FONT_MICRO))
+                                            .text_size(theme::font_micro())
                                             .text_color(status_color)
                                             .child(status),
                                     )
@@ -1870,7 +2242,7 @@ impl MobileWorkbench {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(theme::FONT_BODY))
+                    .text_size(theme::font_body())
                     .text_color(text_color)
                     .child(label),
             )
@@ -1888,7 +2260,7 @@ impl MobileWorkbench {
                         .w(px(16.0))
                         .flex_none()
                         .font_family("monospace")
-                        .text_size(px(theme::FONT_MICRO))
+                        .text_size(theme::font_micro())
                         .text_color(file_git_signal_color(signal))
                         .child(signal.short_label()),
                 )
@@ -2126,7 +2498,7 @@ impl MobileWorkbench {
                                     .history_filter
                                     .author
                                     .as_deref()
-                                    .unwrap_or("All authors")
+                                    .unwrap_or(locale::common("All authors"))
                                     .to_string(),
                             )
                             .h(px(30.0))
@@ -2171,26 +2543,28 @@ impl MobileWorkbench {
                                 .overflow_hidden()
                                 .text_ellipsis()
                                 .whitespace_nowrap()
-                                .text_size(px(theme::FONT_CAPTION))
+                                .text_size(theme::font_caption())
                                 .text_color(theme::text_secondary())
                                 .child(
                                     status
                                         .as_ref()
                                         .and_then(|status| status.branch.clone())
-                                        .unwrap_or_else(|| "No repository".to_string()),
+                                        .unwrap_or_else(|| {
+                                            locale::common("No repository").to_string()
+                                        }),
                                 ),
                         )
                         .child(
                             div()
                                 .font_family("monospace")
-                                .text_size(px(theme::FONT_MICRO))
+                                .text_size(theme::font_micro())
                                 .text_color(theme::text_muted())
                                 .child(format!("{} files", change_count)),
                         )
                         .child(
                             div()
                                 .font_family("monospace")
-                                .text_size(px(theme::FONT_MICRO))
+                                .text_size(theme::font_micro())
                                 .text_color(if additions > 0 {
                                     theme::accent_green()
                                 } else {
@@ -2201,7 +2575,7 @@ impl MobileWorkbench {
                         .child(
                             div()
                                 .font_family("monospace")
-                                .text_size(px(theme::FONT_MICRO))
+                                .text_size(theme::font_micro())
                                 .text_color(if deletions > 0 {
                                     theme::accent_red()
                                 } else {
@@ -2373,7 +2747,7 @@ impl MobileWorkbench {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(theme::FONT_BODY))
+                    .text_size(theme::font_body())
                     .text_color(text_color)
                     .when(
                         change
@@ -2402,7 +2776,7 @@ impl MobileWorkbench {
                         .px_1()
                         .flex_none()
                         .font_family("monospace")
-                        .text_size(px(theme::FONT_MICRO))
+                        .text_size(theme::font_micro())
                         .text_color(git_change_text_color_mobile(&change))
                         .child(git_change_label_mobile(change.kind)),
                 )
@@ -2411,7 +2785,7 @@ impl MobileWorkbench {
                         .w(px(30.0))
                         .flex_none()
                         .font_family("monospace")
-                        .text_size(px(theme::FONT_MICRO))
+                        .text_size(theme::font_micro())
                         .text_color(if change.additions > 0 {
                             theme::accent_green()
                         } else {
@@ -2424,7 +2798,7 @@ impl MobileWorkbench {
                         .w(px(30.0))
                         .flex_none()
                         .font_family("monospace")
-                        .text_size(px(theme::FONT_MICRO))
+                        .text_size(theme::font_micro())
                         .text_color(if change.deletions > 0 {
                             theme::accent_red()
                         } else {
@@ -2510,7 +2884,7 @@ impl MobileWorkbench {
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .whitespace_nowrap()
-                                    .text_size(px(theme::FONT_BODY))
+                                    .text_size(theme::font_body())
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme::text_primary())
                                     .child(subject),
@@ -2521,7 +2895,7 @@ impl MobileWorkbench {
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .whitespace_nowrap()
-                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_size(theme::font_micro())
                                     .font_family("IBM Plex Mono")
                                     .text_color(theme::text_muted())
                                     .child(short_hash),
@@ -2558,7 +2932,7 @@ impl MobileWorkbench {
                                         .flex()
                                         .items_center()
                                         .gap_2()
-                                        .text_size(px(theme::FONT_MICRO))
+                                        .text_size(theme::font_micro())
                                         .text_color(theme::text_muted())
                                         .child(history_relative_time(summary.authored_at_ms))
                                         .child(
@@ -2589,7 +2963,7 @@ impl MobileWorkbench {
                                         meta.child(
                                             div()
                                                 .pt_1()
-                                                .text_size(px(theme::FONT_CAPTION))
+                                                .text_size(theme::font_caption())
                                                 .whitespace_normal()
                                                 .text_color(theme::text_secondary())
                                                 .child(commit_body),
@@ -2606,7 +2980,7 @@ impl MobileWorkbench {
                                         .rounded(px(3.0))
                                         .bg(theme::accent_blue().opacity(0.18))
                                         .px_1()
-                                        .text_size(px(theme::FONT_MICRO))
+                                        .text_size(theme::font_micro())
                                         .text_color(theme::accent_blue())
                                         .child(reference)
                                 })),
@@ -2621,7 +2995,7 @@ impl MobileWorkbench {
                                 .border_t_1()
                                 .border_b_1()
                                 .border_color(theme::border_subtle())
-                                .text_size(px(theme::FONT_MICRO))
+                                .text_size(theme::font_micro())
                                 .text_color(theme::text_muted())
                                 .child(locale::text("Files", "文件", "檔案"))
                                 .child(format!("{}", stats.2)),
@@ -2641,7 +3015,7 @@ impl MobileWorkbench {
                                     .items_center()
                                     .border_t_1()
                                     .border_color(theme::border_subtle())
-                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_size(theme::font_micro())
                                     .text_color(theme::text_muted())
                                     .child(locale::text("Patch", "补丁", "補丁")),
                             )
@@ -2651,7 +3025,7 @@ impl MobileWorkbench {
                                     div()
                                         .px_3()
                                         .py_2()
-                                        .text_size(px(theme::FONT_MICRO))
+                                        .text_size(theme::font_micro())
                                         .text_color(theme::accent_yellow())
                                         .child(locale::text(
                                             "The patch is truncated.",
@@ -2666,7 +3040,7 @@ impl MobileWorkbench {
                                 div()
                                     .px_3()
                                     .py_2()
-                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_size(theme::font_micro())
                                     .text_color(theme::text_muted())
                                     .child(locale::text(
                                         "This commit has no patch content.",
@@ -2712,7 +3086,7 @@ impl MobileWorkbench {
                     .border_color(theme::border_default())
                     .px_1()
                     .font_family("IBM Plex Mono")
-                    .text_size(px(theme::FONT_MICRO))
+                    .text_size(theme::font_micro())
                     .text_color(color)
                     .child(git_change_label_mobile(file.kind)),
             )
@@ -2723,7 +3097,7 @@ impl MobileWorkbench {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(theme::font_caption())
                     .text_color(theme::text_secondary())
                     .when_some(file.original_path.clone(), |row, original| {
                         row.child(format!("{original} → {}", file.path))
@@ -2737,7 +3111,7 @@ impl MobileWorkbench {
                     .w(px(34.0))
                     .flex_none()
                     .font_family("IBM Plex Mono")
-                    .text_size(px(theme::FONT_MICRO))
+                    .text_size(theme::font_micro())
                     .text_color(if file.additions > 0 {
                         theme::accent_green()
                     } else {
@@ -2750,7 +3124,7 @@ impl MobileWorkbench {
                     .w(px(34.0))
                     .flex_none()
                     .font_family("IBM Plex Mono")
-                    .text_size(px(theme::FONT_MICRO))
+                    .text_size(theme::font_micro())
                     .text_color(if file.deletions > 0 {
                         theme::accent_red()
                     } else {
@@ -2785,7 +3159,7 @@ impl MobileWorkbench {
                 };
                 div()
                     .font_family("IBM Plex Mono")
-                    .text_size(px(theme::FONT_MICRO))
+                    .text_size(theme::font_micro())
                     .text_color(color)
                     .whitespace_normal()
                     .child(if line.is_empty() {
@@ -2808,7 +3182,7 @@ impl MobileWorkbench {
             .gap_1()
             .child(
                 div()
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(theme::font_caption())
                     .text_color(theme::text_secondary())
                     .child(diff.path),
             )
@@ -2823,7 +3197,7 @@ impl MobileWorkbench {
                 };
                 div()
                     .font_family("IBM Plex Mono")
-                    .text_size(px(theme::FONT_MICRO))
+                    .text_size(theme::font_micro())
                     .text_color(color)
                     .whitespace_normal()
                     .child(if line.is_empty() {
@@ -2861,7 +3235,7 @@ impl MobileWorkbench {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .text_size(px(theme::FONT_CAPTION))
+                        .text_size(theme::font_caption())
                         .text_color(theme::text_secondary())
                         .child(locale::text(
                             "Commit staged changes?",
@@ -3019,7 +3393,7 @@ impl MobileWorkbench {
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .whitespace_nowrap()
-                                    .text_size(px(theme::FONT_BODY))
+                                    .text_size(theme::font_body())
                                     .text_color(theme::text_primary())
                                     .child(commit.subject.clone()),
                             )
@@ -3032,7 +3406,7 @@ impl MobileWorkbench {
                                     .rounded(px(3.0))
                                     .bg(theme::accent_blue().opacity(0.18))
                                     .px_1()
-                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_size(theme::font_micro())
                                     .text_color(theme::accent_blue())
                                     .child(reference)
                             })),
@@ -3042,7 +3416,7 @@ impl MobileWorkbench {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .text_size(px(theme::FONT_MICRO))
+                            .text_size(theme::font_micro())
                             .text_color(theme::text_muted())
                             .child(history_relative_time(commit.authored_at_ms))
                             .child(
@@ -3067,7 +3441,15 @@ impl MobileWorkbench {
     }
 
     /// Terminal surface: session chips, an auto-fitted cell grid rendered by
-    /// the shared TerminalRenderModel, a touch key bar, and the input row.
+    /// the shared TerminalRenderModel, and a modifier bar that sits between
+    /// the phone keyboard and the PTY.
+    ///
+    /// The grid is the input: tapping it focuses an off-screen one-line field
+    /// so the platform IME has somewhere to commit text, and every committed
+    /// character is forwarded to the PTY immediately (see
+    /// [`Self::forward_terminal_sink`]). There is deliberately no "type here,
+    /// then press Send" row — a terminal that needs a second send gesture is
+    /// not a terminal.
     fn render_terminal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let view = self.terminal.state.view(ShellKind::Compact);
         let sessions = self.terminal.state.sessions.clone();
@@ -3086,21 +3468,32 @@ impl MobileWorkbench {
             .capabilities
             .supports(BackendOperation::TerminalClose);
         let control_latched = self.terminal.state.control_latched;
+        let alt_latched = self.terminal_alt_latched;
 
         div()
             .size_full()
             .flex()
             .flex_col()
+            // ── session header ───────────────────────────────────────────────
             .child(
                 div()
                     .flex_shrink_0()
-                    .h(px(44.0))
-                    .px_2()
-                    .border_b_1()
-                    .border_color(theme::border_subtle())
+                    .h(px(theme::TOUCH_TARGET))
+                    .pl(px(theme::SPACING_MD))
+                    .pr(px(theme::SPACING_XS))
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap(px(theme::SPACING_XS))
+                    .child(
+                        div()
+                            .size(px(8.0))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(session
+                                .as_ref()
+                                .map(|session| terminal_status_color(session.status))
+                                .unwrap_or_else(theme::text_muted)),
+                    )
                     .child(
                         div()
                             .min_w_0()
@@ -3108,15 +3501,14 @@ impl MobileWorkbench {
                             .flex()
                             .flex_col()
                             .justify_center()
-                            .gap(px(1.0))
                             .child(
                                 div()
                                     .min_w_0()
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .whitespace_nowrap()
-                                    .text_size(px(theme::FONT_BODY))
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(theme::font_detail())
+                                    .font_weight(FontWeight::MEDIUM)
                                     .text_color(theme::text_primary())
                                     .child(
                                         session
@@ -3129,32 +3521,32 @@ impl MobileWorkbench {
                             )
                             .child(
                                 div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_size(theme::font_micro())
                                     .text_color(theme::text_muted())
-                                    .when_some(session.clone(), |row, session| {
-                                        row.child(
-                                            div()
-                                                .size(px(6.0))
-                                                .rounded_full()
-                                                .bg(terminal_status_color(session.status)),
-                                        )
-                                        .child(format!(
-                                            "{}  {}\u{d7}{}",
+                                    .child(match session.as_ref() {
+                                        Some(session) => format!(
+                                            "{} · {}\u{d7}{}",
                                             terminal_status_label(session.status),
                                             session.cols,
                                             session.rows
-                                        ))
-                                    })
-                                    .when(session.is_none(), |row| {
-                                        row.child(locale::text(
+                                        ),
+                                        None => locale::text(
                                             "No active session",
                                             "没有活动会话",
                                             "沒有活動會話",
-                                        ))
+                                        )
+                                        .to_string(),
                                     }),
+                            ),
+                    )
+                    .child(
+                        icon_button("refresh-terminal", "icons/refresh.svg", "Refresh")
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.refresh_terminals(cx);
+                                    cx.notify();
+                                }),
                             ),
                     )
                     .child(
@@ -3180,19 +3572,19 @@ impl MobileWorkbench {
                         )
                     }),
             )
-            .when(sessions.len() > 1, |terminal| {
+            // ── session chips ────────────────────────────────────────────────
+            .when(!sessions.is_empty(), |terminal| {
                 terminal.child(
                     div()
                         .id("mobile-terminal-sessions")
                         .flex_shrink_0()
-                        .min_h(px(36.0))
                         .overflow_x_scroll()
                         .restrict_scroll_to_axis()
                         .flex()
                         .items_center()
-                        .gap_1()
-                        .px_2()
-                        .py_1()
+                        .gap(px(theme::SPACING_XS))
+                        .px(px(theme::SPACING_MD))
+                        .pb(px(theme::SPACING_SM))
                         .children(sessions.iter().map(|item| {
                             let terminal_id = item.id.clone();
                             let selected =
@@ -3200,23 +3592,23 @@ impl MobileWorkbench {
                             div()
                                 .id(format!("terminal-chip:{}", item.id))
                                 .flex_shrink_0()
-                                .h(px(26.0))
-                                .rounded(px(theme::RADIUS_CONTROL))
+                                .h(px(36.0))
+                                .rounded_full()
                                 .border_1()
                                 .border_color(if selected {
                                     theme::accent_blue()
                                 } else {
-                                    theme::border_default()
+                                    theme::border_subtle()
                                 })
                                 .bg(if selected {
-                                    theme::bg_card_dim()
+                                    theme::accent_blue().opacity(0.14)
                                 } else {
                                     theme::bg_card()
                                 })
-                                .px_2()
+                                .px_3()
                                 .flex()
                                 .items_center()
-                                .gap_1()
+                                .gap(px(theme::SPACING_XS))
                                 .cursor_pointer()
                                 .active(|style| style.bg(theme::row_pressed_bg()))
                                 .on_mouse_up(
@@ -3233,11 +3625,11 @@ impl MobileWorkbench {
                                 )
                                 .child(
                                     div()
-                                        .max_w(px(120.0))
+                                        .max_w(px(140.0))
                                         .overflow_hidden()
                                         .text_ellipsis()
                                         .whitespace_nowrap()
-                                        .text_size(px(theme::FONT_CAPTION))
+                                        .text_size(theme::font_caption())
                                         .text_color(if selected {
                                             theme::text_primary()
                                         } else {
@@ -3261,7 +3653,7 @@ impl MobileWorkbench {
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .text_size(px(theme::FONT_CAPTION))
+                        .text_size(theme::font_caption())
                         .text_color(theme::text_secondary())
                         .child(locale::text(
                             "Close this terminal and stop its running process?",
@@ -3300,85 +3692,69 @@ impl MobileWorkbench {
                 )
             })
             .child(self.render_terminal_grid(cx))
+            // ── modifier bar ─────────────────────────────────────────────────
             .when_some(active.clone(), |terminal, _| {
-                terminal
-                    .child(
-                        div()
-                            .id("mobile-terminal-keys-scroll")
-                            .flex_shrink_0()
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .px_2()
-                            .overflow_x_scroll()
-                            .restrict_scroll_to_axis()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .border_t_1()
-                            .border_color(theme::border_subtle())
-                            .children(view.key_bar.into_iter().map(|action| {
-                                let key = action.key;
-                                let latched = key == TerminalKey::Control && control_latched;
-                                div()
-                                    .id(format!("terminal-key:{:?}", key))
-                                    .flex_shrink_0()
-                                    .h(px(34.0))
-                                    .min_w(px(44.0))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .border_1()
-                                    .border_color(if latched {
-                                        theme::accent_blue()
-                                    } else {
-                                        theme::border_default()
-                                    })
-                                    .bg(if latched {
-                                        theme::accent_blue().opacity(0.16)
-                                    } else {
-                                        theme::bg_card()
-                                    })
-                                    .px_2()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(px(theme::FONT_CAPTION))
-                                    .text_color(if latched {
-                                        theme::accent_blue()
-                                    } else {
-                                        theme::text_secondary()
-                                    })
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .when(can_input, |chip| {
-                                        chip.on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.send_terminal_key(key, cx)
-                                            }),
-                                        )
-                                    })
-                                    .when(!can_input, |chip| chip.opacity(0.55))
-                                    .child(action.label)
-                            })),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .p_2()
-                            .border_t_1()
-                            .border_color(theme::border_subtle())
-                            .flex()
-                            .gap_2()
-                            .child(input_shell(self.terminal_input.as_ref()))
-                            .child(
-                                action_button("send-terminal-input", locale::common("Send"))
-                                    .when(can_input, |button| {
-                                        button.on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(Self::send_terminal_input),
-                                        )
-                                    })
-                                    .when(!can_input, |button| button.opacity(0.55)),
-                            ),
-                    )
+                terminal.child(
+                    div()
+                        .id("mobile-terminal-keys-scroll")
+                        .flex_shrink_0()
+                        .h(px(52.0))
+                        .px(px(theme::SPACING_SM))
+                        .overflow_x_scroll()
+                        .restrict_scroll_to_axis()
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::SPACING_XS))
+                        .border_t_1()
+                        .border_color(theme::border_subtle())
+                        .children(view.key_bar.into_iter().map(|action| {
+                            let key = action.key;
+                            let latched = key == TerminalKey::Control && control_latched;
+                            terminal_modifier_chip(
+                                format!("terminal-key:{:?}", key),
+                                action.label,
+                                latched,
+                                can_input,
+                                cx.listener(move |this, _, _, cx| this.send_terminal_key(key, cx)),
+                            )
+                        }))
+                        .child(terminal_modifier_chip(
+                            "terminal-key:alt",
+                            "Alt",
+                            alt_latched,
+                            can_input,
+                            cx.listener(|this, _, _, cx| {
+                                this.terminal_alt_latched = !this.terminal_alt_latched;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(terminal_modifier_chip(
+                            "terminal-key:paste",
+                            locale::common("Paste"),
+                            false,
+                            can_input,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(text) =
+                                    cx.read_from_clipboard().and_then(|item| item.text())
+                                {
+                                    this.send_terminal_value(
+                                        TerminalInput::Text(text.replace('\n', "\r")),
+                                        false,
+                                        cx,
+                                    );
+                                }
+                            }),
+                        ))
+                        .child(terminal_modifier_chip(
+                            "terminal-key:keyboard",
+                            locale::text("Keyboard", "键盘", "鍵盤"),
+                            false,
+                            true,
+                            cx.listener(|this, _, window, cx| {
+                                this.show_terminal_keyboard(window, cx)
+                            }),
+                        )),
+                )
             })
             .into_any_element()
     }
@@ -3403,7 +3779,81 @@ impl MobileWorkbench {
             .relative()
             .overflow_hidden()
             .bg(theme::workbench_bg())
+            .track_focus(&self.terminal_focus)
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_terminal))
             .on_scroll_wheel(cx.listener(Self::scroll_terminal))
+            // The IME sink: invisible, unfocusable by tap, but the destination
+            // the platform keyboard commits into while the grid holds the
+            // user's attention.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(1.0))
+                    .h(px(1.0))
+                    .opacity(0.0)
+                    .child(input_element(self.terminal_input.as_ref())),
+            )
+            .when(
+                self.terminal.state.active_session.is_some() && !has_frame,
+                |surface| {
+                    surface.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_size(theme::font_caption())
+                                    .text_color(theme::text_muted())
+                                    .child(locale::text(
+                                        "Waiting for output…",
+                                        "正在等待输出…",
+                                        "正在等待輸出…",
+                                    )),
+                            ),
+                    )
+                },
+            )
+            .when(has_frame && self.terminal_scrolled_back, |surface| {
+                surface.child(
+                    div()
+                        .id("terminal-jump-to-latest")
+                        .absolute()
+                        .right(px(theme::SPACING_MD))
+                        .bottom(px(theme::SPACING_MD))
+                        .h(px(36.0))
+                        .px_3()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(theme::border_default())
+                        .bg(theme::bg_card())
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::SPACING_XS))
+                        .text_size(theme::font_caption())
+                        .text_color(theme::text_secondary())
+                        .cursor_pointer()
+                        .active(|style| style.bg(theme::row_pressed_bg()))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.terminal_scrolled_back = false;
+                                this.scroll_terminal_to_bottom(cx);
+                            }),
+                        )
+                        .child(
+                            svg()
+                                .path("icons/arrow-to-top.svg")
+                                .size(px(theme::ICON_SM))
+                                .text_color(theme::text_secondary()),
+                        )
+                        .child(locale::text("Latest", "最新", "最新")),
+                )
+            })
             .child(
                 canvas(
                     move |bounds, _, cx| {
@@ -3464,9 +3914,13 @@ impl MobileWorkbench {
             })
             .when(!has_frame, |surface| {
                 surface.child(empty_label(if has_session {
-                    "No output yet"
+                    locale::text("No output yet", "暂无输出", "暫無輸出")
                 } else {
-                    "Select or create a terminal"
+                    locale::text(
+                        "Select or create a terminal",
+                        "选择或新建一个终端",
+                        "選擇或新建一個終端機",
+                    )
                 }))
             })
             .into_any_element()
@@ -3558,6 +4012,14 @@ impl Render for MobileWorkbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_inputs(window, cx);
         let surface = self.surface;
+        let changed_files = self.git.state.model.change_row_count();
+        let running_terminals = self
+            .terminal
+            .state
+            .sessions
+            .iter()
+            .filter(|session| session.status == TerminalStatus::Running)
+            .count();
         div()
             .size_full()
             .bg(theme::sidebar_bg())
@@ -3569,40 +4031,85 @@ impl Render for MobileWorkbench {
                     .flex_shrink_0()
                     .w_full()
                     .min_w_0()
-                    .h(px(theme::TOUCH_TARGET))
+                    .p(px(theme::SPACING_SM))
                     .border_b_1()
-                    .border_color(theme::border_default())
+                    .border_color(theme::border_subtle())
                     .flex()
                     .items_center()
+                    .gap(px(theme::SPACING_XS))
                     .children(WorkbenchSurface::ALL.into_iter().map(|candidate| {
+                        let selected = candidate == surface;
+                        let badge = match candidate {
+                            WorkbenchSurface::Git => changed_files,
+                            WorkbenchSurface::Terminal => running_terminals,
+                            WorkbenchSurface::Files => 0,
+                        };
                         div()
                             .id(format!("workbench-tab:{}", candidate.label()))
-                            .h_full()
+                            .h(px(40.0))
                             .min_w_0()
                             .flex_1()
-                            .px_3()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(if selected {
+                                theme::border_default()
+                            } else {
+                                gpui::transparent_black()
+                            })
+                            .bg(if selected {
+                                theme::bg_card()
+                            } else {
+                                gpui::transparent_black()
+                            })
                             .flex()
                             .items_center()
                             .justify_center()
-                            .border_b_1()
-                            .border_color(if candidate == surface {
-                                theme::accent_blue()
+                            .gap(px(theme::SPACING_XS))
+                            .text_size(theme::font_caption())
+                            .font_weight(if selected {
+                                FontWeight::SEMIBOLD
                             } else {
-                                theme::sidebar_bg()
+                                FontWeight::NORMAL
                             })
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(if candidate == surface {
+                            .text_color(if selected {
                                 theme::text_primary()
                             } else {
                                 theme::text_muted()
                             })
                             .cursor_pointer()
+                            .aria_label(candidate.localized_label())
                             .active(|style| style.bg(theme::row_pressed_bg()))
                             .on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| this.set_surface(candidate, cx)),
                             )
+                            .child(
+                                svg()
+                                    .path(candidate.icon())
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(if selected {
+                                        theme::text_primary()
+                                    } else {
+                                        theme::text_muted()
+                                    }),
+                            )
                             .child(candidate.localized_label())
+                            .when(badge > 0, |tab| {
+                                tab.child(
+                                    div()
+                                        .min_w(px(18.0))
+                                        .h(px(18.0))
+                                        .px(px(4.0))
+                                        .rounded_full()
+                                        .bg(theme::accent_blue().opacity(0.18))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(theme::font_micro())
+                                        .text_color(theme::accent_blue())
+                                        .child(badge.min(99).to_string()),
+                                )
+                            })
                     })),
             )
             .when_some(self.notice.clone(), |root, notice| {
@@ -3612,8 +4119,8 @@ impl Render for MobileWorkbench {
                         .px_3()
                         .py_2()
                         .bg(theme::bg_card_dim())
-                        .text_size(px(theme::FONT_CAPTION))
-                        .text_color(theme::accent_green())
+                        .text_size(theme::font_caption())
+                        .text_color(theme::accent_success())
                         .child(notice),
                 )
             })
@@ -3624,7 +4131,7 @@ impl Render for MobileWorkbench {
                         .px_3()
                         .py_2()
                         .bg(theme::bg_card_dim())
-                        .text_size(px(theme::FONT_CAPTION))
+                        .text_size(theme::font_caption())
                         .text_color(theme::accent_red())
                         .child(error.message),
                 )
@@ -3634,28 +4141,6 @@ impl Render for MobileWorkbench {
                 WorkbenchSurface::Git => self.render_git(cx),
                 WorkbenchSurface::Terminal => self.render_terminal(cx),
             }))
-            .child(
-                div()
-                    .absolute()
-                    .right(px(theme::SPACING_SM))
-                    .bottom(px(theme::SPACING_SM))
-                    .size(px(theme::TOUCH_TARGET))
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_card())
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::refresh_active_surface))
-                    .child(
-                        svg()
-                            .path("icons/refresh.svg")
-                            .size(px(theme::ICON_SM))
-                            .text_color(theme::text_secondary()),
-                    ),
-            )
     }
 }
 
@@ -3717,7 +4202,7 @@ fn icon_button(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
-        .size(px(30.0))
+        .size(px(theme::TOUCH_TARGET))
         .rounded(px(theme::RADIUS_CONTROL))
         .flex()
         .items_center()
@@ -3731,6 +4216,52 @@ fn icon_button(
                 .size(px(theme::ICON_SM))
                 .text_color(theme::text_secondary()),
         )
+}
+
+/// One key of the terminal modifier bar: a real 44px target, a latched
+/// appearance for ⌃/⌥, and no handler at all when the runtime cannot accept
+/// input (so a disabled chip never flashes a pressed state that does nothing).
+fn terminal_modifier_chip(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<gpui::SharedString>,
+    latched: bool,
+    enabled: bool,
+    handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .h(px(theme::TOUCH_TARGET))
+        .min_w(px(theme::TOUCH_TARGET))
+        .px_2()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(if latched {
+            theme::accent_blue()
+        } else {
+            theme::border_subtle()
+        })
+        .bg(if latched {
+            theme::accent_blue().opacity(0.16)
+        } else {
+            theme::bg_card()
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(theme::font_caption())
+        .text_color(if latched {
+            theme::accent_blue()
+        } else {
+            theme::text_secondary()
+        })
+        .when(enabled, |chip| {
+            chip.cursor_pointer()
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .on_mouse_up(MouseButton::Left, handler)
+        })
+        .when(!enabled, |chip| chip.opacity(0.45))
+        .child(label.into())
 }
 
 fn git_mode_tab(
@@ -3753,7 +4284,7 @@ fn git_mode_tab(
         } else {
             theme::workbench_bg()
         })
-        .text_size(px(theme::FONT_CAPTION))
+        .text_size(theme::font_caption())
         .text_color(if selected {
             theme::text_primary()
         } else {
@@ -3998,7 +4529,7 @@ fn action_button(id: impl Into<gpui::ElementId>, label: &'static str) -> gpui::S
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(theme::FONT_BODY))
+        .text_size(theme::font_body())
         .text_color(theme::text_secondary())
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
@@ -4019,7 +4550,7 @@ fn compact_action(
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(theme::FONT_MICRO))
+        .text_size(theme::font_micro())
         .text_color(theme::text_secondary())
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
@@ -4045,18 +4576,18 @@ fn section_heading(label: &'static str) -> gpui::Div {
         .px_3()
         .flex()
         .items_center()
-        .text_size(px(theme::FONT_CAPTION))
+        .text_size(theme::font_caption())
         .text_color(theme::text_muted())
         .child(locale::common(label))
 }
 
-fn empty_label(label: &'static str) -> gpui::Div {
+fn empty_label(label: &str) -> gpui::Div {
     div()
         .px_3()
         .py_4()
-        .text_size(px(theme::FONT_CAPTION))
+        .text_size(theme::font_caption())
         .text_color(theme::text_muted())
-        .child(locale::common(label))
+        .child(label.to_string())
 }
 
 fn file_status_label(status: FileEditorStatus) -> &'static str {
