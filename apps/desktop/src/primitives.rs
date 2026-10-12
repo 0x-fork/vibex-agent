@@ -48,10 +48,10 @@ pub struct PrimitiveContract {
 pub const FOUNDATION_PRIMITIVE_CONTRACTS: [PrimitiveContract; 11] = [
     PrimitiveContract {
         primitive: FoundationPrimitive::Notification,
-        backend: "gpui_component::notification::Notification",
+        backend: "crate::hint_layer::HintList",
         keyboard_navigation: true,
         focus_trap: false,
-        escape_dismiss: false,
+        escape_dismiss: true,
         outside_click: OutsideClickBehavior::NotApplicable,
         return_focus: false,
         disabled_state: true,

@@ -13,7 +13,7 @@ use gpui_component::{
     empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle},
     h_flex,
     input::{Input, InputEvent, InputState},
-    notification::Notification,
+    notification::NotificationType,
     pagination::Pagination,
     tab::{Tab, TabBar},
     tag::Tag,
@@ -39,7 +39,8 @@ use vibex_desktop_runtime::{
 
 use crate::{
     gpui_ext::{DOCS_REMOTE_MOBILE_URL, docs_help_button},
-    hint_layer, locale,
+    hint_layer::{self, hint_notification},
+    locale,
     spinner::Spinner,
     theme,
 };
@@ -4086,7 +4087,7 @@ impl RemoteAccessPairing {
     /// Announces the pending light hint on the notification layer.
     ///
     /// The hint answers an action the user just took, so it is shown through the
-    /// kit's `Notification` rather than a page banner: the banner sat in the
+    /// workbench's hint card rather than a page banner: the banner sat in the
     /// layout until the next action happened to clear it, and it pushed the
     /// connection list down while it was there.
     fn present_notice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4095,16 +4096,15 @@ impl RemoteAccessPairing {
         };
         window.defer(cx, move |window, cx| {
             Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
-            let notification = match notice.tone {
-                RemoteAccessNoticeTone::Success => Notification::success(notice.message),
-                RemoteAccessNoticeTone::Error => Notification::error(notice.message),
+            let tone = match notice.tone {
+                RemoteAccessNoticeTone::Success => NotificationType::Success,
+                RemoteAccessNoticeTone::Error => NotificationType::Error,
             };
             hint_layer::push(
                 window,
-                notification
+                hint_notification(tone, notice.message)
                     .id::<RemoteAccessNoticeNotification>()
-                    .autohide(true)
-                    .on_click(|_, _, _| {}),
+                    .autohide(true),
                 cx,
             );
         });
@@ -5046,11 +5046,9 @@ mod tests {
             .map(|(body, _)| body)
             .expect("pairing notice presenter should remain inspectable");
         assert!(presenter.contains("self.state.notice.take()"));
-        assert!(presenter.contains("Notification::success(notice.message)"));
-        assert!(presenter.contains("Notification::error(notice.message)"));
+        assert!(presenter.contains("hint_notification(tone, notice.message)"));
         assert!(presenter.contains(".id::<RemoteAccessNoticeNotification>()"));
         assert!(presenter.contains(".autohide(true)"));
-        assert!(presenter.contains(".on_click(|_, _, _| {})"));
         assert!(presenter.contains("Anchor::TopCenter"));
 
         let render = source

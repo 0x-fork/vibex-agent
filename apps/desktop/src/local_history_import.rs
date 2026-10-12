@@ -34,8 +34,7 @@ use vibex_desktop_runtime::DesktopRuntime;
 
 use crate::app::VibexWorkbench;
 use crate::assets::agent_brand_icon;
-use crate::gpui_ext::hint_notification;
-use crate::hint_layer;
+use crate::hint_layer::{self, hint_notification};
 use crate::locale::{self, ResolvedLocale};
 use crate::skeleton;
 use crate::spinner::Spinner;
@@ -1177,8 +1176,7 @@ impl LocalHistoryImportDialog {
                 window,
                 hint_notification(NotificationType::Error, message)
                     .id::<LocalHistoryImportErrorNotification>()
-                    .autohide(true)
-                    .on_click(|_, _, _| {}),
+                    .autohide(true),
                 cx,
             );
         });

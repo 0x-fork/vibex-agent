@@ -75,10 +75,9 @@ use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
 use crate::app::TITLE_BAR_HEIGHT;
 use crate::assets::agent_brand_icon;
 use crate::gpui_ext::{
-    SCROLLBAR_GUTTER, ScrollGutter as _, button_with_aria_label, hint_notification,
-    solid_empty_border,
+    SCROLLBAR_GUTTER, ScrollGutter as _, button_with_aria_label, solid_empty_border,
 };
-use crate::hint_layer;
+use crate::hint_layer::{self, hint_notification};
 use crate::locale::{self, ResolvedLocale};
 use crate::motion::hover_listener;
 use crate::resize_seam;
@@ -7449,8 +7448,7 @@ impl ManagementCenter {
                 window,
                 notification
                     .id::<ManagementCenterFeedbackNotification>()
-                    .autohide(true)
-                    .on_click(|_, _, _| {}),
+                    .autohide(true),
                 cx,
             );
         });
@@ -25556,7 +25554,7 @@ mod tests {
         assert!(presentation.contains("let agent_auth_error = self.agent_auth_error.take();"));
         assert!(presentation.contains(".id::<ManagementCenterFeedbackNotification>()"));
         assert!(presentation.contains(".autohide(true)"));
-        assert!(presentation.contains(".on_click(|_, _, _| {})"));
+        assert!(presentation.contains("hint_layer::push("));
 
         let renderer = source
             .split_once("impl Render for ManagementCenter {")

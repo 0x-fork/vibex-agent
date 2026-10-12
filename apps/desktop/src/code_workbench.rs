@@ -94,8 +94,8 @@ use crate::app::{VibexWorkbench, session_search_keyword_highlight, session_searc
 use crate::assets::{BUNDLED_SANS_FAMILY, agent_brand_icon, file_icon, open_tool_brand_icon};
 use crate::browser_surface::{BrowserSurface, BrowserSurfaceEvent, OrphanTextures};
 use crate::directory_picker::{DirectoryPickHandler, DirectoryPickerDialog};
-use crate::gpui_ext::{ScrollGutter as _, hint_notification, solid_empty_border};
-use crate::hint_layer;
+use crate::gpui_ext::{ScrollGutter as _, solid_empty_border};
+use crate::hint_layer::{self, hint_notification};
 use crate::locale;
 use crate::motion::{hover_blend, hover_listener};
 use crate::office_surface::OfficeSurface;
@@ -201,8 +201,7 @@ fn push_git_mutation_result_notice(kind: GitMutationKind, window: &mut Window, c
         window,
         hint_notification(NotificationType::Success, message)
             .id::<GitMutationNotification>()
-            .autohide(true)
-            .on_click(|_, _, _| {}),
+            .autohide(true),
         cx,
     );
 }
@@ -230,8 +229,7 @@ fn push_git_mutation_failure_notice(
             format!("{label}: {}", locale::localize_error_message(error)),
         )
         .id::<GitMutationNotification>()
-        .autohide(true)
-        .on_click(|_, _, _| {}),
+        .autohide(true),
         cx,
     );
     true
@@ -1943,8 +1941,7 @@ impl CodeWorkbench {
                     locale::localize_error_message(&error),
                 )
                 .id::<WorkbenchErrorNotification>()
-                .autohide(true)
-                .on_click(|_, _, _| {}),
+                .autohide(true),
                 cx,
             );
         });
@@ -21489,7 +21486,7 @@ mod tests {
                 hint_layer::list(window, cx)
                     .expect("the fixture window mounts the hint layer")
                     .read(cx)
-                    .notifications()
+                    .hints()
                     .len()
             })
         }
@@ -21558,7 +21555,7 @@ mod tests {
         assert!(presenter.contains("locale::localize_error_message(&error)"));
         assert!(presenter.contains(".id::<WorkbenchErrorNotification>()"));
         assert!(presenter.contains(".autohide(true)"));
-        assert!(presenter.contains(".on_click(|_, _, _| {})"));
+        assert!(presenter.contains("hint_layer::push("));
         assert!(presenter.contains("Anchor::TopCenter"));
     }
 

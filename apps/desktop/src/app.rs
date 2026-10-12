@@ -210,9 +210,9 @@ use crate::directory_picker::{
 };
 use crate::gpui_ext::{
     DOCS_SELF_HOSTED_SERVER_URL, ScrollGutter as _, button_with_aria_label, docs_help_button,
-    hint_notification, solid_empty_border,
+    solid_empty_border,
 };
-use crate::hint_layer;
+use crate::hint_layer::{self, hint_notification};
 use crate::image_editor::{
     ImageEditSession, ImageEditTool, apply_arrow, apply_brush, apply_circle, apply_crop,
     apply_mosaic, apply_rectangle, apply_text,
@@ -2568,8 +2568,7 @@ impl VibexWorkbench {
                 window,
                 hint_notification(NotificationType::Info, locale::localize_ui_message(&note))
                     .id::<PersistenceNotification>()
-                    .autohide(true)
-                    .on_click(|_, _, _| {}),
+                    .autohide(true),
                 cx,
             );
         });
@@ -2610,8 +2609,7 @@ impl VibexWorkbench {
                 window,
                 notification
                     .id::<SettingsOperationNotification>()
-                    .autohide(true)
-                    .on_click(|_, _, _| {}),
+                    .autohide(true),
                 cx,
             );
         });
@@ -2636,8 +2634,7 @@ impl VibexWorkbench {
                 window,
                 hint_notification(NotificationType::Error, locale::localize_ui_message(&error))
                     .id::<RuntimeRegistryNotification>()
-                    .autohide(true)
-                    .on_click(|_, _, _| {}),
+                    .autohide(true),
                 cx,
             );
         });
@@ -2663,8 +2660,7 @@ impl VibexWorkbench {
                     locale::localize_error_message(&error),
                 )
                 .id::<NewSessionErrorNotification>()
-                .autohide(true)
-                .on_click(|_, _, _| {}),
+                .autohide(true),
                 cx,
             );
         });
@@ -26989,8 +26985,7 @@ impl VibexWorkbench {
                     ambiguous_message_submission_notice(),
                 )
                 .id::<AmbiguousMessageSubmissionNotification>()
-                .autohide(true)
-                .on_click(|_, _, _| {}),
+                .autohide(true),
                 cx,
             );
         }
@@ -79972,7 +79967,6 @@ mod tests {
     use super::*;
     use crate::assets::{AgentBrandAsset, agent_brand_asset};
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
-    use gpui_component::notification::Notification;
     use vibex_core::{
         AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentId,
         AgentMessageDeltaPayload, AgentMessagePayload, ComputerPermissionReport,
@@ -91116,7 +91110,7 @@ mod tests {
         assert!(reconciliation.contains("ambiguous_message_submission_notice()"));
         assert!(reconciliation.contains(".id::<AmbiguousMessageSubmissionNotification>()"));
         assert!(reconciliation.contains(".autohide(true)"));
-        assert!(reconciliation.contains(".on_click(|_, _, _| {})"));
+        assert!(reconciliation.contains("hint_layer::push("));
 
         let renderer = source
             .split_once("    fn render_submission_statuses(")
@@ -91132,12 +91126,12 @@ mod tests {
     ///
     /// Since GPUI Kit 0.7.0 `Root` mounts the dialog and hint layers itself, so
     /// the probe only has to fill the window they cover.
-    struct NotificationLayerOrderProbe;
+    struct HintLayerOrderProbe;
 
-    impl Render for NotificationLayerOrderProbe {
+    impl Render for HintLayerOrderProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             v_flex()
-                .id("notification-layer-order-probe")
+                .id("hint-layer-order-probe")
                 .size_full()
                 .child(div().size_full().bg(gpui::black()))
         }
@@ -91157,12 +91151,31 @@ mod tests {
     /// priority holds. This asserts the hint's quad reaches the scene after the
     /// dialog body's quad, which is the paint order that keeps it readable.
     #[gpui::test]
-    fn the_notification_layer_paints_above_an_open_dialog(cx: &mut TestAppContext) {
+    fn the_hint_layer_paints_above_an_open_dialog(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         cx.update(hint_layer::init);
-        cx.update(|cx| Theme::global_mut(cx).notification.placement = Anchor::TopCenter);
+        cx.update(|cx| {
+            let theme = Theme::global_mut(cx);
+            theme.notification.placement = Anchor::TopCenter;
+            // The card paints the popover surface, so giving that token the
+            // probe's hue is what makes the hint's quad findable in the scene.
+            // The dialog behind it paints the background token instead.
+            theme.tokens.popover = Hsla {
+                h: 0.77,
+                s: 1.0,
+                l: 0.5,
+                a: 1.0,
+            }
+            .into();
+            // The card's enter animation is wall-clock driven, and a card still
+            // on its way in is culled above the viewport — where the paint order
+            // of its quad says nothing about what a reader sees. Reduced motion
+            // rests it where it belongs, so the scene holds the quads that can
+            // actually cover each other.
+            cx.set_reduce_motion(true);
+        });
         let (_, cx) = cx.add_window_view(|window, cx| {
-            let probe = cx.new(|_| NotificationLayerOrderProbe);
+            let probe = cx.new(|_| HintLayerOrderProbe);
             Root::new(probe, window, cx)
         });
 
@@ -91192,18 +91205,7 @@ mod tests {
         cx.update(|window, cx| {
             hint_layer::push(
                 window,
-                Notification::new().autohide(false).content(|_, _, _| {
-                    div()
-                        .w(px(160.0))
-                        .h(px(48.0))
-                        .bg(Hsla {
-                            h: 0.77,
-                            s: 1.0,
-                            l: 0.5,
-                            a: 1.0,
-                        })
-                        .into_any_element()
-                }),
+                hint_notification(NotificationType::Warning, "Paint order probe").autohide(false),
                 cx,
             );
         });
@@ -91287,11 +91289,7 @@ mod tests {
             window.focus(&anchor_focus, cx);
             hint_layer::push(
                 window,
-                hint_notification(NotificationType::Error, message)
-                    .autohide(false)
-                    // The workbench's dismissable hints carry this handler, and
-                    // it is what a press on the copy button must not trigger.
-                    .on_click(|_, _, _| {}),
+                hint_notification(NotificationType::Error, message).autohide(false),
                 cx,
             );
         });
@@ -91309,7 +91307,7 @@ mod tests {
             hint_layer::list(window, cx)
                 .expect("the hint layer should be mounted on the probe window")
                 .read(cx)
-                .notifications()
+                .hints()
                 .len()
         })
     }
@@ -91321,7 +91319,7 @@ mod tests {
         let message = "Could not save settings: permission denied";
         let (cx, anchor_focus) = hint_window(message, cx);
         let bounds = cx
-            .debug_bounds("hint-notification-copy")
+            .debug_bounds("hint-message-copy")
             .expect("the hint copy button should be laid out");
 
         cx.simulate_click(bounds.center(), Modifiers::none());
@@ -91356,7 +91354,7 @@ mod tests {
     fn a_click_on_a_hint_message_still_dismisses_it(cx: &mut TestAppContext) {
         let (cx, anchor_focus) = hint_window("Saved", cx);
         let bounds = cx
-            .debug_bounds("hint-notification-text")
+            .debug_bounds("hint-message-text")
             .expect("the hint message should be laid out");
 
         cx.simulate_click(bounds.center(), Modifiers::none());
@@ -91374,13 +91372,61 @@ mod tests {
         );
     }
 
-    /// The kit paints `Notification::message` as text no selection layer can
-    /// reach and offers no way to copy it, so a hint built with one of its tone
-    /// constructors shows a message the user cannot take out of the app. Every
-    /// hint in the workbench has to be built through `hint_notification`, which
-    /// carries the message together with the button that copies it.
+    /// The kit's close button used to be the card's only visible dismiss
+    /// affordance, in its top right corner. The card itself has taken that job,
+    /// so a press anywhere on it — including the trailing corner the × sat in —
+    /// has to dismiss the hint, with the copy button the one exception.
+    #[gpui::test]
+    fn a_click_on_the_card_corner_dismisses_the_hint(cx: &mut TestAppContext) {
+        let (cx, _) = hint_window("Saved", cx);
+        let bounds = cx
+            .debug_bounds("hint-card")
+            .expect("the hint card should be laid out");
+        // The trailing bottom corner: inside the card's own padding, clear of
+        // the copy button on the trailing edge's centre line.
+        let corner = gpui::point(bounds.right() - px(6.0), bounds.bottom() - px(6.0));
+
+        cx.simulate_click(corner, Modifiers::none());
+
+        cx.background_executor.advance_clock(HINT_DISMISS_SETTLE);
+        cx.run_until_parked();
+        assert_eq!(
+            mounted_hint_count(cx),
+            0,
+            "the card is the dismiss target, not just its message"
+        );
+    }
+
+    /// A hint that outlives its autohide — a failed session fork — has no
+    /// pointer to wait for, so the keyboard has to reach the same dismissal the
+    /// card offers: Tab onto the layer, Escape.
+    #[gpui::test]
+    fn escape_dismisses_the_front_hint(cx: &mut TestAppContext) {
+        let (cx, _) = hint_window("Saved", cx);
+        cx.update(|window, cx| {
+            window.blur(cx);
+            window.focus_next(cx);
+            let _ = window.draw(cx);
+        });
+
+        cx.simulate_keystrokes("escape");
+
+        cx.background_executor.advance_clock(HINT_DISMISS_SETTLE);
+        cx.run_until_parked();
+        assert_eq!(
+            mounted_hint_count(cx),
+            0,
+            "Escape dismisses the hint the keyboard is on"
+        );
+    }
+
+    /// A kit `Notification` is a sealed card: it paints the message as text no
+    /// selection layer can reach, offers no way to copy that text, and carries a
+    /// close button the hint layer does not want. Every hint therefore has to be
+    /// built through `hint_notification`, which renders the workbench's own card
+    /// — message, copy button, and a click anywhere else to dismiss.
     #[test]
-    fn every_light_hint_carries_a_copy_button() {
+    fn every_light_hint_is_built_on_the_workbench_card() {
         // This test names the constructors it rejects, so only the production
         // region of each file is inspected.
         let production = |source: &'static str| {
@@ -91392,15 +91438,27 @@ mod tests {
             ("app.rs", include_str!("app.rs")),
             ("code_workbench.rs", include_str!("code_workbench.rs")),
             ("management.rs", include_str!("management.rs")),
+            (
+                "local_history_import.rs",
+                include_str!("local_history_import.rs"),
+            ),
+            (
+                "remote_access_pairing.rs",
+                include_str!("remote_access_pairing.rs"),
+            ),
         ] {
             let source = production(source);
             for tone in ["info", "success", "warning", "error"] {
                 let constructor = format!("Notification::{tone}(");
                 assert!(
                     !source.contains(&constructor),
-                    "{path} builds a hint with {constructor}; build it with hint_notification so its message can be copied"
+                    "{path} builds a hint with {constructor}; build it with hint_notification so it gets the workbench's card"
                 );
             }
+            assert!(
+                !source.contains("Notification::"),
+                "{path} builds a hint on the kit's notification card; build it with hint_notification"
+            );
         }
     }
 
@@ -91418,7 +91476,7 @@ mod tests {
         assert!(presenter.contains("locale::localize_ui_message(&note)"));
         assert!(presenter.contains(".id::<PersistenceNotification>()"));
         assert!(presenter.contains(".autohide(true)"));
-        assert!(presenter.contains(".on_click(|_, _, _| {})"));
+        assert!(presenter.contains("hint_layer::push("));
         assert!(presenter.contains("Anchor::TopCenter"));
 
         let render = source
@@ -91447,7 +91505,7 @@ mod tests {
         assert!(presenter.contains("locale::localize_ui_message(&error)"));
         assert!(presenter.contains(".id::<RuntimeRegistryNotification>()"));
         assert!(presenter.contains(".autohide(true)"));
-        assert!(presenter.contains(".on_click(|_, _, _| {})"));
+        assert!(presenter.contains("hint_layer::push("));
         assert!(presenter.contains("Anchor::TopCenter"));
 
         // This test names the strip it rejects, so only the production region of
@@ -91482,7 +91540,7 @@ mod tests {
         assert!(presenter.contains("locale::localize_error_message(&error)"));
         assert!(presenter.contains(".id::<NewSessionErrorNotification>()"));
         assert!(presenter.contains(".autohide(true)"));
-        assert!(presenter.contains(".on_click(|_, _, _| {})"));
+        assert!(presenter.contains("hint_layer::push("));
         assert!(presenter.contains("Anchor::TopCenter"));
 
         let render = source
@@ -91515,7 +91573,7 @@ mod tests {
         assert!(presenter.contains("hint_notification("));
         assert!(presenter.contains(".id::<SettingsOperationNotification>()"));
         assert!(presenter.contains(".autohide(true)"));
-        assert!(presenter.contains(".on_click(|_, _, _| {})"));
+        assert!(presenter.contains("hint_layer::push("));
         assert!(presenter.contains("Anchor::TopCenter"));
 
         let render = source

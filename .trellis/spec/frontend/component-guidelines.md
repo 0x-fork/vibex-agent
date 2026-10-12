@@ -248,17 +248,16 @@ and the user has to tap the field before the keyboard appears.
 
 Transient feedback that answers an action the user just took — a link copied, a
 device paired, storage cleared, a setting rejected — is a light hint and must be
-shown through the kit's `Notification` on the workbench's hint layer
-(`hint_layer::push`). Do not hand-roll a banner, strip, or colored box in the
-page for it.
+shown on the workbench's hint layer (`hint_layer::push`). Do not hand-roll a
+banner, strip, or colored box in the page for it.
 
-The reasons are the ones the kit component already solves: the hint layer stacks
-above sheets and dialogs, it auto-hides, it is click-dismissable, and a hint
-pushed with the same `.id::<T>()` replaces the previous one instead of stacking
-duplicates. A page banner has none of that and needs the page to remember to
-clear it on the next action. That the hint clears a dialog backdrop is not free —
-it comes from the layer's deferred priority, so read "Overlay Layer Z-Order"
-before moving or re-mounting the layer.
+The reasons are the ones the layer already solves: the hint stacks above sheets
+and dialogs, it auto-hides, it is click-dismissable, and a hint pushed with the
+same `.id::<T>()` replaces the previous one instead of stacking duplicates. A
+page banner has none of that and needs the page to remember to clear it on the
+next action. That the hint clears a dialog backdrop is not free — it comes from
+the layer's deferred priority, so read "Overlay Layer Z-Order" before moving or
+re-mounting the layer.
 
 ```rust
 struct GitMutationNotification;
@@ -268,22 +267,21 @@ hint_layer::push(
     window,
     hint_notification(NotificationType::Success, message)
         .id::<GitMutationNotification>()
-        .autohide(true)
-        .on_click(|_, _, _| {}),
+        .autohide(true),
     cx,
 );
 ```
 
 Rules that keep the pattern consistent:
 
-- Build every hint through `gpui_ext::hint_notification`. It carries the
-  message together with one icon button that copies that message whole. A hint
-  built with `Notification::info` / `success` / `warning` / `error` instead
-  shows text the kit paints as plain, unselectable, uncopyable content —
-  including the error text the user most often needs to paste somewhere else.
-  The helper keeps tone, placement, autohide, and the replace-by-id contract on
-  the kit's component, and a source contract in `app.rs` rejects the raw tone
-  constructors so a new hint cannot regress to a message with no way out.
+- Build every hint through `hint_layer::hint_notification`. It carries the
+  message the card paints, and the card carries the one icon button that copies
+  that message whole. A hint built on the kit's `Notification` instead shows text
+  the kit paints as plain, unselectable, uncopyable content — including the error
+  text the user most often needs to paste somewhere else — and brings back the
+  close button the card deliberately does not have. A source contract in `app.rs`
+  rejects the kit's card in every file that raises hints, so a new hint cannot
+  regress to a message with no way out.
 - Set `Theme::global_mut(cx).notification.placement = Anchor::TopCenter` before
   pushing, and give each hint family its own private zero-sized id type so
   unrelated hints do not replace each other.
@@ -301,6 +299,31 @@ Rules that keep the pattern consistent:
   the notification layer is for results, not for pointing at the control that
   needs correcting.
 
+#### The hint card is the workbench's, not the kit's
+
+`hint_layer` owns the card as well as the layer. A kit `Notification` is sealed:
+it always paints a close button in its top right corner, revealed on hover, and
+dismisses on a click only when the caller opts in with `.on_click`. A hint is a
+message, not a form, so the workbench paints its own card — tone glyph, message,
+copy button — on the kit's toast stack and lifecycle
+(`gpui_base::{ToastManager, ToastStack}`), which keeps the enter and exit
+transitions, autohide, replace-by-id, and hover-pauses-the-countdown behavior.
+The card keeps the kit notification's geometry and elevation, and the manager's
+durations stay in step with the card's animation because the manager unmounts an
+ending hint on its own clock (`hint_motion`).
+
+- The whole card dismisses; there is no second close control. A middle click and
+  Escape do the same. Escape works while the keyboard is on the layer (the stack
+  is a tab stop and the copy button sits inside it), which is what keeps a hint
+  that outlives its autohide — a failed session fork — dismissable without a
+  pointer.
+- The card is a plain message with no hover-revealed affordance, so nothing has
+  to be discovered by pointing at it. Dismissal is never the only way out: the
+  card auto-hides unless the hint asked for `.autohide(false)`.
+- `.on_click` on a hint is what the press does *besides* dismissing — the
+  dev-server notice opens the browser panel that way. The card dismisses first so
+  the notice never outlives the answer to it.
+
 The copy button owns two interactions that a hint must not lose, and each one is
 covered by a test in `app.rs`:
 
@@ -310,11 +333,6 @@ covered by a test in `app.rs`:
 - A button takes focus on mouse down unless the press is prevented. The kit's
   `Button` prevents it, and the test pins that: copying a hint must leave the
   caret in whatever the user was typing at.
-
-The button is the hint's `action`, which the kit pairs with a disabled autohide
-because it expects an action to decide what happens next. A hint is still a
-hint, so `hint_notification` restores the kit's autohide default after setting
-the action and a caller's own `.autohide(false)` still wins.
 
 ### GPUI Post-Mutation Scroll Timing
 
@@ -356,7 +374,7 @@ Any overlay whose content must stay readable over a dialog — the workbench's
 top-centered hint layer, for example — therefore has to be deferred at a priority
 inside the band it belongs to. The workbench mounts its own as a root plugin:
 `apps/desktop/src/hint_layer.rs` registers a `gpui_base::RootPlugin` through
-`hint_layer::init`, hosts a kit `NotificationList`, and defers it at
+`hint_layer::init`, hosts its own hint list and card, and defers the list at
 `HINT_LAYER_PRIORITY` (99). Deliver hints with `hint_layer::push`, not
 `window.push_notification`, so they reach that layer instead of the inline one:
 

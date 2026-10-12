@@ -1,18 +1,16 @@
 use gpui::{
-    App, BorderStyle, ClipboardItem, InteractiveElement, Interactivity, IntoElement,
-    ParentElement as _, Pixels, RenderOnce, SharedString, StatefulInteractiveElement, Styled,
-    Window, WindowAppearance, div, px,
+    App, BorderStyle, InteractiveElement, Interactivity, IntoElement, ParentElement as _, Pixels,
+    RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window, WindowAppearance, px,
 };
 use gpui_base::Selectable;
 use gpui_component::{
-    Icon, IconName, Sizable as _,
+    Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     empty::Empty,
-    notification::{Notification, NotificationType},
 };
 use vibex_desktop_runtime::validate_external_open_url;
 
-use crate::{locale, platform::open_external_url};
+use crate::platform::open_external_url;
 
 /// An icon button that carries an accessible name.
 ///
@@ -117,68 +115,6 @@ pub const DOCS_REMOTE_MOBILE_URL: &str = "https://vibex.peatboy.com/docs/remote-
 const DOCS_HELP_ICON: &str = "icons/vibex/circle-question-mark.svg";
 const DOCS_HELP_BUTTON_SIZE: f32 = 24.0;
 const DOCS_HELP_GLYPH_SIZE: f32 = 14.0;
-
-/// Test hook for the laid-out message bounds.
-const HINT_TEXT_DEBUG_KEY: &str = "hint-notification-text";
-/// Element id of the copy button every hint carries.
-const HINT_COPY_BUTTON_ID: &str = "hint-copy-button";
-/// Test hook for the laid-out copy button.
-const HINT_COPY_DEBUG_KEY: &str = "hint-notification-copy";
-
-/// A light hint or error result on the notification layer that copies its whole
-/// message in one click.
-///
-/// The kit paints a notification's `message` as plain text that no selection
-/// layer can reach, and a drag across a line that is already fading is a poor
-/// way to ask for the error text a user most often needs to paste somewhere
-/// else. The message therefore travels as custom content, with one icon button
-/// beside it that puts the message on the clipboard whole.
-///
-/// The surface stays the kit's `Notification`: placement, tone, autohide, and
-/// the replace-by-id contract are unchanged.
-///
-/// The message is deliberately not also set through `Notification::message`,
-/// which would paint it a second time under the content. Every hint the
-/// workbench pushes is delivered in-app, so there is no system notification
-/// body that needs the plain string.
-pub fn hint_notification(tone: NotificationType, message: impl Into<SharedString>) -> Notification {
-    let message = message.into();
-    let copy_value = message.clone();
-    let copy_label = locale::text("Copy message", "复制消息", "複製訊息");
-    Notification::new()
-        .with_type(tone)
-        .content(move |_, _, _| {
-            div()
-                .text_sm()
-                .w_full()
-                .min_w_0()
-                .debug_selector(|| HINT_TEXT_DEBUG_KEY.to_string())
-                .child(message.clone())
-                .into_any_element()
-        })
-        .action(move |_, _, _| {
-            let copy_value = copy_value.clone();
-            Button::new(HINT_COPY_BUTTON_ID)
-                .ghost()
-                .flex_none()
-                .icon(IconName::Copy)
-                .debug_selector(|| HINT_COPY_DEBUG_KEY.to_string())
-                .accessibility_label(copy_label)
-                .tooltip(copy_label)
-                .on_click(move |_, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(copy_value.to_string()));
-                    // Clicking the card dismisses the hint, and a copy is not a
-                    // decision to close it: the click stops at the button so
-                    // the message stays on screen to be read or copied again.
-                    cx.stop_propagation();
-                })
-        })
-        // The kit keeps an action toast open because it expects the action to
-        // decide what happens next. A hint is still a hint and keeps the
-        // lifetime its caller asked for, so the default is restored here and a
-        // caller's `.autohide(false)` still wins.
-        .autohide(true)
-}
 
 /// A quiet, icon-only help button that opens one documentation page.
 ///

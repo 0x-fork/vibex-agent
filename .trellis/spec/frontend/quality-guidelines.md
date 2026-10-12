@@ -503,9 +503,11 @@ A phone shows one narrow column of content, so a notice never takes a line in a
 page's layout. Every notice the mobile client raises — a failed operation, a
 rename or an added project, a connection that dropped, a reconnect that gave up
 — is a toast on the window's notification layer, delivered by
-`toast::push`. The surface is the kit's `Notification` on the same layer the
-desktop workbench uses, so tone, autohide, and replace-by-id behave identically
-on both clients; only where it lands differs.
+`toast::push`. Tone, autohide, and replace-by-id behave exactly as they do on the
+desktop client's hint layer; only the card and where it lands differ. Mobile
+still paints the kit's `Notification`, which is what a touch client wants — the
+close button a pointer reveals on hover is not reachable without one — while the
+desktop card is the workbench's own, with no close control at all.
 
 - Nothing is painted from notice state. `MobileApp` queues notices in
   `pending_hints` and hands them to the layer once per frame, because the paths
