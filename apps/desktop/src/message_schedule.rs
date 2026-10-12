@@ -4,6 +4,9 @@
 use super::*;
 use chrono::{Local, NaiveDateTime, TimeZone as _};
 use gpui::InteractiveElement as _;
+// The popover answers Enter and Space with its own confirm action; the panel
+// claims it while it is open.
+use gpui_base::actions::Confirm as PopoverConfirm;
 use gpui_component::{
     calendar::{Calendar, CalendarEvent, CalendarState, Date},
     input::Enter as InputEnter,
@@ -429,26 +432,48 @@ type MessageScheduleApply = Rc<dyn Fn(Option<MessageSchedule>, &mut Window, &mut
 /// Closes the popover the panel is rendered in.
 type MessageScheduleDismiss = Rc<dyn Fn(&mut Window, &mut App)>;
 
+/// Validates the editor and applies the schedule it holds. Closing is the
+/// workbench's answer rather than a decision of this panel's own: a value it
+/// rejected keeps the surface open with the error it produced.
+fn confirm_message_schedule(
+    view: &Entity<MessageScheduleEditorView>,
+    apply: &MessageScheduleApply,
+    dismiss: &MessageScheduleDismiss,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(schedule) = view.update(cx, |view, cx| view.validate(cx)) else {
+        return;
+    };
+    if apply(Some(schedule), window, cx) {
+        dismiss(window, cx);
+    }
+}
+
 /// One schedule editor plus the two decisions it offers.
 ///
 /// Confirming validates the editor and applies the result; clearing voids the
 /// schedule the panel is showing and keeps the message. Both close the surface
-/// only after the workbench accepted the value.
+/// only after the workbench accepted the value. The Confirm button, Enter in a
+/// countdown field and Enter in the time field all reach that one commit.
 fn render_message_schedule_panel(
     view: Entity<MessageScheduleEditorView>,
     clearable: bool,
     apply: MessageScheduleApply,
     dismiss: MessageScheduleDismiss,
 ) -> AnyElement {
-    let confirm_view = view.clone();
-    let confirm = apply.clone();
-    let confirm_dismiss = dismiss.clone();
+    let click_view = view.clone();
+    let click_apply = apply.clone();
+    let click_dismiss = dismiss.clone();
     let clear_view = view.clone();
-    let clear = apply;
+    let clear_apply = apply;
     let clear_dismiss = dismiss.clone();
-    let enter_view = view.clone();
-    let enter = confirm.clone();
-    let enter_dismiss = confirm_dismiss.clone();
+    let field_view = view.clone();
+    let field_apply = click_apply.clone();
+    let field_dismiss = click_dismiss.clone();
+    let time_view = view.clone();
+    let time_apply = click_apply.clone();
+    let time_dismiss = click_dismiss.clone();
     v_flex()
         .id("message-schedule-panel")
         .w(gpui::rems(MESSAGE_SCHEDULE_PANEL_REM))
@@ -474,7 +499,7 @@ fn render_message_schedule_panel(
                                     view.error = None;
                                     cx.notify();
                                 });
-                                if clear(None, window, cx) {
+                                if clear_apply(None, window, cx) {
                                     clear_dismiss(window, cx);
                                 }
                             }),
@@ -488,14 +513,13 @@ fn render_message_schedule_panel(
                         .primary()
                         .label(locale::text("Confirm", "确认", "確認"))
                         .on_click(move |_, window, cx| {
-                            let Some(schedule) =
-                                confirm_view.update(cx, |view, cx| view.validate(cx))
-                            else {
-                                return;
-                            };
-                            if confirm(Some(schedule), window, cx) {
-                                confirm_dismiss(window, cx);
-                            }
+                            confirm_message_schedule(
+                                &click_view,
+                                &click_apply,
+                                &click_dismiss,
+                                window,
+                                cx,
+                            );
                         }),
                 ),
         )
@@ -506,12 +530,18 @@ fn render_message_schedule_panel(
             // the focused field's own path and stops the action before the
             // Composer's own Enter handling can see it.
             cx.stop_propagation();
-            let Some(schedule) = enter_view.update(cx, |view, cx| view.validate(cx)) else {
-                return;
-            };
-            if enter(Some(schedule), window, cx) {
-                enter_dismiss(window, cx);
-            }
+            confirm_message_schedule(&field_view, &field_apply, &field_dismiss, window, cx);
+        })
+        .on_action(move |_: &PopoverConfirm, window, cx| {
+            // The time field is a segmented editor rather than an `Input`, so
+            // it never answers Enter with `input::Enter`. What the keystroke
+            // becomes instead is the popover's own confirm action, which only
+            // closes the surface and drops the deadline being edited. This
+            // panel is what that gesture is confirming, so it claims the action
+            // and turns it into the same commit; the countdown fields never
+            // reach it because they take the handler above first.
+            cx.stop_propagation();
+            confirm_message_schedule(&time_view, &time_apply, &time_dismiss, window, cx);
         })
         .into_any_element()
 }

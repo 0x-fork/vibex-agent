@@ -532,6 +532,80 @@ fn schedule_popover_keeps_invalid_input_and_confirms_from_the_keyboard(cx: &mut 
     assert_eq!(closed.get(), 4);
 }
 
+/// The absolute editor has no single-line field to answer Enter, so the time
+/// field's keystroke has to reach the same decision the Confirm button makes.
+/// Handing it to the popover instead would close the surface and quietly drop
+/// the time the reader just typed.
+#[gpui::test]
+fn schedule_panel_confirms_from_the_time_field_with_enter(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let results = Rc::new(RefCell::new(Vec::new()));
+    let closed = Rc::new(Cell::new(0));
+    let clearable = Rc::new(Cell::new(false));
+    let mut host = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|_| SchedulePopoverHost {
+            results: results.clone(),
+            closed: closed.clone(),
+            clearable: clearable.clone(),
+            editor: None,
+        });
+        host = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let host = host.unwrap();
+    draw_frames(cx);
+    let trigger = cx.debug_bounds("open-schedule").unwrap();
+    cx.simulate_click(trigger.center(), Modifiers::none());
+    draw_frames(cx);
+    let date_tab = cx.debug_bounds("schedule-date-mode").unwrap();
+    cx.simulate_click(date_tab.center(), Modifiers::none());
+    draw_frames(cx);
+    let view = host.read_with(cx, |host, _| {
+        host.editor
+            .as_ref()
+            .expect("the popover owns an editor while it is open")
+            .view
+            .clone()
+    });
+    assert!(!view.read_with(cx, |view, _| view.countdown));
+    // Point the calendar and the time at a deadline the editor cannot have
+    // guessed, then leave the keyboard in the time field, which is where the
+    // absolute editor starts the reader.
+    let date = Local::now().date_naive() + chrono::Days::new(2);
+    let time = chrono::NaiveTime::from_hms_opt(9, 30, 15).unwrap();
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.calendar.update(cx, |calendar, cx| {
+                calendar.set_date(Date::Single(Some(date)), window, cx);
+            });
+            view.time_field.update(cx, |field, cx| {
+                field.set_time(time, window, cx);
+            });
+            view.focus_initial(window, cx);
+        });
+    });
+    draw_frames(cx);
+    cx.update(|window, cx| {
+        assert!(
+            view.read(cx)
+                .time_field
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window),
+            "the time field is the keyboard this test presses Enter on"
+        );
+    });
+    cx.simulate_keystrokes("enter");
+    draw_frames(cx);
+    let deadline = local_deadline(NaiveDateTime::new(date, time)).unwrap();
+    assert_eq!(*results.borrow(), vec![Some(MessageSchedule::At(deadline))]);
+    assert_eq!(closed.get(), 1, "confirming closes the popover");
+}
+
 /// The schedule surface is the smallest one that fits the decision: a popover
 /// anchored to the clock button, not the modal dialog it replaced. The panel
 /// takes the inline calendar's own width — seven `size_7` day columns and their
