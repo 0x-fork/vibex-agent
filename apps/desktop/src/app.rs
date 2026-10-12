@@ -17370,6 +17370,17 @@ impl VibexWorkbench {
                 .is_some_and(|selected| selected.as_str() == session_id)
     }
 
+    /// The row of the session the workbench shows, when one is on screen.
+    ///
+    /// That row wears the selected wash while a move selection exists without
+    /// being in the clicked set, so every click that extends the selection has
+    /// to be able to reach it.
+    fn sidebar_current_session_item(&self) -> Option<SidebarOrganizationItem> {
+        self.selected_session_id
+            .as_ref()
+            .map(|session_id| SidebarOrganizationItem::Session(session_id.as_str().to_string()))
+    }
+
     /// The rows a move acts on, in a stable order.
     ///
     /// This is the shift/ctrl selection plus the current session's row while a
@@ -17382,12 +17393,10 @@ impl VibexWorkbench {
             .cloned()
             .collect::<Vec<_>>();
         if self.sidebar_move_selection_is_active()
-            && let Some(selected) = self.selected_session_id.as_ref()
+            && let Some(item) = self.sidebar_current_session_item()
+            && !items.contains(&item)
         {
-            let item = SidebarOrganizationItem::Session(selected.as_str().to_string());
-            if !items.contains(&item) {
-                items.push(item);
-            }
+            items.push(item);
         }
         items
     }
@@ -17564,13 +17573,20 @@ impl VibexWorkbench {
     /// target of every command the menu offers. `None` keeps the per-session menu
     /// for a right click on a row outside it, so a batch command never appears
     /// for a selection the user cannot see.
+    ///
+    /// The test reads the whole painted selection rather than the clicked set:
+    /// the current session's row joins it while a selection is on screen, and
+    /// counting the clicked set alone left a selection of two rows without the
+    /// batch commands the drag badge says it carries.
     fn sidebar_batch_selection(
         &mut self,
         primary: &SidebarOrganizationItem,
     ) -> Option<Rc<SidebarSelectionSlice>> {
-        if self.sidebar_move_selected_items.len() < 2
-            || !self.sidebar_move_selected_items.contains(primary)
-        {
+        if !self.sidebar_row_is_move_selected(primary) {
+            return None;
+        }
+        self.refresh_sidebar_selection_index();
+        if self.sidebar_selection_index.effective_members.len() < 2 {
             return None;
         }
         let slice = self.sidebar_selection_slice(primary);
@@ -17630,54 +17646,52 @@ impl VibexWorkbench {
         } else {
             (Rc::new(Vec::new()), BTreeMap::new())
         };
-        if shift {
-            let anchor = self.sidebar_move_selection_anchor.clone();
-            let compatible = anchor.as_ref().is_some_and(|anchor| {
-                self.sidebar_move_selection_scope_matches(&project_scopes, anchor, &item)
-            });
-            if !compatible {
-                self.sidebar_move_selected_items.clear();
-                self.sidebar_move_selected_items.insert(item.clone());
-                self.sidebar_move_selection_anchor = Some(item);
-            } else if let Some(anchor) = anchor {
-                let order = self.sidebar_move_selection_order(&item, &groups, &project_scopes);
-                let Some(anchor_index) = order.iter().position(|candidate| candidate == &anchor)
-                else {
-                    self.sidebar_move_selected_items.clear();
-                    self.sidebar_move_selected_items.insert(item.clone());
-                    self.sidebar_move_selection_anchor = Some(item);
-                    cx.notify();
-                    return selection_only;
-                };
-                let Some(item_index) = order.iter().position(|candidate| candidate == &item) else {
-                    return selection_only;
-                };
-                if !toggle {
-                    self.sidebar_move_selected_items.clear();
-                }
-                let range = if anchor_index <= item_index {
-                    &order[anchor_index..=item_index]
-                } else {
-                    &order[item_index..=anchor_index]
-                };
-                self.sidebar_move_selected_items
-                    .extend(range.iter().cloned());
-            }
-        } else if toggle {
-            if self.sidebar_move_selected_items.iter().any(|selected| {
-                !self.sidebar_move_selection_scope_matches(&project_scopes, selected, &item)
-            }) {
-                self.sidebar_move_selected_items.clear();
-            }
-            if !self.sidebar_move_selected_items.remove(&item) {
-                self.sidebar_move_selected_items.insert(item.clone());
-            }
-            self.sidebar_move_selection_anchor = Some(item);
-        } else {
-            self.sidebar_move_selected_items.clear();
-            self.sidebar_move_selected_items.insert(item.clone());
-            self.sidebar_move_selection_anchor = Some(item);
+        // The rows the sidebar paints are the rows a click extends, so the
+        // current session's row joins the clicked set: it wears the same wash
+        // while a selection is on screen, and a click that read the set alone
+        // left it out of the range and out of the row menus' count.
+        let mut selected = self.sidebar_move_selected_items.clone();
+        if selection_only && let Some(current) = self.sidebar_current_session_item() {
+            selected.insert(current);
         }
+        // A ctrl click that reaches outside the scope the selection shares starts
+        // a new one rather than holding rows a batch cannot cover.
+        if toggle
+            && !shift
+            && selected.iter().any(|candidate| {
+                !self.sidebar_move_selection_scope_matches(&project_scopes, candidate, &item)
+            })
+        {
+            selected.clear();
+        }
+        // A shift range starts where the last click left the anchor, and at the
+        // row the sidebar shows as selected while no click has set one: a plain
+        // click selects its row and then navigates to it, and the navigation
+        // drops the anchor the click had just written.
+        let anchor = self
+            .sidebar_move_selection_anchor
+            .clone()
+            .or_else(|| self.sidebar_current_session_item());
+        let compatible = anchor.as_ref().is_some_and(|anchor| {
+            self.sidebar_move_selection_scope_matches(&project_scopes, anchor, &item)
+        });
+        // Only a range that can span its anchor needs the sidebar order.
+        let order = if shift && compatible {
+            self.sidebar_move_selection_order(&item, &groups, &project_scopes)
+        } else {
+            Vec::new()
+        };
+        let update = sidebar_move_selection_after_click(
+            selected,
+            &item,
+            anchor.as_ref(),
+            &order,
+            shift,
+            toggle,
+            compatible,
+        );
+        self.sidebar_move_selected_items = update.items;
+        self.sidebar_move_selection_anchor = update.anchor;
         cx.notify();
         selection_only
     }
@@ -64788,6 +64802,80 @@ fn sidebar_drag_count_badge(count: usize, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// What one click leaves selected in the sidebar's multi-selection.
+#[derive(Debug, PartialEq, Eq)]
+struct SidebarMoveSelectionUpdate {
+    /// The rows the clicked set holds after the click.
+    items: BTreeSet<SidebarOrganizationItem>,
+    /// The row a following shift range extends from.
+    anchor: Option<SidebarOrganizationItem>,
+}
+
+/// Resolves one click of a sidebar row against the rows the sidebar paints.
+///
+/// The painted set is the clicked set plus the current session's row, which
+/// wears the same wash while a selection is on screen. Reading the clicked set
+/// alone left that row out of the two gestures that need it: a shift range
+/// started nowhere and collapsed to the row just clicked — the rows between it
+/// and the row the user saw selected stayed unselected — and a row menu counted
+/// one session less than the selection on screen.
+///
+/// A click without a modifier replaces the selection outright, a shift click
+/// replaces it with the range its anchor and the clicked row span, and a ctrl
+/// click toggles the clicked row. Shift and ctrl together keep the selection and
+/// add the range to it. `order` is the sidebar order the clicked row belongs to,
+/// and `compatible` says the anchor may form one selection with that row.
+fn sidebar_move_selection_after_click(
+    mut selected: BTreeSet<SidebarOrganizationItem>,
+    item: &SidebarOrganizationItem,
+    anchor: Option<&SidebarOrganizationItem>,
+    order: &[SidebarOrganizationItem],
+    shift: bool,
+    toggle: bool,
+    compatible: bool,
+) -> SidebarMoveSelectionUpdate {
+    if shift {
+        let range = anchor.filter(|_| compatible).and_then(|anchor| {
+            let anchor_index = order.iter().position(|candidate| candidate == anchor)?;
+            let item_index = order.iter().position(|candidate| candidate == item)?;
+            Some((
+                anchor.clone(),
+                anchor_index.min(item_index),
+                anchor_index.max(item_index),
+            ))
+        });
+        let Some((anchor, first, last)) = range else {
+            // A click that cannot span a range stands for its own row, and that
+            // row becomes the anchor the next range starts from.
+            return SidebarMoveSelectionUpdate {
+                items: BTreeSet::from([item.clone()]),
+                anchor: Some(item.clone()),
+            };
+        };
+        if !toggle {
+            selected.clear();
+        }
+        selected.extend(order[first..=last].iter().cloned());
+        SidebarMoveSelectionUpdate {
+            items: selected,
+            anchor: Some(anchor),
+        }
+    } else if toggle {
+        if !selected.remove(item) {
+            selected.insert(item.clone());
+        }
+        SidebarMoveSelectionUpdate {
+            items: selected,
+            anchor: Some(item.clone()),
+        }
+    } else {
+        SidebarMoveSelectionUpdate {
+            items: BTreeSet::from([item.clone()]),
+            anchor: Some(item.clone()),
+        }
+    }
+}
+
 /// Whether two sidebar rows may be moved together.
 ///
 /// Only the project has to agree: a move is a placement inside one project, and
@@ -102398,6 +102486,136 @@ mod tests {
         assert!(
             !reconcile.contains("self.workspaces\n                .iter()\n                .find("),
             "the migration must index workspaces instead of rescanning them per session"
+        );
+    }
+
+    fn sidebar_selection_rows(ids: &[&str]) -> BTreeSet<SidebarOrganizationItem> {
+        ids.iter()
+            .map(|id| SidebarOrganizationItem::Session((*id).to_string()))
+            .collect()
+    }
+
+    /// A shift click spans every row between the one the user sees selected and
+    /// the one it landed on, and it leaves that first row as the anchor the next
+    /// range starts from.
+    #[test]
+    fn a_shift_click_selects_the_whole_range_its_anchor_spans() {
+        let rows = ["a", "b", "c", "d"].map(|id| SidebarOrganizationItem::Session(id.to_string()));
+
+        let update = sidebar_move_selection_after_click(
+            sidebar_selection_rows(&["a"]),
+            &rows[3],
+            Some(&rows[0]),
+            &rows,
+            true,
+            false,
+            true,
+        );
+        assert_eq!(update.items, sidebar_selection_rows(&["a", "b", "c", "d"]));
+        assert_eq!(update.anchor, Some(rows[0].clone()));
+
+        // The clicked row alone when there is no row to span a range from.
+        let update = sidebar_move_selection_after_click(
+            BTreeSet::new(),
+            &rows[3],
+            None,
+            &rows,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(update.items, sidebar_selection_rows(&["d"]));
+        assert_eq!(update.anchor, Some(rows[3].clone()));
+    }
+
+    /// A ctrl click toggles one row of the selection the sidebar paints, so the
+    /// two rows a user sees are the two a batch command acts on, and shift with
+    /// ctrl adds the range instead of replacing what is selected.
+    #[test]
+    fn a_ctrl_click_toggles_the_row_inside_the_painted_selection() {
+        let rows = ["a", "b", "c"].map(|id| SidebarOrganizationItem::Session(id.to_string()));
+
+        let update = sidebar_move_selection_after_click(
+            sidebar_selection_rows(&["a"]),
+            &rows[1],
+            Some(&rows[1]),
+            &[],
+            false,
+            true,
+            true,
+        );
+        assert_eq!(update.items, sidebar_selection_rows(&["a", "b"]));
+        assert_eq!(update.anchor, Some(rows[1].clone()));
+
+        let update = sidebar_move_selection_after_click(
+            sidebar_selection_rows(&["a", "b"]),
+            &rows[1],
+            Some(&rows[1]),
+            &[],
+            false,
+            true,
+            true,
+        );
+        assert_eq!(update.items, sidebar_selection_rows(&["a"]));
+
+        let update = sidebar_move_selection_after_click(
+            sidebar_selection_rows(&["c"]),
+            &rows[1],
+            Some(&rows[0]),
+            &rows,
+            true,
+            true,
+            true,
+        );
+        assert_eq!(update.items, sidebar_selection_rows(&["a", "b", "c"]));
+
+        // A click with no modifier replaces the selection outright.
+        let update = sidebar_move_selection_after_click(
+            sidebar_selection_rows(&["a", "b"]),
+            &rows[2],
+            Some(&rows[2]),
+            &rows,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(update.items, sidebar_selection_rows(&["c"]));
+        assert_eq!(update.anchor, Some(rows[2].clone()));
+    }
+
+    /// The clicks that extend the selection read the rows the sidebar paints,
+    /// not the clicked set alone: the current session's row wears the same wash
+    /// without being in the set, and a plain click navigates to its row, which
+    /// drops the anchor that click had just written.
+    #[test]
+    fn the_click_handlers_extend_the_painted_selection() {
+        let source = include_str!("app.rs");
+        let update = source
+            .split_once("    fn update_sidebar_move_selection(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn clear_sidebar_move_selection("))
+            .map(|(body, _)| body)
+            .expect("the click handler should remain inspectable");
+        assert!(update.contains("self.sidebar_current_session_item()"));
+        assert!(update.contains("let mut selected = self.sidebar_move_selected_items.clone();"));
+        assert!(update.contains(".or_else(|| self.sidebar_current_session_item())"));
+        assert!(update.contains("sidebar_move_selection_after_click("));
+        assert!(
+            update.contains("self.sidebar_move_selection_order(&item, &groups, &project_scopes)")
+        );
+
+        let batch = source
+            .split_once("    fn sidebar_batch_selection(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Every session row's move scope"))
+            .map(|(body, _)| body)
+            .expect("the batch gate should remain inspectable");
+        assert!(batch.contains("self.sidebar_row_is_move_selected(primary)"));
+        assert!(batch.contains("self.sidebar_selection_index.effective_members.len() < 2"));
+        assert!(!batch.contains("sidebar_move_selected_items.len() < 2"));
+
+        assert!(
+            source.contains(
+                "fn sidebar_current_session_item(&self) -> Option<SidebarOrganizationItem>"
+            )
         );
     }
 }
