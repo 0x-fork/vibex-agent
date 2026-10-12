@@ -87,7 +87,11 @@ pub fn restore_terminal() {
         LeaveAlternateScreen,
         crossterm::cursor::Show,
         DisableMouseCapture,
-        DisableBracketedPaste
+        DisableBracketedPaste,
+        // Focus reporting is what tells the notifier whether the reader is
+        // looking at the session in front of them; the program that gets the
+        // terminal back must not keep receiving those reports.
+        crossterm::event::DisableFocusChange
     );
     let _ = stdout.flush();
     // `stderr` comes back last: whatever is printed after the screen is
@@ -146,6 +150,10 @@ impl TerminalGuard {
                 EnterAlternateScreen,
                 EnableMouseCapture,
                 EnableBracketedPaste,
+                // Asked for with the screen: a terminal that does not implement
+                // focus reporting ignores the sequence, and the notifier treats
+                // the missing answer as "assume the reader is at the terminal".
+                crossterm::event::EnableFocusChange,
                 crossterm::cursor::Hide
             )?;
             stdout.flush()
@@ -347,6 +355,24 @@ pub fn copy_to_clipboard(text: &str) -> BackendResult<()> {
         .write_all(sequence.as_bytes())
         .and_then(|()| stdout.flush())
         .map_err(|error| BackendError::failed("tui_clipboard_unavailable", error.to_string()))
+}
+
+/// Write control bytes the notification layer built.
+///
+/// The bytes are already a complete sequence (see [`crate::notify`]); this is
+/// the one door they leave through, so the frame's own writer stays the only
+/// thing that knows about the frame. It is called by the run loop after a draw,
+/// never from inside one: a sequence injected between two of the frame's writes
+/// would land in the middle of a row.
+pub fn write_control(bytes: &[u8]) -> BackendResult<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let mut stdout = io::stdout();
+    stdout
+        .write_all(bytes)
+        .and_then(|()| stdout.flush())
+        .map_err(|error| BackendError::failed("tui_notification_unavailable", error.to_string()))
 }
 
 /// How long a clipboard helper may take before it is killed.

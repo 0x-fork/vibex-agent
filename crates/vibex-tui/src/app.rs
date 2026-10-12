@@ -976,6 +976,10 @@ pub struct App {
     /// already receives, pruned to the sessions the list still holds, so it
     /// costs the runtime nothing.
     pub session_echoes: BTreeMap<String, String>,
+    /// What the terminal is told when a session needs the reader and the reader
+    /// is not looking at it. The bytes are queued here and written by the run
+    /// loop after the frame, so no reducer ever touches the terminal.
+    pub notify: crate::notify::Notifier,
     /// A transient message above the composer, dismissed on the next key.
     pub banner: Option<Banner>,
     /// When the running turn started, for the elapsed-time readout.
@@ -1540,6 +1544,7 @@ impl App {
             pending_send_serial: 0,
             unread_sessions: std::collections::BTreeSet::new(),
             session_echoes: BTreeMap::new(),
+            notify: crate::notify::Notifier::new(),
             banner: None,
             turn_started: None,
             turn_readout: crate::turn::TurnReadout::default(),
@@ -2365,7 +2370,7 @@ impl App {
     }
 
     /// The directory the interface's own files live in.
-    fn interface_home() -> Option<std::path::PathBuf> {
+    pub(crate) fn interface_home() -> Option<std::path::PathBuf> {
         if let Ok(explicit) = std::env::var("VIBEX_TUI_HOME")
             && !explicit.trim().is_empty()
         {

@@ -146,6 +146,13 @@ fn event_loop(
                         app.resize(columns, rows);
                         dirty = true;
                     }
+                    // The notifier is told whether the reader is at the
+                    // terminal; it decides whether a session in front of them
+                    // still has to be announced. A terminal that never reports
+                    // focus sends neither event, and the client keeps assuming
+                    // the reader is there.
+                    Event::FocusGained => app.set_terminal_focused(true),
+                    Event::FocusLost => app.set_terminal_focused(false),
                     Event::Paste(text) => {
                         if app.search_composing() {
                             if let Some(search) = app.search.as_mut() {
@@ -309,6 +316,16 @@ fn event_loop(
                 .map_err(|error| BackendError::failed("tui_render_failed", error.to_string()))?;
             last_frame = Instant::now();
             dirty = false;
+        }
+
+        // ---- notifications ------------------------------------------------
+        // Out-of-band escapes are written after the frame, never inside it: the
+        // frame owns the buffer, and a control sequence injected between two of
+        // its writes would land in the middle of a row. A queued notification
+        // is reason enough to write even when nothing repainted.
+        let notifications = app.take_terminal_notifications();
+        if !notifications.is_empty() {
+            crate::terminal::write_control(&notifications)?;
         }
 
         if app.should_quit {
@@ -2283,6 +2300,10 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             Err(error) => app.toast(Toast::danger(error.message)),
         },
         AppMessage::Event(event) => {
+            // Read for notification before the controller sees it: a background
+            // session's failure is dropped as stale there, and it is exactly
+            // the event the reader is not at the terminal to see.
+            app.observe_notification_event(&event);
             if app.dock_open
                 && !app.team_busy
                 && let Some(effect) = app.load_team(false)

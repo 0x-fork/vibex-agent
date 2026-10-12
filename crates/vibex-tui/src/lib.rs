@@ -21,6 +21,7 @@
 //! layout    the screen as a vertical stack of full-width bands
 //! glyphs    the chrome glyph vocabulary, with per-terminal fallbacks
 //! modal     the one chrome every popup is drawn through
+//! notify    what the terminal is told when a session needs the reader
 //! onboarding what to do first, in order, until it is done
 //! composer  the edit buffer, completion triggers and history
 //! search    transcript search: regex with smart case
@@ -52,6 +53,7 @@ pub mod locale;
 pub mod logo;
 pub mod markdown;
 pub mod modal;
+pub mod notify;
 pub mod onboarding;
 pub mod reduce;
 pub mod run;

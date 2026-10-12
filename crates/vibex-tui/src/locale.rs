@@ -153,6 +153,24 @@ strings! {
     time_hours => { "h", "小时", "小時" },
     time_days => { "d", "天", "天" },
     session_untitled => { "untitled session", "未命名会话", "未命名工作階段" },
+    // The one line a terminal notification carries. It names what happened,
+    // never what was said: the notification layer prepends the Agent's name so
+    // a reader with several sessions knows which one to come back to.
+    notify_turn_failed => {
+        "Agent turn failed",
+        "Agent 回合执行失败",
+        "Agent 回合執行失敗"
+    },
+    notify_needs_input => {
+        "Agent needs your confirmation",
+        "Agent 需要你确认内容",
+        "Agent 需要你確認內容"
+    },
+    notify_turn_completed => {
+        "Agent completed work",
+        "Agent 已完成工作",
+        "Agent 已完成工作"
+    },
     workspace_switch_hint => { "Ctrl+W change", "Ctrl+W 切换", "Ctrl+W 切換" },
     session_open => { "Open", "打开", "開啟" },
     session_rename => { "Rename", "重命名", "重新命名" },
