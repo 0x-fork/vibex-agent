@@ -4414,6 +4414,57 @@ impl App {
         }
     }
 
+    /// Re-read what one write that has just landed changed.
+    ///
+    /// A write is answered with an acknowledgement, not with the record it
+    /// produced: the authority is what decides what a record now looks like,
+    /// and a client that patched its own copy would be guessing at the parts
+    /// of the record the request did not carry. Every key the worker reports a
+    /// completed write under therefore ends here, and the key decides what is
+    /// read again — a reader should never have to press `Ctrl+R` to see the
+    /// change they just made.
+    ///
+    /// The reads are the ones the surface on screen is drawn from, so a write
+    /// that happens to be about something else costs nothing. Keys with
+    /// nothing to re-read — a permission answer, a steer — fall through:
+    /// their record arrives as an event rather than as a write's answer.
+    pub fn refresh_after_mutation(&mut self, key: &str) -> Outcome {
+        match key {
+            // A session's title and its membership of the list are the list's
+            // to draw, and the list is the sidebar of every page.
+            "rename_session" | "archive_session" | "unarchive_session" | "delete_session" => {
+                Outcome::effects(self.session_page_effects())
+            }
+            // Records the management surfaces draw. Which read answers one is
+            // the area on screen: the same write is a row in whichever
+            // collection the reader is looking at.
+            "toggle_entry" | "install_agent" | "uninstall_agent" | "logout_agent"
+            | "update_entry" | "rename_profile" | "select_profile" | "provider_secret" => {
+                Outcome::effects(self.management_record_effects())
+            }
+            "revoke_device" => Outcome::effects(vec![Effect::ListDevices]),
+            _ => Outcome::quiet(),
+        }
+    }
+
+    /// The reads that redraw whichever management area is on screen.
+    ///
+    /// A record is only ever drawn by the area that shows it, so re-reading
+    /// that area is what makes a write visible; the other areas read again when
+    /// the reader walks to them.
+    fn management_record_effects(&mut self) -> Vec<Effect> {
+        match self.page {
+            Page::Management => self.config_section_effects(),
+            Page::Agents => vec![Effect::ListAgents],
+            Page::Providers => vec![Effect::ListProfiles],
+            Page::Mcp => vec![Effect::ListMcp],
+            Page::Skills => vec![Effect::ListSkills],
+            Page::Prompts => vec![Effect::ListPrompts],
+            Page::Devices => vec![Effect::ListDevices],
+            _ => vec![],
+        }
+    }
+
     fn toggle_selected_entry(&mut self) -> Outcome {
         if self.page == Page::Management {
             return self.toggle_config_entry();
@@ -7709,5 +7760,111 @@ mod tests {
                 .and_then(|working| working.reasoning_effort.clone()),
             None
         );
+    }
+
+    /// The read one effect represents, which is what a refresh is judged by.
+    fn read_keys(outcome: &Outcome) -> Vec<&'static str> {
+        outcome.effects.iter().map(|effect| effect.key()).collect()
+    }
+
+    #[test]
+    fn a_completed_session_write_re_reads_the_list() {
+        // The list is the sidebar of every page, so a session's own writes are
+        // read back wherever the reader is. Without this a rename, an archive
+        // or a delete stayed on screen as the row it used to be until the
+        // reader pressed `Ctrl+R`.
+        for key in [
+            "rename_session",
+            "archive_session",
+            "unarchive_session",
+            "delete_session",
+        ] {
+            let mut app = capable_app();
+            // Deliberately not the list page: the sidebar is drawn from the
+            // same list on the Agent page, and it must not go stale there.
+            app.page = Page::Agent;
+            let outcome = app.refresh_after_mutation(key);
+            assert_eq!(
+                read_keys(&outcome),
+                vec!["sessions", "workspaces", "sidebar_organization"],
+                "{key} did not re-read the list"
+            );
+        }
+    }
+
+    #[test]
+    fn a_completed_management_write_re_reads_the_area_on_screen() {
+        // A record is only ever drawn by the area that shows it, so the write
+        // is followed by the read that area makes.
+        let cases = [
+            (
+                crate::config_center::ConfigModule::Agent,
+                crate::config_center::ConfigSection::Agents,
+                "install_agent",
+                "agents",
+            ),
+            (
+                crate::config_center::ConfigModule::Agent,
+                crate::config_center::ConfigSection::Providers,
+                "select_profile",
+                "profiles",
+            ),
+            (
+                crate::config_center::ConfigModule::Mcp,
+                crate::config_center::ConfigSection::Servers,
+                "toggle_entry",
+                "mcp",
+            ),
+            (
+                crate::config_center::ConfigModule::Skills,
+                crate::config_center::ConfigSection::Installed,
+                "toggle_entry",
+                "skills",
+            ),
+            (
+                crate::config_center::ConfigModule::Prompts,
+                crate::config_center::ConfigSection::Prompts,
+                "toggle_entry",
+                "prompts",
+            ),
+        ];
+        for (module, section, key, read) in cases {
+            let mut app = capable_app();
+            app.show_config_module(module, Some(section));
+            let outcome = app.refresh_after_mutation(key);
+            assert!(
+                read_keys(&outcome).contains(&read),
+                "{key} on {} did not re-read {read}: {:?}",
+                section.key(),
+                read_keys(&outcome)
+            );
+        }
+
+        // A device list is not a configuration record, and its write is
+        // answered by the read its own page makes.
+        let mut app = capable_app();
+        app.navigate_to(Page::Devices);
+        let outcome = app.refresh_after_mutation("revoke_device");
+        assert_eq!(read_keys(&outcome), vec!["devices"]);
+    }
+
+    #[test]
+    fn a_write_with_nothing_to_re_read_stays_quiet() {
+        // An approval answer, a steer, an interrupt: the record they change
+        // arrives as an event, so a read here would only ask the runtime to say
+        // again what it is already saying.
+        for key in [
+            "resolve_permission",
+            "resolve_elicitation",
+            "interrupt",
+            "continue_turn",
+            "steer_message",
+        ] {
+            let mut app = capable_app();
+            assert!(
+                app.refresh_after_mutation(key).effects.is_empty(),
+                "{key} asked for a read it does not need"
+            );
+        }
     }
 }

@@ -1964,6 +1964,9 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         }
         AppMessage::Mutation { key, result } => {
             app.pending.remove(&key);
+            // The write is over either way, so the row stops saying it is
+            // working. A failure says why below; it does not leave a spinner.
+            app.config_center.finish_pending(&key);
             match result {
                 Ok(()) => {
                     if key == "resolve_permission" {
@@ -1986,10 +1989,12 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                         let message = app.strings.runtime_switching().to_string();
                         app.toast(Toast::info(message));
                     }
-                    if key == "revoke_device" || key == "delete_session" {
-                        let outcome = app.perform(crate::action::Intent::Refresh);
-                        dispatch_refresh(app, outcome);
-                    }
+                    // A write is only half the story: every record on screen
+                    // is the one from before it. Re-read what the write
+                    // changed, so what the reader just did is what they see
+                    // rather than what a later `Ctrl+R` would have shown.
+                    let outcome = app.refresh_after_mutation(&key);
+                    dispatch_all(worker, &outcome);
                 }
                 Err(error) => {
                     // A failed mutation rolls the optimistic UI back and says
@@ -2013,7 +2018,7 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 Ok(summary) => {
                     app.workspace_path = Some(summary.workspace.root_path.clone());
                     let outcome = app.perform(crate::action::Intent::NewSession);
-                    dispatch_refresh(app, outcome);
+                    dispatch_all(worker, &outcome);
                 }
                 Err(error) => app.toast(Toast::danger(error.message)),
             }
@@ -2360,10 +2365,6 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         worker.dispatch(effect);
     }
     Ok(())
-}
-
-fn dispatch_refresh(app: &mut App, outcome: Outcome) {
-    let _ = (app, outcome);
 }
 
 /// Build a prompt overlay for the given field. Used by the composition root for
@@ -4618,6 +4619,90 @@ mod tests {
         assert_eq!(
             app.page_runtime_selection().unwrap().agent_id.as_str(),
             "deepseek-harness"
+        );
+    }
+
+    #[test]
+    fn a_completed_write_stops_saying_it_is_working() {
+        // The row wears "working" while the write is in flight. Only the
+        // write's own answer can take it off again, and nothing else said the
+        // write was over: the marker outlived the change it described.
+        let (worker, _messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+        let mut app = test_app(120, 32);
+        app.config_center.begin_pending("mcp:filesystem", "delete");
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Mutation {
+                key: "mcp:filesystem".to_string(),
+                result: Ok(()),
+            },
+        )
+        .unwrap();
+        assert!(!app.config_center.is_pending("mcp:filesystem"));
+
+        // A refusal is an answer too: the reader is told why, and the row is
+        // not left spinning over a record that did not change.
+        let mut app = test_app(120, 32);
+        app.config_center.begin_pending("mcp:filesystem", "delete");
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Mutation {
+                key: "mcp:filesystem".to_string(),
+                result: Err(vibex_backend::BackendError::failed("test", "refused")),
+            },
+        )
+        .unwrap();
+        assert!(!app.config_center.is_pending("mcp:filesystem"));
+        assert!(app.toast.is_some(), "the refusal was silent");
+    }
+
+    #[test]
+    fn a_completed_write_asks_the_authority_to_say_what_changed() {
+        // The write's answer carries an acknowledgement rather than the record
+        // it produced, so the client has to read the area again. The read is
+        // what the worker is handed here; its answer is what the next frame
+        // draws instead of the record from before the write.
+        let (worker, mut messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+        let mut app = test_app(120, 32);
+        app.show_config_module(
+            crate::config_center::ConfigModule::Agent,
+            Some(crate::config_center::ConfigSection::Agents),
+        );
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Mutation {
+                key: "uninstall_agent".to_string(),
+                result: Ok(()),
+            },
+        )
+        .unwrap();
+
+        // The roster read is asked for even though the backend behind it has
+        // nothing to say: the request, not its answer, is what was missing.
+        let observer = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let read = observer.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match messages.recv().await {
+                        Some(AppMessage::Agents(_)) => break,
+                        Some(_) => continue,
+                        None => panic!("the worker stopped"),
+                    }
+                }
+            })
+            .await
+        });
+        assert!(
+            read.is_ok(),
+            "the completed write did not re-read the area it changed"
         );
     }
 }
