@@ -154,8 +154,8 @@ use vibex_desktop_model::{
     SESSION_GROUP_SPLIT_SCALE, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode,
     SessionGroupLayout, SessionGroupPane, SessionGroupSplitPosition, SessionGroupUiState,
     SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome, SidebarMutationRejection,
-    SidebarOrganizationItem, SidebarOrganizationScope, SidebarOrganizationView,
-    SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
+    SidebarOrganizationItem, SidebarOrganizationScope, SidebarOrganizationState,
+    SidebarOrganizationView, SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
     SidebarProjectProjection, SidebarState, SidebarUiState, SidebarWorkspaceProjection,
     StartupDestination, TerminalWorkingDirectory, ThemeMode as ModelThemeMode,
     ThrottledUiStateWriter, TimelineConversationTurn, TimelineDelegationProjection,
@@ -8427,6 +8427,14 @@ pub struct VibexWorkbench {
     sidebar_move_selection_anchor: Option<SidebarOrganizationItem>,
     /// The shift/ctrl multi-selection resolved for the rows of one frame.
     sidebar_selection_index: SidebarSelectionIndex,
+    /// The sessions each folder's batch checkbox governs, keyed by folder id.
+    ///
+    /// Resolved once for the sidebar pass that paints the rows, the way
+    /// [`Self::sidebar_selection_index`] is: every checkbox of one frame asks
+    /// the same tree, so walking it per painted folder would make the frame
+    /// cost scale with the tree times the number of folders. The map is empty
+    /// outside batch mode, where no checkbox asks for it.
+    sidebar_folder_batch_ids: BTreeMap<String, Vec<String>>,
     sidebar_rename_target: Option<SidebarRenameTarget>,
     sidebar_rename_error: Option<String>,
     sidebar_project_drag_state: Option<SidebarProjectDragState>,
@@ -9879,6 +9887,7 @@ impl VibexWorkbench {
             sidebar_move_selected_items: BTreeSet::new(),
             sidebar_move_selection_anchor: None,
             sidebar_selection_index: SidebarSelectionIndex::default(),
+            sidebar_folder_batch_ids: BTreeMap::new(),
             sidebar_rename_target: None,
             sidebar_rename_error: None,
             sidebar_project_drag_state: None,
@@ -17716,7 +17725,14 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    fn toggle_project_batch_sessions(&mut self, session_ids: Vec<String>, cx: &mut Context<Self>) {
+    /// Checks or unchecks one container's checkbox — a project row's or a
+    /// folder row's — over every session that container governs.
+    ///
+    /// One click is all-or-nothing: a partial selection counts as unchecked, so
+    /// the first click completes it and the second clears it. Anything already
+    /// selected outside the container is left alone, which is what lets a
+    /// reader build a selection out of several folders.
+    fn toggle_batch_sessions(&mut self, session_ids: Vec<String>, cx: &mut Context<Self>) {
         let all_selected = !session_ids.is_empty()
             && session_ids
                 .iter()
@@ -39874,6 +39890,14 @@ impl VibexWorkbench {
         // painted, so it belongs to this pass: the next one resolves the
         // selection again against whatever changed in between.
         self.sidebar_selection_index = SidebarSelectionIndex::default();
+        // Folder checkboxes are the one thing this pass needs from the
+        // organization tree before any row paints, and only batch mode shows
+        // them; every other pass keeps the map empty.
+        self.sidebar_folder_batch_ids = if self.sidebar_batch_mode {
+            sidebar_folder_batch_ids(&self.ui_state.sidebar.organization, &self.sessions)
+        } else {
+            BTreeMap::new()
+        };
         let strings = self.strings();
         let groups = self.sidebar_workspace_groups("");
         let reorder_enabled = !self.sidebar_batch_mode;
@@ -43429,6 +43453,17 @@ impl VibexWorkbench {
             .folder(&folder_id)
             .is_some_and(|folder| folder.project_id.is_some());
         let new_session_folder_id = folder_id.clone();
+        // The folder's checkbox speaks for everything the folder shows, and its
+        // state is the selection the batch bar already holds. Both are resolved
+        // for the whole pass in [`Self::sidebar_folder_batch_ids`].
+        let folder_batch_ids = self
+            .sidebar_folder_batch_ids
+            .get(&folder_id)
+            .cloned()
+            .unwrap_or_default();
+        let folder_has_sessions = !folder_batch_ids.is_empty();
+        let folder_batch_state =
+            sidebar_selection_state(&folder_batch_ids, &self.sidebar_state.selected_ids);
         let rename_error = renaming
             .then(|| self.sidebar_rename_error.clone())
             .flatten();
@@ -43698,6 +43733,9 @@ impl VibexWorkbench {
                     } else {
                         0.0
                     }))
+                    // The checkbox sits in the column the session rows share,
+                    // so the folder icon yields the same leading strip they do.
+                    .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
                     .child(
                         h_flex()
                             .size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))
@@ -43842,7 +43880,27 @@ impl VibexWorkbench {
                                 )
                             }),
                     ),
-            );
+            )
+            .when(self.sidebar_batch_mode, |this| {
+                this.child(
+                    div()
+                        .id(format!("sidebar-folder-select-{folder_id}"))
+                        .absolute()
+                        .left_2()
+                        .top(px(9.0))
+                        .cursor_pointer()
+                        .when(!folder_has_sessions, |this| {
+                            this.opacity(0.35).cursor_not_allowed()
+                        })
+                        .child(sidebar_selection_indicator(folder_batch_state, cx))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if !folder_batch_ids.is_empty() {
+                                this.toggle_batch_sessions(folder_batch_ids.clone(), cx);
+                            }
+                        })),
+                )
+            });
 
         v_flex()
             .id(format!("sidebar-folder-{folder_id}"))
@@ -44458,7 +44516,7 @@ impl VibexWorkbench {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             if !batch_ids.is_empty() {
-                                this.toggle_project_batch_sessions(batch_ids.clone(), cx);
+                                this.toggle_batch_sessions(batch_ids.clone(), cx);
                             }
                         })),
                 )
@@ -64774,6 +64832,103 @@ fn sidebar_selection_state(
     } else {
         SidebarSelectionState::Indeterminate
     }
+}
+
+/// The sessions each folder's batch checkbox governs, keyed by folder id.
+///
+/// A folder governs every session it shows, at any depth: the sessions filed
+/// directly under it, the ones filed under its nested folders, and the members
+/// of the groups it holds. A root folder also holds projects, and a project
+/// paints its own sessions inside whatever holds it, so those sessions belong
+/// to the root folder as well. A session that a group shows is filed where the
+/// *group* is placed, because that is the row it renders under; its own
+/// placement is stale once the group owns it.
+///
+/// Only sessions the sidebar knows are listed: a delegated child is painted
+/// under its parent's row and has no placement of its own, exactly as the
+/// project checkbox treats it.
+fn sidebar_folder_batch_ids(
+    organization: &SidebarOrganizationState,
+    sessions: &[AgentSession],
+) -> BTreeMap<String, Vec<String>> {
+    let mut batches = organization
+        .folders
+        .keys()
+        .map(|folder_id| (folder_id.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<String, BTreeSet<String>>>();
+    if batches.is_empty() {
+        return BTreeMap::new();
+    }
+
+    // Every item reaches its parent folder through this map, so a session's
+    // containing folders are one walk up the tree instead of a scan per level.
+    let mut parents = BTreeMap::<SidebarOrganizationItem, Option<String>>::new();
+    for placement in &organization.placements {
+        parents.insert(placement.item.clone(), placement.parent_folder_id.clone());
+    }
+    // A group answers for its members: the group row is where they render.
+    let mut session_groups = BTreeMap::<&str, &str>::new();
+    for (group_id, group) in &organization.groups {
+        for session_id in &group.member_session_ids {
+            session_groups.insert(session_id.as_str(), group_id.as_str());
+        }
+    }
+
+    fn file_under_folders(
+        session_id: &str,
+        owner_folder_id: Option<&str>,
+        parents: &BTreeMap<SidebarOrganizationItem, Option<String>>,
+        batches: &mut BTreeMap<String, BTreeSet<String>>,
+    ) {
+        let mut current = owner_folder_id.map(str::to_string);
+        let mut seen = BTreeSet::new();
+        while let Some(folder_id) = current {
+            if !seen.insert(folder_id.clone()) {
+                return;
+            }
+            if let Some(governed) = batches.get_mut(&folder_id) {
+                governed.insert(session_id.to_string());
+            }
+            current = parents
+                .get(&SidebarOrganizationItem::Folder(folder_id))
+                .cloned()
+                .flatten();
+        }
+    }
+
+    for session in sessions {
+        let session_id = session.id.as_str();
+        let owner = match session_groups.get(session_id) {
+            Some(group_id) => parents
+                .get(&SidebarOrganizationItem::Group((*group_id).to_string()))
+                .cloned()
+                .flatten(),
+            None => parents
+                .get(&SidebarOrganizationItem::Session(session_id.to_string()))
+                .cloned()
+                .flatten(),
+        };
+        file_under_folders(session_id, owner.as_deref(), &parents, &mut batches);
+        // A root folder holds projects rather than sessions, and a project
+        // paints every session it owns inside its holder.
+        let project_holder = parents
+            .get(&SidebarOrganizationItem::Project(
+                session.project_id.as_str().to_string(),
+            ))
+            .cloned()
+            .flatten();
+        file_under_folders(
+            session_id,
+            project_holder.as_deref(),
+            &parents,
+            &mut batches,
+        );
+    }
+
+    batches
+        .into_iter()
+        .map(|(folder_id, governed)| (folder_id, governed.into_iter().collect()))
+        .collect()
 }
 
 fn sidebar_project_is_active(
@@ -88121,6 +88276,131 @@ mod tests {
         assert!(filing.contains("is_none_or(|workspace_id| workspace_id == session_workspace_id)"));
         assert!(filing.contains("collapsed_folder_ids"));
         assert!(source.contains("self.new_session_folder_id = None;\n        self.new_session_workspace.reset_after_success();"));
+    }
+
+    /// A folder's batch checkbox speaks for everything the folder shows: the
+    /// sessions filed at any depth, the members of the groups it holds, and —
+    /// for a root folder — every session of the projects inside it. A session
+    /// filed outside the folder stays out, so the checkbox never reaches past
+    /// the rows the reader can see under it.
+    #[test]
+    fn folder_batch_checkbox_governs_every_session_the_folder_shows() {
+        fn session(session_id: &str, project_id: &str) -> AgentSession {
+            AgentSession {
+                id: VibexSessionId::parse(session_id).expect("session id"),
+                title: session_id.into(),
+                project_id: ProjectId::parse(project_id).expect("project id"),
+                workspace_id: WorkspaceId::new(),
+                workspace_root: "/tmp/vibex-folder-batch".into(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                agent_id: AgentId::parse("codex").unwrap(),
+                state: AgentSessionState::Idle,
+                safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: 1,
+                updated_at_ms: 2,
+                last_message_at_ms: 2,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            }
+        }
+
+        let sessions = vec![
+            session("session_a", "project_a"),
+            session("session_b", "project_a"),
+            session("session_c", "project_a"),
+            session("session_d", "project_a"),
+            session("session_e", "project_b"),
+        ];
+        let session_projects = sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id.as_str().to_string(),
+                    session.project_id.as_str().to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut organization = SidebarOrganizationState::default();
+        assert!(organization.create_folder("outer", "Outer", Some("project_a".into()), None));
+        assert!(organization.create_folder(
+            "inner",
+            "Inner",
+            Some("project_a".into()),
+            Some("outer".into())
+        ));
+        assert!(organization.create_folder("root", "Root", None, None));
+        assert!(organization.place_into_folder(
+            &SidebarOrganizationItem::Session("session_a".into()),
+            "outer",
+            &session_projects
+        ));
+        assert!(organization.place_into_folder(
+            &SidebarOrganizationItem::Session("session_b".into()),
+            "inner",
+            &session_projects
+        ));
+        // A group answers for its members: session_c renders under the group
+        // row, which sits in the inner folder, wherever its own placement went.
+        assert!(organization.create_group(
+            "group-a",
+            "Group A",
+            "project_a",
+            "workspace-a",
+            &["session_c".to_string()],
+            &BTreeMap::from([("session_c".to_string(), "workspace-a".to_string())]),
+            Some("inner".into()),
+        ));
+        // session_d stays at the project root, which no folder holds.
+        assert!(organization.place_into_folder(
+            &SidebarOrganizationItem::Project("project_b".into()),
+            "root",
+            &session_projects
+        ));
+
+        let batches = sidebar_folder_batch_ids(&organization, &sessions);
+        let governed = |folder_id: &str| batches.get(folder_id).cloned().unwrap_or_default();
+        assert_eq!(governed("outer"), ["session_a", "session_b", "session_c"]);
+        assert_eq!(governed("inner"), ["session_b", "session_c"]);
+        assert_eq!(governed("root"), ["session_e"]);
+        assert_eq!(batches.len(), 3);
+    }
+
+    /// A folder row carries the checkbox a project row does, in the same
+    /// column, and one click checks or clears every session the folder governs
+    /// without collapsing the row it sits on.
+    #[test]
+    fn folder_rows_carry_the_batch_checkbox_that_governs_their_sessions() {
+        let source = include_str!("app.rs");
+        let folder = source
+            .split_once("    fn render_sidebar_folder(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
+            .map(|(body, _)| body)
+            .expect("folder renderer should remain inspectable");
+
+        // The containers share one toggle, and the folder resolves the sessions
+        // it governs once per pass instead of walking the tree per row.
+        assert!(source.contains("fn sidebar_folder_batch_ids("));
+        assert!(!source.contains(concat!("fn toggle_project_", "batch_sessions(")));
+        assert!(source.contains("fn toggle_batch_sessions("));
+        assert!(source.contains(
+            "self.sidebar_folder_batch_ids = if self.sidebar_batch_mode {\n            sidebar_folder_batch_ids(&self.ui_state.sidebar.organization, &self.sessions)"
+        ));
+
+        assert!(folder.contains("sidebar_selection_state(&folder_batch_ids"));
+        assert!(folder.contains(".when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())"));
+        assert!(folder.contains(".id(format!(\"sidebar-folder-select-{folder_id}\"))"));
+        assert!(folder.contains(
+            ".absolute()\n                        .left_2()\n                        .top(px(9.0))"
+        ));
+        assert!(folder.contains("sidebar_selection_indicator(folder_batch_state, cx)"));
+        assert!(folder.contains("this.toggle_batch_sessions(folder_batch_ids.clone(), cx);"));
+        // The row's own click expands the folder, so the checkbox has to stop
+        // the click at the control.
+        assert!(folder.contains("cx.stop_propagation();"));
+        // A folder with nothing under it paints a disabled box rather than one
+        // that would select nothing.
+        assert!(folder.contains("this.opacity(0.35).cursor_not_allowed()"));
     }
 
     #[test]
