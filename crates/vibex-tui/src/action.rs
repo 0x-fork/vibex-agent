@@ -118,6 +118,7 @@ intents! {
     QueueMoveUp => { scope: Agent, id: "queue_move_up", label: "Queue raise", help: "Send the queued message one turn earlier." },
     QueueMoveDown => { scope: Agent, id: "queue_move_down", label: "Queue lower", help: "Send the queued message one turn later." },
     QueueSendNow => { scope: Agent, id: "queue_send_now", label: "Send now", help: "Interrupt the turn and send the queued message immediately." },
+    ScheduleMessage => { scope: Agent, id: "message_schedule", label: "Schedule", help: "Give the draft a send time; until the clock reaches it the message waits in the queue." },
     SearchNext => { scope: Agent, id: "search_next", label: "Next match", help: "Jump to the next match, wrapping at the end." },
     SearchPrevious => { scope: Agent, id: "search_previous", label: "Prev match", help: "Jump to the previous match, wrapping at the start." },
 
@@ -157,6 +158,7 @@ intents! {
     OverlayNextField => { scope: Overlay, id: "overlay_next_field", label: "Next field", help: "Move to the next form field." },
     OverlayPreviousField => { scope: Overlay, id: "overlay_prev_field", label: "Prev field", help: "Move to the previous form field." },
     OverlayToggleValue => { scope: Overlay, id: "overlay_toggle", label: "Toggle", help: "Flip a boolean field or a multi-select option." },
+    ScheduleClear => { scope: Overlay, id: "schedule_clear", label: "Clear", help: "Void the draft's send time and keep the message." },
     PaletteRun => { scope: Overlay, id: "palette_run", label: "Run", help: "Run the highlighted command." },
 
     // ---- the runtime switcher -------------------------------------------
@@ -309,6 +311,7 @@ impl Intent {
                 | Intent::QueueDeleteSelected
                 | Intent::QueueMoveUp
                 | Intent::QueueMoveDown
+                | Intent::ScheduleMessage
                 | Intent::CopyBlockBody
                 | Intent::CopyBlockMetadata
                 | Intent::OpenBlockDetails

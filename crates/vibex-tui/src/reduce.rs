@@ -746,6 +746,7 @@ impl App {
                 });
                 Outcome::effects(effects)
             }
+            Intent::ScheduleMessage => self.open_message_schedule(),
             Intent::AttachImage => Outcome::effects(vec![Effect::ReadClipboard {
                 ticket: self.composer_ticket(),
                 wanted: ClipboardWanted::Image,
@@ -1064,7 +1065,10 @@ impl App {
             | Intent::OverlayFoldClosed
             | Intent::StarRuntimeModel
             | Intent::ManageRuntimeAccount
-            | Intent::ResetRunOption => Outcome::quiet(),
+            | Intent::ResetRunOption
+            // The schedule editor's own key. With no editor open there is no
+            // send time in front of the reader to void.
+            | Intent::ScheduleClear => Outcome::quiet(),
         }
     }
 
@@ -1771,6 +1775,120 @@ impl App {
         }
     }
 
+    /// Mount the schedule editor on the Composer in front of the reader.
+    ///
+    /// The value the draft already carries is what the editor opens on, so a
+    /// reader who came back to change the hour does not have to type the whole
+    /// deadline again — and a draft with no schedule opens on the deadline
+    /// someone who has not decided yet almost always means.
+    fn open_message_schedule(&mut self) -> Outcome {
+        let Some(target) = self.composer_target.clone() else {
+            return Outcome::quiet();
+        };
+        let initial = self.draft_schedule();
+        let now_ms = vibex_core::unix_timestamp_ms();
+        self.overlay = Some(Overlay::Schedule(
+            crate::schedule::MessageScheduleForm::new(target, initial, now_ms),
+        ));
+        Outcome::effects(vec![])
+    }
+
+    /// The schedule editor's own keys.
+    ///
+    /// A form is a small state machine: `Enter` on the mode row flips it,
+    /// `Enter` on a text row commits the whole thing, and `←`/`→` are the value
+    /// keys every other form in this client draws — which for a two-valued
+    /// shape means the other one.
+    fn perform_schedule(
+        &mut self,
+        intent: Intent,
+        form: crate::schedule::MessageScheduleForm,
+    ) -> Outcome {
+        use crate::schedule::ScheduleField;
+        let mut form = form;
+        match intent {
+            Intent::OverlayNextField | Intent::SelectNext | Intent::ScrollPageDown => {
+                form.step_field(1);
+                form.error = None;
+                self.overlay = Some(Overlay::Schedule(form));
+                Outcome::effects(vec![])
+            }
+            Intent::OverlayPreviousField | Intent::SelectPrevious | Intent::ScrollPageUp => {
+                form.step_field(-1);
+                form.error = None;
+                self.overlay = Some(Overlay::Schedule(form));
+                Outcome::effects(vec![])
+            }
+            // A closed-set row has no text to type, so `Enter` steps it; a text
+            // row's `Enter` is the panel's own commit.
+            Intent::ConfirmOverlay if form.field == ScheduleField::Mode => {
+                form.toggle_mode();
+                self.overlay = Some(Overlay::Schedule(form));
+                Outcome::effects(vec![])
+            }
+            Intent::ConfirmOverlay => self.apply_schedule(form),
+            Intent::ElicitationFieldPrevious
+            | Intent::ElicitationFieldNext
+            | Intent::OverlayToggleValue => {
+                form.toggle_mode();
+                self.overlay = Some(Overlay::Schedule(form));
+                Outcome::effects(vec![])
+            }
+            Intent::ScheduleClear => self.clear_schedule(form),
+            _ => Outcome::quiet(),
+        }
+    }
+
+    /// Write the editor's value onto the draft it was opened for.
+    ///
+    /// A value the send path would refuse keeps the surface open with the
+    /// reason, which is what lets the reader fix it rather than lose it. The
+    /// target is re-checked because the reader may have navigated while the
+    /// editor was up: a schedule written onto whatever happens to be in front
+    /// of them now is worse than no schedule at all.
+    fn apply_schedule(&mut self, form: crate::schedule::MessageScheduleForm) -> Outcome {
+        let now_ms = vibex_core::unix_timestamp_ms();
+        let schedule = match form.validate(now_ms) {
+            Ok(schedule) => schedule,
+            Err(error) => {
+                let mut form = form;
+                form.error = Some(error);
+                self.overlay = Some(Overlay::Schedule(form));
+                return Outcome::effects(vec![]);
+            }
+        };
+        if self.composer_target.as_ref() != Some(&form.target) {
+            self.overlay = None;
+            return Outcome::effects(vec![]);
+        }
+        self.set_draft_schedule(Some(schedule));
+        self.overlay = None;
+        self.toast(Toast::info(format!(
+            "{} · {}",
+            self.strings.schedule_set(),
+            crate::schedule::schedule_summary(schedule)
+        )));
+        Outcome::effects(vec![])
+    }
+
+    /// Void the draft's schedule. The message is kept: clearing a timer is not
+    /// deleting what the reader wrote.
+    fn clear_schedule(&mut self, form: crate::schedule::MessageScheduleForm) -> Outcome {
+        // Nothing armed is nothing to void: the key that means "clear" must not
+        // be the one that closes an editor the reader is still deciding in.
+        if !form.clearable {
+            return Outcome::quiet();
+        }
+        if self.composer_target.as_ref() != Some(&form.target) {
+            self.overlay = None;
+            return Outcome::effects(vec![]);
+        }
+        self.set_draft_schedule(None);
+        self.overlay = None;
+        self.toast(Toast::info(self.strings.schedule_cleared().to_string()));
+        Outcome::effects(vec![])
+    }
+
     fn step_form_field(&mut self, delta: isize) {
         if let Some(Overlay::Form { form }) = self.overlay.as_mut() {
             form.step_field(delta);
@@ -2313,6 +2431,7 @@ impl App {
             // depends on whether a field is being typed into.
             Overlay::Form { form } => self.perform_form(intent, form),
             Overlay::EntryActions { entry } => self.perform_entry_actions(intent, entry),
+            Overlay::Schedule(form) => self.perform_schedule(intent, form),
             Overlay::Palette { query, selected } => self.perform_palette(intent, query, selected),
             // The editor owns its keys directly, including the captured chord;
             // only the overlay-wide intents reach the reducer, and the two that
@@ -3228,6 +3347,18 @@ impl App {
         }
         let outgoing = self.composer.take_outgoing();
         self.completion = None;
+        // The send time the page armed, resolved now that the message is really
+        // being submitted: a countdown starts here, and a deadline passed while
+        // the reader was still typing is refused with the draft put back rather
+        // than turned into an immediate send.
+        let scheduled_at_ms = match self.take_draft_schedule(vibex_core::unix_timestamp_ms()) {
+            Ok(at_ms) => at_ms,
+            Err(error) => {
+                self.composer.set_draft(outgoing.text, outgoing.images);
+                self.toast(Toast::warning(error.message(self.strings).to_string()));
+                return Outcome::quiet();
+            }
+        };
         // Read through the page's own answer (`new_session_workspace`), so what
         // the page names is what the creation carries — including the directory
         // the client was started in when nothing has chosen one.
@@ -3237,9 +3368,26 @@ impl App {
         // the authority acknowledges creation, and no old timeline survives.
         self.agent.select_pending_session(request_id.clone());
         self.enter_creating_session(request_id.clone());
-        let projected = self.wire_attachments(&outgoing.images);
-        let send_id =
-            self.mark_send_dispatched(Some(&request_id), outgoing.text.clone(), projected);
+        // A session the reader gave a send time to is created at once and its
+        // message waits in the queue, which is what puts the row in the session
+        // list — counting down — before anything has been sent. An ordinary
+        // creation sends the moment the authority acknowledges it, so its
+        // message is projected here and now.
+        let send_id = match scheduled_at_ms {
+            Some(at_ms) => {
+                self.enqueue_scheduled(
+                    request_id.clone(),
+                    outgoing.text.clone(),
+                    outgoing.images.clone(),
+                    Some(at_ms),
+                );
+                0
+            }
+            None => {
+                let projected = self.wire_attachments(&outgoing.images);
+                self.mark_send_dispatched(Some(&request_id), outgoing.text.clone(), projected)
+            }
+        };
         self.pending_creations.insert(
             request_id.clone(),
             PendingCreation {
@@ -3247,6 +3395,7 @@ impl App {
                 runtime: runtime.clone(),
                 workspace_root: workspace_root.clone(),
                 send_id,
+                scheduled_at_ms,
             },
         );
         Outcome::effects(vec![Effect::CreateSession {
@@ -3396,11 +3545,38 @@ impl App {
         let outgoing = self.composer.take_outgoing();
         let (text, images) = (outgoing.text, outgoing.images);
         self.completion = None;
+        // A schedule is resolved at the moment the message is submitted: a
+        // countdown starts here, and an absolute deadline the reader typed a
+        // while ago is checked again rather than trusted. A value the clock has
+        // walked past is refused with the draft put back, because sending it now
+        // is the one thing a schedule promised not to do.
+        let scheduled_at_ms = match self.take_draft_schedule(vibex_core::unix_timestamp_ms()) {
+            Ok(at_ms) => at_ms,
+            Err(error) => {
+                self.composer.set_draft(text, images);
+                self.toast(Toast::warning(error.message(self.strings).to_string()));
+                return Outcome::quiet();
+            }
+        };
         // A message written while a turn is running is held rather than sent:
         // the runtime would have to interleave it with work already in flight.
-        if self.turn_reads_running() || self.session_is_uncreated(&session_id) {
-            self.enqueue(session_id.clone(), text, images);
-            self.toast(Toast::info(self.strings.queue_held().to_string()));
+        // A message with a send time is held for a different reason — the clock
+        // is what it waits for — but it waits in the same queue, and the same
+        // send path releases it.
+        if scheduled_at_ms.is_some()
+            || self.turn_reads_running()
+            || self.session_is_uncreated(&session_id)
+        {
+            self.enqueue_scheduled(session_id.clone(), text, images, scheduled_at_ms);
+            let message = match scheduled_at_ms {
+                Some(at_ms) => format!(
+                    "{} · {}",
+                    self.strings.schedule_set(),
+                    crate::schedule::format_send_time(at_ms)
+                ),
+                None => self.strings.queue_held().to_string(),
+            };
+            self.toast(Toast::info(message));
             return Outcome::effects(vec![]);
         }
         self.history.push(text.clone());
@@ -7832,5 +8008,242 @@ mod tests {
                 "{key} asked for a read it does not need"
             );
         }
+    }
+
+    // ---- scheduling a send ---------------------------------------------
+
+    /// The session-page app the schedule keys are exercised on.
+    fn scheduled_session_app() -> App {
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        let session = openable_session("session_sched0001");
+        app.agent.state.selected_session_id = Some(session.id.clone());
+        app.agent.state.active_session.resolve(session);
+        app.navigate_to(Page::Agent);
+        app
+    }
+
+    /// Apply a schedule through the editor, the way a reader does: open it,
+    /// type a countdown, commit.
+    fn arm_countdown(app: &mut App, minutes: &str, seconds: &str) {
+        app.perform(Intent::ScheduleMessage);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Schedule(_))),
+            "the schedule editor did not open"
+        );
+        app.perform(Intent::OverlayToggleValue);
+        {
+            let Some(Overlay::Schedule(form)) = app.overlay.as_mut() else {
+                unreachable!("the editor is open");
+            };
+            form.hours = "0".to_string();
+            form.minutes = minutes.to_string();
+            form.seconds = seconds.to_string();
+        }
+        app.perform(Intent::ConfirmOverlay);
+    }
+
+    #[test]
+    fn the_schedule_key_opens_the_editor_on_the_draft() {
+        let mut app = scheduled_session_app();
+        app.composer.insert_str("later today");
+        let opened = app.perform(Intent::ScheduleMessage);
+        assert!(opened.effects.is_empty());
+        let Some(Overlay::Schedule(form)) = app.overlay.clone() else {
+            panic!("the editor did not open");
+        };
+        assert_eq!(
+            form.target,
+            ComposerTarget::Session(
+                vibex_core::VibexSessionId::parse("session_sched0001").expect("session id")
+            )
+        );
+        assert!(!form.clearable, "the draft had no schedule to clear");
+        // Nothing is written until the reader confirms: opening an editor is
+        // not a decision.
+        assert_eq!(app.draft_schedule(), None);
+    }
+
+    #[test]
+    fn a_refused_value_keeps_the_editor_open_with_its_reason() {
+        let mut app = scheduled_session_app();
+        app.perform(Intent::ScheduleMessage);
+        {
+            let Some(Overlay::Schedule(form)) = app.overlay.as_mut() else {
+                unreachable!("the editor is open");
+            };
+            form.mode = crate::schedule::ScheduleMode::After;
+            form.hours = "0".to_string();
+            form.minutes = "0".to_string();
+            form.seconds = "0".to_string();
+        }
+        app.perform(Intent::ConfirmOverlay);
+        let Some(Overlay::Schedule(form)) = app.overlay.clone() else {
+            panic!("a refused value closed the editor");
+        };
+        assert_eq!(
+            form.error,
+            Some(crate::schedule::ScheduleError::InvalidCountdown)
+        );
+        assert_eq!(app.draft_schedule(), None);
+    }
+
+    #[test]
+    fn clearing_a_schedule_keeps_the_message() {
+        let mut app = scheduled_session_app();
+        app.composer.insert_str("later today");
+        arm_countdown(&mut app, "5", "0");
+        assert!(app.draft_schedule().is_some());
+
+        app.perform(Intent::ScheduleMessage);
+        let cleared = app.perform(Intent::ScheduleClear);
+        assert!(cleared.effects.is_empty());
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.draft_schedule(), None);
+        assert_eq!(
+            app.composer.text(),
+            "later today",
+            "clearing the timer threw the message away"
+        );
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text == app.strings.schedule_cleared())
+        );
+    }
+
+    #[test]
+    fn a_scheduled_send_waits_in_the_queue_instead_of_going_out() {
+        let mut app = scheduled_session_app();
+        app.composer.insert_str("send me later");
+        arm_countdown(&mut app, "5", "0");
+        assert!(app.draft_schedule().is_some());
+
+        let sent = app.perform(Intent::SubmitComposer);
+        assert!(
+            sent.effects.is_empty(),
+            "a scheduled message was sent on the spot: {sent:?}"
+        );
+        let session_id = app.selected_session_id().cloned().expect("a session");
+        assert_eq!(app.queued_messages.len(), 1);
+        assert_eq!(app.queued_messages[0].session_id, session_id);
+        assert_eq!(app.queued_messages[0].text, "send me later");
+        assert!(
+            app.queued_messages[0].scheduled_at_ms.is_some(),
+            "the message was held with no deadline"
+        );
+        // The draft's schedule is spent by the submission that carried it.
+        assert_eq!(app.draft_schedule(), None);
+        assert!(app.drain_queue().is_empty(), "it left before its hour");
+    }
+
+    #[test]
+    fn a_deadline_the_clock_walked_past_is_refused_with_the_draft_put_back() {
+        let mut app = scheduled_session_app();
+        app.composer.insert_str("too late now");
+        app.set_draft_schedule(Some(crate::schedule::MessageSchedule::At(
+            vibex_core::unix_timestamp_ms() - 1_000,
+        )));
+        let refused = app.perform(Intent::SubmitComposer);
+        assert!(refused.effects.is_empty());
+        assert_eq!(
+            app.composer.text(),
+            "too late now",
+            "the refused send lost what the reader wrote"
+        );
+        assert!(app.queued_messages.is_empty());
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text == app.strings.schedule_error_not_future())
+        );
+    }
+
+    #[test]
+    fn a_scheduled_first_message_creates_the_session_and_waits_for_its_hour() {
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        app.runtime_options = Some(run_option_catalog());
+        app.perform(Intent::NewSession);
+        app.composer.insert_str("the first thing");
+        arm_countdown(&mut app, "5", "0");
+
+        let created = app.perform(Intent::SubmitComposer);
+        assert!(
+            created
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CreateSession { .. })),
+            "the session was not created for the scheduled message: {created:?}"
+        );
+        // The reader lands in the session at once — that is what puts a row in
+        // the list, counting down, before anything has been sent.
+        assert!(app.page_shows_uncreated_session());
+        let request_id = app.selected_session_id().cloned().expect("a session");
+        assert_eq!(app.queued_messages.len(), 1);
+        assert_eq!(app.queued_messages[0].session_id, request_id);
+        assert!(app.queued_messages[0].scheduled_at_ms.is_some());
+        assert!(
+            app.pending_sends.is_empty(),
+            "a scheduled first message was projected as a send"
+        );
+
+        // The authority acknowledges the creation, and the message still does
+        // not go: its clock is what it is waiting for.
+        assert!(
+            app.pending_send_effect(request_id.clone()).is_none(),
+            "the acknowledged creation sent the message anyway"
+        );
+        assert!(!app.page_session_is_being_created());
+        assert!(app.drain_queue().is_empty(), "it left before its hour");
+    }
+
+    #[test]
+    fn a_creation_that_failed_takes_its_scheduled_message_back_to_the_draft() {
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        app.runtime_options = Some(run_option_catalog());
+        app.perform(Intent::NewSession);
+        app.composer.insert_str("the first thing");
+        arm_countdown(&mut app, "5", "0");
+        app.perform(Intent::SubmitComposer);
+        let request_id = app.selected_session_id().cloned().expect("a session");
+        assert_eq!(app.queued_messages.len(), 1);
+
+        assert!(app.fail_creation(&request_id));
+        assert!(
+            app.queued_messages.is_empty(),
+            "a message waited on a session that was never created"
+        );
+        assert_eq!(app.composer.text(), "the first thing");
+        assert!(
+            app.draft_schedule().is_some(),
+            "the retry lost the send time the reader chose"
+        );
+    }
+
+    #[test]
+    fn a_schedule_is_written_onto_the_draft_that_armed_it() {
+        // The reader armed a send time on one session, walked to another, and
+        // committed there. The value belongs to the draft that opened the
+        // editor, so it must not land on the page in front of them now.
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        let first = openable_session("session_sched0001");
+        let second = openable_session("session_sched0002");
+        app.agent.state.selected_session_id = Some(first.id.clone());
+        app.agent.state.active_session.resolve(first);
+        app.navigate_to(Page::Agent);
+        app.perform(Intent::ScheduleMessage);
+        app.agent.state.selected_session_id = Some(second.id.clone());
+        app.agent.state.active_session.resolve(second);
+        app.navigate_to(Page::Agent);
+        app.perform(Intent::ConfirmOverlay);
+        assert_eq!(
+            app.draft_schedule(),
+            None,
+            "the value followed the reader onto another session's draft"
+        );
+        assert_eq!(app.overlay, None);
     }
 }

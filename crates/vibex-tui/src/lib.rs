@@ -27,6 +27,7 @@
 //! preview   what a collapsed paste or an attached picture holds, drawn in place
 //! search    transcript search: regex with smart case
 //! scramble  the character transition a line wears when its text changes
+//! schedule  when a written message goes out, and the editor that decides it
 //! transcript block cache, incremental layout, viewport-only rendering
 //! turn      the running turn's phase, tool count and pace, read from the projection
 //! view      page shells, overlays, the key bar
@@ -61,6 +62,7 @@ pub mod reduce;
 pub mod run;
 pub mod runtime_picker;
 pub mod runtime_prefs;
+pub mod schedule;
 pub mod scramble;
 pub mod search;
 pub mod sessions;

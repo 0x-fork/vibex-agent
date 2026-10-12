@@ -737,6 +737,14 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::QueueSendNow,
         "Send now",
     ),
+    // The clock button the Desktop puts beside the Composer. `Alt` keeps it out
+    // of the way of the transcript, and it no-ops on a page with no draft.
+    binding(
+        Scope::Agent,
+        Chord::new(KeyCode::Char('s'), KeyModifiers::ALT),
+        Intent::ScheduleMessage,
+        "Schedule send",
+    ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::Char('n')),
@@ -1000,6 +1008,14 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Chord::ctrl('s'),
         Intent::ConfigFormSave,
         "Save",
+    ),
+    // Voiding a deadline is not deleting the message, so it is a keystroke of
+    // its own rather than the overlay's destructive one.
+    binding(
+        Scope::Overlay,
+        Chord::ctrl('x'),
+        Intent::ScheduleClear,
+        "Clear schedule",
     ),
     binding(
         Scope::Overlay,
@@ -1912,6 +1928,31 @@ mod tests {
         assert_eq!(
             keymap.resolve(&[Scope::Agent, Scope::Global], Chord::ctrl('c')),
             Some(Intent::ContextualCancel)
+        );
+    }
+
+    #[test]
+    fn the_schedule_key_reaches_the_page_while_the_composer_types() {
+        // The composer's scope is consulted before the page's, and it binds
+        // `Alt` chords of its own: a schedule key the composer swallowed would
+        // be one the reader could not press while writing the message they are
+        // scheduling.
+        let keymap = Keymap::built_in();
+        let chord = Chord::new(KeyCode::Char('s'), KeyModifiers::ALT);
+        assert_eq!(
+            keymap.resolve(&[Scope::Composer, Scope::Agent, Scope::Global], chord),
+            Some(Intent::ScheduleMessage)
+        );
+        // And voiding a deadline is the overlay's, so it only answers where the
+        // editor that owns it is open.
+        assert_eq!(
+            keymap.resolve(&[Scope::Overlay, Scope::Global], Chord::ctrl('x')),
+            Some(Intent::ScheduleClear)
+        );
+        assert_eq!(
+            keymap.resolve(&[Scope::Agent, Scope::Global], Chord::ctrl('x')),
+            None,
+            "the overlay's key answered on a page"
         );
     }
 

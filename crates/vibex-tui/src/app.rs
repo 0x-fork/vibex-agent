@@ -230,6 +230,15 @@ pub enum Overlay {
     WorkspacePicker { selected: usize },
     /// A read-only detail view for one transcript block.
     BlockDetails { block: usize, scroll: usize },
+    /// When the draft in the Composer should be sent.
+    ///
+    /// The Desktop's clock popover, on the character grid: the same two shapes
+    /// (an absolute local time and a countdown), the same one-year bound, and
+    /// the same refusal of a deadline that is not in the future. Applying a
+    /// value leaves the message in the held queue with a deadline instead of
+    /// sending it, which is what makes a scheduled session show up in the
+    /// session list as one that is waiting.
+    Schedule(crate::schedule::MessageScheduleForm),
     /// The key-binding editor: every binding, rebindable in place.
     Keys {
         query: String,
@@ -605,6 +614,18 @@ pub struct QueuedMessage {
     /// composer restores exactly what was there — and where each of them sat in
     /// the text, which the wire needs to put the picture back in its place.
     pub images: Vec<(crate::composer::ImageAttachment, u32)>,
+    /// The local deadline of a scheduled message, in milliseconds since the
+    /// epoch. `None` is an ordinary held message that only waits for the
+    /// session to be ready — the same field, with the same meaning, the Desktop
+    /// persists in `ComposerQueueEntry`.
+    pub scheduled_at_ms: Option<i64>,
+}
+
+impl QueuedMessage {
+    /// Whether the clock has reached this message.
+    pub fn is_due(&self, now_ms: i64) -> bool {
+        self.scheduled_at_ms.is_none_or(|at_ms| at_ms <= now_ms)
+    }
 }
 
 /// A message the reader has sent that the runtime has not echoed back yet.
@@ -726,6 +747,14 @@ pub struct PendingCreation {
     pub runtime: Option<vibex_core::SessionRuntimeSelection>,
     pub workspace_root: String,
     pub send_id: u64,
+    /// The send time the first message was written for, when it has one.
+    ///
+    /// A session opened for a scheduled message is created at once — the
+    /// reader sees it in the list, waiting — and the message it was opened for
+    /// is held in the queue instead of being sent when the creation is
+    /// acknowledged. `send_id` is then the reserved id of a projection that was
+    /// never made, and nothing reads it.
+    pub scheduled_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -950,6 +979,16 @@ pub struct App {
     pub queued_messages: Vec<QueuedMessage>,
     /// Which queued message the queue band's cursor is on.
     pub queue_selection: Option<usize>,
+    /// The send time each Composer draft is written for, until it is submitted.
+    ///
+    /// A schedule is a property of the message being written rather than of the
+    /// page, so it survives leaving the session and coming back with the draft
+    /// the rest of the Composer state does. It is consumed by the submission
+    /// that carries it: the message it produces is the one that waits.
+    pub draft_schedules: BTreeMap<ComposerTarget, crate::schedule::MessageSchedule>,
+    /// The countdown second the surfaces last painted, so a tick that does not
+    /// move the display is not a reason to repaint it.
+    pub schedule_shown_second: Option<i64>,
     /// The message that has been sent but not yet echoed back by the runtime.
     ///
     /// The timeline belongs to the runtime, and its copy of the reader's own
@@ -1537,6 +1576,8 @@ impl App {
             last_click: None,
             queued_messages: Vec::new(),
             queue_selection: None,
+            draft_schedules: BTreeMap::new(),
+            schedule_shown_second: None,
             pending_sends: BTreeMap::new(),
             inflight_sends: BTreeMap::new(),
             pending_send_serial: 0,
@@ -3022,10 +3063,14 @@ impl App {
             // The configuration centre's two overlays print their own keys in
             // the modal footer, and the overlay scope is shared with the
             // approval and elicitation cards: left in, the bar would offer
-            // `A Allow` under a server editor, where it does nothing.
+            // `A Allow` under a server editor, where it does nothing. The
+            // schedule editor is the third of them: it names its own keys,
+            // including the one that voids a deadline.
             if matches!(
                 self.overlay,
-                Some(Overlay::Form { .. }) | Some(Overlay::EntryActions { .. })
+                Some(Overlay::Form { .. })
+                    | Some(Overlay::EntryActions { .. })
+                    | Some(Overlay::Schedule(_))
             ) && binding.scope == Scope::Overlay
             {
                 continue;
@@ -3887,9 +3932,15 @@ impl App {
         let (actions, moved) = self.auto_continue.tick(&sessions, now_ms, |session_id| {
             pending.contains(session_id.as_str())
         });
+        // A scheduled send counts down on the same clock and for the same
+        // reason: nothing arrives to say a second has passed, and a countdown
+        // that never moves reads as decoration. The due message itself is
+        // released by `drain_queue`, which every pass of the event loop already
+        // calls.
+        let counting = self.tick_schedules(now_ms);
         crate::reduce::Outcome {
             effects: actions.into_iter().map(auto_continue_effect).collect(),
-            dirty: dirty || moved,
+            dirty: dirty || moved || counting,
         }
     }
 
@@ -4148,8 +4199,15 @@ impl App {
 
     /// Consume exactly one acknowledged creation. Duplicate or unrelated
     /// callbacks have no prompt to send.
+    ///
+    /// A creation opened for a scheduled message has nothing to send: the
+    /// message is already in the queue, waiting for its own clock, and the
+    /// acknowledgment is the only thing this call had left to do.
     pub fn pending_send_effect(&mut self, session_id: VibexSessionId) -> Option<Effect> {
         let creation = self.pending_creations.remove(&session_id)?;
+        if creation.scheduled_at_ms.is_some() {
+            return None;
+        }
         let pending = self.pending_sends.get_mut(&creation.send_id)?;
         pending.submitted_at = std::time::Instant::now();
         let correlation_id = pending.correlation_id.clone();
@@ -4171,6 +4229,14 @@ impl App {
             return false;
         };
         self.abandon_send(request_id, creation.send_id);
+        // A scheduled creation put its message in the queue before the session
+        // it belongs to existed. The session does not exist, so the message
+        // cannot be sent anywhere: it goes back to the draft with the rest of
+        // the creation rather than waiting forever on a row nobody can open.
+        if creation.scheduled_at_ms.is_some() {
+            self.queued_messages
+                .retain(|queued| &queued.session_id != request_id);
+        }
         let on_failed_session =
             self.page_shows_session() && self.selected_session_id() == Some(request_id);
         self.failed_creations.push(FailedCreation {
@@ -4225,6 +4291,12 @@ impl App {
             failed.creation.outgoing.text,
             failed.creation.outgoing.images,
         );
+        // A creation that failed on its way to a deadline comes back with the
+        // deadline it had: the reader asked for a send time, and the retry is
+        // the same message, not a new decision about when.
+        if let Some(at_ms) = failed.creation.scheduled_at_ms {
+            self.set_draft_schedule(Some(crate::schedule::MessageSchedule::At(at_ms)));
+        }
     }
 
     /// Take the keyboard into the composer, placing the caret when the click
@@ -4794,11 +4866,20 @@ impl App {
         }
         self.clear_banner(BannerPriority::Warning);
         if !self.queued_for_active().is_empty() && self.page == Page::Agent {
-            let text = format!(
-                "{} · {}",
-                self.strings.queue_held(),
-                self.strings.queue_hint()
-            );
+            // A queue that is waiting on the clock says so rather than claiming
+            // a running turn is what holds it: with a send time armed and no
+            // turn running, "held until the running turn ends" would be a
+            // promise this client has no intention of keeping.
+            let held = if self
+                .queued_for_active()
+                .iter()
+                .all(|at| self.queued_messages[*at].scheduled_at_ms.is_some())
+            {
+                self.strings.schedule_message()
+            } else {
+                self.strings.queue_held()
+            };
+            let text = format!("{held} · {}", self.strings.queue_hint());
             return self.set_banner(Banner::info(text).with_priority(BannerPriority::Mode));
         }
         if self.composer_mode != ComposerMode::Normal && self.page == Page::Agent {
@@ -4989,10 +5070,26 @@ impl App {
         text: String,
         images: Vec<(crate::composer::ImageAttachment, u32)>,
     ) {
+        self.enqueue_scheduled(session_id, text, images, None);
+    }
+
+    /// Hold a message until its own deadline, or until the turn ends.
+    ///
+    /// A message with a deadline waits the same way an ordinary held one does
+    /// and is released by the same send path; the only difference is which
+    /// clock decides that it is ready. `None` is the ordinary case.
+    pub fn enqueue_scheduled(
+        &mut self,
+        session_id: VibexSessionId,
+        text: String,
+        images: Vec<(crate::composer::ImageAttachment, u32)>,
+        scheduled_at_ms: Option<i64>,
+    ) {
         self.queued_messages.push(QueuedMessage {
             session_id,
             text,
             images,
+            scheduled_at_ms,
         });
         self.queue_selection = Some(self.queued_for_active().len().saturating_sub(1));
     }
@@ -5039,6 +5136,11 @@ impl App {
     }
 
     /// Take the selected queued message back into the composer to edit it.
+    ///
+    /// The message's deadline comes back with it. A reader who pulled a
+    /// scheduled message back did so to change something about it — the words
+    /// or the hour — and dropping the hour silently would send it the moment
+    /// the turn ended, which is the one thing they were trying to avoid.
     pub fn edit_queued_message(&mut self) -> bool {
         let Some(index) = self.selected_queued_index() else {
             return false;
@@ -5059,10 +5161,22 @@ impl App {
                     session_id: queued.session_id.clone(),
                     text: draft,
                     images,
+                    scheduled_at_ms: None,
                 },
             );
         }
         self.composer.set_draft(queued.text, queued.images);
+        if let Some(target) = self.composer_target.clone() {
+            match queued.scheduled_at_ms {
+                Some(at_ms) => {
+                    self.draft_schedules
+                        .insert(target, crate::schedule::MessageSchedule::At(at_ms));
+                }
+                None => {
+                    self.draft_schedules.remove(&target);
+                }
+            }
+        }
         self.focus = Focus::Composer;
         self.composer_mode = ComposerMode::Normal;
         true
@@ -5133,15 +5247,26 @@ impl App {
     /// be looking. Called after every worker message rather than on a special
     /// "turn ended" event — the client has no such event, and a queue that only
     /// drains on one signal would stall the moment that signal changed shape.
+    ///
+    /// A scheduled message is not ready until its own deadline, and a message
+    /// still waiting is skipped rather than allowed to block the ones behind
+    /// it: the reader's queue is ordered by what they wrote, and a message they
+    /// set an hour out is not an instruction to hold everything after it. The
+    /// call runs on every pass of the event loop, so a deadline that arrives
+    /// while the client is sitting still releases on the next pass.
     pub fn drain_queue(
         &mut self,
     ) -> Vec<(VibexSessionId, String, Vec<vibex_core::MessageAttachment>)> {
         if !self.live.is_live() || self.queued_messages.is_empty() {
             return Vec::new();
         }
+        let now_ms = vibex_core::unix_timestamp_ms();
         let mut ready: Vec<VibexSessionId> = Vec::new();
         for queued in &self.queued_messages {
             if ready.contains(&queued.session_id) {
+                continue;
+            }
+            if !queued.is_due(now_ms) {
                 continue;
             }
             if self.session_is_running(&queued.session_id) {
@@ -5156,7 +5281,7 @@ impl App {
             let Some(index) = self
                 .queued_messages
                 .iter()
-                .position(|queued| queued.session_id == session_id)
+                .position(|queued| queued.session_id == session_id && queued.is_due(now_ms))
             else {
                 continue;
             };
@@ -5171,6 +5296,167 @@ impl App {
             released.push((session_id, queued.text, attachments));
         }
         released
+    }
+
+    // ---- scheduling a send -----------------------------------------------
+
+    /// The send time the Composer in front of the reader is written for.
+    pub fn draft_schedule(&self) -> Option<crate::schedule::MessageSchedule> {
+        self.composer_target
+            .as_ref()
+            .and_then(|target| self.draft_schedules.get(target).copied())
+    }
+
+    /// Give the Composer's draft a send time, or take the one it has away.
+    ///
+    /// The value belongs to the draft rather than to the page, so a reader who
+    /// steps out to the session list and comes back finds it still armed.
+    pub fn set_draft_schedule(
+        &mut self,
+        schedule: Option<crate::schedule::MessageSchedule>,
+    ) -> bool {
+        let Some(target) = self.composer_target.clone() else {
+            return false;
+        };
+        match schedule {
+            Some(schedule) => {
+                self.draft_schedules.insert(target, schedule);
+            }
+            None => {
+                self.draft_schedules.remove(&target);
+            }
+        }
+        true
+    }
+
+    /// Take the draft's schedule, resolving a countdown against the moment the
+    /// message is actually submitted.
+    pub fn take_draft_schedule(
+        &mut self,
+        now_ms: i64,
+    ) -> Result<Option<i64>, crate::schedule::ScheduleError> {
+        let Some(schedule) = self.draft_schedule() else {
+            return Ok(None);
+        };
+        let at_ms = schedule.deadline(now_ms)?;
+        if let Some(target) = self.composer_target.clone() {
+            self.draft_schedules.remove(&target);
+        }
+        Ok(Some(at_ms))
+    }
+
+    /// The earliest message still waiting on a clock for one session.
+    pub fn scheduled_message_for(&self, session_id: &VibexSessionId) -> Option<&QueuedMessage> {
+        self.queued_messages
+            .iter()
+            .filter(|queued| &queued.session_id == session_id)
+            .filter(|queued| queued.scheduled_at_ms.is_some())
+            .min_by_key(|queued| queued.scheduled_at_ms)
+    }
+
+    /// The deadline of the next message one session is waiting to send.
+    pub fn next_scheduled_message_at(&self, session_id: &VibexSessionId) -> Option<i64> {
+        self.scheduled_message_for(session_id)
+            .and_then(|queued| queued.scheduled_at_ms)
+    }
+
+    /// The earliest deadline any session is waiting on, so a tick can tell
+    /// whether the countdowns on screen have moved.
+    pub fn next_scheduled_message_at_anywhere(&self) -> Option<i64> {
+        self.queued_messages
+            .iter()
+            .filter_map(|queued| queued.scheduled_at_ms)
+            .min()
+    }
+
+    /// The name a session borrows from the scheduled message it is still
+    /// waiting to send, when the session has no name of its own yet.
+    ///
+    /// A session opened for a scheduled message exists before the message does:
+    /// the manager persists it under its default `<agent> session` title until a
+    /// message is actually submitted, so for the whole wait every authoritative
+    /// snapshot would put that placeholder on the row. The name is read from
+    /// what the reader wrote instead, and stops being read the moment the send
+    /// leaves the queue — which is exactly what leaves the Agent's own rename
+    /// free to land once the message has really been sent.
+    pub fn pending_scheduled_session_title(&self, session: &AgentSession) -> Option<String> {
+        let queued = self.scheduled_message_for(&session.id)?;
+        let title = vibex_core::normalize_agent_session_title(&queued.text)?;
+        let fallback = format!("{} session", session.agent_id);
+        (session.title == fallback || session.title == title).then_some(title)
+    }
+
+    /// The label a session row shows: its own title, or the name of the
+    /// scheduled message it is waiting to send.
+    pub fn session_row_title(&self, session: &AgentSession) -> String {
+        self.pending_scheduled_session_title(session)
+            .unwrap_or_else(|| session.title.clone())
+    }
+
+    /// How long a session's next scheduled send still waits, when it has one.
+    pub fn session_schedule_countdown(
+        &self,
+        session_id: &VibexSessionId,
+        now_ms: i64,
+    ) -> Option<String> {
+        self.next_scheduled_message_at(session_id)
+            .map(|at_ms| crate::schedule::format_schedule_countdown(at_ms.saturating_sub(now_ms)))
+    }
+
+    /// What a held message is waiting for, in the words its row can hold.
+    ///
+    /// A deadline still ahead names both the hour and the wait, which are the
+    /// two questions a scheduled row is asked. One that has arrived says what
+    /// it is still waiting for instead: the clock is not the reason any more,
+    /// and a row that kept counting down past zero would be lying about which
+    /// of the two is holding it.
+    pub fn schedule_status_label(
+        &self,
+        at_ms: i64,
+        session_id: &VibexSessionId,
+        now_ms: i64,
+    ) -> String {
+        let remaining = at_ms.saturating_sub(now_ms);
+        if remaining > 0 {
+            format!(
+                "{} {} · {}",
+                crate::glyphs::schedule_marker(self.glyph_tier()),
+                crate::schedule::format_send_time(at_ms),
+                crate::schedule::format_remaining(remaining)
+            )
+        } else if self.session_is_running(session_id) {
+            self.strings.schedule_due_running().to_string()
+        } else {
+            self.strings.schedule_due_waiting().to_string()
+        }
+    }
+
+    /// Move the countdowns on. Answers whether the display changed, which is
+    /// what keeps the interface repainting its seconds — the same contract the
+    /// auto-continue countdown has.
+    ///
+    /// The bucket is the unit the surfaces actually print: seconds under a day
+    /// and minutes past it, so a list that is only showing hours is not
+    /// repainted once a second to say the same thing.
+    pub fn tick_schedules(&mut self, now_ms: i64) -> bool {
+        let shown = self.next_scheduled_message_at_anywhere().map(|at_ms| {
+            let remaining = at_ms.saturating_sub(now_ms).max(0);
+            // Rounded up, because the surfaces print a countdown that reads
+            // `00:00:01` while most of a second is still left.
+            if remaining < 24 * 60 * 60 * 1_000 {
+                (remaining + 999) / 1_000
+            } else {
+                (remaining + 59_999) / 60_000
+            }
+        });
+        if shown == self.schedule_shown_second {
+            return false;
+        }
+        // Any change repaints, including the last countdown going away: a row
+        // that kept showing a number after the send left would be describing a
+        // message that is no longer there.
+        self.schedule_shown_second = shown;
+        true
     }
 
     /// Note a finished answer for a session the reader is not looking at.
@@ -6983,6 +7269,207 @@ mod tests {
         // The active-scope list is order-sensitive: the first match wins.
         let management_scopes = [Scope::Management, Scope::Global];
         assert_eq!(management_scopes[0], Scope::Management);
+    }
+
+    /// An app with one session open, ready to hold messages for it.
+    fn scheduled_app(session_id: &VibexSessionId) -> App {
+        let mut app = arrangement_app(&tempfile::tempdir().unwrap().path().join("unused.json"));
+        app.agent.state.selected_session_id = Some(session_id.clone());
+        app.navigate_to(Page::Agent);
+        app.live = LiveState::Ready;
+        app
+    }
+
+    #[test]
+    fn a_message_with_a_send_time_waits_for_the_clock_not_the_turn() {
+        let session_id = VibexSessionId::new();
+        let mut app = scheduled_app(&session_id);
+        let now_ms = vibex_core::unix_timestamp_ms();
+        app.enqueue_scheduled(
+            session_id.clone(),
+            "later".to_string(),
+            Vec::new(),
+            Some(now_ms + 60_000),
+        );
+        assert!(
+            app.drain_queue().is_empty(),
+            "a message whose hour has not come was sent anyway"
+        );
+
+        // The clock arrives; the same call now releases it, with no turn to
+        // wait for at all.
+        app.queued_messages[0].scheduled_at_ms = Some(now_ms - 1);
+        let released = app.drain_queue();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].0, session_id);
+        assert_eq!(released[0].1, "later");
+    }
+
+    #[test]
+    fn a_message_still_waiting_does_not_hold_the_ones_behind_it() {
+        let session_id = VibexSessionId::new();
+        let mut app = scheduled_app(&session_id);
+        let now_ms = vibex_core::unix_timestamp_ms();
+        app.enqueue_scheduled(
+            session_id.clone(),
+            "an hour out".to_string(),
+            Vec::new(),
+            Some(now_ms + 3_600_000),
+        );
+        app.enqueue_scheduled(session_id.clone(), "due now".to_string(), Vec::new(), None);
+        let released = app.drain_queue();
+        assert_eq!(released.len(), 1, "the queue drained only what was ready");
+        assert_eq!(released[0].1, "due now");
+        assert_eq!(
+            app.queued_messages.len(),
+            1,
+            "the scheduled message is still waiting"
+        );
+    }
+
+    #[test]
+    fn pulling_a_scheduled_message_back_carries_its_send_time() {
+        let session_id = VibexSessionId::new();
+        let mut app = scheduled_app(&session_id);
+        let at_ms = vibex_core::unix_timestamp_ms() + 600_000;
+        app.enqueue_scheduled(
+            session_id.clone(),
+            "later".to_string(),
+            Vec::new(),
+            Some(at_ms),
+        );
+        app.queue_selection = Some(0);
+        assert!(app.edit_queued_message());
+        assert_eq!(
+            app.draft_schedule(),
+            Some(crate::schedule::MessageSchedule::At(at_ms)),
+            "the deadline was dropped on the way back into the draft"
+        );
+
+        // And holding it again keeps it, which is the whole point of carrying
+        // it: a reader who edits the words did not ask to send it now.
+        let outgoing = app.composer.take_outgoing();
+        let taken = app.take_draft_schedule(vibex_core::unix_timestamp_ms());
+        assert_eq!(taken, Ok(Some(at_ms)));
+        app.enqueue_scheduled(
+            session_id.clone(),
+            outgoing.text,
+            outgoing.images,
+            taken.ok().flatten(),
+        );
+        assert!(app.drain_queue().is_empty(), "it left before its hour");
+    }
+
+    #[test]
+    fn a_session_waiting_on_a_scheduled_message_borrows_its_name() {
+        let session_id = VibexSessionId::new();
+        let mut app = scheduled_app(&session_id);
+        let agent_id = vibex_core::AgentId::parse("codex").expect("agent id");
+        let mut session = AgentSession {
+            id: session_id.clone(),
+            title: format!("{agent_id} session"),
+            project_id: vibex_core::ProjectId::new(),
+            workspace_id: vibex_core::WorkspaceId::new(),
+            workspace_root: "/repo".to_string(),
+            workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+            agent_id: agent_id.clone(),
+            state: vibex_core::AgentSessionState::Initializing,
+            safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_message_at_ms: 1,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        let at_ms = vibex_core::unix_timestamp_ms() + 60_000;
+        app.enqueue_scheduled(
+            session_id.clone(),
+            "  Fix   the flake  ".to_string(),
+            Vec::new(),
+            Some(at_ms),
+        );
+        assert_eq!(
+            app.pending_scheduled_session_title(&session).as_deref(),
+            Some("Fix the flake")
+        );
+        assert_eq!(app.session_row_title(&session), "Fix the flake");
+        assert_eq!(app.next_scheduled_message_at(&session_id), Some(at_ms));
+        assert_eq!(
+            app.session_schedule_countdown(&session_id, at_ms - 90_000)
+                .as_deref(),
+            Some("00:01:30")
+        );
+
+        // A session that already has a name of its own keeps it: the scheduled
+        // message names the wait, it does not rename the work.
+        session.title = "Migrate the scheduler".to_string();
+        assert_eq!(app.pending_scheduled_session_title(&session), None);
+        assert_eq!(app.session_row_title(&session), "Migrate the scheduler");
+    }
+
+    #[test]
+    fn a_scheduled_session_says_what_it_is_waiting_for() {
+        let session_id = VibexSessionId::new();
+        let mut app = scheduled_app(&session_id);
+        let now_ms = vibex_core::unix_timestamp_ms();
+        app.enqueue_scheduled(
+            session_id.clone(),
+            "later".to_string(),
+            Vec::new(),
+            Some(now_ms + 90_000),
+        );
+        let label = app.schedule_status_label(now_ms + 90_000, &session_id, now_ms);
+        assert!(
+            label.contains("00:01:30"),
+            "the wait is not in the label: {label}"
+        );
+        let due = app.schedule_status_label(now_ms - 1, &session_id, now_ms);
+        assert_eq!(due, app.strings.schedule_due_waiting());
+
+        // A due message whose turn is still going says so instead: the clock is
+        // not what is holding it any more.
+        app.pending_sends.insert(
+            1,
+            PendingSend {
+                session_id: Some(session_id.clone()),
+                serial: 1,
+                correlation_id: vibex_core::CorrelationId::new(),
+                text: "in flight".to_string(),
+                attachments: Vec::new(),
+                after_sequence: 0,
+                submitted_at: std::time::Instant::now(),
+                submitted_at_ms: now_ms,
+            },
+        );
+        assert_eq!(
+            app.schedule_status_label(now_ms - 1, &session_id, now_ms),
+            app.strings.schedule_due_running()
+        );
+    }
+
+    #[test]
+    fn a_countdown_repaints_only_when_the_number_it_prints_moves() {
+        let session_id = VibexSessionId::new();
+        let mut app = scheduled_app(&session_id);
+        let now_ms = vibex_core::unix_timestamp_ms();
+        assert!(!app.tick_schedules(now_ms), "nothing is waiting on a clock");
+        app.enqueue_scheduled(
+            session_id.clone(),
+            "later".to_string(),
+            Vec::new(),
+            Some(now_ms + 10_000),
+        );
+        assert!(app.tick_schedules(now_ms), "the countdown appeared");
+        assert!(
+            !app.tick_schedules(now_ms + 10),
+            "a tick that did not move the second repainted"
+        );
+        assert!(app.tick_schedules(now_ms + 1_000), "the second moved");
+        // The countdown going away is a repaint too: a row that kept showing a
+        // number after the send left would describe a message that is gone.
+        app.queued_messages.clear();
+        assert!(app.tick_schedules(now_ms + 2_000), "the countdown vanished");
+        assert!(!app.tick_schedules(now_ms + 3_000), "and then it settled");
     }
 
     #[test]

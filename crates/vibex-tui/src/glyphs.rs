@@ -138,6 +138,19 @@ pub fn unread_marker(tier: GlyphTier) -> &'static str {
     }
 }
 
+/// The mark beside a session that is waiting for a scheduled send. One column.
+///
+/// A clock face rather than the arrow auto-continue wears: both marks mean
+/// "something will happen here without you", and a reader has to be able to
+/// tell a message that is already written from a turn that will be started
+/// again. The legacy tier degrades to the ASCII clock every terminal has.
+pub fn schedule_marker(tier: GlyphTier) -> &'static str {
+    match tier {
+        GlyphTier::Full => "◷",
+        GlyphTier::Legacy => "@",
+    }
+}
+
 /// The mark beside a session's state. One column.
 ///
 /// Colour carries the same distinction, but the shape does not depend on it: a
@@ -365,6 +378,7 @@ mod tests {
                 timeline_tick(tier),
                 timeline_tick_active(tier),
                 heading_rule(tier),
+                schedule_marker(tier),
             ] {
                 assert_eq!(
                     crate::text::display_width(glyph),

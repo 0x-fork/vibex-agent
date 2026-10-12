@@ -2943,6 +2943,147 @@ fn the_queue_band_shows_the_cursor_and_its_keys() {
 }
 
 #[test]
+fn the_queue_band_says_when_a_held_message_will_go_out() {
+    // A message held for the clock and a message held for a turn read the same
+    // in the text, so the row has to say which of the two it is waiting on.
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    enter_session(&mut app, "session_queue0003");
+    let session_id = app.selected_session_id().cloned().expect("a session");
+    let at_ms = vibex_core::unix_timestamp_ms() + 90_000;
+    app.enqueue_message("held for the clock".to_string());
+    app.queued_messages[0].scheduled_at_ms = Some(at_ms);
+    app.queued_messages[0].session_id = session_id;
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains(&vibex_tui::schedule::format_send_time(at_ms)),
+        "the hour it will go out at is not on the row:\n{screen}"
+    );
+    assert!(
+        screen.contains("00:01:30"),
+        "the wait is not on the row:\n{screen}"
+    );
+
+    // Once the hour is here, the row says what is actually holding it.
+    app.queued_messages[0].scheduled_at_ms = Some(vibex_core::unix_timestamp_ms() - 1);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains(app.strings.schedule_due_waiting()),
+        "a due message did not say what it waits for:\n{screen}"
+    );
+}
+
+#[test]
+fn the_schedule_editor_shows_the_shape_it_will_apply() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    enter_session(&mut app, "session_queue0003");
+    app.perform(vibex_tui::action::Intent::ScheduleMessage);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains(app.strings.schedule_title()), "{screen}");
+    assert!(
+        screen.contains(app.strings.schedule_mode_at()),
+        "the shape being edited is not named:\n{screen}"
+    );
+    assert!(
+        screen.contains("YYYY-MM-DD HH:MM:SS"),
+        "the layout the field is read in is not said:\n{screen}"
+    );
+    assert!(
+        screen.contains("Sends automatically when due"),
+        "what a schedule promises is not said:\n{screen}"
+    );
+
+    // The countdown shape swaps the field for the three numbers, and the note
+    // under it changes with the shape.
+    app.perform(vibex_tui::action::Intent::OverlayToggleValue);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains(app.strings.schedule_mode_after()),
+        "{screen}"
+    );
+    assert!(
+        screen.contains(app.strings.schedule_countdown_hint()),
+        "the countdown did not explain itself:\n{screen}"
+    );
+}
+
+#[test]
+fn the_composer_says_a_draft_has_a_send_time() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    enter_session(&mut app, "session_queue0003");
+    app.composer.insert_str("later today");
+    app.set_draft_schedule(Some(vibex_tui::schedule::MessageSchedule::After(3_723)));
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("01:02:03"),
+        "the Composer did not say when its draft goes out:\n{screen}"
+    );
+}
+
+#[test]
+fn a_session_waiting_on_a_scheduled_message_counts_down_in_the_list() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    // A session created for a scheduled message exists before the message does,
+    // and carries the manager's placeholder name until the send lands.
+    let mut session = seeded_session("session_sched0009", "claude session");
+    session.title = format!("{} session", session.agent_id);
+    let session_id = session.id.clone();
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(session_id.clone());
+    app.agent.state.active_session.resolve(session.clone());
+    let at_ms = vibex_core::unix_timestamp_ms() + 3_600_000;
+    app.enqueue_scheduled(
+        session_id.clone(),
+        "  Summarise   the release notes  ".to_string(),
+        Vec::new(),
+        Some(at_ms),
+    );
+    app.perform(Intent::GotoSessions);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("Summarise the release notes"),
+        "the row did not borrow the scheduled message's name:\n{screen}"
+    );
+    assert!(
+        screen.contains(vibex_tui::glyphs::schedule_marker(
+            vibex_tui::glyphs::GlyphTier::Full
+        )),
+        "the row is not marked as waiting on a clock:\n{screen}"
+    );
+    assert!(
+        screen.contains("01:00:00") || screen.contains("00:59:"),
+        "the row is not counting down:\n{screen}"
+    );
+}
+
+#[test]
+fn a_session_opened_for_a_scheduled_message_says_what_it_is_waiting_for() {
+    let mut app = app(120, 40);
+    enter_session(&mut app, "session_sched0009");
+    let session_id = app.selected_session_id().cloned().expect("a session");
+    app.enqueue_scheduled(
+        session_id,
+        "the first thing".to_string(),
+        Vec::new(),
+        Some(vibex_core::unix_timestamp_ms() + 90_000),
+    );
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains(app.strings.schedule_message()),
+        "an empty transcript with a scheduled message did not say so:\n{screen}"
+    );
+    assert!(
+        screen.contains("00:01:30"),
+        "the countdown is missing:\n{screen}"
+    );
+}
+
+#[test]
 fn queue_editing_moves_a_message_back_into_the_draft() {
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);

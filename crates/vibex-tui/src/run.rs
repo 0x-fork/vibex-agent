@@ -511,6 +511,38 @@ fn handle_key(
                 _ => {}
             }
         }
+        if let Overlay::Schedule(form) = &overlay
+            && form.value(form.field).is_some()
+        {
+            // The schedule editor is a form of text fields with one closed-set
+            // row, so it takes characters the way the configuration form does:
+            // out of the way of the keys that move and commit.
+            match key.code {
+                KeyCode::Char(character)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    let mut form = form.clone();
+                    // A character the field has no room for is not an error to
+                    // report: the field simply does not take it, the way a
+                    // caret in a one-line input stops at the edge.
+                    if form.push(character) {
+                        form.error = None;
+                        app.overlay = Some(Overlay::Schedule(form));
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Backspace => {
+                    let mut form = form.clone();
+                    if form.backspace() {
+                        form.error = None;
+                    }
+                    app.overlay = Some(Overlay::Schedule(form));
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
         if let Overlay::Prompt {
             field,
             value,

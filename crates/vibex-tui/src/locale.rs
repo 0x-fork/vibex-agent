@@ -495,10 +495,76 @@ strings! {
         "已把排隊訊息放回輸入框"
     },
     queue_hint => {
-        "Alt+↑↓ pick · Alt+E edit · Alt+X drop · Alt+J/K reorder · Alt+Enter send now",
-        "Alt+↑↓ 选择 · Alt+E 编辑 · Alt+X 删除 · Alt+J/K 调序 · Alt+Enter 立即发送",
-        "Alt+↑↓ 選擇 · Alt+E 編輯 · Alt+X 刪除 · Alt+J/K 調序 · Alt+Enter 立即傳送"
+        "Alt+↑↓ pick · Alt+E edit · Alt+X drop · Alt+J/K reorder · Alt+S schedule · Alt+Enter send now",
+        "Alt+↑↓ 选择 · Alt+E 编辑 · Alt+X 删除 · Alt+J/K 调序 · Alt+S 定时 · Alt+Enter 立即发送",
+        "Alt+↑↓ 選擇 · Alt+E 編輯 · Alt+X 刪除 · Alt+J/K 調序 · Alt+S 定時 · Alt+Enter 立即傳送"
     },
+    // ---- scheduling a send ----------------------------------------------
+    // The Desktop's clock button, on the character grid. A message that is
+    // written is given a deadline instead of a turn; until the clock reaches
+    // it the message waits in the held queue beside the ordinary ones.
+    schedule_title => { "Schedule send", "定时发送", "定時傳送" },
+    schedule_mode_at => { "Date and time", "定时", "定時" },
+    schedule_mode_after => { "Countdown", "倒计时", "倒計時" },
+    schedule_field_mode => { "Mode", "方式", "方式" },
+    schedule_field_when => { "Send at", "发送时间", "傳送時間" },
+    schedule_field_hours => { "Hours", "时", "時" },
+    schedule_field_minutes => { "Minutes", "分", "分" },
+    schedule_field_seconds => { "Seconds", "秒", "秒" },
+    schedule_when_hint => {
+        "YYYY-MM-DD HH:MM:SS, in your own timezone",
+        "按本地时区填写 YYYY-MM-DD HH:MM:SS",
+        "按本機時區填寫 YYYY-MM-DD HH:MM:SS"
+    },
+    schedule_countdown_hint => {
+        "Counts down from the moment the message is submitted",
+        "从发送该消息的那一刻开始倒计时",
+        "從傳送該訊息的那一刻開始倒數"
+    },
+    schedule_note => {
+        "Sends automatically when due. If the session is running, waits for it to finish. Keep Vibex open.",
+        "到时自动发送；会话运行中则等待结束。请保持 Vibex 开启。",
+        "到時自動傳送；會話執行中則等待結束。請保持 Vibex 開啟。"
+    },
+    schedule_clear => { "Clear schedule", "清除定时", "清除定時" },
+    schedule_cleared => { "Schedule cleared", "已清除定时", "已清除定時" },
+    schedule_set => { "Send scheduled", "已设定发送时间", "已設定傳送時間" },
+    schedule_error_not_future => {
+        "Choose a future time.",
+        "请选择未来的时间。",
+        "請選擇未來的時間。"
+    },
+    schedule_error_countdown => {
+        "Enter a countdown between 1 second and 365 days; minutes and seconds must be 0–59.",
+        "倒计时须为 1 秒至 365 天，分钟和秒须为 0–59。",
+        "倒計時須為 1 秒至 365 天，分鐘和秒須為 0–59。"
+    },
+    schedule_error_ambiguous => {
+        "This local time is ambiguous or unavailable. Choose another time.",
+        "此本地时间不存在或不唯一，请选择其他时间。",
+        "此本機時間不存在或不唯一，請選擇其他時間。"
+    },
+    schedule_error_unreadable => {
+        "Type a deadline as YYYY-MM-DD HH:MM:SS.",
+        "请按 YYYY-MM-DD HH:MM:SS 填写发送时间。",
+        "請按 YYYY-MM-DD HH:MM:SS 填寫傳送時間。"
+    },
+    schedule_pending => { "Scheduled send", "定时发送", "定時傳送" },
+    schedule_message => { "Scheduled message", "定时消息", "定時訊息" },
+    schedule_due_waiting => {
+        "Due · waiting to send",
+        "已到时 · 等待发送",
+        "已到時 · 等待傳送"
+    },
+    schedule_due_running => {
+        "Due · waiting for the current turn",
+        "已到时 · 等待当前运行结束",
+        "已到時 · 等待目前執行結束"
+    },
+    schedule_hint_move => { "move", "移动", "移動" },
+    schedule_hint_switch => { "shape", "切换方式", "切換方式" },
+    schedule_hint_type => { "type", "输入", "輸入" },
+    schedule_hint_apply => { "apply", "应用", "套用" },
     mode_shell => { "shell", "shell", "shell" },
     mode_remember => { "remember", "记住", "記住" },
     mode_plan => { "plan", "计划", "計畫" },

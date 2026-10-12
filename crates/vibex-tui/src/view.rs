@@ -1360,18 +1360,23 @@ fn render_session_rows(
     // the list is looking for what changed, and a wall of identical rows says
     // nothing about that. The column is measured from what will be drawn, so a
     // list of sessions from today spends no width on days.
+    //
+    // A session with a scheduled send reads the other way round: the question
+    // its row answers is "how long until it goes", not "when did it last
+    // speak", and a wall clock beside a waiting message would only be a second
+    // timestamp to decode. The absolute deadline stays in the row's own
+    // schedule mark, where there is room to say both.
     let time_labels = rows
         .iter()
         .map(|row| {
-            row.session_id
-                .as_ref()
-                .and_then(|session_id| {
-                    sessions
-                        .iter()
-                        .find(|session| &session.id == session_id)
-                        .map(|session| session.last_message_at_ms)
-                })
-                .map(|at_ms| relative_time_label(at_ms, now_ms, strings))
+            let session_id = row.session_id.as_ref()?;
+            let session = sessions.iter().find(|session| &session.id == session_id)?;
+            Some(
+                app.session_schedule_countdown(&session.id, now_ms)
+                    .unwrap_or_else(|| {
+                        relative_time_label(session.last_message_at_ms, now_ms, strings)
+                    }),
+            )
         })
         .collect::<Vec<_>>();
     let time_column = time_labels
@@ -1705,6 +1710,15 @@ fn session_row_lines(
         )
     });
     let time_block_width = time_block.as_deref().map(display_width).unwrap_or(0);
+    // A row whose right end is counting down is waiting on something the reader
+    // set, so it is drawn as the clock it is rather than as the muted age of a
+    // session that has gone quiet.
+    let time_style =
+        if session.is_some_and(|session| app.next_scheduled_message_at(&session.id).is_some()) {
+            paint(theme.roles.accent_attention)
+        } else {
+            dim_style
+        };
     // The row's own controls are drawn only while the row is the reader's: the
     // selected row, or the one the pointer is on. They take the age's place at
     // the right edge, and the age is not drawn under them: two answers to
@@ -1736,7 +1750,13 @@ fn session_row_lines(
         Span::styled(format!("{bar} "), bar_style),
         Span::styled(format!("{icon} "), icon_style),
     ];
-    let title = truncate_to_width(&row.label, text_width, "…");
+    // The name a session that exists only to wait for its scheduled message
+    // comes from that message until the send actually leaves the queue, so the
+    // manager's default `<agent> session` title never labels the wait.
+    let label = session
+        .map(|session| app.session_row_title(session))
+        .unwrap_or_else(|| row.label.clone());
+    let title = truncate_to_width(&label, text_width, "…");
     let mut text_used = display_width(&title);
     spans.push(Span::styled(title, title_style));
     // Who is answering, when the title has left room for it: which Agent a
@@ -1818,7 +1838,7 @@ fn session_row_lines(
             " ".repeat(reserved - time_block_width),
             blank_style,
         ));
-        spans.push(Span::styled(time, dim_style));
+        spans.push(Span::styled(time, time_style));
     }
     let mut lines = vec![Line::from(spans)];
     // The second line is what the session last did, and nothing else: the
@@ -1872,8 +1892,9 @@ fn session_row_control_width(app: &App, intent: Intent) -> usize {
         .unwrap_or(0)
 }
 
-/// The marks a session row carries: pinned, unread, and whether the session is
-/// going to continue itself.
+/// The marks a session row carries: whether it is waiting on a scheduled send,
+/// whether it is pinned, whether it is unread, and whether it is going to
+/// continue itself.
 fn session_row_badges(
     row: &vibex_desktop_model::AgentSidebarRow,
     session: Option<&vibex_core::AgentSession>,
@@ -1884,6 +1905,23 @@ fn session_row_badges(
     let tier = app.glyph_tier();
     let resting = |colour: ratatui::style::Color| Style::default().fg(colour);
     let mut spans = Vec::new();
+    // The clock leads the marks: a session waiting on a scheduled send is
+    // waiting on something the reader set. The Desktop draws the same mark in
+    // the same place, in place of the state it would otherwise show, and leaves
+    // the counting to the row's time column — saying the number twice in one
+    // row would be one answer too many.
+    if let Some(session) = session
+        && app.next_scheduled_message_at(&session.id).is_some()
+    {
+        spans.push(Span::styled(
+            format!("{} ", crate::glyphs::schedule_marker(tier)),
+            resting(if selected {
+                theme.roles.text_secondary
+            } else {
+                theme.roles.accent_attention
+            }),
+        ));
+    }
     if row.pinned {
         spans.push(Span::styled(
             format!("{} ", crate::glyphs::pin_marker(tier)),
@@ -2439,32 +2477,78 @@ fn render_queue_band(
     let held = app.queued_for_active();
     let selected = app.queue_selection.unwrap_or(0);
     let offset = selected.saturating_sub(visible.saturating_sub(1));
+    // What each row is waiting on, right-aligned in a column of its own: a
+    // message held for a turn and a message held for the clock read the same in
+    // the text, and the difference is exactly what the right edge is for. The
+    // column is measured from the rows that will be drawn, so a queue of
+    // unscheduled messages spends no width on a clock.
+    let now_ms = vibex_core::unix_timestamp_ms();
+    let schedules = held
+        .iter()
+        .map(|at| {
+            let message = &app.queued_messages[*at];
+            message
+                .scheduled_at_ms
+                .map(|at_ms| app.schedule_status_label(at_ms, &message.session_id, now_ms))
+        })
+        .collect::<Vec<_>>();
+    let schedule_column = schedules
+        .iter()
+        .flatten()
+        .map(|label| display_width(label))
+        .max()
+        .unwrap_or(0)
+        .min(usize::from(area.width) / 3);
     for (row, at) in held.iter().enumerate().skip(offset).take(visible) {
         let message = &app.queued_messages[*at];
         let active = app.queue_selection == Some(row);
         let prefix = if active { "▸ " } else { "  " };
-        lines.push(Line::from(vec![
+        let number = format!("#{} ", row + 1);
+        let schedule = schedules
+            .get(row)
+            .and_then(Option::as_deref)
+            .map(|label| truncate_to_width(label, schedule_column, "…"));
+        let width = usize::from(area.width);
+        // The columns are laid out exactly rather than left to the paragraph
+        // widget: the schedule is right-aligned, and a row whose message grew
+        // would otherwise push the clock off the edge it belongs on.
+        let lead = display_width(prefix) + display_width(&number);
+        let reserved = schedule
+            .as_ref()
+            .map_or(0, |label| display_width(label) + 2);
+        let text = truncate_to_width(
+            message.text.lines().next().unwrap_or_default(),
+            width.saturating_sub(lead + reserved),
+            "…",
+        );
+        let mut spans = vec![
             Span::styled(
                 prefix.to_string(),
                 Style::default().fg(theme.roles.accent_user),
             ),
+            Span::styled(number, Style::default().fg(theme.roles.gray_dim)),
             Span::styled(
-                format!("#{} ", row + 1),
-                Style::default().fg(theme.roles.gray_dim),
-            ),
-            Span::styled(
-                truncate_to_width(
-                    message.text.lines().next().unwrap_or_default(),
-                    usize::from(area.width).saturating_sub(6),
-                    "…",
-                ),
+                text.clone(),
                 if active {
                     theme.selected()
                 } else {
                     Style::default().fg(theme.roles.gray)
                 },
             ),
-        ]));
+        ];
+        if let Some(schedule) = schedule {
+            let pad = width.saturating_sub(lead + display_width(&text) + display_width(&schedule));
+            spans.push(Span::styled(" ".repeat(pad), Style::default()));
+            spans.push(Span::styled(
+                schedule,
+                if active {
+                    Style::default().fg(theme.roles.accent_attention)
+                } else {
+                    Style::default().fg(theme.roles.gray_dim)
+                },
+            ));
+        }
+        lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
@@ -3176,6 +3260,18 @@ fn render_welcome(
         empty_state(frame, area, theme, strings.transcript_empty());
         return;
     }
+    // A session whose first message is scheduled has nothing in its transcript
+    // yet and nothing running: what the page has to say is when the message it
+    // was opened for goes out. The Desktop draws the same countdown in place of
+    // its own empty state, so a reader who opens such a session is told what it
+    // is waiting for rather than that it is empty.
+    if let Some(at_ms) = app
+        .page_session_id()
+        .and_then(|session_id| app.next_scheduled_message_at(session_id))
+    {
+        render_scheduled_empty_timeline(frame, area, app, at_ms, theme, strings);
+        return;
+    }
     // While the first-run steps are unfinished the guide is the content, in
     // order, with the next step to take called out. It belongs to the landing
     // surface: once a session is open the transcript is what matters, and the
@@ -3382,6 +3478,61 @@ fn empty_state(frame: &mut Frame<'_>, area: Rect, theme: &TuiTheme, message: &st
             .alignment(Alignment::Center),
         area,
     );
+}
+
+/// What a session opened for a scheduled message says until it goes out.
+///
+/// The same three answers the Desktop gives — that a message is waiting, how
+/// long is left, and the hour it will leave at — because a transcript with
+/// nothing in it and a countdown in front of it is otherwise indistinguishable
+/// from a client that dropped the message.
+fn render_scheduled_empty_timeline(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    at_ms: i64,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let now_ms = vibex_core::unix_timestamp_ms();
+    let remaining = at_ms.saturating_sub(now_ms);
+    let height = area.height.min(6);
+    let region = Rect {
+        y: area.y + area.height.saturating_sub(height) / 2,
+        height,
+        ..area
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "  {} {}",
+                crate::glyphs::schedule_marker(app.glyph_tier()),
+                strings.schedule_message()
+            ),
+            Style::default().fg(theme.roles.gray_dim),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {}", crate::schedule::format_remaining(remaining)),
+            Style::default()
+                .fg(theme.roles.accent_attention)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("  {}", crate::schedule::format_send_time(at_ms)),
+            Style::default().fg(theme.roles.gray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {}", strings.schedule_note()),
+            Style::default().fg(theme.roles.gray_dim),
+        )),
+    ];
+    lines.truncate(usize::from(region.height));
+    frame.render_widget(Paragraph::new(Text::from(lines)), region);
 }
 
 /// The empty composer's hint: one sigil per completion drawer, named in the
@@ -3703,6 +3854,19 @@ fn render_composer_info(
         .and_then(|id| app.auto_continue.countdown_seconds(id))
     {
         left.push(Span::styled(format!(" · ↻{seconds}"), theme.warning()));
+    }
+    // The Composer's own clock, where the info line has room for it: a draft
+    // with a send time says so beside the runtime it will go through, because
+    // Enter is otherwise about to do something the reader did not ask for.
+    if let Some(schedule) = app.draft_schedule() {
+        left.push(Span::styled(
+            format!(
+                " · {} {}",
+                crate::glyphs::schedule_marker(app.glyph_tier()),
+                crate::schedule::schedule_summary(schedule)
+            ),
+            theme.warning(),
+        ));
     }
     let images = app.composer.image_count();
     if images > 0 {
@@ -5813,6 +5977,190 @@ fn render_config_form(
     }
 }
 
+/// The send-time editor: the Desktop's clock popover, on the character grid.
+///
+/// Two shapes in one panel, the way the Desktop's segmented control has them. A
+/// terminal has no calendar grid, so the absolute shape is one text field in
+/// the layout it is read back in — said beside the field, because a deadline
+/// typed in the wrong layout is refused and the reader has to be able to see
+/// why before they are told. The countdown shape is three small numbers, and
+/// the note under both is the Desktop's own sentence about what a schedule
+/// promises: it sends by itself, it waits for a running turn, and it needs the
+/// client to still be open.
+fn render_message_schedule(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    form: &crate::schedule::MessageScheduleForm,
+    theme: &TuiTheme,
+) {
+    use crate::schedule::{ScheduleField, ScheduleMode};
+    let strings = app.strings;
+    // The keys the panel names are the keys it answers: a draft with no send
+    // time has nothing to void, so the clear is not offered until there is
+    // something to clear.
+    let mut hints = vec![
+        ModalHint::new("Tab", strings.schedule_hint_move()),
+        ModalHint::new("←→", strings.schedule_hint_switch()),
+        ModalHint::new("Enter", strings.schedule_hint_apply()),
+    ];
+    if form.clearable {
+        hints.push(ModalHint::new("^X", strings.schedule_clear()));
+    }
+    hints.push(ModalHint::new("Esc", strings.close()));
+    let chrome = modal_chrome(
+        app,
+        strings.schedule_title(),
+        ModalSizing::new(52, 72, 44, 4, 2, 1, 0),
+        hints,
+    );
+    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
+        return;
+    };
+    let content = layout.content;
+    let label_width = 12usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // The shape row: a closed set with two values, drawn the way every other
+    // closed set in this client is drawn.
+    let mode_selected = form.field == ScheduleField::Mode;
+    lines.push(Line::from(vec![
+        Span::styled(
+            if mode_selected { "▸ " } else { "  " },
+            Style::default().fg(theme.roles.accent_user),
+        ),
+        Span::styled(
+            format!(
+                "{:<label_width$}",
+                truncate_to_width(strings.schedule_field_mode(), label_width, "…")
+            ),
+            if mode_selected {
+                Style::default()
+                    .fg(theme.roles.accent_user)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.roles.gray)
+            },
+        ),
+        Span::styled(
+            format!("‹ {} ›", form.mode.label(strings)),
+            Style::default().fg(if mode_selected {
+                theme.roles.foreground
+            } else {
+                theme.roles.text_secondary
+            }),
+        ),
+    ]));
+    // Then the fields the shape actually has. A field the shape does not use is
+    // not drawn greyed: it does not exist until the shape is changed, and a row
+    // that could not be acted on would only be something to skip past.
+    let fields = match form.mode {
+        ScheduleMode::At => vec![(ScheduleField::When, strings.schedule_field_when())],
+        ScheduleMode::After => vec![
+            (ScheduleField::Hours, strings.schedule_field_hours()),
+            (ScheduleField::Minutes, strings.schedule_field_minutes()),
+            (ScheduleField::Seconds, strings.schedule_field_seconds()),
+        ],
+    };
+    for (field, label) in fields {
+        let selected = form.field == field;
+        let value = form.value(field).cloned().unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "▸ " } else { "  " },
+                Style::default().fg(theme.roles.accent_user),
+            ),
+            Span::styled(
+                format!(
+                    "{:<label_width$}",
+                    truncate_to_width(label, label_width, "…")
+                ),
+                if selected {
+                    Style::default()
+                        .fg(theme.roles.accent_user)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.roles.gray)
+                },
+            ),
+            Span::styled(
+                truncate_to_width(
+                    &value,
+                    usize::from(content.width).saturating_sub(label_width + 8),
+                    "…",
+                ),
+                if selected {
+                    Style::default()
+                        .fg(theme.roles.foreground)
+                        .bg(theme.roles.surface_highlight)
+                } else {
+                    Style::default().fg(theme.roles.foreground)
+                },
+            ),
+            Span::styled(
+                if selected { "▏" } else { "" },
+                Style::default().fg(theme.roles.accent_user),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    let hint = match form.mode {
+        ScheduleMode::At => strings.schedule_when_hint(),
+        ScheduleMode::After => strings.schedule_countdown_hint(),
+    };
+    for row in wrap_hint(hint, usize::from(content.width).saturating_sub(2)) {
+        lines.push(Line::from(Span::styled(
+            format!("  {row}"),
+            Style::default().fg(theme.roles.gray_dim),
+        )));
+    }
+    if let Some(error) = form.error {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", error.message(strings)),
+            Style::default()
+                .fg(theme.roles.danger)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    for row in wrap_hint(
+        strings.schedule_note(),
+        usize::from(content.width).saturating_sub(2),
+    ) {
+        lines.push(Line::from(Span::styled(
+            format!("  {row}"),
+            Style::default().fg(theme.roles.gray_dim),
+        )));
+    }
+    let visible = lines
+        .into_iter()
+        .take(usize::from(content.height))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), content);
+}
+
+/// Cut one sentence into the rows a modal's width can hold, on word
+/// boundaries. The modal is a fixed size, so a line that overflowed would be
+/// silently clipped rather than wrapped by the paragraph widget.
+fn wrap_hint(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for word in text.split_whitespace() {
+        if row.is_empty() {
+            row.push_str(word);
+        } else if display_width(&row) + 1 + display_width(word) <= width {
+            row.push(' ');
+            row.push_str(word);
+        } else {
+            rows.push(std::mem::take(&mut row));
+            row.push_str(word);
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
 /// The action menu for one record.
 fn render_entry_actions(
     frame: &mut Frame<'_>,
@@ -5873,6 +6221,9 @@ fn render_overlay(
     match overlay {
         Overlay::Form { form } => {
             render_config_form(frame, area, app, form, theme);
+        }
+        Overlay::Schedule(form) => {
+            render_message_schedule(frame, area, app, form, theme);
         }
         Overlay::EntryActions { entry } => {
             render_entry_actions(frame, area, app, entry, theme);
