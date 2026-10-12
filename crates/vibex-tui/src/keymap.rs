@@ -993,6 +993,14 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::ConfirmOverlay,
         "Confirm",
     ),
+    // The configuration form's one write key. It is an overlay-wide chord
+    // because `Ctrl+S` means "save" in every form this client will grow.
+    binding(
+        Scope::Overlay,
+        Chord::ctrl('s'),
+        Intent::ConfigFormSave,
+        "Save",
+    ),
     binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Tab),
@@ -1102,7 +1110,10 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::ResetRunOption,
         "Reset",
     ),
-    // ---- deviceless pages ------------------------------------------------
+    // ---- the configuration centre ----------------------------------------
+    // One scope for the whole centre: the module tabs, the area rail, the
+    // record table and the detail pane are four zones of one surface, so the
+    // keys that move between them are declared once rather than per page.
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Up),
@@ -1117,141 +1128,99 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     ),
     binding(
         Scope::Management,
-        Chord::plain(KeyCode::Enter),
-        Intent::OpenManagementSection,
-        "Open",
-    ),
-    binding(
-        Scope::Providers,
-        Chord::plain(KeyCode::Up),
+        Chord::plain(KeyCode::Char('k')),
         Intent::SelectPrevious,
         "Previous",
-    ),
-    binding(
-        Scope::Providers,
-        Chord::plain(KeyCode::Down),
-        Intent::SelectNext,
-        "Next",
-    ),
-    binding(
-        Scope::Providers,
-        Chord::plain(KeyCode::Enter),
-        Intent::ActivateProviderProfile,
-        "Use profile",
-    ),
-    binding(
-        Scope::Providers,
-        Chord::plain(KeyCode::Char('e')),
-        Intent::EditProviderProfile,
-        "Edit profile",
-    ),
-    binding(
-        Scope::Providers,
-        Chord::plain(KeyCode::Char('s')),
-        Intent::EditProviderSecret,
-        "Set credential",
-    ),
-    binding(
-        Scope::Providers,
-        Chord::plain(KeyCode::Char('t')),
-        Intent::TestProviderProfile,
-        "Test connection",
-    ),
-    binding(
-        Scope::Providers,
-        Chord::plain(KeyCode::Char('m')),
-        Intent::FetchProviderModels,
-        "Fetch models",
-    ),
-    binding(
-        Scope::Providers,
-        Chord::plain(KeyCode::Char('p')),
-        Intent::EditProviderProjection,
-        "Edit settings",
-    ),
-    binding(
-        Scope::Mcp,
-        Chord::plain(KeyCode::Up),
-        Intent::SelectPrevious,
-        "Previous",
-    ),
-    binding(
-        Scope::Mcp,
-        Chord::plain(KeyCode::Down),
-        Intent::SelectNext,
-        "Next",
-    ),
-    binding(
-        Scope::Mcp,
-        Chord::plain(KeyCode::Char(' ')),
-        Intent::ToggleSelectedEntry,
-        "Enable / disable",
-    ),
-    binding(
-        Scope::Mcp,
-        Chord::plain(KeyCode::Char('e')),
-        Intent::EditSelectedEntry,
-        "Edit",
-    ),
-    binding(
-        Scope::Skills,
-        Chord::plain(KeyCode::Up),
-        Intent::SelectPrevious,
-        "Previous",
-    ),
-    binding(
-        Scope::Skills,
-        Chord::plain(KeyCode::Down),
-        Intent::SelectNext,
-        "Next",
-    ),
-    binding(
-        Scope::Skills,
-        Chord::plain(KeyCode::Char(' ')),
-        Intent::ToggleSelectedEntry,
-        "Enable / disable",
-    ),
-    binding(
-        Scope::Skills,
-        Chord::plain(KeyCode::Char('e')),
-        Intent::EditSelectedEntry,
-        "Edit",
-    ),
-    binding(
-        Scope::Prompts,
-        Chord::plain(KeyCode::Up),
-        Intent::SelectPrevious,
-        "Previous",
-    ),
-    binding(
-        Scope::Prompts,
-        Chord::plain(KeyCode::Down),
-        Intent::SelectNext,
-        "Next",
-    ),
-    binding(
-        Scope::Prompts,
-        Chord::plain(KeyCode::Char(' ')),
-        Intent::ToggleSelectedEntry,
-        "Enable / disable",
-    ),
-    binding(
-        Scope::Prompts,
-        Chord::plain(KeyCode::Char('e')),
-        Intent::EditSelectedEntry,
-        "Edit",
     ),
     binding(
         Scope::Management,
-        Chord::plain(KeyCode::Char('a')),
-        Intent::InstallOrUpdateAgent,
-        "Install / update",
+        Chord::plain(KeyCode::Char('j')),
+        Intent::SelectNext,
+        "Next",
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char('h')),
+        Intent::ConfigPanePrevious,
+        "Pane",
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('l')),
-        Intent::AgentAuthMenu,
-        "Sign in",
+        Intent::ConfigPaneNext,
+        "Pane",
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Left),
+        Intent::ConfigPanePrevious,
+        "Pane",
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Right),
+        Intent::ConfigPaneNext,
+        "Pane",
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Tab),
+        Intent::ConfigSectionNext,
+        "Area",
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::BackTab),
+        Intent::ConfigSectionPrevious,
+        "Area",
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Enter),
+        Intent::ConfigEntryActions,
+        "Actions",
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char(' ')),
+        Intent::ToggleSelectedEntry,
+        "Enable / disable",
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char('e')),
+        Intent::EditSelectedEntry,
+        "Edit",
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char('n')),
+        Intent::ConfigEntryCreate,
+        "New",
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char('d')),
+        Intent::ConfigEntryDelete,
+        "Delete",
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char('r')),
+        Intent::ReloadManagement,
+        "Reload",
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char('[')),
+        Intent::ConfigModulePrevious,
+        "Module",
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char(']')),
+        Intent::ConfigModuleNext,
+        "Module",
     ),
     // ---- devices ---------------------------------------------------------
     binding(
@@ -1496,34 +1465,10 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Chord::plain(KeyCode::Char('g')),
         Intent::CompletionCancel,
     ),
-    // ---- files / changes extras ------------------------------------------
-    binding(
-        Scope::Management,
-        Chord::ctrl('x'),
-        Intent::UninstallAgent,
-        "Uninstall",
-    ),
-    binding(
-        Scope::Management,
-        Chord::plain(KeyCode::Char('p')),
-        Intent::AgentAuthRefresh,
-        "Re-probe auth",
-    ),
-    binding(
-        Scope::Management,
-        Chord::plain(KeyCode::Char('o')),
-        Intent::AgentLogout,
-        "Sign out",
-    ),
     alias(
         Scope::Management,
         Chord::ctrl('r'),
         Intent::ReloadManagement,
-    ),
-    alias(
-        Scope::Providers,
-        Chord::plain(KeyCode::Char('h')),
-        Intent::ProviderHealth,
     ),
 ];
 

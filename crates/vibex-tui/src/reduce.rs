@@ -16,9 +16,9 @@ use vibex_core::{
 
 use crate::action::Intent;
 use crate::app::{
-    App, Availability, ClipboardWanted, ComposerTarget, Effect, Focus, ManagementRow, Overlay,
-    Page, PendingCreation, PromptField, RunOption, RunOptionKey, RunOptionKind, RuntimePickerView,
-    Toast, WorkspacePickerRow,
+    App, Availability, ClipboardWanted, ComposerTarget, Effect, Focus, Overlay, Page,
+    PendingCreation, PromptField, RunOption, RunOptionKey, RunOptionKind, RuntimePickerView, Toast,
+    WorkspacePickerRow,
 };
 use crate::composer::{CompletionMenu, CompletionTrigger};
 use crate::keymap::Scope;
@@ -35,14 +35,14 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    fn effects(effects: Vec<Effect>) -> Self {
+    pub fn effects(effects: Vec<Effect>) -> Self {
         Self {
             effects,
             dirty: true,
         }
     }
 
-    fn quiet() -> Self {
+    pub fn quiet() -> Self {
         Self::default()
     }
 }
@@ -168,7 +168,10 @@ impl App {
             }
             Intent::GotoManagement => {
                 self.select_global(vibex_ui::shell::GlobalDestination::Management);
-                Outcome::effects(vec![])
+                // The centre opens on the Agent roster, which is a read: a page
+                // that showed an empty table until the reader pressed `r` would
+                // be a page that looks broken on arrival.
+                Outcome::effects(self.config_section_effects())
             }
             Intent::ToggleSidebar => {
                 self.toggle_sidebar_collapsed();
@@ -278,6 +281,12 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::BeginFilter => {
+                if self.page == Page::Management {
+                    self.config_center.filtering = true;
+                    self.config_center.filter.clear();
+                    self.config_center.set_cursor(0);
+                    return Outcome::effects(vec![]);
+                }
                 if self.page == Page::Settings {
                     // The settings filter is the surface's own mode, not the
                     // list filter the other pages share.
@@ -289,6 +298,12 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::ClearFilter => {
+                if self.page == Page::Management {
+                    self.config_center.filter.clear();
+                    self.config_center.filtering = false;
+                    self.config_center.set_cursor(0);
+                    return Outcome::effects(vec![]);
+                }
                 if self.page == Page::Settings {
                     self.leave_settings_filter(true);
                     return Outcome::effects(vec![]);
@@ -950,49 +965,51 @@ impl App {
             | Intent::OverlayNextField
             | Intent::OverlayPreviousField => Outcome::quiet(),
 
-            // ---- management ------------------------------------------------
-            Intent::OpenManagementSection => {
-                let index = self.selection_for(Scope::Management);
-                let Some(row) = ManagementRow::ALL.get(index) else {
-                    return Outcome::quiet();
-                };
-                self.navigate_to(row.page());
-                self.refresh_current_page()
+            // ---- configuration centre --------------------------------------
+            Intent::ConfigModulePrevious => {
+                self.config_center.step_module(-1);
+                Outcome::effects(self.config_section_effects())
             }
-            Intent::ReloadManagement => self.refresh_current_page(),
+            Intent::ConfigModuleNext => {
+                self.config_center.step_module(1);
+                Outcome::effects(self.config_section_effects())
+            }
+            Intent::ConfigSectionPrevious => {
+                self.config_center.step_section(-1);
+                Outcome::effects(self.config_section_effects())
+            }
+            Intent::ConfigSectionNext => {
+                self.config_center.step_section(1);
+                Outcome::effects(self.config_section_effects())
+            }
+            Intent::ConfigPaneNext => {
+                self.config_center.step_zone(1);
+                Outcome::effects(vec![])
+            }
+            Intent::ConfigPanePrevious => {
+                self.config_center.step_zone(-1);
+                Outcome::effects(vec![])
+            }
+            Intent::ConfigEntryActions => self.open_entry_actions(),
+            Intent::ConfigEntryCreate => self.begin_entry_form(None),
+            Intent::ConfigEntryDelete => self.confirm_entry_delete(),
+            // The three verbs every record shares. They mean the same thing in
+            // every module, which is why they are keys; everything a *kind* of
+            // record can also do lives in the action menu, where the row itself
+            // decides what is offered.
             Intent::ToggleSelectedEntry => self.toggle_selected_entry(),
-            Intent::EditSelectedEntry => self.begin_edit_entry(),
-            Intent::InstallOrUpdateAgent => self.install_selected_agent(false),
-            Intent::UninstallAgent => self.install_selected_agent(true),
-            Intent::AgentAuthMenu => self.list_agent_auth(),
-            Intent::AgentAuthRefresh => self.list_agent_auth(),
-            Intent::AgentLogout => self.logout_selected_agent(),
-            Intent::ActivateProviderProfile => self.activate_provider_profile(),
-            Intent::EditProviderProfile => {
-                self.overlay = Some(Overlay::Prompt {
-                    title: self.strings.management_providers().to_string(),
-                    field: PromptField::ProviderEndpoint,
-                    value: String::new(),
-                });
-                Outcome::effects(vec![])
+            Intent::EditSelectedEntry => {
+                let row = self.selected_config_row();
+                self.begin_entry_form(row)
             }
-            Intent::EditProviderProjection => {
-                self.toast(Toast::info(
-                    self.strings.management_form_essentials().to_string(),
-                ));
-                Outcome::quiet()
+            Intent::ConfigFormSave => Outcome::quiet(),
+            Intent::GotoDevices => {
+                self.navigate_to(Page::Devices);
+                Outcome::effects(vec![Effect::ListDevices])
             }
-            Intent::EditProviderSecret => {
-                self.overlay = Some(Overlay::Prompt {
-                    title: self.strings.management_providers().to_string(),
-                    field: PromptField::ProviderSecret,
-                    value: String::new(),
-                });
-                Outcome::effects(vec![])
-            }
-            Intent::TestProviderProfile => self.test_provider_profile(),
-            Intent::FetchProviderModels => self.fetch_provider_models(),
-            Intent::ProviderHealth => Outcome::effects(vec![Effect::ListHealth]),
+
+            // ---- management ------------------------------------------------
+            Intent::ReloadManagement => self.refresh_current_page(),
             Intent::CreatePairingCode => {
                 let availability = self.availability(BackendOperation::DevicePairing);
                 match availability {
@@ -1030,6 +1047,1148 @@ impl App {
             | Intent::ManageRuntimeAccount
             | Intent::ResetRunOption => Outcome::quiet(),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // the configuration centre
+    // -----------------------------------------------------------------
+
+    /// The rows the centre's table is drawing right now.
+    fn visible_config_rows(&self) -> Vec<crate::config_center::ConfigRow> {
+        self.config_center
+            .visible(&self.management_data, self.strings)
+    }
+
+    fn selected_config_row(&self) -> Option<crate::config_center::ConfigRow> {
+        self.config_center
+            .selected(&self.management_data, self.strings)
+    }
+
+    /// Read whatever the area being opened needs and does not already hold.
+    ///
+    /// The three list areas every module owns are read on entry; the registry
+    /// and the import areas are read on demand, because a search costs a
+    /// network round trip and a reader who never opens the registry should
+    /// never pay for one.
+    fn config_section_effects(&mut self) -> Vec<Effect> {
+        use crate::config_center::ConfigSection;
+        match (self.config_center.module, self.config_center.section) {
+            (_, ConfigSection::Agents) => vec![Effect::ListAgents],
+            (_, ConfigSection::Providers) | (_, ConfigSection::Health) => {
+                vec![Effect::ListProfiles, Effect::ListHealth]
+            }
+            (_, ConfigSection::Servers) => vec![Effect::ListMcp],
+            (_, ConfigSection::Installed) => vec![Effect::ListSkills],
+            (_, ConfigSection::Prompts) => vec![Effect::ListPrompts],
+            (_, ConfigSection::Hooks) => vec![Effect::ListHooks],
+            (module, ConfigSection::Catalog) => vec![Effect::SearchRegistry {
+                module,
+                query: self.config_center.filter.clone(),
+            }],
+            (module, ConfigSection::Sources) => vec![Effect::DiscoverSources { module }],
+        }
+    }
+
+    /// `Enter`: everything the highlighted record can do.
+    fn open_entry_actions(&mut self) -> Outcome {
+        let Some(row) = self.selected_config_row() else {
+            return Outcome::quiet();
+        };
+        if row.actions.is_empty() {
+            return Outcome::quiet();
+        }
+        // A health row is a report, not a record: its one action is a probe,
+        // which the menu would charge two presses for.
+        if row.actions.len() == 1 {
+            return self.run_config_action(&row, row.actions[0]);
+        }
+        self.overlay = Some(Overlay::EntryActions {
+            entry: crate::config_center::EntryActions {
+                title: row.title.clone(),
+                row_key: row.key.clone(),
+                actions: row.actions.clone(),
+                selected: 0,
+            },
+        });
+        Outcome::effects(vec![])
+    }
+
+    fn perform_entry_actions(
+        &mut self,
+        intent: Intent,
+        entry: crate::config_center::EntryActions,
+    ) -> Outcome {
+        let last = entry.actions.len().saturating_sub(1);
+        match intent {
+            Intent::SelectPrevious | Intent::ScrollPageUp => {
+                self.overlay = Some(Overlay::EntryActions {
+                    entry: crate::config_center::EntryActions {
+                        selected: entry.selected.saturating_sub(1),
+                        ..entry
+                    },
+                });
+                Outcome::effects(vec![])
+            }
+            Intent::SelectNext | Intent::ScrollPageDown => {
+                self.overlay = Some(Overlay::EntryActions {
+                    entry: crate::config_center::EntryActions {
+                        selected: (entry.selected + 1).min(last),
+                        ..entry
+                    },
+                });
+                Outcome::effects(vec![])
+            }
+            Intent::ConfirmOverlay => {
+                let Some(action) = entry.actions.get(entry.selected).copied() else {
+                    return Outcome::quiet();
+                };
+                self.overlay = None;
+                self.run_config_action_by_key(&entry.row_key, action)
+            }
+            _ => Outcome::quiet(),
+        }
+    }
+
+    /// Run one action against the record it was drawn for.
+    ///
+    /// The record is resolved by key rather than by cursor position: a read
+    /// that lands while the menu is open must not make the choice write to the
+    /// record that took the cursor's place.
+    fn run_config_action(
+        &mut self,
+        row: &crate::config_center::ConfigRow,
+        action: crate::config_center::ConfigAction,
+    ) -> Outcome {
+        let key = row.key.clone();
+        self.run_config_action_by_key(&key, action)
+    }
+
+    pub fn run_config_action_by_key(
+        &mut self,
+        key: &str,
+        action: crate::config_center::ConfigAction,
+    ) -> Outcome {
+        // The two verbs that cannot be undone ask before they run. The answer
+        // comes back through `perform_confirm`, which calls the write below
+        // directly: re-entering this function would ask again for ever.
+        if action.is_destructive() {
+            self.pending_config_action = Some((key.to_string(), action));
+            self.confirm_config_delete(key, Intent::ConfigEntryDelete);
+            return Outcome::effects(vec![]);
+        }
+        self.exec_config_action(key, action)
+    }
+
+    /// The write one row's verb performs, once it has been decided on.
+    fn exec_config_action(
+        &mut self,
+        key: &str,
+        action: crate::config_center::ConfigAction,
+    ) -> Outcome {
+        use crate::config_center::{ConfigAction, ConfigSection};
+        let section = self.config_center.section;
+        match (section, action) {
+            (ConfigSection::Agents, ConfigAction::Toggle) => {
+                let Some(agent) = self
+                    .management_data
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id.as_str() == key)
+                else {
+                    return Outcome::quiet();
+                };
+                let request = crate::app::ConfigMutation::ToggleAgent {
+                    agent_id: agent.id.clone(),
+                    enabled: !agent.enabled,
+                };
+                self.begin_config_mutation(request)
+            }
+            (ConfigSection::Agents, ConfigAction::Install) => {
+                let Some(agent) = self
+                    .management_data
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id.as_str() == key)
+                else {
+                    return Outcome::quiet();
+                };
+                let agent_id = agent.id.clone();
+                self.guard(
+                    BackendOperation::ManagementAgents,
+                    Effect::InstallAgent { agent_id },
+                )
+            }
+            (ConfigSection::Agents, ConfigAction::Rollback) => {
+                let Some(agent_id) = self.agent_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.begin_config_mutation(crate::app::ConfigMutation::RollbackAgent { agent_id })
+            }
+            (ConfigSection::Agents, ConfigAction::CheckUpdate) => {
+                let Some(agent_id) = self.agent_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.begin_config_mutation(crate::app::ConfigMutation::CheckAgentUpdate {
+                    agent_id,
+                })
+            }
+            (ConfigSection::Agents, ConfigAction::RefreshSnapshot) => {
+                let Some(agent_id) = self.agent_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.begin_config_mutation(crate::app::ConfigMutation::RefreshAgentSnapshot {
+                    agent_id,
+                })
+            }
+            (ConfigSection::Agents, ConfigAction::Uninstall) => {
+                let Some(agent_id) = self.agent_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.guard(
+                    BackendOperation::ManagementAgents,
+                    Effect::UninstallAgent { agent_id },
+                )
+            }
+            (ConfigSection::Agents, ConfigAction::Auth) => {
+                let Some(agent_id) = self.agent_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.guard(
+                    BackendOperation::AgentAuthRead,
+                    Effect::ListAgentAuth { agent_id },
+                )
+            }
+            (ConfigSection::Agents, ConfigAction::Logout) => {
+                let Some(agent_id) = self.agent_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.guard(
+                    BackendOperation::AgentAuthManage,
+                    Effect::LogoutAgent { agent_id },
+                )
+            }
+            (ConfigSection::Providers, ConfigAction::Activate) => {
+                let Some(profile_id) = self.provider_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.guard(
+                    BackendOperation::ManagementProfileSelect,
+                    Effect::SelectProfile { profile_id },
+                )
+            }
+            (ConfigSection::Providers, ConfigAction::Secret) => {
+                self.overlay = Some(Overlay::Prompt {
+                    title: self.strings.config_action_secret().to_string(),
+                    field: PromptField::ProviderSecret,
+                    value: String::new(),
+                });
+                Outcome::effects(vec![])
+            }
+            (ConfigSection::Providers, ConfigAction::Test) => {
+                let Some(profile_id) = self.provider_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.guard(
+                    BackendOperation::ManagementProviderProfileTest,
+                    Effect::TestProviderProfile { profile_id },
+                )
+            }
+            (ConfigSection::Providers, ConfigAction::FetchModels) => {
+                let Some(profile_id) = self.provider_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.guard(
+                    BackendOperation::ManagementProviderModelFetch,
+                    Effect::FetchProviderModels { profile_id },
+                )
+            }
+            (ConfigSection::Providers, ConfigAction::Delete) => {
+                let Some(profile_id) = self.provider_id(key) else {
+                    return Outcome::quiet();
+                };
+                let Some(agent_id) = self.profile_agent_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.begin_config_mutation(crate::app::ConfigMutation::DeleteProviderProfile {
+                    agent_id,
+                    profile_id,
+                })
+            }
+            (ConfigSection::Health, ConfigAction::Probe) => {
+                self.begin_config_mutation(crate::app::ConfigMutation::RunHealthProbes)
+            }
+            (ConfigSection::Servers, ConfigAction::Toggle) => {
+                let Some(server) = self.mcp_server(key) else {
+                    return Outcome::quiet();
+                };
+                Outcome::effects(vec![Effect::ToggleMcp {
+                    server_id: server.id.clone(),
+                    enabled: server.status != vibex_core::McpServerStatus::Enabled,
+                }])
+            }
+            (ConfigSection::Servers, ConfigAction::Validate) => {
+                let Some(server) = self.mcp_server(key) else {
+                    return Outcome::quiet();
+                };
+                let server_id = server.id.clone();
+                self.begin_config_mutation(crate::app::ConfigMutation::ValidateMcpServer {
+                    server_id,
+                })
+            }
+            (ConfigSection::Servers, ConfigAction::Matrix)
+            | (ConfigSection::Installed, ConfigAction::Matrix) => self.begin_matrix_form(key),
+            (ConfigSection::Servers, ConfigAction::Delete) => {
+                let Some(server) = self.mcp_server(key) else {
+                    return Outcome::quiet();
+                };
+                let server_id = server.id.clone();
+                self.begin_config_mutation(crate::app::ConfigMutation::DeleteMcpServer {
+                    server_id,
+                })
+            }
+            (ConfigSection::Installed, ConfigAction::Toggle) => {
+                let Some(skill) = self.skill(key) else {
+                    return Outcome::quiet();
+                };
+                Outcome::effects(vec![Effect::ToggleSkill {
+                    skill_id: skill.id.clone(),
+                    enabled: skill.status != vibex_core::SkillStatus::Enabled,
+                }])
+            }
+            (ConfigSection::Installed, ConfigAction::Validate) => {
+                let Some(skill) = self.skill(key) else {
+                    return Outcome::quiet();
+                };
+                let skill_id = skill.id.clone();
+                self.begin_config_mutation(crate::app::ConfigMutation::ValidateSkill { skill_id })
+            }
+            (ConfigSection::Installed, ConfigAction::Delete) => {
+                let Some(skill) = self.skill(key) else {
+                    return Outcome::quiet();
+                };
+                let skill_id = skill.id.clone();
+                self.begin_config_mutation(crate::app::ConfigMutation::DeleteSkill { skill_id })
+            }
+            (ConfigSection::Prompts, ConfigAction::Toggle) => {
+                let Some(prompt) = self.prompt(key) else {
+                    return Outcome::quiet();
+                };
+                Outcome::effects(vec![Effect::TogglePrompt {
+                    prompt_id: prompt.id.clone(),
+                    enabled: prompt.status != vibex_core::PromptStatus::Enabled,
+                }])
+            }
+            (ConfigSection::Prompts, ConfigAction::Delete) => {
+                let Some(prompt) = self.prompt(key) else {
+                    return Outcome::quiet();
+                };
+                let prompt_id = prompt.id.clone();
+                self.begin_config_mutation(crate::app::ConfigMutation::DeletePrompt { prompt_id })
+            }
+            (ConfigSection::Prompts, ConfigAction::Validate) => {
+                self.toast(Toast::info(
+                    self.strings.config_action_validate().to_string(),
+                ));
+                Outcome::quiet()
+            }
+            (ConfigSection::Hooks, ConfigAction::Toggle) => {
+                let Some(hook) = self.hook(key) else {
+                    return Outcome::quiet();
+                };
+                let status = if hook.status == vibex_core::HookStatus::Enabled {
+                    vibex_core::HookStatus::Disabled
+                } else {
+                    vibex_core::HookStatus::Enabled
+                };
+                self.begin_config_mutation(crate::app::ConfigMutation::UpdateHook(Box::new(
+                    vibex_core::HookUpdateRequest {
+                        hook_id: hook.id.clone(),
+                        display_name: None,
+                        provider_kind: None,
+                        event_kind: None,
+                        status: Some(status),
+                        install_state: None,
+                        command_preview: None,
+                        managed_marker: None,
+                        description: None,
+                    },
+                )))
+            }
+            (ConfigSection::Hooks, ConfigAction::Preview) => {
+                let Some(hook_id) = self.hook_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.begin_config_mutation(crate::app::ConfigMutation::PreviewHookInstall {
+                    hook_id,
+                })
+            }
+            (ConfigSection::Hooks, ConfigAction::Delete) => {
+                let Some(hook_id) = self.hook_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.begin_config_mutation(crate::app::ConfigMutation::DeleteHook { hook_id })
+            }
+            (ConfigSection::Catalog, ConfigAction::Install) => self.install_registry_entry(key),
+            (ConfigSection::Sources, ConfigAction::Import) => self.import_discovery(key),
+            _ => Outcome::quiet(),
+        }
+    }
+
+    fn agent_id(&self, key: &str) -> Option<vibex_core::AgentId> {
+        self.management_data
+            .agents
+            .iter()
+            .find(|agent| agent.id.as_str() == key)
+            .map(|agent| agent.id.clone())
+    }
+
+    fn provider_id(&self, key: &str) -> Option<vibex_core::ProviderProfileId> {
+        self.management_data
+            .providers
+            .iter()
+            .find(|profile| profile.id.as_str() == key)
+            .map(|profile| profile.id.clone())
+    }
+
+    fn hook_id(&self, key: &str) -> Option<vibex_core::HookId> {
+        self.management_data
+            .hooks
+            .iter()
+            .find(|hook| hook.id.as_str() == key)
+            .map(|hook| hook.id.clone())
+    }
+
+    fn mcp_server(&self, key: &str) -> Option<&vibex_core::McpServer> {
+        self.management_data
+            .mcp
+            .iter()
+            .find(|server| server.id.as_str() == key)
+    }
+
+    fn skill(&self, key: &str) -> Option<&vibex_core::Skill> {
+        self.management_data
+            .skills
+            .iter()
+            .find(|skill| skill.id.as_str() == key)
+    }
+
+    fn prompt(&self, key: &str) -> Option<&vibex_core::Prompt> {
+        self.management_data
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id.as_str() == key)
+    }
+
+    fn hook(&self, key: &str) -> Option<&vibex_core::Hook> {
+        self.management_data
+            .hooks
+            .iter()
+            .find(|hook| hook.id.as_str() == key)
+    }
+
+    fn profile_agent_id(&self, key: &str) -> Option<vibex_core::AgentId> {
+        self.management_data
+            .providers
+            .iter()
+            .find(|profile| profile.id.as_str() == key)
+            .map(|profile| profile.agent_id.clone())
+    }
+
+    /// `d`, and the delete row of the action menu.
+    fn confirm_entry_delete(&mut self) -> Outcome {
+        let Some(row) = self.selected_config_row() else {
+            return Outcome::quiet();
+        };
+        let action = if row
+            .actions
+            .contains(&crate::config_center::ConfigAction::Delete)
+        {
+            crate::config_center::ConfigAction::Delete
+        } else if row
+            .actions
+            .contains(&crate::config_center::ConfigAction::Uninstall)
+        {
+            crate::config_center::ConfigAction::Uninstall
+        } else {
+            return Outcome::quiet();
+        };
+        self.run_config_action(&row, action)
+    }
+
+    fn confirm_config_delete(&mut self, label: &str, confirm: Intent) {
+        let uninstall = self
+            .pending_config_action
+            .as_ref()
+            .is_some_and(|(_, action)| *action == crate::config_center::ConfigAction::Uninstall);
+        let (title, explanation) = if uninstall {
+            (
+                self.strings.config_confirm_uninstall_title(),
+                self.strings.config_confirm_uninstall_body(),
+            )
+        } else {
+            (
+                self.strings.config_confirm_delete_title(),
+                self.strings.config_confirm_delete_body(),
+            )
+        };
+        let body = if label.is_empty() {
+            explanation.to_string()
+        } else {
+            format!("{label}\n\n{explanation}")
+        };
+        self.overlay = Some(Overlay::Confirm {
+            title: title.to_string(),
+            body,
+            confirm,
+        });
+    }
+
+    /// `e` / `n`: open the form for a record, or the blank one for a new one.
+    fn begin_entry_form(&mut self, row: Option<crate::config_center::ConfigRow>) -> Outcome {
+        use crate::config_center::{ConfigModule, ConfigSection};
+        let strings = self.strings;
+        let key = row.as_ref().map(|row| row.key.as_str());
+        let form = match (self.config_center.module, self.config_center.section) {
+            (ConfigModule::Mcp, ConfigSection::Servers) => {
+                let server = key.and_then(|key| self.mcp_server(key)).cloned();
+                Some(crate::config_center::mcp_form(server.as_ref(), strings))
+            }
+            (ConfigModule::Skills, ConfigSection::Installed) => {
+                let skill = key.and_then(|key| self.skill(key)).cloned();
+                Some(crate::config_center::skill_form(skill.as_ref(), strings))
+            }
+            (ConfigModule::Prompts, ConfigSection::Prompts) => {
+                let prompt = key.and_then(|key| self.prompt(key)).cloned();
+                Some(crate::config_center::prompt_form(prompt.as_ref(), strings))
+            }
+            (ConfigModule::Prompts, ConfigSection::Hooks) => {
+                let hook = key.and_then(|key| self.hook(key)).cloned();
+                Some(crate::config_center::hook_form(hook.as_ref(), strings))
+            }
+            (ConfigModule::Agent, ConfigSection::Providers) => {
+                let profile = key
+                    .and_then(|key| {
+                        self.management_data
+                            .providers
+                            .iter()
+                            .find(|profile| profile.id.as_str() == key)
+                    })
+                    .cloned();
+                profile.map(|profile| crate::config_center::provider_form(&profile, strings))
+            }
+            _ => None,
+        };
+        match form {
+            Some(form) => {
+                self.overlay = Some(Overlay::Form { form });
+                Outcome::effects(vec![])
+            }
+            None => Outcome::quiet(),
+        }
+    }
+
+    /// The per-Agent matrix of one MCP server or Skill.
+    /// Install one registry entry the reader chose.
+    ///
+    /// The entry is resolved here, where the page the registry answered is
+    /// still in hand: the install request needs the entry's own launcher, and
+    /// the row key alone would make the worker guess at it.
+    fn install_registry_entry(&mut self, key: &str) -> Outcome {
+        use crate::config_center::ConfigModule;
+        if self.config_center.module == ConfigModule::Mcp {
+            let Some(entry) = self
+                .management_data
+                .mcp_market
+                .iter()
+                .find(|entry| entry.id == key)
+                .cloned()
+            else {
+                return Outcome::quiet();
+            };
+            let env = entry
+                .env
+                .iter()
+                .map(|requirement| {
+                    let value = requirement.default_value.clone().unwrap_or_default();
+                    (requirement.name.clone(), value)
+                })
+                .collect::<Vec<_>>();
+            let candidate = vibex_core::McpServerCreateRequest {
+                display_name: entry.name.clone(),
+                transport_kind: entry.transport,
+                status: vibex_core::McpServerStatus::Enabled,
+                scope_kind: vibex_core::McpServerScopeKind::User,
+                project_id: None,
+                workspace_id: None,
+                command: entry.command.clone(),
+                args: entry.args.clone(),
+                env: env
+                    .iter()
+                    .map(|(name, value)| vibex_core::McpServerEnvEntry {
+                        name: name.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+                url: entry.url.clone(),
+                headers: Vec::new(),
+                description: entry.description.clone(),
+                tags: vec!["market".to_string()],
+                secret_references: Vec::new(),
+                provider_matrix: Vec::new(),
+            };
+            let env_values = candidate.env.clone();
+            return self.begin_config_mutation(crate::app::ConfigMutation::InstallMcpMarketEntry {
+                entry_id: entry.id.clone(),
+                candidate: Box::new(candidate),
+                env_values,
+            });
+        }
+        let Some(entry) = self
+            .management_data
+            .skill_market
+            .iter()
+            .find(|entry| entry.id == key)
+            .cloned()
+        else {
+            return Outcome::quiet();
+        };
+        self.begin_config_mutation(crate::app::ConfigMutation::InstallSkillMarketEntry {
+            entry_id: entry.id.clone(),
+            slug: entry.slug.clone(),
+            owner_handle: entry.owner_handle.clone(),
+            version: entry.version.clone(),
+        })
+    }
+
+    /// Import one discovered resource, carrying the candidate the runtime
+    /// published for it.
+    fn import_discovery(&mut self, key: &str) -> Outcome {
+        use crate::config_center::ConfigModule;
+        if self.config_center.module == ConfigModule::Mcp {
+            let Some(selection) = self
+                .management_data
+                .mcp_discoveries
+                .iter()
+                .find(|discovery| discovery.discovery_id == key)
+                .and_then(|discovery| {
+                    discovery.candidate.clone().map(|candidate| {
+                        vibex_core::McpServerImportSelection {
+                            discovery_id: discovery.discovery_id.clone(),
+                            source_agent_id: discovery.source_agent_id.clone(),
+                            candidate,
+                            enable_agent_ids: vec![discovery.source_agent_id.clone()],
+                        }
+                    })
+                })
+            else {
+                return Outcome::quiet();
+            };
+            return self.begin_config_mutation(crate::app::ConfigMutation::ImportMcpServer {
+                selection: Box::new(selection),
+            });
+        }
+        let Some(selection) = self
+            .management_data
+            .skill_discoveries
+            .iter()
+            .find(|discovery| discovery.discovery_id == key)
+            .map(|discovery| vibex_core::SkillImportSelection {
+                discovery_id: discovery.discovery_id.clone(),
+                source_agent_id: discovery.source_agent_id.clone(),
+                source_path: discovery.source_path.clone(),
+                display_name: discovery.display_name.clone(),
+                command_name: discovery.command_name.clone(),
+                description: discovery.description.clone(),
+                content_preview: discovery.content_preview.clone(),
+                body: discovery.body.clone(),
+                enable_agent_ids: vec![discovery.source_agent_id.clone()],
+            })
+        else {
+            return Outcome::quiet();
+        };
+        self.begin_config_mutation(crate::app::ConfigMutation::ImportSkill {
+            selection: Box::new(selection),
+        })
+    }
+
+    fn begin_matrix_form(&mut self, key: &str) -> Outcome {
+        let strings = self.strings;
+        let agents = self.management_data.agents.clone();
+        let form = match self.config_center.section {
+            crate::config_center::ConfigSection::Servers => self
+                .mcp_server(key)
+                .cloned()
+                .map(|server| crate::config_center::mcp_matrix_form(&server, &agents, strings)),
+            crate::config_center::ConfigSection::Installed => self
+                .skill(key)
+                .cloned()
+                .map(|skill| crate::config_center::skill_matrix_form(&skill, &agents, strings)),
+            _ => None,
+        };
+        match form {
+            Some(form) => {
+                self.overlay = Some(Overlay::Form { form });
+                Outcome::effects(vec![])
+            }
+            None => Outcome::quiet(),
+        }
+    }
+
+    /// A form key the reader is typing into, delivered one character at a time.
+    pub fn type_form_char(&mut self, character: char) {
+        let Some(Overlay::Form { form }) = self.overlay.as_mut() else {
+            return;
+        };
+        let Some(key) = form.editing.clone() else {
+            return;
+        };
+        if let Some(field) = form.field_mut(&key) {
+            field.value.push(character);
+        }
+    }
+
+    pub fn form_backspace(&mut self) {
+        let Some(Overlay::Form { form }) = self.overlay.as_mut() else {
+            return;
+        };
+        let Some(key) = form.editing.clone() else {
+            return;
+        };
+        if let Some(field) = form.field_mut(&key) {
+            field.value.pop();
+        }
+    }
+
+    fn perform_form(&mut self, intent: Intent, form: crate::config_center::ConfigForm) -> Outcome {
+        // While a field is being typed into, the field owns the keys, and the
+        // ones that matter are "keep this" and "put it back".
+        if form.editing.is_some() {
+            let multiline = form.selected_field().is_some_and(|field| {
+                matches!(field.kind, crate::config_center::FormFieldKind::Multiline)
+            });
+            return match intent {
+                // `Enter` keeps a one-line field and takes a newline in a
+                // multi-line one: a body is a document, and a key that ended
+                // it would make the reader reach for the mouse to write a
+                // second paragraph.
+                Intent::ConfirmOverlay if multiline => {
+                    self.type_form_char('\n');
+                    Outcome::quiet()
+                }
+                Intent::ConfirmOverlay => {
+                    self.commit_form_field(form);
+                    Outcome::effects(vec![])
+                }
+                // `Tab` keeps the field and moves on, in every field.
+                Intent::OverlayNextField => {
+                    self.commit_form_field(form);
+                    Outcome::effects(vec![])
+                }
+                Intent::OverlayPreviousField => {
+                    self.commit_form_field(form);
+                    self.step_form_field(-2);
+                    Outcome::effects(vec![])
+                }
+                Intent::ConfigFormSave => self.submit_form(form),
+                Intent::ScrollPageUp | Intent::ScrollPageDown => Outcome::quiet(),
+                _ => Outcome::quiet(),
+            };
+        }
+        match intent {
+            Intent::OverlayNextField | Intent::SelectNext | Intent::ScrollPageDown => {
+                self.step_form_field(1);
+                Outcome::effects(vec![])
+            }
+            Intent::OverlayPreviousField | Intent::SelectPrevious | Intent::ScrollPageUp => {
+                self.step_form_field(-1);
+                Outcome::effects(vec![])
+            }
+            Intent::ConfirmOverlay => self.begin_form_field(form),
+            // `←`/`→` are the value keys in every other form this client
+            // draws — the elicitation card, the approval card — so they are
+            // the value keys here too.
+            Intent::ElicitationFieldPrevious => self.step_form_value(-1),
+            Intent::ElicitationFieldNext => self.step_form_value(1),
+            Intent::ConfigFormSave => self.submit_form(form),
+            _ => Outcome::quiet(),
+        }
+    }
+
+    fn step_form_field(&mut self, delta: isize) {
+        if let Some(Overlay::Form { form }) = self.overlay.as_mut() {
+            form.step_field(delta);
+        }
+    }
+
+    fn step_form_value(&mut self, delta: isize) -> Outcome {
+        let Some(Overlay::Form { form }) = self.overlay.as_mut() else {
+            return Outcome::quiet();
+        };
+        let index = form.selected;
+        if let Some(field) = form.fields.get_mut(index) {
+            field.step(delta);
+        }
+        Outcome::effects(vec![])
+    }
+
+    fn begin_form_field(&mut self, form: crate::config_center::ConfigForm) -> Outcome {
+        let Some(field) = form.selected_field() else {
+            return Outcome::quiet();
+        };
+        // A closed set or a switch has no text to type: `Enter` moves it.
+        if !matches!(
+            field.kind,
+            crate::config_center::FormFieldKind::Text
+                | crate::config_center::FormFieldKind::Multiline
+        ) {
+            return self.step_form_value(1);
+        }
+        let key = field.key.clone();
+        if let Some(Overlay::Form { form }) = self.overlay.as_mut() {
+            form.editing = Some(key);
+        }
+        Outcome::effects(vec![])
+    }
+
+    fn commit_form_field(&mut self, form: crate::config_center::ConfigForm) {
+        let _ = form;
+        if let Some(Overlay::Form { form }) = self.overlay.as_mut() {
+            form.editing = None;
+            form.step_field(1);
+        }
+    }
+
+    /// `Ctrl+S`: write the form.
+    fn submit_form(&mut self, mut form: crate::config_center::ConfigForm) -> Outcome {
+        match self.form_mutation(&form) {
+            Ok(mutation) => {
+                form.error = None;
+                self.overlay = Some(Overlay::Form { form });
+                self.begin_config_mutation(mutation)
+            }
+            Err(message) => {
+                form.error = Some(message.to_string());
+                self.overlay = Some(Overlay::Form { form });
+                Outcome::effects(vec![])
+            }
+        }
+    }
+
+    /// Turn a filled-in form into the request it describes.
+    fn form_mutation(
+        &self,
+        form: &crate::config_center::ConfigForm,
+    ) -> Result<crate::app::ConfigMutation, &'static str> {
+        use crate::app::ConfigMutation;
+        use crate::config_center::FormPurpose;
+        let strings = self.strings;
+        let name = form.value("name").unwrap_or_default();
+        match &form.purpose {
+            FormPurpose::McpServer { server_id } => {
+                if name.is_empty() {
+                    return Err(strings.config_form_error_name());
+                }
+                let transport = match form.value("transport").as_deref() {
+                    Some("http") => vibex_core::McpServerTransportKind::Http,
+                    Some("sse") => vibex_core::McpServerTransportKind::Sse,
+                    _ => vibex_core::McpServerTransportKind::Stdio,
+                };
+                let command = form.optional("command");
+                let url = form.optional("url");
+                if transport == vibex_core::McpServerTransportKind::Stdio && command.is_none() {
+                    return Err(strings.config_form_error_stdio_command());
+                }
+                if transport != vibex_core::McpServerTransportKind::Stdio && url.is_none() {
+                    return Err(strings.config_form_error_remote_url());
+                }
+                let args = form
+                    .value("args")
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                let env = parse_pairs(form.value("env").as_deref().unwrap_or_default(), '=')
+                    .into_iter()
+                    .map(|(name, value)| vibex_core::McpServerEnvEntry { name, value })
+                    .collect::<Vec<_>>();
+                let headers =
+                    parse_pairs(form.value("headers").as_deref().unwrap_or_default(), ':')
+                        .into_iter()
+                        .map(|(name, value)| vibex_core::McpServerHeaderEntry { name, value })
+                        .collect::<Vec<_>>();
+                let tags = split_tags(form.value("tags").as_deref().unwrap_or_default());
+                let status = match form.value("status").as_deref() {
+                    Some("disabled") => vibex_core::McpServerStatus::Disabled,
+                    _ => vibex_core::McpServerStatus::Enabled,
+                };
+                let scope = mcp_scope(&form.value("scope").unwrap_or_default());
+                match server_id {
+                    Some(id) => Ok(ConfigMutation::UpdateMcpServer(Box::new(
+                        vibex_core::McpServerUpdateRequest {
+                            mcp_server_id: parse_config_id(id)?,
+                            display_name: Some(name),
+                            transport_kind: Some(transport),
+                            status: Some(status),
+                            scope_kind: Some(scope),
+                            project_id: None,
+                            workspace_id: None,
+                            command,
+                            args: Some(args),
+                            env: Some(env),
+                            url,
+                            headers: Some(headers),
+                            description: form.optional("description"),
+                            tags: Some(tags),
+                        },
+                    ))),
+                    None => Ok(ConfigMutation::CreateMcpServer(Box::new(
+                        vibex_core::McpServerCreateRequest {
+                            display_name: name,
+                            transport_kind: transport,
+                            status,
+                            scope_kind: scope,
+                            project_id: None,
+                            workspace_id: None,
+                            command,
+                            args,
+                            env,
+                            url,
+                            headers,
+                            description: form.optional("description"),
+                            tags,
+                            secret_references: Vec::new(),
+                            provider_matrix: Vec::new(),
+                        },
+                    ))),
+                }
+            }
+            FormPurpose::Skill { skill_id } => {
+                if name.is_empty() {
+                    return Err(strings.config_form_error_name());
+                }
+                let body = form.value("body").unwrap_or_default();
+                let source_kind = match form.value("source_kind").as_deref() {
+                    Some("local_folder") => vibex_core::SkillSourceKind::LocalFolder,
+                    Some("git_repo") => vibex_core::SkillSourceKind::GitRepo,
+                    _ => vibex_core::SkillSourceKind::Manual,
+                };
+                let status = match form.value("status").as_deref() {
+                    Some("disabled") => vibex_core::SkillStatus::Disabled,
+                    _ => vibex_core::SkillStatus::Enabled,
+                };
+                let scope = skill_scope(&form.value("scope").unwrap_or_default());
+                let description = form.optional("description");
+                let tags = split_tags(form.value("tags").as_deref().unwrap_or_default());
+                let source_uri = form.optional("source_uri");
+                let preview = Some(body.chars().take(2048).collect::<String>());
+                match skill_id {
+                    Some(id) => Ok(ConfigMutation::UpdateSkill(Box::new(
+                        vibex_core::SkillUpdateRequest {
+                            skill_id: parse_config_id(id)?,
+                            display_name: Some(name),
+                            source_kind: Some(source_kind),
+                            status: Some(status),
+                            scope_kind: Some(scope),
+                            project_id: None,
+                            workspace_id: None,
+                            source_uri,
+                            description,
+                            tags: Some(tags),
+                            content_preview: preview,
+                            body: Some(body),
+                        },
+                    ))),
+                    None => {
+                        if body.trim().is_empty() {
+                            return Err(strings.config_form_error_body());
+                        }
+                        Ok(ConfigMutation::CreateSkill(Box::new(
+                            vibex_core::SkillCreateRequest {
+                                display_name: name,
+                                source_kind,
+                                status,
+                                scope_kind: scope,
+                                project_id: None,
+                                workspace_id: None,
+                                source_uri,
+                                description,
+                                tags,
+                                content_preview: preview,
+                                body: Some(body),
+                                provider_matrix: Vec::new(),
+                            },
+                        )))
+                    }
+                }
+            }
+            FormPurpose::Prompt { prompt_id } => {
+                if name.is_empty() {
+                    return Err(strings.config_form_error_name());
+                }
+                let body = form.value("body").unwrap_or_default();
+                if body.trim().is_empty() {
+                    return Err(strings.config_form_error_body());
+                }
+                let kind = match form.value("kind").as_deref() {
+                    Some("slash_command") => vibex_core::PromptKind::SlashCommand,
+                    Some("system_snippet") => vibex_core::PromptKind::SystemSnippet,
+                    _ => vibex_core::PromptKind::ReusablePrompt,
+                };
+                let status = match form.value("status").as_deref() {
+                    Some("disabled") => vibex_core::PromptStatus::Disabled,
+                    Some("archived") => vibex_core::PromptStatus::Archived,
+                    _ => vibex_core::PromptStatus::Enabled,
+                };
+                let scope = prompt_scope(&form.value("scope").unwrap_or_default());
+                let description = form.optional("description");
+                let tags = split_tags(form.value("tags").as_deref().unwrap_or_default());
+                match prompt_id {
+                    Some(id) => Ok(ConfigMutation::UpdatePrompt(Box::new(
+                        vibex_core::PromptUpdateRequest {
+                            prompt_id: parse_config_id(id)?,
+                            display_name: Some(name),
+                            kind: Some(kind),
+                            status: Some(status),
+                            scope_kind: Some(scope),
+                            project_id: None,
+                            workspace_id: None,
+                            body: Some(body),
+                            description,
+                            tags: Some(tags),
+                        },
+                    ))),
+                    None => Ok(ConfigMutation::CreatePrompt(Box::new(
+                        vibex_core::PromptCreateRequest {
+                            display_name: name,
+                            kind,
+                            status,
+                            scope_kind: scope,
+                            project_id: None,
+                            workspace_id: None,
+                            body,
+                            description,
+                            tags,
+                        },
+                    ))),
+                }
+            }
+            FormPurpose::Hook { hook_id } => {
+                if name.is_empty() {
+                    return Err(strings.config_form_error_name());
+                }
+                let provider = match form.value("provider").as_deref() {
+                    Some("claude") => vibex_core::ProviderKind::Claude,
+                    Some("codex") => vibex_core::ProviderKind::Codex,
+                    _ => vibex_core::ProviderKind::Acp,
+                };
+                let event = match form.value("event").as_deref() {
+                    Some("session_start") => vibex_core::HookEventKind::SessionStart,
+                    Some("session_stop") => vibex_core::HookEventKind::SessionStop,
+                    Some("terminal_activity") => vibex_core::HookEventKind::TerminalActivity,
+                    _ => vibex_core::HookEventKind::PermissionRequest,
+                };
+                let status = match form.value("status").as_deref() {
+                    Some("enabled") => vibex_core::HookStatus::Enabled,
+                    Some("disabled") => vibex_core::HookStatus::Disabled,
+                    _ => vibex_core::HookStatus::Draft,
+                };
+                let command = form.optional("command");
+                let description = form.optional("description");
+                match hook_id {
+                    Some(id) => Ok(ConfigMutation::UpdateHook(Box::new(
+                        vibex_core::HookUpdateRequest {
+                            hook_id: parse_config_id(id)?,
+                            display_name: Some(name),
+                            provider_kind: Some(provider),
+                            event_kind: Some(event),
+                            status: Some(status),
+                            install_state: None,
+                            command_preview: command,
+                            managed_marker: None,
+                            description,
+                        },
+                    ))),
+                    None => Ok(ConfigMutation::CreateHook(Box::new(
+                        vibex_core::HookCreateRequest {
+                            display_name: name,
+                            provider_kind: provider,
+                            event_kind: event,
+                            status,
+                            command_preview: command,
+                            managed_marker: None,
+                            description,
+                        },
+                    ))),
+                }
+            }
+            FormPurpose::ProviderProfile {
+                agent_id,
+                profile_id,
+            } => {
+                if name.is_empty() {
+                    return Err(strings.config_form_error_name());
+                }
+                Ok(ConfigMutation::UpdateProviderProfile {
+                    agent_id: parse_config_id(agent_id)?,
+                    profile_id: parse_config_id(profile_id)?,
+                    display_name: Some(name),
+                    base_url: form.optional("base_url"),
+                    default_model: form.optional("default_model"),
+                })
+            }
+            FormPurpose::McpMatrix { server_id } => {
+                let server_id: vibex_core::McpServerId = parse_config_id(server_id)?;
+                let Some(server) = self
+                    .management_data
+                    .mcp
+                    .iter()
+                    .find(|server| server.id == server_id)
+                else {
+                    return Err("unknown record");
+                };
+                let enabled = form.enabled_agents();
+                let matrix = server
+                    .agent_matrix
+                    .iter()
+                    .map(|entry| vibex_core::McpServerAgentMatrix {
+                        enabled: enabled.iter().any(|id| id == entry.agent_id.as_str()),
+                        ..entry.clone()
+                    })
+                    .collect();
+                Ok(ConfigMutation::SetMcpAgentMatrix { server_id, matrix })
+            }
+            FormPurpose::SkillMatrix { skill_id } => {
+                let skill_id: vibex_core::SkillId = parse_config_id(skill_id)?;
+                let Some(skill) = self
+                    .management_data
+                    .skills
+                    .iter()
+                    .find(|skill| skill.id == skill_id)
+                else {
+                    return Err("unknown record");
+                };
+                let enabled = form.enabled_agents();
+                let matrix = skill
+                    .agent_matrix
+                    .iter()
+                    .map(|entry| vibex_core::SkillAgentMatrix {
+                        enabled: enabled.iter().any(|id| id == entry.agent_id.as_str()),
+                        ..entry.clone()
+                    })
+                    .collect();
+                Ok(ConfigMutation::SetSkillAgentMatrix { skill_id, matrix })
+            }
+        }
+    }
+
+    /// Mark a write in flight and ask the worker for it.
+    fn begin_config_mutation(&mut self, mutation: crate::app::ConfigMutation) -> Outcome {
+        let key = mutation.key();
+        if !self.config_center.begin_pending(key, mutation.label()) {
+            self.toast(Toast::warning(self.strings.config_working().to_string()));
+            return Outcome::quiet();
+        }
+        Outcome::effects(vec![Effect::ConfigMutation { mutation }])
     }
 
     fn guard(&mut self, operation: BackendOperation, effect: Effect) -> Outcome {
@@ -1142,11 +2301,42 @@ impl App {
     fn perform_overlay(&mut self, intent: Intent) -> Outcome {
         // Global escape hatches still work with an overlay open.
         match intent {
+            // `Esc` means "undo the thing I am in the middle of" everywhere
+            // else in this client, and a form has two things to be in the
+            // middle of: first the field being typed into, then the form.
+            Intent::CloseOverlay | Intent::Back
+                if matches!(
+                    &self.overlay,
+                    Some(Overlay::Form { form }) if form.editing.is_some()
+                ) =>
+            {
+                if let Some(Overlay::Form { form }) = self.overlay.as_mut() {
+                    let key = form.editing.take();
+                    if let Some(key) = key
+                        && let Some(field) = form.field_mut(&key)
+                        && !matches!(field.kind, crate::config_center::FormFieldKind::Multiline)
+                    {
+                        // A one-line field gives its draft up; a body keeps it,
+                        // because a paragraph that vanished on `Esc` is a
+                        // paragraph the reader has to write twice.
+                        field.value = field.origin.clone();
+                    }
+                }
+                return Outcome::effects(vec![]);
+            }
             Intent::CloseOverlay | Intent::Back => {
                 // The switcher's two views nest: the run options were opened
                 // from the catalogue, and the value list from the run options,
                 // so `Esc` steps back one level at a time rather than dropping
                 // the reader out of the surface they are working in.
+                if matches!(
+                    self.overlay,
+                    Some(Overlay::Form { .. })
+                        | Some(Overlay::EntryActions { .. })
+                        | Some(Overlay::Confirm { .. })
+                ) {
+                    self.pending_config_action = None;
+                }
                 self.overlay = match self.overlay.take() {
                     Some(Overlay::RunOptionValues { row, .. }) => Some(Overlay::RuntimePicker {
                         view: RuntimePickerView::Options,
@@ -1210,6 +2400,11 @@ impl App {
             return Outcome::quiet();
         };
         match overlay {
+            // The two configuration-centre overlays own their keys, because a
+            // form is a small state machine of its own: what `Enter` means
+            // depends on whether a field is being typed into.
+            Overlay::Form { form } => self.perform_form(intent, form),
+            Overlay::EntryActions { entry } => self.perform_entry_actions(intent, entry),
             Overlay::Palette { query, selected } => self.perform_palette(intent, query, selected),
             // The editor owns its keys directly, including the captured chord;
             // only the overlay-wide intents reach the reducer, and the two that
@@ -1521,11 +2716,29 @@ impl App {
     fn perform_filter(&mut self, intent: Intent) -> Outcome {
         // The same rule the overlay follows: a destination named from the
         // filter is the reader leaving it, so the query is given up rather than
-        // swallowing the key.
+        // swallowing the key. Both filters are given up at once — only the page
+        // that is showing has one — because the destination leaves the page
+        // either way.
         if intent.leaves_the_surface() {
             self.filtering = false;
             self.filter.clear();
+            self.config_center.filtering = false;
+            self.config_center.filter.clear();
             return self.perform_intent(intent);
+        }
+        if self.page == Page::Management {
+            match intent {
+                Intent::Back | Intent::CloseOverlay | Intent::ContextualCancel => {
+                    self.config_center.filtering = false;
+                    self.config_center.filter.clear();
+                    return Outcome::effects(vec![]);
+                }
+                Intent::ConfirmOverlay => {
+                    self.config_center.filtering = false;
+                    return Outcome::effects(self.config_section_effects());
+                }
+                _ => return Outcome::quiet(),
+            }
         }
         match intent {
             Intent::Back | Intent::CloseOverlay | Intent::ContextualCancel => {
@@ -1542,6 +2755,14 @@ impl App {
     }
 
     fn perform_confirm(&mut self, confirm: Intent) -> Outcome {
+        if confirm == Intent::ConfigEntryDelete {
+            let Some((key, action)) = self.pending_config_action.take() else {
+                return Outcome::quiet();
+            };
+            // The write itself, not the entry point: the question has been
+            // answered, and asking it again is what the entry point would do.
+            return self.exec_config_action(&key, action);
+        }
         match confirm {
             Intent::ResetSetting => {
                 let Some(row) = self.selected_setting() else {
@@ -1860,6 +3081,9 @@ impl App {
             self.move_setting_selection(delta);
             return Outcome::effects(vec![]);
         }
+        if self.page == Page::Management {
+            return self.move_config_selection(delta);
+        }
         let count = self.page_row_count();
         if count == 0 {
             return Outcome::quiet();
@@ -1886,6 +3110,37 @@ impl App {
             self.scroll.offset = offset;
         }
         Outcome::effects(vec![])
+    }
+
+    /// Move inside the configuration centre, where the same two keys mean
+    /// four things depending on the pane the reader is in.
+    fn move_config_selection(&mut self, delta: i64) -> Outcome {
+        use crate::config_center::ConfigZone;
+        match self.config_center.zone {
+            ConfigZone::Modules => {
+                self.config_center.step_module(delta as isize);
+                Outcome::effects(self.config_section_effects())
+            }
+            ConfigZone::Rail => {
+                self.config_center.step_section(delta as isize);
+                Outcome::effects(self.config_section_effects())
+            }
+            ConfigZone::Detail => {
+                let row = self.config_center.detail_scroll as i64 + delta;
+                self.config_center.detail_scroll = row.max(0) as u16;
+                Outcome::effects(vec![])
+            }
+            ConfigZone::Rows => {
+                let rows = self.visible_config_rows();
+                self.config_center.reconcile(&rows);
+                let before = self.config_center.cursor(rows.len());
+                self.config_center.step_cursor(&rows, delta as isize);
+                if self.config_center.cursor(rows.len()) == before && !rows.is_empty() {
+                    self.config_center.pin(rows.get(before));
+                }
+                Outcome::effects(vec![])
+            }
+        }
     }
 
     /// Whether the page in front of the reader is the session list, whose
@@ -3110,6 +4365,14 @@ impl App {
         effects
     }
 
+    /// Re-read whatever the configuration centre is showing.
+    ///
+    /// Every write ends here, which is what makes "what changed is what is
+    /// re-read" true for verbs nobody has written yet.
+    pub fn refresh_config_area(&mut self) -> Outcome {
+        Outcome::effects(self.config_section_effects())
+    }
+
     fn refresh_current_page(&mut self) -> Outcome {
         match self.page {
             Page::NewSession | Page::Sessions => Outcome::effects(self.session_page_effects()),
@@ -3120,11 +4383,15 @@ impl App {
             Page::Mcp => Outcome::effects(vec![Effect::ListMcp]),
             Page::Skills => Outcome::effects(vec![Effect::ListSkills]),
             Page::Prompts => Outcome::effects(vec![Effect::ListPrompts]),
-            Page::Management | Page::Settings | Page::Help => Outcome::effects(vec![]),
+            Page::Management => Outcome::effects(self.config_section_effects()),
+            Page::Settings | Page::Help => Outcome::effects(vec![]),
         }
     }
 
     fn toggle_selected_entry(&mut self) -> Outcome {
+        if self.page == Page::Management {
+            return self.toggle_config_entry();
+        }
         let index = self.selection_for(self.page.scope());
         match self.page {
             Page::Mcp => match self.management_data.mcp.get(index) {
@@ -3152,97 +4419,18 @@ impl App {
         }
     }
 
-    fn begin_edit_entry(&mut self) -> Outcome {
-        let field = match self.page {
-            Page::Mcp => PromptField::McpServerName,
-            Page::Skills => PromptField::SkillName,
-            Page::Prompts => PromptField::PromptName,
-            _ => return Outcome::quiet(),
-        };
-        self.overlay = Some(Overlay::Prompt {
-            title: self.strings.management_mcp().to_string(),
-            field,
-            value: String::new(),
-        });
-        Outcome::effects(vec![])
-    }
-
-    fn install_selected_agent(&mut self, uninstall: bool) -> Outcome {
-        let index = self.selection_for(Scope::Management);
-        let Some(agent) = self.management_data.agents.get(index) else {
+    /// `Space` on the highlighted record: its on/off verb, when it has one.
+    fn toggle_config_entry(&mut self) -> Outcome {
+        use crate::config_center::ConfigAction;
+        let Some(row) = self.selected_config_row() else {
             return Outcome::quiet();
         };
-        let agent_id = agent.id.clone();
-        if uninstall {
-            return self.guard(
-                BackendOperation::ManagementAgents,
-                Effect::UninstallAgent { agent_id },
-            );
+        for action in [ConfigAction::Toggle] {
+            if row.actions.contains(&action) {
+                return self.run_config_action(&row, action);
+            }
         }
-        self.guard(
-            BackendOperation::ManagementAgents,
-            Effect::InstallAgent { agent_id },
-        )
-    }
-
-    fn list_agent_auth(&mut self) -> Outcome {
-        let index = self.selection_for(Scope::Management);
-        let Some(agent) = self.management_data.agents.get(index) else {
-            return Outcome::quiet();
-        };
-        let agent_id = agent.id.clone();
-        self.guard(
-            BackendOperation::AgentAuthRead,
-            Effect::ListAgentAuth { agent_id },
-        )
-    }
-
-    fn logout_selected_agent(&mut self) -> Outcome {
-        let index = self.selection_for(Scope::Management);
-        let Some(agent) = self.management_data.agents.get(index) else {
-            return Outcome::quiet();
-        };
-        let agent_id = agent.id.clone();
-        self.guard(
-            BackendOperation::AgentAuthManage,
-            Effect::LogoutAgent { agent_id },
-        )
-    }
-
-    fn activate_provider_profile(&mut self) -> Outcome {
-        let index = self.selection_for(Scope::Providers);
-        let Some(profile) = self.management_data.providers.get(index) else {
-            return Outcome::quiet();
-        };
-        let profile_id = profile.id.clone();
-        self.guard(
-            BackendOperation::ManagementProfileSelect,
-            Effect::SelectProfile { profile_id },
-        )
-    }
-
-    fn test_provider_profile(&mut self) -> Outcome {
-        let index = self.selection_for(Scope::Providers);
-        let Some(profile) = self.management_data.providers.get(index) else {
-            return Outcome::quiet();
-        };
-        let profile_id = profile.id.clone();
-        self.guard(
-            BackendOperation::ManagementProviderProfileTest,
-            Effect::TestProviderProfile { profile_id },
-        )
-    }
-
-    fn fetch_provider_models(&mut self) -> Outcome {
-        let index = self.selection_for(Scope::Providers);
-        let Some(profile) = self.management_data.providers.get(index) else {
-            return Outcome::quiet();
-        };
-        let profile_id = profile.id.clone();
-        self.guard(
-            BackendOperation::ManagementProviderModelFetch,
-            Effect::FetchProviderModels { profile_id },
-        )
+        Outcome::quiet()
     }
 
     /// `Enter` on the settings page: what it does depends on the row's kind.
@@ -3603,6 +4791,73 @@ impl ElicitationDraft {
     }
 }
 
+/// Read an id back from the key a row published.
+///
+/// The key *is* the id the row was projected from, so a parse failure means
+/// the form outlived the record it was opened on; the caller turns that into
+/// "nothing happened" rather than writing to a guessed id.
+fn parse_config_id<T: std::str::FromStr>(value: &str) -> Result<T, &'static str> {
+    value.parse().map_err(|_| "unknown record")
+}
+
+/// `KEY=value` (or `Name: value`) per line, as the forms ask for them.
+///
+/// A line with no separator is skipped rather than guessed at: half an
+/// environment variable is not a value, and inventing one would send a secret
+/// to a server under a name nobody chose.
+fn parse_pairs(text: &str, separator: char) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (name, value) = line.split_once(separator)?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some((name.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+/// A comma-separated tag list.
+fn split_tags(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn mcp_scope(value: &str) -> vibex_core::McpServerScopeKind {
+    match value {
+        "global" => vibex_core::McpServerScopeKind::Global,
+        "project" => vibex_core::McpServerScopeKind::Project,
+        "workspace" => vibex_core::McpServerScopeKind::Workspace,
+        _ => vibex_core::McpServerScopeKind::User,
+    }
+}
+
+fn skill_scope(value: &str) -> vibex_core::SkillScopeKind {
+    match value {
+        "global" => vibex_core::SkillScopeKind::Global,
+        "project" => vibex_core::SkillScopeKind::Project,
+        "workspace" => vibex_core::SkillScopeKind::Workspace,
+        _ => vibex_core::SkillScopeKind::User,
+    }
+}
+
+fn prompt_scope(value: &str) -> vibex_core::PromptScopeKind {
+    match value {
+        "global" => vibex_core::PromptScopeKind::Global,
+        "project" => vibex_core::PromptScopeKind::Project,
+        "workspace" => vibex_core::PromptScopeKind::Workspace,
+        _ => vibex_core::PromptScopeKind::User,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3849,14 +5104,22 @@ mod tests {
 
     #[test]
     fn a_panel_returns_to_the_page_that_opened_it() {
-        // The management sections are pages of their own, so the way back from
-        // one is the page that listed it rather than the session list.
+        // The configuration centre is one surface with four modules, so a
+        // module route is not a page change: `Back` leaves the centre in one
+        // press rather than walking out through the module it was opened on.
         let mut app = capable_app();
         app.navigate_to(Page::Management);
         app.navigate_to(Page::Providers);
-
-        app.perform(Intent::Back);
         assert_eq!(app.page, Page::Management);
+        assert_eq!(
+            app.config_center.module,
+            crate::config_center::ConfigModule::Agent
+        );
+        assert_eq!(
+            app.config_center.section,
+            crate::config_center::ConfigSection::Providers
+        );
+
         app.perform(Intent::Back);
         assert_eq!(app.page, Page::NewSession);
     }

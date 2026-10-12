@@ -1,0 +1,2314 @@
+//! The configuration centre: the desktop's module rail, rebuilt for a grid.
+//!
+//! The desktop config centre is an information architecture, not a screen: four
+//! modules (Agent, MCP, Skills, Prompts), each with its own set of function
+//! areas, each area a list of records with a detail pane and a set of actions
+//! that depend on the record. The TUI keeps that architecture and re-draws it
+//! for a character grid — a tab strip for the modules, a rail for the areas, a
+//! table for the records and a detail pane under it — because a client that
+//! invents its own structure is a second product to learn.
+//!
+//! Everything here is pure: the projections read [`ManagementData`] and answer
+//! rows, the state machine answers where the cursor is, and neither performs
+//! I/O. The reducer turns the row a cursor is on into an effect; the renderer
+//! draws the rows this module projects. That split is what keeps the mouse and
+//! the keyboard acting on the same object.
+
+use std::collections::BTreeMap;
+
+use vibex_core::{
+    AgentManagedInstallStatus, AgentRuntimeStatus, HookInstallState, McpServerTransportKind,
+    PromptKind, ProviderHealthStatus, ProviderSecretSetupState, ResourceDiscoveryStatus,
+};
+
+use crate::app::ManagementData;
+use crate::keymap::Scope;
+use crate::locale::Strings;
+
+/// The four modules the configuration centre is organised into.
+///
+/// The order is the desktop's: the Agent is what everything else attaches to,
+/// and the three resource kinds follow in the order the session composer
+/// reaches for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConfigModule {
+    Agent,
+    Mcp,
+    Skills,
+    Prompts,
+}
+
+impl ConfigModule {
+    pub const ALL: [Self; 4] = [Self::Agent, Self::Mcp, Self::Skills, Self::Prompts];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Mcp => "mcp",
+            Self::Skills => "skills",
+            Self::Prompts => "prompts",
+        }
+    }
+
+    pub const fn label(self, strings: Strings) -> &'static str {
+        match self {
+            Self::Agent => strings.config_module_agent(),
+            Self::Mcp => strings.config_module_mcp(),
+            Self::Skills => strings.config_module_skills(),
+            Self::Prompts => strings.config_module_prompts(),
+        }
+    }
+
+    /// The function areas this module offers, in rail order.
+    pub const fn sections(self) -> &'static [ConfigSection] {
+        match self {
+            Self::Agent => &[
+                ConfigSection::Agents,
+                ConfigSection::Providers,
+                ConfigSection::Health,
+            ],
+            Self::Mcp => &[
+                ConfigSection::Servers,
+                ConfigSection::Catalog,
+                ConfigSection::Sources,
+            ],
+            Self::Skills => &[
+                ConfigSection::Installed,
+                ConfigSection::Catalog,
+                ConfigSection::Sources,
+            ],
+            Self::Prompts => &[ConfigSection::Prompts, ConfigSection::Hooks],
+        }
+    }
+
+    pub const fn default_section(self) -> ConfigSection {
+        match self {
+            Self::Agent => ConfigSection::Agents,
+            Self::Mcp => ConfigSection::Servers,
+            Self::Skills => ConfigSection::Installed,
+            Self::Prompts => ConfigSection::Prompts,
+        }
+    }
+}
+
+/// One function area inside a module: the second level of the navigation.
+///
+/// A section owns its own list, its own filter and its own cursor. `Catalog`
+/// and `Sources` are shared by MCP and Skills because they mean the same thing
+/// in both — the registry the resource can be installed from, and the Agent
+/// configuration it can be imported from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConfigSection {
+    // ---- Agent ----------------------------------------------------------
+    Agents,
+    Providers,
+    Health,
+    // ---- MCP ------------------------------------------------------------
+    Servers,
+    // ---- Skills ---------------------------------------------------------
+    Installed,
+    // ---- MCP + Skills ---------------------------------------------------
+    Catalog,
+    Sources,
+    // ---- Prompts --------------------------------------------------------
+    Prompts,
+    Hooks,
+}
+
+impl ConfigSection {
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Agents => "agents",
+            Self::Providers => "providers",
+            Self::Health => "health",
+            Self::Servers => "servers",
+            Self::Installed => "installed",
+            Self::Catalog => "catalog",
+            Self::Sources => "sources",
+            Self::Prompts => "prompts",
+            Self::Hooks => "hooks",
+        }
+    }
+
+    pub const fn label(self, strings: Strings) -> &'static str {
+        match self {
+            Self::Agents => strings.config_section_agents(),
+            Self::Providers => strings.config_section_providers(),
+            Self::Health => strings.config_section_health(),
+            Self::Servers => strings.config_section_servers(),
+            Self::Installed => strings.config_section_installed(),
+            Self::Catalog => strings.config_section_catalog(),
+            Self::Sources => strings.config_section_sources(),
+            Self::Prompts => strings.config_section_prompts(),
+            Self::Hooks => strings.config_section_hooks(),
+        }
+    }
+
+    /// The hint under the rail entry: what the area is for.
+    pub const fn hint(self, strings: Strings) -> &'static str {
+        match self {
+            Self::Agents => strings.config_hint_agents(),
+            Self::Providers => strings.config_hint_providers(),
+            Self::Health => strings.config_hint_health(),
+            Self::Servers => strings.config_hint_servers(),
+            Self::Installed => strings.config_hint_installed(),
+            Self::Catalog => strings.config_hint_catalog(),
+            Self::Sources => strings.config_hint_sources(),
+            Self::Prompts => strings.config_hint_prompts(),
+            Self::Hooks => strings.config_hint_hooks(),
+        }
+    }
+
+    /// Whether `Enter` on a row opens the action list rather than a detail.
+    pub const fn is_read_only(self) -> bool {
+        matches!(self, Self::Health)
+    }
+}
+
+/// Which of the three panes owns the keyboard.
+///
+/// `Tab` walks them in this order, and the mouse sets the zone by clicking in
+/// it, so the pane that is lit and the pane a key acts on cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigZone {
+    Modules,
+    Rail,
+    Rows,
+    Detail,
+}
+
+impl ConfigZone {
+    pub const ALL: [Self; 4] = [Self::Modules, Self::Rail, Self::Rows, Self::Detail];
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Modules => 0,
+            Self::Rail => 1,
+            Self::Rows => 2,
+            Self::Detail => 3,
+        }
+    }
+}
+
+/// The tone a status chip is drawn in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigTone {
+    Ok,
+    Warn,
+    Bad,
+    Muted,
+}
+
+/// One action a row offers, and the label it is drawn under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigAction {
+    /// Install an Agent, or install a registry entry.
+    Install,
+    /// Re-install the version Vibex verified for an Agent.
+    Rollback,
+    /// Re-read what the Agent's own installer advertises.
+    CheckUpdate,
+    Uninstall,
+    /// Enable or disable the record.
+    Toggle,
+    Edit,
+    Delete,
+    /// Re-read this Agent's snapshot from its own runtime.
+    RefreshSnapshot,
+    /// Open the Agent's authentication methods.
+    Auth,
+    Logout,
+    /// Make a model provider profile the active one.
+    Activate,
+    /// Write a new credential for a profile.
+    Secret,
+    Test,
+    FetchModels,
+    Probe,
+    Validate,
+    /// Choose which Agents receive a resource.
+    Matrix,
+    /// Import a discovered resource.
+    Import,
+    /// Read the install preview for a hook.
+    Preview,
+}
+
+impl ConfigAction {
+    pub const fn label(self, strings: Strings) -> &'static str {
+        match self {
+            Self::Install => strings.config_action_install(),
+            Self::Rollback => strings.config_action_rollback(),
+            Self::CheckUpdate => strings.config_action_check_update(),
+            Self::Uninstall => strings.config_action_uninstall(),
+            Self::Toggle => strings.config_action_toggle(),
+            Self::Edit => strings.config_action_edit(),
+            Self::Delete => strings.config_action_delete(),
+            Self::RefreshSnapshot => strings.config_action_refresh(),
+            Self::Auth => strings.config_action_sign_in(),
+            Self::Logout => strings.config_action_sign_out(),
+            Self::Activate => strings.config_action_activate(),
+            Self::Secret => strings.config_action_secret(),
+            Self::Test => strings.config_action_test(),
+            Self::FetchModels => strings.config_action_fetch_models(),
+            Self::Probe => strings.config_action_probe(),
+            Self::Validate => strings.config_action_validate(),
+            Self::Matrix => strings.config_action_matrix(),
+            Self::Import => strings.config_action_import(),
+            Self::Preview => strings.config_action_preview(),
+        }
+    }
+
+    /// Whether the action asks a destructive question first.
+    pub const fn is_destructive(self) -> bool {
+        matches!(self, Self::Delete | Self::Uninstall)
+    }
+}
+
+/// One record as the table and the detail pane draw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigRow {
+    /// Stable identity of the record. The cursor is an index, but an action
+    /// resolves through this so a list that refreshed under the reader cannot
+    /// make a press act on a different record than the one that was lit.
+    pub key: String,
+    pub title: String,
+    /// Short facts, one per table column after the title.
+    pub cells: Vec<String>,
+    pub chip: String,
+    pub tone: ConfigTone,
+    pub enabled: bool,
+    /// Key/value lines for the detail pane.
+    pub detail: Vec<(String, String)>,
+    /// Free text shown above the key/value lines.
+    pub summary: Option<String>,
+    pub actions: Vec<ConfigAction>,
+}
+
+impl ConfigRow {
+    fn new(key: impl Into<String>, title: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            title: title.into(),
+            cells: Vec::new(),
+            chip: String::new(),
+            tone: ConfigTone::Muted,
+            enabled: true,
+            detail: Vec::new(),
+            summary: None,
+            actions: Vec::new(),
+        }
+    }
+
+    fn cell(mut self, value: impl Into<String>) -> Self {
+        self.cells.push(value.into());
+        self
+    }
+
+    fn chip(mut self, label: impl Into<String>, tone: ConfigTone) -> Self {
+        self.chip = label.into();
+        self.tone = tone;
+        self
+    }
+
+    fn detail(mut self, label: impl Into<String>, value: impl Into<String>) -> Self {
+        let value = value.into();
+        if !value.trim().is_empty() {
+            self.detail.push((label.into(), value));
+        }
+        self
+    }
+
+    fn summary(mut self, value: impl Into<String>) -> Self {
+        let value = value.into();
+        if !value.trim().is_empty() {
+            self.summary = Some(value);
+        }
+        self
+    }
+
+    fn actions(mut self, actions: &[ConfigAction]) -> Self {
+        self.actions = actions.to_vec();
+        self
+    }
+
+    fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Whether the row still matches a filter, over everything it shows.
+    fn matches(&self, needle: &str) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        let needle = needle.to_lowercase();
+        self.title.to_lowercase().contains(&needle)
+            || self.chip.to_lowercase().contains(&needle)
+            || self
+                .cells
+                .iter()
+                .any(|cell| cell.to_lowercase().contains(&needle))
+            || self.detail.iter().any(|(label, value)| {
+                label.to_lowercase().contains(&needle) || value.to_lowercase().contains(&needle)
+            })
+            || self
+                .summary
+                .as_ref()
+                .is_some_and(|summary| summary.to_lowercase().contains(&needle))
+    }
+}
+
+/// The table's column headings for one section.
+pub fn columns(
+    module: ConfigModule,
+    section: ConfigSection,
+    strings: Strings,
+) -> Vec<&'static str> {
+    match section {
+        ConfigSection::Agents => vec![
+            strings.config_col_install(),
+            strings.config_col_runtime(),
+            strings.config_col_source(),
+            strings.config_col_models(),
+        ],
+        ConfigSection::Providers => vec![
+            strings.config_col_agent(),
+            strings.config_col_kind(),
+            strings.config_col_model(),
+            strings.config_col_secret(),
+        ],
+        ConfigSection::Health => vec![
+            strings.config_col_health(),
+            strings.config_col_checked(),
+            strings.config_col_probes(),
+        ],
+        ConfigSection::Servers => vec![
+            strings.config_col_transport(),
+            strings.config_col_scope(),
+            strings.config_col_agents(),
+            strings.config_col_tags(),
+        ],
+        ConfigSection::Installed => vec![
+            strings.config_col_source(),
+            strings.config_col_scope(),
+            strings.config_col_agents(),
+            strings.config_col_updated(),
+        ],
+        ConfigSection::Catalog => match module {
+            ConfigModule::Mcp => vec![
+                strings.config_col_transport(),
+                strings.config_col_version(),
+                strings.config_col_publisher(),
+                strings.config_col_package(),
+            ],
+            _ => vec![
+                strings.config_col_kind(),
+                strings.config_col_version(),
+                strings.config_col_publisher(),
+                strings.config_col_installs(),
+            ],
+        },
+        ConfigSection::Sources => vec![
+            strings.config_col_agent(),
+            strings.config_col_path(),
+            strings.config_col_state(),
+        ],
+        ConfigSection::Prompts => vec![
+            strings.config_col_kind(),
+            strings.config_col_scope(),
+            strings.config_col_tags(),
+            strings.config_col_updated(),
+        ],
+        ConfigSection::Hooks => vec![
+            strings.config_col_provider(),
+            strings.config_col_event(),
+            strings.config_col_install(),
+        ],
+    }
+}
+
+/// Everything the centre remembers between frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigCenter {
+    pub module: ConfigModule,
+    pub section: ConfigSection,
+    pub zone: ConfigZone,
+    /// The inline filter. One per section would be four strings nobody asked
+    /// for; the filter is cleared when the reader changes area, which is what
+    /// keeps a hidden row from looking deleted.
+    pub filter: String,
+    pub filtering: bool,
+    /// Rows the detail pane has scrolled past.
+    pub detail_scroll: u16,
+    /// One cursor per area, so leaving an area and coming back lands where the
+    /// reader left rather than at the top.
+    cursor: BTreeMap<&'static str, usize>,
+    /// The record key each area's cursor was last resolved against, so a list
+    /// that refreshed can keep the cursor on the same record.
+    pinned: BTreeMap<&'static str, String>,
+    /// What the last mutation said, drawn under the table.
+    pub notice: Option<(String, ConfigTone)>,
+    /// Row keys with an action in flight, so a press cannot be queued twice and
+    /// the row can say it is working.
+    pub pending: BTreeMap<String, String>,
+}
+
+impl Default for ConfigCenter {
+    fn default() -> Self {
+        Self {
+            module: ConfigModule::Agent,
+            section: ConfigModule::Agent.default_section(),
+            zone: ConfigZone::Rows,
+            filter: String::new(),
+            filtering: false,
+            detail_scroll: 0,
+            cursor: BTreeMap::new(),
+            pinned: BTreeMap::new(),
+            notice: None,
+            pending: BTreeMap::new(),
+        }
+    }
+}
+
+impl ConfigCenter {
+    /// The scope every key of the centre is bound in.
+    pub const SCOPE: Scope = Scope::Management;
+
+    /// Show a module, opening its first area unless the caller names one that
+    /// the module actually has.
+    pub fn show_module(&mut self, module: ConfigModule, section: Option<ConfigSection>) {
+        let section = match section {
+            Some(section) if module.sections().contains(&section) => section,
+            _ => module.default_section(),
+        };
+        if self.module != module || self.section != section {
+            self.notice = None;
+            self.detail_scroll = 0;
+        }
+        self.module = module;
+        self.section = section;
+    }
+
+    pub fn show_section(&mut self, section: ConfigSection) {
+        if !self.module.sections().contains(&section) {
+            return;
+        }
+        if self.section != section {
+            self.filter.clear();
+            self.filtering = false;
+            self.detail_scroll = 0;
+            self.notice = None;
+        }
+        self.section = section;
+    }
+
+    /// Move the module cursor by `delta`, wrapping. The area the module opens
+    /// on is the one the reader last used in it, so walking the tabs does not
+    /// reset the rail.
+    pub fn step_module(&mut self, delta: isize) {
+        let all = ConfigModule::ALL;
+        let index = all.iter().position(|m| *m == self.module).unwrap_or(0) as isize;
+        let next = (index + delta).rem_euclid(all.len() as isize) as usize;
+        let module = all[next];
+        let remembered = self
+            .pinned
+            .get(module.default_section().key())
+            .map(|_| module.default_section());
+        let section = self.section_for_module(module).or(remembered);
+        self.show_module(module, section);
+    }
+
+    /// The area of `module` the reader was last in, when they have been there.
+    fn section_for_module(&self, module: ConfigModule) -> Option<ConfigSection> {
+        module
+            .sections()
+            .iter()
+            .copied()
+            .find(|section| self.cursor.contains_key(section.key()))
+    }
+
+    pub fn step_section(&mut self, delta: isize) {
+        let sections = self.module.sections();
+        let index = sections
+            .iter()
+            .position(|s| *s == self.section)
+            .unwrap_or(0) as isize;
+        let next = (index + delta).rem_euclid(sections.len() as isize) as usize;
+        if let Some(section) = sections.get(next).copied() {
+            self.show_section(section);
+        }
+    }
+
+    pub fn step_zone(&mut self, delta: isize) {
+        let all = ConfigZone::ALL;
+        let index = all.iter().position(|zone| *zone == self.zone).unwrap_or(0) as isize;
+        let next = (index + delta).rem_euclid(all.len() as isize) as usize;
+        self.zone = all[next];
+    }
+
+    /// Rows for the current area, before the filter is applied.
+    pub fn rows(&self, data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+        match self.section {
+            ConfigSection::Agents => agent_rows(data, strings),
+            ConfigSection::Providers => provider_rows(data, strings),
+            ConfigSection::Health => health_rows(data, strings),
+            ConfigSection::Servers => server_rows(data, strings),
+            ConfigSection::Installed => skill_rows(data, strings),
+            ConfigSection::Catalog => match self.module {
+                ConfigModule::Mcp => market_rows(data, strings),
+                _ => skill_market_rows(data, strings),
+            },
+            ConfigSection::Sources => match self.module {
+                ConfigModule::Mcp => mcp_source_rows(data, strings),
+                _ => skill_source_rows(data, strings),
+            },
+            ConfigSection::Prompts => prompt_rows(data, strings),
+            ConfigSection::Hooks => hook_rows(data, strings),
+        }
+    }
+
+    /// The rows the table draws: the area's records, filtered.
+    pub fn visible(&self, data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+        let needle = self.filter.trim();
+        self.rows(data, strings)
+            .into_iter()
+            .filter(|row| row.matches(needle))
+            .collect()
+    }
+
+    /// The cursor index inside the visible rows, clamped.
+    pub fn cursor(&self, visible: usize) -> usize {
+        self.cursor
+            .get(self.section.key())
+            .copied()
+            .unwrap_or(0)
+            .min(visible.saturating_sub(1))
+    }
+
+    pub fn set_cursor(&mut self, index: usize) {
+        self.cursor.insert(self.section.key(), index);
+        self.pinned.remove(self.section.key());
+        self.detail_scroll = 0;
+    }
+
+    /// Keep the cursor on the same record across a refresh, falling back to the
+    /// index when the record is gone.
+    pub fn reconcile(&mut self, rows: &[ConfigRow]) {
+        let key = self.section.key();
+        let Some(pinned) = self.pinned.get(key) else {
+            return;
+        };
+        if let Some(index) = rows.iter().position(|row| row.key == *pinned) {
+            self.cursor.insert(key, index);
+        }
+    }
+
+    /// Pin the cursor to the record it is on, so a read that lands later cannot
+    /// move the reader's place.
+    pub fn pin(&mut self, row: Option<&ConfigRow>) {
+        match row {
+            Some(row) => {
+                self.pinned.insert(self.section.key(), row.key.clone());
+            }
+            None => {
+                self.pinned.remove(self.section.key());
+            }
+        }
+    }
+
+    pub fn step_cursor(&mut self, rows: &[ConfigRow], delta: isize) {
+        if rows.is_empty() {
+            return;
+        }
+        let current = self.cursor(rows.len()) as isize;
+        let next = (current + delta).rem_euclid(rows.len() as isize) as usize;
+        self.set_cursor(next);
+        self.pin(rows.get(next));
+    }
+
+    /// The row the cursor is on, if the area has one.
+    pub fn selected(&self, data: &ManagementData, strings: Strings) -> Option<ConfigRow> {
+        let rows = self.visible(data, strings);
+        let index = self.cursor(rows.len());
+        rows.into_iter().nth(index)
+    }
+
+    pub fn is_pending(&self, key: &str) -> bool {
+        self.pending.contains_key(key)
+    }
+
+    pub fn begin_pending(&mut self, key: impl Into<String>, label: impl Into<String>) -> bool {
+        let key = key.into();
+        if self.pending.contains_key(&key) {
+            return false;
+        }
+        self.pending.insert(key, label.into());
+        true
+    }
+
+    pub fn finish_pending(&mut self, key: &str) {
+        self.pending.remove(key);
+    }
+
+    pub fn set_notice(&mut self, message: impl Into<String>, tone: ConfigTone) {
+        self.notice = Some((message.into(), tone));
+    }
+
+    /// How many rows each area would draw, for the rail's counts.
+    pub fn counts(&self, data: &ManagementData, strings: Strings) -> Vec<usize> {
+        self.module
+            .sections()
+            .iter()
+            .map(|section| {
+                let mut probe = self.clone();
+                probe.section = *section;
+                probe.rows(data, strings).len()
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// projections
+// ---------------------------------------------------------------------------
+
+fn tone_for_enabled(enabled: bool) -> ConfigTone {
+    if enabled {
+        ConfigTone::Ok
+    } else {
+        ConfigTone::Muted
+    }
+}
+
+fn runtime_tone(status: AgentRuntimeStatus) -> ConfigTone {
+    match status {
+        AgentRuntimeStatus::Ready => ConfigTone::Ok,
+        AgentRuntimeStatus::ProbeFailed | AgentRuntimeStatus::Unavailable => ConfigTone::Bad,
+        AgentRuntimeStatus::Disabled | AgentRuntimeStatus::Unknown => ConfigTone::Muted,
+    }
+}
+
+fn health_tone(status: ProviderHealthStatus) -> ConfigTone {
+    match status {
+        ProviderHealthStatus::Pass => ConfigTone::Ok,
+        ProviderHealthStatus::Warn | ProviderHealthStatus::Skipped => ConfigTone::Warn,
+        ProviderHealthStatus::Fail => ConfigTone::Bad,
+        ProviderHealthStatus::Unknown | ProviderHealthStatus::Unsupported => ConfigTone::Muted,
+    }
+}
+
+/// A probe status as a word. The core enum carries no `Display` of its own,
+/// and a chip that read `ProbeFailed` would be the wire spelling, not English.
+fn health_label(status: ProviderHealthStatus) -> String {
+    match status {
+        ProviderHealthStatus::Unknown => "Unknown",
+        ProviderHealthStatus::Pass => "Pass",
+        ProviderHealthStatus::Warn => "Warn",
+        ProviderHealthStatus::Fail => "Fail",
+        ProviderHealthStatus::Skipped => "Skipped",
+        ProviderHealthStatus::Unsupported => "Unsupported",
+    }
+    .to_string()
+}
+
+fn discovery_tone(status: ResourceDiscoveryStatus) -> ConfigTone {
+    match status {
+        ResourceDiscoveryStatus::Importable => ConfigTone::Ok,
+        ResourceDiscoveryStatus::AlreadyImported => ConfigTone::Muted,
+        ResourceDiscoveryStatus::Unsupported | ResourceDiscoveryStatus::Error => ConfigTone::Warn,
+    }
+}
+
+fn scope_label(scope: vibex_core::McpServerScopeKind, strings: Strings) -> &'static str {
+    match scope {
+        vibex_core::McpServerScopeKind::Global => strings.config_scope_global(),
+        vibex_core::McpServerScopeKind::User => strings.config_scope_user(),
+        vibex_core::McpServerScopeKind::Project => strings.config_scope_project(),
+        vibex_core::McpServerScopeKind::Workspace => strings.config_scope_workspace(),
+    }
+}
+
+fn skill_scope_label(scope: vibex_core::SkillScopeKind, strings: Strings) -> &'static str {
+    match scope {
+        vibex_core::SkillScopeKind::Global => strings.config_scope_global(),
+        vibex_core::SkillScopeKind::User => strings.config_scope_user(),
+        vibex_core::SkillScopeKind::Project => strings.config_scope_project(),
+        vibex_core::SkillScopeKind::Workspace => strings.config_scope_workspace(),
+    }
+}
+
+fn prompt_scope_label(scope: vibex_core::PromptScopeKind, strings: Strings) -> &'static str {
+    match scope {
+        vibex_core::PromptScopeKind::Global => strings.config_scope_global(),
+        vibex_core::PromptScopeKind::Project => strings.config_scope_project(),
+        vibex_core::PromptScopeKind::Workspace => strings.config_scope_workspace(),
+        vibex_core::PromptScopeKind::User => strings.config_scope_user(),
+    }
+}
+
+fn transport_label(kind: McpServerTransportKind) -> &'static str {
+    match kind {
+        McpServerTransportKind::Stdio => "stdio",
+        McpServerTransportKind::Http => "http",
+        McpServerTransportKind::Sse => "sse",
+    }
+}
+
+/// An epoch-millisecond stamp as the reader's own civil date and time.
+fn stamp(at_ms: i64) -> String {
+    crate::text::format_utc_timestamp(at_ms)
+}
+
+fn secret_label(state: ProviderSecretSetupState, strings: Strings) -> &'static str {
+    match state {
+        ProviderSecretSetupState::Available => strings.config_secret_set(),
+        ProviderSecretSetupState::Missing => strings.config_secret_missing(),
+        ProviderSecretSetupState::Referenced => strings.config_secret_referenced(),
+        ProviderSecretSetupState::Unsupported => strings.config_secret_unsupported(),
+    }
+}
+
+fn prompt_kind_label(kind: PromptKind, strings: Strings) -> &'static str {
+    match kind {
+        PromptKind::ReusablePrompt => strings.config_prompt_kind_reusable(),
+        PromptKind::SlashCommand => strings.config_prompt_kind_slash(),
+        PromptKind::SystemSnippet => strings.config_prompt_kind_snippet(),
+    }
+}
+
+fn agents_label(matrix: &[vibex_core::McpServerAgentMatrix], strings: Strings) -> String {
+    let enabled = matrix.iter().filter(|entry| entry.enabled).count();
+    if matrix.is_empty() {
+        strings.config_agents_none().to_string()
+    } else {
+        format!("{enabled}/{}", matrix.len())
+    }
+}
+
+fn skill_agents_label(matrix: &[vibex_core::SkillAgentMatrix], strings: Strings) -> String {
+    let enabled = matrix.iter().filter(|entry| entry.enabled).count();
+    if matrix.is_empty() {
+        strings.config_agents_none().to_string()
+    } else {
+        format!("{enabled}/{}", matrix.len())
+    }
+}
+
+/// Whether the Agent's own installer owns the binary, and at what version.
+fn managed_line(agent: &vibex_core::AgentSnapshotEntry, strings: Strings) -> String {
+    if !agent.managed_install.managed {
+        return strings.config_managed_external().to_string();
+    }
+    let Some(version) = agent.managed_install.installed_version.clone() else {
+        return match agent.managed_install.status {
+            AgentManagedInstallStatus::NotInstalled => strings.config_managed_absent().to_string(),
+            _ => strings.config_managed_unknown().to_string(),
+        };
+    };
+    match agent.managed_install.available_version.clone() {
+        Some(available) if available != version => format!("{version} → {available}"),
+        _ => version,
+    }
+}
+
+fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+    data.agents
+        .iter()
+        .map(|agent| {
+            let install = match agent.install_status {
+                vibex_core::AgentInstallStatus::Installed => strings.config_state_installed(),
+                vibex_core::AgentInstallStatus::Missing => strings.config_state_missing(),
+                vibex_core::AgentInstallStatus::Disabled => strings.config_state_disabled(),
+                vibex_core::AgentInstallStatus::Unknown => strings.config_state_unknown(),
+            };
+            let runtime = match agent.runtime_status {
+                AgentRuntimeStatus::Ready => strings.config_state_ready(),
+                AgentRuntimeStatus::Unavailable => strings.config_state_unavailable(),
+                AgentRuntimeStatus::ProbeFailed => strings.config_state_probe_failed(),
+                AgentRuntimeStatus::Disabled => strings.config_state_disabled(),
+                AgentRuntimeStatus::Unknown => strings.config_state_unknown(),
+            };
+            let mut actions = vec![
+                ConfigAction::Toggle,
+                ConfigAction::RefreshSnapshot,
+                ConfigAction::Auth,
+                ConfigAction::Logout,
+            ];
+            if agent.managed_install.managed {
+                actions.insert(0, ConfigAction::Install);
+                actions.insert(1, ConfigAction::CheckUpdate);
+                if agent.installed {
+                    actions.insert(2, ConfigAction::Rollback);
+                    actions.push(ConfigAction::Uninstall);
+                }
+            } else {
+                actions.insert(0, ConfigAction::Install);
+            }
+            let mut row = ConfigRow::new(agent.id.as_str().to_string(), agent.label.clone())
+                .cell(install)
+                .cell(runtime)
+                .cell(format!("{:?}", agent.source_kind))
+                .cell(agent.models.len().to_string())
+                .chip(
+                    if agent.enabled {
+                        strings.config_state_enabled()
+                    } else {
+                        strings.config_state_disabled()
+                    },
+                    if agent.enabled {
+                        runtime_tone(agent.runtime_status)
+                    } else {
+                        ConfigTone::Muted
+                    },
+                )
+                .enabled(agent.enabled)
+                .summary(agent.description.clone().unwrap_or_default())
+                .detail(strings.config_field_id(), agent.id.as_str())
+                .detail(
+                    strings.config_field_install(),
+                    format!(
+                        "{install} · {}",
+                        match agent.managed_install.status {
+                            AgentManagedInstallStatus::External =>
+                                strings.config_managed_external(),
+                            AgentManagedInstallStatus::NotInstalled =>
+                                strings.config_managed_absent(),
+                            AgentManagedInstallStatus::Installed =>
+                                strings.config_managed_installed(),
+                            AgentManagedInstallStatus::UpdateAvailable =>
+                                strings.config_managed_update(),
+                            AgentManagedInstallStatus::Installing
+                            | AgentManagedInstallStatus::Upgrading
+                            | AgentManagedInstallStatus::Uninstalling => strings.config_working(),
+                            AgentManagedInstallStatus::Failed => strings.config_managed_failed(),
+                        }
+                    ),
+                )
+                .detail(strings.config_field_version(), managed_line(agent, strings))
+                .detail(
+                    strings.config_field_configured(),
+                    if agent.configured {
+                        strings.config_yes()
+                    } else {
+                        strings.config_no()
+                    },
+                )
+                .detail(
+                    strings.config_field_models(),
+                    if agent.models.is_empty() {
+                        strings.config_agents_none().to_string()
+                    } else {
+                        agent.models.join(", ")
+                    },
+                )
+                .detail(strings.config_field_command(), {
+                    let mut command = agent
+                        .command
+                        .as_ref()
+                        .map(|command| command.command.clone())
+                        .unwrap_or_default();
+                    if let Some(config) = agent.command.as_ref()
+                        && !config.args.is_empty()
+                    {
+                        command.push(' ');
+                        command.push_str(&config.args.join(" "));
+                    }
+                    command
+                })
+                .detail(
+                    strings.config_field_path(),
+                    agent.native_config_paths.join("\n"),
+                )
+                .actions(&actions);
+            row.enabled = agent.enabled;
+            row
+        })
+        .collect()
+}
+
+fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+    data.providers
+        .iter()
+        .map(|profile| {
+            let enabled = profile.status == vibex_core::ProviderProfileStatus::Enabled;
+            ConfigRow::new(
+                profile.id.as_str().to_string(),
+                profile.display_name.clone(),
+            )
+            .cell(profile.agent_id.as_str())
+            .cell(profile.kind.to_string())
+            .cell(profile.default_model.clone().unwrap_or_default())
+            .cell(secret_label(profile.secret_setup_state, strings))
+            .chip(
+                if enabled {
+                    strings.config_state_enabled()
+                } else {
+                    strings.config_state_disabled()
+                },
+                if enabled {
+                    ConfigTone::Ok
+                } else {
+                    ConfigTone::Muted
+                },
+            )
+            .enabled(enabled)
+            .detail(strings.config_field_id(), profile.id.as_str())
+            .detail(strings.config_field_agent(), profile.agent_id.as_str())
+            .detail(strings.config_field_kind(), profile.kind.to_string())
+            .detail(
+                strings.config_field_account(),
+                profile.account_alias.clone().unwrap_or_default(),
+            )
+            .detail(
+                strings.config_field_model(),
+                profile.default_model.clone().unwrap_or_default(),
+            )
+            .detail(
+                strings.config_field_models(),
+                profile
+                    .configured_models
+                    .iter()
+                    .filter(|model| model.enabled)
+                    .map(|model| model.id.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+            .detail(
+                strings.config_field_secret(),
+                secret_label(profile.secret_setup_state, strings),
+            )
+            .detail(strings.config_field_updated(), stamp(profile.updated_at_ms))
+            .actions(&[
+                ConfigAction::Activate,
+                ConfigAction::Edit,
+                ConfigAction::Secret,
+                ConfigAction::Test,
+                ConfigAction::FetchModels,
+                ConfigAction::Delete,
+            ])
+        })
+        .collect()
+}
+
+fn health_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+    data.health
+        .iter()
+        .map(|summary| {
+            let failures = summary
+                .probe_results
+                .iter()
+                .filter(|probe| {
+                    probe.status == ProviderHealthStatus::Fail
+                        || probe.status == ProviderHealthStatus::Warn
+                })
+                .count();
+            ConfigRow::new(
+                summary.profile.id.as_str().to_string(),
+                summary.profile.display_name.clone(),
+            )
+            .cell(health_label(summary.overall_status))
+            .cell(
+                summary
+                    .last_checked_at_ms
+                    .map(stamp)
+                    .unwrap_or_else(|| strings.config_never().to_string()),
+            )
+            .cell(format!("{failures}/{}", summary.probe_results.len()))
+            .chip(
+                health_label(summary.overall_status),
+                health_tone(summary.overall_status),
+            )
+            .detail(strings.config_field_id(), summary.profile.id.as_str())
+            .detail(
+                strings.config_field_agent(),
+                summary.profile.agent_id.as_str(),
+            )
+            .detail(
+                strings.config_field_model(),
+                summary.profile.default_model.clone().unwrap_or_default(),
+            )
+            .detail(
+                strings.config_field_probes(),
+                summary
+                    .probe_results
+                    .iter()
+                    .map(|probe| {
+                        format!(
+                            "{:?} · {} · {}",
+                            probe.probe_kind,
+                            health_label(probe.status),
+                            probe.summary
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .actions(&[ConfigAction::Probe, ConfigAction::Edit])
+        })
+        .collect()
+}
+
+fn server_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+    data.mcp
+        .iter()
+        .map(|server| {
+            let enabled = server.status == vibex_core::McpServerStatus::Enabled;
+            ConfigRow::new(server.id.as_str().to_string(), server.display_name.clone())
+                .cell(transport_label(server.transport_kind))
+                .cell(scope_label(server.scope_kind, strings))
+                .cell(agents_label(&server.agent_matrix, strings))
+                .cell(server.tags.join(", "))
+                .chip(
+                    if enabled {
+                        strings.config_state_enabled()
+                    } else {
+                        strings.config_state_disabled()
+                    },
+                    tone_for_enabled(enabled),
+                )
+                .enabled(enabled)
+                .summary(server.description.clone().unwrap_or_default())
+                .detail(strings.config_field_id(), server.id.as_str())
+                .detail(
+                    strings.config_field_transport(),
+                    transport_label(server.transport_kind),
+                )
+                .detail(
+                    strings.config_field_scope(),
+                    scope_label(server.scope_kind, strings),
+                )
+                .detail(strings.config_field_command(), {
+                    let mut line = server.command.clone().unwrap_or_default();
+                    if !server.args.is_empty() {
+                        if !line.is_empty() {
+                            line.push(' ');
+                        }
+                        line.push_str(&server.args.join(" "));
+                    }
+                    line
+                })
+                .detail(
+                    strings.config_field_url(),
+                    server.url.clone().unwrap_or_default(),
+                )
+                .detail(
+                    strings.config_field_env(),
+                    server
+                        .env
+                        .iter()
+                        .map(|entry| format!("{}={}", entry.name, entry.value))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+                .detail(
+                    strings.config_field_headers(),
+                    server
+                        .headers
+                        .iter()
+                        .map(|entry| format!("{}: {}", entry.name, entry.value))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+                .detail(
+                    strings.config_field_agents(),
+                    agents_label(&server.agent_matrix, strings),
+                )
+                .detail(strings.config_field_tags(), server.tags.join(", "))
+                .detail(strings.config_field_updated(), stamp(server.updated_at_ms))
+                .actions(&[
+                    ConfigAction::Toggle,
+                    ConfigAction::Edit,
+                    ConfigAction::Matrix,
+                    ConfigAction::Validate,
+                    ConfigAction::Delete,
+                ])
+        })
+        .collect()
+}
+
+fn skill_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+    data.skills
+        .iter()
+        .map(|skill| {
+            let enabled = skill.status == vibex_core::SkillStatus::Enabled;
+            ConfigRow::new(skill.id.as_str().to_string(), skill.display_name.clone())
+                .cell(format!("{:?}", skill.source_kind))
+                .cell(skill_scope_label(skill.scope_kind, strings))
+                .cell(skill_agents_label(&skill.agent_matrix, strings))
+                .cell(stamp(skill.updated_at_ms))
+                .chip(
+                    if enabled {
+                        strings.config_state_enabled()
+                    } else {
+                        strings.config_state_disabled()
+                    },
+                    tone_for_enabled(enabled),
+                )
+                .enabled(enabled)
+                .summary(skill.description.clone().unwrap_or_default())
+                .detail(strings.config_field_id(), skill.id.as_str())
+                .detail(
+                    strings.config_field_scope(),
+                    skill_scope_label(skill.scope_kind, strings),
+                )
+                .detail(
+                    strings.config_field_source(),
+                    skill.source_uri.clone().unwrap_or_default(),
+                )
+                .detail(strings.config_field_tags(), skill.tags.join(", "))
+                .detail(
+                    strings.config_field_preview(),
+                    skill.content_preview.clone().unwrap_or_default(),
+                )
+                .detail(
+                    strings.config_field_body(),
+                    skill
+                        .body
+                        .as_ref()
+                        .map(|body| format!("{} {}", body.lines().count(), strings.config_lines()))
+                        .unwrap_or_default(),
+                )
+                .detail(
+                    strings.config_field_agents(),
+                    skill_agents_label(&skill.agent_matrix, strings),
+                )
+                .actions(&[
+                    ConfigAction::Toggle,
+                    ConfigAction::Edit,
+                    ConfigAction::Matrix,
+                    ConfigAction::Validate,
+                    ConfigAction::Delete,
+                ])
+        })
+        .collect()
+}
+
+fn market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+    data.mcp_market
+        .iter()
+        .map(|entry| {
+            let command = entry
+                .url
+                .clone()
+                .or_else(|| entry.command.clone())
+                .unwrap_or_default();
+            ConfigRow::new(entry.id.clone(), entry.name.clone())
+                .cell(transport_label(entry.transport))
+                .cell(entry.version.clone().unwrap_or_default())
+                .cell(entry.author.clone().unwrap_or_default())
+                .cell(entry.package_kind.clone().unwrap_or_default())
+                .chip(
+                    entry
+                        .status
+                        .clone()
+                        .unwrap_or_else(|| strings.config_state_active().to_string()),
+                    if entry.status.as_deref() == Some("deprecated") {
+                        ConfigTone::Warn
+                    } else {
+                        ConfigTone::Muted
+                    },
+                )
+                .summary(entry.description.clone().unwrap_or_default())
+                .detail(strings.config_field_id(), entry.id.clone())
+                .detail(
+                    strings.config_field_transport(),
+                    transport_label(entry.transport),
+                )
+                .detail(strings.config_field_command(), command)
+                .detail(
+                    strings.config_field_homepage(),
+                    entry.homepage.clone().unwrap_or_default(),
+                )
+                .detail(
+                    strings.config_field_repository(),
+                    entry.repository.clone().unwrap_or_default(),
+                )
+                .detail(
+                    strings.config_field_env(),
+                    entry
+                        .env
+                        .iter()
+                        .map(|requirement| requirement.name.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+                .detail(
+                    strings.config_field_package(),
+                    entry.package_kind.clone().unwrap_or_default(),
+                )
+                .detail(
+                    strings.config_field_updated(),
+                    entry.updated_at.clone().unwrap_or_default(),
+                )
+                .actions(&[ConfigAction::Install, ConfigAction::Validate])
+        })
+        .collect()
+}
+
+fn skill_market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+    data.skill_market
+        .iter()
+        .map(|entry| {
+            ConfigRow::new(entry.id.clone(), entry.name.clone())
+                .cell(strings.config_kind_skill())
+                .cell(entry.version.clone().unwrap_or_default())
+                .cell(entry.owner_handle.clone().unwrap_or_default())
+                .cell(entry.installs.to_string())
+                .chip(strings.config_source_market(), ConfigTone::Muted)
+                .summary(entry.summary.clone().unwrap_or_default())
+                .detail(strings.config_field_id(), entry.id.clone())
+                .detail(strings.config_field_slug(), entry.slug.clone())
+                .detail(
+                    strings.config_field_publisher(),
+                    entry.owner_handle.clone().unwrap_or_default(),
+                )
+                .detail(strings.config_field_stars(), entry.stars.to_string())
+                .detail(
+                    strings.config_field_downloads(),
+                    entry.downloads.to_string(),
+                )
+                .actions(&[ConfigAction::Install])
+        })
+        .collect()
+}
+
+fn mcp_source_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+    data.mcp_discoveries
+        .iter()
+        .map(|discovery| {
+            let candidate = discovery.candidate.as_ref();
+            let title = candidate
+                .map(|candidate| candidate.display_name.clone())
+                .unwrap_or_else(|| discovery.import_key.clone());
+            let transport = candidate
+                .map(|candidate| transport_label(candidate.transport_kind))
+                .unwrap_or_default();
+            let mut actions = Vec::new();
+            if discovery.status == ResourceDiscoveryStatus::Importable {
+                actions.push(ConfigAction::Import);
+            }
+            let mut row = ConfigRow::new(discovery.discovery_id.clone(), title)
+                .cell(discovery.source_agent_id.as_str())
+                .cell(discovery.source_path.clone())
+                .cell(format!("{:?}", discovery.status))
+                .chip(
+                    match discovery.status {
+                        ResourceDiscoveryStatus::Importable => strings.config_state_importable(),
+                        ResourceDiscoveryStatus::AlreadyImported => strings.config_state_imported(),
+                        ResourceDiscoveryStatus::Unsupported => strings.config_state_unsupported(),
+                        ResourceDiscoveryStatus::Error => strings.config_state_error(),
+                    },
+                    discovery_tone(discovery.status),
+                )
+                .detail(strings.config_field_id(), discovery.discovery_id.clone())
+                .detail(
+                    strings.config_field_agent(),
+                    discovery.source_agent_id.as_str(),
+                )
+                .detail(strings.config_field_path(), discovery.source_path.clone())
+                .detail(strings.config_field_transport(), transport)
+                .detail(
+                    strings.config_field_command(),
+                    candidate
+                        .and_then(|candidate| candidate.command.clone())
+                        .unwrap_or_default(),
+                )
+                .detail(
+                    strings.config_field_url(),
+                    candidate
+                        .and_then(|candidate| candidate.url.clone())
+                        .unwrap_or_default(),
+                )
+                .detail(
+                    strings.config_field_description(),
+                    candidate
+                        .and_then(|candidate| candidate.description.clone())
+                        .unwrap_or_default(),
+                )
+                .actions(&actions);
+            row.enabled = discovery.status == ResourceDiscoveryStatus::Importable;
+            row
+        })
+        .collect()
+}
+
+fn skill_source_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+    data.skill_discoveries
+        .iter()
+        .map(|discovery| {
+            let mut actions = Vec::new();
+            if discovery.status == ResourceDiscoveryStatus::Importable {
+                actions.push(ConfigAction::Import);
+            }
+            ConfigRow::new(
+                discovery.discovery_id.clone(),
+                discovery.display_name.clone(),
+            )
+            .cell(discovery.source_agent_id.as_str())
+            .cell(discovery.source_path.clone())
+            .cell(format!("{:?}", discovery.status))
+            .chip(
+                match discovery.status {
+                    ResourceDiscoveryStatus::Importable => strings.config_state_importable(),
+                    ResourceDiscoveryStatus::AlreadyImported => strings.config_state_imported(),
+                    ResourceDiscoveryStatus::Unsupported => strings.config_state_unsupported(),
+                    ResourceDiscoveryStatus::Error => strings.config_state_error(),
+                },
+                discovery_tone(discovery.status),
+            )
+            .summary(discovery.description.clone().unwrap_or_default())
+            .detail(strings.config_field_id(), discovery.discovery_id.clone())
+            .detail(
+                strings.config_field_agent(),
+                discovery.source_agent_id.as_str(),
+            )
+            .detail(strings.config_field_path(), discovery.source_path.clone())
+            .detail(
+                strings.config_field_command(),
+                discovery.command_name.clone(),
+            )
+            .detail(
+                strings.config_field_preview(),
+                discovery.content_preview.clone().unwrap_or_default(),
+            )
+            .actions(&actions)
+        })
+        .collect()
+}
+
+fn prompt_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+    data.prompts
+        .iter()
+        .map(|prompt| {
+            let enabled = prompt.status == vibex_core::PromptStatus::Enabled;
+            ConfigRow::new(prompt.id.as_str().to_string(), prompt.display_name.clone())
+                .cell(prompt_kind_label(prompt.kind, strings))
+                .cell(prompt_scope_label(prompt.scope_kind, strings))
+                .cell(prompt.tags.join(", "))
+                .cell(stamp(prompt.updated_at_ms))
+                .chip(
+                    match prompt.status {
+                        vibex_core::PromptStatus::Enabled => strings.config_state_enabled(),
+                        vibex_core::PromptStatus::Disabled => strings.config_state_disabled(),
+                        vibex_core::PromptStatus::Archived => strings.config_state_archived(),
+                    },
+                    tone_for_enabled(enabled),
+                )
+                .enabled(enabled)
+                .summary(prompt.description.clone().unwrap_or_default())
+                .detail(strings.config_field_id(), prompt.id.as_str())
+                .detail(
+                    strings.config_field_kind(),
+                    prompt_kind_label(prompt.kind, strings),
+                )
+                .detail(
+                    strings.config_field_scope(),
+                    prompt_scope_label(prompt.scope_kind, strings),
+                )
+                .detail(strings.config_field_tags(), prompt.tags.join(", "))
+                .detail(
+                    strings.config_field_body(),
+                    format!("{} {}", prompt.body.lines().count(), strings.config_lines()),
+                )
+                .detail(strings.config_field_preview(), prompt.body.clone())
+                .actions(&[
+                    ConfigAction::Toggle,
+                    ConfigAction::Edit,
+                    ConfigAction::Validate,
+                    ConfigAction::Delete,
+                ])
+        })
+        .collect()
+}
+
+fn hook_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+    data.hooks
+        .iter()
+        .map(|hook| {
+            let enabled = hook.status == vibex_core::HookStatus::Enabled;
+            ConfigRow::new(hook.id.as_str().to_string(), hook.display_name.clone())
+                .cell(hook.provider_kind.to_string())
+                .cell(format!("{:?}", hook.event_kind))
+                .cell(match hook.install_state {
+                    HookInstallState::Installed => strings.config_state_installed(),
+                    HookInstallState::NotInstalled => strings.config_state_missing(),
+                    HookInstallState::PreviewOnly => strings.config_state_preview(),
+                    HookInstallState::Stale => strings.config_state_stale(),
+                })
+                .chip(
+                    match hook.status {
+                        vibex_core::HookStatus::Enabled => strings.config_state_enabled(),
+                        vibex_core::HookStatus::Disabled => strings.config_state_disabled(),
+                        vibex_core::HookStatus::Draft => strings.config_state_draft(),
+                    },
+                    tone_for_enabled(enabled),
+                )
+                .enabled(enabled)
+                .summary(hook.description.clone().unwrap_or_default())
+                .detail(strings.config_field_id(), hook.id.as_str())
+                .detail(
+                    strings.config_field_provider(),
+                    hook.provider_kind.to_string(),
+                )
+                .detail(
+                    strings.config_field_event(),
+                    format!("{:?}", hook.event_kind),
+                )
+                .detail(
+                    strings.config_field_command(),
+                    hook.command_preview.clone().unwrap_or_default(),
+                )
+                .detail(strings.config_field_marker(), hook.managed_marker.clone())
+                .detail(strings.config_field_updated(), stamp(hook.updated_at_ms))
+                .actions(&[
+                    ConfigAction::Toggle,
+                    ConfigAction::Edit,
+                    ConfigAction::Preview,
+                    ConfigAction::Delete,
+                ])
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// forms
+// ---------------------------------------------------------------------------
+
+/// How one form field is presented and changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormFieldKind {
+    /// Free text, typed in place.
+    Text,
+    /// Free text that may hold newlines.
+    Multiline,
+    /// A closed set: `←`/`→` and a click cycle it.
+    Choice {
+        /// Wire values, in order.
+        options: Vec<&'static str>,
+        /// What each option is called on screen, aligned with `options`.
+        labels: Vec<&'static str>,
+    },
+    /// Two states.
+    Toggle,
+}
+
+/// One line of an editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormField {
+    /// What the field means to the reducer that reads it back.
+    pub key: String,
+    pub label: String,
+    pub value: String,
+    /// The value the form opened with, so a cancel can put it back and the
+    /// footer can say whether anything changed.
+    pub origin: String,
+    pub kind: FormFieldKind,
+    pub hint: Option<String>,
+}
+
+impl FormField {
+    fn text(key: impl Into<String>, label: impl Into<String>, value: impl Into<String>) -> Self {
+        let value = value.into();
+        Self {
+            key: key.into(),
+            label: label.into(),
+            origin: value.clone(),
+            value,
+            kind: FormFieldKind::Text,
+            hint: None,
+        }
+    }
+
+    fn multiline(
+        key: impl Into<String>,
+        label: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        let value = value.into();
+        Self {
+            key: key.into(),
+            label: label.into(),
+            origin: value.clone(),
+            value,
+            kind: FormFieldKind::Multiline,
+            hint: None,
+        }
+    }
+
+    fn choice(
+        key: impl Into<String>,
+        label: impl Into<String>,
+        options: Vec<&'static str>,
+        labels: Vec<&'static str>,
+        value: &'static str,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            label: label.into(),
+            origin: value.to_string(),
+            value: value.to_string(),
+            kind: FormFieldKind::Choice { options, labels },
+            hint: None,
+        }
+    }
+
+    fn toggle(key: impl Into<String>, label: impl Into<String>, value: bool) -> Self {
+        let value = if value { "on" } else { "off" }.to_string();
+        Self {
+            key: key.into(),
+            label: label.into(),
+            origin: value.clone(),
+            value,
+            kind: FormFieldKind::Toggle,
+            hint: None,
+        }
+    }
+
+    fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    pub fn changed(&self) -> bool {
+        self.value != self.origin
+    }
+
+    /// The value as a flag, for a toggle field.
+    pub fn is_on(&self) -> bool {
+        self.value == "on"
+    }
+
+    /// Whether the value needs writing at all. A text field left empty is
+    /// `None` rather than an empty string, so "not set" stays not set.
+    pub fn optional(&self) -> Option<String> {
+        let trimmed = self.value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+
+    pub fn required(&self) -> String {
+        self.value.trim().to_string()
+    }
+
+    /// Advance a choice or toggle in place. Answers whether it moved.
+    pub fn step(&mut self, delta: isize) -> bool {
+        match &self.kind {
+            FormFieldKind::Choice { options, .. } => {
+                if options.is_empty() {
+                    return false;
+                }
+                let index = options
+                    .iter()
+                    .position(|option| *option == self.value)
+                    .unwrap_or(0) as isize;
+                let next = (index + delta).rem_euclid(options.len() as isize) as usize;
+                self.value = options[next].to_string();
+                true
+            }
+            FormFieldKind::Toggle => {
+                self.value = if self.is_on() { "off" } else { "on" }.to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn displayed(&self) -> String {
+        match &self.kind {
+            FormFieldKind::Choice { options, labels } => {
+                let index = options
+                    .iter()
+                    .position(|option| *option == self.value)
+                    .unwrap_or(0);
+                labels
+                    .get(index)
+                    .copied()
+                    .unwrap_or(self.value.as_str())
+                    .to_string()
+            }
+            FormFieldKind::Toggle => if self.is_on() { "on" } else { "off" }.to_string(),
+            _ => self.value.clone(),
+        }
+    }
+}
+
+/// What a finished form becomes.
+///
+/// The purpose travels with the overlay rather than being looked up from the
+/// cursor when the reader saves: a read that lands while the form is open must
+/// not make the save write to a different record than the one it was opened on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormPurpose {
+    McpServer {
+        server_id: Option<String>,
+    },
+    Skill {
+        skill_id: Option<String>,
+    },
+    Prompt {
+        prompt_id: Option<String>,
+    },
+    Hook {
+        hook_id: Option<String>,
+    },
+    ProviderProfile {
+        agent_id: String,
+        profile_id: String,
+    },
+    /// Which Agents receive one MCP server or Skill.
+    McpMatrix {
+        server_id: String,
+    },
+    SkillMatrix {
+        skill_id: String,
+    },
+}
+
+impl FormPurpose {
+    /// Whether the form creates a record rather than changing one.
+    pub fn is_new(&self) -> bool {
+        matches!(
+            self,
+            Self::McpServer { server_id: None }
+                | Self::Skill { skill_id: None }
+                | Self::Prompt { prompt_id: None }
+                | Self::Hook { hook_id: None }
+        )
+    }
+}
+
+/// An open editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigForm {
+    pub purpose: FormPurpose,
+    pub title: String,
+    pub fields: Vec<FormField>,
+    pub selected: usize,
+    /// The key of the field being typed into, with the buffer under it.
+    ///
+    /// The buffer is separate from the field so `Esc` inside an edit puts the
+    /// old value back rather than closing the form: "undo what I am in the
+    /// middle of" is the same promise everywhere else in this client.
+    pub editing: Option<String>,
+    pub error: Option<String>,
+    pub scroll: u16,
+}
+
+impl ConfigForm {
+    pub fn new(purpose: FormPurpose, title: impl Into<String>, fields: Vec<FormField>) -> Self {
+        Self {
+            purpose,
+            title: title.into(),
+            fields,
+            selected: 0,
+            editing: None,
+            error: None,
+            scroll: 0,
+        }
+    }
+
+    pub fn dirty(&self) -> bool {
+        self.fields.iter().any(FormField::changed)
+    }
+
+    pub fn field(&self, key: &str) -> Option<&FormField> {
+        self.fields.iter().find(|field| field.key == key)
+    }
+
+    pub fn field_mut(&mut self, key: &str) -> Option<&mut FormField> {
+        self.fields.iter_mut().find(|field| field.key == key)
+    }
+
+    pub fn value(&self, key: &str) -> Option<String> {
+        self.field(key).map(FormField::required)
+    }
+
+    pub fn optional(&self, key: &str) -> Option<String> {
+        self.field(key).and_then(FormField::optional)
+    }
+
+    pub fn flag(&self, key: &str) -> bool {
+        self.field(key).is_some_and(FormField::is_on)
+    }
+
+    /// Every field that is on, for the matrix forms: their keys are `agent:<id>`.
+    pub fn enabled_agents(&self) -> Vec<String> {
+        self.fields
+            .iter()
+            .filter(|field| field.key.starts_with("agent:") && field.is_on())
+            .map(|field| field.key.trim_start_matches("agent:").to_string())
+            .collect()
+    }
+
+    pub fn selected_field(&self) -> Option<&FormField> {
+        self.fields.get(self.selected)
+    }
+
+    pub fn step_field(&mut self, delta: isize) {
+        if self.fields.is_empty() {
+            return;
+        }
+        let current = self.selected.min(self.fields.len() - 1) as isize;
+        let next = (current + delta).rem_euclid(self.fields.len() as isize) as usize;
+        self.selected = next;
+    }
+}
+
+/// What `Enter` on a row opened: the actions that row actually offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryActions {
+    pub title: String,
+    /// The record's stable key, so the chosen action resolves against the
+    /// record rather than against whatever the cursor moved to.
+    pub row_key: String,
+    pub actions: Vec<ConfigAction>,
+    pub selected: usize,
+}
+
+// ---------------------------------------------------------------------------
+// form construction
+// ---------------------------------------------------------------------------
+
+const MCP_TRANSPORTS: [&str; 3] = ["stdio", "http", "sse"];
+
+fn mcp_transport_options() -> Vec<&'static str> {
+    MCP_TRANSPORTS.to_vec()
+}
+
+fn mcp_transport_labels() -> Vec<&'static str> {
+    MCP_TRANSPORTS.to_vec()
+}
+
+fn scope_choices(strings: Strings) -> (Vec<&'static str>, Vec<&'static str>) {
+    (
+        vec!["user", "workspace", "global", "project"],
+        vec![
+            strings.config_scope_user(),
+            strings.config_scope_workspace(),
+            strings.config_scope_global(),
+            strings.config_scope_project(),
+        ],
+    )
+}
+
+fn status_choices(strings: Strings) -> (Vec<&'static str>, Vec<&'static str>) {
+    (
+        vec!["enabled", "disabled"],
+        vec![
+            strings.config_state_enabled(),
+            strings.config_state_disabled(),
+        ],
+    )
+}
+
+fn scope_wire(scope: vibex_core::McpServerScopeKind) -> &'static str {
+    match scope {
+        vibex_core::McpServerScopeKind::Global => "global",
+        vibex_core::McpServerScopeKind::User => "user",
+        vibex_core::McpServerScopeKind::Project => "project",
+        vibex_core::McpServerScopeKind::Workspace => "workspace",
+    }
+}
+
+fn mcp_scope_wire(scope: vibex_core::McpServerScopeKind) -> &'static str {
+    scope_wire(scope)
+}
+
+fn skill_scope_wire(scope: vibex_core::SkillScopeKind) -> &'static str {
+    match scope {
+        vibex_core::SkillScopeKind::Global => "global",
+        vibex_core::SkillScopeKind::User => "user",
+        vibex_core::SkillScopeKind::Project => "project",
+        vibex_core::SkillScopeKind::Workspace => "workspace",
+    }
+}
+
+fn prompt_scope_wire(scope: vibex_core::PromptScopeKind) -> &'static str {
+    match scope {
+        vibex_core::PromptScopeKind::Global => "global",
+        vibex_core::PromptScopeKind::User => "user",
+        vibex_core::PromptScopeKind::Project => "project",
+        vibex_core::PromptScopeKind::Workspace => "workspace",
+    }
+}
+
+/// An MCP server editor, over the record or over a blank one.
+pub fn mcp_form(server: Option<&vibex_core::McpServer>, strings: Strings) -> ConfigForm {
+    let transport = server
+        .map(|server| transport_label(server.transport_kind))
+        .unwrap_or("stdio");
+    let (scope_options, scope_labels) = scope_choices(strings);
+    let (status_options, status_labels) = status_choices(strings);
+    let env = server
+        .map(|server| {
+            server
+                .env
+                .iter()
+                .map(|entry| format!("{}={}", entry.name, entry.value))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let headers = server
+        .map(|server| {
+            server
+                .headers
+                .iter()
+                .map(|entry| format!("{}: {}", entry.name, entry.value))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let fields = vec![
+        FormField::text(
+            "name",
+            strings.config_form_name(),
+            server
+                .map(|server| server.display_name.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::choice(
+            "transport",
+            strings.config_field_transport(),
+            mcp_transport_options(),
+            mcp_transport_labels(),
+            transport,
+        ),
+        FormField::text(
+            "command",
+            strings.config_field_command(),
+            server
+                .and_then(|server| server.command.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::text(
+            "args",
+            strings.config_field_args(),
+            server
+                .map(|server| server.args.join(" "))
+                .unwrap_or_default(),
+        ),
+        FormField::multiline("env", strings.config_field_env(), env)
+            .hint(strings.config_hint_env()),
+        FormField::text(
+            "url",
+            strings.config_field_url(),
+            server
+                .and_then(|server| server.url.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::multiline("headers", strings.config_field_headers(), headers)
+            .hint(strings.config_hint_headers()),
+        FormField::text(
+            "description",
+            strings.config_field_description(),
+            server
+                .and_then(|server| server.description.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::text(
+            "tags",
+            strings.config_field_tags(),
+            server
+                .map(|server| server.tags.join(", "))
+                .unwrap_or_default(),
+        ),
+        FormField::choice(
+            "scope",
+            strings.config_field_scope(),
+            scope_options,
+            scope_labels,
+            server
+                .map(|server| mcp_scope_wire(server.scope_kind))
+                .unwrap_or("user"),
+        ),
+        FormField::choice(
+            "status",
+            strings.config_col_state(),
+            status_options,
+            status_labels,
+            server
+                .map(|server| {
+                    if server.status == vibex_core::McpServerStatus::Enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                })
+                .unwrap_or("enabled"),
+        ),
+    ];
+    let purpose = FormPurpose::McpServer {
+        server_id: server.map(|server| server.id.as_str().to_string()),
+    };
+    let title = if server.is_some() {
+        strings.config_form_edit_server()
+    } else {
+        strings.config_form_new_server()
+    };
+    ConfigForm::new(purpose, title, fields)
+}
+
+/// A Skill editor.
+pub fn skill_form(skill: Option<&vibex_core::Skill>, strings: Strings) -> ConfigForm {
+    let (scope_options, scope_labels) = scope_choices(strings);
+    let (status_options, status_labels) = status_choices(strings);
+    let source_kind = skill
+        .map(|skill| match skill.source_kind {
+            vibex_core::SkillSourceKind::Manual => "manual",
+            vibex_core::SkillSourceKind::GitRepo => "git_repo",
+            vibex_core::SkillSourceKind::LocalFolder => "local_folder",
+            vibex_core::SkillSourceKind::Marketplace => "marketplace",
+        })
+        .unwrap_or("manual");
+    let fields = vec![
+        FormField::text(
+            "name",
+            strings.config_form_name(),
+            skill
+                .map(|skill| skill.display_name.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::multiline(
+            "description",
+            strings.config_field_description(),
+            skill
+                .and_then(|skill| skill.description.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::multiline(
+            "body",
+            strings.config_field_body(),
+            skill
+                .and_then(|skill| skill.body.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::text(
+            "tags",
+            strings.config_field_tags(),
+            skill.map(|skill| skill.tags.join(", ")).unwrap_or_default(),
+        ),
+        FormField::choice(
+            "source_kind",
+            strings.config_field_source(),
+            vec!["manual", "local_folder", "git_repo"],
+            vec![
+                strings.config_source_manual(),
+                strings.config_source_folder(),
+                strings.config_source_git(),
+            ],
+            source_kind,
+        ),
+        FormField::text(
+            "source_uri",
+            strings.config_field_path(),
+            skill
+                .and_then(|skill| skill.source_uri.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::choice(
+            "scope",
+            strings.config_field_scope(),
+            scope_options,
+            scope_labels,
+            skill
+                .map(|skill| skill_scope_wire(skill.scope_kind))
+                .unwrap_or("user"),
+        ),
+        FormField::choice(
+            "status",
+            strings.config_col_state(),
+            status_options,
+            status_labels,
+            skill
+                .map(|skill| {
+                    if skill.status == vibex_core::SkillStatus::Enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                })
+                .unwrap_or("enabled"),
+        ),
+    ];
+    let purpose = FormPurpose::Skill {
+        skill_id: skill.map(|skill| skill.id.as_str().to_string()),
+    };
+    let title = if skill.is_some() {
+        strings.config_form_edit_skill()
+    } else {
+        strings.config_form_new_skill()
+    };
+    ConfigForm::new(purpose, title, fields)
+}
+
+/// A Prompt editor.
+pub fn prompt_form(prompt: Option<&vibex_core::Prompt>, strings: Strings) -> ConfigForm {
+    let (scope_options, scope_labels) = scope_choices(strings);
+    let kind = prompt
+        .map(|prompt| match prompt.kind {
+            PromptKind::ReusablePrompt => "reusable_prompt",
+            PromptKind::SlashCommand => "slash_command",
+            PromptKind::SystemSnippet => "system_snippet",
+        })
+        .unwrap_or("reusable_prompt");
+    let status = prompt
+        .map(|prompt| match prompt.status {
+            vibex_core::PromptStatus::Enabled => "enabled",
+            vibex_core::PromptStatus::Disabled => "disabled",
+            vibex_core::PromptStatus::Archived => "archived",
+        })
+        .unwrap_or("enabled");
+    let fields = vec![
+        FormField::text(
+            "name",
+            strings.config_form_name(),
+            prompt
+                .map(|prompt| prompt.display_name.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::choice(
+            "kind",
+            strings.config_field_kind(),
+            vec!["reusable_prompt", "slash_command", "system_snippet"],
+            vec![
+                strings.config_prompt_kind_reusable(),
+                strings.config_prompt_kind_slash(),
+                strings.config_prompt_kind_snippet(),
+            ],
+            kind,
+        ),
+        FormField::multiline(
+            "description",
+            strings.config_field_description(),
+            prompt
+                .and_then(|prompt| prompt.description.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::multiline(
+            "body",
+            strings.config_field_body(),
+            prompt.map(|prompt| prompt.body.clone()).unwrap_or_default(),
+        ),
+        FormField::text(
+            "tags",
+            strings.config_field_tags(),
+            prompt
+                .map(|prompt| prompt.tags.join(", "))
+                .unwrap_or_default(),
+        ),
+        FormField::choice(
+            "scope",
+            strings.config_field_scope(),
+            scope_options,
+            scope_labels,
+            prompt
+                .map(|prompt| prompt_scope_wire(prompt.scope_kind))
+                .unwrap_or("user"),
+        ),
+        FormField::choice(
+            "status",
+            strings.config_col_state(),
+            vec!["enabled", "disabled", "archived"],
+            vec![
+                strings.config_state_enabled(),
+                strings.config_state_disabled(),
+                strings.config_state_archived(),
+            ],
+            status,
+        ),
+    ];
+    let purpose = FormPurpose::Prompt {
+        prompt_id: prompt.map(|prompt| prompt.id.as_str().to_string()),
+    };
+    let title = if prompt.is_some() {
+        strings.config_form_edit_prompt()
+    } else {
+        strings.config_form_new_prompt()
+    };
+    ConfigForm::new(purpose, title, fields)
+}
+
+/// A hook editor.
+pub fn hook_form(hook: Option<&vibex_core::Hook>, strings: Strings) -> ConfigForm {
+    let provider = hook
+        .map(|hook| hook.provider_kind.to_string())
+        .unwrap_or_else(|| "acp".to_string());
+    let event = hook
+        .map(|hook| match hook.event_kind {
+            vibex_core::HookEventKind::TerminalActivity => "terminal_activity",
+            vibex_core::HookEventKind::SessionStart => "session_start",
+            vibex_core::HookEventKind::SessionStop => "session_stop",
+            vibex_core::HookEventKind::PermissionRequest => "permission_request",
+        })
+        .unwrap_or("permission_request");
+    let status = hook
+        .map(|hook| match hook.status {
+            vibex_core::HookStatus::Draft => "draft",
+            vibex_core::HookStatus::Enabled => "enabled",
+            vibex_core::HookStatus::Disabled => "disabled",
+        })
+        .unwrap_or("draft");
+    let fields = vec![
+        FormField::text(
+            "name",
+            strings.config_form_name(),
+            hook.map(|hook| hook.display_name.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::choice(
+            "provider",
+            strings.config_field_provider(),
+            vec!["acp", "claude", "codex"],
+            vec!["acp", "claude", "codex"],
+            match provider.as_str() {
+                "claude" => "claude",
+                "codex" => "codex",
+                _ => "acp",
+            },
+        ),
+        FormField::choice(
+            "event",
+            strings.config_field_event(),
+            vec![
+                "permission_request",
+                "session_start",
+                "session_stop",
+                "terminal_activity",
+            ],
+            vec![
+                strings.config_event_permission(),
+                strings.config_event_session_start(),
+                strings.config_event_session_stop(),
+                strings.config_event_terminal(),
+            ],
+            event,
+        ),
+        FormField::text(
+            "command",
+            strings.config_field_command(),
+            hook.and_then(|hook| hook.command_preview.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::text(
+            "description",
+            strings.config_field_description(),
+            hook.and_then(|hook| hook.description.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::choice(
+            "status",
+            strings.config_col_state(),
+            vec!["draft", "enabled", "disabled"],
+            vec![
+                strings.config_state_draft(),
+                strings.config_state_enabled(),
+                strings.config_state_disabled(),
+            ],
+            status,
+        ),
+    ];
+    let purpose = FormPurpose::Hook {
+        hook_id: hook.map(|hook| hook.id.as_str().to_string()),
+    };
+    let title = if hook.is_some() {
+        strings.config_form_edit_hook()
+    } else {
+        strings.config_form_new_hook()
+    };
+    ConfigForm::new(purpose, title, fields)
+}
+
+/// A model-provider profile editor.
+pub fn provider_form(profile: &vibex_core::ProviderProfileSummary, strings: Strings) -> ConfigForm {
+    let fields = vec![
+        FormField::text(
+            "name",
+            strings.config_form_name(),
+            profile.display_name.clone(),
+        ),
+        FormField::text("base_url", strings.config_field_url(), String::new())
+            .hint(strings.config_hint_endpoint()),
+        FormField::text(
+            "default_model",
+            strings.config_field_model(),
+            profile.default_model.clone().unwrap_or_default(),
+        ),
+    ];
+    ConfigForm::new(
+        FormPurpose::ProviderProfile {
+            agent_id: profile.agent_id.as_str().to_string(),
+            profile_id: profile.id.as_str().to_string(),
+        },
+        strings.config_form_edit_provider(),
+        fields,
+    )
+}
+
+/// The per-Agent switches for one MCP server.
+pub fn mcp_matrix_form(
+    server: &vibex_core::McpServer,
+    agents: &[vibex_core::AgentSnapshotEntry],
+    strings: Strings,
+) -> ConfigForm {
+    let fields = agents
+        .iter()
+        .map(|agent| {
+            let enabled = server
+                .agent_matrix
+                .iter()
+                .find(|entry| entry.agent_id == agent.id)
+                .is_some_and(|entry| entry.enabled);
+            FormField::toggle(
+                format!("agent:{}", agent.id.as_str()),
+                agent.label.clone(),
+                enabled,
+            )
+        })
+        .collect();
+    ConfigForm::new(
+        FormPurpose::McpMatrix {
+            server_id: server.id.as_str().to_string(),
+        },
+        format!(
+            "{} · {}",
+            strings.config_action_matrix(),
+            server.display_name
+        ),
+        fields,
+    )
+}
+
+/// The per-Agent switches for one Skill.
+pub fn skill_matrix_form(
+    skill: &vibex_core::Skill,
+    agents: &[vibex_core::AgentSnapshotEntry],
+    strings: Strings,
+) -> ConfigForm {
+    let fields = agents
+        .iter()
+        .map(|agent| {
+            let enabled = skill
+                .agent_matrix
+                .iter()
+                .find(|entry| entry.agent_id == agent.id)
+                .is_some_and(|entry| entry.enabled);
+            FormField::toggle(
+                format!("agent:{}", agent.id.as_str()),
+                agent.label.clone(),
+                enabled,
+            )
+        })
+        .collect();
+    ConfigForm::new(
+        FormPurpose::SkillMatrix {
+            skill_id: skill.id.as_str().to_string(),
+        },
+        format!(
+            "{} · {}",
+            strings.config_action_matrix(),
+            skill.display_name
+        ),
+        fields,
+    )
+}

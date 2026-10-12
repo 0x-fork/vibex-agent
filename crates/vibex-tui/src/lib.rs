@@ -42,6 +42,7 @@ pub mod app;
 pub mod attachment;
 pub mod auto_continue;
 pub mod composer;
+pub mod config_center;
 pub mod console;
 pub mod glyphs;
 pub mod interface_prefs;

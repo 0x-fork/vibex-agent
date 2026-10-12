@@ -54,6 +54,33 @@ pub enum ClipboardContent {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum AppMessage {
+    /// The hooks the runtime manages.
+    Hooks(BackendResult<Vec<vibex_core::Hook>>),
+    /// What a resource kind can be imported from. `mcp` and `skill` are the
+    /// same answer for two different modules, so the module travels with it
+    /// rather than the client guessing from which field is set.
+    ConfigSources {
+        module: crate::config_center::ConfigModule,
+        mcp: BackendResult<Vec<vibex_core::McpServerDiscovery>>,
+        skill: Option<BackendResult<Vec<vibex_core::SkillDiscovery>>>,
+    },
+    /// One page of a registry search.
+    Registry {
+        module: crate::config_center::ConfigModule,
+        mcp: BackendResult<Vec<vibex_core::McpMarketEntry>>,
+        skill: Option<BackendResult<Vec<vibex_core::SkillMarketEntry>>>,
+        /// What the registry said about the search itself, when it said
+        /// anything: how much of the catalogue the page covers.
+        note: Option<String>,
+    },
+    /// A validation or preview line, shown against the record it describes.
+    Validation {
+        key: Option<String>,
+        message: String,
+        failed: bool,
+    },
+    /// A configuration write finished, so the area it changed is re-read.
+    ConfigReload,
     TeamLoaded {
         ticket: vibex_ui::TeamLoadTicket,
         result: BackendResult<vibex_core::TeamSnapshot>,
@@ -359,6 +386,516 @@ struct Dispatch {
 impl Dispatch {
     fn send(&self, message: AppMessage) {
         let _ = self.sender.send(message);
+    }
+
+    /// Search one registry and hand the page back.
+    async fn search_registry(&mut self, module: crate::config_center::ConfigModule, query: String) {
+        use crate::config_center::ConfigModule;
+        let result = match module {
+            ConfigModule::Mcp => {
+                let request = vibex_core::McpMarketSearchRequest {
+                    query: (!query.trim().is_empty()).then_some(query),
+                    limit: Some(40),
+                    offset: None,
+                    transport: None,
+                    extend: None,
+                };
+                match self.facade.management().search_mcp_market(request).await {
+                    Ok(response) => Ok((
+                        response.entries,
+                        None,
+                        Some(format!(
+                            "{} / {}",
+                            response.total_matches, response.catalog_size
+                        )),
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            _ => {
+                let request = vibex_core::SkillMarketSearchRequest {
+                    query: (!query.trim().is_empty()).then_some(query),
+                    limit: Some(40),
+                    cursor: None,
+                    sort: None,
+                };
+                match self.facade.management().search_skill_market(request).await {
+                    Ok(response) => Ok((Vec::new(), Some(Ok(response.entries)), None)),
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        match result {
+            Ok((mcp, skill, note)) => self.send(AppMessage::Registry {
+                module,
+                mcp: Ok(mcp),
+                skill,
+                note,
+            }),
+            Err(error) => self.send(AppMessage::Registry {
+                module,
+                mcp: Err(error.clone()),
+                skill: Some(Err(error)),
+                note: None,
+            }),
+        }
+    }
+
+    /// Issue one configuration-centre write and report what it did.
+    ///
+    /// Every arm ends the same way: report the outcome under the row's key and
+    /// ask the client to re-read the area. That is deliberate — the authority
+    /// is what decides what a record now looks like, and a client that patched
+    /// its own copy would be guessing at the parts of the record the request
+    /// did not carry.
+    async fn config_mutation(&mut self, mutation: crate::app::ConfigMutation) {
+        use crate::app::ConfigMutation as M;
+        use vibex_backend::MutationRequest;
+        let key = mutation.key();
+        let result: BackendResult<()> = match mutation {
+            M::ToggleAgent { agent_id, enabled } => {
+                let request = MutationRequest::new(vibex_core::AgentUpdateConfigRequest {
+                    agent_id,
+                    added: None,
+                    enabled: Some(enabled),
+                    label_override: None,
+                    description_override: None,
+                    order_index: None,
+                    command: None,
+                    env: None,
+                    params: None,
+                });
+                self.facade
+                    .management()
+                    .update_agent_config(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::RefreshAgentSnapshot { agent_id } => {
+                let request = vibex_core::AgentRefreshSnapshotRequest {
+                    agent_id,
+                    cwd_scope: None,
+                };
+                self.facade
+                    .management()
+                    .refresh_agent_snapshot(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::CheckAgentUpdate { agent_id } => {
+                let request = MutationRequest::new(agent_id);
+                self.facade
+                    .management()
+                    .check_managed_agent_update(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::RollbackAgent { agent_id } => {
+                let request = MutationRequest::new(agent_id);
+                self.facade
+                    .management()
+                    .rollback_managed_agent(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::UpdateProviderProfile {
+                agent_id,
+                profile_id,
+                display_name,
+                base_url,
+                default_model,
+            } => {
+                let request =
+                    MutationRequest::new(vibex_core::AgentModelProviderProfileUpdateRequest {
+                        agent_id,
+                        provider_profile_id: profile_id,
+                        display_name,
+                        status: None,
+                        account_alias: None,
+                        base_url,
+                        default_model,
+                        small_model: None,
+                        large_model: None,
+                        configured_models: None,
+                        reasoning_effort: None,
+                        sandbox_defaults: None,
+                        network_defaults: None,
+                        permission_defaults: None,
+                        provider_options: None,
+                    });
+                self.facade
+                    .management()
+                    .update_agent_model_provider_profile(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::DeleteProviderProfile {
+                agent_id,
+                profile_id,
+            } => {
+                let request =
+                    MutationRequest::new(vibex_core::AgentModelProviderProfileDeleteRequest {
+                        agent_id,
+                        provider_profile_id: profile_id,
+                    });
+                self.facade
+                    .management()
+                    .delete_agent_model_provider_profile(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::RunHealthProbes => {
+                let request = MutationRequest::new(vibex_core::ProviderRunHealthProbesRequest {
+                    provider_profile_ids: None,
+                    probe_kinds: None,
+                });
+                self.facade
+                    .management()
+                    .run_health_probes(request)
+                    .await
+                    .map(|result| {
+                        self.send(AppMessage::ProviderHealth(Ok(result.summaries)));
+                    })
+            }
+            M::CreateMcpServer(request) => {
+                let request = MutationRequest::new(*request);
+                self.facade
+                    .management()
+                    .create_mcp_server(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::UpdateMcpServer(request) => {
+                let request = MutationRequest::new(*request);
+                self.facade
+                    .management()
+                    .update_mcp_server(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::DeleteMcpServer { server_id } => {
+                let request = MutationRequest::new(vibex_core::McpServerDeleteRequest {
+                    mcp_server_id: server_id,
+                });
+                self.facade
+                    .management()
+                    .delete_mcp_server(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::ValidateMcpServer { server_id } => {
+                let request = vibex_core::McpServerValidateRequest {
+                    mcp_server_id: Some(server_id),
+                    candidate: None,
+                };
+                self.facade
+                    .management()
+                    .validate_mcp_server(request)
+                    .await
+                    .map(|result| {
+                        self.send(AppMessage::Validation {
+                            key: None,
+                            message: format!("{} · {}", result.code, result.message),
+                            failed: result.status == vibex_core::McpServerValidationStatus::Fail,
+                        });
+                    })
+            }
+            M::SetMcpAgentMatrix { server_id, matrix } => {
+                let request = MutationRequest::new(vibex_core::McpServerSetAgentMatrixRequest {
+                    mcp_server_id: server_id,
+                    agent_matrix: matrix,
+                });
+                self.facade
+                    .management()
+                    .set_mcp_server_agent_matrix(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::DiscoverMcpSources => {
+                let request = vibex_core::McpServerDiscoverRequest {
+                    source_agent_id: None,
+                };
+                let result = self.facade.management().discover_mcp_sources(request).await;
+                self.send(AppMessage::ConfigSources {
+                    module: crate::config_center::ConfigModule::Mcp,
+                    mcp: result.map(|response| response.discoveries),
+                    skill: None,
+                });
+                Ok(())
+            }
+            M::ImportMcpServer { selection } => {
+                let request = MutationRequest::new(vibex_core::McpServerImportRequest {
+                    selections: vec![*selection],
+                });
+                self.facade
+                    .management()
+                    .import_mcp_servers(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::SearchMcpMarket { query } => {
+                let request = vibex_core::McpMarketSearchRequest {
+                    query: (!query.trim().is_empty()).then_some(query),
+                    limit: Some(40),
+                    offset: None,
+                    transport: None,
+                    extend: None,
+                };
+                let result = self.facade.management().search_mcp_market(request).await;
+                match result {
+                    Ok(response) => {
+                        self.send(AppMessage::Registry {
+                            module: crate::config_center::ConfigModule::Mcp,
+                            mcp: Ok(response.entries),
+                            skill: None,
+                            note: Some(format!(
+                                "{} / {}",
+                                response.total_matches, response.catalog_size
+                            )),
+                        });
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            M::InstallMcpMarketEntry {
+                entry_id,
+                candidate,
+                env_values,
+            } => {
+                let request = MutationRequest::new(vibex_core::McpMarketInstallRequest {
+                    entry_id,
+                    agent_ids: Vec::new(),
+                    env_values,
+                    candidate: *candidate,
+                });
+                self.facade
+                    .management()
+                    .install_mcp_market_entry(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::CreateSkill(request) => {
+                let request = MutationRequest::new(*request);
+                self.facade
+                    .management()
+                    .create_skill(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::UpdateSkill(request) => {
+                let request = MutationRequest::new(*request);
+                self.facade
+                    .management()
+                    .update_skill(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::DeleteSkill { skill_id } => {
+                let request = MutationRequest::new(vibex_core::SkillDeleteRequest { skill_id });
+                self.facade
+                    .management()
+                    .delete_skill(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::ValidateSkill { skill_id } => {
+                let request = vibex_core::SkillValidateRequest {
+                    skill_id: Some(skill_id),
+                    candidate: None,
+                };
+                self.facade
+                    .management()
+                    .validate_skill(request)
+                    .await
+                    .map(|result| {
+                        self.send(AppMessage::Validation {
+                            key: None,
+                            message: format!("{} · {}", result.code, result.message),
+                            failed: result.status == vibex_core::SkillValidationStatus::Fail,
+                        });
+                    })
+            }
+            M::SetSkillAgentMatrix { skill_id, matrix } => {
+                let request = MutationRequest::new(vibex_core::SkillSetAgentMatrixRequest {
+                    skill_id,
+                    agent_matrix: matrix,
+                });
+                self.facade
+                    .management()
+                    .set_skill_agent_matrix(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::DiscoverSkillSources => {
+                let request = vibex_core::SkillDiscoverRequest {
+                    source_agent_id: None,
+                    workspace_id: None,
+                };
+                let result = self
+                    .facade
+                    .management()
+                    .discover_skill_sources(request)
+                    .await;
+                self.send(AppMessage::ConfigSources {
+                    module: crate::config_center::ConfigModule::Skills,
+                    mcp: Ok(Vec::new()),
+                    skill: Some(result.map(|response| response.discoveries)),
+                });
+                Ok(())
+            }
+            M::ImportSkill { selection } => {
+                let request = MutationRequest::new(vibex_core::SkillImportRequest {
+                    selections: vec![*selection],
+                });
+                self.facade
+                    .management()
+                    .import_skills(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::SearchSkillMarket { query } => {
+                let request = vibex_core::SkillMarketSearchRequest {
+                    query: (!query.trim().is_empty()).then_some(query),
+                    limit: Some(40),
+                    cursor: None,
+                    sort: None,
+                };
+                let result = self.facade.management().search_skill_market(request).await;
+                match result {
+                    Ok(response) => {
+                        self.send(AppMessage::Registry {
+                            module: crate::config_center::ConfigModule::Skills,
+                            mcp: Ok(Vec::new()),
+                            skill: Some(Ok(response.entries)),
+                            note: None,
+                        });
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            M::InstallSkillMarketEntry {
+                entry_id,
+                slug,
+                owner_handle,
+                version,
+            } => {
+                let document_request = vibex_core::SkillMarketDocumentRequest {
+                    entry_id: entry_id.clone(),
+                    slug,
+                    owner_handle,
+                    version,
+                };
+                match self
+                    .facade
+                    .management()
+                    .skill_market_document(document_request)
+                    .await
+                {
+                    Ok(document) => {
+                        let request = MutationRequest::new(vibex_core::SkillMarketInstallRequest {
+                            entry_id,
+                            agent_ids: Vec::new(),
+                            document,
+                        });
+                        self.facade
+                            .management()
+                            .install_skill_market_entry(request)
+                            .await
+                            .map(|_| ())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            M::CreatePrompt(request) => {
+                let request = MutationRequest::new(*request);
+                self.facade
+                    .management()
+                    .create_prompt(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::UpdatePrompt(request) => {
+                let request = MutationRequest::new(*request);
+                self.facade
+                    .management()
+                    .update_prompt(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::DeletePrompt { prompt_id } => {
+                let request = MutationRequest::new(vibex_core::PromptDeleteRequest { prompt_id });
+                self.facade
+                    .management()
+                    .delete_prompt(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::CreateHook(request) => {
+                let request = MutationRequest::new(*request);
+                self.facade
+                    .management()
+                    .create_hook(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::UpdateHook(request) => {
+                let request = MutationRequest::new(*request);
+                self.facade
+                    .management()
+                    .update_hook(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::DeleteHook { hook_id } => {
+                let request = MutationRequest::new(vibex_core::HookDeleteRequest { hook_id });
+                self.facade
+                    .management()
+                    .delete_hook(request)
+                    .await
+                    .map(|_| ())
+            }
+            M::PreviewHookInstall { hook_id } => {
+                let request = vibex_core::HookInstallPreviewRequest {
+                    hook_id,
+                    target_path: None,
+                };
+                let result = self.facade.management().preview_hook_install(request).await;
+                match result {
+                    Ok(preview) => {
+                        self.send(AppMessage::Validation {
+                            key: None,
+                            message: format!(
+                                "{} · {}",
+                                preview.target_path, preview.redacted_preview
+                            ),
+                            failed: false,
+                        });
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.send(AppMessage::Mutation {
+                    key,
+                    result: Ok(()),
+                });
+                self.send(AppMessage::ConfigReload);
+            }
+            Err(error) => self.config_failed(&key, error),
+        }
+    }
+
+    fn config_failed(&mut self, key: &str, error: BackendError) {
+        self.send(AppMessage::Mutation {
+            key: key.to_string(),
+            result: Err(error),
+        });
+        self.send(AppMessage::ConfigReload);
     }
 
     fn failure(&self, key: &str, error: BackendError) {
@@ -967,6 +1504,46 @@ impl Dispatch {
                     Ok(()) => self.ok("logout_agent"),
                     Err(error) => self.failure("logout_agent", error),
                 }
+            }
+            Effect::ConfigMutation { mutation } => self.config_mutation(mutation).await,
+            Effect::ListHooks => {
+                let result = self.facade.management().hooks().await;
+                self.send(AppMessage::Hooks(result));
+            }
+            Effect::DiscoverSources { module } => {
+                use crate::config_center::ConfigModule;
+                match module {
+                    ConfigModule::Mcp => {
+                        let request = vibex_core::McpServerDiscoverRequest {
+                            source_agent_id: None,
+                        };
+                        let result = self.facade.management().discover_mcp_sources(request).await;
+                        self.send(AppMessage::ConfigSources {
+                            module,
+                            mcp: result.map(|response| response.discoveries),
+                            skill: None,
+                        });
+                    }
+                    _ => {
+                        let request = vibex_core::SkillDiscoverRequest {
+                            source_agent_id: None,
+                            workspace_id: None,
+                        };
+                        let result = self
+                            .facade
+                            .management()
+                            .discover_skill_sources(request)
+                            .await;
+                        self.send(AppMessage::ConfigSources {
+                            module,
+                            mcp: Ok(Vec::new()),
+                            skill: Some(result.map(|response| response.discoveries)),
+                        });
+                    }
+                }
+            }
+            Effect::SearchRegistry { module, query } => {
+                self.search_registry(module, query).await;
             }
             Effect::ListMcp => {
                 let result = self.facade.management().mcp_servers().await;

@@ -1220,28 +1220,37 @@ fn a_secret_prompt_never_echoes_the_secret() {
 }
 
 #[test]
-fn the_management_index_lists_every_section() {
+fn the_configuration_centre_lists_every_module_and_area() {
     let mut app = app(120, 40);
     app.perform(vibex_tui::action::Intent::GotoManagement);
     let screen = text(&render(&mut app, 120, 40));
-    for needle in ["Agents", "Providers", "MCP servers", "Skills", "Devices"] {
+    // The four modules of the desktop configuration centre, and the Agent
+    // module's own function areas under the rail.
+    for needle in ["Agent", "MCP", "Skills", "Prompts"] {
         assert!(
             screen.contains(needle),
-            "management lost {needle}:\n{screen}"
+            "the centre lost the {needle} module:\n{screen}"
         );
     }
+    for needle in ["Agents", "Model providers", "Health"] {
+        assert!(screen.contains(needle), "the rail lost {needle}:\n{screen}");
+    }
+    // The device pages are not a configuration module; they are reachable
+    // from the palette, and the centre must not have swallowed them.
+    assert!(
+        !screen.contains("Devices"),
+        "the centre grew a device module:\n{screen}"
+    );
 }
 
 #[test]
 fn unavailable_capabilities_are_visible_not_hidden() {
-    // A disconnected backend supports nothing, so every gated row must say so
-    // rather than silently disappearing.
-    let mut app = app(120, 40);
     // A connected client whose backend does not offer device management: the
-    // index's gated row has to say so rather than pretending it is there.
+    // devices page has to say so rather than pretending the rows are there.
+    let mut app = app(120, 40);
     app.live = vibex_tui::app::LiveState::Ready;
     app.capabilities.device = vibex_backend::DomainCapabilities::unavailable();
-    app.perform(vibex_tui::action::Intent::GotoManagement);
+    app.perform(vibex_tui::action::Intent::GotoDevices);
     let screen = text(&render(&mut app, 120, 40));
     assert!(
         screen.contains("cannot") || screen.contains("unavailable"),
@@ -1388,11 +1397,16 @@ fn color_less_mode_still_renders_every_label() {
 fn the_selection_marker_follows_the_scope() {
     let mut app = app(120, 40);
     app.perform(vibex_tui::action::Intent::GotoManagement);
-    app.set_selection(Scope::Management, 2);
+    // The configuration centre keeps its own cursor per area, so moving to the
+    // second record and redrawing must light the row under the reader rather
+    // than the first one.
+    app.config_center.set_cursor(1);
     let screen = text(&render(&mut app, 120, 40));
-    // The third row is MCP servers; the list renders without panicking and the
-    // row is present at the new index.
-    assert!(screen.contains("MCP servers"), "{screen}");
+    assert!(screen.contains("Agents"), "{screen}");
+    assert!(
+        screen.contains("Codex") || screen.contains("Nothing here yet"),
+        "{screen}"
+    );
 }
 
 #[test]

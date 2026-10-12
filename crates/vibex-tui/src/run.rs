@@ -418,6 +418,37 @@ fn handle_key(
             _ => {}
         }
     }
+    // The configuration centre's filter is its own field: it narrows a table
+    // on the page rather than the session list, and `Enter` asks the area to
+    // read again, which is what makes a registry search a search.
+    if app.config_center.filtering {
+        match key.code {
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.push_config_filter(character);
+                return Ok(false);
+            }
+            KeyCode::Backspace => {
+                app.pop_config_filter();
+                return Ok(false);
+            }
+            KeyCode::Delete => {
+                app.clear_config_filter();
+                return Ok(false);
+            }
+            KeyCode::Enter => {
+                app.config_center.filtering = false;
+                let outcome = app.refresh_config_area();
+                dispatch_all(worker, &outcome);
+                return Ok(false);
+            }
+            KeyCode::Esc => {
+                let outcome = app.perform(crate::action::Intent::Back);
+                dispatch_all(worker, &outcome);
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
     // While a filter or a prompt is being typed, printable characters are text.
     if app.filtering {
         match key.code {
@@ -448,6 +479,21 @@ fn handle_key(
             _ => {}
         }
     } else if let Some(overlay) = app.overlay.clone() {
+        if let Overlay::Form { form } = &overlay
+            && form.editing.is_some()
+        {
+            match key.code {
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.type_form_char(character);
+                    return Ok(false);
+                }
+                KeyCode::Backspace => {
+                    app.form_backspace();
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
         if let Overlay::Prompt {
             field,
             value,
@@ -1141,6 +1187,11 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 app.scroll_session_list(-3);
                 return true;
             }
+            if app.page == crate::app::Page::Management && app.overlay.is_none() {
+                let outcome = app.scroll_config_area(-3, mouse.column, mouse.row);
+                dispatch_all(worker, &outcome);
+                return true;
+            }
             app.scroll_lines(-3);
             // The wheel is the other way to reach the top of the loaded
             // window; the controller ignores the ask when the history is
@@ -1158,6 +1209,11 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             }
             if app.page == crate::app::Page::Sessions && app.overlay.is_none() {
                 app.scroll_session_list(3);
+                return true;
+            }
+            if app.page == crate::app::Page::Management && app.overlay.is_none() {
+                let outcome = app.scroll_config_area(3, mouse.column, mouse.row);
+                dispatch_all(worker, &outcome);
                 return true;
             }
             app.scroll_lines(3);
@@ -1199,6 +1255,15 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 .and_then(|region| region.entry_at(mouse.column, mouse.row))
             {
                 let outcome = app.select_palette_row(row, true);
+                dispatch_all(worker, &outcome);
+                return true;
+            }
+            // The configuration centre's own controls come first: a tab, an
+            // area and a record's action button are each a control, and a
+            // click on one is the press rather than a step towards it.
+            if app.overlay.is_none()
+                && let Some(outcome) = app.click_config_control(mouse.column, mouse.row)
+            {
                 dispatch_all(worker, &outcome);
                 return true;
             }
@@ -1250,6 +1315,11 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 && let Some(index) = crate::app::list_row_at(&region, mouse.column, mouse.row)
             {
                 let repeat = app.double_click_at(mouse.column, mouse.row);
+                if region.scope == crate::keymap::Scope::Management {
+                    let outcome = app.click_config_row(index, repeat);
+                    dispatch_all(worker, &outcome);
+                    return true;
+                }
                 app.set_selection(region.scope, index);
                 // A heading is a control, not a row to open: it folds on the
                 // first click, the way a tree does everywhere else. A session
@@ -1261,9 +1331,6 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                     let intent = match region.scope {
                         crate::keymap::Scope::Sessions => {
                             crate::action::Intent::OpenSelectedSession
-                        }
-                        crate::keymap::Scope::Management => {
-                            crate::action::Intent::OpenManagementSection
                         }
                         _ => crate::action::Intent::ActivateSetting,
                     };
@@ -2071,6 +2138,62 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
+        AppMessage::Hooks(result) => match result {
+            Ok(hooks) => app.management_data.hooks = hooks,
+            Err(error) => app.toast(Toast::danger(error.message)),
+        },
+        AppMessage::ConfigSources { module, mcp, skill } => {
+            if module == crate::config_center::ConfigModule::Mcp {
+                match mcp {
+                    Ok(discoveries) => app.management_data.mcp_discoveries = discoveries,
+                    Err(error) => app.toast(Toast::danger(error.message)),
+                }
+            }
+            if let Some(skill) = skill {
+                match skill {
+                    Ok(discoveries) => app.management_data.skill_discoveries = discoveries,
+                    Err(error) => app.toast(Toast::danger(error.message)),
+                }
+            }
+        }
+        AppMessage::Registry {
+            module,
+            mcp,
+            skill,
+            note,
+        } => {
+            if module == crate::config_center::ConfigModule::Mcp {
+                match mcp {
+                    Ok(entries) => app.management_data.mcp_market = entries,
+                    Err(error) => app.toast(Toast::danger(error.message)),
+                }
+            } else if let Some(skill) = skill {
+                match skill {
+                    Ok(entries) => app.management_data.skill_market = entries,
+                    Err(error) => app.toast(Toast::danger(error.message)),
+                }
+            }
+            app.management_data.market_note = note;
+        }
+        AppMessage::Validation {
+            key,
+            message,
+            failed,
+        } => {
+            if let Some(key) = key {
+                app.config_center.finish_pending(&key);
+            }
+            let tone = if failed {
+                crate::config_center::ConfigTone::Bad
+            } else {
+                crate::config_center::ConfigTone::Ok
+            };
+            app.config_center.set_notice(message, tone);
+        }
+        AppMessage::ConfigReload => {
+            let outcome = app.refresh_config_area();
+            dispatch_all(worker, &outcome);
+        }
         AppMessage::Mcp(result) => match result {
             Ok(servers) => {
                 app.management_data.mcp = servers;

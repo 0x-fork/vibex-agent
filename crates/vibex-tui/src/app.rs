@@ -62,11 +62,15 @@ impl Page {
         match self {
             Page::Sessions => Scope::Sessions,
             Page::Agent | Page::NewSession => Scope::Agent,
-            Page::Management | Page::Agents => Scope::Management,
-            Page::Providers => Scope::Providers,
-            Page::Mcp => Scope::Mcp,
-            Page::Skills => Scope::Skills,
-            Page::Prompts => Scope::Prompts,
+            // The configuration centre is one surface with four modules, so it
+            // is one key scope: a binding written for the MCP table must not
+            // disappear because the reader moved to Skills.
+            Page::Management
+            | Page::Agents
+            | Page::Providers
+            | Page::Mcp
+            | Page::Skills
+            | Page::Prompts => Scope::Management,
             Page::Devices => Scope::Devices,
             Page::Settings => Scope::Settings,
             Page::Help => Scope::Help,
@@ -169,6 +173,23 @@ pub enum Overlay {
         title: String,
         field: PromptField,
         value: String,
+    },
+    /// A multi-field editor for one configuration record.
+    ///
+    /// A form rather than a prompt because an MCP server is not a name: it has
+    /// a transport, an endpoint, arguments and environment, and a client that
+    /// only lets the reader rename it is a client that cannot configure it.
+    Form {
+        form: crate::config_center::ConfigForm,
+    },
+    /// The actions one configuration record offers, chosen from a list.
+    ///
+    /// What a record can do depends on the record — an Agent with an external
+    /// install has no rollback, a provider profile with no credential has no
+    /// test — so the actions are a menu built from the row rather than a key
+    /// per verb that might do nothing.
+    EntryActions {
+        entry: crate::config_center::EntryActions,
     },
     /// The pending approval card.
     Approval { selected: usize },
@@ -505,6 +526,17 @@ pub struct ManagementData {
     pub mcp: Vec<vibex_core::McpServer>,
     pub skills: Vec<vibex_core::Skill>,
     pub prompts: Vec<vibex_core::Prompt>,
+    pub hooks: Vec<vibex_core::Hook>,
+    /// The last registry page the configuration centre asked for. Market
+    /// results are a read like any other, so they are held beside the records
+    /// rather than inside the surface that drew them.
+    pub mcp_market: Vec<vibex_core::McpMarketEntry>,
+    pub skill_market: Vec<vibex_core::SkillMarketEntry>,
+    /// What the registry answered about the read itself: how many entries the
+    /// page holds and whether another page exists.
+    pub market_note: Option<String>,
+    pub mcp_discoveries: Vec<vibex_core::McpServerDiscovery>,
+    pub skill_discoveries: Vec<vibex_core::SkillDiscovery>,
     pub backups: Vec<vibex_core::BackupCreateOutcome>,
 }
 
@@ -760,6 +792,17 @@ pub struct App {
 
     pub settings: SettingsState,
     pub management_data: ManagementData,
+    /// The configuration centre's own navigation: which module and area are
+    /// open, which pane owns the keyboard, and the filter over the records.
+    ///
+    /// It lives beside the data rather than inside a page because the centre
+    /// keeps its place while the reader works in the timeline and comes back.
+    pub config_center: crate::config_center::ConfigCenter,
+    /// The record a confirmation is about, for the two destructive verbs that
+    /// ask first. It is carried as the record's key and the verb rather than as
+    /// the cursor's index, so an answer that arrives after a refresh still
+    /// names the record the question was asked about.
+    pub pending_config_action: Option<(String, crate::config_center::ConfigAction)>,
     pub selection: BTreeMap<Scope, usize>,
     pub filter: String,
     pub filtering: bool,
@@ -1102,6 +1145,12 @@ pub struct FrameRegions {
     /// A row-per-index list the frame drew: its rect and the scope it selects
     /// in. Clicking row `n` selects entry `n`.
     pub list: Option<ListRegion>,
+    /// The configuration centre's module tabs, area rail and per-record
+    /// action buttons. Each is a control, not a row: pressing one switches a
+    /// module, opens an area, or runs the verb it is labelled with.
+    pub config_tabs: Vec<(ratatui::layout::Rect, crate::config_center::ConfigModule)>,
+    pub config_sections: Vec<(ratatui::layout::Rect, crate::config_center::ConfigSection)>,
+    pub config_buttons: Vec<(ratatui::layout::Rect, crate::config_center::ConfigAction)>,
     /// The runtime switcher's rows, when it is the modal on screen. Its cursor
     /// indexes a window rather than a rect, so the region carries where the
     /// window started as well as where it was drawn.
@@ -1128,6 +1177,9 @@ impl FrameRegions {
         self.turns.clear();
         self.hints.clear();
         self.row_actions.clear();
+        self.config_tabs.clear();
+        self.config_sections.clear();
+        self.config_buttons.clear();
         self.runtime_picker = None;
         self.palette = None;
         // A list, a banner row, a composer's box and a modal's close affordance
@@ -1416,6 +1468,8 @@ impl App {
                 filter: String::new(),
             },
             management_data: ManagementData::default(),
+            config_center: crate::config_center::ConfigCenter::default(),
+            pending_config_action: None,
             selection: BTreeMap::new(),
             filter: String::new(),
             filtering: false,
@@ -2680,6 +2734,141 @@ impl App {
         self.selection.insert(scope, value);
     }
 
+    /// Whether a point is inside a rect the last frame published.
+    pub fn rect_contains(rect: ratatui::layout::Rect, column: u16, row: u16) -> bool {
+        column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+    }
+
+    /// A press on one of the centre's own controls, if the point is over one.
+    ///
+    /// The frame publishes where each control landed, so the pointer's press
+    /// is resolved against the same rects the reader saw rather than against a
+    /// second copy of the layout sums.
+    pub fn click_config_control(
+        &mut self,
+        column: u16,
+        row: u16,
+    ) -> Option<crate::reduce::Outcome> {
+        if let Some((_, module)) = self
+            .regions
+            .config_tabs
+            .iter()
+            .find(|(rect, _)| App::rect_contains(*rect, column, row))
+            .copied()
+        {
+            return Some(self.show_config_module(module, None));
+        }
+        if let Some((_, section)) = self
+            .regions
+            .config_sections
+            .iter()
+            .find(|(rect, _)| App::rect_contains(*rect, column, row))
+            .copied()
+        {
+            return Some(self.show_config_section(section));
+        }
+        let action = self
+            .regions
+            .config_buttons
+            .iter()
+            .find(|(rect, _)| App::rect_contains(*rect, column, row))
+            .map(|(_, action)| *action)?;
+        Some(self.run_selected_config_action(action))
+    }
+
+    /// A press on a record row: the first selects, the second opens the menu.
+    pub fn click_config_row(&mut self, index: usize, repeat: bool) -> crate::reduce::Outcome {
+        let rows = self
+            .config_center
+            .visible(&self.management_data, self.strings);
+        if index >= rows.len() {
+            return crate::reduce::Outcome::quiet();
+        }
+        self.config_center.set_cursor(index);
+        self.config_center.zone = crate::config_center::ConfigZone::Rows;
+        self.config_center.pin(rows.get(index));
+        if repeat {
+            return self.perform(crate::action::Intent::ConfigEntryActions);
+        }
+        crate::reduce::Outcome::quiet()
+    }
+
+    /// Show one module of the configuration centre, and read what it needs.
+    pub fn show_config_module(
+        &mut self,
+        module: crate::config_center::ConfigModule,
+        section: Option<crate::config_center::ConfigSection>,
+    ) -> crate::reduce::Outcome {
+        self.config_center.show_module(module, section);
+        self.config_center.zone = crate::config_center::ConfigZone::Modules;
+        self.page = Page::Management;
+        self.refresh_config_area()
+    }
+
+    pub fn show_config_section(
+        &mut self,
+        section: crate::config_center::ConfigSection,
+    ) -> crate::reduce::Outcome {
+        self.config_center.show_section(section);
+        self.config_center.zone = crate::config_center::ConfigZone::Rail;
+        self.refresh_config_area()
+    }
+
+    /// Run one of the highlighted record's verbs, as a click on its button.
+    pub fn run_selected_config_action(
+        &mut self,
+        action: crate::config_center::ConfigAction,
+    ) -> crate::reduce::Outcome {
+        let Some(row) = self
+            .config_center
+            .selected(&self.management_data, self.strings)
+        else {
+            return crate::reduce::Outcome::quiet();
+        };
+        self.config_center.zone = crate::config_center::ConfigZone::Rows;
+        self.run_config_action_by_key(&row.key, action)
+    }
+
+    /// The wheel, over whichever band of the centre the pointer is in.
+    pub fn scroll_config_area(
+        &mut self,
+        delta: i64,
+        column: u16,
+        row: u16,
+    ) -> crate::reduce::Outcome {
+        let in_table = self
+            .regions
+            .list
+            .as_ref()
+            .is_some_and(|region| App::rect_contains(region.rect, column, row));
+        if in_table {
+            let rows = self
+                .config_center
+                .visible(&self.management_data, self.strings);
+            self.config_center.reconcile(&rows);
+            self.config_center.step_cursor(&rows, delta as isize);
+            return crate::reduce::Outcome::effects(vec![]);
+        }
+        let scroll = self.config_center.detail_scroll as i64 + delta;
+        self.config_center.detail_scroll = scroll.max(0) as u16;
+        crate::reduce::Outcome::effects(vec![])
+    }
+
+    pub fn push_config_filter(&mut self, character: char) {
+        self.config_center.filter.push(character);
+        self.config_center.set_cursor(0);
+    }
+
+    pub fn pop_config_filter(&mut self) {
+        self.config_center.filter.pop();
+        self.config_center.set_cursor(0);
+    }
+
+    pub fn clear_config_filter(&mut self) {
+        self.config_center.filter.clear();
+        self.config_center.set_cursor(0);
+    }
+
     /// Move the session list's window by `lines`, without moving the cursor.
     ///
     /// The window is clamped where it is drawn — only the frame knows how tall
@@ -2713,13 +2902,12 @@ impl App {
         match self.page {
             Page::NewSession => 0,
             Page::Sessions => self.sidebar_rows().len(),
-            Page::Management => ManagementRow::ALL.len(),
+            Page::Management => self
+                .config_center
+                .visible(&self.management_data, self.strings)
+                .len(),
             Page::Devices => self.management_data.devices.len(),
-            Page::Providers => self.management_data.providers.len(),
-            Page::Agents => self.management_data.agents.len(),
-            Page::Mcp => self.management_data.mcp.len(),
-            Page::Skills => self.management_data.skills.len(),
-            Page::Prompts => self.management_data.prompts.len(),
+            Page::Providers | Page::Agents | Page::Mcp | Page::Skills | Page::Prompts => 0,
             Page::Settings => self.visible_settings().len(),
             Page::Agent => self.transcript.len(),
             Page::Help => 0,
@@ -2804,14 +2992,35 @@ impl App {
             if self.keymap.resolve(&dispatch, binding.chord) != Some(binding.intent) {
                 continue;
             }
-            if (self.overlay.is_some() || self.filtering)
+            if (self.overlay.is_some() || self.filtering || self.config_center.filtering)
                 && binding.scope == Scope::Global
                 && !self.surface_answers(binding.intent)
             {
                 continue;
             }
+            // The configuration centre's two overlays print their own keys in
+            // the modal footer, and the overlay scope is shared with the
+            // approval and elicitation cards: left in, the bar would offer
+            // `A Allow` under a server editor, where it does nothing.
+            if matches!(
+                self.overlay,
+                Some(Overlay::Form { .. }) | Some(Overlay::EntryActions { .. })
+            ) && binding.scope == Scope::Overlay
+            {
+                continue;
+            }
             advertised.push((binding.scope, binding));
         }
+        // The page's own keys lead the bar: a reader looking at the
+        // configuration centre needs what `Enter` does there more than they
+        // need the eighth global shortcut, and the bar drops what does not
+        // fit. The sort is stable, so declaration order holds inside a scope.
+        advertised.sort_by_key(|(scope, _)| {
+            eligible
+                .iter()
+                .position(|candidate| candidate == scope)
+                .unwrap_or(usize::MAX)
+        });
         advertised
     }
 
@@ -2828,7 +3037,7 @@ impl App {
         if intent.leaves_the_surface() || matches!(intent, Intent::Back | Intent::CloseOverlay) {
             return true;
         }
-        self.filtering && intent == Intent::ContextualCancel
+        (self.filtering || self.config_center.filtering) && intent == Intent::ContextualCancel
     }
 
     /// The chord one intent answers to on the surface that owns the keyboard.
@@ -2894,12 +3103,14 @@ impl App {
         if !typing {
             return false;
         }
-        if self.runtime_picker_filtering() || self.filtering {
+        if self.runtime_picker_filtering() || self.filtering || self.config_center.filtering {
             return true;
         }
         match &self.overlay {
             // The surfaces with a query or a form of their own type what the
-            // reader pressed, and the two that answer with a digit spend it.
+            // reader pressed, and the two that answer with a digit spend it. A
+            // configuration form only types while a field is open for editing:
+            // between fields its own keys are the table's.
             Some(Overlay::Palette { .. })
             | Some(Overlay::Help { .. })
             | Some(Overlay::Prompt { .. })
@@ -2908,6 +3119,7 @@ impl App {
                 view: RuntimePickerView::Choices,
                 ..
             }) => true,
+            Some(Overlay::Form { form }) => form.editing.is_some(),
             Some(_) => false,
             None => self.composer_takes_keys(),
         }
@@ -3776,10 +3988,35 @@ impl App {
     /// composing page, not on a session list they never opened. Showing the
     /// page already on screen is not a step, so it is not remembered either.
     pub fn navigate_to(&mut self, page: Page) {
+        let page = self.config_center_route(page);
         if page != self.page {
             self.remember_page();
         }
         self.enter_page(page);
+    }
+
+    /// Fold the per-module pages into the one configuration centre.
+    ///
+    /// `Page::Mcp` and its siblings predate the centre and are still how the
+    /// palette and the rest of the client name a destination; they are routes
+    /// into a module now rather than four screens with four key scopes.
+    fn config_center_route(&mut self, page: Page) -> Page {
+        use crate::config_center::{ConfigModule, ConfigSection};
+        let route = match page {
+            Page::Agents => Some((ConfigModule::Agent, ConfigSection::Agents)),
+            Page::Providers => Some((ConfigModule::Agent, ConfigSection::Providers)),
+            Page::Mcp => Some((ConfigModule::Mcp, ConfigSection::Servers)),
+            Page::Skills => Some((ConfigModule::Skills, ConfigSection::Installed)),
+            Page::Prompts => Some((ConfigModule::Prompts, ConfigSection::Prompts)),
+            _ => None,
+        };
+        match route {
+            Some((module, section)) => {
+                self.config_center.show_module(module, Some(section));
+                Page::Management
+            }
+            None => page,
+        }
     }
 
     /// Note where the reader is, for the walk back.
@@ -5780,6 +6017,198 @@ pub enum ClipboardWanted {
     Image,
 }
 
+/// One configuration-centre mutation, as data.
+///
+/// The centre offers a verb per record, and most of those verbs are one write
+/// against one request type. They travel as a single effect rather than as
+/// twenty variants because the worker's job is the same for all of them: issue
+/// the request, report the outcome, re-read the area. Keeping them together is
+/// what makes "every mutation refreshes what it changed" a property of the
+/// dispatcher instead of a rule each new verb has to remember.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigMutation {
+    // ---- Agent ----------------------------------------------------------
+    ToggleAgent {
+        agent_id: vibex_core::AgentId,
+        enabled: bool,
+    },
+    RefreshAgentSnapshot {
+        agent_id: vibex_core::AgentId,
+    },
+    CheckAgentUpdate {
+        agent_id: vibex_core::AgentId,
+    },
+    RollbackAgent {
+        agent_id: vibex_core::AgentId,
+    },
+    // ---- provider profiles ----------------------------------------------
+    UpdateProviderProfile {
+        agent_id: vibex_core::AgentId,
+        profile_id: vibex_core::ProviderProfileId,
+        display_name: Option<String>,
+        base_url: Option<String>,
+        default_model: Option<String>,
+    },
+    DeleteProviderProfile {
+        agent_id: vibex_core::AgentId,
+        profile_id: vibex_core::ProviderProfileId,
+    },
+    RunHealthProbes,
+    // ---- MCP ------------------------------------------------------------
+    CreateMcpServer(Box<vibex_core::McpServerCreateRequest>),
+    UpdateMcpServer(Box<vibex_core::McpServerUpdateRequest>),
+    DeleteMcpServer {
+        server_id: vibex_core::McpServerId,
+    },
+    ValidateMcpServer {
+        server_id: vibex_core::McpServerId,
+    },
+    SetMcpAgentMatrix {
+        server_id: vibex_core::McpServerId,
+        matrix: Vec<vibex_core::McpServerAgentMatrix>,
+    },
+    DiscoverMcpSources,
+    /// Import one discovered server. The selection carries the candidate the
+    /// runtime published, so the write names the record rather than the row it
+    /// was drawn on.
+    ImportMcpServer {
+        selection: Box<vibex_core::McpServerImportSelection>,
+    },
+    SearchMcpMarket {
+        query: String,
+    },
+    InstallMcpMarketEntry {
+        entry_id: String,
+        candidate: Box<vibex_core::McpServerCreateRequest>,
+        env_values: Vec<vibex_core::McpServerEnvEntry>,
+    },
+    // ---- Skills ---------------------------------------------------------
+    CreateSkill(Box<vibex_core::SkillCreateRequest>),
+    UpdateSkill(Box<vibex_core::SkillUpdateRequest>),
+    DeleteSkill {
+        skill_id: vibex_core::SkillId,
+    },
+    ValidateSkill {
+        skill_id: vibex_core::SkillId,
+    },
+    SetSkillAgentMatrix {
+        skill_id: vibex_core::SkillId,
+        matrix: Vec<vibex_core::SkillAgentMatrix>,
+    },
+    DiscoverSkillSources,
+    ImportSkill {
+        selection: Box<vibex_core::SkillImportSelection>,
+    },
+    SearchSkillMarket {
+        query: String,
+    },
+    InstallSkillMarketEntry {
+        entry_id: String,
+        slug: String,
+        owner_handle: Option<String>,
+        version: Option<String>,
+    },
+    // ---- Prompts and hooks ----------------------------------------------
+    CreatePrompt(Box<vibex_core::PromptCreateRequest>),
+    UpdatePrompt(Box<vibex_core::PromptUpdateRequest>),
+    DeletePrompt {
+        prompt_id: vibex_core::PromptId,
+    },
+    CreateHook(Box<vibex_core::HookCreateRequest>),
+    UpdateHook(Box<vibex_core::HookUpdateRequest>),
+    DeleteHook {
+        hook_id: vibex_core::HookId,
+    },
+    PreviewHookInstall {
+        hook_id: vibex_core::HookId,
+    },
+}
+
+impl ConfigMutation {
+    /// The pending key a row wears while this mutation is in flight.
+    pub fn key(&self) -> String {
+        match self {
+            Self::ToggleAgent { agent_id, .. }
+            | Self::RefreshAgentSnapshot { agent_id }
+            | Self::CheckAgentUpdate { agent_id }
+            | Self::RollbackAgent { agent_id } => format!("agent:{}", agent_id.as_str()),
+            Self::UpdateProviderProfile { profile_id, .. }
+            | Self::DeleteProviderProfile { profile_id, .. } => {
+                format!("provider:{}", profile_id.as_str())
+            }
+            Self::RunHealthProbes => "health".to_string(),
+            Self::CreateMcpServer(_) => "mcp:new".to_string(),
+            Self::UpdateMcpServer(request) => format!("mcp:{}", request.mcp_server_id.as_str()),
+            Self::DeleteMcpServer { server_id }
+            | Self::ValidateMcpServer { server_id }
+            | Self::SetMcpAgentMatrix { server_id, .. } => {
+                format!("mcp:{}", server_id.as_str())
+            }
+            Self::DiscoverMcpSources => "mcp:sources".to_string(),
+            Self::ImportMcpServer { selection } => selection.discovery_id.clone(),
+            Self::SearchMcpMarket { .. } => "mcp:market".to_string(),
+            Self::InstallMcpMarketEntry { entry_id, .. } => entry_id.clone(),
+            Self::CreateSkill(_) => "skill:new".to_string(),
+            Self::UpdateSkill(request) => format!("skill:{}", request.skill_id.as_str()),
+            Self::DeleteSkill { skill_id }
+            | Self::ValidateSkill { skill_id }
+            | Self::SetSkillAgentMatrix { skill_id, .. } => {
+                format!("skill:{}", skill_id.as_str())
+            }
+            Self::DiscoverSkillSources => "skill:sources".to_string(),
+            Self::ImportSkill { selection } => selection.discovery_id.clone(),
+            Self::SearchSkillMarket { .. } => "skill:market".to_string(),
+            Self::InstallSkillMarketEntry { entry_id, .. } => entry_id.clone(),
+            Self::CreatePrompt(_) => "prompt:new".to_string(),
+            Self::UpdatePrompt(request) => format!("prompt:{}", request.prompt_id.as_str()),
+            Self::DeletePrompt { prompt_id } => format!("prompt:{}", prompt_id.as_str()),
+            Self::CreateHook(_) => "hook:new".to_string(),
+            Self::UpdateHook(request) => format!("hook:{}", request.hook_id.as_str()),
+            Self::DeleteHook { hook_id } | Self::PreviewHookInstall { hook_id } => {
+                format!("hook:{}", hook_id.as_str())
+            }
+        }
+    }
+
+    /// What the reader is told while it runs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ToggleAgent { .. } => "agent",
+            Self::RefreshAgentSnapshot { .. } => "agent_probe",
+            Self::CheckAgentUpdate { .. } => "agent_update_check",
+            Self::RollbackAgent { .. } => "agent_rollback",
+            Self::UpdateProviderProfile { .. } => "provider_profile",
+            Self::DeleteProviderProfile { .. } => "provider_profile_delete",
+            Self::RunHealthProbes => "health_probes",
+            Self::CreateMcpServer(_) => "mcp_create",
+            Self::UpdateMcpServer(_) => "mcp_update",
+            Self::DeleteMcpServer { .. } => "mcp_delete",
+            Self::ValidateMcpServer { .. } => "mcp_validate",
+            Self::SetMcpAgentMatrix { .. } => "mcp_matrix",
+            Self::DiscoverMcpSources => "mcp_discover",
+            Self::ImportMcpServer { .. } => "mcp_import",
+            Self::SearchMcpMarket { .. } => "mcp_market",
+            Self::InstallMcpMarketEntry { .. } => "mcp_install",
+            Self::CreateSkill(_) => "skill_create",
+            Self::UpdateSkill(_) => "skill_update",
+            Self::DeleteSkill { .. } => "skill_delete",
+            Self::ValidateSkill { .. } => "skill_validate",
+            Self::SetSkillAgentMatrix { .. } => "skill_matrix",
+            Self::DiscoverSkillSources => "skill_discover",
+            Self::ImportSkill { .. } => "skill_import",
+            Self::SearchSkillMarket { .. } => "skill_market",
+            Self::InstallSkillMarketEntry { .. } => "skill_install",
+            Self::CreatePrompt(_) => "prompt_create",
+            Self::UpdatePrompt(_) => "prompt_update",
+            Self::DeletePrompt { .. } => "prompt_delete",
+            Self::CreateHook(_) => "hook_create",
+            Self::UpdateHook(_) => "hook_update",
+            Self::DeleteHook { .. } => "hook_delete",
+            Self::PreviewHookInstall { .. } => "hook_preview",
+        }
+    }
+}
+
 /// Asynchronous work the reducer asks the worker to perform.
 ///
 /// The variants carry only data; the worker owns the tokio runtime and the
@@ -5979,6 +6408,21 @@ pub enum Effect {
     UpdateEntry {
         entry: ManagementEntryEdit,
     },
+    /// One configuration-centre write.
+    ConfigMutation {
+        mutation: ConfigMutation,
+    },
+    /// Read the hooks the runtime manages.
+    ListHooks,
+    /// Read the Agent sources a module's resources can be imported from.
+    DiscoverSources {
+        module: crate::config_center::ConfigModule,
+    },
+    /// Search a module's registry.
+    SearchRegistry {
+        module: crate::config_center::ConfigModule,
+        query: String,
+    },
     /// Provider health summaries.
     ListHealth,
     /// Rename a provider profile.
@@ -6027,6 +6471,10 @@ impl Effect {
             Effect::LoadSidebarOrganization => "sidebar_organization",
             Effect::ProbeAutoContinue { .. } => "auto_continue_probe",
             Effect::MutateSidebarOrganization { .. } => "sidebar_organization_mutation",
+            Effect::ConfigMutation { mutation } => mutation.label(),
+            Effect::ListHooks => "hooks",
+            Effect::DiscoverSources { .. } => "config_sources",
+            Effect::SearchRegistry { .. } => "config_registry",
             Effect::OpenSession { .. } => "open_session",
             Effect::RefreshTimeline => "timeline",
             Effect::LoadOlder { .. } => "older_timeline",
@@ -6557,6 +7005,7 @@ mod tests {
             Page::Sessions,
             Page::Agent,
             Page::Devices,
+            Page::Prompts,
             Page::Settings,
             Page::Help,
         ] {

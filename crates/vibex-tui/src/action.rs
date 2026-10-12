@@ -182,24 +182,24 @@ intents! {
 
 
     // ---- management -----------------------------------------------------
-    OpenManagementSection => { scope: Management, id: "management_open", label: "Open", help: "Open the highlighted management section." },
-    InstallOrUpdateAgent => { scope: Management, id: "management_agent_install", label: "Install", help: "Install, update or roll back the highlighted Agent." },
-    UninstallAgent => { scope: Management, id: "management_agent_uninstall", label: "Uninstall", help: "Uninstall the highlighted Agent." },
-    AgentAuthMenu => { scope: Management, id: "management_agent_auth", label: "Sign in", help: "Open the Agent's authentication options." },
-    AgentAuthRefresh => { scope: Management, id: "management_agent_auth_refresh", label: "Re-probe", help: "Re-read the Agent's advertised authentication methods." },
-    AgentLogout => { scope: Management, id: "management_agent_logout", label: "Sign out", help: "Release the stored credentials for this Agent." },
     ToggleSelectedEntry => { scope: Management, id: "management_toggle", label: "Toggle", help: "Enable or disable the highlighted entry." },
     EditSelectedEntry => { scope: Management, id: "management_edit", label: "Edit", help: "Edit the highlighted entry." },
     ReloadManagement => { scope: Management, id: "management_reload", label: "Reload", help: "Re-read this management section." },
 
+    // ---- configuration centre -------------------------------------------
+    ConfigModulePrevious => { scope: Global, id: "config_module_previous", label: "Module", help: "Move to the previous configuration module (Agent, MCP, Skills, Prompts)." },
+    ConfigModuleNext => { scope: Global, id: "config_module_next", label: "Module", help: "Move to the next configuration module." },
+    ConfigSectionPrevious => { scope: Management, id: "config_section_previous", label: "Area", help: "Move to the previous function area of this module." },
+    ConfigSectionNext => { scope: Management, id: "config_section_next", label: "Area", help: "Move to the next function area of this module." },
+    ConfigPaneNext => { scope: Management, id: "config_pane_next", label: "Pane", help: "Move the keyboard between the modules, the areas, the records and the details." },
+    ConfigPanePrevious => { scope: Management, id: "config_pane_previous", label: "Pane", help: "Move the keyboard backwards between the panes." },
+    ConfigEntryActions => { scope: Management, id: "config_entry_actions", label: "Actions", help: "Open everything the highlighted record can do." },
+    ConfigEntryCreate => { scope: Management, id: "config_entry_create", label: "New", help: "Create a record in this area." },
+    ConfigEntryDelete => { scope: Management, id: "config_entry_delete", label: "Delete", help: "Delete the highlighted record." },
+    ConfigFormSave => { scope: Overlay, id: "config_form_save", label: "Save", help: "Write the form to the runtime." },
+    GotoDevices => { scope: Global, id: "goto_devices", label: "Devices", help: "Paired devices, pairing codes and the audit log." },
+
     // ---- providers ------------------------------------------------------
-    ActivateProviderProfile => { scope: Providers, id: "provider_activate", label: "Use", help: "Make the highlighted profile the active one." },
-    EditProviderProfile => { scope: Providers, id: "provider_edit", label: "Rename", help: "Rename the highlighted profile." },
-    EditProviderProjection => { scope: Providers, id: "provider_projection", label: "Settings", help: "Edit the profile's endpoint and model settings." },
-    EditProviderSecret => { scope: Providers, id: "provider_secret", label: "Credential", help: "Write a new credential. Stored values are never shown." },
-    TestProviderProfile => { scope: Providers, id: "provider_test", label: "Test", help: "Run a connectivity check against the profile." },
-    FetchProviderModels => { scope: Providers, id: "provider_models", label: "Models", help: "Ask the provider which models it offers." },
-    ProviderHealth => { scope: Providers, id: "provider_health", label: "Health", help: "Show the provider health report." },
 
     // ---- devices --------------------------------------------------------
     CreatePairingCode => { scope: Devices, id: "device_pair", label: "Pair", help: "Issue a one-time pairing code and link." },
@@ -242,12 +242,6 @@ impl Intent {
                 | Intent::DeleteSession
                 | Intent::CreatePairingCode
                 | Intent::RevokeSelectedDevice
-                | Intent::InstallOrUpdateAgent
-                | Intent::UninstallAgent
-                | Intent::AgentLogout
-                | Intent::ActivateProviderProfile
-                | Intent::EditProviderSecret
-                | Intent::EditProviderProjection
                 | Intent::ToggleSelectedEntry
                 | Intent::EditSelectedEntry
                 | Intent::SteerRunningTurn

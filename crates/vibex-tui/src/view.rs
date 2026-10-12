@@ -19,9 +19,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use vibex_ui::shell::ShellKind;
 
 use crate::action::Intent;
-use crate::app::{
-    App, Availability, BannerTone, ComposerMode, ManagementRow, Overlay, Page, ToastTone,
-};
+use crate::app::{App, Availability, BannerTone, ComposerMode, Overlay, Page, ToastTone};
 use crate::keymap::Scope;
 use crate::layout::Bands;
 use crate::locale::Strings;
@@ -186,7 +184,7 @@ fn palette_label(intent: Intent, strings: Strings) -> &'static str {
         Intent::DeleteSession => strings.palette_cmd_delete_session(),
         Intent::SwitchAgentRuntime => strings.palette_cmd_switch_runtime(),
         Intent::ProbeAgentRuntime => strings.palette_cmd_probe_runtimes(),
-        Intent::OpenManagementSection => strings.palette_cmd_devices(),
+        Intent::GotoDevices => strings.palette_cmd_devices(),
         Intent::CreatePairingCode => strings.palette_cmd_pair_device(),
         Intent::ReloadKeymap => strings.palette_cmd_reload_keys(),
         Intent::Refresh => strings.palette_cmd_refresh(),
@@ -210,7 +208,7 @@ fn palette_hint(intent: Intent, strings: Strings) -> &'static str {
         Intent::DeleteSession => strings.palette_hint_delete_session(),
         Intent::SwitchAgentRuntime => strings.palette_hint_switch_runtime(),
         Intent::ProbeAgentRuntime => strings.palette_hint_probe_runtimes(),
-        Intent::OpenManagementSection => strings.palette_hint_devices(),
+        Intent::GotoDevices => strings.palette_hint_devices(),
         Intent::CreatePairingCode => strings.palette_hint_pair_device(),
         Intent::ReloadKeymap => strings.palette_hint_reload_keys(),
         Intent::Refresh => strings.palette_hint_refresh(),
@@ -258,7 +256,7 @@ pub const PALETTE: &[PaletteEntry] = &[
         intent: Intent::ProbeAgentRuntime,
     },
     PaletteEntry {
-        intent: Intent::OpenManagementSection,
+        intent: Intent::GotoDevices,
     },
     PaletteEntry {
         intent: Intent::CreatePairingCode,
@@ -315,14 +313,15 @@ pub const fn palette_group(intent: Intent) -> PaletteGroup {
         | Intent::CopyBlockMetadata
         | Intent::ToggleBlockExpanded
         | Intent::BeginTranscriptSearch => PaletteGroup::Workbench,
-        Intent::OpenManagementSection
-        | Intent::InstallOrUpdateAgent
-        | Intent::UninstallAgent
-        | Intent::AgentAuthMenu
+        Intent::GotoDevices
+        | Intent::ConfigModuleNext
+        | Intent::ConfigModulePrevious
+        | Intent::ConfigEntryActions
+        | Intent::ConfigEntryCreate
+        | Intent::ConfigEntryDelete
         | Intent::ToggleSelectedEntry
         | Intent::EditSelectedEntry
-        | Intent::ReloadManagement
-        | Intent::ProviderHealth => PaletteGroup::Management,
+        | Intent::ReloadManagement => PaletteGroup::Management,
         Intent::CreatePairingCode | Intent::RevokeSelectedDevice | Intent::OpenDeviceAudit => {
             PaletteGroup::Device
         }
@@ -2100,10 +2099,15 @@ fn render_management_view(
     strings: Strings,
 ) {
     match app.page {
-        Page::Management => render_management(frame, area, app, theme, strings),
-        Page::Providers | Page::Agents | Page::Mcp | Page::Skills | Page::Prompts => {
-            render_entry_list(frame, area, app, theme, strings)
-        }
+        // Every configuration route draws the one centre; which module and
+        // area are open is the centre's own state, set when the route was
+        // taken.
+        Page::Management
+        | Page::Providers
+        | Page::Agents
+        | Page::Mcp
+        | Page::Skills
+        | Page::Prompts => render_config_center(frame, area, app, theme, strings),
         Page::Devices => render_devices(frame, area, app, theme, strings),
         Page::Settings => render_settings(frame, area, app, theme, strings),
         Page::Help => render_help(frame, area, app, theme, strings),
@@ -3835,196 +3839,609 @@ fn strings_of(_app: &App) -> Strings {
     Strings::for_locale(crate::locale::Locale::En)
 }
 
-fn render_management(
+/// The configuration centre: modules, areas, records and the detail pane.
+///
+/// Four bands rather than one, because the centre is a hierarchy and a flat
+/// list cannot show one: the tab strip is the module, the rail is the function
+/// area inside it, the table is the area's records, and the pane under it is
+/// the highlighted record. Every band is drawn from the same cursor the keys
+/// move, so the pane that is lit and the pane a key acts on cannot disagree.
+fn render_config_center(
     frame: &mut Frame<'_>,
     area: Rect,
     app: &mut App,
     theme: &TuiTheme,
     strings: Strings,
 ) {
-    let inner = page_frame(frame, area, theme, strings.nav_management(), true);
-    let rows = ManagementRow::ALL;
-    let labels = [
-        strings.management_agents(),
-        strings.management_providers(),
-        strings.management_mcp(),
-        strings.management_skills(),
-        strings.management_prompts(),
-        strings.management_devices(),
-    ];
-    let counts = [
-        app.management_data.agents.len(),
-        app.management_data.providers.len(),
-        app.management_data.mcp.len(),
-        app.management_data.skills.len(),
-        app.management_data.prompts.len(),
-        app.management_data.devices.len(),
-    ];
-    let selected = app.selection_for(Scope::Management);
-    let items = rows
-        .iter()
-        .zip(labels.iter().zip(counts.iter()))
-        .enumerate()
-        .map(|(index, (row, (label, count)))| {
-            let availability = match row {
-                ManagementRow::Devices => {
-                    app.availability(vibex_backend::BackendOperation::DeviceList)
-                }
-                _ => Availability::Available,
-            };
-            let suffix = match availability {
-                Availability::RequiresPermission => {
-                    format!("  [{}]", strings.permission_required_for())
-                }
-                Availability::Unsupported => format!("  [{}]", strings.toast_action_unavailable()),
-                _ => format!("  ({count})"),
-            };
-            let style = if index == selected {
-                theme.selected()
-            } else if app.hover == Some((Scope::Management, index)) {
-                theme.base().bg(theme.roles.surface_highlight)
-            } else {
-                theme.base()
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{:<18}", label), style),
-                Span::styled(suffix, theme.muted()),
-            ]))
-        })
-        .collect::<Vec<_>>();
-    app.regions.list = Some(crate::app::ListRegion {
-        rect: inner,
-        scope: Scope::Management,
-        rows: rows.len(),
-        first_line: 0,
-        first_row: 0,
-        heights: Vec::new(),
-    });
-    let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(selected.min(rows.len() - 1)));
-    frame.render_stateful_widget(List::new(items), inner, &mut state);
-}
-
-fn render_entry_list(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &mut App,
-    theme: &TuiTheme,
-    strings: Strings,
-) {
-    let title = match app.page {
-        Page::Providers => strings.management_providers(),
-        Page::Agents => strings.management_agents(),
-        Page::Mcp => strings.management_mcp(),
-        Page::Skills => strings.management_skills(),
-        Page::Prompts => strings.management_prompts(),
-        _ => strings.management_providers(),
-    };
-    let inner = page_frame(frame, area, theme, title, true);
-    let entries: Vec<(String, String, bool)> = match app.page {
-        Page::Providers => app
-            .management_data
-            .providers
-            .iter()
-            .map(|profile| {
-                (
-                    profile.display_name.clone(),
-                    format!(
-                        "{} · {:?}",
-                        profile.default_model.clone().unwrap_or_default(),
-                        profile.status
-                    ),
-                    profile.status == vibex_core::ProviderProfileStatus::Enabled,
-                )
-            })
-            .collect(),
-        Page::Agents => app
-            .management_data
-            .agents
-            .iter()
-            .map(|agent| {
-                (
-                    agent.label.clone(),
-                    format!("{:?} · {:?}", agent.install_status, agent.runtime_status),
-                    agent.enabled,
-                )
-            })
-            .collect(),
-        Page::Mcp => app
-            .management_data
-            .mcp
-            .iter()
-            .map(|server| {
-                (
-                    server.display_name.clone(),
-                    format!("{:?}", server.transport_kind),
-                    server.status == vibex_core::McpServerStatus::Enabled,
-                )
-            })
-            .collect(),
-        Page::Skills => app
-            .management_data
-            .skills
-            .iter()
-            .map(|skill| {
-                (
-                    skill.display_name.clone(),
-                    skill.description.clone().unwrap_or_default(),
-                    skill.status == vibex_core::SkillStatus::Enabled,
-                )
-            })
-            .collect(),
-        Page::Prompts => app
-            .management_data
-            .prompts
-            .iter()
-            .map(|prompt| {
-                (
-                    prompt.display_name.clone(),
-                    prompt.description.clone().unwrap_or_default(),
-                    prompt.status == vibex_core::PromptStatus::Enabled,
-                )
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-    if entries.is_empty() {
-        empty_state(frame, inner, theme, strings.nothing_here());
+    if area.width < 40 || area.height < 8 {
+        empty_state(frame, area, theme, strings.config_title());
         return;
     }
-    let selected = app.selection_for(app.page.scope());
-    let items = entries
-        .iter()
-        .enumerate()
-        .map(|(index, (label, detail, enabled))| {
-            let style = if index == selected {
-                theme.selected()
-            } else if *enabled {
-                theme.base()
-            } else {
-                theme.muted()
-            };
-            let marker = if *enabled { "●" } else { "○" };
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{marker} {:<20}", truncate_to_width(label, 20, "…")),
-                    style,
-                ),
-                Span::styled(truncate_to_width(detail, 40, "…"), theme.muted()),
-            ]))
-        })
+    let rows = app.config_center.visible(&app.management_data, strings);
+    app.config_center.reconcile(&rows);
+    let bands = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    render_config_tabs(frame, bands[0], app, theme, strings);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(usize::from(bands[1].width)),
+            Style::default().fg(theme.roles.gray_dim),
+        ))),
+        bands[1],
+    );
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(rail_width(area.width)),
+            Constraint::Length(1),
+            Constraint::Min(20),
+        ])
+        .split(bands[2]);
+    render_config_rail(frame, body[0], app, theme, strings);
+    // A rule between the rail and the records, so the two panes read as two
+    // panes rather than as one wide table with a stray column.
+    let rule = (body[1].y..body[1].bottom())
+        .map(|_| Line::from(Span::styled("│", Style::default().fg(theme.roles.gray_dim))))
         .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(rule), body[1]);
+    render_config_records(frame, body[2], app, &rows, theme, strings);
+    render_config_footer(frame, bands[3], app, &rows, theme, strings);
+}
+
+/// How wide the area rail is: a quarter of the terminal, within reason.
+fn rail_width(width: u16) -> u16 {
+    (width / 4).clamp(16, 26)
+}
+
+/// The module strip: four tabs, drawn as pills, clickable and switchable with
+/// `[`/`]` or `Tab` from the module zone.
+fn render_config_tabs(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    let mut used = 1u16;
+    let focused = app.config_center.zone == crate::config_center::ConfigZone::Modules;
+    for module in crate::config_center::ConfigModule::ALL {
+        let active = module == app.config_center.module;
+        let label = format!(" {} ", module.label(strings));
+        let width = display_width(&label) as u16;
+        if used + width > area.width {
+            break;
+        }
+        let style = if active {
+            Style::default()
+                .fg(theme.roles.background)
+                .bg(theme.roles.accent_user)
+                .add_modifier(Modifier::BOLD)
+        } else if focused {
+            Style::default().fg(theme.roles.gray_bright)
+        } else {
+            Style::default().fg(theme.roles.gray)
+        };
+        app.regions.config_tabs.push((
+            Rect {
+                x: area.x + used,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            module,
+        ));
+        spans.push(Span::styled(label, style));
+        spans.push(Span::styled(" ", Style::default()));
+        used += width + 1;
+    }
+    // What sits on the right is the area's record count: the tab strip names
+    // where the reader is, and the number tells them whether it is worth
+    // walking to before they walk.
+    let count = app.config_center.section.label(strings).to_string();
+    let count_label = format!("{} · {}  ", count, app.page_row_count());
+    let count_width = display_width(&count_label) as u16;
+    if used + count_width + 2 < area.width {
+        let pad = area.width - used - count_width - 1;
+        spans.push(Span::raw(" ".repeat(usize::from(pad))));
+        spans.push(Span::styled(
+            count_label,
+            Style::default().fg(theme.roles.gray_dim),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The area rail: the module's function areas, with their record counts.
+fn render_config_rail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let sections = app.config_center.module.sections().to_vec();
+    let counts = app.config_center.counts(&app.management_data, strings);
+    let focused = app.config_center.zone == crate::config_center::ConfigZone::Rail;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(sections.len() + 2);
+    lines.push(Line::from(Span::styled(
+        format!(" {}", strings.config_section_label().to_uppercase()),
+        Style::default()
+            .fg(theme.roles.gray_dim)
+            .add_modifier(Modifier::BOLD),
+    )));
+    for (index, section) in sections.iter().enumerate() {
+        let active = *section == app.config_center.section;
+        let marker = if active { "▸" } else { " " };
+        let count = counts.get(index).copied().unwrap_or(0);
+        let label = format!("{marker} {}", section.label(strings));
+        let count_label = format!("{count} ");
+        let width = usize::from(area.width).saturating_sub(3);
+        let label = truncate_to_width(
+            &label,
+            width.saturating_sub(display_width(&count_label)),
+            "…",
+        );
+        let style = if active {
+            Style::default()
+                .fg(theme.roles.foreground)
+                .bg(theme.roles.surface_highlight)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.roles.text_secondary)
+        };
+        let mut spans = vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(label, style),
+        ];
+        let used = 2 + display_width(&spans[1].content);
+        if used + display_width(&count_label) < usize::from(area.width) {
+            spans.push(Span::styled(
+                " ".repeat(usize::from(area.width) - used - display_width(&count_label)),
+                style,
+            ));
+        }
+        spans.push(Span::styled(
+            count_label,
+            if active {
+                style
+            } else {
+                Style::default().fg(theme.roles.gray_dim)
+            },
+        ));
+        lines.push(Line::from(spans));
+        app.regions.config_sections.push((
+            Rect {
+                x: area.x,
+                y: area.y + lines.len() as u16 - 1,
+                width: area.width,
+                height: 1,
+            },
+            *section,
+        ));
+    }
+    // The rail's own hint, under the list, when the terminal is tall enough
+    // for it to be an explanation rather than a squeeze. It is wrapped rather
+    // than truncated: a hint cut in half explains nothing.
+    if area.height as usize > lines.len() + 2 {
+        let width = usize::from(area.width).saturating_sub(2);
+        lines.push(Line::from(""));
+        for line in textwrap(app.config_center.section.hint(strings), width)
+            .into_iter()
+            .take(3)
+        {
+            lines.push(Line::from(Span::styled(
+                format!(" {line}"),
+                Style::default().fg(theme.roles.gray_dim),
+            )));
+        }
+    }
+    let style = if focused {
+        Style::default()
+    } else {
+        Style::default().fg(theme.roles.text_secondary)
+    };
+    frame.render_widget(Paragraph::new(lines).style(style), area);
+}
+
+/// The record table and the detail pane under it.
+fn render_config_records(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    rows: &[crate::config_center::ConfigRow],
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let detail_rows = if area.height >= 18 {
+        9
+    } else if area.height >= 12 {
+        6
+    } else {
+        0
+    };
+    let bands = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(detail_rows)])
+        .split(area);
+    render_config_table(frame, bands[0], app, rows, theme, strings);
+    if detail_rows > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(usize::from(bands[1].width)),
+                Style::default().fg(theme.roles.gray_dim),
+            ))),
+            Rect {
+                height: 1,
+                ..bands[1]
+            },
+        );
+        let detail = Rect {
+            y: bands[1].y + 1,
+            height: bands[1].height.saturating_sub(1),
+            ..bands[1]
+        };
+        render_config_detail(frame, detail, app, rows, theme, strings);
+    }
+}
+
+fn render_config_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    rows: &[crate::config_center::ConfigRow],
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    if area.height < 2 {
+        return;
+    }
+    let focused = app.config_center.zone == crate::config_center::ConfigZone::Rows;
+    // A filter line takes the first row when one is being typed or is set, so
+    // the reader can see what is hiding rows rather than wondering.
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if app.config_center.filtering || !app.config_center.filter.is_empty() {
+        let caret = if app.config_center.filtering {
+            "▏"
+        } else {
+            ""
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", strings.config_search()),
+                Style::default().fg(theme.roles.accent_user),
+            ),
+            Span::styled(
+                app.config_center.filter.clone(),
+                Style::default().fg(theme.roles.foreground),
+            ),
+            Span::styled(caret.to_string(), theme.accent()),
+            Span::styled(
+                if app.config_center.filter.is_empty() {
+                    format!("  {}", strings.config_search_hint())
+                } else {
+                    String::new()
+                },
+                Style::default().fg(theme.roles.gray_dim),
+            ),
+        ]));
+    }
+    // The heading row is the columns, measured against the same widths the
+    // cells use so a heading sits over its own column.
+    let columns =
+        crate::config_center::columns(app.config_center.module, app.config_center.section, strings);
+    let widths = column_widths(area.width, &columns);
+    if lines.len() < usize::from(area.height) {
+        let mut spans = vec![
+            Span::styled("   ", Style::default()),
+            // The status column has no heading of its own: its cells are
+            // chips, and a chip already says what it is.
+            Span::styled(
+                format!("{:<width$}", "", width = CHIP_COLUMN),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ];
+        for (index, column) in columns.iter().enumerate() {
+            let width = widths.get(index).copied().unwrap_or(0);
+            spans.push(Span::styled(
+                format!("{:<width$}", truncate_to_width(column, width, "…")),
+                Style::default()
+                    .fg(theme.roles.gray_dim)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    let body_top = lines.len() as u16;
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "   {}",
+                if app.config_center.filter.trim().is_empty() {
+                    strings.config_empty()
+                } else {
+                    strings.config_no_matches()
+                }
+            ),
+            Style::default().fg(theme.roles.gray_dim),
+        )));
+    }
+    let selected = app.config_center.cursor(rows.len());
+    let window = area.height.saturating_sub(body_top) as usize;
+    let first = selected.saturating_sub(window.saturating_sub(1) / 2);
+    for (offset, row) in rows.iter().skip(first).take(window.max(1)).enumerate() {
+        let index = first + offset;
+        let is_selected = index == selected;
+        let hovered = app.hover == Some((crate::keymap::Scope::Management, index));
+        let base = if is_selected && focused {
+            Style::default()
+                .fg(theme.roles.foreground)
+                .bg(theme.roles.surface_highlight)
+                .add_modifier(Modifier::BOLD)
+        } else if is_selected || hovered {
+            Style::default()
+                .fg(theme.roles.foreground)
+                .bg(theme.roles.surface)
+        } else if row.enabled {
+            Style::default().fg(theme.roles.foreground)
+        } else {
+            Style::default().fg(theme.roles.gray)
+        };
+        let marker = if row.enabled { "●" } else { "○" };
+        let mut spans = vec![
+            Span::styled(
+                format!(" {marker} "),
+                if row.enabled {
+                    Style::default().fg(theme.roles.success)
+                } else {
+                    Style::default().fg(theme.roles.gray_dim)
+                },
+            ),
+            Span::styled(
+                format!(
+                    "{:<width$}",
+                    truncate_to_width(&row.title, widths[0], "…"),
+                    width = widths[0]
+                ),
+                base,
+            ),
+        ];
+        if !row.chip.is_empty() {
+            spans.push(Span::styled(
+                format!(
+                    "{:<width$}",
+                    truncate_to_width(&row.chip, CHIP_COLUMN, "…"),
+                    width = CHIP_COLUMN
+                ),
+                chip_style(row.tone, theme).patch(base),
+            ));
+        }
+        for (column, cell) in row.cells.iter().enumerate() {
+            let width = widths.get(column + 1).copied().unwrap_or(10);
+            spans.push(Span::styled(
+                format!("{:<width$}", truncate_to_width(cell, width, "…")),
+                base,
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
     app.regions.list = Some(crate::app::ListRegion {
-        rect: inner,
-        scope: app.page.scope(),
-        rows: entries.len(),
+        rect: Rect {
+            y: area.y + body_top,
+            height: area.height.saturating_sub(body_top),
+            ..area
+        },
+        scope: crate::keymap::Scope::Management,
+        rows: rows.len(),
         first_line: 0,
-        first_row: 0,
+        first_row: first,
         heights: Vec::new(),
     });
-    let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(selected.min(entries.len() - 1)));
-    frame.render_stateful_widget(List::new(items), inner, &mut state);
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The width of the status column, which sits between the title and the cells.
+const CHIP_COLUMN: usize = 12;
+
+/// The column widths: the title takes what is left after the fixed columns.
+fn column_widths(width: u16, columns: &[&'static str]) -> Vec<usize> {
+    let total = usize::from(width);
+    if columns.is_empty() {
+        return Vec::new();
+    }
+    // The status chip owns a fixed column of its own, between the title and
+    // the cells, so the title's share is what is left after everything else.
+    let fixed = 3 + CHIP_COLUMN + (columns.len().saturating_sub(1)) * 14;
+    let title = total.saturating_sub(fixed).clamp(12, 48);
+    let mut widths = vec![title];
+    widths.extend(std::iter::repeat_n(14, columns.len().saturating_sub(1)));
+    widths
+}
+
+fn chip_style(tone: crate::config_center::ConfigTone, theme: &TuiTheme) -> Style {
+    use crate::config_center::ConfigTone;
+    let color = match tone {
+        ConfigTone::Ok => theme.roles.success,
+        ConfigTone::Warn => theme.roles.warning,
+        ConfigTone::Bad => theme.roles.danger,
+        ConfigTone::Muted => theme.roles.gray,
+    };
+    Style::default().fg(color)
+}
+
+/// The detail pane: what the highlighted record is, in full.
+fn render_config_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    rows: &[crate::config_center::ConfigRow],
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let Some(row) = rows.get(app.config_center.cursor(rows.len())) else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {}", strings.config_no_selection()),
+                Style::default().fg(theme.roles.gray_dim),
+            ))),
+            area,
+        );
+        return;
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            row.title.clone(),
+            Style::default()
+                .fg(theme.roles.foreground)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {}", strings.config_detail()),
+            Style::default().fg(theme.roles.gray_dim),
+        ),
+    ]));
+    if let Some(summary) = &row.summary {
+        for line in textwrap(summary, usize::from(area.width).saturating_sub(4)) {
+            lines.push(Line::from(Span::styled(
+                format!("   {line}"),
+                Style::default().fg(theme.roles.text_secondary),
+            )));
+        }
+    }
+    let label_width = 14;
+    for (label, value) in &row.detail {
+        let mut parts = value.lines();
+        let first = parts.next().unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    "   {:<label_width$}",
+                    truncate_to_width(label, label_width, "…")
+                ),
+                Style::default().fg(theme.roles.gray_dim),
+            ),
+            Span::styled(
+                truncate_to_width(
+                    first,
+                    usize::from(area.width).saturating_sub(label_width + 4),
+                    "…",
+                ),
+                Style::default().fg(theme.roles.text_secondary),
+            ),
+        ]));
+        for line in parts.take(4) {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "   {:<label_width$}{}",
+                    "",
+                    truncate_to_width(
+                        line,
+                        usize::from(area.width).saturating_sub(label_width + 4),
+                        "…"
+                    )
+                ),
+                Style::default().fg(theme.roles.text_secondary),
+            )));
+        }
+    }
+    let scroll = usize::from(app.config_center.detail_scroll).min(lines.len().saturating_sub(1));
+    let visible = lines
+        .into_iter()
+        .skip(scroll)
+        .take(usize::from(area.height))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), area);
+}
+
+/// The footer: what the highlighted record can do, as buttons the mouse can
+/// press, plus whatever the last write had to say.
+fn render_config_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    rows: &[crate::config_center::ConfigRow],
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let row = rows.get(app.config_center.cursor(rows.len()));
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    let mut used = 1u16;
+    if let Some(row) = row {
+        for action in &row.actions {
+            let label = format!(" {} ", action.label(strings));
+            let width = display_width(&label) as u16;
+            if used + width + 1 > area.width {
+                break;
+            }
+            let pending = app.config_center.is_pending(&row.key);
+            let style = if pending {
+                Style::default()
+                    .fg(theme.roles.warning)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(theme.roles.gray_bright)
+                    .bg(theme.roles.surface)
+            };
+            app.regions.config_buttons.push((
+                Rect {
+                    x: area.x + used,
+                    y: area.y,
+                    width,
+                    height: 1,
+                },
+                *action,
+            ));
+            spans.push(Span::styled(label, style));
+            spans.push(Span::raw(" "));
+            used += width + 1;
+        }
+    }
+    if let Some((notice, tone)) = &app.config_center.notice {
+        let text = truncate_to_width(
+            notice,
+            usize::from(area.width).saturating_sub(usize::from(used) + 2),
+            "…",
+        );
+        if !text.is_empty() {
+            spans.push(Span::styled("  ", Style::default()));
+            spans.push(Span::styled(text, chip_style(*tone, theme)));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Wrap one line of prose to `width` columns, on word boundaries where it can.
+fn textwrap(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if display_width(&current) + 1 + display_width(word) <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn render_devices(
@@ -4039,6 +4456,17 @@ fn render_devices(
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(inner);
+    // A backend that does not offer device management says so rather than
+    // drawing an empty list: "no devices" and "this runtime cannot pair one"
+    // are different answers, and only one of them is the reader's to fix.
+    if app.availability(vibex_backend::BackendOperation::DeviceList) != Availability::Available {
+        let message = match app.availability(vibex_backend::BackendOperation::DeviceList) {
+            Availability::RequiresPermission => strings.permission_required_for(),
+            _ => strings.toast_action_unavailable(),
+        };
+        empty_state(frame, rows[0], theme, message);
+        return;
+    }
     if app.management_data.devices.is_empty() {
         empty_state(frame, rows[0], theme, strings.devices_empty());
     } else {
@@ -4870,11 +5298,12 @@ fn category_label(category: crate::keymap::Category, strings: Strings) -> &'stat
 /// from the least important end rather than truncating it arbitrarily.
 fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTheme) {
     let strings = app.strings;
-    let mut labels = Vec::new();
+    let mut labels: Vec<(Scope, Intent, &'static str)> = Vec::new();
     if app.page.is_session_page() && app.overlay.is_none() {
         let composing = app.focus == crate::app::Focus::Composer || app.page_is_composing();
         if composing {
             labels.push((
+                app.page.scope(),
                 Intent::SubmitComposer,
                 if app.turn_reads_running() {
                     strings.composer_queue()
@@ -4882,14 +5311,31 @@ fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiT
                     strings.composer_send()
                 },
             ));
-            labels.push((Intent::InsertNewline, strings.composer_newline()));
+            labels.push((
+                app.page.scope(),
+                Intent::InsertNewline,
+                strings.composer_newline(),
+            ));
         } else {
-            labels.push((Intent::ToggleBlockExpanded, strings.transcript_expand()));
-            labels.push((Intent::OpenBlockDetails, strings.transcript_details()));
-            labels.push((Intent::FocusComposer, strings.composer_send()));
+            labels.push((
+                app.page.scope(),
+                Intent::ToggleBlockExpanded,
+                strings.transcript_expand(),
+            ));
+            labels.push((
+                app.page.scope(),
+                Intent::OpenBlockDetails,
+                strings.transcript_details(),
+            ));
+            labels.push((
+                app.page.scope(),
+                Intent::FocusComposer,
+                strings.composer_send(),
+            ));
         }
         if app.turn_reads_running() {
             labels.push((
+                Scope::Global,
                 Intent::ContextualCancel,
                 if app.composer.is_empty() {
                     strings.session_stop()
@@ -4898,31 +5344,71 @@ fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiT
                 },
             ));
         }
-        labels.push((Intent::SwitchAgentRuntime, strings.runtime_title()));
-        labels.push((Intent::FocusNext, strings.transcript_browse()));
+        labels.push((
+            app.page.scope(),
+            Intent::SwitchAgentRuntime,
+            strings.runtime_title(),
+        ));
+        labels.push((
+            Scope::Global,
+            Intent::FocusNext,
+            strings.transcript_browse(),
+        ));
     }
     // The table fills in the rest, and the whole list is read back through the
     // keys that answer here: a hint whose intent has no chord on this surface
     // — `Tab` means "previous pane" on the transcript and "accept completion"
     // in the composer, and `?` is help on the list and a question mark in a
     // draft — is dropped rather than spelled wrong.
-    for (_, binding) in app.advertised_keys() {
+    // How many of the bar's rows the page's own scope may take. A page with
+    // twenty verbs would otherwise fill the bar and push the global chrome off
+    // it — including the palette, which is how a reader finds the verbs that
+    // did not fit.
+    // How much of the bar the global chrome keeps. The page's own keys lead,
+    // but a page with twenty verbs would take the whole row and leave the
+    // reader without the palette — which is how they reach the verbs that did
+    // not fit.
+    const GLOBAL_SHARE: u16 = 3;
+    let mut reserved = 0u16;
+    for (scope, binding) in app.advertised_keys() {
+        if scope != Scope::Global {
+            continue;
+        }
+        if let Some(label) = binding.label {
+            reserved +=
+                (display_width(&binding.chord.display()) + 1 + display_width(label) + 5) as u16;
+        }
+        if reserved >= area.width / GLOBAL_SHARE {
+            reserved = reserved.min(area.width / GLOBAL_SHARE);
+            break;
+        }
+    }
+    for (scope, binding) in app.advertised_keys() {
         if let Some(label) = binding.label
-            && !labels.iter().any(|(hinted, _)| *hinted == binding.intent)
+            && !labels
+                .iter()
+                .any(|(_, hinted, _)| *hinted == binding.intent)
         {
-            labels.push((binding.intent, label));
+            labels.push((scope, binding.intent, label));
         }
     }
     let mut spans = vec![Span::raw(" ")];
     let mut used = 1usize;
-    for (intent, label) in labels {
+    for (scope, intent, label) in labels {
         let Some(chord) = app.advertised_chord(intent) else {
             continue;
         };
         let key = chord.display();
         let separator = if used == 1 { "" } else { "  ·  " };
         let width = display_width(&key) + 1 + display_width(label);
-        if used + display_width(separator) + width > usize::from(area.width) {
+        // The page's own rows stop at the line the global chrome keeps; the
+        // global rows may use the whole bar.
+        let ceiling = if scope == Scope::Global {
+            area.width
+        } else {
+            area.width.saturating_sub(reserved)
+        };
+        if used + display_width(separator) + width > usize::from(ceiling) {
             continue;
         }
         spans.push(Span::styled(separator, theme.dimmed(theme.roles.gray_dim)));
@@ -5004,6 +5490,211 @@ fn render_modal(
     Some(layout)
 }
 
+/// The form overlay: one record's fields, edited in place.
+///
+/// Every field is on one screen rather than behind a step per field, because a
+/// reader changing an MCP server's transport usually changes its URL in the
+/// same breath, and a wizard makes them walk the whole form twice.
+fn render_config_form(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    form: &crate::config_center::ConfigForm,
+    theme: &TuiTheme,
+) {
+    let strings = app.strings;
+    let saving = app.config_center.pending.contains_key("form");
+    let chrome = modal_chrome(
+        app,
+        &form.title,
+        ModalSizing::new(70, 96, 48, 2, 2, 1, 2),
+        vec![
+            ModalHint::new("Tab", strings.config_form_hint_move()),
+            ModalHint::new("←→", strings.config_form_hint_change()),
+            ModalHint::new("Enter", strings.config_form_hint_edit()),
+            ModalHint::new("^S", strings.config_form_hint_save()),
+            ModalHint::new("Esc", strings.config_form_hint_cancel()),
+        ],
+    );
+    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
+        return;
+    };
+    let content = layout.content;
+    let footer = layout.footer;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let label_width = 18usize;
+    for (index, field) in form.fields.iter().enumerate() {
+        let selected = index == form.selected;
+        let editing = form.editing.as_deref() == Some(field.key.as_str());
+        let label_style = if selected {
+            Style::default()
+                .fg(theme.roles.accent_user)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.roles.gray)
+        };
+        let marker = if selected { "▸" } else { " " };
+        let changed = if field.changed() { "•" } else { " " };
+        let value = field.displayed();
+        let value_style = if editing {
+            Style::default()
+                .fg(theme.roles.foreground)
+                .bg(theme.roles.surface_highlight)
+        } else if field.changed() {
+            Style::default().fg(theme.roles.warning)
+        } else {
+            Style::default().fg(theme.roles.foreground)
+        };
+        let chevron = match field.kind {
+            crate::config_center::FormFieldKind::Choice { .. } => "‹ ›",
+            crate::config_center::FormFieldKind::Toggle => "on/off",
+            _ => "",
+        };
+        let multi = matches!(field.kind, crate::config_center::FormFieldKind::Multiline);
+        let shown = if multi {
+            value.lines().next().unwrap_or_default().to_string()
+        } else {
+            value.clone()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{marker}{changed} "),
+                Style::default().fg(theme.roles.gray_dim),
+            ),
+            Span::styled(
+                format!(
+                    "{:<label_width$}",
+                    truncate_to_width(&field.label, label_width, "…")
+                ),
+                label_style,
+            ),
+            Span::styled(
+                truncate_to_width(
+                    &shown,
+                    usize::from(content.width).saturating_sub(label_width + 10),
+                    "…",
+                ),
+                value_style,
+            ),
+            Span::styled(
+                if editing {
+                    format!("▏{chevron}")
+                } else {
+                    chevron.to_string()
+                },
+                Style::default().fg(theme.roles.accent_user),
+            ),
+        ]));
+        // A multi-line value is worth its own box: the reader is writing
+        // instructions an Agent will follow, and one truncated line is not
+        // enough to see what they wrote.
+        if multi && (selected || editing) {
+            let body_width = usize::from(content.width).saturating_sub(label_width + 4);
+            for line in field.value.lines().skip(1).take(4) {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{:<label_width$}  {}",
+                        "",
+                        truncate_to_width(line, body_width, "…")
+                    ),
+                    Style::default().fg(theme.roles.text_secondary),
+                )));
+            }
+        }
+        if let Some(hint) = &field.hint
+            && selected
+        {
+            lines.push(Line::from(Span::styled(
+                format!("  {:<label_width$}{}", "", hint),
+                Style::default().fg(theme.roles.gray_dim),
+            )));
+        }
+    }
+    if let Some(error) = &form.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {error}"),
+            Style::default()
+                .fg(theme.roles.danger)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    let scroll = usize::from(form.scroll);
+    let visible = lines
+        .into_iter()
+        .skip(scroll)
+        .take(usize::from(content.height))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), content);
+    if let Some(footer) = footer {
+        // The footer carries the one state the fields cannot show: a write on
+        // its way, or an unsaved change the reader would lose by leaving.
+        let hint = if saving {
+            strings.config_working()
+        } else if form.dirty() {
+            strings.config_form_unsaved()
+        } else {
+            ""
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {hint}"),
+                Style::default().fg(theme.roles.gray_dim),
+            ))),
+            footer,
+        );
+    }
+}
+
+/// The action menu for one record.
+fn render_entry_actions(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    entry: &crate::config_center::EntryActions,
+    theme: &TuiTheme,
+) {
+    let strings = app.strings;
+    let chrome = modal_chrome(
+        app,
+        &entry.title,
+        ModalSizing::new(40, 56, 36, 4, 2, 1, 0),
+        vec![
+            ModalHint::new("↑↓", strings.hint_nav()),
+            ModalHint::new("Enter", strings.hint_run()),
+            ModalHint::new("Esc", strings.close()),
+        ],
+    );
+    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
+        return;
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (index, action) in entry.actions.iter().enumerate() {
+        let selected = index == entry.selected;
+        let label = action.label(strings);
+        let style = if selected {
+            Style::default()
+                .fg(theme.roles.foreground)
+                .bg(theme.roles.surface_highlight)
+                .add_modifier(Modifier::BOLD)
+        } else if action.is_destructive() {
+            Style::default().fg(theme.roles.danger)
+        } else {
+            Style::default().fg(theme.roles.text_secondary)
+        };
+        let marker = if selected { "▸" } else { " " };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{marker} {:<width$}",
+                label,
+                width = usize::from(layout.content.width).saturating_sub(2)
+            ),
+            style,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), layout.content);
+}
+
 fn render_overlay(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -5013,6 +5704,12 @@ fn render_overlay(
 ) {
     let strings = app.strings;
     match overlay {
+        Overlay::Form { form } => {
+            render_config_form(frame, area, app, form, theme);
+        }
+        Overlay::EntryActions { entry } => {
+            render_entry_actions(frame, area, app, entry, theme);
+        }
         Overlay::Palette { query, selected } => {
             let matches = app.palette_entries(query);
             let chrome = modal_chrome(
