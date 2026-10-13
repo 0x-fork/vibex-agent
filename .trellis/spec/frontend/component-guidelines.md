@@ -32,6 +32,54 @@ Compact GPUI shells use single-task list-to-detail navigation:
 
 Keep layout state explicit and serializable enough for persistence or restore.
 
+### Compact Right Rail
+
+The mobile right rail (`apps/mobile/src/workbench.rs`) is the drawer that hosts
+Files, Git, and Terminal. It owns its entire header, and the drawer that carries
+it must not draw a second one: a duplicate title row costs a phone a whole band
+of height to repeat the tab that is already selected, and it leaves two controls
+claiming to be the way out.
+
+- **One header row.** The surface switch is a strip of text tabs plus the close
+  control. The selected tab carries the only fill in the row (`row_active_bg`)
+  and the only semibold weight; the others recede to `text_muted`. A count (open
+  changes, running terminals) rides beside its label in mono micro type instead
+  of a coloured badge, so it reads as part of the word rather than as an alert.
+  Do not put the tab strip in a horizontal scroller: that axis belongs to the
+  drawer's own close swipe.
+- **At most two chrome rows per surface.** One context row (the branch and its
+  totals, or the commit query) and one filter row (the mode switch and the
+  actions that belong to the mode). Every extra band is a row of content the
+  reader loses on a phone.
+- **One primary action per surface.** It is filled with `primary()` and is the
+  only filled control on the rail. Everything else is either a bare glyph target
+  (`toolbar_icon_button`) or a filled pill (`chip_action`); avoid framed,
+  bordered buttons in rail toolbars, because a row of five equal boxes has no
+  hierarchy left to show.
+- **Touch targets.** Every navigation and action control clears
+  `theme::TOUCH_TARGET` (44px) on its own; a control that cannot, such as the
+  half of a segmented track, must sit inside a 44px track. Rows are taller than
+  their controls (52px against 44px) so the padding stays ink, not hitbox.
+- **List rows are inset cards.** File, change, and commit rows carry a
+  `TREE_ROW_INSET` horizontal inset and a rounded fill, so a selected row reads
+  as a card under the pane's border instead of a full-bleed band. Any absolute
+  child (a tree guide rail) subtracts that inset to stay aligned with the rows
+  above it.
+- **Statuses are tinted pills, not bordered chips.** A change status fills
+  `color.opacity(0.18)` behind `color` and shows the one-letter code; additions
+  and deletions sit in fixed-width mono columns so magnitudes compare down the
+  right edge.
+- **Empty panes say one thing, centred.** `empty_state(icon, label)` centres a
+  glyph and a sentence in the space the content would have filled;
+  `centered_pane_state` does the same for an absolutely positioned surface such
+  as the terminal grid. A message in the top-left corner of an empty pane reads
+  as a mistake.
+- **The rail reports, the app animates.** The drawer belongs to `MobileApp`, so
+  the rail's close control calls a handler installed through
+  `MobileWorkbench::set_close_handler` rather than touching drawer state. A
+  source contract asserts the app installs it, because a close control that
+  reports to nobody is a dead button.
+
 ### Top Bar Critical Actions
 
 Top-bar actions that open core surfaces, such as mobile/Web pairing and

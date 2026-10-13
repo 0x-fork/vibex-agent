@@ -4899,13 +4899,24 @@ impl MobileApp {
         let Some(backend) = self.backend.clone() else {
             return;
         };
+        // The rail draws its own header, so it owns the visible way out; the
+        // drawer animation stays here with the page the drawer belongs to.
+        let close = cx.listener(|this, _, window, cx| this.close_right_rail(window, cx));
         self.workbench =
             Some(cx.new(|cx| MobileWorkbench::new(backend, workspace_id, session_id, cx)));
-        if let Some(surface) = pending_surface
-            && let Some(workbench) = self.workbench.as_ref()
-        {
-            workbench.update(cx, |workbench, cx| workbench.set_surface(surface, cx));
+        if let Some(workbench) = self.workbench.as_ref() {
+            workbench.update(cx, |workbench, cx| {
+                workbench.set_close_handler(close);
+                if let Some(surface) = pending_surface {
+                    workbench.set_surface(surface, cx);
+                }
+            });
         }
+    }
+
+    /// Closes the right rail from the rail's own header.
+    fn close_right_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_drawer_snap(0.0, Some(window), cx);
     }
 
     fn create_session(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -18057,15 +18068,17 @@ impl MobileApp {
             .into_any_element()
     }
 
+    /// The right rail as a drawer.
+    ///
+    /// The rail brings its own header — the surface tabs and the close control
+    /// are one row inside the surface — so the drawer only supplies the frame
+    /// and the seam. A second header here would cost a whole row of a phone's
+    /// height to repeat the title of the tab that is already selected.
     fn render_workbench_drawer(
         &self,
         workbench: Option<Entity<MobileWorkbench>>,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let surface = workbench
-            .as_ref()
-            .map(|workbench| workbench.read(cx).surface())
-            .unwrap_or(WorkbenchSurface::Files);
         let body = match workbench {
             Some(workbench) => div().flex_1().min_h_0().child(workbench),
             None => div()
@@ -18088,52 +18101,6 @@ impl MobileApp {
             .border_color(theme::border_default())
             .flex()
             .flex_col()
-            // The rail carries its own header: a phone has no cursor to hover
-            // the drawer edge and no hardware back key rooted in this page, so
-            // the visible way out is part of the surface, not a gesture.
-            .child(
-                div()
-                    .h(px(theme::DRAWER_HEADER_HEIGHT))
-                    .flex_shrink_0()
-                    .px(px(theme::SPACING_SM))
-                    .flex()
-                    .items_center()
-                    .gap(px(theme::SPACING_XS))
-                    .child(
-                        div()
-                            .id("close-right-rail")
-                            .size(px(theme::HEADER_BUTTON_SIZE))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .cursor_pointer()
-                            .aria_label(locale::text("Close", "关闭", "關閉"))
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.start_drawer_snap(0.0, Some(window), cx);
-                                }),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/chevron-right.svg")
-                                    .size(px(theme::ICON_MD))
-                                    .text_color(theme::text_secondary()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .text_size(theme::font_heading())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_primary())
-                            .child(surface.localized_label()),
-                    ),
-            )
             .child(body)
     }
 }

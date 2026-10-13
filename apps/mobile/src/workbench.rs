@@ -1,3 +1,4 @@
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,6 +64,30 @@ const TERMINAL_SELECTION_BAR_BAND: f32 = TERMINAL_SELECTION_BAR_HEIGHT + theme::
 const TERMINAL_HANDLE_SIZE: f32 = 14.0;
 const TERMINAL_HANDLE_TOUCH_RADIUS: f32 = 26.0;
 
+/// The rail's own header: one row of surface tabs and the way out. The drawer
+/// that hosts the rail reserves no header of its own, so this row is the whole
+/// chrome between the session and the surface. The drawer's own old header was
+/// this tall, so the rail now carries a tab strip, a count, and the close
+/// control for the price the title row used to cost on its own.
+const WORKBENCH_HEADER_HEIGHT: f32 = 56.0;
+/// A surface tab inside that header. Every one of these is a navigation
+/// control, so each clears the platform's touch minimum on its own instead of
+/// borrowing the row's height.
+const WORKBENCH_TAB_HEIGHT: f32 = 44.0;
+/// The contextual row under the header: a branch, a search field, a refresh.
+const WORKBENCH_CONTEXT_HEIGHT: f32 = 52.0;
+/// The row that carries a segmented switch and the actions that belong to the
+/// segment it is on.
+const WORKBENCH_FILTER_HEIGHT: f32 = 52.0;
+/// A control drawn inside one of those rows: the full touch minimum, so the
+/// four pixels of the row above and below it stay ink rather than hitbox.
+const WORKBENCH_CONTROL_SIZE: f32 = 44.0;
+/// A secondary control (a chip that names a filter) inside one of those rows.
+const WORKBENCH_CHIP_HEIGHT: f32 = 36.0;
+/// How far a tree row's fill is inset from the rail's edges. The fill is a
+/// rounded card, so it must not touch the border it sits under.
+const TREE_ROW_INSET: f32 = 4.0;
+
 /// The two ends of a touch selection over the terminal grid.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct TerminalSelection {
@@ -104,6 +129,11 @@ struct TerminalMouseDrag {
     /// not sent again.
     last: TerminalGridPoint,
 }
+
+/// How the rail reports that its own close control was pressed. The drawer it
+/// lives in belongs to the app, so the panel holds the app's handler rather
+/// than the animation state.
+type CloseHandler = Rc<dyn Fn(&MouseUpEvent, &mut Window, &mut gpui::App)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkbenchSurface {
@@ -153,12 +183,8 @@ enum MobileFileSearchMode {
 }
 
 impl MobileFileSearchMode {
-    fn toggle(self) -> Self {
-        match self {
-            Self::Name => Self::Content,
-            Self::Content => Self::Name,
-        }
-    }
+    /// The two halves of the switch, in the order the row lays them out.
+    const ALL: [Self; 2] = [Self::Name, Self::Content];
 
     fn label(self) -> &'static str {
         match self {
@@ -182,16 +208,6 @@ impl WorkbenchSurface {
     pub fn localized_label(self) -> &'static str {
         locale::common(self.label())
     }
-
-    /// The glyph the surface switcher draws, so the three tabs are
-    /// distinguishable before their labels are read.
-    pub const fn icon(self) -> &'static str {
-        match self {
-            Self::Files => "icons/folder-open.svg",
-            Self::Git => "icons/git-branch.svg",
-            Self::Terminal => "icons/square-terminal.svg",
-        }
-    }
 }
 
 pub struct MobileWorkbench {
@@ -211,6 +227,8 @@ pub struct MobileWorkbench {
     file_screen_open: bool,
     git_commit_input: Option<Entity<InputState>>,
     git_history_query_input: Option<Entity<InputState>>,
+    /// Installed with the field so the keyboard's action key runs the query.
+    git_history_query_subscription: Option<gpui::Subscription>,
     /// The focused sink the software keyboard writes into.
     ///
     /// A hardware keyboard can hand a focused element raw key events, but an
@@ -327,6 +345,10 @@ pub struct MobileWorkbench {
     /// confirmation is raised.
     notice_clear_task: Option<Task<()>>,
     error: Option<BackendError>,
+    /// The rail's own way out. The drawer belongs to the app, so the header
+    /// reports the request instead of animating the panel itself; the app
+    /// installs this when it creates the workbench.
+    close_handler: Option<CloseHandler>,
     tasks: Vec<Task<()>>,
 }
 
@@ -360,6 +382,7 @@ impl MobileWorkbench {
             file_screen_open: false,
             git_commit_input: None,
             git_history_query_input: None,
+            git_history_query_subscription: None,
             terminal_input: None,
             terminal_sink_subscription: None,
             terminal_sink_previous: String::new(),
@@ -409,10 +432,23 @@ impl MobileWorkbench {
             notice: None,
             notice_clear_task: None,
             error: None,
+            close_handler: None,
             tasks: Vec::new(),
         };
         workbench.refresh_all(cx);
         workbench
+    }
+
+    /// Installs the app's way out of the rail, drawn by this view's header.
+    ///
+    /// Called once when the app creates the workbench. Without it the header
+    /// still renders its close control, so a surface built outside the app
+    /// shell (a test, or a future embedding) never panics on a missing owner.
+    pub fn set_close_handler(
+        &mut self,
+        handler: impl Fn(&MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
+    ) {
+        self.close_handler = Some(Rc::new(handler));
     }
 
     pub fn set_surface(&mut self, surface: WorkbenchSurface, cx: &mut Context<Self>) {
@@ -721,17 +757,21 @@ impl MobileWorkbench {
         self.tasks.push(task);
     }
 
-    fn search_files(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.start_file_search(cx);
-    }
-
-    fn toggle_file_search_mode(
+    /// Picks one half of the search-mode switch.
+    ///
+    /// Switching to the mode already in force is a no-op, and picking the other
+    /// one re-runs the query: the reader changed what the same words mean, so
+    /// the list has to answer the question they now think they asked.
+    fn choose_file_search_mode(
         &mut self,
-        _: &MouseUpEvent,
+        mode: MobileFileSearchMode,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.file_search_mode = self.file_search_mode.toggle();
+        if self.file_search_mode == mode {
+            return;
+        }
+        self.file_search_mode = mode;
         if !input_value(&self.file_search_input, cx).trim().is_empty() {
             self.start_file_search(cx);
         } else {
@@ -1117,6 +1157,21 @@ impl MobileWorkbench {
                     "搜尋提交資訊或代碼",
                 ))
             }));
+            if let Some(input) = self.git_history_query_input.clone() {
+                self.git_history_query_subscription = Some(cx.subscribe_in(
+                    &input,
+                    window,
+                    |this: &mut Self,
+                     _: &Entity<InputState>,
+                     event: &InputEvent,
+                     _: &mut Window,
+                     cx: &mut Context<Self>| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.start_git_history_search(cx);
+                        }
+                    },
+                ));
+            }
         }
         if self.file_editor_input.is_none() {
             self.file_editor_input = Some(cx.new(|cx| {
@@ -1211,7 +1266,12 @@ impl MobileWorkbench {
         }
     }
 
-    fn search_git_history(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    /// Runs the commit-history query as it now stands.
+    ///
+    /// Reached from the keyboard's own action key, which is what a phone has
+    /// instead of a search button: the field is the control, and a second
+    /// framed glyph beside it would only repeat what the field already does.
+    fn start_git_history_search(&mut self, cx: &mut Context<Self>) {
         let query = input_value(&self.git_history_query_input, cx)
             .trim()
             .to_string();
@@ -3036,29 +3096,31 @@ impl MobileWorkbench {
             .child(
                 div()
                     .flex_shrink_0()
-                    .p_2()
+                    .h(px(WORKBENCH_CONTEXT_HEIGHT))
+                    .px(px(theme::SPACING_SM))
+                    .overflow_hidden()
                     .border_b_1()
                     .border_color(theme::border_subtle())
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap(px(theme::SPACING_XS))
                     .child(
                         div()
-                            .h(px(theme::TOUCH_TARGET))
+                            .h(px(WORKBENCH_CONTROL_SIZE))
                             .min_w_0()
                             .flex_1()
                             .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_default())
                             .bg(theme::workbench_panel_bg())
-                            .px_2()
+                            .pl(px(theme::SPACING_SM))
+                            .pr(px(theme::SPACING_XS))
                             .flex()
                             .items_center()
-                            .gap_1()
+                            .gap(px(theme::SPACING_XS))
                             .child(
                                 svg()
                                     .path("icons/search.svg")
                                     .size(px(theme::ICON_SM))
+                                    .flex_shrink_0()
                                     .text_color(theme::text_muted()),
                             )
                             .child(
@@ -3076,82 +3138,62 @@ impl MobileWorkbench {
                                     svg()
                                         .path("icons/loader-circle.svg")
                                         .size(px(theme::ICON_SM))
+                                        .flex_shrink_0()
                                         .text_color(theme::text_primary()),
                                 )
                             })
                             .when(query_present, |bar| {
-                                bar.child(
-                                    icon_button("clear-file-search", "icons/x.svg", "Clear search")
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(Self::clear_file_search),
-                                        ),
+                                bar.child(inline_icon_button(
+                                    "clear-file-search",
+                                    "icons/x.svg",
+                                    "Clear search",
+                                ))
+                            }),
+                    )
+                    // One switch, two named halves: the old chip asked the
+                    // reader to tap a word to learn what the other word was,
+                    // and the keyboard's own action key is the search trigger.
+                    .child(
+                        div()
+                            .id("file-search-mode")
+                            .flex_shrink_0()
+                            .h(px(WORKBENCH_CONTROL_SIZE))
+                            .p(px(2.0))
+                            .rounded(px(theme::RADIUS_PILL))
+                            .bg(theme::workbench_panel_bg())
+                            .flex()
+                            .items_center()
+                            .children(MobileFileSearchMode::ALL.into_iter().map(|mode| {
+                                segment(
+                                    format!("file-search-mode:{}", mode.label()),
+                                    mode.label(),
+                                    self.file_search_mode == mode,
                                 )
-                            }),
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.choose_file_search_mode(mode, window, cx)
+                                    }),
+                                )
+                            })),
                     )
                     .child(
-                        // The mode chip doubles as the search trigger: on a
-                        // phone the keyboard's own action key commits, and this
-                        // is the visible way to ask again after an edit.
-                        compact_action(
-                            "toggle-file-search-mode",
-                            self.file_search_mode.label().to_string(),
-                        )
-                        .h(px(theme::TOUCH_TARGET))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(Self::toggle_file_search_mode),
-                        ),
-                    )
-                    .child(
-                        icon_button("submit-file-search", "icons/search.svg", "Search")
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::search_files)),
-                    )
-                    .child(
-                        icon_button("refresh-files", "icons/refresh.svg", "Refresh").on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.refresh_files(cx);
-                                cx.notify();
-                            }),
-                        ),
+                        toolbar_icon_button("refresh-files", "icons/refresh.svg", "Refresh")
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.refresh_files(cx);
+                                    cx.notify();
+                                }),
+                            ),
                     ),
             )
             // The path bar: the tree ellipsises long names, so the full path
             // of the open file lives here and scrolls instead of truncating.
-            .child(
-                div()
-                    .id("mobile-files-path-bar")
-                    .flex_shrink_0()
-                    .h(px(32.0))
-                    .px(px(theme::SPACING_MD))
-                    .border_b_1()
-                    .border_color(theme::border_subtle())
-                    .overflow_x_scroll()
-                    .restrict_scroll_to_axis()
-                    .flex()
-                    .items_center()
-                    .gap(px(theme::SPACING_XS))
-                    .child(
-                        svg()
-                            .path("icons/folder-open.svg")
-                            .size(px(12.0))
-                            .flex_shrink_0()
-                            .text_color(theme::text_muted()),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .whitespace_nowrap()
-                            .font_family("IBM Plex Mono")
-                            .text_size(theme::font_micro())
-                            .text_color(theme::text_muted())
-                            .child(selected_path.clone().unwrap_or_else(|| {
-                                locale::text("Workspace root", "工作区根目录", "工作區根目錄")
-                                    .to_string()
-                            })),
-                    ),
-            )
+            // It is a whisper, not a row: no seam of its own, one step below
+            // the tree's own text, so the first row still reads as the top of
+            // the list.
+            .child(self.render_file_path_bar(selected_path, status, status_color, cx))
             .child(
                 div()
                     .id("mobile-files-scroll")
@@ -3169,29 +3211,34 @@ impl MobileWorkbench {
                         )
                     })
                     .when(query_present && search_loading, |body| {
-                        body.child(empty_label(locale::common("Searching")))
+                        body.child(empty_state(
+                            "icons/loader-circle.svg",
+                            locale::common("Searching"),
+                        ))
                     })
                     .when(
                         query_present && !search_loading && !search_has_results,
                         |body| {
-                            body.child(empty_label(locale::common(
-                                if self.file_search_mode == MobileFileSearchMode::Name {
-                                    "No matching items"
-                                } else {
-                                    "No matching files"
-                                },
-                            )))
+                            body.child(empty_state(
+                                "icons/search.svg",
+                                locale::common(
+                                    if self.file_search_mode == MobileFileSearchMode::Name {
+                                        "No matching items"
+                                    } else {
+                                        "No matching files"
+                                    },
+                                ),
+                            ))
                         },
                     )
                     .when(query_present && search_has_results, |body| {
                         body.child(
                             div()
                                 .h(px(30.0))
-                                .px_3()
+                                .px(px(theme::SPACING_MD))
                                 .flex()
                                 .items_center()
                                 .border_t_1()
-                                .border_b_1()
                                 .border_color(theme::border_subtle())
                                 .text_size(theme::font_micro())
                                 .text_color(theme::text_muted())
@@ -3203,12 +3250,13 @@ impl MobileWorkbench {
                             let select_path = path.clone();
                             div()
                                 .id(format!("file-search-result:{path}:{line}"))
-                                .min_h(px(36.0))
-                                .px_3()
-                                .py_1()
+                                .min_h(px(theme::TOUCH_TARGET))
+                                .mx(px(TREE_ROW_INSET))
+                                .px(px(theme::SPACING_XS))
+                                .rounded(px(theme::RADIUS_CONTROL))
                                 .flex()
                                 .items_center()
-                                .gap_2()
+                                .gap(px(theme::SPACING_SM))
                                 .cursor_pointer()
                                 .active(|style| style.bg(theme::row_pressed_bg()))
                                 .on_mouse_up(
@@ -3252,66 +3300,116 @@ impl MobileWorkbench {
                                 })
                                 .into_any_element()
                         }))
-                    })
-                    .when(!query_present, |body| {
-                        // A compact summary of the chosen file; tapping it
-                        // re-opens the full-screen file view.
-                        body.when_some(selected_path, |body, path| {
-                            body.child(
-                                div()
-                                    .id("mobile-file-reopen")
-                                    .min_h(px(36.0))
-                                    .px_3()
-                                    .py_1()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .border_t_1()
-                                    .border_color(theme::border_subtle())
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.file_screen_open = true;
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path("icons/pencil.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_muted()),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .text_size(theme::font_caption())
-                                            .text_color(theme::text_secondary())
-                                            .child(path),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .text_size(theme::font_micro())
-                                            .text_color(status_color)
-                                            .child(status),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path("icons/chevron-right.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_muted()),
-                                    ),
-                            )
-                        })
                     }),
             )
             .into_any_element()
+    }
+
+    /// The strip under the Files toolbar: which file the tree has chosen, and
+    /// the way back into it.
+    ///
+    /// The tree ellipsises long names, so the full path lives here and scrolls
+    /// instead of truncating. When a file is chosen the strip is also its
+    /// handle: it was rendered at the far end of the tree, which is a place the
+    /// reader had to scroll to find, and it now sits at the top where the
+    /// question "what am I looking at" is already being asked.
+    fn render_file_path_bar(
+        &self,
+        selected_path: Option<String>,
+        status: &'static str,
+        status_color: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match selected_path {
+            Some(path) => div()
+                .id("mobile-file-open")
+                .flex_shrink_0()
+                .h(px(theme::TOUCH_TARGET))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .cursor_pointer()
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.file_screen_open = true;
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .id("mobile-files-path-bar")
+                        .flex_1()
+                        .min_w_0()
+                        .px(px(theme::SPACING_MD))
+                        .overflow_x_scroll()
+                        .restrict_scroll_to_axis()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            svg()
+                                .path("icons/pencil.svg")
+                                .size(px(11.0))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted()),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .whitespace_nowrap()
+                                .font_family("IBM Plex Mono")
+                                .text_size(theme::font_micro())
+                                .text_color(theme::text_secondary())
+                                .child(path),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(theme::font_micro())
+                        .text_color(status_color)
+                        .child(status),
+                )
+                .child(
+                    svg()
+                        .path("icons/chevron-right.svg")
+                        .size(px(theme::ICON_SM))
+                        .mr(px(theme::SPACING_MD))
+                        .flex_shrink_0()
+                        .text_color(theme::text_muted()),
+                )
+                .into_any_element(),
+            None => div()
+                .id("mobile-files-path-bar")
+                .flex_shrink_0()
+                .h(px(28.0))
+                .px(px(theme::SPACING_MD))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    svg()
+                        .path("icons/folder-open.svg")
+                        .size(px(11.0))
+                        .flex_shrink_0()
+                        .text_color(theme::text_muted()),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .whitespace_nowrap()
+                        .font_family("IBM Plex Mono")
+                        .text_size(theme::font_micro())
+                        .text_color(theme::text_muted())
+                        .child(
+                            locale::text("Workspace root", "工作区根目录", "工作區根目錄")
+                                .to_string(),
+                        ),
+                )
+                .into_any_element(),
+        }
     }
 
     fn render_file_tree_row(
@@ -3344,7 +3442,9 @@ impl MobileWorkbench {
             // A file row is a touch target like every other list row; 30px was
             // below the platform minimum and made the tree feel cramped.
             .min_h(px(theme::TOUCH_TARGET))
-            .px_2()
+            .mx(px(TREE_ROW_INSET))
+            .px(px(theme::SPACING_XS))
+            .rounded(px(theme::RADIUS_CONTROL))
             .flex()
             .items_center()
             .gap_1()
@@ -3403,9 +3503,9 @@ impl MobileWorkbench {
             .when_some(status, |item, signal| {
                 item.child(
                     div()
-                        .w(px(16.0))
+                        .w(px(18.0))
                         .flex_none()
-                        .font_family("monospace")
+                        .font_family("IBM Plex Mono")
                         .text_size(theme::font_micro())
                         .text_color(file_git_signal_color(signal))
                         .child(signal.short_label()),
@@ -3480,133 +3580,103 @@ impl MobileWorkbench {
             .relative()
             .flex()
             .flex_col()
+            // ── where the working tree stands ────────────────────────────────
+            // The branch and its totals are one thought, so they share the row
+            // above the list instead of a band of their own; the history view
+            // spends the same row on the query that filters it.
             .child(
                 div()
-                    .h(px(40.0))
                     .flex_shrink_0()
-                    .border_b_1()
-                    .border_color(theme::border_default())
-                    .flex()
-                    .children([
-                        git_mode_tab(
-                            "git-mode-changes",
-                            locale::text("Changes", "更改", "變更"),
-                            changes_active,
-                        )
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.set_git_mode(GitWorkbenchMode::Changes, cx)
-                            }),
-                        ),
-                        git_mode_tab(
-                            "git-mode-history",
-                            locale::text("Commits", "提交", "提交"),
-                            history_active,
-                        )
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.set_git_mode(GitWorkbenchMode::History, cx)
-                            }),
-                        ),
-                    ]),
-            )
-            .child(
-                div()
-                    .h(px(40.0))
-                    .flex_shrink_0()
-                    .px_2()
-                    .gap_1()
+                    .h(px(WORKBENCH_CONTEXT_HEIGHT))
+                    .px(px(theme::SPACING_SM))
+                    .overflow_hidden()
                     .border_b_1()
                     .border_color(theme::border_subtle())
                     .flex()
                     .items_center()
-                    .child(
-                        icon_button("git-pull", "icons/download.svg", "Pull")
-                            .when(can_remote && !self.busy, |button| {
-                                button.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.run_git_remote_action(GitRemoteActionKind::Pull, cx)
-                                    }),
-                                )
-                            })
-                            .when(!can_remote, |button| button.opacity(0.55)),
-                    )
-                    .child(
-                        icon_button("git-push", "icons/upload.svg", "Push")
-                            .when(can_remote && !self.busy, |button| {
-                                button.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.run_git_remote_action(GitRemoteActionKind::Push, cx)
-                                    }),
-                                )
-                            })
-                            .when(!can_remote, |button| button.opacity(0.55)),
-                    )
-                    .child(
-                        icon_button("git-refresh", "icons/rotate-ccw.svg", "Refresh").when(
-                            !self.busy,
-                            |button| {
-                                button.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(Self::refresh_active_surface),
-                                )
-                            },
-                        ),
-                    )
-                    .when(changes_active, |bar| {
-                        bar.child(
-                            icon_button("git-revert", "icons/undo.svg", "Rollback selected")
-                                .when(!self.busy && can_revert, |button| {
-                                    button.on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::revert_selected_git),
-                                    )
-                                })
-                                .when(!can_revert, |button| button.opacity(0.55)),
+                    .gap(px(theme::SPACING_XS))
+                    .when(changes_active, |row| {
+                        row.child(
+                            svg()
+                                .path("icons/git-branch.svg")
+                                .size(px(theme::ICON_SM))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted()),
                         )
-                        .child(div().flex_1())
                         .child(
-                            icon_button(
-                                "git-toggle-directories",
-                                "icons/chevrons-down-up.svg",
-                                "Expand or collapse all",
-                            )
-                            .when(
-                                self.git.state.model.has_change_directories(),
-                                |button| {
-                                    button.on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.git.state.model.toggle_all_change_directories();
-                                            cx.notify();
-                                        }),
-                                    )
-                                },
-                            ),
-                        )
-                    })
-                    .when(history_active, |bar| {
-                        bar.child(
                             div()
-                                .h(px(30.0))
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(theme::font_detail())
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::text_primary())
+                                .child(
+                                    status
+                                        .as_ref()
+                                        .and_then(|status| status.branch.clone())
+                                        .unwrap_or_else(|| {
+                                            if self.git_status_error.is_some() {
+                                                locale::common("Could not read the repository")
+                                                    .to_string()
+                                            } else if status_loading {
+                                                locale::common("Loading…").to_string()
+                                            } else {
+                                                locale::common("No repository").to_string()
+                                            }
+                                        }),
+                                ),
+                        )
+                        .when(change_count > 0, |row| {
+                            row.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .font_family("IBM Plex Mono")
+                                    .text_size(theme::font_micro())
+                                    .child(
+                                        div()
+                                            .text_color(if additions > 0 {
+                                                theme::accent_green()
+                                            } else {
+                                                theme::text_muted()
+                                            })
+                                            .child(format!("+{additions}")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(if deletions > 0 {
+                                                theme::accent_red()
+                                            } else {
+                                                theme::text_muted()
+                                            })
+                                            .child(format!("-{deletions}")),
+                                    ),
+                            )
+                        })
+                    })
+                    .when(history_active, |row| {
+                        row.child(
+                            div()
+                                .h(px(WORKBENCH_CONTROL_SIZE))
                                 .min_w_0()
                                 .flex_1()
                                 .rounded(px(theme::RADIUS_CONTROL))
-                                .border_1()
-                                .border_color(theme::border_default())
                                 .bg(theme::workbench_panel_bg())
-                                .px_2()
+                                .pl(px(theme::SPACING_SM))
+                                .pr(px(theme::SPACING_XS))
                                 .flex()
                                 .items_center()
-                                .gap_1()
+                                .gap(px(theme::SPACING_XS))
                                 .child(
                                     svg()
                                         .path("icons/search.svg")
                                         .size(px(theme::ICON_SM))
+                                        .flex_shrink_0()
                                         .text_color(theme::text_muted()),
                                 )
                                 .child(
@@ -3626,26 +3696,159 @@ impl MobileWorkbench {
                                         .trim()
                                         .is_empty(),
                                     |bar| {
-                                        bar.child(
-                                            icon_button(
-                                                "clear-git-history-search",
-                                                "icons/x.svg",
-                                                "Clear commit search",
-                                            )
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::clear_git_history_search),
-                                            ),
-                                        )
+                                        bar.child(inline_icon_button(
+                                            "clear-git-history-search",
+                                            "icons/x.svg",
+                                            "Clear commit search",
+                                        ))
                                     },
+                                ),
+                        )
+                    })
+                    .child(
+                        toolbar_icon_button("git-pull", "icons/download.svg", "Pull")
+                            .when(can_remote && !self.busy, |button| {
+                                button.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.run_git_remote_action(GitRemoteActionKind::Pull, cx)
+                                    }),
+                                )
+                            })
+                            .when(!can_remote || self.busy, |button| button.opacity(0.55)),
+                    )
+                    .child(
+                        toolbar_icon_button("git-push", "icons/upload.svg", "Push")
+                            .when(can_remote && !self.busy, |button| {
+                                button.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.run_git_remote_action(GitRemoteActionKind::Push, cx)
+                                    }),
+                                )
+                            })
+                            .when(!can_remote || self.busy, |button| button.opacity(0.55)),
+                    )
+                    .child(
+                        toolbar_icon_button("git-refresh", "icons/rotate-ccw.svg", "Refresh").when(
+                            !self.busy,
+                            |button| {
+                                button.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::refresh_active_surface),
+                                )
+                            },
+                        ),
+                    ),
+            )
+            // ── what the list below is showing ───────────────────────────────
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .h(px(WORKBENCH_FILTER_HEIGHT))
+                    .px(px(theme::SPACING_SM))
+                    .overflow_hidden()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .child(
+                        div()
+                            .id("git-mode")
+                            .flex_shrink_0()
+                            .h(px(WORKBENCH_CONTROL_SIZE))
+                            .p(px(2.0))
+                            .rounded(px(theme::RADIUS_PILL))
+                            .bg(theme::workbench_panel_bg())
+                            .flex()
+                            .items_center()
+                            .child(
+                                segment(
+                                    "git-mode:changes",
+                                    locale::text("Changes", "更改", "變更"),
+                                    changes_active,
                                 )
                                 .on_mouse_up(
                                     MouseButton::Left,
-                                    cx.listener(Self::search_git_history),
+                                    cx.listener(|this, _, _, cx| {
+                                        this.set_git_mode(GitWorkbenchMode::Changes, cx)
+                                    }),
                                 ),
+                            )
+                            .child(
+                                segment(
+                                    "git-mode:history",
+                                    locale::common("Commits"),
+                                    history_active,
+                                )
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.set_git_mode(GitWorkbenchMode::History, cx)
+                                    }),
+                                ),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .when(changes_active, |row| {
+                        // How many paths are selected is answered by the commit
+                        // panel at the foot of the surface, which is where the
+                        // number is actually acted on; repeating it here would
+                        // squeeze the row on a narrow phone for nothing.
+                        row.child(
+                            toolbar_icon_button(
+                                "select-all-git",
+                                "icons/list-checks.svg",
+                                "Select all",
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    let selected = this.git.state.model.path_selection_state("")
+                                        != GitPathSelectionState::Checked;
+                                    this.git.state.model.select_path_prefix("", selected);
+                                    cx.notify();
+                                }),
+                            ),
                         )
                         .child(
-                            compact_action(
+                            toolbar_icon_button(
+                                "git-revert",
+                                "icons/undo.svg",
+                                "Rollback selected",
+                            )
+                            .when(!self.busy && can_revert, |button| {
+                                button.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::revert_selected_git),
+                                )
+                            })
+                            .when(!can_revert, |button| button.opacity(0.55)),
+                        )
+                        .child(
+                            toolbar_icon_button(
+                                "git-toggle-directories",
+                                "icons/chevrons-down-up.svg",
+                                "Expand or collapse all",
+                            )
+                            .when(
+                                self.git.state.model.has_change_directories(),
+                                |button| {
+                                    button.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.git.state.model.toggle_all_change_directories();
+                                            cx.notify();
+                                        }),
+                                    )
+                                },
+                            ),
+                        )
+                    })
+                    .when(history_active, |row| {
+                        row.child(
+                            chip_action(
                                 "git-history-branch",
                                 self.git
                                     .state
@@ -3655,15 +3858,15 @@ impl MobileWorkbench {
                                     .as_deref()
                                     .map(|branch| short_branch_label(branch, 18))
                                     .unwrap_or_else(|| locale::common("All branches").to_string()),
+                                true,
                             )
-                            .h(px(30.0))
                             .on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(Self::open_git_branch_sheet),
                             ),
                         )
                         .child(
-                            compact_action(
+                            chip_action(
                                 "git-history-author",
                                 self.git
                                     .state
@@ -3673,8 +3876,8 @@ impl MobileWorkbench {
                                     .as_deref()
                                     .unwrap_or(locale::common("All authors"))
                                     .to_string(),
+                                true,
                             )
-                            .h(px(30.0))
                             .on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(Self::toggle_git_history_author),
@@ -3682,92 +3885,6 @@ impl MobileWorkbench {
                         )
                     }),
             )
-            .when(changes_active, |root| {
-                root.child(
-                    div()
-                        .h(px(44.0))
-                        .flex_shrink_0()
-                        .px_2()
-                        .border_b_1()
-                        .border_color(theme::border_subtle())
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            icon_button("select-all-git", "icons/list-checks.svg", "Select all")
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        let selected =
-                                            this.git.state.model.path_selection_state("")
-                                                != GitPathSelectionState::Checked;
-                                        this.git.state.model.select_path_prefix("", selected);
-                                        cx.notify();
-                                    }),
-                                ),
-                        )
-                        .child(git_selection_indicator_mobile(
-                            self.git.state.model.path_selection_state(""),
-                        ))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_size(theme::font_caption())
-                                .text_color(theme::text_secondary())
-                                .child(
-                                    status
-                                        .as_ref()
-                                        .and_then(|status| status.branch.clone())
-                                        .unwrap_or_else(|| {
-                                            if self.git_status_error.is_some() {
-                                                locale::common("Could not read the repository")
-                                                    .to_string()
-                                            } else if status_loading {
-                                                locale::common("Loading…").to_string()
-                                            } else {
-                                                locale::common("No repository").to_string()
-                                            }
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .font_family("monospace")
-                                .text_size(theme::font_micro())
-                                .text_color(theme::text_muted())
-                                .child(
-                                    locale::text("{} files", "{} 个文件", "{} 個檔案")
-                                        .replace("{}", &change_count.to_string()),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .font_family("monospace")
-                                .text_size(theme::font_micro())
-                                .text_color(if additions > 0 {
-                                    theme::accent_green()
-                                } else {
-                                    theme::text_muted()
-                                })
-                                .child(format!("+{additions}")),
-                        )
-                        .child(
-                            div()
-                                .font_family("monospace")
-                                .text_size(theme::font_micro())
-                                .text_color(if deletions > 0 {
-                                    theme::accent_red()
-                                } else {
-                                    theme::text_muted()
-                                })
-                                .child(format!("-{deletions}")),
-                        ),
-                )
-            })
             .child(
                 div()
                     .id("mobile-git-scroll")
@@ -3814,11 +3931,14 @@ impl MobileWorkbench {
                         })
                         .when(self.git_status_error.is_none(), |body| {
                             body.when(row_count == 0, |body| {
-                                body.child(empty_label(if status_loading {
-                                    locale::common("Loading repository status...")
-                                } else {
-                                    locale::common("Working tree is clean")
-                                }))
+                                body.child(empty_state(
+                                    "icons/git-branch.svg",
+                                    if status_loading {
+                                        locale::common("Loading repository status...")
+                                    } else {
+                                        locale::common("Working tree is clean")
+                                    },
+                                ))
                             })
                             .children((0..row_count).filter_map(|index| {
                                 self.git
@@ -4019,10 +4139,12 @@ impl MobileWorkbench {
             .id(format!("git-tree:{row_id}"))
             .relative()
             .min_h(px(theme::TOUCH_TARGET))
-            .px_2()
+            .mx(px(TREE_ROW_INSET))
+            .px(px(theme::SPACING_XS))
+            .rounded(px(theme::RADIUS_CONTROL))
             .flex()
             .items_center()
-            .gap_1()
+            .gap(px(theme::SPACING_XS))
             .when(selected_path, |item| item.bg(theme::sidebar_selected_bg()))
             .when(!selected_path, |item| {
                 item.hover(|style| style.bg(theme::row_pressed_bg()))
@@ -4103,49 +4225,41 @@ impl MobileWorkbench {
                     }),
             )
             .when_some(change.clone(), |item, change| {
-                item.child(
+                item.child(change_status_pill(
+                    change.kind,
+                    git_change_text_color_mobile(&change),
+                ))
+                .child(
+                    // The two counts share one column pair so a list of changes
+                    // reads as a table: the eye compares magnitudes down the
+                    // right edge instead of hunting for them after each name.
                     div()
-                        .h(px(18.0))
-                        .min_w(px(22.0))
-                        .flex_none()
+                        .flex_shrink_0()
                         .flex()
                         .items_center()
-                        .justify_center()
-                        .rounded(px(3.0))
-                        .border_1()
-                        .border_color(theme::border_default())
-                        .px_1()
-                        .flex_none()
-                        .font_family("monospace")
+                        .gap(px(6.0))
+                        .font_family("IBM Plex Mono")
                         .text_size(theme::font_micro())
-                        .text_color(git_change_text_color_mobile(&change))
-                        .child(git_change_label_mobile(change.kind)),
-                )
-                .child(
-                    div()
-                        .w(px(30.0))
-                        .flex_none()
-                        .font_family("monospace")
-                        .text_size(theme::font_micro())
-                        .text_color(if change.additions > 0 {
-                            theme::accent_green()
-                        } else {
-                            theme::text_muted()
-                        })
-                        .child(format!("+{}", change.additions)),
-                )
-                .child(
-                    div()
-                        .w(px(30.0))
-                        .flex_none()
-                        .font_family("monospace")
-                        .text_size(theme::font_micro())
-                        .text_color(if change.deletions > 0 {
-                            theme::accent_red()
-                        } else {
-                            theme::text_muted()
-                        })
-                        .child(format!("-{}", change.deletions)),
+                        .child(
+                            div()
+                                .min_w(px(28.0))
+                                .text_color(if change.additions > 0 {
+                                    theme::accent_green()
+                                } else {
+                                    theme::text_muted()
+                                })
+                                .child(format!("+{}", change.additions)),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(28.0))
+                                .text_color(if change.deletions > 0 {
+                                    theme::accent_red()
+                                } else {
+                                    theme::text_muted()
+                                })
+                                .child(format!("-{}", change.deletions)),
+                        ),
                 )
             })
             .on_mouse_up(
@@ -4251,7 +4365,10 @@ impl MobileWorkbench {
                     .overflow_y_scroll()
                     .restrict_scroll_to_axis()
                     .when(loading, |body| {
-                        body.child(empty_label(locale::common("Loading")))
+                        body.child(empty_state(
+                            "icons/loader-circle.svg",
+                            locale::common("Loading"),
+                        ))
                     })
                     .when_some(detail.clone(), |body, detail| {
                         let summary = &detail.summary;
@@ -4669,32 +4786,45 @@ impl MobileWorkbench {
             .into_any_element()
     }
 
+    /// The bottom of the Changes surface: the message and the one action it
+    /// exists for.
+    ///
+    /// The button is filled rather than outlined because it is the point of the
+    /// whole panel; the line above it names what the action will take, which is
+    /// the difference between a disabled button and a user who knows why.
     fn render_git_commit_panel(
         &self,
         can_commit: bool,
         has_selected_paths: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let action_label = if !can_commit {
+            locale::common("Read only")
+        } else if self.busy {
+            locale::common("Working...")
+        } else {
+            locale::common("Commit")
+        };
+        let action_enabled = can_commit && !self.busy && has_selected_paths;
         div()
             .flex_shrink_0()
             .border_t_1()
-            .border_color(theme::border_default())
+            .border_color(theme::border_subtle())
             .bg(theme::workbench_panel_bg())
-            .p_2()
+            .p(px(theme::SPACING_SM))
             .flex()
             .flex_col()
-            .gap_1()
+            .gap(px(theme::SPACING_SM))
             .child(input_shell(self.git_commit_input.as_ref()))
             .when(self.git_commit_confirmation, |panel| {
                 panel.child(
                     div()
-                        .p_2()
+                        .p(px(theme::SPACING_MD))
                         .rounded(px(theme::RADIUS_CONTROL))
-                        .border_1()
-                        .border_color(theme::accent_yellow())
+                        .bg(theme::accent_yellow().opacity(0.14))
                         .flex()
                         .items_center()
-                        .gap_2()
+                        .gap(px(theme::SPACING_SM))
                         .text_size(theme::font_caption())
                         .text_color(theme::text_secondary())
                         .child(locale::text(
@@ -4704,48 +4834,69 @@ impl MobileWorkbench {
                         ))
                         .child(div().flex_1())
                         .child(
-                            compact_action("cancel-commit", locale::common("Cancel")).on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::cancel_git_commit),
-                            ),
+                            chip_action("cancel-commit", locale::common("Cancel"), true)
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::cancel_git_commit),
+                                ),
                         )
                         .child(
-                            compact_action("confirm-commit", locale::common("Commit"))
+                            chip_action("confirm-commit", locale::common("Commit"), can_commit)
                                 .when(can_commit, |button| {
                                     button.on_mouse_up(
                                         MouseButton::Left,
                                         cx.listener(Self::confirm_git_commit),
                                     )
-                                })
-                                .when(!can_commit, |button| button.opacity(0.55)),
+                                }),
                         ),
                 )
             })
             .when(!self.git_commit_confirmation, |panel| {
                 panel.child(
-                    div().flex().justify_end().child(
-                        compact_action(
-                            "request-commit",
-                            if !can_commit {
-                                locale::common("Read only")
-                            } else if !has_selected_paths {
-                                locale::common("Select changes")
-                            } else if self.busy {
-                                locale::common("Working...")
-                            } else {
-                                locale::common("Commit")
-                            },
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::SPACING_SM))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(theme::font_micro())
+                                .text_color(if has_selected_paths {
+                                    theme::text_secondary()
+                                } else {
+                                    theme::text_muted()
+                                })
+                                .child(if !can_commit {
+                                    locale::common("This runtime cannot commit").to_string()
+                                } else if has_selected_paths {
+                                    locale::text(
+                                        "{} selected for this commit",
+                                        "已选 {} 项待提交",
+                                        "已選 {} 項待提交",
+                                    )
+                                    .replace(
+                                        "{}",
+                                        &self.git.state.model.selected_path_count().to_string(),
+                                    )
+                                } else {
+                                    locale::common("Select changes to commit").to_string()
+                                }),
                         )
-                        .when(!self.busy && can_commit && has_selected_paths, |button| {
-                            button.on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::request_git_commit),
-                            )
-                        })
-                        .when(!can_commit || !has_selected_paths, |button| {
-                            button.opacity(0.55)
-                        }),
-                    ),
+                        .child(
+                            primary_action("request-commit", action_label, action_enabled).when(
+                                action_enabled,
+                                |button| {
+                                    button.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::request_git_commit),
+                                    )
+                                },
+                            ),
+                        ),
                 )
             })
             .into_any_element()
@@ -4758,11 +4909,14 @@ impl MobileWorkbench {
     ) -> gpui::Stateful<gpui::Div> {
         let count = self.git.state.model.history_row_count();
         body.when(count == 0, |body| {
-            body.child(empty_label(if self.git_history_loading {
-                "Loading history"
-            } else {
-                "No commits found"
-            }))
+            body.child(empty_state(
+                "icons/message-square.svg",
+                if self.git_history_loading {
+                    locale::common("Loading history")
+                } else {
+                    locale::common("No commits found")
+                },
+            ))
         })
         .children((0..count).filter_map(|index| {
             self.git
@@ -4774,17 +4928,22 @@ impl MobileWorkbench {
         }))
         .when(self.git.state.model.history_has_more, |body| {
             body.child(
-                compact_action(
-                    "load-more-git-history",
-                    if self.git_history_loading {
-                        locale::common("Loading...")
-                    } else {
-                        locale::common("Load more")
-                    },
-                )
-                .mx_3()
-                .my_2()
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::load_more_git_history)),
+                div()
+                    .p(px(theme::SPACING_MD))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        chip_action(
+                            "load-more-git-history",
+                            if self.git_history_loading {
+                                locale::common("Loading...")
+                            } else {
+                                locale::common("Load more")
+                            },
+                            true,
+                        )
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::load_more_git_history)),
+                    ),
             )
         })
     }
@@ -4798,12 +4957,14 @@ impl MobileWorkbench {
         let selected = self.git.state.model.selected_commit_hash.as_deref() == Some(hash.as_str());
         div()
             .id(format!("git-history:{}", commit.hash))
-            .min_h(px(58.0))
-            .px_2()
+            .min_h(px(64.0))
+            .mx(px(TREE_ROW_INSET))
+            .px(px(theme::SPACING_XS))
             .py_1()
+            .rounded(px(theme::RADIUS_CONTROL))
             .flex()
             .items_center()
-            .gap_2()
+            .gap(px(theme::SPACING_SM))
             .cursor_pointer()
             .when(selected, |item| item.bg(theme::sidebar_selected_bg()))
             .when(!selected, |item| {
@@ -4888,7 +5049,7 @@ impl MobileWorkbench {
                                     .whitespace_nowrap()
                                     .child(commit.author_name),
                             )
-                            .child(div().font_family("monospace").child(commit.short_hash)),
+                            .child(div().font_family("IBM Plex Mono").child(commit.short_hash)),
                     ),
             )
             .on_mouse_up(
@@ -4935,12 +5096,19 @@ impl MobileWorkbench {
             .flex()
             .flex_col()
             // ── session header ───────────────────────────────────────────────
+            // The row says which session this is and offers only what a running
+            // session needs; the two words that change its life ("New" and
+            // "Close") are filled pills, so the row has one hierarchy instead of
+            // five framed boxes of the same weight.
             .child(
                 div()
                     .flex_shrink_0()
-                    .h(px(theme::TOUCH_TARGET))
+                    .h(px(WORKBENCH_CONTEXT_HEIGHT))
                     .pl(px(theme::SPACING_MD))
                     .pr(px(theme::SPACING_XS))
+                    .overflow_hidden()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
                     .flex()
                     .items_center()
                     .gap(px(theme::SPACING_XS))
@@ -4999,8 +5167,19 @@ impl MobileWorkbench {
                                     }),
                             ),
                     )
+                    .when_some(active.clone(), |bar, _| {
+                        bar.child(
+                            toolbar_icon_button("search-terminal", "icons/search.svg", "Find")
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.toggle_terminal_search(window, cx)
+                                    }),
+                                ),
+                        )
+                    })
                     .child(
-                        icon_button("refresh-terminal", "icons/refresh.svg", "Refresh")
+                        toolbar_icon_button("refresh-terminal", "icons/refresh.svg", "Refresh")
                             .on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -5011,36 +5190,28 @@ impl MobileWorkbench {
                     )
                     .when_some(active.clone(), |bar, _| {
                         bar.child(
-                            icon_button("search-terminal", "icons/search.svg", "Find").on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.toggle_terminal_search(window, cx)
-                                }),
-                            ),
-                        )
-                    })
-                    .child(
-                        action_button("create-terminal", locale::common("New"))
-                            .when(can_create, |button| {
-                                button.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(Self::create_terminal),
-                                )
-                            })
-                            .when(!can_create, |button| button.opacity(0.55)),
-                    )
-                    .when_some(active.clone(), |bar, _| {
-                        bar.child(
-                            action_button("close-terminal", locale::common("Close"))
-                                .when(can_close, |button| {
+                            chip_action("close-terminal", locale::common("Close"), can_close).when(
+                                can_close,
+                                |button| {
                                     button.on_mouse_up(
                                         MouseButton::Left,
                                         cx.listener(Self::request_close_terminal),
                                     )
-                                })
-                                .when(!can_close, |button| button.opacity(0.55)),
+                                },
+                            ),
                         )
-                    }),
+                    })
+                    .child(
+                        chip_action("create-terminal", locale::common("New"), can_create).when(
+                            can_create,
+                            |button| {
+                                button.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::create_terminal),
+                                )
+                            },
+                        ),
+                    ),
             )
             // ── in-terminal find ─────────────────────────────────────────────
             .when(self.terminal_search_open, |terminal| {
@@ -5058,7 +5229,7 @@ impl MobileWorkbench {
                         .items_center()
                         .gap(px(theme::SPACING_XS))
                         .px(px(theme::SPACING_MD))
-                        .pb(px(theme::SPACING_SM))
+                        .py(px(theme::SPACING_SM))
                         .children(sessions.iter().map(|item| {
                             let terminal_id = item.id.clone();
                             let selected =
@@ -5066,23 +5237,17 @@ impl MobileWorkbench {
                             div()
                                 .id(format!("terminal-chip:{}", item.id))
                                 .flex_shrink_0()
-                                .h(px(36.0))
+                                .h(px(WORKBENCH_CHIP_HEIGHT))
                                 .rounded_full()
-                                .border_1()
-                                .border_color(if selected {
-                                    theme::accent_blue()
-                                } else {
-                                    theme::border_subtle()
-                                })
                                 .bg(if selected {
-                                    theme::accent_blue().opacity(0.14)
+                                    theme::accent_blue().opacity(0.16)
                                 } else {
-                                    theme::bg_card()
+                                    theme::workbench_panel_bg()
                                 })
-                                .px_3()
+                                .px(px(theme::SPACING_MD))
                                 .flex()
                                 .items_center()
-                                .gap(px(theme::SPACING_XS))
+                                .gap(px(6.0))
                                 .cursor_pointer()
                                 .active(|style| style.bg(theme::row_pressed_bg()))
                                 .on_mouse_up(
@@ -5118,15 +5283,13 @@ impl MobileWorkbench {
                 terminal.child(
                     div()
                         .flex_shrink_0()
-                        .mx_3()
-                        .my_2()
+                        .m(px(theme::SPACING_SM))
                         .rounded(px(theme::RADIUS_CONTROL))
-                        .border_1()
-                        .border_color(theme::accent_yellow())
-                        .p_3()
+                        .bg(theme::accent_yellow().opacity(0.14))
+                        .p(px(theme::SPACING_MD))
                         .flex()
                         .flex_col()
-                        .gap_2()
+                        .gap(px(theme::SPACING_SM))
                         .text_size(theme::font_caption())
                         .text_color(theme::text_secondary())
                         .child(locale::text(
@@ -5138,11 +5301,12 @@ impl MobileWorkbench {
                             div()
                                 .flex()
                                 .justify_end()
-                                .gap_2()
+                                .gap(px(theme::SPACING_SM))
                                 .child(
-                                    action_button(
+                                    chip_action(
                                         "cancel-terminal-close",
                                         locale::common("Cancel"),
+                                        true,
                                     )
                                     .on_mouse_up(
                                         MouseButton::Left,
@@ -5150,17 +5314,20 @@ impl MobileWorkbench {
                                     ),
                                 )
                                 .child(
-                                    action_button(
+                                    chip_action(
                                         "confirm-terminal-close",
                                         locale::text("Close terminal", "关闭终端", "關閉終端機"),
+                                        can_close,
                                     )
-                                    .when(can_close, |button| {
-                                        button.on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(Self::confirm_close_terminal),
-                                        )
-                                    })
-                                    .when(!can_close, |button| button.opacity(0.55)),
+                                    .when(
+                                        can_close,
+                                        |button| {
+                                            button.on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(Self::confirm_close_terminal),
+                                            )
+                                        },
+                                    ),
                                 ),
                         ),
                 )
@@ -5247,8 +5414,9 @@ impl MobileWorkbench {
         div()
             .id("mobile-terminal-search")
             .flex_shrink_0()
-            .h(px(theme::TOUCH_TARGET))
+            .h(px(WORKBENCH_CONTEXT_HEIGHT))
             .px(px(theme::SPACING_SM))
+            .overflow_hidden()
             .flex()
             .items_center()
             .gap(px(theme::SPACING_XS))
@@ -5256,19 +5424,41 @@ impl MobileWorkbench {
             .border_color(theme::border_subtle())
             .child(
                 div()
-                    .flex_1()
+                    .h(px(WORKBENCH_CONTROL_SIZE))
                     .min_w_0()
-                    .child(input_element(self.terminal_search_input.as_ref())),
+                    .flex_1()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .bg(theme::workbench_panel_bg())
+                    .pl(px(theme::SPACING_SM))
+                    .pr(px(theme::SPACING_XS))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
+                    .child(
+                        svg()
+                            .path("icons/search.svg")
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(theme::text_muted()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .child(input_element(self.terminal_search_input.as_ref())),
+                    ),
             )
             .child(
                 div()
                     .flex_shrink_0()
-                    .text_size(theme::font_caption())
+                    .font_family("IBM Plex Mono")
+                    .text_size(theme::font_micro())
                     .text_color(theme::text_muted())
                     .child(format!("{position}/{total}")),
             )
             .child(
-                icon_button(
+                toolbar_icon_button(
                     "terminal-search-next",
                     "icons/chevron-down.svg",
                     "Next match",
@@ -5282,7 +5472,7 @@ impl MobileWorkbench {
                 }),
             )
             .child(
-                icon_button("terminal-search-close", "icons/x.svg", "Close").on_mouse_up(
+                toolbar_icon_button("terminal-search-close", "icons/x.svg", "Close").on_mouse_up(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| this.toggle_terminal_search(window, cx)),
                 ),
@@ -5410,24 +5600,10 @@ impl MobileWorkbench {
             .when(
                 self.terminal.state.active_session.is_some() && !has_frame,
                 |surface| {
-                    surface.child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .text_size(theme::font_caption())
-                                    .text_color(theme::text_muted())
-                                    .child(locale::text(
-                                        "Waiting for output…",
-                                        "正在等待输出…",
-                                        "正在等待輸出…",
-                                    )),
-                            ),
-                    )
+                    surface.child(centered_pane_state(
+                        "icons/loader-circle.svg",
+                        locale::text("Waiting for output…", "正在等待输出…", "正在等待輸出…"),
+                    ))
                 },
             )
             .when(has_frame && self.terminal_scrolled_back, |surface| {
@@ -5582,15 +5758,18 @@ impl MobileWorkbench {
                 )
             })
             .when(!has_frame, |surface| {
-                surface.child(empty_label(if has_session {
-                    locale::text("No output yet", "暂无输出", "暫無輸出")
-                } else {
-                    locale::text(
-                        "Select or create a terminal",
-                        "选择或新建一个终端",
-                        "選擇或新建一個終端機",
-                    )
-                }))
+                surface.child(centered_pane_state(
+                    "icons/square-terminal.svg",
+                    if has_session {
+                        locale::text("No output yet", "暂无输出", "暫無輸出")
+                    } else {
+                        locale::text(
+                            "Select or create a terminal",
+                            "选择或新建一个终端",
+                            "選擇或新建一個終端機",
+                        )
+                    },
+                ))
             })
             .when(self.terminal_selection.is_some(), |surface| {
                 surface
@@ -5685,6 +5864,130 @@ impl MobileWorkbench {
             })
             .into_any_element()
     }
+
+    /// The rail's header: the surface switch and the way out, on one row.
+    ///
+    /// Three framed buttons read as three commands competing for the eye and
+    /// cost a whole second row above the surface. A tab is a place, so the
+    /// selected one carries the only fill in the row and the rest recede; the
+    /// count that used to ride a coloured badge sits beside its label, where it
+    /// is read as part of the word rather than as an alert.
+    fn render_header(
+        &self,
+        surface: WorkbenchSurface,
+        changed_files: usize,
+        running_terminals: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .flex_shrink_0()
+            .h(px(WORKBENCH_HEADER_HEIGHT))
+            .pl(px(theme::SPACING_SM))
+            .pr(px(theme::SPACING_XS))
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_XS))
+            .child(
+                // A plain row rather than a horizontal scroller: the tabs fit a
+                // phone at every text size the platform offers, and a scroller
+                // on this axis would compete with the swipe that closes the
+                // drawer.
+                div()
+                    .id("mobile-workbench-tabs")
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .children(WorkbenchSurface::ALL.into_iter().map(|candidate| {
+                        let selected = candidate == surface;
+                        let badge = match candidate {
+                            WorkbenchSurface::Git => changed_files,
+                            WorkbenchSurface::Terminal => running_terminals,
+                            WorkbenchSurface::Files => 0,
+                        };
+                        div()
+                            .id(format!("workbench-tab:{}", candidate.label()))
+                            .h(px(WORKBENCH_TAB_HEIGHT))
+                            .flex_shrink_0()
+                            .px(px(10.0))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .when(selected, |tab| tab.bg(theme::row_active_bg()))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .text_size(theme::font_caption())
+                            .font_weight(if selected {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(if selected {
+                                theme::text_primary()
+                            } else {
+                                theme::text_muted()
+                            })
+                            .cursor_pointer()
+                            .aria_label(candidate.localized_label())
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| this.set_surface(candidate, cx)),
+                            )
+                            .child(candidate.localized_label())
+                            .when(badge > 0, |tab| {
+                                tab.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .font_family("IBM Plex Mono")
+                                        .text_size(theme::font_micro())
+                                        .text_color(if selected {
+                                            theme::text_secondary()
+                                        } else {
+                                            theme::text_muted()
+                                        })
+                                        .child(badge.min(99).to_string()),
+                                )
+                            })
+                    })),
+            )
+            .child(self.render_close_control())
+            .into_any_element()
+    }
+
+    /// The one way out a thumb can see: the rail has no hardware back key
+    /// rooted in it, and an edge swipe is not an affordance the phone
+    /// announces. The drawer belongs to the app, so this reports the request
+    /// through the handler installed when the workbench was created.
+    fn render_close_control(&self) -> gpui::AnyElement {
+        let handler = self.close_handler.clone();
+        div()
+            .id("close-right-rail")
+            .size(px(theme::HEADER_BUTTON_SIZE))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(theme::RADIUS_CONTROL))
+            .cursor_pointer()
+            .aria_label(locale::text("Close", "关闭", "關閉"))
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .when_some(handler, |button, handler| {
+                button.on_mouse_up(MouseButton::Left, move |event, window, cx| {
+                    handler(event, window, cx)
+                })
+            })
+            .child(
+                svg()
+                    .path("icons/x.svg")
+                    .size(px(theme::ICON_MD))
+                    .text_color(theme::text_secondary()),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for MobileWorkbench {
@@ -5704,98 +6007,12 @@ impl Render for MobileWorkbench {
             .bg(theme::sidebar_bg())
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .id("mobile-workbench-tabs-scroll")
-                    .flex_shrink_0()
-                    .w_full()
-                    .min_w_0()
-                    .p(px(theme::SPACING_SM))
-                    .border_b_1()
-                    .border_color(theme::border_subtle())
-                    .flex()
-                    .items_center()
-                    .gap(px(theme::SPACING_XS))
-                    .children(WorkbenchSurface::ALL.into_iter().map(|candidate| {
-                        let selected = candidate == surface;
-                        let badge = match candidate {
-                            WorkbenchSurface::Git => changed_files,
-                            WorkbenchSurface::Terminal => running_terminals,
-                            WorkbenchSurface::Files => 0,
-                        };
-                        div()
-                            .id(format!("workbench-tab:{}", candidate.label()))
-                            .h(px(40.0))
-                            .min_w_0()
-                            .flex_1()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(if selected {
-                                theme::border_default()
-                            } else {
-                                gpui::transparent_black()
-                            })
-                            .bg(if selected {
-                                theme::bg_card()
-                            } else {
-                                gpui::transparent_black()
-                            })
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(theme::SPACING_XS))
-                            .text_size(theme::font_caption())
-                            .font_weight(if selected {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::NORMAL
-                            })
-                            .text_color(if selected {
-                                theme::text_primary()
-                            } else {
-                                theme::text_muted()
-                            })
-                            .cursor_pointer()
-                            .aria_label(candidate.localized_label())
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| this.set_surface(candidate, cx)),
-                            )
-                            .child(
-                                svg()
-                                    .path(candidate.icon())
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(if selected {
-                                        theme::text_primary()
-                                    } else {
-                                        theme::text_muted()
-                                    }),
-                            )
-                            .child(candidate.localized_label())
-                            .when(badge > 0, |tab| {
-                                tab.child(
-                                    div()
-                                        .min_w(px(18.0))
-                                        .h(px(18.0))
-                                        .px(px(4.0))
-                                        .rounded_full()
-                                        .bg(theme::accent_blue().opacity(0.18))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_size(theme::font_micro())
-                                        .text_color(theme::accent_blue())
-                                        .child(badge.min(99).to_string()),
-                                )
-                            })
-                    })),
-            )
+            .child(self.render_header(surface, changed_files, running_terminals, cx))
             .when_some(self.notice.clone(), |root, notice| {
                 root.child(
                     div()
                         .flex_shrink_0()
-                        .px_3()
+                        .px(px(theme::SPACING_MD))
                         .py_2()
                         .bg(theme::bg_card_dim())
                         .text_size(theme::font_caption())
@@ -5807,7 +6024,7 @@ impl Render for MobileWorkbench {
                 root.child(
                     div()
                         .flex_shrink_0()
-                        .px_3()
+                        .px(px(theme::SPACING_MD))
                         .py_2()
                         .bg(theme::bg_card_dim())
                         .text_size(theme::font_caption())
@@ -5823,16 +6040,19 @@ impl Render for MobileWorkbench {
     }
 }
 
+/// The frame around a one-line kit field the rail owns.
+///
+/// A field is a surface, not a box: on a phone the border around an empty
+/// rectangle is ink that says nothing, so the fill alone marks where the text
+/// goes and the row it sits in supplies the inset.
 fn input_shell(input: Option<&Entity<InputState>>) -> gpui::Div {
     div()
         .h(px(theme::TOUCH_TARGET))
         .flex_1()
         .min_w_0()
         .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::border_default())
-        .bg(theme::bg_card())
-        .px_1()
+        .bg(theme::workbench_panel_bg())
+        .px_2()
         .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
         .child(input_element(input))
 }
@@ -5895,6 +6115,222 @@ fn icon_button(
                 .size(px(theme::ICON_SM))
                 .text_color(theme::text_secondary()),
         )
+}
+
+/// A glyph action inside a rail toolbar or header.
+///
+/// The row it sits in is already a touch-height band, so the control only has
+/// to own its own width: a second 44px square inside every row is what made the
+/// old chrome read as a wall of boxes. The caller still gets a comfortable
+/// target because the row's height is the hitbox's height.
+fn toolbar_icon_button(
+    id: impl Into<gpui::ElementId>,
+    path: &'static str,
+    label: &'static str,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(WORKBENCH_CONTROL_SIZE))
+        .flex_shrink_0()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .flex()
+        .items_center()
+        .justify_center()
+        .aria_label(locale::common(label))
+        .cursor_pointer()
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .child(
+            svg()
+                .path(path)
+                .size(px(theme::ICON_SM))
+                .text_color(theme::text_secondary()),
+        )
+}
+
+/// The clear glyph that lives inside a toolbar field's own frame.
+fn inline_icon_button(
+    id: impl Into<gpui::ElementId>,
+    path: &'static str,
+    label: &'static str,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(24.0))
+        .flex_shrink_0()
+        .rounded(px(theme::RADIUS_PILL))
+        .flex()
+        .items_center()
+        .justify_center()
+        .aria_label(locale::common(label))
+        .cursor_pointer()
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .child(
+            svg()
+                .path(path)
+                .size(px(14.0))
+                .text_color(theme::text_muted()),
+        )
+}
+
+/// One half of a segmented switch. The caller owns the track and the handlers;
+/// this owns the one look a half has in either state.
+fn segment(
+    id: impl Into<gpui::ElementId>,
+    label: &'static str,
+    selected: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h_full()
+        .flex_shrink_0()
+        .px(px(10.0))
+        .rounded(px(theme::RADIUS_PILL))
+        .when(selected, |half| half.bg(theme::row_active_bg()))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(theme::font_micro())
+        .font_weight(if selected {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::NORMAL
+        })
+        .text_color(if selected {
+            theme::text_primary()
+        } else {
+            theme::text_muted()
+        })
+        .cursor_pointer()
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .child(label)
+}
+
+/// A secondary action drawn as a filled pill: lighter than a framed button and
+/// still a target a thumb finds without reading it.
+fn chip_action(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<gpui::SharedString>,
+    enabled: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .h(px(WORKBENCH_CHIP_HEIGHT))
+        .px(px(theme::SPACING_MD))
+        .rounded(px(theme::RADIUS_PILL))
+        .bg(theme::workbench_panel_bg())
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(theme::font_caption())
+        .text_color(theme::text_secondary())
+        .when(enabled, |chip| {
+            chip.cursor_pointer()
+                .active(|style| style.bg(theme::row_pressed_bg()))
+        })
+        .when(!enabled, |chip| chip.opacity(0.55))
+        .child(label.into())
+}
+
+/// The one action a surface exists to offer. It is the only filled control on
+/// the rail, so the eye lands on it before anything else in the row.
+fn primary_action(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<gpui::SharedString>,
+    enabled: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .h(px(theme::TOUCH_TARGET))
+        .px(px(theme::SPACING_LG))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .bg(if enabled {
+            theme::primary()
+        } else {
+            theme::bg_card_dim()
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(theme::font_caption())
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(if enabled {
+            theme::primary_foreground()
+        } else {
+            theme::text_muted()
+        })
+        .when(enabled, |button| {
+            button.cursor_pointer().active(|style| style.opacity(0.85))
+        })
+        .child(label.into())
+}
+
+/// What a change is, as a tinted pill rather than a framed box: the status is
+/// colour-coded already, and a border around it added a second edge to every
+/// row in the tree.
+fn change_status_pill(kind: GitChangeKind, color: gpui::Hsla) -> gpui::AnyElement {
+    div()
+        .flex_shrink_0()
+        .h(px(18.0))
+        .min_w(px(22.0))
+        .px(px(6.0))
+        .rounded(px(theme::RADIUS_PILL))
+        .bg(color.opacity(0.18))
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family("IBM Plex Mono")
+        .text_size(theme::font_micro())
+        .text_color(color)
+        .child(git_change_label_mobile(kind))
+        .into_any_element()
+}
+
+/// The one thing a surface says when it has nothing to show.
+///
+/// A sentence in the top-left corner of an empty pane reads as a mistake; the
+/// pane is a place, so the message is centred in it and carries the surface's
+/// own glyph, which is what tells the reader they are looking at the right
+/// place with nothing in it rather than at the wrong place.
+fn empty_state(icon: &'static str, label: impl Into<gpui::SharedString>) -> gpui::Div {
+    div()
+        .py_8()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(theme::SPACING_SM))
+        .child(
+            svg()
+                .path(icon)
+                .size(px(24.0))
+                .text_color(theme::text_muted()),
+        )
+        .child(
+            div()
+                .px(px(theme::SPACING_LG))
+                .text_size(theme::font_caption())
+                .text_align(gpui::TextAlign::Center)
+                .text_color(theme::text_muted())
+                .child(label.into()),
+        )
+}
+
+/// The same message for a pane with no flow of its own.
+///
+/// The terminal grid is an absolutely positioned surface, so a message inside
+/// it has to claim the whole pane before it can be centred in it; a terminal
+/// that has never produced a frame would otherwise leave the words in a corner
+/// of an empty black rectangle.
+fn centered_pane_state(icon: &'static str, label: impl Into<gpui::SharedString>) -> gpui::Div {
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(empty_state(icon, label))
 }
 
 /// One key of the terminal modifier bar: a real 44px target, a latched
@@ -5979,37 +6415,11 @@ fn terminal_selection_action(
         )
 }
 
-fn git_mode_tab(
-    id: &'static str,
-    label: &'static str,
-    selected: bool,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .h_full()
-        .min_w_0()
-        .flex_1()
-        .px_3()
-        .flex()
-        .items_center()
-        .justify_center()
-        .border_b_2()
-        .border_color(if selected {
-            theme::text_primary()
-        } else {
-            theme::workbench_bg()
-        })
-        .text_size(theme::font_caption())
-        .text_color(if selected {
-            theme::text_primary()
-        } else {
-            theme::text_muted()
-        })
-        .cursor_pointer()
-        .active(|style| style.bg(theme::row_pressed_bg()))
-        .child(label)
-}
-
+/// The guide rails a tree row draws down its ancestor columns.
+///
+/// The offsets are measured against the rail's edge, so the row's own inset is
+/// subtracted here: a guide has to line up with the chevron above it no matter
+/// how far the row's fill is pulled in from the edge.
 fn file_tree_guides_mobile(depth: usize) -> Vec<gpui::AnyElement> {
     (0..depth)
         .map(|index| {
@@ -6017,7 +6427,7 @@ fn file_tree_guides_mobile(depth: usize) -> Vec<gpui::AnyElement> {
                 .absolute()
                 .top_0()
                 .bottom_0()
-                .left(px(index as f32 * 20.0 + 16.0))
+                .left(px(index as f32 * 20.0 + 16.0 - TREE_ROW_INSET))
                 .w(px(1.0))
                 .bg(theme::border_default())
                 .into_any_element()
@@ -6282,53 +6692,26 @@ fn history_relative_time(authored_at_ms: Option<i64>) -> String {
     }
 }
 
+/// A secondary button on a sheet or a full-screen card's action bar. It keeps
+/// its frame because it stands alone rather than inside a toolbar row, and a
+/// lone word with no edge reads as a label instead of a control.
 fn action_button(id: impl Into<gpui::ElementId>, label: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .h(px(theme::TOUCH_TARGET))
-        .px_3()
+        .px(px(theme::SPACING_LG))
         .rounded(px(theme::RADIUS_CONTROL))
         .border_1()
-        .border_color(theme::border_default())
-        .bg(theme::bg_card())
+        .border_color(theme::border_subtle())
+        .bg(theme::workbench_panel_bg())
         .flex()
         .items_center()
         .justify_center()
-        .text_size(theme::font_body())
+        .text_size(theme::font_detail())
         .text_color(theme::text_secondary())
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
         .child(locale::common(label))
-}
-
-fn compact_action(
-    id: impl Into<gpui::ElementId>,
-    label: impl Into<String>,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .h(px(36.0))
-        .px_2()
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::border_default())
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_size(theme::font_micro())
-        .text_color(theme::text_secondary())
-        .cursor_pointer()
-        .active(|style| style.bg(theme::row_pressed_bg()))
-        .child(label.into())
-}
-
-fn empty_label(label: &str) -> gpui::Div {
-    div()
-        .px_3()
-        .py_4()
-        .text_size(theme::font_caption())
-        .text_color(theme::text_muted())
-        .child(label.to_string())
 }
 
 fn file_status_label(status: FileEditorStatus) -> &'static str {
@@ -7070,13 +7453,11 @@ mod tests {
 
     #[test]
     fn mobile_workbench_file_and_git_mappings_follow_desktop_labels() {
+        // The switch draws one segment per mode, so the list is the contract
+        // between what the row offers and what the query can mean.
         assert_eq!(
-            MobileFileSearchMode::Name.toggle(),
-            MobileFileSearchMode::Content
-        );
-        assert_eq!(
-            MobileFileSearchMode::Content.toggle(),
-            MobileFileSearchMode::Name
+            MobileFileSearchMode::ALL,
+            [MobileFileSearchMode::Name, MobileFileSearchMode::Content]
         );
         assert_eq!(MobileFileSearchMode::Name.label(), "Name");
         assert_eq!(MobileFileSearchMode::Content.label(), "Content");
@@ -7087,6 +7468,51 @@ mod tests {
         assert_eq!(file_icon_kind_for_path("src/main.rs"), FileIconKind::Rust);
         assert_eq!(file_icon_kind_for_path("README.md"), FileIconKind::Markdown);
         assert_eq!(file_icon_kind_for_path("config.toml"), FileIconKind::Config);
+    }
+
+    /// The rail owns its whole header, and exactly one control closes it.
+    ///
+    /// The drawer used to draw a second header above the rail's own tabs. It
+    /// spent a phone's row on repeating the title already selected below it,
+    /// and it left two `close-right-rail` ids in the tree, which is how the
+    /// duplicate survived review: both looked like the one way out.
+    #[test]
+    fn the_right_rail_draws_its_own_header() {
+        let drawer = include_str!("app.rs")
+            .split_once("fn render_workbench_drawer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_drawer("))
+            .map(|(body, _)| body)
+            .expect("the workbench drawer should remain inspectable");
+        assert!(
+            !drawer.contains("close-right-rail"),
+            "the drawer must not draw a second header over the rail's own"
+        );
+        assert!(
+            !drawer.contains("DRAWER_HEADER_HEIGHT"),
+            "the drawer must not reserve a header row of its own"
+        );
+
+        let workbench = include_str!("workbench.rs");
+        assert!(workbench.contains("\"close-right-rail\""));
+        assert!(workbench.contains("fn render_header("));
+    }
+
+    /// A close control that reports to nobody is a dead button.
+    ///
+    /// The rail cannot animate the drawer it lives in, so the app hands it a
+    /// handler when it creates the workbench; without the hand-off the header
+    /// still paints and taps do nothing.
+    #[test]
+    fn the_app_gives_the_rail_a_way_to_close_itself() {
+        let ensure = include_str!("app.rs")
+            .split_once("fn ensure_workbench(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Closes the right rail"))
+            .map(|(body, _)| body)
+            .expect("workbench creation should remain inspectable");
+        assert!(
+            ensure.contains("set_close_handler("),
+            "the workbench has to learn how to close the drawer it was created in"
+        );
     }
 
     #[test]
