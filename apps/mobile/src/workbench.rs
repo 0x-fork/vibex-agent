@@ -2,9 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Context, Entity, FontWeight, IntoElement, MouseButton, MouseUpEvent, ParentElement as _,
-    Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, WeakEntity, Window,
-    canvas, div, prelude::*, px, relative, rgb, svg,
+    Bounds, ClipboardItem, Context, DispatchPhase, Entity, FontWeight, IntoElement, LongPressEvent,
+    MouseButton, MouseUpEvent, ParentElement as _, Pixels, Point, Render, ScrollDelta,
+    ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchPhase, WeakEntity, Window, canvas, div,
+    prelude::*, px, relative, rgb, svg,
 };
 use vibex_backend::{
     BackendError, BackendOperation, BackendResult, MutationRequest, TerminalBackend as _,
@@ -23,6 +24,7 @@ use vibex_desktop_model::{
 use vibex_remote_client::WebRemoteBackend;
 use vibex_terminal_ui::{
     TerminalCellColor, TerminalCellSnapshot, TerminalCursorShape, TerminalGridPoint,
+    TerminalSearchMatch,
 };
 use vibex_ui::{
     FileEditorStatus, FileWorkflowController, GitWorkflowController, ShellKind, TerminalInput,
@@ -47,6 +49,18 @@ const TERMINAL_MIN_ROWS: u16 = 4;
 const TERMINAL_MAX_ROWS: u16 = 100;
 const TERMINAL_MIN_COLS: u16 = 20;
 const TERMINAL_MAX_COLS: u16 = 240;
+/// Height of the floating copy bar a touch selection raises, and the band at
+/// the top of the grid it occupies. A long press inside the band belongs to
+/// the bar, not to the row underneath it.
+const TERMINAL_SELECTION_BAR_HEIGHT: f32 = 40.0;
+const TERMINAL_SELECTION_BAR_BAND: f32 = TERMINAL_SELECTION_BAR_HEIGHT + theme::SPACING_SM * 2.0;
+
+/// The two ends of a touch selection over the terminal grid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct TerminalSelection {
+    anchor: TerminalGridPoint,
+    head: TerminalGridPoint,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkbenchSurface {
@@ -194,6 +208,23 @@ pub struct MobileWorkbench {
     /// instead of re-notifying on every frame.
     terminal_fit_error: Option<String>,
     terminal_poll_generation: u64,
+    /// The geometry the terminal grid was last painted at, in window
+    /// coordinates. A touch point is turned into a cell against it, which is
+    /// what makes a long press select the place the finger is actually on.
+    terminal_grid_bounds: Option<Bounds<Pixels>>,
+    /// The anchor and live head of a touch selection, in grid points. Its
+    /// presence is what raises the copy bar.
+    terminal_selection: Option<TerminalSelection>,
+    /// The text the current selection holds, kept for Copy so the clipboard
+    /// write does not have to reach back into the render model.
+    terminal_selection_text: Option<String>,
+    /// In-terminal find. Matches are painted by reusing the emulator's own
+    /// selection, exactly as the desktop surface highlights them.
+    terminal_search_open: bool,
+    terminal_search_input: Option<Entity<InputState>>,
+    terminal_search_subscription: Option<gpui::Subscription>,
+    terminal_search_matches: Vec<TerminalSearchMatch>,
+    terminal_active_search_match: usize,
     busy: bool,
     notice: Option<String>,
     error: Option<BackendError>,
@@ -257,6 +288,14 @@ impl MobileWorkbench {
             terminal_fit_size: None,
             terminal_fit_error: None,
             terminal_poll_generation: 0,
+            terminal_grid_bounds: None,
+            terminal_selection: None,
+            terminal_selection_text: None,
+            terminal_search_open: false,
+            terminal_search_input: None,
+            terminal_search_subscription: None,
+            terminal_search_matches: Vec::new(),
+            terminal_active_search_match: 0,
             busy: false,
             notice: None,
             error: None,
@@ -269,6 +308,9 @@ impl MobileWorkbench {
     pub fn set_surface(&mut self, surface: WorkbenchSurface, cx: &mut Context<Self>) {
         if self.surface == WorkbenchSurface::Terminal && surface != WorkbenchSurface::Terminal {
             self.stop_terminal_poll();
+            // The grid goes with the surface; a selection it was showing has
+            // nothing left to be copied from.
+            self.dismiss_terminal_selection(cx);
         }
         self.sync_capabilities();
         self.surface = surface;
@@ -298,6 +340,7 @@ impl MobileWorkbench {
         self.terminal_fit_size = None;
         self.terminal_fit_error = None;
         self.terminal_close_confirmation = None;
+        self.reset_terminal_text_state();
         self.git_history_loading = false;
         self.git_history_request_generation = self.git_history_request_generation.wrapping_add(1);
         self.git_history_query_clear_pending = true;
@@ -834,6 +877,34 @@ impl MobileWorkbench {
                 ));
             }
         }
+        if self.terminal_search_input.is_none() {
+            self.terminal_search_input = Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Find in terminal",
+                    "在终端中查找",
+                    "在終端機中尋找",
+                ))
+            }));
+            if let Some(input) = self.terminal_search_input.clone() {
+                self.terminal_search_subscription = Some(cx.subscribe_in(
+                    &input,
+                    window,
+                    |this: &mut Self,
+                     _: &Entity<InputState>,
+                     event: &InputEvent,
+                     _: &mut Window,
+                     cx: &mut Context<Self>| {
+                        match event {
+                            InputEvent::Change => this.refresh_terminal_search(cx),
+                            InputEvent::PressEnter { .. } => {
+                                this.select_next_terminal_search_match(cx)
+                            }
+                            _ => {}
+                        }
+                    },
+                ));
+            }
+        }
 
         let clears = [
             (&mut self.file_search_clear_pending, &self.file_search_input),
@@ -1263,6 +1334,7 @@ impl MobileWorkbench {
 
     fn attach_terminal(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
         self.terminal_close_confirmation = None;
+        self.reset_terminal_text_state();
         match self.terminal.attach(terminal_id.clone()) {
             Ok(()) => {
                 self.error = None;
@@ -1361,6 +1433,14 @@ impl MobileWorkbench {
             .render
             .get_or_insert_with(|| vibex_ui::TerminalRenderModel::new(1, 1));
         terminal_feed_snapshot(render, &mut self.terminal_render_sequence, &snapshot);
+        // A rebuild drops the emulator's own selection with the grid it pointed
+        // into, so a live touch selection is re-applied to what is left.
+        if let Some(selection) = self.terminal_selection {
+            self.terminal_selection_text = render
+                .select_text(selection.anchor, selection.head)
+                .ok()
+                .or_else(|| self.terminal_selection_text.clone());
+        }
     }
 
     /// Auto-fits the PTY to the available surface. The desktop grid geometry
@@ -1496,6 +1576,10 @@ impl MobileWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A tap on the grid is the user leaving selection mode; the recognizer
+        // reports a touch as a tap only when it never became a long press, so
+        // this can never cut a selection drag short.
+        self.dismiss_terminal_selection(cx);
         self.show_terminal_keyboard(window, cx);
     }
 
@@ -1580,6 +1664,214 @@ impl MobileWorkbench {
             self.terminal_scrolled_back = false;
             cx.notify();
         }
+    }
+
+    /// The cell a window point falls in, using the geometry the grid was last
+    /// painted at. A point past an edge clamps to the nearest cell, so a finger
+    /// that drags off the grid keeps extending the selection instead of losing
+    /// it.
+    fn terminal_cell_at(&self, position: Point<Pixels>) -> Option<TerminalGridPoint> {
+        let bounds = self.terminal_grid_bounds?;
+        let render = self.terminal.state.render.as_ref()?;
+        terminal_cell_at_point(bounds, render.frame.rows, render.frame.columns, position)
+    }
+
+    /// The run of non-blank cells around `point` on its own row. A long press
+    /// selects the whole run, which is how Android selects a word.
+    fn terminal_word_at(&self, point: TerminalGridPoint) -> (TerminalGridPoint, TerminalGridPoint) {
+        let Some(render) = self.terminal.state.render.as_ref() else {
+            return (point, point);
+        };
+        let mut blanks = vec![true; usize::from(render.frame.columns)];
+        for cell in &render.frame.cells {
+            if cell.row != point.row {
+                continue;
+            }
+            if let Some(blank) = blanks.get_mut(usize::from(cell.column)) {
+                *blank = cell.text.trim().is_empty();
+            }
+        }
+        let (start, end) = terminal_word_range(&blanks, point.column);
+        (
+            TerminalGridPoint {
+                row: point.row,
+                column: start,
+            },
+            TerminalGridPoint {
+                row: point.row,
+                column: end,
+            },
+        )
+    }
+
+    /// Drops everything that pointed into the previous terminal's grid: the
+    /// selection, its text, the find query's matches, and the geometry they
+    /// were resolved against.
+    fn reset_terminal_text_state(&mut self) {
+        self.terminal_grid_bounds = None;
+        self.terminal_selection = None;
+        self.terminal_selection_text = None;
+        self.terminal_search_matches.clear();
+        self.terminal_active_search_match = 0;
+    }
+
+    /// Points the shared render model's selection at `anchor..head` and keeps
+    /// the text it produced. The model rebuilds its frame from the selection,
+    /// so the next paint carries the per-cell highlight.
+    fn select_terminal_cells(
+        &mut self,
+        anchor: TerminalGridPoint,
+        head: TerminalGridPoint,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self
+            .terminal
+            .state
+            .render
+            .as_mut()
+            .and_then(|render| render.select_text(anchor, head).ok());
+        self.terminal_selection_text = text;
+        self.terminal_selection = Some(TerminalSelection { anchor, head });
+        cx.notify();
+    }
+
+    /// Drops the touch selection and the highlight it painted.
+    fn dismiss_terminal_selection(&mut self, cx: &mut Context<Self>) {
+        if self.terminal_selection.take().is_none() {
+            return;
+        }
+        self.terminal_selection_text = None;
+        if let Some(render) = self.terminal.state.render.as_mut() {
+            render.clear_selection();
+        }
+        cx.notify();
+    }
+
+    /// A long press starts a selection; the recognizer keeps reporting the same
+    /// touch through `Moved`, which is what turns the press into a drag over
+    /// the grid. A plain pan never reaches this: it stays a scroll gesture.
+    fn on_terminal_long_press(&mut self, event: &LongPressEvent, cx: &mut Context<Self>) {
+        match event.phase {
+            TouchPhase::Started => {
+                // The bar sits over the top rows while a selection is up; a
+                // press there is meant for the bar.
+                if self.terminal_selection.is_some()
+                    && self.terminal_grid_bounds.is_some_and(|bounds| {
+                        event.position.y < bounds.top() + px(TERMINAL_SELECTION_BAR_BAND)
+                    })
+                {
+                    return;
+                }
+                let Some(point) = self.terminal_cell_at(event.position) else {
+                    return;
+                };
+                let (start, end) = self.terminal_word_at(point);
+                self.select_terminal_cells(start, end, cx);
+                cx.stop_propagation();
+            }
+            TouchPhase::Moved => {
+                let Some(selection) = self.terminal_selection else {
+                    return;
+                };
+                let Some(point) = self.terminal_cell_at(event.position) else {
+                    return;
+                };
+                if point != selection.head {
+                    self.select_terminal_cells(selection.anchor, point, cx);
+                }
+                cx.stop_propagation();
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if self.terminal_selection.is_some() {
+                    cx.stop_propagation();
+                }
+            }
+        }
+    }
+
+    fn copy_terminal_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.terminal_selection_text.take()
+            && !text.is_empty()
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.notice = Some(locale::text("Copied", "已复制", "已複製").to_string());
+        }
+        self.dismiss_terminal_selection(cx);
+    }
+
+    fn toggle_terminal_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_search_open = !self.terminal_search_open;
+        self.terminal_selection = None;
+        self.terminal_selection_text = None;
+        if self.terminal_search_open {
+            if let Some(input) = self.terminal_search_input.clone() {
+                // The field opens empty every time: the previous query belonged
+                // to the grid the reader was looking at before.
+                input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                    input.focus(window, cx);
+                });
+            }
+            crate::platform::show_keyboard();
+            self.refresh_terminal_search(cx);
+        } else {
+            self.terminal_search_matches.clear();
+            self.terminal_active_search_match = 0;
+            if let Some(render) = self.terminal.state.render.as_mut() {
+                render.clear_selection();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Re-runs the query over the visible grid. The emulator only searches what
+    /// is on screen, which is the same scope the desktop surface gives it.
+    fn refresh_terminal_search(&mut self, cx: &mut Context<Self>) {
+        let query = input_value(&self.terminal_search_input, cx).to_string();
+        let query = query.trim();
+        self.terminal_search_matches = self
+            .terminal
+            .state
+            .render
+            .as_ref()
+            .filter(|_| !query.is_empty())
+            .map(|render| render.find_visible(query, false))
+            .unwrap_or_default();
+        self.terminal_active_search_match = self
+            .terminal_active_search_match
+            .min(self.terminal_search_matches.len().saturating_sub(1));
+        if self.terminal_search_matches.is_empty() {
+            if let Some(render) = self.terminal.state.render.as_mut() {
+                render.clear_selection();
+            }
+        } else {
+            self.apply_terminal_search_match(cx);
+            return;
+        }
+        cx.notify();
+    }
+
+    fn select_next_terminal_search_match(&mut self, cx: &mut Context<Self>) {
+        if self.terminal_search_matches.is_empty() {
+            return;
+        }
+        self.terminal_active_search_match =
+            (self.terminal_active_search_match + 1) % self.terminal_search_matches.len();
+        self.apply_terminal_search_match(cx);
+    }
+
+    fn apply_terminal_search_match(&mut self, cx: &mut Context<Self>) {
+        let Some(found) = self
+            .terminal_search_matches
+            .get(self.terminal_active_search_match)
+            .copied()
+        else {
+            return;
+        };
+        if let Some(render) = self.terminal.state.render.as_mut() {
+            let _ = render.select_text(found.start, found.end);
+        }
+        cx.notify();
     }
 
     fn send_terminal_value(
@@ -3920,6 +4212,16 @@ impl MobileWorkbench {
                                 }),
                             ),
                     )
+                    .when_some(active.clone(), |bar, _| {
+                        bar.child(
+                            icon_button("search-terminal", "icons/search.svg", "Find").on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.toggle_terminal_search(window, cx)
+                                }),
+                            ),
+                        )
+                    })
                     .child(
                         action_button("create-terminal", locale::common("New"))
                             .when(can_create, |button| {
@@ -3943,6 +4245,10 @@ impl MobileWorkbench {
                         )
                     }),
             )
+            // ── in-terminal find ─────────────────────────────────────────────
+            .when(self.terminal_search_open, |terminal| {
+                terminal.child(self.render_terminal_search(cx))
+            })
             // ── session chips ────────────────────────────────────────────────
             .when(!sessions.is_empty(), |terminal| {
                 terminal.child(
@@ -4130,6 +4436,110 @@ impl MobileWorkbench {
             .into_any_element()
     }
 
+    /// The in-terminal find bar. Matches are highlighted by the shared render
+    /// model's own selection, so the grid needs no second highlight path; this
+    /// row only carries the query, the position, and the way forward.
+    fn render_terminal_search(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let total = self.terminal_search_matches.len();
+        let position = if total == 0 {
+            0
+        } else {
+            self.terminal_active_search_match + 1
+        };
+        let empty = self.terminal_search_matches.is_empty();
+        div()
+            .id("mobile-terminal-search")
+            .flex_shrink_0()
+            .h(px(theme::TOUCH_TARGET))
+            .px(px(theme::SPACING_SM))
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_XS))
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(input_element(self.terminal_search_input.as_ref())),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(theme::font_caption())
+                    .text_color(theme::text_muted())
+                    .child(format!("{position}/{total}")),
+            )
+            .child(
+                icon_button(
+                    "terminal-search-next",
+                    "icons/chevron-down.svg",
+                    "Next match",
+                )
+                .when(empty, |button| button.opacity(0.45))
+                .when(!empty, |button| {
+                    button.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.select_next_terminal_search_match(cx)),
+                    )
+                }),
+            )
+            .child(
+                icon_button("terminal-search-close", "icons/x.svg", "Close").on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.toggle_terminal_search(window, cx)),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// The floating bar a touch selection raises. It sits over the top rows so
+    /// it is always clear of the software keyboard, and only offers what the
+    /// phone can actually do with the selection: copy it, or leave.
+    fn render_terminal_selection_bar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .absolute()
+            .top(px(theme::SPACING_SM))
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .id("terminal-selection-bar")
+                    .h(px(TERMINAL_SELECTION_BAR_HEIGHT))
+                    .px(px(theme::SPACING_XS))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_popover())
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    // A press on the bar is never a press on the grid.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(terminal_selection_action(
+                        "terminal-selection-copy",
+                        "icons/copy.svg",
+                        locale::common("Copy"),
+                        cx.listener(|this, _, _, cx| this.copy_terminal_selection(cx)),
+                    ))
+                    .child(
+                        div()
+                            .w(px(1.0))
+                            .h(px(theme::SPACING_XL))
+                            .bg(theme::border_subtle()),
+                    )
+                    .child(terminal_selection_action(
+                        "terminal-selection-close",
+                        "icons/x.svg",
+                        locale::common("Close"),
+                        cx.listener(|this, _, _, cx| this.dismiss_terminal_selection(cx)),
+                    )),
+            )
+            .into_any_element()
+    }
+
     /// The cell grid. The surface reports its bounds on paint so the PTY is
     /// auto-fitted to fill the screen, and the shared render model frame is
     /// rendered cell-by-cell with the desktop palette and cursor treatment.
@@ -4225,19 +4635,52 @@ impl MobileWorkbench {
                         .child(locale::text("Latest", "最新", "最新")),
                 )
             })
-            .child(
+            .child({
+                let prepaint_entity = weak_entity.clone();
                 canvas(
                     move |bounds, _, cx| {
                         let width = f32::from(bounds.size.width);
                         let height = f32::from(bounds.size.height);
-                        let _ = weak_entity
-                            .update(cx, |this, cx| this.fit_terminal_to(width, height, cx));
+                        let _ = prepaint_entity.update(cx, |this, cx| {
+                            // The grid's own geometry, kept for turning a touch
+                            // point into the cell under it.
+                            this.terminal_grid_bounds = Some(bounds);
+                            this.fit_terminal_to(width, height, cx);
+                        });
                     },
-                    |_, _, _, _| {},
+                    {
+                        let gesture_entity = weak_entity.clone();
+                        move |bounds, _, window, cx| {
+                            let _ = gesture_entity.update(cx, |this, _| {
+                                this.terminal_grid_bounds = Some(bounds);
+                            });
+                            // A long press is the one touch the grid has to
+                            // claim from the platform: the recognizer keeps
+                            // reporting that same touch through `Moved`, which
+                            // is the drag that extends the selection. A plain
+                            // pan stays a scroll gesture and is untouched.
+                            window.on_mouse_event({
+                                let entity = weak_entity.clone();
+                                move |event: &LongPressEvent,
+                                      phase: DispatchPhase,
+                                      _: &mut Window,
+                                      cx: &mut gpui::App| {
+                                    if phase != DispatchPhase::Bubble
+                                        || !bounds.contains(&event.position)
+                                    {
+                                        return;
+                                    }
+                                    let _ = entity.update(cx, |this, cx| {
+                                        this.on_terminal_long_press(event, cx)
+                                    });
+                                }
+                            });
+                        }
+                    },
                 )
                 .absolute()
-                .size_full(),
-            )
+                .size_full()
+            })
             .when_some(frame, |surface, frame| {
                 let rows = frame.rows;
                 let columns = frame.columns;
@@ -4294,6 +4737,9 @@ impl MobileWorkbench {
                     )
                 }))
             })
+            .when(self.terminal_selection.is_some(), |surface| {
+                surface.child(self.render_terminal_selection_bar(cx))
+            })
             .into_any_element()
     }
 
@@ -4332,6 +4778,11 @@ impl MobileWorkbench {
         );
         if cell.dim {
             foreground = foreground.opacity(0.68);
+        }
+        // The emulator owns the selection, so the highlight is painted from the
+        // cell flags the frame carries — the same tone the desktop surface uses.
+        if cell.selected {
+            background = default_foreground.opacity(0.28);
         }
         if at_cursor && cursor.is_some_and(|cursor| cursor.shape == TerminalCursorShape::Block) {
             background = default_foreground;
@@ -4633,6 +5084,42 @@ fn terminal_modifier_chip(
         })
         .when(!enabled, |chip| chip.opacity(0.45))
         .child(label.into())
+}
+
+/// One action of the terminal selection bar: an icon and a word, inside a
+/// target that still clears the touch minimum on its own.
+fn terminal_selection_action(
+    id: impl Into<gpui::ElementId>,
+    icon: &'static str,
+    label: &'static str,
+    handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(32.0))
+        .min_w(px(64.0))
+        .px_2()
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(theme::SPACING_XS))
+        .aria_label(label)
+        .cursor_pointer()
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .on_mouse_up(MouseButton::Left, handler)
+        .child(
+            svg()
+                .path(icon)
+                .size(px(theme::ICON_SM))
+                .text_color(theme::text_secondary()),
+        )
+        .child(
+            div()
+                .text_size(theme::font_caption())
+                .text_color(theme::text_primary())
+                .child(label),
+        )
 }
 
 fn git_mode_tab(
@@ -4960,6 +5447,54 @@ fn file_status_color(status: FileEditorStatus) -> gpui::Hsla {
     }
 }
 
+/// The cell a point falls in, given the geometry the grid was painted at.
+///
+/// Rows are laid out bottom-aligned under a fixed vertical padding, so the
+/// row is measured from the grid's bottom edge. Points outside the grid clamp
+/// to the nearest cell, which keeps a drag alive when the finger leaves the
+/// surface instead of dropping the selection.
+fn terminal_cell_at_point(
+    bounds: Bounds<Pixels>,
+    rows: u16,
+    columns: u16,
+    position: Point<Pixels>,
+) -> Option<TerminalGridPoint> {
+    if rows == 0 || columns == 0 {
+        return None;
+    }
+    let content_bottom = f32::from(bounds.bottom()) - TERMINAL_VERTICAL_PADDING;
+    let rows_from_bottom =
+        ((content_bottom - f32::from(position.y)) / TERMINAL_CELL_HEIGHT).floor();
+    let row = (f32::from(rows) - 1.0 - rows_from_bottom).clamp(0.0, f32::from(rows) - 1.0) as u16;
+    let column = ((f32::from(position.x) - f32::from(bounds.left())) / TERMINAL_CELL_WIDTH)
+        .floor()
+        .clamp(0.0, f32::from(columns) - 1.0) as u16;
+    Some(TerminalGridPoint { row, column })
+}
+
+/// The inclusive column range of the non-blank run `column` belongs to. A
+/// blank cell selects itself, so a long press on empty space still raises the
+/// copy bar instead of doing nothing.
+fn terminal_word_range(row: &[bool], column: u16) -> (u16, u16) {
+    let Some(last) = row.len().checked_sub(1) else {
+        return (column, column);
+    };
+    let index = usize::from(column).min(last);
+    let blank = |index: usize| row.get(index).copied().unwrap_or(true);
+    if blank(index) {
+        return (column, column);
+    }
+    let mut start = index;
+    while start > 0 && !blank(start - 1) {
+        start -= 1;
+    }
+    let mut end = index;
+    while end < last && !blank(end + 1) {
+        end += 1;
+    }
+    (start as u16, end as u16)
+}
+
 /// Feeds one polled snapshot into the render model. Chunks already applied
 /// are skipped by sequence; a dims change, a sequence rewind (terminal
 /// reattached), or a gap (retained ring evicted past the next expected chunk)
@@ -5239,6 +5774,52 @@ mod tests {
             ),
             foreground
         );
+    }
+
+    /// Rows are bottom-aligned under the grid's vertical padding, so a point's
+    /// row is measured from that edge, and a point outside the grid clamps to
+    /// the nearest cell instead of dropping the selection.
+    #[test]
+    fn terminal_cell_at_point_reads_the_painted_geometry() {
+        use gpui::{point, size};
+
+        let bounds = Bounds::new(point(px(6.0), px(100.0)), size(px(80.0), px(200.0)));
+        let cell = |x: f32, y: f32| {
+            terminal_cell_at_point(bounds, 10, 10, point(px(x), px(y))).expect("the grid has cells")
+        };
+
+        // The bottom padding is not a row: the last row ends above it.
+        assert_eq!(cell(6.0, 295.0), TerminalGridPoint { row: 9, column: 0 });
+        assert_eq!(cell(6.0, 278.0), TerminalGridPoint { row: 8, column: 0 });
+        // A point past the top is the first row, not a negative one.
+        assert_eq!(cell(6.0, 100.0), TerminalGridPoint { row: 0, column: 0 });
+        // Columns advance by the cell width and clamp at both ends.
+        assert_eq!(cell(13.0, 295.0).column, 0);
+        assert_eq!(cell(14.0, 295.0).column, 1);
+        assert_eq!(cell(0.0, 295.0).column, 0);
+        assert_eq!(cell(500.0, 295.0).column, 9);
+
+        assert!(terminal_cell_at_point(bounds, 0, 10, point(px(6.0), px(295.0))).is_none());
+    }
+
+    /// A long press selects the non-blank run around the cell it landed on, and
+    /// a blank cell selects only itself.
+    #[test]
+    fn terminal_word_range_selects_the_run_around_a_cell() {
+        // `true` is a blank cell: three runs, the last of them against the edge.
+        let row = [
+            true, false, false, false, true, false, false, true, false, false,
+        ];
+
+        assert_eq!(terminal_word_range(&row, 2), (1, 3));
+        assert_eq!(terminal_word_range(&row, 1), (1, 3));
+        assert_eq!(terminal_word_range(&row, 3), (1, 3));
+        assert_eq!(terminal_word_range(&row, 0), (0, 0));
+        assert_eq!(terminal_word_range(&row, 5), (5, 6));
+        assert_eq!(terminal_word_range(&row, 9), (8, 9));
+        // A point past the row's own width clamps into it rather than panicking.
+        assert_eq!(terminal_word_range(&row, 40), (8, 9));
+        assert_eq!(terminal_word_range(&[], 3), (3, 3));
     }
 
     #[test]

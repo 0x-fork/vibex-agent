@@ -19,7 +19,10 @@ use vibex_core::{
     TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalSession, TerminalStatus,
     TerminalWriteRequest, WorkspaceId,
 };
-use vibex_terminal_ui::{TerminalEmulator, TerminalFrameSnapshot, TerminalModeSnapshot};
+use vibex_terminal_ui::{
+    TerminalEmulator, TerminalFrameSnapshot, TerminalGridPoint, TerminalModeSnapshot,
+    TerminalSearchMatch,
+};
 
 use crate::{MIN_TOUCH_TARGET_PX, ShellKind};
 
@@ -386,6 +389,29 @@ impl TerminalRenderModel {
 
     pub fn modes(&self) -> TerminalModeSnapshot {
         self.emulator.modes()
+    }
+
+    /// Selects the cells between two grid points and returns the text they
+    /// hold. The selection stays in the emulator, so the next frame carries the
+    /// per-cell `selected` flags the surfaces paint the highlight from.
+    pub fn select_text(
+        &mut self,
+        start: TerminalGridPoint,
+        end: TerminalGridPoint,
+    ) -> vibex_core::VibexResult<String> {
+        let text = self.emulator.select_text(start, end)?;
+        self.frame = self.emulator.frame();
+        Ok(text)
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.emulator.clear_selection();
+        self.frame = self.emulator.frame();
+    }
+
+    /// Finds every occurrence on the visible grid, top to bottom.
+    pub fn find_visible(&self, query: &str, case_sensitive: bool) -> Vec<TerminalSearchMatch> {
+        self.emulator.find_visible(query, case_sensitive)
     }
 
     pub fn encode_input(&self, input: TerminalInput) -> Vec<u8> {

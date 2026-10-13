@@ -27,21 +27,23 @@ use vibex_backend::{
     WorkspaceBackend as _, WorkspaceSummary,
 };
 use vibex_core::{
-    AgentId, AgentListRequest, AgentSessionState, AgentTimelineDisplaySettings,
+    AgentCommandDiscoverRequest, AgentCommandEntry, AgentCommandExecuteRequest,
+    AgentCommandExecutionBehavior, AgentCommandSourceKind, AgentCommandTrigger, AgentId,
+    AgentListRequest, AgentSessionState, AgentTimelineDisplaySettings,
     AgentTimelineReasoningDisplayMode, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     ElicitationFieldKind, ElicitationResolutionAction, ForkAgentSessionRequest, MessageAttachment,
     OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PermissionRiskCategory,
-    RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteServerKind,
-    RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
+    PlanStepPayload, PlanStepStatus, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState,
+    RemoteServerKind, RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
     RemoteSidebarOrganizationMutation, RenameAgentSessionRequest, RequestId,
     ResolvePermissionRequest, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
     RuntimeAuthSourceSummary, RuntimeModelSelection, RuntimeOptionAvailability,
     RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
     SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelinePayload,
-    TimelineRedactionState, TimelineSource, UserMessageDelivery, UserMessagePayload,
-    VibexSessionId, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
-    unix_timestamp_ms,
+    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelineItemKind,
+    TimelinePayload, TimelineRedactionState, TimelineSource, UserMessageDelivery,
+    UserMessagePayload, VibexSessionId, VibexUseMention, VibexUseRef, WorkspaceMode,
+    WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice, RuntimeCascadeProjection,
@@ -465,6 +467,22 @@ impl TimelineBooleanSetting {
             TimelineBooleanSetting::EnhancedFileOperationDisplay => "File edit cards",
         }
     }
+}
+
+/// One prompt the reader wrote while the Agent was still working.
+///
+/// The queue is the phone's answer to a keyboard that cannot send into a live
+/// turn: the text is held per session, drawn above the composer, and handed to
+/// the authority when the turn settles. `id` is what the row's buttons address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MobileQueuedMessage {
+    id: u64,
+    session_id: VibexSessionId,
+    text: String,
+    attachments: Vec<MessageAttachment>,
+    /// The `@` references the text still names, resolved when it was written.
+    mentions: Vec<VibexUseMention>,
+    created_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1084,6 +1102,7 @@ type TimelineMarkdownViews =
 /// Keeping that boundary explicit lets headless windows own independent streams.
 struct PlatformEventStreams {
     scanner_results: UnboundedReceiver<String>,
+    attachment_picks: UnboundedReceiver<crate::attachment::AttachmentPickEvent>,
     notification_actions: UnboundedReceiver<notifications::NotificationAction>,
     update_actions: UnboundedReceiver<update::UpdateAction>,
     lan_discovery_events: UnboundedReceiver<LanDiscoveryEvent>,
@@ -1094,6 +1113,7 @@ impl PlatformEventStreams {
     fn subscribe() -> Self {
         Self {
             scanner_results: scanner::subscribe(),
+            attachment_picks: crate::attachment::subscribe(),
             notification_actions: notifications::subscribe_actions(),
             update_actions: update::subscribe_actions(),
             lan_discovery_events: crate::discovery::subscribe(),
@@ -1105,6 +1125,7 @@ impl PlatformEventStreams {
     fn disconnected() -> Self {
         Self {
             scanner_results: futures_channel::mpsc::unbounded().1,
+            attachment_picks: futures_channel::mpsc::unbounded().1,
             notification_actions: futures_channel::mpsc::unbounded().1,
             update_actions: futures_channel::mpsc::unbounded().1,
             lan_discovery_events: futures_channel::mpsc::unbounded().1,
@@ -1139,6 +1160,39 @@ pub struct MobileApp {
     /// observed in an async task with no window, so the check-and-write is
     /// deferred to the next paint.
     pending_composer_restore: Option<String>,
+    /// The slash commands the open session's Agent offers. Discovered once per
+    /// session and filtered locally, so typing `/p` never waits on the wire.
+    composer_commands: Vec<AgentCommandEntry>,
+    /// The generation of the in-flight command discovery, so a late answer for
+    /// a session the user has left is dropped.
+    composer_commands_generation: u64,
+    /// The executable command the current draft has been armed with. A slash
+    /// command is not a message: the desktop runs it through the authority, and
+    /// so does the phone — otherwise `/plan` was just text the Agent ignored.
+    composer_armed_command: Option<AgentCommandEntry>,
+    /// The `@` references the draft has picked up. Like the armed command they
+    /// are resolved at send time against the text, so deleting an `@Name` drops
+    /// the reference with it.
+    composer_armed_mentions: Vec<VibexUseMention>,
+    /// Images attached to the open draft. They travel with the prompt as data
+    /// URLs, so the phone never needs the desktop's filesystem to name them.
+    composer_attachments: Vec<MessageAttachment>,
+    /// Attachments per session, like the text drafts: what was attached to A
+    /// must not be sent with a prompt typed in B.
+    composer_attachment_drafts: BTreeMap<String, Vec<MessageAttachment>>,
+    /// The plan bar the reader has opened, as the session and plan it belongs
+    /// to. One bar at a time: the composer has room for exactly one.
+    composer_plan_expanded: Option<(String, i64)>,
+    /// Plan bars the reader closed. Identity is the session plus the plan
+    /// revision, so a new plan from the Agent shows up again on its own.
+    dismissed_composer_plans: BTreeSet<(String, i64)>,
+    /// Prompts written while a turn was running, oldest first.
+    ///
+    /// The desktop keeps a full scheduler here; a phone needs the part that
+    /// matters on a small screen: write ahead, see what is waiting, send it
+    /// when the turn settles (or force it in now).
+    composer_queue: Vec<MobileQueuedMessage>,
+    composer_queue_next_id: u64,
     /// One draft per session.
     ///
     /// The composer used to be a single buffer that survived a session switch,
@@ -1372,8 +1426,195 @@ impl Focusable for MobileApp {
     }
 }
 
+/// How many images one draft may carry. The desktop clipboard allows 32; a
+/// phone prompt that carries more than a handful is a mistake, and every byte
+/// is base64 on the wire.
+const MOBILE_MAX_COMPOSER_ATTACHMENTS: usize = 8;
+
 /// One member of the open session's group, as the tab strip draws it.
 type SessionGroupTabs = (String, Vec<(VibexSessionId, String, AgentSessionState)>);
+
+/// Splits a composer draft into a slash command name and its arguments.
+///
+/// Mirrors the desktop's parser exactly: the name stops at the first
+/// whitespace and may not contain another slash, so a path typed after a
+/// command is an argument rather than part of its name.
+fn parse_slash_command_invocation(text: &str) -> Option<(String, Option<String>)> {
+    let command_text = text.trim();
+    let remainder = command_text.strip_prefix('/')?;
+    let command_end = remainder
+        .find(char::is_whitespace)
+        .unwrap_or(remainder.len());
+    let command_name = &remainder[..command_end];
+    if command_name.is_empty() || command_name.contains('/') {
+        return None;
+    }
+    let arguments = remainder[command_end..].trim().to_string();
+    let arguments = (!arguments.is_empty()).then_some(arguments);
+    Some((command_name.to_string(), arguments))
+}
+
+/// The partial command name a draft is currently typing, if any.
+///
+/// Only the bare `/name` stage produces suggestions; once the user types a
+/// space they are writing arguments and the popup would only be in the way.
+fn slash_command_prefix(text: &str) -> Option<&str> {
+    let command_text = text.trim_start();
+    let remainder = command_text.strip_prefix('/')?;
+    if remainder.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(remainder)
+}
+
+/// The reference metadata keys the runtime stamps on a mention entry.
+///
+/// Literals rather than a dependency: these are wire values, and the phone has
+/// to read exactly what the desktop wrote them as.
+const COMPOSER_AGENT_REFERENCE_KEY: &str = "vibexUseAgentReference";
+const COMPOSER_SELECTION_REFERENCE_KEY: &str = "vibexUseSelectionReference";
+const COMPOSER_SESSION_REFERENCE_KEY: &str = "vibexUseSessionReference";
+
+/// The partial `@` reference a draft is currently typing, if any.
+///
+/// Only a token still being typed counts: once the reader has moved past it
+/// with a space they are writing the prompt, and the panel would be in the way.
+fn mention_prefix(text: &str) -> Option<&str> {
+    if text.is_empty() || text.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let token = text.split_whitespace().last()?;
+    let remainder = token.strip_prefix('@')?;
+    (!remainder.contains('@')).then_some(remainder)
+}
+
+/// The `@` reference behind one suggestion entry, when it has one.
+///
+/// Same two shapes the desktop resolves: an Agent plus the configuration that
+/// was offered, or a conversation.
+fn composer_entry_mention(entry: &AgentCommandEntry) -> Option<VibexUseMention> {
+    let metadata = |key: &str| {
+        entry
+            .metadata
+            .iter()
+            .find(|metadata| metadata.key == key)
+            .map(|metadata| metadata.value.as_str())
+    };
+    if let (Some(agent_id), Some(option)) = (
+        metadata(COMPOSER_AGENT_REFERENCE_KEY),
+        metadata(COMPOSER_SELECTION_REFERENCE_KEY),
+    ) {
+        let agent_id = AgentId::parse(agent_id).ok()?;
+        let option = VibexUseRef::parse(option)?;
+        return Some(VibexUseMention::agent(
+            &agent_id,
+            &option,
+            Some(entry.label.as_str()),
+        ));
+    }
+    if let Some(session) = metadata(COMPOSER_SESSION_REFERENCE_KEY) {
+        let reference = VibexUseRef::parse(session)?;
+        let session_id = reference.session_id()?;
+        return Some(VibexUseMention::session(
+            &session_id,
+            Some(entry.label.as_str()),
+        ));
+    }
+    None
+}
+
+/// Whether choosing this entry runs something rather than inserting text.
+///
+/// Both a `/name` Prompt and a quick phrase carry the `Prompt` source kind, so
+/// the behaviour is what separates an executable command from reusable prose.
+fn is_executable_command_source(entry: &AgentCommandEntry) -> bool {
+    matches!(
+        entry.source_kind,
+        AgentCommandSourceKind::Provider | AgentCommandSourceKind::Prompt
+    ) && entry.execution_behavior != AgentCommandExecutionBehavior::None
+}
+
+/// The plan the latest turn of a session currently stands on.
+///
+/// The same projection the desktop composer bar uses, kept local because the
+/// phone does not link the desktop model crate. A plan is only "current" while
+/// it belongs to the running turn: the search stops at the newest user message,
+/// so yesterday's checklist never sits under today's input.
+struct MobilePlanProjection {
+    sequence: i64,
+    title: String,
+    steps: Vec<PlanStepPayload>,
+}
+
+impl MobilePlanProjection {
+    fn completed_step_count(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|step| step.status == PlanStepStatus::Completed)
+            .count()
+    }
+
+    fn current_step_number(&self) -> usize {
+        self.steps
+            .iter()
+            .position(|step| step.status == PlanStepStatus::Running)
+            .or_else(|| {
+                self.steps
+                    .iter()
+                    .position(|step| step.status == PlanStepStatus::Failed)
+            })
+            .or_else(|| {
+                self.steps
+                    .iter()
+                    .position(|step| step.status == PlanStepStatus::Pending)
+            })
+            .map(|index| index + 1)
+            .unwrap_or(self.steps.len())
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.steps.is_empty()
+            && self
+                .steps
+                .iter()
+                .all(|step| step.status == PlanStepStatus::Completed)
+    }
+}
+
+fn current_mobile_plan(items: &[TimelineItem]) -> Option<MobilePlanProjection> {
+    let turn_anchor_sequence = items
+        .iter()
+        .rev()
+        .find(|item| item.kind == TimelineItemKind::UserMessage)
+        .map(|item| item.sequence)
+        .unwrap_or_default();
+
+    items
+        .iter()
+        .rev()
+        .take_while(|item| item.sequence > turn_anchor_sequence)
+        .find_map(|item| {
+            let (title, steps) = match &item.payload {
+                TimelinePayload::Plan(plan) => (&plan.title, &plan.steps),
+                TimelinePayload::TodoUpdate(todo) => (&todo.title, &todo.items),
+                _ => return None,
+            };
+            (!steps.is_empty()).then(|| MobilePlanProjection {
+                sequence: item.sequence,
+                title: title.clone(),
+                steps: steps.clone(),
+            })
+        })
+}
+
+fn plan_step_status_label(status: PlanStepStatus) -> &'static str {
+    match status {
+        PlanStepStatus::Pending => locale::text("Pending", "待处理", "待處理"),
+        PlanStepStatus::Running => locale::text("Running", "进行中", "進行中"),
+        PlanStepStatus::Completed => locale::text("Completed", "已完成", "已完成"),
+        PlanStepStatus::Failed => locale::text("Failed", "失败", "失敗"),
+    }
+}
 
 /// The colour a session state paints with, shared by every status surface so
 /// "waiting on you" never looks like "idle".
@@ -1948,6 +2189,16 @@ impl MobileApp {
             selection_menu,
             pending_composer_restore: None,
             composer_drafts: BTreeMap::new(),
+            composer_commands: Vec::new(),
+            composer_commands_generation: 0,
+            composer_armed_command: None,
+            composer_armed_mentions: Vec::new(),
+            composer_attachments: Vec::new(),
+            composer_attachment_drafts: BTreeMap::new(),
+            composer_plan_expanded: None,
+            dismissed_composer_plans: BTreeSet::new(),
+            composer_queue: Vec::new(),
+            composer_queue_next_id: 1,
             timeline_turns: Arc::new(Vec::new()),
             timeline_markdown_views: RefCell::new(BTreeMap::new()),
             pending_user_message: None,
@@ -2152,6 +2403,7 @@ impl MobileApp {
             app.defer_bundle_install(bundle, RemoteServerKind::Unknown, cx);
         }
         app.start_scanner_result_stream(events.scanner_results, cx);
+        app.start_attachment_pick_stream(events.attachment_picks, cx);
         app.start_notification_action_stream(events.notification_actions, cx);
         app.start_lan_discovery_event_stream(events.lan_discovery_events, cx);
         app.start_lifecycle_stream(events.lifecycle_events, cx);
@@ -2309,6 +2561,84 @@ impl MobileApp {
             }
         });
         self.tasks.push(task);
+    }
+
+    fn start_attachment_pick_stream(
+        &mut self,
+        mut picks: UnboundedReceiver<crate::attachment::AttachmentPickEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            while let Some(event) = picks.next().await {
+                if entity
+                    .update(cx, |this, cx| this.handle_attachment_pick(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self.tasks.push(task);
+    }
+
+    /// Applies one trip to the image picker.
+    fn handle_attachment_pick(
+        &mut self,
+        event: crate::attachment::AttachmentPickEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            crate::attachment::AttachmentPickEvent::Picked(picked) => {
+                if self.composer_attachments.len() >= MOBILE_MAX_COMPOSER_ATTACHMENTS {
+                    self.hint(
+                        Tone::Warning,
+                        locale::text(
+                            "Too many attachments on the draft",
+                            "草稿附件过多",
+                            "草稿附件過多",
+                        ),
+                    );
+                    cx.notify();
+                    return;
+                }
+                self.composer_attachments.push(MessageAttachment {
+                    label: picked.label,
+                    mime_type: picked.mime_type,
+                    uri: Some(picked.data_url),
+                    // A phone has no text editor to anchor an inline attachment
+                    // to, so every picked image rides the message as a whole.
+                    inline_text_offset: None,
+                });
+                self.hint(
+                    Tone::Info,
+                    locale::text("Image attached", "已添加图片", "已新增圖片"),
+                );
+            }
+            crate::attachment::AttachmentPickEvent::Failed(message) => {
+                self.hint(Tone::Error, message);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Opens the platform image picker for the composer.
+    fn pick_composer_attachment(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = crate::attachment::launch() {
+            self.fail(error);
+            cx.notify();
+        }
+    }
+
+    fn remove_composer_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.composer_attachments.len() {
+            self.composer_attachments.remove(index);
+            cx.notify();
+        }
     }
 
     fn start_notification_action_stream(
@@ -2905,6 +3235,9 @@ impl MobileApp {
             self.refresh_sidebar_organization(cx);
             needs_repaint = true;
         }
+        // A session snapshot that says the turn is over is what releases the
+        // next queued prompt; this is the batch that carries it.
+        self.maybe_dispatch_next_queued_message(cx);
         if needs_repaint {
             cx.notify();
         }
@@ -4859,12 +5192,19 @@ impl MobileApp {
             // Park the draft with the session it was typed in and restore the
             // target's own draft before the first frame of the new conversation.
             let current = self.composer_input.read(cx).value().to_string();
+            let current_attachments = std::mem::take(&mut self.composer_attachments);
             if let Some(previous) = previous_session {
                 self.composer_drafts
                     .insert(previous.as_str().to_string(), current);
-            } else if !current.trim().is_empty() {
-                self.composer_drafts
-                    .insert(Self::unsessioned_draft_key(), current);
+                self.composer_attachment_drafts
+                    .insert(previous.as_str().to_string(), current_attachments);
+            } else {
+                if !current.trim().is_empty() {
+                    self.composer_drafts
+                        .insert(Self::unsessioned_draft_key(), current);
+                }
+                self.composer_attachment_drafts
+                    .insert(Self::unsessioned_draft_key(), current_attachments);
             }
             self.composer_drafts.remove(session_id.as_str());
         }
@@ -4872,6 +5212,10 @@ impl MobileApp {
             .composer_drafts
             .get(session_id.as_str())
             .cloned()
+            .unwrap_or_default();
+        self.composer_attachments = self
+            .composer_attachment_drafts
+            .remove(session_id.as_str())
             .unwrap_or_default();
         self.pending_input_writes
             .push((InputField::Composer, draft));
@@ -4911,7 +5255,14 @@ impl MobileApp {
         self.reset_drawers();
         self.timeline_follow = true;
         self.token_usage = None;
+        // The command catalogue belongs to the Agent behind this session, so it
+        // is re-read with it. The armed command never survives a switch: it
+        // names a command the new Agent may not have.
+        self.composer_commands.clear();
+        self.composer_armed_command = None;
+        self.composer_armed_mentions.clear();
         self.refresh_token_usage(cx);
+        self.refresh_composer_commands(cx);
         self.expanded_process.clear();
         self.expanded_timeline_rows.clear();
         self.collapsed_timeline_rows.clear();
@@ -4965,6 +5316,7 @@ impl MobileApp {
                     if let Some(workspace_id) = workspace_id {
                         this.ensure_workbench(workspace_id, cx);
                     }
+                    this.maybe_dispatch_next_queued_message(cx);
                 }
                 cx.notify();
             });
@@ -5088,6 +5440,288 @@ impl MobileApp {
             })
             .collect::<Vec<_>>();
         (members.len() >= 2).then(|| (group.name.clone(), members))
+    }
+
+    /// Loads the `/` commands and `@` references the open session's Agent
+    /// advertises.
+    ///
+    /// A runtime that does not implement discovery simply answers with nothing,
+    /// so a failure here is silent: the composer just has no suggestions. What
+    /// matters is that `/plan` and `/permission` reach the authority when the
+    /// user types them, and that an `@` names a real collaborator rather than a
+    /// word the model has to guess at.
+    fn refresh_composer_commands(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let selected = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone());
+        self.composer_commands_generation = self.composer_commands_generation.wrapping_add(1);
+        let generation = self.composer_commands_generation;
+        let agent_id = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.active_session.value.as_ref())
+            .map(|session| session.agent_id.clone());
+        let workspace_id = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.active_session.value.as_ref())
+            .map(|session| session.workspace_id.clone());
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let discovery = backend
+                .discover_agent_commands(AgentCommandDiscoverRequest {
+                    agent_id,
+                    provider_profile_id: None,
+                    session_id: selected.clone(),
+                    workspace_id,
+                    // Both triggers in one read: the suggestion panel decides
+                    // which list to show from the character being typed.
+                    trigger: None,
+                    query: None,
+                    limit: Some(64),
+                })
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                if generation != this.composer_commands_generation {
+                    return;
+                }
+                if let Ok(discovery) = discovery {
+                    this.composer_commands = discovery.response.entries;
+                    cx.notify();
+                }
+            });
+        });
+        self.tasks.push(task);
+    }
+
+    /// The suggestion panel's contents for the draft on screen, if the user is
+    /// typing a command name.
+    fn composer_command_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
+        let draft = self.composer_input.read(cx).value().to_string();
+        let Some(prefix) = slash_command_prefix(&draft) else {
+            return Vec::new();
+        };
+        let needle = prefix.to_lowercase();
+        self.composer_commands
+            .iter()
+            .filter(|entry| entry.trigger == AgentCommandTrigger::Slash)
+            .filter(|entry| {
+                let name = entry
+                    .command_name
+                    .clone()
+                    .unwrap_or_else(|| entry.label.clone())
+                    .to_lowercase();
+                needle.is_empty()
+                    || name.contains(&needle)
+                    || entry.label.to_lowercase().contains(&needle)
+            })
+            .take(8)
+            .cloned()
+            .collect()
+    }
+
+    /// Applies one suggestion: an executable command arms the draft and waits
+    /// for a send, anything else is inserted as text.
+    fn choose_composer_command(
+        &mut self,
+        entry: AgentCommandEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if is_executable_command_source(&entry) {
+            let name = entry
+                .command_name
+                .clone()
+                .unwrap_or_else(|| entry.label.clone());
+            self.composer_armed_command = Some(entry);
+            self.composer_input.update(cx, |input, cx| {
+                input.set_value(format!("/{name} "), window, cx)
+            });
+        } else {
+            self.composer_armed_command = None;
+            self.composer_input.update(cx, |input, cx| {
+                input.set_value(entry.insertion_text.clone(), window, cx)
+            });
+        }
+        crate::platform::show_keyboard();
+        cx.notify();
+    }
+
+    /// The suggestion panel's contents for an `@` being typed.
+    fn composer_mention_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
+        let draft = self.composer_input.read(cx).value().to_string();
+        let Some(prefix) = mention_prefix(&draft) else {
+            return Vec::new();
+        };
+        let needle = prefix.to_lowercase();
+        let mut mentions: Vec<AgentCommandEntry> = Vec::new();
+        for entry in self
+            .composer_commands
+            .iter()
+            .filter(|entry| entry.trigger == AgentCommandTrigger::Mention)
+        {
+            if composer_entry_mention(entry).is_none() {
+                continue;
+            }
+            let label = entry.label.trim_start_matches('@').to_lowercase();
+            let name = entry
+                .command_name
+                .clone()
+                .unwrap_or_else(|| entry.label.clone())
+                .to_lowercase();
+            if !needle.is_empty() && !label.contains(&needle) && !name.contains(&needle) {
+                continue;
+            }
+            // The same collaborator is offered once per configuration; on a
+            // phone screen one row per collaborator is what fits.
+            if mentions
+                .iter()
+                .any(|existing| existing.label == entry.label)
+            {
+                continue;
+            }
+            mentions.push(entry.clone());
+            if mentions.len() >= 8 {
+                break;
+            }
+        }
+        mentions
+    }
+
+    /// Applies one mention: the typed `@` token becomes the reference's label,
+    /// and the reference itself is remembered for the send.
+    fn choose_composer_mention(
+        &mut self,
+        entry: AgentCommandEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mention) = composer_entry_mention(&entry) else {
+            return;
+        };
+        let draft = self.composer_input.read(cx).value().to_string();
+        let trimmed = draft.trim_end();
+        let kept = trimmed
+            .rfind('@')
+            .map(|index| &trimmed[..index])
+            .unwrap_or_default()
+            .to_string();
+        let next = format!("{kept}{}", entry.insertion_text);
+        self.composer_armed_mentions.retain(|existing| {
+            existing.reference != mention.reference
+                || existing.kind != mention.kind
+                || existing.agent_id != mention.agent_id
+        });
+        self.composer_armed_mentions.push(mention);
+        self.composer_input
+            .update(cx, |input, cx| input.set_value(next, window, cx));
+        crate::platform::show_keyboard();
+        cx.notify();
+    }
+
+    /// The `@` references the draft still names, in reading order.
+    fn armed_mentions(&self, cx: &gpui::App) -> Vec<VibexUseMention> {
+        let draft = self.composer_input.read(cx).value().to_string();
+        self.armed_mentions_in(&draft)
+    }
+
+    fn armed_mentions_in(&self, text: &str) -> Vec<VibexUseMention> {
+        self.composer_armed_mentions
+            .iter()
+            .filter(|mention| {
+                mention
+                    .label
+                    .as_deref()
+                    .filter(|label| !label.is_empty())
+                    .is_some_and(|label| text.contains(label))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The executable command the current draft still names, if any.
+    fn armed_slash_command(&self, cx: &gpui::App) -> Option<AgentCommandEntry> {
+        let armed = self.composer_armed_command.clone()?;
+        let (name, _) = parse_slash_command_invocation(&self.composer_input.read(cx).value())?;
+        let armed_name = armed
+            .command_name
+            .clone()
+            .unwrap_or_else(|| armed.label.clone());
+        armed_name.eq_ignore_ascii_case(&name).then_some(armed)
+    }
+
+    /// Runs an armed slash command through the authority instead of sending it
+    /// as a message.
+    ///
+    /// This is the whole reason the phone needs a command list: `/plan` and
+    /// `/permission` are provider commands, not prompts, and sending them as
+    /// text left both modes unreachable on mobile.
+    fn execute_composer_command(
+        &mut self,
+        entry: AgentCommandEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self.composer_input.read(cx).value().to_string();
+        let Some((name, arguments)) = parse_slash_command_invocation(&text) else {
+            return;
+        };
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let request = MutationRequest::new(AgentCommandExecuteRequest {
+            session_id,
+            command_id: Some(entry.id.clone()),
+            trigger: AgentCommandTrigger::Slash,
+            source_kind: entry.source_kind,
+            command_text: text.trim().to_string(),
+            command_name: Some(name),
+            arguments,
+            prompt_id: entry.prompt_id.clone(),
+            attachments: Vec::new(),
+            reasoning_effort: None,
+            correlation_id: None,
+        });
+        self.composer_armed_command = None;
+        self.composer_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.operation_busy = true;
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = backend.execute_agent_command(request).await;
+            let _ = entity.update(cx, |this, cx| {
+                this.operation_busy = false;
+                match outcome {
+                    Ok(result)
+                        if result.status == vibex_core::AgentCommandExecuteStatus::Failed =>
+                    {
+                        this.hint(
+                            Tone::Error,
+                            result.message.unwrap_or_else(|| {
+                                locale::common("The command could not run").to_string()
+                            }),
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => this.fail(error),
+                }
+                // The command writes to the same timeline, so the authoritative
+                // read is what shows its effect.
+                this.reload_selected_session(cx);
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
     }
 
     /// Reads the open session's token counters. The desktop owns them; the
@@ -5514,6 +6148,108 @@ impl MobileApp {
             drag.target = target;
         }
         cx.notify();
+    }
+
+    /// The rows a menu reorder may swap `row` with: the nearest visible sibling
+    /// before and after it.
+    ///
+    /// Siblings share a scope (project and worktree) and a tree depth, which is
+    /// the same rule the drag path enforces before it sends a move.
+    fn sidebar_move_targets(
+        &self,
+        row: &SidebarRow,
+        query: &str,
+    ) -> (Option<SidebarRow>, Option<SidebarRow>) {
+        if row.kind == SidebarRowKind::Workspace {
+            let rows = self.mobile_sidebar_rows(query);
+            let siblings = rows
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.kind == SidebarRowKind::Workspace
+                        && candidate.project_id == row.project_id
+                })
+                .collect::<Vec<_>>();
+            return Self::neighbouring_rows(&siblings, row);
+        }
+        let rows = self.mobile_sidebar_rows(query);
+        let siblings = rows
+            .into_iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.kind,
+                    SidebarRowKind::Session | SidebarRowKind::Folder | SidebarRowKind::Group
+                ) && candidate.project_id == row.project_id
+                    && candidate.workspace_id == row.workspace_id
+                    && (candidate.indent - row.indent).abs() < f32::EPSILON
+            })
+            .collect::<Vec<_>>();
+        Self::neighbouring_rows(&siblings, row)
+    }
+
+    fn neighbouring_rows(
+        siblings: &[SidebarRow],
+        row: &SidebarRow,
+    ) -> (Option<SidebarRow>, Option<SidebarRow>) {
+        let Some(index) = siblings
+            .iter()
+            .position(|candidate| candidate.id() == row.id() && candidate.kind == row.kind)
+        else {
+            return (None, None);
+        };
+        (
+            index.checked_sub(1).and_then(|i| siblings.get(i)).cloned(),
+            siblings.get(index + 1).cloned(),
+        )
+    }
+
+    /// Moves one row one step up or down by anchoring it against its neighbour.
+    fn move_sidebar_row(
+        &mut self,
+        row: &SidebarRow,
+        anchor: &SidebarRow,
+        upwards: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if row.kind == SidebarRowKind::Workspace {
+            let (Some(project_id), Some(workspace_id), Some(anchor_workspace_id)) = (
+                row.project_id.clone(),
+                row.workspace_id.clone(),
+                anchor.workspace_id.clone(),
+            ) else {
+                return;
+            };
+            self.send_sidebar_mutation(
+                RemoteSidebarOrganizationMutation::MoveWorkspaces {
+                    project_id,
+                    workspace_ids: vec![workspace_id],
+                    anchor_workspace_id: Some(anchor_workspace_id),
+                    // Moving up places the row before its neighbour; moving
+                    // down places it after.
+                    position: if upwards {
+                        RemoteSidebarDropPosition::Before
+                    } else {
+                        RemoteSidebarDropPosition::After
+                    },
+                },
+                true,
+                cx,
+            );
+            return;
+        }
+        self.send_sidebar_mutation(
+            RemoteSidebarOrganizationMutation::MoveItems {
+                items: vec![sidebar_item_ref(&row.item)],
+                anchor: Some(sidebar_item_ref(&anchor.item)),
+                position: if upwards {
+                    RemoteSidebarDropPosition::Before
+                } else {
+                    RemoteSidebarDropPosition::After
+                },
+                project_id: row.project_id.clone(),
+            },
+            true,
+            cx,
+        );
     }
 
     fn finish_sidebar_drag(&mut self, cancelled: bool, cx: &mut Context<Self>) {
@@ -6775,21 +7511,226 @@ impl MobileApp {
             return;
         }
         let text = self.composer_input.read(cx).value().trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.composer_attachments.is_empty() {
             return;
         }
+        // A slash command the user picked from the catalogue runs on the
+        // authority; it is not a prompt and must not be sent as one.
+        if let Some(entry) = self.armed_slash_command(cx) {
+            self.execute_composer_command(entry, window, cx);
+            return;
+        }
+        self.composer_armed_command = None;
         let running = self
             .controller
             .as_ref()
             .and_then(|controller| controller.state.active_session.value.as_ref())
             .is_some_and(|session| session.state == AgentSessionState::Running);
+        let mentions = self.armed_mentions(cx);
+        let attachments = std::mem::take(&mut self.composer_attachments);
+        self.composer_armed_mentions.clear();
+        // A prompt written while the Agent is still working is neither lost nor
+        // shouted over the running turn: it waits in the queue above the field
+        // and goes out when the turn settles, unless the reader forces it in.
+        if running {
+            self.enqueue_composer_message(text, attachments, mentions, window, cx);
+            return;
+        }
+        self.submit_prompt(
+            text,
+            attachments,
+            UserMessageDelivery::Prompt,
+            Some(mentions),
+            Some(window),
+            cx,
+        );
+    }
+
+    /// Holds a prompt until the open session's turn settles.
+    fn enqueue_composer_message(
+        &mut self,
+        text: String,
+        attachments: Vec<MessageAttachment>,
+        mentions: Vec<VibexUseMention>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        let id = self.composer_queue_next_id;
+        self.composer_queue_next_id = self.composer_queue_next_id.saturating_add(1);
+        self.composer_queue.push(MobileQueuedMessage {
+            id,
+            session_id,
+            text,
+            attachments,
+            mentions,
+            created_at_ms: unix_timestamp_ms(),
+        });
+        if let Some(draft_key) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.as_ref())
+            .map(|session_id| session_id.as_str().to_string())
+        {
+            self.composer_drafts.remove(&draft_key);
+        }
+        self.composer_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        // The keyboard stays up: the next line is usually already in mind.
+        crate::platform::show_keyboard();
+        self.hint(
+            Tone::Info,
+            locale::text(
+                "Queued until the turn finishes",
+                "已排队，回合结束后发送",
+                "已排隊，回合結束後傳送",
+            ),
+        );
+        cx.notify();
+    }
+
+    /// The queued prompts that belong to the session on screen.
+    fn composer_queue_for_open_session(&self) -> Vec<MobileQueuedMessage> {
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return Vec::new();
+        };
+        self.composer_queue
+            .iter()
+            .filter(|message| message.session_id == session_id)
+            .cloned()
+            .collect()
+    }
+
+    fn remove_queued_message(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.composer_queue.retain(|message| message.id != id);
+        cx.notify();
+    }
+
+    /// Takes a queued prompt back into the field so it can be rewritten.
+    fn edit_queued_message(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .composer_queue
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return;
+        };
+        let message = self.composer_queue.remove(index);
+        self.composer_input
+            .update(cx, |input, cx| input.set_value(message.text, window, cx));
+        crate::platform::show_keyboard();
+        cx.notify();
+    }
+
+    /// Pushes one queued prompt into the live turn instead of waiting.
+    fn send_queued_message_now(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .composer_queue
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return;
+        };
+        let message = self.composer_queue.remove(index);
+        let running = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.active_session.value.as_ref())
+            .is_some_and(|session| session.state == AgentSessionState::Running);
+        // An explicit "now" means the same thing the old Send meant while a turn
+        // was live: steer into that turn rather than queue behind it.
+        let delivery = if running {
+            UserMessageDelivery::Steer
+        } else {
+            UserMessageDelivery::Prompt
+        };
+        self.submit_prompt(
+            message.text,
+            message.attachments,
+            delivery,
+            Some(message.mentions),
+            None,
+            cx,
+        );
+    }
+
+    /// Sends the oldest queued prompt once the open session's turn has settled.
+    ///
+    /// Called wherever the state can have settled: an event batch, a finished
+    /// mutation, or a fresh session snapshot.
+    fn maybe_dispatch_next_queued_message(&mut self, cx: &mut Context<Self>) {
+        if self.operation_busy || self.runtime_switch_busy_generation.is_some() {
+            return;
+        }
+        let Some(controller) = self.controller.as_ref() else {
+            return;
+        };
+        let Some(session_id) = controller.state.selected_session_id.clone() else {
+            return;
+        };
+        let state = controller
+            .state
+            .active_session
+            .value
+            .as_ref()
+            .map(|session| session.state);
+        if matches!(
+            state,
+            None | Some(AgentSessionState::Running) | Some(AgentSessionState::Initializing)
+        ) {
+            return;
+        }
+        let Some(index) = self
+            .composer_queue
+            .iter()
+            .position(|message| message.session_id == session_id)
+        else {
+            return;
+        };
+        let message = self.composer_queue.remove(index);
+        self.submit_prompt(
+            message.text,
+            message.attachments,
+            UserMessageDelivery::Prompt,
+            Some(message.mentions),
+            None,
+            cx,
+        );
+    }
+
+    /// The one place a prompt leaves the phone.
+    ///
+    /// `window` is present when the draft still lives in the field and has to
+    /// be cleared; a queued prompt is already out of it. A failure hands the
+    /// text back to the field rather than dropping it.
+    fn submit_prompt(
+        &mut self,
+        text: String,
+        attachments: Vec<MessageAttachment>,
+        delivery: UserMessageDelivery,
+        mentions: Option<Vec<VibexUseMention>>,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.operation_busy || self.runtime_switch_busy_generation.is_some() {
+            return;
+        }
         let Some(controller) = self.controller.as_mut() else {
             return;
         };
         let Some(session_id) = controller.state.selected_session_id.clone() else {
             return;
         };
-        let attachments = Vec::new();
         let after_sequence = controller
             .state
             .timeline
@@ -6826,7 +7767,7 @@ impl MobileApp {
             attachments: attachments.clone(),
         };
         let request = MutationRequest::new(SendAgentMessageRequest {
-            mentions: Vec::new(),
+            mentions: mentions.unwrap_or_default(),
             session_id,
             message_idempotency_key: RequestId::new().into_string(),
             desired_runtime: runtime.desired.clone(),
@@ -6834,15 +7775,7 @@ impl MobileApp {
             attachments,
             reasoning_effort: runtime.desired.reasoning_effort.clone(),
             correlation_id: None,
-            // A message sent into a running turn is an interruption of that
-            // turn's context, not a new prompt behind it: the desktop steers
-            // and so does the phone. The manager answers `PromptRequired` when
-            // the provider cannot take one, so this never has to guess.
-            delivery: if running {
-                UserMessageDelivery::Steer
-            } else {
-                UserMessageDelivery::Prompt
-            },
+            delivery,
             prompt_context: None,
             provenance: vibex_core::MessageProvenance::HumanInput,
         });
@@ -6857,16 +7790,19 @@ impl MobileApp {
         let future = controller.send_message(request);
         self.pending_user_message = Some(pending_user_message);
         self.timeline_metadata_tip = None;
-        if let Some(draft_key) = self
-            .controller
-            .as_ref()
-            .and_then(|controller| controller.state.selected_session_id.as_ref())
-            .map(|session_id| session_id.as_str().to_string())
+        if window.is_some()
+            && let Some(draft_key) = self
+                .controller
+                .as_ref()
+                .and_then(|controller| controller.state.selected_session_id.as_ref())
+                .map(|session_id| session_id.as_str().to_string())
         {
             self.composer_drafts.remove(&draft_key);
         }
-        self.composer_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
+        if let Some(window) = window {
+            self.composer_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
         self.spawn_timeline_mutation(ticket, future, Some(restore_text), cx);
     }
 
@@ -6916,6 +7852,7 @@ impl MobileApp {
                     controller.apply_timeline_mutation(&ticket, outcome);
                     controller.state.latest_mutation.error.clone()
                 });
+                let mutation_failed = mutation_error.is_some();
                 if let Some(error) = mutation_error {
                     this.fail(error);
                 }
@@ -6925,6 +7862,11 @@ impl MobileApp {
                 this.rebuild_timeline_turns();
                 if failed && let Some(text) = restore_composer {
                     this.pending_composer_restore = Some(text);
+                }
+                // A send that worked may have been the head of the queue, and a
+                // turn that has settled is exactly what releases the next one.
+                if !mutation_failed {
+                    this.maybe_dispatch_next_queued_message(cx);
                 }
                 cx.notify();
             });
@@ -9838,6 +10780,7 @@ impl MobileApp {
                 });
                 if can_delete {
                     let workspace_id_for_delete = workspace_id;
+                    let title_for_delete = row.label.clone();
                     sheet = entry(
                         sheet,
                         "mobile-row-menu-workspace-delete",
@@ -9847,7 +10790,7 @@ impl MobileApp {
                             this.begin_workspace_action(
                                 WorkspaceActionKind::Delete,
                                 workspace_id_for_delete.clone(),
-                                row.label.clone(),
+                                title_for_delete.clone(),
                                 cx,
                             );
                         }),
@@ -9856,6 +10799,40 @@ impl MobileApp {
             }
             SidebarRowKind::Group => return div().into_any_element(),
             SidebarRowKind::EmptyWorkspace => return div().into_any_element(),
+        }
+
+        // Reordering without a drag. The desktop moves rows with the pointer;
+        // a finger has no hover, the drag never produced a drop on this
+        // platform, and a menu step is what a phone can actually do.
+        let reorder_row = row.clone();
+        if matches!(
+            reorder_row.kind,
+            SidebarRowKind::Session | SidebarRowKind::Folder | SidebarRowKind::Workspace
+        ) {
+            let query = self.sidebar_search_input.read(cx).value().to_string();
+            let (previous, next) = self.sidebar_move_targets(&reorder_row, &query);
+            if let Some(previous) = previous {
+                let moving = reorder_row.clone();
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-move-up",
+                    locale::text("Move up", "上移", "上移").to_string(),
+                    false,
+                    Box::new(move |this, _, cx| {
+                        this.move_sidebar_row(&moving, &previous, true, cx)
+                    }),
+                );
+            }
+            if let Some(next) = next {
+                let moving = reorder_row.clone();
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-move-down",
+                    locale::text("Move down", "下移", "下移").to_string(),
+                    false,
+                    Box::new(move |this, _, cx| this.move_sidebar_row(&moving, &next, false, cx)),
+                );
+            }
         }
 
         div()
@@ -12111,8 +13088,12 @@ impl MobileApp {
         {
             return None;
         }
+        let attribution = turn
+            .runtime_attribution
+            .as_deref()
+            .map(runtime_attribution_line);
         let (agent_identity, runtime_label) =
-            timeline_runtime_attribution_parts(turn.runtime_attribution.as_deref());
+            timeline_runtime_attribution_parts(attribution.as_deref());
         let duration = format_compact_duration(
             turn.started_at_ms,
             (turn.complete || turn.superseded)
@@ -13486,7 +14467,13 @@ impl MobileApp {
         });
         let runtime_switch_pending = self.runtime_switch_busy_generation.is_some();
         let has_text = !self.composer_input.read(cx).value().trim().is_empty();
-        let send_enabled = has_text && state.is_some() && !self.operation_busy;
+        // An image on its own is a prompt: the manager takes a message whose
+        // text is empty as long as it carries an attachment.
+        let has_content = has_text || !self.composer_attachments.is_empty();
+        let send_enabled = has_content && state.is_some() && !self.operation_busy;
+        let attach_enabled = state.is_some()
+            && !self.operation_busy
+            && self.composer_attachments.len() < MOBILE_MAX_COMPOSER_ATTACHMENTS;
         let stop_enabled = state.is_some() && !self.operation_busy && !runtime_switch_pending;
         let usage_fraction = self.token_usage.as_ref().and_then(token_usage_fraction);
         let usage_percent = usage_fraction.unwrap_or(0.0) * 100.0;
@@ -13496,6 +14483,10 @@ impl MobileApp {
             _ => theme::text_muted(),
         };
         let usage_reported = self.token_usage.is_some();
+        let command_suggestions = self.composer_command_suggestions(cx);
+        let mention_suggestions = self.composer_mention_suggestions(cx);
+        let composer_plan = self.render_composer_plan(cx);
+        let queued = self.composer_queue_for_open_session();
         let runtime_selection = self.controller.as_ref().and_then(|controller| {
             controller
                 .state
@@ -13523,6 +14514,23 @@ impl MobileApp {
             .border_color(theme::border_subtle())
             .bg(theme::bg_primary())
             .p(px(theme::SPACING_MD))
+            // Slash-command suggestions sit directly above the field they are
+            // completing, the way a phone keyboard's own suggestion strip does.
+            .when(!command_suggestions.is_empty(), |composer| {
+                composer.child(self.render_composer_command_panel(&command_suggestions, cx))
+            })
+            .when(!mention_suggestions.is_empty(), |composer| {
+                composer.child(self.render_composer_mention_panel(&mention_suggestions, cx))
+            })
+            // What the Agent is working through, then what the reader has
+            // written ahead: both sit between the suggestions and the field.
+            .when_some(composer_plan, |composer, plan| composer.child(plan))
+            .when(!queued.is_empty(), |composer| {
+                composer.child(self.render_composer_queue(&queued, cx))
+            })
+            .when(!self.composer_attachments.is_empty(), |composer| {
+                composer.child(self.render_composer_attachments(cx))
+            })
             .when(needs_continue, |composer| {
                 composer.child(
                     div()
@@ -13625,6 +14633,41 @@ impl MobileApp {
                                 ),
                         )
                     })
+                    // The picker is the phone's whole attachment surface: one
+                    // image per trip, scaled and encoded before it leaves.
+                    .child(
+                        div()
+                            .id("attach-image")
+                            .size(px(theme::TOUCH_TARGET))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .aria_label(
+                                locale::text("Attach an image", "添加图片", "新增圖片").to_string(),
+                            )
+                            .when(attach_enabled, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::pick_composer_attachment),
+                                    )
+                            })
+                            .when(!attach_enabled, |button| button.opacity(0.45))
+                            .child(
+                                svg()
+                                    .path("icons/image.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(if attach_enabled {
+                                        theme::text_secondary()
+                                    } else {
+                                        theme::text_muted()
+                                    }),
+                            ),
+                    )
                     .child(
                         div()
                             .id("send-message")
@@ -13809,6 +14852,641 @@ impl MobileApp {
                             ),
                     ),
             )
+    }
+
+    /// The `/` suggestion list. Choosing an entry either arms the draft with an
+    /// executable command or inserts reusable text, matching the desktop's two
+    /// kinds of slash entry.
+    fn render_composer_command_panel(
+        &self,
+        entries: &[AgentCommandEntry],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        self.render_composer_suggestion_panel(entries, false, cx)
+    }
+
+    /// The `@` suggestion list: same shape as the command list, because it is
+    /// the same gesture with a different character in front of it.
+    fn render_composer_mention_panel(
+        &self,
+        entries: &[AgentCommandEntry],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        self.render_composer_suggestion_panel(entries, true, cx)
+    }
+
+    /// The `/` and `@` suggestion list. Choosing a command either arms the
+    /// draft with something executable or inserts reusable text; choosing a
+    /// mention inserts the reference's label and remembers the reference.
+    fn render_composer_suggestion_panel(
+        &self,
+        entries: &[AgentCommandEntry],
+        mention: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id(if mention {
+                "mobile-composer-mentions"
+            } else {
+                "mobile-composer-commands"
+            })
+            .debug_selector(move || {
+                if mention {
+                    "mobile-composer-mentions".to_string()
+                } else {
+                    "mobile-composer-commands".to_string()
+                }
+            })
+            .mb(px(theme::SPACING_SM))
+            .max_h(px(200.0))
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            .border_color(theme::border_default())
+            .bg(theme::bg_card())
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("mobile-composer-suggestions-scroll")
+                    .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
+                    .children(entries.iter().map(|entry| {
+                        let entry = entry.clone();
+                        let executable = !mention && is_executable_command_source(&entry);
+                        let destructive = entry.destructive;
+                        let label = entry.label.clone();
+                        // A collaborator's row is described by the account it
+                        // runs as and the model it runs, both written by the
+                        // runtime; the account is the one name this client says
+                        // for itself.
+                        let description =
+                            entry.description.as_deref().map(runtime_attribution_line);
+                        let name = entry
+                            .command_name
+                            .clone()
+                            .unwrap_or_else(|| entry.label.clone());
+                        let leading = if mention {
+                            entry.label.clone()
+                        } else {
+                            format!("/{name}")
+                        };
+                        div()
+                            .id(format!("composer-suggestion:{}", entry.id))
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .px(px(theme::SPACING_MD))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .border_b_1()
+                            .border_color(theme::border_subtle())
+                            .cursor_pointer()
+                            .aria_label(name.clone())
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    if mention {
+                                        this.choose_composer_mention(entry.clone(), window, cx)
+                                    } else {
+                                        this.choose_composer_command(entry.clone(), window, cx)
+                                    }
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .font_family("IBM Plex Mono")
+                                    .text_size(theme::font_caption())
+                                    .text_color(if destructive {
+                                        theme::accent_red()
+                                    } else {
+                                        theme::accent_blue()
+                                    })
+                                    .child(leading),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_size(theme::font_micro())
+                                            .text_color(theme::text_primary())
+                                            .child(label.clone()),
+                                    )
+                                    .when_some(description.clone(), |labels, description| {
+                                        labels.child(
+                                            div()
+                                                .min_w_0()
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .text_size(theme::font_micro())
+                                                .text_color(theme::text_muted())
+                                                .child(description),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_muted())
+                                    .child(if mention {
+                                        locale::text("Refers", "引用", "引用")
+                                    } else if executable {
+                                        locale::text("Runs", "执行", "執行")
+                                    } else {
+                                        locale::text("Inserts", "插入", "插入")
+                                    }),
+                            )
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// The plan bar above the composer.
+    ///
+    /// The desktop keeps the running plan one click from the input, and a phone
+    /// needs it more, not less: the timeline scrolls away while the reader
+    /// types. Collapsed it is a single touch row; the chevron opens the steps,
+    /// and closing it is remembered per plan revision.
+    fn render_composer_plan(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let session_id = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())?;
+        let plan = {
+            let timeline = self.display_timeline()?;
+            current_mobile_plan(&timeline.items)?
+        };
+        let identity = (session_id.as_str().to_string(), plan.sequence);
+        if self.dismissed_composer_plans.contains(&identity) {
+            return None;
+        }
+
+        let total_steps = plan.steps.len();
+        let completed_steps = plan.completed_step_count();
+        let current_step_number = plan.current_step_number();
+        let complete = plan.is_complete();
+        let current_step = plan.steps.get(current_step_number.saturating_sub(1));
+        let failed = current_step.is_some_and(|step| step.status == PlanStepStatus::Failed);
+        let accent = if complete {
+            theme::accent_success()
+        } else if failed {
+            theme::accent_red()
+        } else {
+            theme::accent_blue()
+        };
+        let plan_title = if plan.title.trim().is_empty() {
+            locale::text("Current plan", "当前计划", "目前計劃").to_string()
+        } else {
+            plan.title.clone()
+        };
+        let current_step_title = current_step
+            .map(|step| step.title.trim())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| locale::text("Plan in progress", "计划进行中", "計劃進行中"))
+            .to_string();
+        let progress_label = format!("{current_step_number}/{total_steps}");
+        let expanded = self.composer_plan_expanded.as_ref() == Some(&identity);
+
+        let toggle_identity = identity.clone();
+        let dismiss_identity = identity.clone();
+        let summary = div()
+            .id("mobile-composer-plan")
+            .debug_selector(|| "mobile-composer-plan".to_string())
+            .mb(px(theme::SPACING_SM))
+            .min_h(px(theme::TOUCH_TARGET))
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            .border_color(if complete {
+                theme::accent_success().opacity(0.32)
+            } else {
+                theme::border_default()
+            })
+            .bg(theme::bg_card())
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_SM))
+            .pl(px(theme::SPACING_MD))
+            .pr(px(theme::SPACING_XS))
+            .cursor_pointer()
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if this.composer_plan_expanded.as_ref() == Some(&toggle_identity) {
+                        this.composer_plan_expanded = None;
+                    } else {
+                        this.composer_plan_expanded = Some(toggle_identity.clone());
+                    }
+                    cx.notify();
+                }),
+            )
+            .child(
+                div().flex_shrink_0().child(
+                    svg()
+                        .path(if complete {
+                            "icons/check.svg"
+                        } else {
+                            "icons/list-checks.svg"
+                        })
+                        .size(px(theme::ICON_MD))
+                        .text_color(accent),
+                ),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(theme::font_caption())
+                    .text_color(if complete {
+                        theme::text_secondary()
+                    } else {
+                        theme::text_primary()
+                    })
+                    .child(format!("{plan_title} · {current_step_title}")),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(theme::font_micro())
+                    .text_color(if failed {
+                        theme::accent_red()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .child(progress_label),
+            )
+            .child(
+                div()
+                    .id("mobile-composer-plan-close")
+                    .size(px(32.0))
+                    .flex_shrink_0()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .aria_label(locale::text("Close plan", "关闭计划", "關閉計劃").to_string())
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.dismissed_composer_plans
+                                .insert(dismiss_identity.clone());
+                            if this.composer_plan_expanded.as_ref() == Some(&dismiss_identity) {
+                                this.composer_plan_expanded = None;
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        svg()
+                            .path("icons/x.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::text_muted()),
+                    ),
+            );
+
+        if !expanded {
+            return Some(summary.into_any_element());
+        }
+
+        let completed_label = format!(
+            "{completed_steps}/{total_steps} {}",
+            locale::text("completed", "已完成", "已完成")
+        );
+        let steps = div()
+            .id("mobile-composer-plan-steps")
+            .max_h(px(220.0))
+            .overflow_y_scroll()
+            .restrict_scroll_to_axis()
+            .pb(px(theme::SPACING_XS))
+            .children(plan.steps.iter().enumerate().map(|(index, step)| {
+                let (status_color, status_glyph) = match step.status {
+                    PlanStepStatus::Completed => (theme::accent_success(), "icons/check.svg"),
+                    PlanStepStatus::Running => (theme::accent_blue(), "icons/loader-circle.svg"),
+                    PlanStepStatus::Failed => (theme::accent_red(), "icons/triangle-alert.svg"),
+                    PlanStepStatus::Pending => (theme::text_muted(), "icons/minus.svg"),
+                };
+                div()
+                    .id(format!("mobile-composer-plan-step-{index}"))
+                    .min_h(px(theme::TOUCH_TARGET))
+                    .px(px(theme::SPACING_MD))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        svg()
+                            .path(status_glyph)
+                            .size(px(theme::ICON_SM))
+                            .text_color(status_color),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .text_size(theme::font_caption())
+                            .text_color(if step.status == PlanStepStatus::Pending {
+                                theme::text_secondary()
+                            } else {
+                                theme::text_primary()
+                            })
+                            .child(step.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(theme::font_micro())
+                            .text_color(status_color)
+                            .child(plan_step_status_label(step.status)),
+                    )
+            }));
+
+        Some(
+            div()
+                .id("mobile-composer-plan-expanded")
+                .mb(px(theme::SPACING_SM))
+                .rounded(px(theme::RADIUS_CARD))
+                .border_1()
+                .border_color(theme::border_default())
+                .bg(theme::bg_card())
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .min_h(px(theme::TOUCH_TARGET))
+                        .px(px(theme::SPACING_MD))
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::SPACING_SM))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(theme::font_detail())
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::text_primary())
+                                .child(plan_title),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(theme::font_micro())
+                                .text_color(theme::text_muted())
+                                .child(completed_label),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(1.0))
+                        .mx(px(theme::SPACING_MD))
+                        .bg(theme::border_subtle()),
+                )
+                .child(steps)
+                .child(summary)
+                .into_any_element(),
+        )
+    }
+
+    /// The prompts waiting for the running turn to finish.
+    ///
+    /// One row per message: tapping the row puts it back in the field to edit,
+    /// the arrow pushes it into the live turn now, the cross drops it.
+    fn render_composer_queue(
+        &self,
+        queued: &[MobileQueuedMessage],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id("mobile-composer-queue")
+            .debug_selector(|| "mobile-composer-queue".to_string())
+            .mb(px(theme::SPACING_SM))
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACING_XS))
+            .children(queued.iter().enumerate().map(|(index, message)| {
+                let edit_id = message.id;
+                let send_id = message.id;
+                let remove_id = message.id;
+                let position = index + 1;
+                let summary = if message.text.trim().is_empty() {
+                    format!(
+                        "{} ({})",
+                        locale::common("Image"),
+                        message.attachments.len()
+                    )
+                } else {
+                    message.text.clone()
+                };
+                div()
+                    .id(format!("mobile-composer-queue-row-{}", message.id))
+                    .min_h(px(theme::TOUCH_TARGET))
+                    .rounded(px(theme::RADIUS_CARD))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .pl(px(theme::SPACING_MD))
+                    .pr(px(theme::SPACING_XS))
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.edit_queued_message(edit_id, window, cx)
+                        }),
+                    )
+                    .child(
+                        svg()
+                            .path("icons/clock.svg")
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(theme::text_muted()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(theme::font_caption())
+                                    .text_color(theme::text_secondary())
+                                    .child(summary),
+                            )
+                            .child(
+                                div()
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_muted())
+                                    .child(format!(
+                                        "#{position} · {}",
+                                        locale::text("Queued", "已排队", "已排隊")
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(format!("mobile-composer-queue-send-{}", message.id))
+                            .size(px(36.0))
+                            .flex_shrink_0()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .aria_label(
+                                locale::text(
+                                    "Send into the turn now",
+                                    "立即插入当前回合",
+                                    "立即插入目前回合",
+                                )
+                                .to_string(),
+                            )
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.send_queued_message_now(send_id, cx);
+                                }),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/arrow-to-top.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::accent_blue()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(format!("mobile-composer-queue-remove-{}", message.id))
+                            .size(px(36.0))
+                            .flex_shrink_0()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .aria_label(locale::common("Remove").to_string())
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.remove_queued_message(remove_id, cx);
+                                }),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/x.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            ),
+                    )
+            }))
+            .into_any_element()
+    }
+
+    /// The images attached to the draft, each with its own remove control.
+    ///
+    /// A chip, not a thumbnail grid: the phone never renders attachment pixels
+    /// until the timeline does, and a row of labels is what tells the reader
+    /// what is about to be sent.
+    fn render_composer_attachments(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .id("mobile-composer-attachments")
+            .debug_selector(|| "mobile-composer-attachments".to_string())
+            .mb(px(theme::SPACING_SM))
+            .flex()
+            .flex_wrap()
+            .gap(px(theme::SPACING_XS))
+            .children(
+                self.composer_attachments
+                    .iter()
+                    .enumerate()
+                    .map(|(index, attachment)| {
+                        div()
+                            .id(format!("mobile-composer-attachment-{index}"))
+                            .min_h(px(32.0))
+                            .pl(px(theme::SPACING_SM))
+                            .pr(px(theme::SPACING_XS))
+                            .rounded(px(theme::RADIUS_PILL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::bg_card())
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_XS))
+                            .child(
+                                svg()
+                                    .path("icons/image.svg")
+                                    .size(px(14.0))
+                                    .flex_shrink_0()
+                                    .text_color(theme::text_muted()),
+                            )
+                            .child(
+                                div()
+                                    .max_w(px(160.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_secondary())
+                                    .child(attachment.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("mobile-composer-attachment-remove-{index}"))
+                                    .size(px(28.0))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .aria_label(locale::common("Remove").to_string())
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.remove_composer_attachment(index, cx)
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/x.svg")
+                                            .size(px(12.0))
+                                            .text_color(theme::text_muted()),
+                                    ),
+                            )
+                    }),
+            )
+            .into_any_element()
     }
 
     fn render_sidebar_row(
@@ -18905,8 +20583,18 @@ fn runtime_selection_summary(
         });
     let mut details = vec![
         option
-            .map(|option| option.auth_source_label.clone())
-            .unwrap_or_else(|| selection.auth_source.id().to_string()),
+            .map(|option| {
+                runtime_auth_source_selection_label(
+                    &option.selection.auth_source,
+                    &option.auth_source_label,
+                )
+            })
+            .unwrap_or_else(|| {
+                runtime_auth_source_selection_label(
+                    &selection.auth_source,
+                    selection.auth_source.id(),
+                )
+            }),
     ];
     if let Some(reasoning) = selection.reasoning_effort.as_ref() {
         details.push(format!("{}: {reasoning}", locale::common("Reasoning")));
@@ -19758,6 +21446,24 @@ fn runtime_auth_source_display_label(source: &RuntimeAuthSourceSummary) -> Strin
     }
 }
 
+/// The account a selection runs as, named in the reader's language.
+///
+/// The runtime labels its own account in English because it serves every
+/// client at once, but an Agent account is the product's own concept rather
+/// than a name the reader chose, so this client names it from the kind; a
+/// Provider Profile keeps the name its owner gave it.
+fn runtime_auth_source_selection_label(
+    auth_source: &vibex_core::RuntimeAuthSource,
+    fallback: &str,
+) -> String {
+    match auth_source {
+        vibex_core::RuntimeAuthSource::AgentAccount { .. } => {
+            locale::text("Agent account", "Agent 账户", "Agent 帳戶").to_string()
+        }
+        vibex_core::RuntimeAuthSource::ProviderProfile { .. } => fallback.to_string(),
+    }
+}
+
 fn runtime_auth_source_status_label(
     availability: RuntimeAuthSourceAvailability,
     model_count: usize,
@@ -20375,6 +22081,29 @@ fn agent_icon_path(agent_id: &str) -> &'static str {
             .find_map(|(needle, path)| normalized.contains(needle).then_some(*path))
             .unwrap_or("brand/logo.svg")
     }
+}
+
+/// A runtime attribution line with the Agent account named the reader's way.
+///
+/// The line is composed by the shared projection out of labels the runtime
+/// wrote, and the account is the one part of it this client names for itself:
+/// an Agent account is a product concept, while the Agent, the model and a
+/// Provider Profile are names the reader already knows. Only the runtime's own
+/// wording is replaced, and the account hint stays behind the name.
+fn runtime_attribution_line(attribution: &str) -> String {
+    const SEPARATOR: &str = " · ";
+    let account = locale::text("Agent account", "Agent 账户", "Agent 帳戶");
+    attribution
+        .split(SEPARATOR)
+        .map(
+            |segment| match vibex_core::agent_account_label_hint(segment) {
+                Some("") => account.to_string(),
+                Some(hint) => format!("{account} - {hint}"),
+                None => segment.to_string(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join(SEPARATOR)
 }
 
 fn timeline_runtime_attribution_parts(
@@ -21269,6 +22998,31 @@ mod tests {
         assert!(summary.secondary.contains("high"));
         assert!(summary.secondary.contains("plan"));
         assert!(summary.available);
+    }
+
+    #[test]
+    fn the_agent_account_is_named_the_readers_way() {
+        let selection = SessionRuntimeSelection::agent_default(
+            vibex_core::AgentId::parse("codex").unwrap(),
+            vibex_core::AgentAuthContextId::new(),
+        );
+        let account = locale::text("Agent account", "Agent 账户", "Agent 帳戶");
+        // The runtime's own account is the product's concept, so the label the
+        // runtime wrote for it is replaced wherever the client names it.
+        assert_eq!(
+            runtime_auth_source_selection_label(&selection.auth_source, "Agent account"),
+            account
+        );
+        assert_eq!(
+            runtime_attribution_line("Codex · Default CLI account - you@example.com · gpt-5"),
+            format!("Codex · {account} - you@example.com · gpt-5"),
+            "a line written before the account was renamed reads as one"
+        );
+        // A Provider Profile is named by its owner, so its line is left alone.
+        assert_eq!(
+            runtime_attribution_line("Codex · Work account · gpt-5"),
+            "Codex · Work account · gpt-5"
+        );
     }
 
     #[test]

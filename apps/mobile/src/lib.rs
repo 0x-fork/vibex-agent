@@ -11,6 +11,7 @@ mod android_host;
 mod android_insets;
 mod app;
 mod assets;
+mod attachment;
 mod background_connection;
 mod device;
 mod discovery;

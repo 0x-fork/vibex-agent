@@ -10,7 +10,12 @@ import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Base64;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
 import android.os.Build;
@@ -43,7 +48,9 @@ import androidx.core.view.WindowInsetsCompat;
 
 import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.InputStream;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
@@ -71,6 +78,11 @@ import java.util.Map;
 public final class GpuiHostActivity extends Activity {
     private static final int LOCAL_NETWORK_PERMISSION_REQUEST = 4102;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 4103;
+    private static final int PICK_IMAGE_REQUEST = 4104;
+    /** The longest side a picked image is scaled down to before it is encoded. */
+    private static final int ATTACHMENT_MAX_EDGE = 2048;
+    /** The encoded attachment budget; a phone photograph has to fit the relay. */
+    private static final int ATTACHMENT_MAX_BYTES = 6 * 1024 * 1024;
     private static final String AGENT_NOTIFICATION_CHANNEL = "agent_activity";
     private static final String UPDATE_NOTIFICATION_CHANNEL = "app_updates";
     private static final String UPDATE_NOTIFICATION_TAG = "vibex_update";
@@ -109,6 +121,8 @@ public final class GpuiHostActivity extends Activity {
     private static native void nativeOnNotificationActivated(
             String notificationId, String opaqueLocator);
     private static native void nativeOnUpdateNotificationActivated();
+    private static native void nativeOnAttachmentPicked(String label, String mimeType, String dataUrl);
+    private static native void nativeOnAttachmentPickFailed(String message);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -168,6 +182,133 @@ public final class GpuiHostActivity extends Activity {
     protected void onPause() {
         nativeOnAppLifecycle(false);
         super.onPause();
+    }
+
+    /**
+     * Opens the system picker for one image to attach to the composer.
+     *
+     * The document picker grants read access to the single picked item, so this
+     * needs no storage permission. The bytes never leave the phone as a file the
+     * desktop cannot see: they are scaled down and encoded as a data URL, which
+     * the desktop materializes into its own attachment directory.
+     */
+    public void gpuiPickImageAttachment() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("image/*");
+        try {
+            startActivityForResult(intent, PICK_IMAGE_REQUEST);
+        } catch (ActivityNotFoundException error) {
+            nativeOnAttachmentPickFailed("No file picker is available on this device");
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != PICK_IMAGE_REQUEST) {
+            return;
+        }
+        Uri uri = (resultCode == RESULT_OK && data != null) ? data.getData() : null;
+        if (uri == null) {
+            // A cancelled pick is not a failure: nothing is reported, and the
+            // composer simply keeps the attachments it already had.
+            return;
+        }
+        // Decoding and encoding a camera-sized image takes long enough to drop
+        // frames, so it happens off the UI thread and reports back through the
+        // Activity's own thread.
+        new Thread(() -> {
+            String label = attachmentLabel(uri);
+            try {
+                byte[] encoded = encodeAttachment(uri);
+                String mimeType = getContentResolver().getType(uri);
+                if (mimeType == null || !mimeType.startsWith("image/")) {
+                    mimeType = "image/jpeg";
+                }
+                String dataUrl = "data:" + mimeType + ";base64,"
+                        + Base64.encodeToString(encoded, Base64.NO_WRAP);
+                String finalLabel = label;
+                String finalMimeType = mimeType;
+                runOnUiThread(() -> nativeOnAttachmentPicked(finalLabel, finalMimeType, dataUrl));
+            } catch (Exception error) {
+                runOnUiThread(() -> nativeOnAttachmentPickFailed(
+                        "The picked image could not be read"));
+            }
+        }).start();
+    }
+
+    /** Reads one picked image, scaled down to what a relayed prompt can carry. */
+    private byte[] encodeAttachment(Uri uri) throws Exception {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        try (InputStream stream = getContentResolver().openInputStream(uri)) {
+            BitmapFactory.decodeStream(stream, null, bounds);
+        }
+        BitmapFactory.Options decode = new BitmapFactory.Options();
+        int longestEdge = Math.max(bounds.outWidth, bounds.outHeight);
+        int sampleSize = 1;
+        while (longestEdge > 0 && longestEdge / (sampleSize * 2) >= ATTACHMENT_MAX_EDGE) {
+            sampleSize *= 2;
+        }
+        decode.inSampleSize = sampleSize;
+        Bitmap bitmap;
+        try (InputStream stream = getContentResolver().openInputStream(uri)) {
+            bitmap = BitmapFactory.decodeStream(stream, null, decode);
+        }
+        if (bitmap == null) {
+            throw new IllegalStateException("the picked image has no decodable pixels");
+        }
+        String mimeType = getContentResolver().getType(uri);
+        boolean keepAlpha = mimeType != null && mimeType.contains("png");
+        Bitmap.CompressFormat format =
+                keepAlpha ? Bitmap.CompressFormat.PNG : Bitmap.CompressFormat.JPEG;
+        byte[] encoded = compress(bitmap, format, keepAlpha ? 100 : 88);
+        // Still too large for the wire: halve the pixels once and try again.
+        if (encoded.length > ATTACHMENT_MAX_BYTES) {
+            Bitmap scaled = Bitmap.createScaledBitmap(
+                    bitmap,
+                    Math.max(1, bitmap.getWidth() / 2),
+                    Math.max(1, bitmap.getHeight() / 2),
+                    true);
+            encoded = compress(scaled, Bitmap.CompressFormat.JPEG, 80);
+        }
+        bitmap.recycle();
+        if (encoded.length > ATTACHMENT_MAX_BYTES * 3 / 2) {
+            throw new IllegalStateException("the picked image is too large to attach");
+        }
+        return encoded;
+    }
+
+    private static byte[] compress(Bitmap bitmap, Bitmap.CompressFormat format, int quality) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        bitmap.compress(format, quality, out);
+        return out.toByteArray();
+    }
+
+    /** The name the reader sees on the attachment chip. */
+    private String attachmentLabel(Uri uri) {
+        String displayName = null;
+        try (android.database.Cursor cursor = getContentResolver().query(
+                uri, new String[]{android.provider.OpenableColumns.DISPLAY_NAME},
+                null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                if (index >= 0) {
+                    displayName = cursor.getString(index);
+                }
+            }
+        } catch (Exception ignored) {
+            // A provider that does not answer the metadata query still has a
+            // last path segment worth showing.
+        }
+        if (displayName == null || displayName.isBlank()) {
+            String lastSegment = uri.getLastPathSegment();
+            displayName = (lastSegment == null || lastSegment.isBlank())
+                    ? "image"
+                    : lastSegment;
+        }
+        return displayName;
     }
 
     /** Hands the surface Android just created to the render thread. */
