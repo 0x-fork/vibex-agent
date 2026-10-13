@@ -1273,9 +1273,10 @@ strings! {
     palette_title => { "Command palette", "命令面板", "命令面板" },
     palette_placeholder => { "Type a command…", "输入命令…", "輸入命令…" },
     // The headings, in the order the palette draws them: where the reader is,
-    // the devices they trust, the client itself, and the conversation.
+    // the devices they trust, the client itself, and — on a session's page
+    // alone — the conversation.
     palette_group_view => { "View", "视图", "檢視" },
-    palette_group_pairing => { "Pairing & devices", "配对与设备管理", "配對與裝置管理" },
+    palette_group_pairing => { "Remote pairing", "远程配对", "遠端配對" },
     palette_group_app => { "App", "应用", "應用" },
     palette_group_session => { "Session", "会话", "工作階段" },
     palette_group_workbench => { "Workbench", "工作台", "工作台" },

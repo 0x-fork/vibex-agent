@@ -3379,6 +3379,10 @@ fn the_palette_groups_commands_under_their_headings() {
     use vibex_tui::action::Intent;
     use vibex_tui::view::PaletteGroup;
     let mut app = app(120, 40);
+    // The session section is offered on a page that is showing a session, and
+    // this test is about every command being filed under a heading: the whole
+    // list has to be on offer for the count below to mean anything.
+    enter_session(&mut app, "session_palette01");
     app.perform(Intent::OpenCommandPalette);
     let screen = text(&render(&mut app, 120, 40));
     assert!(screen.contains("View"), "no group headings:\n{screen}");
@@ -3449,12 +3453,14 @@ fn the_palette_groups_commands_under_their_headings() {
 
 /// The sections read top-down in the order the reader asked for: where they
 /// are, the devices they trust, the client itself, and the conversation. The
-/// headings are compared in Chinese because that is where the two renamed
-/// commands and the merged device section have to be legible.
+/// headings are compared in Chinese because that is where the renamed device
+/// section has to be legible, and the frame is rendered on a session's page so
+/// that the conversation's own section is on offer with the rest.
 #[test]
 fn the_palette_files_its_sections_in_reading_order() {
     use vibex_tui::view::PaletteGroup;
     let mut app = app(120, 40);
+    enter_session(&mut app, "session_palette02");
     app.strings = Strings::for_locale(Locale::ZhCn);
     app.perform(vibex_tui::action::Intent::OpenCommandPalette);
 
@@ -3480,29 +3486,12 @@ fn the_palette_files_its_sections_in_reading_order() {
     );
 
     // The frame draws those headings, in that order: what a reader sees is the
-    // list the sections were filed in. A heading is the line the region maps to
-    // no entry, and reading a wide glyph back inserts a cell of padding after
-    // it, so the spaces come out.
-    let buffer = render_buffer(&mut app, 120, 40);
-    let region = app
-        .regions
-        .palette
-        .clone()
-        .expect("the palette published no rows");
-    let drawn = region
-        .rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| row.is_none())
-        .map(|(line, _)| {
-            (region.rect.x..region.rect.right())
-                .filter_map(|column| buffer.cell((column, region.rect.y + line as u16)))
-                .map(|cell| cell.symbol().to_string())
-                .collect::<String>()
-                .replace(' ', "")
-        })
+    // list the sections were filed in.
+    let drawn = palette_headings(&mut app, 120, 40)
+        .into_iter()
+        .map(|heading| heading.replace(' ', ""))
         .collect::<Vec<_>>();
-    let expected = ["视图", "配对与设备管理", "应用", "会话"];
+    let expected = ["视图", "远程配对", "应用", "会话"];
     assert!(drawn.len() >= 2, "the palette drew no sections: {drawn:?}");
     assert!(
         drawn.len() <= expected.len(),
@@ -3524,6 +3513,93 @@ fn the_palette_files_its_sections_in_reading_order() {
     assert!(
         pairing.contains(&"设备配对") && pairing.contains(&"设备管理"),
         "the pairing section is not the device section: {pairing:?}"
+    );
+}
+
+/// The headings the palette frame just drew, top-down.
+///
+/// A heading is the line the published region maps to no entry — the region is
+/// what the reader sees, so the headings have to be read back from it rather
+/// than from the list they were computed from. Reading a wide glyph back
+/// inserts a cell of padding after it; the callers that compare Chinese strip
+/// the spaces themselves.
+fn palette_headings(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    let buffer = render_buffer(app, width, height);
+    let region = app
+        .regions
+        .palette
+        .clone()
+        .expect("the palette published no rows");
+    region
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.is_none())
+        .map(|(line, _)| {
+            (region.rect.x..region.rect.right())
+                .filter_map(|column| buffer.cell((column, region.rect.y + line as u16)))
+                .map(|cell| cell.symbol().to_string())
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The session section belongs to a page that is showing a session.
+///
+/// Its verbs act on the session list's own cursor, so a page that shows no
+/// session must not offer them: on the list, in the configuration centre, on a
+/// composing page or in help, the row they would move is one the reader cannot
+/// see. What a page cannot act on, it does not offer — and the page that can is
+/// where they are listed, under their own heading.
+#[test]
+fn the_palette_withholds_its_session_section_where_no_session_is_shown() {
+    use vibex_tui::action::Intent;
+    use vibex_tui::view::PaletteGroup;
+    let mut app = app(120, 40);
+    for page in [
+        Page::NewSession,
+        Page::Sessions,
+        Page::Management,
+        Page::Settings,
+        Page::Devices,
+        Page::Help,
+    ] {
+        app.navigate_to(page);
+        app.perform(Intent::OpenCommandPalette);
+        let entries = app.palette_entries("");
+        assert!(
+            entries
+                .iter()
+                .all(|listing| listing.group != PaletteGroup::Session),
+            "{page:?} offered the session section"
+        );
+        // The section is not merely empty: its heading is not drawn either, so
+        // the drawer cannot name a group it has no rows for.
+        assert!(
+            !palette_headings(&mut app, 120, 40)
+                .iter()
+                .any(|heading| heading == "Session"),
+            "{page:?} drew the session heading with nothing under it"
+        );
+    }
+
+    // A page that is showing a session offers them, and the list it offers is
+    // the whole palette again.
+    enter_session(&mut app, "session_palette03");
+    app.perform(Intent::OpenCommandPalette);
+    assert!(
+        app.palette_entries("")
+            .iter()
+            .any(|listing| listing.group == PaletteGroup::Session),
+        "the session's page did not offer the session section"
+    );
+    assert!(
+        palette_headings(&mut app, 120, 40)
+            .iter()
+            .any(|heading| heading == "Session"),
+        "the session's page did not draw the session heading"
     );
 }
 

@@ -3666,13 +3666,18 @@ mod tests {
     ///
     /// The frame is tall because the sections read view-first: a session command
     /// is the last group down, and a palette window that only fits the first
-    /// screenful cannot show the row this test points at.
+    /// screenful cannot show the row this test points at. It is drawn on a
+    /// session's own page for the same reason: the session section is offered
+    /// only where a session is on screen.
     #[test]
     fn the_palette_rows_answer_the_pointer() {
         use crate::action::Intent;
         use crate::view::PaletteGroup;
         let worker = isolation_worker();
         let mut app = test_app(100, 60);
+        let session = isolation_session(vibex_core::VibexSessionId::new(), "claude");
+        app.agent.state.selected_session_id = Some(session.id.clone());
+        app.agent.state.active_session.resolve(session);
         app.navigate_to(Page::Agent);
         app.overlay = Some(Overlay::Palette {
             query: String::new(),

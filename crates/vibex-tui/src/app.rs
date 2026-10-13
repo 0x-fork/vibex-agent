@@ -4817,8 +4817,22 @@ impl App {
     }
 
     /// The palette's entries, each with the heading it is drawn under.
+    ///
+    /// The session section is offered only on a page that is showing a session.
+    /// Its verbs act on the session list's own cursor, so anywhere else — the
+    /// list itself, the configuration centre, a composing page — they would
+    /// rename, fork or delete a row chosen behind a page that is no longer
+    /// showing it, which is the confusion the section is withheld to prevent.
+    /// The commands are not lost to those pages: the list answers for the row
+    /// under its own cursor with the keys the row names.
     pub fn palette_entries(&self, query: &str) -> Vec<crate::view::PaletteListing> {
+        let showing_a_session = self.page_shows_session();
         crate::view::palette_listings(query, self.strings)
+            .into_iter()
+            .filter(|listing| {
+                showing_a_session || listing.group != crate::view::PaletteGroup::Session
+            })
+            .collect()
     }
 
     /// Whether this click is the second of a double click.
