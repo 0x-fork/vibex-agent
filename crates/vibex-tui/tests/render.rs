@@ -4462,6 +4462,7 @@ fn a_prepended_history_page_keeps_the_readers_viewport_anchored() {
         end_sequence: Some(5),
         has_older: false,
         has_newer: true,
+        starts_at_turn_start: true,
     };
     assert!(
         app.agent

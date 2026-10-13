@@ -1751,6 +1751,7 @@ fn a_history_page_a_switch_superseded_returns_its_slot(cx: &mut TestAppContext) 
                 end_sequence: None,
                 has_older: false,
                 has_newer: false,
+                starts_at_turn_start: true,
             }),
         );
     });
@@ -1813,5 +1814,100 @@ fn a_prefetch_that_cannot_start_keeps_the_history_budget(cx: &mut TestAppContext
     assert_eq!(
         slots, 0,
         "a read that never started must not spend a slot that only a completion can release"
+    );
+}
+
+/// A turn whose own first row has not arrived reads as loading, not as work.
+///
+/// The rows a later read adds to that turn are older than the ones on screen, so
+/// a duration built from the rows already here would move under the reader. The
+/// view says so instead, and stops reporting a turn in progress: the tick that
+/// would keep the duration moving has nothing left to move.
+#[gpui::test]
+fn a_turn_that_is_still_arriving_reads_as_loading(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, cx) = live_tool_timeline(cx, true);
+    // Keep only the response rows: what a window shows when its budget ran out
+    // inside one long turn, with that turn's first row still below the window.
+    workbench.update(cx, |workbench, _| {
+        let session_id = workbench.timeline.session_id.clone().unwrap();
+        let tail = workbench
+            .timeline
+            .items
+            .iter()
+            .filter(|item| item.kind != vibex_core::TimelineItemKind::UserMessage)
+            .cloned()
+            .collect::<Vec<_>>();
+        workbench.timeline.replace_authoritative(session_id, tail);
+        workbench.timeline_starts_mid_turn = true;
+        workbench.conversation_turns_cache_key = None;
+        workbench.timeline_row_sizes = Rc::new(Vec::new());
+    });
+    let _ = draw_live_timeline_frames(&workbench, cx, 2);
+    let leading = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_starts_mid_turn,
+            workbench
+                .conversation_turns_cache
+                .first()
+                .map(|turn| turn.user_row.is_none()),
+            workbench.conversation_turns_summary.has_incomplete_turn,
+        )
+    });
+    assert_eq!(
+        leading,
+        (true, Some(true), false),
+        "the arriving turn is the leading one, and it is not work in progress"
+    );
+
+    // Once the page that carries its first row lands, the view is a window of
+    // whole turns again and the turn reads as work with a duration.
+    workbench.update(cx, |workbench, _| {
+        workbench.timeline_starts_mid_turn = false;
+        workbench.conversation_turns_cache_key = None;
+    });
+    let _ = draw_live_timeline_frames(&workbench, cx, 2);
+    let loaded = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_starts_mid_turn,
+            workbench.conversation_turns_summary.has_incomplete_turn,
+        )
+    });
+    assert_eq!(loaded, (false, true));
+}
+
+/// The boundary comes from the read that produced the page, not from what the
+/// rows happen to look like.
+#[gpui::test]
+fn an_older_page_moves_the_views_leading_end(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let session_a = VibexSessionId::parse("session_layout").unwrap();
+    let (workbench, cx) = live_tool_timeline(cx, true);
+    let generation = workbench.update(cx, |workbench, _| workbench.session_generation);
+    let items = workbench.read_with(cx, |workbench, _| workbench.timeline.items.clone());
+    let page = |starts_at_turn_start: bool| TimelinePage {
+        session_id: session_a.clone(),
+        items: items.clone(),
+        start_sequence: items.first().map(|item| item.sequence),
+        end_sequence: items.last().map(|item| item.sequence),
+        has_older: true,
+        has_newer: false,
+        starts_at_turn_start,
+    };
+    // The page's items all sit below the cursor it was read for.
+    let cursor = items.last().map(|item| item.sequence).unwrap_or(0) + 1;
+    workbench.update(cx, |workbench, _| {
+        workbench.finish_older_timeline_load(&session_a, cursor, generation, Ok(page(false)));
+    });
+    assert!(
+        workbench.read_with(cx, |workbench, _| workbench.timeline_starts_mid_turn),
+        "a page that opens inside a turn leaves the leading turn unfinished"
+    );
+    workbench.update(cx, |workbench, _| {
+        workbench.finish_older_timeline_load(&session_a, cursor, generation, Ok(page(true)));
+    });
+    assert!(
+        !workbench.read_with(cx, |workbench, _| workbench.timeline_starts_mid_turn),
+        "a page that opens on a boundary finishes the turn above it"
     );
 }

@@ -4241,6 +4241,7 @@ mod tests {
             end_sequence: Some(0),
             has_older: true,
             has_newer: true,
+            starts_at_turn_start: true,
         };
         apply_message(
             &mut app,

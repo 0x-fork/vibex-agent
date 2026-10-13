@@ -23,6 +23,12 @@ pub(super) struct PreparedTimeline {
     /// a resumed load refreshes the tail above a prefix and must not overwrite
     /// what that prefix already knew about the history below it.
     timeline_has_older: bool,
+    /// Whether the prepared window's oldest row sits inside a turn.
+    ///
+    /// Carried for the same reason: a resumed load keeps the prefix's own
+    /// leading end, so only the read that produced a window can say whether that
+    /// window opens on a turn boundary.
+    timeline_starts_mid_turn: bool,
 }
 
 /// Only the request owns this buffer. Its weak view reference expires on
@@ -82,13 +88,15 @@ impl PreparedTimeline {
         pending: bool,
         reasoning: ReasoningDisplayMode,
     ) -> VibexResult<Self> {
-        Self::prepare_with_older(session_id, items, false, state, pending, reasoning).await
+        Self::prepare_with_older(session_id, items, false, false, state, pending, reasoning).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn prepare_with_older(
         session_id: VibexSessionId,
         items: Vec<TimelineItem>,
         timeline_has_older: bool,
+        timeline_starts_mid_turn: bool,
         state: Option<AgentSessionState>,
         pending: bool,
         reasoning: ReasoningDisplayMode,
@@ -104,6 +112,7 @@ impl PreparedTimeline {
                 pending,
                 reasoning,
                 timeline_has_older,
+                timeline_starts_mid_turn,
             }
         })
         .await
@@ -147,6 +156,7 @@ impl VibexWorkbench {
             &session_id,
             &prepared.timeline.items,
         );
+        self.timeline_starts_mid_turn = prepared.timeline_starts_mid_turn;
         let changed = self.timeline.session_id != prepared.timeline.session_id
             || self.timeline.items != prepared.timeline.items;
         if changed {
@@ -163,7 +173,10 @@ impl VibexWorkbench {
             self.timeline_item_index.get_mut().invalidate();
             self.invalidate_agent_generation_output_estimate();
             self.invalidate_agent_generation_compaction_count();
-            self.conversation_turns_summary = ConversationTurnsSummary::from_turns(&turns);
+            self.conversation_turns_summary = ConversationTurnsSummary::from_turns_after_leading(
+                &turns,
+                self.timeline_starts_mid_turn,
+            );
             self.conversation_turns_cache = Rc::new(turns);
             let key = self.current_conversation_turns_cache_key();
             self.conversation_turns_cache_key = (key.session_state == prepared.state

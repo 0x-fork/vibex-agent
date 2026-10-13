@@ -9027,6 +9027,7 @@ impl TimelineRepository {
             end_sequence,
             has_older,
             has_newer,
+            starts_at_turn_start: page_starts_at_turn_start(conn, session_id, start_sequence)?,
         })
     }
 
@@ -9153,6 +9154,7 @@ impl TimelineRepository {
             end_sequence,
             has_older,
             has_newer,
+            starts_at_turn_start: page_starts_at_turn_start(conn, session_id, start_sequence)?,
         })
     }
 
@@ -9201,12 +9203,22 @@ impl TimelineRepository {
     /// and [`Self::fetch_before`] in three ways that all exist to keep a page
     /// small enough to move:
     ///
-    /// - the window can end on a conversational turn boundary, so a page never
-    ///   splits a turn in half;
+    /// - a turn window ends on a conversational turn boundary, so a page never
+    ///   splits a turn in half. A reader prepends a page above what it already
+    ///   holds, so a page that opened inside a turn would add rows older than
+    ///   the ones on screen and move that turn's own header under them. The turn
+    ///   the page opens in is finished even when it costs more than the byte
+    ///   budget, up to [`TIMELINE_TURN_ALIGNED_PAGE_MAX_BYTES`]; a turn that does
+    ///   not fit within that is left out of the page instead, and the read that
+    ///   opens on it finishes it the same way;
     /// - a byte budget stops the page once it has spent what the reader asked
     ///   for, because one file snapshot can outweigh hundreds of messages;
     /// - every item is projected to the requested payload depth, so tool
     ///   detail ships only when a reader asks for it by sequence.
+    ///
+    /// A page says whether its own leading end sits on a turn boundary
+    /// ([`TimelinePage::starts_at_turn_start`]), which is what a client needs to
+    /// know before it shows a duration for the one turn the page opens in.
     ///
     /// `has_older` and `has_newer` stay session-wide existence probes, which is
     /// what lets a reader treat "there is more" and "the window ended" as
@@ -9326,28 +9338,40 @@ impl TimelineRepository {
             items.truncate(limit as usize);
         }
 
-        if let Some(budget) = max_bytes.filter(|budget| *budget > 0) {
-            let budget = budget as usize;
+        // A byte budget is measured against what the reader actually receives,
+        // so a stripped file snapshot does not spend the whole page on detail it
+        // never carries. The budget spends the front of the scan, which is the
+        // anchored end of the page in either direction, so whatever it drops
+        // stays reported by the existence probes below.
+        let budget = max_bytes
+            .filter(|budget| *budget > 0)
+            .map(|bytes| bytes as usize);
+        let mut cut = items.len();
+        if let Some(budget) = budget {
             let mut spent = 0_usize;
             let mut kept = 0_usize;
             for item in &items {
-                // A byte budget is measured against what the reader actually
-                // receives, so a stripped file snapshot does not spend the
-                // whole page on detail it never carries.
-                let cost =
-                    item.payload.approximate_bytes() - item.payload.stripped_tool_detail_bytes();
+                let cost = page_payload_cost(item);
                 if kept > 0 && spent.saturating_add(cost) > budget {
                     break;
                 }
                 spent = spent.saturating_add(cost);
                 kept += 1;
             }
-            // Whatever the budget dropped stays reported by the existence
-            // probe below, so a reader still learns the window was cut short.
-            // The budget spends the front of the scan, which is the anchored
-            // end of the page in either direction.
-            items.truncate(kept.max(1).min(items.len()));
+            cut = kept.max(1).min(items.len());
         }
+
+        // A turn window that ends in the middle of a turn hands that turn over
+        // in pieces: its header moves when the older rows arrive, and the reader
+        // watches one turn load instead of reading it. The leading end of such a
+        // page therefore sits on a turn boundary. The rows that takes were
+        // already scanned, so this only moves the cut inside what the page paid
+        // for. A read that did not ask for whole turns keeps the budget it asked
+        // for: its caller is sampling the tail, not opening a conversation.
+        if read_backward && turn_window.is_some() && items.len() > 1 {
+            cut = align_backward_page_to_turn_start(conn, session_id, &items, cut, budget)?;
+        }
+        items.truncate(cut.max(1).min(items.len()));
 
         if read_backward {
             items.reverse();
@@ -9403,6 +9427,7 @@ impl TimelineRepository {
             end_sequence,
             has_older,
             has_newer,
+            starts_at_turn_start: page_starts_at_turn_start(conn, session_id, start_sequence)?,
         })
     }
 
@@ -16109,6 +16134,233 @@ fn remove_timeline_sequences(
 /// malformed request cannot ask the database for a whole session.
 const TIMELINE_TURN_WINDOW_ITEM_CEILING: i64 = 20_000;
 
+/// What a page may spend to finish the turn its leading end landed in.
+///
+/// A reader never sees a turn grow: the page's oldest row is the start of a
+/// turn, so the rows a later read adds are older than everything on screen and
+/// no turn already shown changes under them. Finishing the turn the page opened
+/// in may cost more than the byte budget the reader asked for, because the
+/// budget is spent from the anchored end and that turn sits in front of it; the
+/// allowance is what keeps a single turn from carrying an unbounded page. A turn
+/// whose remaining rows cost more than this is left out of the page instead, and
+/// the read that opens on it finishes it the same way.
+const TIMELINE_TURN_ALIGNED_PAGE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// What one row costs the page that carries it.
+///
+/// A byte budget is measured against what the reader actually receives, so a
+/// stripped file snapshot does not spend the whole page on detail it never
+/// carries.
+fn page_payload_cost(item: &TimelineItem) -> usize {
+    item.payload.approximate_bytes() - item.payload.stripped_tool_detail_bytes()
+}
+
+/// Whether a page's oldest row begins a conversational turn.
+///
+/// The session's first row begins the first turn whatever it carries; every
+/// other turn begins at a user message, which is the same rule the turn window
+/// and the client's projection use.
+fn page_starts_at_turn_start(
+    conn: &Connection,
+    session_id: &VibexSessionId,
+    start_sequence: Option<i64>,
+) -> VibexResult<bool> {
+    let Some(start_sequence) = start_sequence else {
+        return Ok(true);
+    };
+    if start_sequence <= 1 {
+        return Ok(true);
+    }
+    let user_message = enum_to_db(&TimelineItemKind::UserMessage)?;
+    conn.query_row(
+        "
+        SELECT EXISTS(
+            SELECT 1 FROM agent_timeline_items
+            WHERE session_id = ?1 AND kind = ?2 AND sequence = ?3
+        )
+        ",
+        params![session_id.as_str(), user_message, start_sequence],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(storage_err(
+        "timeline_turn_boundary_failed",
+        "failed to inspect the start of a timeline page",
+    ))
+}
+
+/// The sequences that begin a conversational turn within `(after, through]`,
+/// newest first.
+fn timeline_turn_starts(
+    conn: &Connection,
+    session_id: &VibexSessionId,
+    after: i64,
+    through: i64,
+) -> VibexResult<Vec<i64>> {
+    let user_message = enum_to_db(&TimelineItemKind::UserMessage)?;
+    let mut stmt = conn
+        .prepare_cached(
+            "
+            SELECT sequence FROM agent_timeline_items
+            WHERE session_id = ?1
+                AND kind = ?2
+                AND sequence > ?3
+                AND sequence <= ?4
+            ORDER BY sequence DESC
+            ",
+        )
+        .map_err(storage_err(
+            "timeline_turn_boundary_failed",
+            "failed to prepare the turn boundary probe",
+        ))?;
+    let rows = stmt
+        .query_map(
+            params![session_id.as_str(), user_message, after, through],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(storage_err(
+            "timeline_turn_boundary_failed",
+            "failed to probe the turn boundary",
+        ))?;
+    let mut starts = Vec::new();
+    for row in rows {
+        starts.push(row.map_err(storage_err(
+            "timeline_turn_boundary_failed",
+            "failed to read the turn boundary",
+        ))?);
+    }
+    Ok(starts)
+}
+
+/// Where the leading cut of a backward page lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackwardPageCut {
+    /// The cut already ends the page on a turn boundary, or the turn it landed
+    /// in cannot be finished from the rows the read holds.
+    KeepBudget,
+    /// Extend the page to include every row of the turn that starts at this
+    /// index, which is the turn the cut landed in.
+    FinishTurn { index: usize },
+    /// Leave the turn the cut landed in out of the page. The page then ends
+    /// where the newer turn begins, and the next read opens on that turn's own
+    /// boundary.
+    LeaveTurnOut { index: usize },
+}
+
+/// Chooses a turn boundary for the leading end of a backward page.
+///
+/// `items` is the page in scan order (newest first), `cut` is the index the byte
+/// budget or the row limit chose, and `starts` are the sequences that begin a
+/// conversational turn within the scanned span, newest first.
+///
+/// A page that ends in the middle of a turn shows that turn growing: the rows a
+/// later read adds are older than the ones on screen, so the turn's own header —
+/// when it started, how long it worked — moves under the reader, and the turn
+/// has to be read again in pieces. The cut therefore lands on a turn boundary.
+/// The turn the reader is already inside is finished even when it costs more
+/// than the budget, because leaving it out would take away what they are looking
+/// at; an older turn that does not fit under `ceiling` is left out instead, and
+/// the read that opens on it finishes it the same way.
+fn aligned_backward_page_cut(
+    items: &[TimelineItem],
+    cut: usize,
+    starts: &[i64],
+    ceiling: usize,
+) -> BackwardPageCut {
+    if items.is_empty() {
+        return BackwardPageCut::KeepBudget;
+    }
+    let cut = cut.clamp(1, items.len());
+    let (Some(anchored), Some(leading)) = (
+        items.first().map(|item| item.sequence),
+        items.get(cut - 1).map(|item| item.sequence),
+    ) else {
+        return BackwardPageCut::KeepBudget;
+    };
+    let anchored_start = starts.iter().copied().find(|start| *start <= anchored);
+    let leading_start = starts.iter().copied().find(|start| *start <= leading);
+    // The session's first row begins the first turn whatever it carries, and a
+    // user message begins one wherever it sits.
+    if leading_start == Some(leading) || leading <= 1 {
+        return BackwardPageCut::KeepBudget;
+    }
+    let spent = items[..cut]
+        .iter()
+        .map(page_payload_cost)
+        .fold(0_usize, usize::saturating_add);
+    let finish_turn = |start: Option<i64>| -> Option<usize> {
+        let start = start?;
+        let index = items.iter().position(|item| item.sequence == start)?;
+        if index < cut {
+            // The turn's first row is already inside the page.
+            return None;
+        }
+        let added = items[cut..=index]
+            .iter()
+            .map(page_payload_cost)
+            .fold(0_usize, usize::saturating_add);
+        (spent.saturating_add(added) <= ceiling).then_some(index + 1)
+    };
+    if leading_start.is_some() && leading_start == anchored_start {
+        // The whole page lies inside the turn the reader is in.
+        return finish_turn(anchored_start)
+            .map_or(BackwardPageCut::KeepBudget, |index| BackwardPageCut::FinishTurn {
+                index,
+            });
+    }
+    if let Some(index) = finish_turn(leading_start) {
+        return BackwardPageCut::FinishTurn { index };
+    }
+    let Some(end) = starts
+        .iter()
+        .rev()
+        .copied()
+        .find(|start| *start > leading)
+        .map(|next| next - 1)
+    else {
+        return BackwardPageCut::KeepBudget;
+    };
+    items
+        .iter()
+        .position(|item| item.sequence <= end)
+        .map_or(BackwardPageCut::KeepBudget, |index| {
+            BackwardPageCut::LeaveTurnOut { index }
+        })
+}
+
+/// Moves the leading cut of a backward page onto a conversational turn boundary.
+///
+/// The rows the alignment reaches for were already scanned — the row ceiling is
+/// what bounds the read — so this only moves the cut inside what the page paid
+/// for. A turn that cannot be finished from them is left out, which costs the
+/// read nothing but the page's own breadth.
+fn align_backward_page_to_turn_start(
+    conn: &Connection,
+    session_id: &VibexSessionId,
+    items: &[TimelineItem],
+    cut: usize,
+    budget: Option<usize>,
+) -> VibexResult<usize> {
+    if items.len() <= 1 || cut == 0 {
+        return Ok(cut.max(1).min(items.len()));
+    }
+    let (Some(oldest), Some(anchored)) = (
+        items.last().map(|item| item.sequence),
+        items.first().map(|item| item.sequence),
+    ) else {
+        return Ok(cut);
+    };
+    let starts = timeline_turn_starts(conn, session_id, oldest.saturating_sub(1), anchored)?;
+    let ceiling = budget
+        .unwrap_or(usize::MAX)
+        .max(TIMELINE_TURN_ALIGNED_PAGE_MAX_BYTES);
+    Ok(match aligned_backward_page_cut(items, cut, &starts, ceiling) {
+        BackwardPageCut::KeepBudget => cut,
+        BackwardPageCut::FinishTurn { index } | BackwardPageCut::LeaveTurnOut { index } => {
+            index.max(1)
+        }
+    })
+}
+
 /// A merge key for one streamed payload, part of deciding whether two rows
 /// belong to the same segment.
 ///
@@ -22283,6 +22535,219 @@ mod tests {
         assert_eq!(budgeted.end_sequence, Some(12));
         assert!(budgeted.has_older);
         assert!(!budgeted.has_newer);
+
+        cleanup_db(temp);
+    }
+
+    /// A session whose turns can be told apart by where they start.
+    ///
+    /// Returns the connection, the session, and the sequence each turn's user
+    /// message was appended at.
+    fn turn_boundary_fixture(
+        label: &str,
+        turns: &[(usize, bool)],
+    ) -> (DbConnection, VibexSessionId, Vec<i64>, PathBuf) {
+        let temp = temp_db_path(label);
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            &format!("/tmp/vibex-db-{label}"),
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: label.to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        let mut starts = Vec::new();
+        for (index, (rows, finish)) in turns.iter().enumerate() {
+            starts.push(
+                TimelineRepository::append(
+                    &mut conn,
+                    &session.id,
+                    TimelineSource::User,
+                    TimelinePayload::UserMessage(UserMessagePayload {
+                        text: format!("question-{index}"),
+                        attachments: Vec::new(),
+                        ..Default::default()
+                    }),
+                    None,
+                    None,
+                    TimelineRedactionState::None,
+                )
+                .unwrap()
+                .sequence,
+            );
+            for row in 0..*rows {
+                TimelineRepository::append(
+                    &mut conn,
+                    &session.id,
+                    TimelineSource::Agent,
+                    TimelinePayload::AgentMessage(AgentMessagePayload {
+                        text: format!("streamed row {row} of turn {index}"),
+                        is_final: *finish && row + 1 == *rows,
+                    }),
+                    None,
+                    None,
+                    TimelineRedactionState::None,
+                )
+                .unwrap();
+            }
+        }
+        (conn, session.id, starts, temp)
+    }
+
+    /// A page never hands a turn over in pieces.
+    ///
+    /// A reader prepends a page above what it already holds, so a page that
+    /// opens inside a turn adds rows older than the ones on screen: the turn's
+    /// own header moves, and the turn reads as loading instead of read. The
+    /// budget is spent from the anchored end, which is what used to leave the
+    /// cut inside a turn.
+    #[test]
+    fn a_backward_page_finishes_the_turn_it_opens_in() {
+        // Turn one is short, turn two is long enough to swallow the budget, and
+        // turn three is the newest.
+        let (conn, session_id, starts, temp) = turn_boundary_fixture(
+            "timeline-page-inside-turn",
+            &[(4, true), (200, true), (2, true)],
+        );
+
+        // The reader sits at the end of the long turn, and the budget runs out
+        // inside it.
+        let page = TimelineRepository::fetch_window(
+            &conn,
+            &session_id,
+            None,
+            Some(starts[2]),
+            500,
+            Some(8),
+            Some(2_048),
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(
+            page.start_sequence,
+            Some(starts[1]),
+            "the page must open at the turn's own first row"
+        );
+        assert!(page.starts_at_turn_start);
+        assert!(page.has_older, "turn one is still below the page");
+        assert!(
+            page.items.iter().all(|item| item.sequence >= starts[1]),
+            "no row of an older turn may be pulled in"
+        );
+
+        // The next read opens on that turn's boundary and takes it whole.
+        let older = TimelineRepository::fetch_window(
+            &conn,
+            &session_id,
+            None,
+            page.start_sequence,
+            500,
+            Some(8),
+            Some(2_048),
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(older.start_sequence, Some(starts[0]));
+        assert!(!older.has_older);
+
+        // A cold open ends on the same boundary: the newest turn arrives whole
+        // instead of in the piece its budget could pay for.
+        let window = TimelineRepository::fetch_window(
+            &conn,
+            &session_id,
+            None,
+            None,
+            500,
+            Some(8),
+            Some(2_048),
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(window.start_sequence, Some(starts[1]));
+        assert!(window.starts_at_turn_start);
+        assert!(window.has_older);
+
+        cleanup_db(temp);
+    }
+
+    /// An older turn gets the same treatment: it is finished when the page can
+    /// pay for it, and left out whole when it cannot.
+    ///
+    /// Either way the page ends on a turn boundary, so the read that opens on
+    /// the turn the page dropped is the one that finishes it.
+    #[test]
+    fn an_older_turn_is_finished_or_left_out_whole() {
+        // Turn one is short, turn two is long, and turns three and four sit
+        // above it: the budget runs out inside a turn that is older than the one
+        // the page is anchored on.
+        let (conn, session_id, starts, temp) = turn_boundary_fixture(
+            "timeline-page-older-turn",
+            &[(2, true), (200, true), (2, true), (2, true)],
+        );
+        let page = TimelineRepository::fetch_window(
+            &conn,
+            &session_id,
+            None,
+            Some(starts[3]),
+            500,
+            Some(8),
+            Some(2_048),
+            TimelinePayloadDepth::Detail,
+        )
+        .unwrap();
+        assert_eq!(page.start_sequence, Some(starts[1]));
+        assert!(page.starts_at_turn_start);
+        assert!(page.has_older);
+
+        // The whole span, newest first, as the read scans it.
+        let mut scanned = page.items.clone();
+        scanned.sort_by_key(|item| std::cmp::Reverse(item.sequence));
+        let inside_turn_two = scanned
+            .iter()
+            .position(|item| item.sequence < starts[1] + 2)
+            .expect("the page holds rows of turn two");
+        let starts_newest_first = vec![starts[3], starts[2], starts[1], starts[0]];
+        // An allowance that is already spent cannot pay for the turn's remaining
+        // rows, so the turn is left out and the page ends above it.
+        let left_out =
+            aligned_backward_page_cut(&scanned, inside_turn_two, &starts_newest_first, 0);
+        // The cut lands on turn two's last row, so truncating there keeps every
+        // row of the newer turns and none of the turn that does not fit.
+        let index = scanned
+            .iter()
+            .position(|item| item.sequence == starts[2] - 1)
+            .expect("turn two ends just below turn three");
+        assert_eq!(left_out, BackwardPageCut::LeaveTurnOut { index });
+        // With room to pay, the same cut finishes the turn instead.
+        let finished = aligned_backward_page_cut(
+            &scanned,
+            inside_turn_two,
+            &starts_newest_first,
+            usize::MAX,
+        );
+        let index = scanned
+            .iter()
+            .position(|item| item.sequence == starts[1])
+            .expect("turn two's first row is in the page");
+        assert_eq!(finished, BackwardPageCut::FinishTurn { index: index + 1 });
 
         cleanup_db(temp);
     }

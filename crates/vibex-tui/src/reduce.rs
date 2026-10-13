@@ -7444,6 +7444,7 @@ mod tests {
             end_sequence: None,
             has_older: false,
             has_newer: true,
+            starts_at_turn_start: true,
         };
         assert!(
             app.agent

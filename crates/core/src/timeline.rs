@@ -1472,6 +1472,25 @@ pub struct TimelinePage {
     pub end_sequence: Option<i64>,
     pub has_older: bool,
     pub has_newer: bool,
+    /// Whether the page's oldest item begins a conversational turn.
+    ///
+    /// A reader prepends a page above what it already holds, so a page that
+    /// opens inside a turn hands that turn over in pieces: the rows added below
+    /// it are older than the ones on screen, and the turn's own header — when it
+    /// started, how long it worked — moves under the reader. A read looks for a
+    /// turn boundary for this end, and this says whether it found one: the one
+    /// turn a page opens in is the one a client has to be careful about.
+    #[serde(default = "timeline_page_starts_at_turn_start_default")]
+    pub starts_at_turn_start: bool,
+}
+
+/// Assume a boundary when a peer does not report one.
+///
+/// An older peer cuts pages wherever its budget ended; treating its pages as cut
+/// would hold a reader in a loading state their history could never leave, so a
+/// missing answer reads as the behavior that peer had.
+fn timeline_page_starts_at_turn_start_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

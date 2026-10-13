@@ -4383,6 +4383,26 @@ impl ConversationTurnsSummary {
             has_pending_permission: turns.iter().any(|turn| turn.borrow().pending_permission),
         }
     }
+
+    /// The summary of a projection whose leading turn may still be arriving.
+    ///
+    /// A turn that is missing its own first row is being read, not working: the
+    /// rows still to come are older than the ones on screen. Reporting it as an
+    /// incomplete turn would keep the duration ticker alive for a header that no
+    /// longer shows a duration, and every tick it asks for is a repaint that
+    /// cannot move anything.
+    fn from_turns_after_leading<T>(turns: &[T], leading_still_arriving: bool) -> Self
+    where
+        T: std::borrow::Borrow<TimelineConversationTurn>,
+    {
+        let mut summary = Self::from_turns(turns);
+        if leading_still_arriving && summary.has_incomplete_turn {
+            summary.has_incomplete_turn = turns
+                .get(1..)
+                .is_some_and(|rest| rest.iter().any(|turn| !turn.borrow().complete));
+        }
+        summary
+    }
 }
 
 /// Where the permission alert has to scroll to reach the request it names.
@@ -4433,6 +4453,15 @@ pub struct SessionView {
     /// Per view, because it describes the window that view holds rather than
     /// the session in the abstract.
     timeline_has_older: bool,
+    /// Whether this view's oldest row sits inside a conversational turn.
+    ///
+    /// A read looks for a turn boundary for the end of a page, so this is only
+    /// true while that turn is too long to be handed over in one page: the rows
+    /// still to come are older than the ones on screen, and the turn's own
+    /// header — when it started, how long it worked — would move under the
+    /// reader as they arrive. The leading turn reads as loading until its first
+    /// row is here, and only then does it show a duration.
+    timeline_starts_mid_turn: bool,
     /// How many older pages this view has outstanding.
     timeline_older_in_flight: usize,
     /// Row ids whose tool detail is being read back right now.
@@ -4589,6 +4618,7 @@ impl SessionView {
             timeline_follow: TimelineFollowState::default(),
             timeline_scroll: VirtualListScrollHandle::new(),
             timeline_has_older: false,
+            timeline_starts_mid_turn: false,
             timeline_older_in_flight: 0,
             timeline_detail_in_flight: BTreeSet::new(),
             timeline_scroll_to_latest_pending: false,
@@ -9115,6 +9145,7 @@ impl VibexWorkbench {
         self.timeline
             .replace_authoritative(session_id.clone(), merged);
         self.timeline_has_older = page.has_older && added_history;
+        self.timeline_starts_mid_turn = !page.starts_at_turn_start;
         self.timeline_item_index.get_mut().invalidate();
         self.conversation_turns_cache_key = None;
         self.timeline_scroll_anchor_pending = true;
@@ -20775,6 +20806,10 @@ impl VibexWorkbench {
             reset_pending_user_requests(&mut this.pending_user_request_ids, &session_id, &items);
             this.timeline
                 .replace_authoritative(session_id.clone(), items);
+            // The pane load reads the whole conversation, so its leading end is
+            // the session's first row rather than a turn boundary it had to look
+            // for.
+            this.timeline_starts_mid_turn = false;
             this.agent_loading = false;
             this.reconcile_optimistic_user_message();
             this.rebuild_timeline_sizes();
@@ -21750,7 +21785,10 @@ impl VibexWorkbench {
                     Rc::new(self.conversation_turns().into_iter().map(Rc::new).collect());
             }
             let turns = self.conversation_turns_cache.as_slice();
-            self.conversation_turns_summary = ConversationTurnsSummary::from_turns(turns);
+            self.conversation_turns_summary = ConversationTurnsSummary::from_turns_after_leading(
+                turns,
+                self.timeline_starts_mid_turn,
+            );
             self.conversation_turns_cache_key = Some(key);
             // The projection just moved, so every memoized render fingerprint
             // describes a turn shape that no longer exists.
@@ -22068,8 +22106,12 @@ impl VibexWorkbench {
         let load_revision = self
             .registered_session(session_id.as_str())
             .map(|session| session.updated_at_ms);
+        // A resumed load keeps the prefix the view already holds, so its leading
+        // end — and whether that end sits inside a turn — is whatever the view
+        // had. Only the window a read fetches can move it.
+        let resumed_starts_mid_turn = self.timeline_starts_mid_turn;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let (items, timeline_has_older) = match resume {
+            let (items, timeline_has_older, timeline_starts_mid_turn) = match resume {
                 Some(resume) => {
                     match fetch_timeline_tail_via_backend(
                         backend.clone(),
@@ -22081,6 +22123,7 @@ impl VibexWorkbench {
                         Some(tail) => (
                             resume.prefix.into_iter().chain(tail).collect(),
                             resume.timeline_has_older,
+                            resumed_starts_mid_turn,
                         ),
                         None => {
                             let page = fetch_timeline_window_via_backend(
@@ -22096,13 +22139,15 @@ impl VibexWorkbench {
                     let page =
                         fetch_timeline_window_via_backend(backend, request_session_id.clone())
                             .await?;
-                    (page.items, page.has_older)
+                    let starts_mid_turn = !page.starts_at_turn_start;
+                    (page.items, page.has_older, starts_mid_turn)
                 }
             };
             PreparedTimeline::prepare_with_older(
                 request_session_id,
                 items,
                 timeline_has_older,
+                timeline_starts_mid_turn,
                 state,
                 pending,
                 reasoning,
@@ -22189,8 +22234,12 @@ impl VibexWorkbench {
         let load_revision = self
             .registered_session(session_id.as_str())
             .map(|session| session.updated_at_ms);
+        // A resumed load keeps the prefix the view already holds, so its leading
+        // end — and whether that end sits inside a turn — is whatever the view
+        // had. Only the window a read fetches can move it.
+        let resumed_starts_mid_turn = self.timeline_starts_mid_turn;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let (items, timeline_has_older) = match resume {
+            let (items, timeline_has_older, timeline_starts_mid_turn) = match resume {
                 Some(resume) => {
                     match fetch_timeline_tail(
                         runtime.clone(),
@@ -22202,6 +22251,7 @@ impl VibexWorkbench {
                         Some(tail) => (
                             resume.prefix.into_iter().chain(tail).collect(),
                             resume.timeline_has_older,
+                            resumed_starts_mid_turn,
                         ),
                         // Nothing above the prefix is worth patching, so open
                         // the session again rather than replay the history
@@ -22209,19 +22259,22 @@ impl VibexWorkbench {
                         None => {
                             let page =
                                 fetch_timeline_window(runtime, request_session_id.clone()).await?;
-                            (page.items, page.has_older)
+                            let starts_mid_turn = !page.starts_at_turn_start;
+                            (page.items, page.has_older, starts_mid_turn)
                         }
                     }
                 }
                 None => {
                     let page = fetch_timeline_window(runtime, request_session_id.clone()).await?;
-                    (page.items, page.has_older)
+                    let starts_mid_turn = !page.starts_at_turn_start;
+                    (page.items, page.has_older, starts_mid_turn)
                 }
             };
             PreparedTimeline::prepare_with_older(
                 request_session_id,
                 items,
                 timeline_has_older,
+                timeline_starts_mid_turn,
                 state,
                 pending,
                 reasoning,
@@ -53706,11 +53759,21 @@ impl VibexWorkbench {
                 .child(runtime_agent_icon(identity))
                 .into_any_element()
         };
+        // A turn whose first row is not loaded yet is still arriving: the rows
+        // the next read adds are older than the ones on screen, so its start
+        // time — and the duration built from it — would move under the reader.
+        // It reads as loading until the turn's own first row is here, which is
+        // when the duration means something.
+        let leading_turn_incomplete = is_first && self.timeline_starts_mid_turn;
         let duration = format_compact_duration(
             turn.started_at_ms,
             timeline_turn_duration_end(timeline_turn_finished(turn), turn.ended_at_ms),
         );
-        let header_label = format!("{} {duration}", strings.agent_worked_for);
+        let header_label = if leading_turn_incomplete {
+            strings.agent_turn_loading.to_string()
+        } else {
+            format!("{} {duration}", strings.agent_worked_for)
+        };
         let mut content = v_flex()
             .id(turn.id.clone())
             .w_full()
@@ -101749,6 +101812,26 @@ mod tests {
         assert!(renderer.contains(".opacity(0.0)"));
         assert!(renderer.contains(".group_hover(runtime_hover_group, |style|"));
         assert!(renderer.contains("style.opacity(1.0)"));
+    }
+
+    /// A turn whose own first row has not arrived must not show a duration.
+    ///
+    /// The rows a later read adds to it are older than the ones on screen, so
+    /// the number would move under the reader every time a page landed — the
+    /// loading label holds the header still until the turn's start is here.
+    #[test]
+    fn a_turn_that_is_still_arriving_shows_its_loading_label() {
+        let source = include_str!("app.rs");
+        let renderer = source
+            .split_once("    fn render_timeline_turn(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn timeline_turn_execution_attribution("))
+            .map(|(body, _)| body)
+            .expect("timeline turn renderer should remain inspectable");
+
+        assert!(renderer.contains("let leading_turn_incomplete = is_first && self.timeline_starts_mid_turn;"));
+        assert!(renderer.contains("strings.agent_turn_loading.to_string()"));
+        // A turn whose start is loaded still reports what it worked for.
+        assert!(renderer.contains("format!(\"{} {duration}\", strings.agent_worked_for)"));
     }
 
     #[test]

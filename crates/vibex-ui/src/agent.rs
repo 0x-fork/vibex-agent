@@ -2263,6 +2263,7 @@ mod tests {
                         end_sequence: page.last().map(|item| item.sequence),
                         has_older: start > 0,
                         has_newer: true,
+                        starts_at_turn_start: true,
                         items: page,
                     });
                 }
@@ -2280,6 +2281,7 @@ mod tests {
                     end_sequence: page.last().map(|item| item.sequence),
                     has_older: false,
                     has_newer: total_after > page.len(),
+                    starts_at_turn_start: true,
                     items: page,
                 })
             })
@@ -2641,6 +2643,7 @@ mod tests {
             end_sequence: None,
             has_older: false,
             has_newer: false,
+            starts_at_turn_start: true,
         };
         assert!(
             controller
@@ -2673,6 +2676,7 @@ mod tests {
             end_sequence: None,
             has_older: true,
             has_newer: true,
+            starts_at_turn_start: true,
         };
         assert!(controller.apply_timeline_before(&ticket, Ok(page)).unwrap());
         assert!(!controller.state.timeline_has_older);
@@ -2781,6 +2785,7 @@ mod tests {
             end_sequence: Some(1),
             has_older: false,
             has_newer: true,
+            starts_at_turn_start: true,
         };
         assert!(controller.apply_timeline_before(&ticket, Ok(page)).unwrap());
 
@@ -2813,6 +2818,7 @@ mod tests {
             end_sequence: Some(4),
             has_older: false,
             has_newer: true,
+            starts_at_turn_start: true,
         };
         assert!(!controller.apply_timeline_before(&ticket, Ok(page)).unwrap());
     }
