@@ -327,6 +327,12 @@ fn event_loop(
         if !control.is_empty() {
             crate::terminal::write_control(&control)?;
         }
+        // A desktop popup is a process rather than a byte, and it leaves through
+        // the same door for the same reason: the frame owns the buffer, and the
+        // reader's own desktop is not the frame's business.
+        for notification in app.take_system_notifications() {
+            crate::notify::deliver_system(&notification);
+        }
 
         if app.should_quit {
             return Ok(ExitReason::UserQuit);

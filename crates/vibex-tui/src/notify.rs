@@ -10,9 +10,7 @@
 //! control sequences, and they are the only channel that survives `ssh`: a
 //! client running on a cloud host writes the bytes, the local terminal (or the
 //! multiplexer in front of it) interprets them, and the notification appears on
-//! the machine the reader is actually sitting at. Nothing here starts a
-//! process, opens a socket or talks to a display server, so the crate keeps its
-//! "linkable without a window server" boundary.
+//! the machine the reader is actually sitting at.
 //!
 //! # The transports
 //!
@@ -24,6 +22,17 @@
 //! | [`Transport::Osc777`] | `OSC 777` | rxvt-unicode, VTE |
 //! | [`Transport::Osc99`] | `OSC 99` | kitty |
 //! | [`Transport::Iterm2Attention`] | `OSC 1337` | iTerm2 (bounces, no text) |
+//!
+//! Beside them sits one channel that is not an escape: [`SystemDelivery`] hands
+//! the same news to the host's own notification service (`notify-send` on Linux,
+//! `osascript` on macOS), which is what draws a real desktop bubble. It is the
+//! only thing here that starts a process, so it is fenced twice: it never fires
+//! on a seat reached over `ssh` — a bubble raised on a cloud host is one nobody
+//! will ever see, while the client would report success — and it is a switch of
+//! its own on the settings page, which also says so when the host has no program
+//! to draw it with. The crate keeps its "linkable without a window server"
+//! boundary either way: the bubble is drawn by a program the reader's desktop
+//! already runs, not by this process.
 //!
 //! Which one to use is decided by [`TerminalProfile::detect`] from the
 //! environment, the same way the client already decides whether it may write a
@@ -61,9 +70,19 @@
 //! session id. The Agent's prose never rides a notification, because a terminal
 //! may log an OSC payload and a title is read by anyone glancing at the screen.
 //! The session title is therefore opt-in (`includeSessionTitle`).
+//!
+//! # The settings page
+//!
+//! Everything a reader can change here — the master switch, the three kinds, the
+//! transport, the title, the desktop bubble — is a field of
+//! [`NotifyPreferences`], and the settings surface is a second door onto the
+//! same file the hand-written `~/.vibex/tui-notify.json` opens. [`Notifier`]
+//! keeps the preferences it was built from and hands them back edited, so the
+//! page and the file cannot disagree about what the reader chose.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 use vibex_backend::BackendEvent;
@@ -129,6 +148,20 @@ pub enum Transport {
 }
 
 impl Transport {
+    /// Every transport the settings page offers, in the order it offers them.
+    ///
+    /// `Off` leads because a reader looking for it should not have to walk the
+    /// whole list, and the OSCs follow the order of the table above.
+    pub const ALL: [Self; 7] = [
+        Self::Off,
+        Self::Bell,
+        Self::Title,
+        Self::Osc9,
+        Self::Osc777,
+        Self::Osc99,
+        Self::Iterm2Attention,
+    ];
+
     /// The spelling the configuration file uses.
     pub const fn id(self) -> &'static str {
         match self {
@@ -182,6 +215,12 @@ pub struct TerminalProfile {
     pub multiplexer: Option<Multiplexer>,
     /// The terminal the environment identified, for a settings readout.
     pub terminal: Option<String>,
+    /// Whether the client is running on a host the reader reached over `ssh`.
+    ///
+    /// A remote seat is the reason the escape transports exist and the reason
+    /// the desktop bubble is switched off: the host this process runs on is not
+    /// the host the reader is looking at.
+    pub remote: bool,
 }
 
 impl TerminalProfile {
@@ -202,6 +241,12 @@ impl TerminalProfile {
         } else {
             None
         };
+
+        // `sshd` sets all three for an interactive session; any one of them is
+        // enough, because a stripped environment may keep only one.
+        let remote = get("SSH_CONNECTION").is_some()
+            || get("SSH_TTY").is_some()
+            || get("SSH_CLIENT").is_some();
 
         let term = get("TERM").unwrap_or_default();
         let program = get("TERM_PROGRAM").unwrap_or_default();
@@ -244,6 +289,7 @@ impl TerminalProfile {
             transport,
             multiplexer,
             terminal,
+            remote,
         }
     }
 }
@@ -271,6 +317,13 @@ pub struct NotifyPreferences {
     /// is derived from what the reader typed, and a terminal may log it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_session_title: Option<bool>,
+    /// Whether the host's own desktop may be asked to draw a bubble.
+    ///
+    /// On by default, because a reader who is away from the terminal is exactly
+    /// the reader a bubble reaches — but only ever on a local seat, where the
+    /// bubble lands on the machine they are sitting at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_popup: Option<bool>,
 }
 
 impl NotifyPreferences {
@@ -322,6 +375,174 @@ impl NotifyPreferences {
     fn includes_session_title(&self) -> bool {
         self.include_session_title.unwrap_or(false)
     }
+
+    fn includes_system_popup(&self) -> bool {
+        self.system_popup.unwrap_or(true)
+    }
+}
+
+/// The program a native popup is handed to, when the host has one.
+///
+/// This is the one place in the module that names an external process. Which
+/// program it is follows the platform: macOS ships `osascript` with the system,
+/// while Linux and the BSDs get a bubble from `notify-send`, part of libnotify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemDelivery {
+    /// `notify-send`, from libnotify.
+    NotifySend,
+    /// `osascript`, which every macOS install has.
+    OsaScript,
+}
+
+impl SystemDelivery {
+    /// The delivery this host would use, when it has one.
+    ///
+    /// A missing program is not an error to report: it means the channel is
+    /// simply not available here, which the settings page states rather than
+    /// letting the reader wonder why nothing appeared.
+    pub fn detect() -> Option<Self> {
+        Self::detect_with(|program| find_in_path(program).is_some())
+    }
+
+    /// The detection table, with the search injected so it is a test.
+    pub fn detect_with(mut found: impl FnMut(&str) -> bool) -> Option<Self> {
+        if cfg!(target_os = "macos") && found("osascript") {
+            return Some(Self::OsaScript);
+        }
+        if found("notify-send") {
+            return Some(Self::NotifySend);
+        }
+        None
+    }
+
+    /// The command that draws one bubble.
+    ///
+    /// The caller spawns it: building the command is pure, which is what lets
+    /// the arguments be asserted without a desktop to run them on.
+    pub fn command(self, title: &str, body: &str) -> Command {
+        match self {
+            Self::NotifySend => {
+                let mut command = Command::new("notify-send");
+                command
+                    .arg("--app-name=Vibex")
+                    .arg("--icon=utilities-terminal")
+                    .arg(title)
+                    .arg(body);
+                command
+            }
+            Self::OsaScript => {
+                // The script is a fixed sentence with the two fields quoted in;
+                // `quote` is what keeps a body from ending the string literal
+                // and running a statement of its own.
+                let mut command = Command::new("osascript");
+                command.arg("-e").arg(format!(
+                    "display notification {} with title {}",
+                    quote(body),
+                    quote(title)
+                ));
+                command
+            }
+        }
+    }
+}
+
+/// One popup, on its way to the host's own notification service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemNotification {
+    pub title: String,
+    pub body: String,
+}
+
+/// What the desktop-popup setting can honestly say.
+///
+/// `On` and `Off` are choices the reader may change; `Remote` and `Unsupported`
+/// are facts about where the client runs, and the row reports them instead of a
+/// switch position that would not do anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifySystemState {
+    /// The reader asked for a bubble and this host will draw one.
+    On,
+    /// The reader asked for none.
+    Off,
+    /// The seat is reached over `ssh`, so a bubble would be raised on the wrong
+    /// machine.
+    Remote,
+    /// No `notify-send` and no `osascript` on this host.
+    Unsupported,
+}
+
+/// The delivery this host would use, when it has one.
+pub fn system_delivery() -> Option<SystemDelivery> {
+    SystemDelivery::detect()
+}
+
+/// Hand one notification to the host's popup, without waiting for it.
+///
+/// The child is reaped on a thread of its own: a notification outlives the turn
+/// that raised it, and a process left unreaped per notification would be a
+/// zombie per notification. Every failure is silent — a desktop that is not
+/// running is not news worth interrupting the reader over.
+pub fn deliver_system(notification: &SystemNotification) {
+    let Some(delivery) = SystemDelivery::detect() else {
+        return;
+    };
+    let mut command = delivery.command(&notification.title, &notification.body);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Ok(mut child) = command.spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
+/// Whether a program is reachable on this process's `PATH`.
+fn find_in_path(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .map(|directory| directory.join(program))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Whether a path names a file this process may run.
+///
+/// The permission bits are read rather than the file opened: the probe runs at
+/// startup for the settings readout, and it must not disturb the file it looks
+/// at.
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// A string as an AppleScript string literal.
+///
+/// AppleScript has no escape for a newline inside a literal, so the two
+/// characters that could end it — the quote and the backslash — are the ones
+/// that are escaped, and the payload has already been flattened to one line by
+/// [`sanitize`] before it gets here.
+fn quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        if matches!(character, '"' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// What the reader is doing while a notification is considered.
@@ -340,15 +561,29 @@ pub struct NotifyContext<'a> {
 
 /// The client's out-of-band notification state.
 ///
-/// It owns no I/O: a decision and the bytes it produces are collected in
-/// `pending`, and the run loop writes them after the frame. Keeping the writes
-/// out of the reducer is what lets every rule here be a unit test.
+/// It owns no terminal I/O: a decision and the bytes it produces are collected
+/// in `pending`, and the run loop writes them after the frame. A popup is
+/// collected the same way in `pending_system`, and the run loop hands it to the
+/// host after the frame. Keeping both out of the reducer is what lets every rule
+/// here be a unit test.
 #[derive(Debug)]
 pub struct Notifier {
+    /// The choices as they were read, kept so the settings page edits the same
+    /// object the file holds rather than a parallel copy of it.
+    preferences: NotifyPreferences,
+    /// Where those choices are written back, when the reader's home is known.
+    preferences_path: Option<std::path::PathBuf>,
     enabled: bool,
     transport: Transport,
+    /// The transport detection picked, for the "automatic" setting to name.
+    detected: Transport,
     multiplexer: Option<Multiplexer>,
     terminal: Option<String>,
+    /// Whether the seat is reached over `ssh`, which is what makes a local
+    /// bubble useless rather than merely unwanted.
+    remote: bool,
+    delivery: Option<SystemDelivery>,
+    system_popup: bool,
     kind_switches: [bool; 3],
     include_session_title: bool,
     focused: bool,
@@ -356,40 +591,67 @@ pub struct Notifier {
     seen: HashSet<(String, String)>,
     order: VecDeque<(String, String)>,
     pending: Vec<u8>,
+    pending_system: Vec<SystemNotification>,
 }
 
 impl Default for Notifier {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
 impl Notifier {
-    /// Read the saved choices and detect the terminal.
-    pub fn new() -> Self {
-        let preferences = NotifyPreferences::load(App::notification_preferences_path().as_deref());
-        Self::from_preferences(preferences)
+    /// Read the saved choices from `path` and detect the terminal.
+    ///
+    /// The path is the composition root's decision, like every other file this
+    /// client keeps: a test harness must not read — or write — the home of
+    /// whoever ran it.
+    pub fn new(path: Option<std::path::PathBuf>) -> Self {
+        let preferences = NotifyPreferences::load(path.as_deref());
+        Self::from_preferences(preferences, path)
     }
 
-    /// Build from already-read choices, detecting the terminal.
-    pub fn from_preferences(preferences: NotifyPreferences) -> Self {
+    /// Build from already-read choices, detecting the terminal and the host.
+    pub fn from_preferences(
+        preferences: NotifyPreferences,
+        path: Option<std::path::PathBuf>,
+    ) -> Self {
         let profile = TerminalProfile::detect();
-        Self::from_parts(preferences, profile)
+        Self::build(preferences, profile, system_delivery(), path)
     }
 
-    fn from_parts(preferences: NotifyPreferences, profile: TerminalProfile) -> Self {
+    /// Build from every detected fact, which is what makes the rules a test.
+    fn build(
+        preferences: NotifyPreferences,
+        profile: TerminalProfile,
+        delivery: Option<SystemDelivery>,
+        path: Option<std::path::PathBuf>,
+    ) -> Self {
+        // Read every choice out before the preferences move into the struct:
+        // the live switches are the resolved answers, and the preferences are
+        // kept as they were written so the settings page edits the same object.
         let transport = preferences.transport().unwrap_or(profile.transport);
+        let enabled = preferences.is_enabled();
+        let system_popup = preferences.includes_system_popup();
+        let kind_switches = [
+            preferences.kind_enabled(NotificationKind::Completed),
+            preferences.kind_enabled(NotificationKind::NeedsInput),
+            preferences.kind_enabled(NotificationKind::Failed),
+        ];
+        let include_session_title = preferences.includes_session_title();
         Self {
-            enabled: preferences.is_enabled(),
+            preferences,
+            preferences_path: path,
+            enabled,
             transport,
+            detected: profile.transport,
             multiplexer: profile.multiplexer,
             terminal: profile.terminal,
-            kind_switches: [
-                preferences.kind_enabled(NotificationKind::Completed),
-                preferences.kind_enabled(NotificationKind::NeedsInput),
-                preferences.kind_enabled(NotificationKind::Failed),
-            ],
-            include_session_title: preferences.includes_session_title(),
+            remote: profile.remote,
+            delivery,
+            system_popup,
+            kind_switches,
+            include_session_title,
             // Before the terminal has told us otherwise, the reader is assumed
             // to be at it: the client was started from a keypress, and a
             // terminal that never reports focus should not turn every
@@ -399,6 +661,7 @@ impl Notifier {
             seen: HashSet::new(),
             order: VecDeque::new(),
             pending: Vec::new(),
+            pending_system: Vec::new(),
         }
     }
 
@@ -407,9 +670,52 @@ impl Notifier {
         self.transport
     }
 
+    /// The transport the environment identified, which "automatic" resolves to.
+    pub fn detected_transport(&self) -> Transport {
+        self.detected
+    }
+
+    /// The transport the reader named, when they named one.
+    pub fn transport_preference(&self) -> Option<Transport> {
+        self.preferences.transport()
+    }
+
     /// The terminal the environment identified, when it identified one.
     pub fn terminal(&self) -> Option<&str> {
         self.terminal.as_deref()
+    }
+
+    /// Whether the client runs on a host the reader reached over `ssh`.
+    pub fn remote(&self) -> bool {
+        self.remote
+    }
+
+    /// The popup program this host has, when it has one.
+    pub fn delivery(&self) -> Option<SystemDelivery> {
+        self.delivery
+    }
+
+    /// Whether the reader asked the host's desktop to draw a bubble.
+    pub fn system_popup(&self) -> bool {
+        self.system_popup
+    }
+
+    /// Whether a bubble would actually be drawn right now.
+    ///
+    /// Three facts, not one: the reader asked for it, the host has a program to
+    /// draw it with, and the reader is sitting at this host.
+    pub fn system_available(&self) -> bool {
+        self.system_popup && !self.remote && self.delivery.is_some()
+    }
+
+    /// Whether notifications are on at all.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Whether one kind of news is one the reader asked about.
+    pub fn kind_enabled(&self, kind: NotificationKind) -> bool {
+        self.kind_switches[kind.index()]
     }
 
     /// Whether the session title may ride the payload.
@@ -420,6 +726,63 @@ impl Notifier {
     /// Whether the terminal is currently the focused window.
     pub fn focused(&self) -> bool {
         self.focused
+    }
+
+    /// Whether any channel would carry news right now.
+    fn any_channel(&self) -> bool {
+        self.transport != Transport::Off || self.system_available()
+    }
+
+    /// Turn the whole layer on or off.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        self.preferences.enabled = Some(enabled);
+    }
+
+    /// Turn one kind of news on or off.
+    pub fn set_kind_enabled(&mut self, kind: NotificationKind, enabled: bool) {
+        self.kind_switches[kind.index()] = enabled;
+        match kind {
+            NotificationKind::Completed => self.preferences.notify_agent_completed = Some(enabled),
+            NotificationKind::NeedsInput => {
+                self.preferences.notify_agent_needs_input = Some(enabled)
+            }
+            NotificationKind::Failed => self.preferences.notify_agent_failed = Some(enabled),
+        }
+    }
+
+    /// Name the transport, or hand the choice back to detection with `None`.
+    pub fn set_transport(&mut self, transport: Option<Transport>) {
+        match transport {
+            Some(transport) => {
+                self.transport = transport;
+                self.preferences.transport = Some(transport.id().to_string());
+            }
+            None => {
+                self.transport = self.detected;
+                self.preferences.transport = None;
+            }
+        }
+    }
+
+    /// Ask the host's desktop for a bubble, or stop asking.
+    pub fn set_system_popup(&mut self, on: bool) {
+        self.system_popup = on;
+        self.preferences.system_popup = Some(on);
+    }
+
+    /// Let the session title ride the payload, or keep it off.
+    pub fn set_include_session_title(&mut self, on: bool) {
+        self.include_session_title = on;
+        self.preferences.include_session_title = Some(on);
+    }
+
+    /// Write the choices down, so the next run starts where this one left off.
+    ///
+    /// The same file the hand-written configuration uses, which is the point:
+    /// there is one answer to what this client remembers, not two.
+    pub fn save_preferences(&self) {
+        self.preferences.save(self.preferences_path.as_deref());
     }
 
     /// Note that the terminal gained or lost focus.
@@ -448,7 +811,7 @@ impl Notifier {
         source_event_id: &str,
         context: &NotifyContext<'_>,
     ) -> bool {
-        if !self.enabled || self.transport == Transport::Off || !self.kind_switches[kind.index()] {
+        if !self.enabled || !self.any_channel() || !self.kind_switches[kind.index()] {
             return false;
         }
         if self.focused && context.session_page && context.selected_session_id == Some(session_id) {
@@ -457,21 +820,64 @@ impl Notifier {
         self.remember(session_id, source_event_id)
     }
 
-    /// Build the sequence for one notification and queue it.
+    /// Build one notification and queue it on every live channel.
     pub fn emit(&mut self, session_id: &str, title: &str, body: &str) {
+        self.queue_terminal(session_id, title, body);
+        self.queue_system(title, body);
+    }
+
+    /// Raise the reader's own test notification.
+    ///
+    /// It goes through the same two channels a real one uses — that is the
+    /// point of it: a reader who cannot see it knows the terminal, the
+    /// multiplexer or the desktop is the reason, not the client. The policy is
+    /// skipped (a test is asked for, not news) but the master switch is not: a
+    /// notification layer that is off has nothing to test.
+    pub fn emit_test(&mut self, title: &str, body: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let terminal = self.queue_terminal("test", title, body);
+        let system = self.queue_system(title, body);
+        terminal || system
+    }
+
+    /// Build the sequence for one notification and queue it.
+    ///
+    /// Reports whether a sequence was queued: an `Off` transport writes
+    /// nothing, which is not the same as a payload that came out empty.
+    fn queue_terminal(&mut self, session_id: &str, title: &str, body: &str) -> bool {
         let sequence = self.sequence(session_id, title, body);
         if sequence.is_empty() {
-            return;
+            return false;
         }
         if self.transport == Transport::Title {
             self.title_marked = true;
         }
         self.pending.extend_from_slice(sequence.as_bytes());
+        true
+    }
+
+    /// Queue one popup for the host's own desktop.
+    fn queue_system(&mut self, title: &str, body: &str) -> bool {
+        if !self.system_available() {
+            return false;
+        }
+        self.pending_system.push(SystemNotification {
+            title: sanitize(title),
+            body: sanitize(body),
+        });
+        true
     }
 
     /// Take the bytes the run loop has to write, if any.
     pub fn take_pending(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending)
+    }
+
+    /// Take the popups the run loop has to hand to the host, if any.
+    pub fn take_pending_system(&mut self) -> Vec<SystemNotification> {
+        std::mem::take(&mut self.pending_system)
     }
 
     /// Record a dedup key, reporting whether it was new.
@@ -689,6 +1095,38 @@ impl App {
         self.notify.take_pending()
     }
 
+    /// Take the popups the run loop has to hand to the host, if any.
+    pub fn take_system_notifications(&mut self) -> Vec<SystemNotification> {
+        self.notify.take_pending_system()
+    }
+
+    /// Raise the reader's own test notification, reporting whether any channel
+    /// took it.
+    pub fn test_notification(&mut self) -> bool {
+        let title = self.strings.app_name().to_string();
+        let body = self.strings.settings_notify_test_body().to_string();
+        self.notify.emit_test(&title, &body)
+    }
+
+    /// What the desktop-popup row should say.
+    ///
+    /// The state is the one the reader can act on, not the stored preference: a
+    /// remote seat and a host with no program both leave the toggle inert, and
+    /// saying so is better than letting the reader flip a switch nothing reads.
+    pub fn notification_system_state(&self) -> NotifySystemState {
+        if self.notify.remote() {
+            return NotifySystemState::Remote;
+        }
+        if self.notify.delivery().is_none() {
+            return NotifySystemState::Unsupported;
+        }
+        if self.notify.system_popup() {
+            NotifySystemState::On
+        } else {
+            NotifySystemState::Off
+        }
+    }
+
     /// Take every control sequence the last frame owes the terminal.
     ///
     /// One door for the run loop to write through, whatever produced the
@@ -743,11 +1181,18 @@ mod tests {
             transport,
             multiplexer,
             terminal: None,
+            remote: false,
         }
     }
 
+    /// A notifier with no popup program, so a test's environment cannot decide
+    /// what it does. The popup has tests of its own below.
+    fn built(preferences: NotifyPreferences, profile: TerminalProfile) -> Notifier {
+        Notifier::build(preferences, profile, None, None)
+    }
+
     fn notifier(transport: Transport) -> Notifier {
-        Notifier::from_parts(
+        built(
             NotifyPreferences {
                 transport: Some(transport.id().to_string()),
                 ..NotifyPreferences::default()
@@ -761,6 +1206,229 @@ mod tests {
             selected_session_id: selected,
             session_page,
         }
+    }
+
+    #[test]
+    fn an_ssh_session_is_read_as_a_remote_seat() {
+        for variable in ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"] {
+            let remote = TerminalProfile::detect_from(|key| match key {
+                _ if key == variable => Some("10.0.0.1 5000 10.0.0.2 22".to_string()),
+                _ => None,
+            });
+            assert!(remote.remote, "{variable} did not mark the seat remote");
+        }
+        let local = TerminalProfile::detect_from(|key| match key {
+            "TERM" => Some("xterm-256color".to_string()),
+            _ => None,
+        });
+        assert!(!local.remote);
+    }
+
+    #[test]
+    fn the_popup_program_follows_the_platform() {
+        assert_eq!(
+            SystemDelivery::detect_with(|program| program == "notify-send"),
+            Some(SystemDelivery::NotifySend)
+        );
+        assert_eq!(SystemDelivery::detect_with(|_| false), None);
+        // macOS prefers the program the system ships, even where libnotify was
+        // installed beside it.
+        let both = SystemDelivery::detect_with(|_| true);
+        if cfg!(target_os = "macos") {
+            assert_eq!(both, Some(SystemDelivery::OsaScript));
+        } else {
+            assert_eq!(both, Some(SystemDelivery::NotifySend));
+        }
+    }
+
+    #[test]
+    fn a_popup_is_queued_only_for_a_local_seat_that_asked_for_one() {
+        let preferences = NotifyPreferences {
+            transport: Some(Transport::Off.id().to_string()),
+            system_popup: Some(true),
+            ..NotifyPreferences::default()
+        };
+        let mut local = Notifier::build(
+            preferences.clone(),
+            profile(Transport::Off, None),
+            Some(SystemDelivery::NotifySend),
+            None,
+        );
+        assert!(local.system_available());
+        // The terminal channel is off, so the popup alone is reason enough to
+        // announce: the two channels are independent.
+        assert!(local.accept(NotificationKind::Failed, "s1", "e1", &context(None, false)));
+        local.emit("s1", "Vibex", "Agent failed");
+        assert!(local.take_pending().is_empty());
+        assert_eq!(
+            local.take_pending_system(),
+            vec![SystemNotification {
+                title: "Vibex".to_string(),
+                body: "Agent failed".to_string(),
+            }]
+        );
+
+        // A seat reached over ssh: the bubble would be drawn on the cloud host.
+        let mut remote_profile = profile(Transport::Off, None);
+        remote_profile.remote = true;
+        let mut remote = Notifier::build(
+            preferences.clone(),
+            remote_profile,
+            Some(SystemDelivery::NotifySend),
+            None,
+        );
+        assert!(!remote.system_available());
+        assert!(!remote.accept(NotificationKind::Failed, "s1", "e1", &context(None, false)));
+        remote.emit("s1", "Vibex", "Agent failed");
+        assert!(remote.take_pending_system().is_empty());
+
+        // A host with no program to draw it: the preference is not a promise.
+        let mut bare = Notifier::build(
+            preferences.clone(),
+            profile(Transport::Off, None),
+            None,
+            None,
+        );
+        assert!(!bare.system_available());
+        bare.emit("s1", "Vibex", "Agent failed");
+        assert!(bare.take_pending_system().is_empty());
+
+        // And the reader's own switch, off.
+        let declined = Notifier::build(
+            NotifyPreferences {
+                system_popup: Some(false),
+                ..preferences
+            },
+            profile(Transport::Off, None),
+            Some(SystemDelivery::NotifySend),
+            None,
+        );
+        assert!(!declined.system_available());
+    }
+
+    #[test]
+    fn a_popup_payload_cannot_carry_control_bytes_either() {
+        let mut notifier = Notifier::build(
+            NotifyPreferences {
+                transport: Some(Transport::Off.id().to_string()),
+                ..NotifyPreferences::default()
+            },
+            profile(Transport::Off, None),
+            Some(SystemDelivery::NotifySend),
+            None,
+        );
+        notifier.emit("s1", "Vibex", "line\nbreak\x07");
+        let pending = notifier.take_pending_system();
+        assert_eq!(pending[0].body, "line break");
+    }
+
+    #[test]
+    fn the_osascript_payload_quotes_what_it_carries() {
+        let command = SystemDelivery::OsaScript.command("Vibex", "he said \"hi\" \\ bye");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-e".to_string(),
+                "display notification \"he said \\\"hi\\\" \\\\ bye\" with title \"Vibex\""
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_settings_page_edits_the_same_choices_the_file_holds() {
+        let mut notifier = built(NotifyPreferences::default(), profile(Transport::Bell, None));
+        assert!(notifier.enabled());
+        assert!(notifier.kind_enabled(NotificationKind::Failed));
+        assert_eq!(notifier.transport_preference(), None);
+        assert_eq!(notifier.detected_transport(), Transport::Bell);
+        assert!(!notifier.includes_session_title());
+        assert!(notifier.system_popup());
+
+        notifier.set_enabled(false);
+        notifier.set_kind_enabled(NotificationKind::Failed, false);
+        notifier.set_kind_enabled(NotificationKind::NeedsInput, false);
+        notifier.set_kind_enabled(NotificationKind::Completed, false);
+        notifier.set_transport(Some(Transport::Osc9));
+        notifier.set_include_session_title(true);
+        notifier.set_system_popup(false);
+
+        let written = serde_json::to_value(&notifier.preferences).unwrap();
+        assert_eq!(written["enabled"], serde_json::json!(false));
+        assert_eq!(written["notifyAgentFailed"], serde_json::json!(false));
+        assert_eq!(written["notifyAgentNeedsInput"], serde_json::json!(false));
+        assert_eq!(written["notifyAgentCompleted"], serde_json::json!(false));
+        assert_eq!(written["transport"], serde_json::json!("osc9"));
+        assert_eq!(written["includeSessionTitle"], serde_json::json!(true));
+        assert_eq!(written["systemPopup"], serde_json::json!(false));
+
+        // Handing the choice back to detection clears the stored spelling.
+        notifier.set_transport(None);
+        assert_eq!(notifier.transport(), Transport::Bell);
+        assert_eq!(notifier.transport_preference(), None);
+        assert!(notifier.preferences.transport.is_none());
+    }
+
+    #[test]
+    fn a_test_notification_takes_every_live_channel() {
+        let mut both = Notifier::build(
+            NotifyPreferences {
+                transport: Some(Transport::Bell.id().to_string()),
+                ..NotifyPreferences::default()
+            },
+            profile(Transport::Bell, None),
+            Some(SystemDelivery::NotifySend),
+            None,
+        );
+        assert!(both.emit_test("Vibex", "Test"));
+        assert_eq!(both.take_pending(), b"\x07".to_vec());
+        assert_eq!(both.take_pending_system().len(), 1);
+
+        // With the layer off there is nothing to test, and the settings page
+        // says so rather than writing a bell nobody asked for.
+        let mut off = built(
+            NotifyPreferences {
+                enabled: Some(false),
+                transport: Some(Transport::Bell.id().to_string()),
+                ..NotifyPreferences::default()
+            },
+            profile(Transport::Bell, None),
+        );
+        assert!(!off.emit_test("Vibex", "Test"));
+        assert!(off.take_pending().is_empty());
+        assert!(off.take_pending_system().is_empty());
+    }
+
+    #[test]
+    fn the_system_state_reports_what_the_reader_can_act_on() {
+        let local = |preference: bool| {
+            Notifier::build(
+                NotifyPreferences {
+                    system_popup: Some(preference),
+                    ..NotifyPreferences::default()
+                },
+                profile(Transport::Bell, None),
+                Some(SystemDelivery::NotifySend),
+                None,
+            )
+        };
+        assert!(local(true).system_available());
+        assert!(!local(false).system_available());
+
+        let mut remote_profile = profile(Transport::Bell, None);
+        remote_profile.remote = true;
+        let remote = Notifier::build(
+            NotifyPreferences::default(),
+            remote_profile,
+            Some(SystemDelivery::NotifySend),
+            None,
+        );
+        assert!(remote.remote());
+        assert!(!remote.system_available());
     }
 
     #[test]
@@ -823,7 +1491,7 @@ mod tests {
             transport: Some("carrier-pigeon".to_string()),
             ..NotifyPreferences::default()
         };
-        let notifier = Notifier::from_parts(preferences, profile(Transport::Osc9, None));
+        let notifier = built(preferences, profile(Transport::Osc9, None));
         assert_eq!(notifier.transport(), Transport::Osc9);
     }
 
@@ -878,7 +1546,7 @@ mod tests {
 
     #[test]
     fn switched_off_kinds_and_the_off_transport_stay_silent() {
-        let mut completed = Notifier::from_parts(
+        let mut completed = built(
             NotifyPreferences {
                 notify_agent_completed: Some(false),
                 ..NotifyPreferences::default()
@@ -943,7 +1611,7 @@ mod tests {
 
     #[test]
     fn tmux_gets_the_passthrough_envelope_with_doubled_escapes() {
-        let mut notifier = Notifier::from_parts(
+        let mut notifier = built(
             NotifyPreferences {
                 transport: Some(Transport::Osc9.id().to_string()),
                 ..NotifyPreferences::default()
@@ -959,7 +1627,7 @@ mod tests {
 
     #[test]
     fn the_bell_is_not_wrapped_for_tmux() {
-        let mut notifier = Notifier::from_parts(
+        let mut notifier = built(
             NotifyPreferences::default(),
             profile(Transport::Bell, Some(Multiplexer::Tmux)),
         );

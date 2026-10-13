@@ -4814,6 +4814,18 @@ impl App {
                 });
                 Outcome::effects(vec![])
             }
+            // The test row raises a real notification through every live
+            // channel, so the reader can see what their terminal — or their
+            // desktop — does with it. When nothing is live the answer says so
+            // rather than leaving them to wonder whether it worked.
+            crate::settings::SettingRow::NotifyTest => {
+                if self.test_notification() {
+                    self.toast(Toast::info(self.strings.settings_notify_test_sent()));
+                } else {
+                    self.toast(Toast::warning(self.strings.settings_notify_test_none()));
+                }
+                Outcome::quiet()
+            }
             _ => self.perform(Intent::ReloadKeymap),
         }
     }
@@ -4857,6 +4869,16 @@ impl App {
             crate::settings::definition(row).kind,
             crate::settings::SettingKind::ReadOnly | crate::settings::SettingKind::Action
         ) {
+            return Outcome::quiet();
+        }
+        // A toggle with no state to show — the desktop popup on a remote seat —
+        // has nothing to reset either, and asking first would be a question
+        // whose answer changes nothing.
+        if matches!(
+            crate::settings::definition(row).kind,
+            crate::settings::SettingKind::Toggle
+        ) && self.setting_choices(row).is_empty()
+        {
             return Outcome::quiet();
         }
         self.overlay = Some(Overlay::Confirm {

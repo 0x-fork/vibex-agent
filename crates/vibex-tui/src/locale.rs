@@ -1166,6 +1166,92 @@ strings! {
     },
     settings_on => { "On", "开", "開" },
     settings_off => { "Off", "关", "關" },
+    // ---- notifications ---------------------------------------------------
+    // The settings page's own copy for the notification layer. The three kinds
+    // are named the way the desktop names them, and the hint under each says
+    // what makes it news: a session the reader is not looking at.
+    settings_section_notifications => { "Notifications", "通知", "通知" },
+    settings_notifications => { "Notifications", "通知", "通知" },
+    settings_notifications_hint => {
+        "Announce a session that finishes, fails or waits for you while you are on another page or away from the terminal.",
+        "当会话完成、失败或等待确认，而你在其他页面或离开终端时提醒你。",
+        "當工作階段完成、失敗或等待確認，而你在其他頁面或離開終端時提醒你。"
+    },
+    settings_notify_completed => { "Agent completed", "Agent 完成", "Agent 完成" },
+    settings_notify_completed_hint => {
+        "Notify when an Agent turn completes.",
+        "Agent 回合完成时通知。",
+        "Agent 回合完成時通知。"
+    },
+    settings_notify_needs_input => { "Agent needs input", "Agent 需要输入", "Agent 需要輸入" },
+    settings_notify_needs_input_hint => {
+        "Notify when an Agent is waiting for input.",
+        "Agent 等待输入时通知。",
+        "Agent 等待輸入時通知。"
+    },
+    settings_notify_failed => { "Agent failed", "Agent 失败", "Agent 失敗" },
+    settings_notify_failed_hint => {
+        "Notify when an Agent turn fails.",
+        "Agent 回合失败时通知。",
+        "Agent 回合失敗時通知。"
+    },
+    settings_notify_transport => { "Terminal signal", "终端提示方式", "終端提示方式" },
+    settings_notify_transport_hint => {
+        "The escape sequence this terminal understands; automatic follows the terminal it detects.",
+        "该终端能识别的控制序列；自动会跟随探测到的终端。",
+        "該終端能識別的控制序列；自動會跟隨探測到的終端。"
+    },
+    settings_notify_transport_auto => { "Automatic", "自动", "自動" },
+    settings_notify_transport_off => { "Off (in-app only)", "关闭（仅界面内）", "關閉（僅介面內）" },
+    settings_notify_transport_bell => { "Bell", "响铃", "響鈴" },
+    settings_notify_transport_title => { "Window title", "窗口标题", "視窗標題" },
+    settings_notify_transport_osc9 => { "OSC 9 notification", "OSC 9 通知", "OSC 9 通知" },
+    settings_notify_transport_osc777 => { "OSC 777 notification", "OSC 777 通知", "OSC 777 通知" },
+    settings_notify_transport_osc99 => { "OSC 99 notification", "OSC 99 通知", "OSC 99 通知" },
+    settings_notify_transport_iterm2 => { "iTerm2 attention", "iTerm2 提醒", "iTerm2 提醒" },
+    settings_notify_system => { "Desktop popup", "系统弹窗", "系統彈窗" },
+    settings_notify_system_hint => {
+        "Draw a desktop notification with notify-send or osascript. Only on the machine running this client, never over ssh.",
+        "用 notify-send 或 osascript 弹出系统通知。仅在运行本客户端的机器上生效，SSH 连接下不会触发。",
+        "用 notify-send 或 osascript 彈出系統通知。僅在執行本客戶端的機器上生效，SSH 連線下不會觸發。"
+    },
+    settings_notify_system_remote => {
+        "Unavailable over ssh",
+        "SSH 连接下不可用",
+        "SSH 連線下不可用"
+    },
+    settings_notify_system_missing => {
+        "No notifier installed",
+        "未安装通知程序",
+        "未安裝通知程式"
+    },
+    settings_notify_title => { "Include session title", "通知带会话标题", "通知帶工作階段標題" },
+    settings_notify_title_hint => {
+        "Let the session's own title ride the notification. Off by default: a terminal may log it.",
+        "在通知中附带会话标题。默认关闭：终端可能记录该内容。",
+        "在通知中附帶工作階段標題。預設關閉：終端可能記錄該內容。"
+    },
+    settings_notify_test => { "Test notification", "测试通知", "測試通知" },
+    settings_notify_test_hint => {
+        "Send one now through the channels above, so you can see what this terminal does with it.",
+        "立即通过上面的通道发送一条，看看你的终端会怎么显示。",
+        "立即透過上面的通道傳送一條，看看你的終端會怎麼顯示。"
+    },
+    settings_notify_test_body => {
+        "Test notification from Vibex",
+        "来自 Vibex 的测试通知",
+        "來自 Vibex 的測試通知"
+    },
+    settings_notify_test_sent => {
+        "Test notification sent",
+        "测试通知已发送",
+        "測試通知已傳送"
+    },
+    settings_notify_test_none => {
+        "Nothing to send: notifications are off or every channel is",
+        "没有可发送的通道：通知已关闭，或所有通道都关闭了",
+        "沒有可傳送的通道：通知已關閉，或所有通道都關閉了"
+    },
     settings_reasoning_display => { "Reasoning display", "推理显示方式", "推理顯示方式" },
     settings_reasoning_display_hint => {
         "Show the latest live reasoning at the bottom, or keep reasoning in the timeline.",

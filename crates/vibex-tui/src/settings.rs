@@ -18,6 +18,7 @@ use vibex_desktop_model::{ReasoningDisplayMode, ReasoningExpansionMode, ThemeSel
 use crate::app::App;
 use crate::locale::{Locale, Strings};
 use crate::logo::MarkStyle;
+use crate::notify::{NotificationKind, NotifySystemState, Transport};
 use crate::theme::GlyphMode;
 
 /// The theme id held by the slot for one appearance.
@@ -56,12 +57,40 @@ pub enum SettingRow {
     ReasoningDisplay,
     ReasoningExpanded,
     ReasoningExpansion,
+    Notifications,
+    NotifyCompleted,
+    NotifyNeedsInput,
+    NotifyFailed,
+    NotifyTransport,
+    NotifySystem,
+    NotifyTitle,
+    NotifyTest,
     Language,
     Keys,
     Workspace,
     Backend,
     Seat,
     Version,
+}
+
+impl SettingRow {
+    /// Whether the row edits the notification layer rather than the interface.
+    ///
+    /// The two remember their choices in different files, so the row decides
+    /// which one a change is written to — and only that one: rewriting the
+    /// other would say a preference had changed when it had not.
+    pub const fn is_notification(self) -> bool {
+        matches!(
+            self,
+            Self::Notifications
+                | Self::NotifyCompleted
+                | Self::NotifyNeedsInput
+                | Self::NotifyFailed
+                | Self::NotifyTransport
+                | Self::NotifySystem
+                | Self::NotifyTitle
+        )
+    }
 }
 
 /// How a setting's value is presented and changed.
@@ -84,14 +113,16 @@ pub enum SettingKind {
 pub enum SettingsSection {
     Appearance,
     Timeline,
+    Notifications,
     Language,
     Interface,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 4] = [
+    pub const ALL: [SettingsSection; 5] = [
         SettingsSection::Appearance,
         SettingsSection::Timeline,
+        SettingsSection::Notifications,
         SettingsSection::Language,
         SettingsSection::Interface,
     ];
@@ -100,6 +131,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Appearance => strings.settings_section_appearance(),
             SettingsSection::Timeline => strings.help_category_transcript(),
+            SettingsSection::Notifications => strings.settings_section_notifications(),
             SettingsSection::Language => strings.settings_section_language(),
             SettingsSection::Interface => strings.settings_section_interface(),
         }
@@ -162,6 +194,46 @@ pub const SETTINGS: &[SettingDef] = &[
         kind: SettingKind::Choice,
     },
     SettingDef {
+        row: SettingRow::Notifications,
+        section: SettingsSection::Notifications,
+        kind: SettingKind::Toggle,
+    },
+    SettingDef {
+        row: SettingRow::NotifyCompleted,
+        section: SettingsSection::Notifications,
+        kind: SettingKind::Toggle,
+    },
+    SettingDef {
+        row: SettingRow::NotifyNeedsInput,
+        section: SettingsSection::Notifications,
+        kind: SettingKind::Toggle,
+    },
+    SettingDef {
+        row: SettingRow::NotifyFailed,
+        section: SettingsSection::Notifications,
+        kind: SettingKind::Toggle,
+    },
+    SettingDef {
+        row: SettingRow::NotifyTransport,
+        section: SettingsSection::Notifications,
+        kind: SettingKind::Choice,
+    },
+    SettingDef {
+        row: SettingRow::NotifySystem,
+        section: SettingsSection::Notifications,
+        kind: SettingKind::Toggle,
+    },
+    SettingDef {
+        row: SettingRow::NotifyTitle,
+        section: SettingsSection::Notifications,
+        kind: SettingKind::Toggle,
+    },
+    SettingDef {
+        row: SettingRow::NotifyTest,
+        section: SettingsSection::Notifications,
+        kind: SettingKind::Action,
+    },
+    SettingDef {
         row: SettingRow::Language,
         section: SettingsSection::Language,
         kind: SettingKind::Choice,
@@ -199,6 +271,22 @@ pub fn definition(row: SettingRow) -> &'static SettingDef {
         .iter()
         .find(|definition| definition.row == row)
         .expect("every SettingRow has a definition")
+}
+
+/// The name a transport is shown under.
+///
+/// The sequences are named in the reader's language, except for the OSCs, whose
+/// numbers are the only names their terminals document them under.
+pub fn transport_label(transport: Transport, strings: Strings) -> &'static str {
+    match transport {
+        Transport::Off => strings.settings_notify_transport_off(),
+        Transport::Bell => strings.settings_notify_transport_bell(),
+        Transport::Title => strings.settings_notify_transport_title(),
+        Transport::Osc9 => strings.settings_notify_transport_osc9(),
+        Transport::Osc777 => strings.settings_notify_transport_osc777(),
+        Transport::Osc99 => strings.settings_notify_transport_osc99(),
+        Transport::Iterm2Attention => strings.settings_notify_transport_iterm2(),
+    }
 }
 
 /// Which interaction the settings surface is in.
@@ -322,6 +410,14 @@ impl App {
             SettingRow::ReasoningDisplay => strings.settings_reasoning_display(),
             SettingRow::ReasoningExpanded => strings.settings_reasoning_expanded(),
             SettingRow::ReasoningExpansion => strings.settings_reasoning_expansion(),
+            SettingRow::Notifications => strings.settings_notifications(),
+            SettingRow::NotifyCompleted => strings.settings_notify_completed(),
+            SettingRow::NotifyNeedsInput => strings.settings_notify_needs_input(),
+            SettingRow::NotifyFailed => strings.settings_notify_failed(),
+            SettingRow::NotifyTransport => strings.settings_notify_transport(),
+            SettingRow::NotifySystem => strings.settings_notify_system(),
+            SettingRow::NotifyTitle => strings.settings_notify_title(),
+            SettingRow::NotifyTest => strings.settings_notify_test(),
             SettingRow::Language => strings.settings_language(),
             SettingRow::Keys => strings.settings_keys(),
             SettingRow::Workspace => strings.session_workspace(),
@@ -343,6 +439,14 @@ impl App {
             SettingRow::ReasoningDisplay => strings.settings_reasoning_display_hint(),
             SettingRow::ReasoningExpanded => strings.settings_reasoning_expanded_hint(),
             SettingRow::ReasoningExpansion => strings.settings_reasoning_expansion_hint(),
+            SettingRow::Notifications => strings.settings_notifications_hint(),
+            SettingRow::NotifyCompleted => strings.settings_notify_completed_hint(),
+            SettingRow::NotifyNeedsInput => strings.settings_notify_needs_input_hint(),
+            SettingRow::NotifyFailed => strings.settings_notify_failed_hint(),
+            SettingRow::NotifyTransport => strings.settings_notify_transport_hint(),
+            SettingRow::NotifySystem => strings.settings_notify_system_hint(),
+            SettingRow::NotifyTitle => strings.settings_notify_title_hint(),
+            SettingRow::NotifyTest => strings.settings_notify_test_hint(),
             SettingRow::Language => strings.settings_language_hint(),
             SettingRow::Keys => strings.settings_keys_hint(),
             SettingRow::Workspace => strings.settings_workspace_hint(),
@@ -384,6 +488,39 @@ impl App {
             }
             .to_string(),
             SettingRow::Language => self.settings.locale.tag().to_string(),
+            SettingRow::Notifications => self.toggle_label(self.notify.enabled()),
+            SettingRow::NotifyCompleted => {
+                self.toggle_label(self.notify.kind_enabled(NotificationKind::Completed))
+            }
+            SettingRow::NotifyNeedsInput => {
+                self.toggle_label(self.notify.kind_enabled(NotificationKind::NeedsInput))
+            }
+            SettingRow::NotifyFailed => {
+                self.toggle_label(self.notify.kind_enabled(NotificationKind::Failed))
+            }
+            SettingRow::NotifyTransport => match self.notify.transport_preference() {
+                Some(transport) => transport_label(transport, self.strings).to_string(),
+                None => format!(
+                    "{} · {}",
+                    self.strings.settings_notify_transport_auto(),
+                    transport_label(self.notify.detected_transport(), self.strings)
+                ),
+            },
+            SettingRow::NotifySystem => match self.notification_system_state() {
+                NotifySystemState::On => self.strings.settings_on().to_string(),
+                NotifySystemState::Off => self.strings.settings_off().to_string(),
+                NotifySystemState::Remote => {
+                    self.strings.settings_notify_system_remote().to_string()
+                }
+                NotifySystemState::Unsupported => {
+                    self.strings.settings_notify_system_missing().to_string()
+                }
+            },
+            SettingRow::NotifyTitle => self.toggle_label(self.notify.includes_session_title()),
+            // An action rather than a value, so the row reports what the button
+            // would actually reach: a reader who turned every channel off can
+            // see that before pressing it.
+            SettingRow::NotifyTest => self.notification_channel_summary(),
             SettingRow::Keys => format!(
                 "{} · {}",
                 self.strings.settings_keys_reload(),
@@ -460,9 +597,15 @@ impl App {
                     current: style == self.settings.mark,
                 })
                 .collect(),
-            SettingRow::Motion | SettingRow::Transitions | SettingRow::ReasoningExpanded => {
-                self.toggle_choices(row)
-            }
+            SettingRow::Motion
+            | SettingRow::Transitions
+            | SettingRow::ReasoningExpanded
+            | SettingRow::Notifications
+            | SettingRow::NotifyCompleted
+            | SettingRow::NotifyNeedsInput
+            | SettingRow::NotifyFailed
+            | SettingRow::NotifySystem
+            | SettingRow::NotifyTitle => self.toggle_choices(row),
             SettingRow::ReasoningDisplay => [
                 (
                     ReasoningDisplayMode::LatestAtBottom,
@@ -501,6 +644,24 @@ impl App {
                 current: mode == self.settings.reasoning_expansion_mode,
             })
             .collect(),
+            // The first choice hands the decision back to detection, and names
+            // what detection picked so the reader can see what they are
+            // choosing between before they choose it.
+            SettingRow::NotifyTransport => std::iter::once(SettingChoice {
+                value: "auto".to_string(),
+                label: format!(
+                    "{} · {}",
+                    self.strings.settings_notify_transport_auto(),
+                    transport_label(self.notify.detected_transport(), self.strings)
+                ),
+                current: self.notify.transport_preference().is_none(),
+            })
+            .chain(Transport::ALL.into_iter().map(|transport| SettingChoice {
+                value: transport.id().to_string(),
+                label: transport_label(transport, self.strings).to_string(),
+                current: self.notify.transport_preference() == Some(transport),
+            }))
+            .collect(),
             SettingRow::Language => [Locale::En, Locale::ZhCn, Locale::ZhTw]
                 .into_iter()
                 .map(|locale| SettingChoice {
@@ -531,6 +692,16 @@ impl App {
             SettingRow::ReasoningDisplay => "latest_at_bottom".to_string(),
             SettingRow::ReasoningExpanded => "off".to_string(),
             SettingRow::ReasoningExpansion => "window".to_string(),
+            // Every notification switch is on as shipped, the title is off, and
+            // the transport follows the terminal: a reset puts the layer back
+            // to what a reader who never opened this page already has.
+            SettingRow::Notifications
+            | SettingRow::NotifyCompleted
+            | SettingRow::NotifyNeedsInput
+            | SettingRow::NotifyFailed
+            | SettingRow::NotifySystem => "on".to_string(),
+            SettingRow::NotifyTransport => "auto".to_string(),
+            SettingRow::NotifyTitle => "off".to_string(),
             SettingRow::Language => Locale::En.tag().to_string(),
             SettingRow::Workspace => String::new(),
             _ => self.setting_value(row),
@@ -546,16 +717,75 @@ impl App {
         }
     }
 
+    /// The state a toggle row is in, when it has one to show.
+    ///
+    /// `None` is the honest answer for a toggle whose channel cannot work here
+    /// — the desktop popup on a remote seat — and it is what makes the row
+    /// inert: no choices means nothing to pick, nothing to step and nothing to
+    /// reset.
+    fn toggle_on(&self, row: SettingRow) -> Option<bool> {
+        match row {
+            SettingRow::Motion => Some(self.settings.motion),
+            SettingRow::Transitions => Some(self.settings.transitions),
+            SettingRow::ReasoningExpanded => Some(self.settings.reasoning_expanded_by_default),
+            SettingRow::Notifications => Some(self.notify.enabled()),
+            SettingRow::NotifyCompleted => {
+                Some(self.notify.kind_enabled(NotificationKind::Completed))
+            }
+            SettingRow::NotifyNeedsInput => {
+                Some(self.notify.kind_enabled(NotificationKind::NeedsInput))
+            }
+            SettingRow::NotifyFailed => Some(self.notify.kind_enabled(NotificationKind::Failed)),
+            SettingRow::NotifyTitle => Some(self.notify.includes_session_title()),
+            SettingRow::NotifySystem => match self.notification_system_state() {
+                NotifySystemState::On => Some(true),
+                NotifySystemState::Off => Some(false),
+                NotifySystemState::Remote | NotifySystemState::Unsupported => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Apply one kind's toggle value.
+    fn set_notification_kind(&mut self, value: &str, kind: NotificationKind) -> bool {
+        let Some(on) = Self::toggle_value(value) else {
+            return false;
+        };
+        if on == self.notify.kind_enabled(kind) {
+            return false;
+        }
+        self.notify.set_kind_enabled(kind, on);
+        true
+    }
+
+    /// What the test row would reach, for its value.
+    ///
+    /// The terminal channel and the popup are named separately because they are
+    /// separate switches; the summary is what the reader is about to send.
+    fn notification_channel_summary(&self) -> String {
+        let mut channels: Vec<&str> = Vec::new();
+        if self.notify.enabled() {
+            if self.notify.transport() != Transport::Off {
+                channels.push(transport_label(self.notify.transport(), self.strings));
+            }
+            if self.notify.system_available() {
+                channels.push(self.strings.settings_notify_system());
+            }
+        }
+        if channels.is_empty() {
+            return self.strings.settings_off().to_string();
+        }
+        channels.join(" · ")
+    }
+
     /// The two values a toggle row offers.
     ///
     /// A toggle is a choice with two values rather than a kind of its own: the
     /// picker, the key that steps it and the reset all read the same list, so
     /// they cannot disagree about what the other state is called.
     fn toggle_choices(&self, row: SettingRow) -> Vec<SettingChoice> {
-        let current = match row {
-            SettingRow::Motion => self.settings.motion,
-            SettingRow::ReasoningExpanded => self.settings.reasoning_expanded_by_default,
-            _ => self.settings.transitions,
+        let Some(current) = self.toggle_on(row) else {
+            return Vec::new();
         };
         [("on", true), ("off", false)]
             .into_iter()
@@ -585,7 +815,13 @@ impl App {
     pub fn apply_setting_value(&mut self, row: SettingRow, value: &str) -> bool {
         let changed = self.apply_setting_value_inner(row, value);
         if changed {
-            self.save_interface_preferences();
+            // Each surface remembers its own choices: the notification layer
+            // writes `tui-notify.json`, everything else the interface's file.
+            if row.is_notification() {
+                self.notify.save_preferences();
+            } else {
+                self.save_interface_preferences();
+            }
         }
         changed
     }
@@ -703,6 +939,65 @@ impl App {
                 self.sync_transcript();
                 true
             }
+            SettingRow::Notifications => {
+                let Some(on) = Self::toggle_value(value) else {
+                    return false;
+                };
+                if on == self.notify.enabled() {
+                    return false;
+                }
+                self.notify.set_enabled(on);
+                true
+            }
+            SettingRow::NotifyCompleted => {
+                self.set_notification_kind(value, NotificationKind::Completed)
+            }
+            SettingRow::NotifyNeedsInput => {
+                self.set_notification_kind(value, NotificationKind::NeedsInput)
+            }
+            SettingRow::NotifyFailed => self.set_notification_kind(value, NotificationKind::Failed),
+            SettingRow::NotifyTransport => {
+                // `auto` hands the choice back to detection; every other value
+                // is a transport id, and an id this build does not know is
+                // refused rather than silently stored.
+                let transport = match value {
+                    "auto" => None,
+                    id => match Transport::from_id(id) {
+                        Some(transport) => Some(transport),
+                        None => return false,
+                    },
+                };
+                if transport == self.notify.transport_preference() {
+                    return false;
+                }
+                self.notify.set_transport(transport);
+                true
+            }
+            SettingRow::NotifySystem => {
+                let Some(on) = Self::toggle_value(value) else {
+                    return false;
+                };
+                // A seat over ssh, or a host with no popup program, has no
+                // switch to flip: the row already says why, and storing a
+                // choice that cannot take effect would be a lie about it.
+                if self.toggle_on(SettingRow::NotifySystem).is_none()
+                    || on == self.notify.system_popup()
+                {
+                    return false;
+                }
+                self.notify.set_system_popup(on);
+                true
+            }
+            SettingRow::NotifyTitle => {
+                let Some(on) = Self::toggle_value(value) else {
+                    return false;
+                };
+                if on == self.notify.includes_session_title() {
+                    return false;
+                }
+                self.notify.set_include_session_title(on);
+                true
+            }
             SettingRow::Language => {
                 let Some(locale) = [Locale::En, Locale::ZhCn, Locale::ZhTw]
                     .into_iter()
@@ -730,9 +1025,13 @@ impl App {
                 self.preferred_workspace = path;
                 true
             }
-            SettingRow::Keys | SettingRow::Backend | SettingRow::Seat | SettingRow::Version => {
-                false
-            }
+            // Rows that carry no value: the test is a command, the rest are
+            // reported rather than set.
+            SettingRow::NotifyTest
+            | SettingRow::Keys
+            | SettingRow::Backend
+            | SettingRow::Seat
+            | SettingRow::Version => false,
         }
     }
 

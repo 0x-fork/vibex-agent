@@ -382,6 +382,7 @@ mod tests {
             transport: crate::notify::Transport::Title,
             multiplexer,
             terminal: terminal.map(str::to_string),
+            remote: false,
         }
     }
 

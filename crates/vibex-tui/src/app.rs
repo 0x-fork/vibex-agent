@@ -1591,7 +1591,7 @@ impl App {
             pending_send_serial: 0,
             unread_sessions: std::collections::BTreeSet::new(),
             session_echoes: BTreeMap::new(),
-            notify: crate::notify::Notifier::new(),
+            notify: crate::notify::Notifier::new(options.notify_path.clone()),
             terminal_images: crate::terminal_image::ImageSupport::detect(),
             picture: crate::preview::PlacedPicture::default(),
             banner: None,
@@ -6207,6 +6207,13 @@ pub struct AppOptions {
     /// reader who wants the interface back at its shipped defaults deletes it
     /// without losing the arrangement or the switcher's memory.
     pub preferences_path: Option<std::path::PathBuf>,
+    /// Where the notification layer's choices are kept.
+    ///
+    /// `None` reads nothing and writes nothing, which is what a preview and a
+    /// test want: a test that flipped a notification switch would otherwise
+    /// edit the file of whoever ran it, and would race every test doing the
+    /// same. The composition root names the real file.
+    pub notify_path: Option<std::path::PathBuf>,
 }
 
 impl Default for AppOptions {
@@ -6228,6 +6235,10 @@ impl AppOptions {
             sidebar_path: App::sidebar_arrangement_path(),
             runtime_path: App::runtime_preferences_path(),
             preferences_path: App::interface_preferences_path(),
+            // Not `App::notification_preferences_path()`: a test that flips a
+            // notification switch writes the file, and the settings page's own
+            // tests are the ones that do it.
+            notify_path: None,
         }
     }
 }

@@ -212,6 +212,7 @@ pub fn run(facade: BackendFacade, options: TuiOptions) -> BackendResult<ExitReas
             sidebar_path: App::sidebar_arrangement_path(),
             runtime_path: App::runtime_preferences_path(),
             preferences_path,
+            notify_path: App::notification_preferences_path(),
         },
     );
     let result = run::run_loop(&mut app, &worker, &mut messages);

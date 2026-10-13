@@ -1060,7 +1060,73 @@ is never a column count.
   `Transcript::plain_lines` (not the viewport) so a drag can exceed the screen,
   and painted by grapheme so a wide glyph is never split.
 
-## 8. Security
+## 8. Notifications
+
+`crate::notify` is the out-of-band layer: it tells the reader about a session the
+terminal is not showing. It paints nothing — every byte and every process it
+produces leaves *after* the frame, through one door in the run loop — and it has
+exactly two channels:
+
+| channel | carrier | reaches |
+| --- | --- | --- |
+| terminal escapes | `BEL`, `OSC 2` / `9` / `777` / `99` / `1337` | the reader's own terminal, across `ssh` |
+| desktop popup | `notify-send` (Linux/BSD) or `osascript` (macOS) | the host the client runs on, never a remote seat |
+
+* **The escape is the only channel that survives `ssh`, and detection picks it,
+  not a probe.** The client writes the bytes and the reader's terminal (or the
+  multiplexer in front of it) interprets them. Asking the terminal what it
+  supports would put a query in the input queue the interface is about to read,
+  and the answer changes only the spelling of a sequence an unknown terminal
+  ignores. `TerminalProfile::detect_from` is the table (`TERM_PROGRAM`, `TERM`,
+  `KITTY_WINDOW_ID`, `WT_SESSION`, `VTE_VERSION`, …) and it is a unit test; an
+  unrecognised terminal gets `OSC 2`, the title.
+* **A multiplexer is respected.** tmux and screen swallow OSCs they do not
+  implement, so inside one the default is the bell (tmux always forwards it and
+  flags the window) and a configured OSC is wrapped in tmux's passthrough
+  envelope. Without `allow-passthrough on` the envelope is discarded, which
+  degrades to "no notification" rather than to stray text on the screen.
+* **The desktop popup is fenced twice.** It is the one thing here that starts a
+  process, so it never fires unless the reader turned it on *and* the seat is
+  local: `SSH_CONNECTION` / `SSH_TTY` / `SSH_CLIENT` mark a remote seat, where a
+  bubble would be drawn on the cloud host and the client would report success.
+  The child is reaped on its own thread, and a missing program is a state the
+  settings row states rather than a failure to retry.
+* **A notification is news only when the reader is not already reading it.**
+  `accept` is the one policy: the layer must be on, at least one channel must be
+  live, the kind must be switched on, and the reader must not be looking at that
+  session's own page with the terminal focused. Focus comes from DECSET 1004
+  (tmux needs `focus-events on`); a terminal that never reports focus is assumed
+  to be focused, so an unsupported terminal does not turn every failure into a
+  bell.
+* **The dedup key is the runtime's `(session, source_event_id)`.** The live
+  stream, the polling fallback and the remote seat's notification intent all
+  spell the same pair, so one failure is announced once; the ledger is bounded
+  and consumed at `accept`, so a suppressed event does not silence a later
+  duplicate.
+* **The payload carries no Agent prose.** A terminal may log an OSC payload and
+  a title is read by anyone glancing at the screen, so a notification is the
+  kind plus the Agent's name, localized; the session title rides only when the
+  reader opts in (`includeSessionTitle`). Every field is sanitized: control
+  characters cannot close the sequence, whitespace collapses, and the length is
+  bounded.
+* **The settings page is a second door onto the same file.** The Notifications
+  section of the settings surface (master switch, the three kinds, the transport
+  chooser with an "automatic" value, the desktop popup, the title, and a test
+  button) edits the same `NotifyPreferences` the hand-written
+  `~/.vibex/tui-notify.json` holds, and `apply_setting_value` is the only
+  writer, so the page and the file cannot disagree. An unknown transport id in
+  the file falls back to detection rather than to "off".
+* **The path is the composition root's, like every other file.** `AppOptions`
+  carries `notify_path`; `None` reads and writes nothing, which is what a test
+  wants — a test that flipped a switch would otherwise edit the home of whoever
+  ran it. `App::notification_preferences_path()` is what `lib.rs::run` names.
+* **The test button goes through the real channels.** It skips the "is the
+  reader looking" policy (a test is asked for, not news) but not the master
+  switch, and its answer is a toast that says whether anything was sent — the
+  point of the button is to make a terminal's or a desktop's silence
+  attributable.
+
+## 9. Security
 
 | Rule | Requirement |
 | --- | --- |
@@ -1073,7 +1139,7 @@ is never a column count.
 | R7 | The client never opens the runtime database, except for the documented local bootstrap path. |
 | R8 | Non-loopback transport is HTTPS/WSS. Pinned TLS is preferred; plain HTTP only on loopback with an explicit opt-in. |
 
-## 9. Testing
+## 10. Testing
 
 | Layer | What it proves |
 | --- | --- |

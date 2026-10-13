@@ -2708,6 +2708,180 @@ fn the_landing_effects_are_rows_the_settings_page_offers() {
 }
 
 #[test]
+fn the_settings_page_carries_the_notification_switches() {
+    use vibex_tui::app::SettingsMode;
+    use vibex_tui::settings::{SettingKind, SettingRow, definition};
+    // The layer is switches and one chooser; the test is a command rather than
+    // a value, which is what makes it a button.
+    assert_eq!(
+        definition(SettingRow::Notifications).kind,
+        SettingKind::Toggle
+    );
+    assert_eq!(
+        definition(SettingRow::NotifyTransport).kind,
+        SettingKind::Choice
+    );
+    assert_eq!(definition(SettingRow::NotifyTest).kind, SettingKind::Action);
+
+    let mut app = settings_app(120, 40);
+    let rows = app.visible_settings();
+    for row in [
+        SettingRow::Notifications,
+        SettingRow::NotifyCompleted,
+        SettingRow::NotifyNeedsInput,
+        SettingRow::NotifyFailed,
+        SettingRow::NotifyTransport,
+        SettingRow::NotifySystem,
+        SettingRow::NotifyTitle,
+        SettingRow::NotifyTest,
+    ] {
+        assert!(rows.contains(&row), "{row:?} is not on the settings page");
+    }
+    let screen = text(&render(&mut app, 120, 40));
+    for word in [
+        "Notifications",
+        "Agent completed",
+        "Agent needs input",
+        "Agent failed",
+        "Terminal signal",
+        "Desktop popup",
+        "Test notification",
+    ] {
+        assert!(screen.contains(word), "{word} is not drawn:\n{screen}");
+    }
+
+    // The shipped defaults: the layer on, the title off, and the transport
+    // following whatever the terminal is.
+    assert_eq!(app.setting_value(SettingRow::Notifications), "On");
+    assert_eq!(app.setting_value(SettingRow::NotifyCompleted), "On");
+    assert_eq!(app.setting_value(SettingRow::NotifyTitle), "Off");
+    assert!(app.notify.transport_preference().is_none());
+
+    // `Enter` on the master flips it where it stands.
+    select_setting(&mut app, SettingRow::Notifications);
+    app.perform(vibex_tui::action::Intent::ActivateSetting);
+    assert!(!app.notify.enabled());
+    assert_eq!(app.setting_value(SettingRow::Notifications), "Off");
+
+    // One kind can be switched off on its own, and the others stay on.
+    app.apply_setting_value(SettingRow::NotifyFailed, "off");
+    assert!(
+        !app.notify
+            .kind_enabled(vibex_tui::notify::NotificationKind::Failed)
+    );
+    assert!(
+        app.notify
+            .kind_enabled(vibex_tui::notify::NotificationKind::NeedsInput)
+    );
+
+    // The transport opens a chooser whose first value hands the decision back
+    // to detection, and whose others name the sequences.
+    select_setting(&mut app, SettingRow::NotifyTransport);
+    app.perform(vibex_tui::action::Intent::ActivateSetting);
+    assert!(matches!(app.settings.view, SettingsMode::Picking { .. }));
+    let choices = app.setting_choices(SettingRow::NotifyTransport);
+    assert_eq!(choices[0].value, "auto");
+    assert!(choices[0].current, "automatic is not marked as the value");
+    let screen = text(&render(&mut app, 120, 40));
+    for word in ["Automatic", "Bell", "Window title", "OSC 9"] {
+        assert!(
+            screen.contains(word),
+            "the transport chooser lost {word}:\n{screen}"
+        );
+    }
+    app.step_setting_pick(2);
+    app.commit_setting_pick();
+    assert_eq!(
+        app.notify.transport(),
+        vibex_tui::notify::Transport::Bell,
+        "the chooser did not take the transport it drew"
+    );
+    assert_eq!(app.setting_value(SettingRow::NotifyTransport), "Bell");
+}
+
+#[test]
+fn a_test_notification_reaches_the_channels_the_page_names() {
+    use vibex_tui::settings::SettingRow;
+    let mut app = settings_app(120, 40);
+    // The bell is the one channel whose bytes are the same everywhere, so the
+    // test asserts the write rather than the terminal that would interpret it.
+    app.apply_setting_value(SettingRow::NotifyTransport, "bell");
+    app.apply_setting_value(SettingRow::Notifications, "on");
+    select_setting(&mut app, SettingRow::NotifyTest);
+    app.perform(vibex_tui::action::Intent::ActivateSetting);
+    assert_eq!(
+        app.take_terminal_notifications(),
+        b"\x07".to_vec(),
+        "the test did not reach the terminal channel"
+    );
+    let toast = app.toast.as_ref().expect("the test answers with a toast");
+    assert!(
+        toast.text.contains("sent"),
+        "the answer does not say what happened: {}",
+        toast.text
+    );
+
+    // With the layer off there is nothing to send, and the answer says so
+    // rather than leaving the reader to wonder whether the terminal is broken.
+    app.apply_setting_value(SettingRow::Notifications, "off");
+    app.perform(vibex_tui::action::Intent::ActivateSetting);
+    assert!(app.take_terminal_notifications().is_empty());
+    let toast = app.toast.as_ref().expect("the refusal is answered too");
+    assert!(
+        toast.text.contains("Nothing to send"),
+        "the refusal does not say why: {}",
+        toast.text
+    );
+}
+
+#[test]
+fn a_notification_switch_is_written_to_the_notification_file() {
+    use vibex_tui::settings::SettingRow;
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("tui-notify.json");
+    let mut app = App::new(
+        DisconnectedBackend::facade(),
+        AppOptions {
+            seat: SeatKind::Remote,
+            capability: ColorCapability {
+                mode: ColorMode::TrueColor,
+                glyphs: GlyphMode::Unicode,
+            },
+            theme_id: Some("vibex-dark".to_string()),
+            mode: vibex_ui::GpuiThemeMode::Dark,
+            locale: Locale::En,
+            sidebar_path: None,
+            runtime_path: None,
+            preferences_path: None,
+            notify_path: Some(path.clone()),
+            ..Default::default()
+        },
+    );
+    app.perform(vibex_tui::action::Intent::OpenSettings);
+
+    app.apply_setting_value(SettingRow::Notifications, "off");
+    app.apply_setting_value(SettingRow::NotifyNeedsInput, "off");
+    app.apply_setting_value(SettingRow::NotifyTransport, "osc9");
+    app.apply_setting_value(SettingRow::NotifyTitle, "on");
+
+    let written = std::fs::read_to_string(&path).expect("the choices are written");
+    for needle in [
+        "\"enabled\": false",
+        "\"notifyAgentNeedsInput\": false",
+        "\"transport\": \"osc9\"",
+        "\"includeSessionTitle\": true",
+    ] {
+        assert!(
+            written.contains(needle),
+            "the file lost {needle}:\n{written}"
+        );
+    }
+    // The interface's own file is not the notification layer's, and nothing
+    // else was written beside it.
+    assert!(!directory.path().join("tui-interface.json").exists());
+}
+
+#[test]
 fn the_settings_editor_commits_a_workspace_path() {
     use vibex_tui::app::SettingsMode;
     use vibex_tui::settings::SettingRow;
