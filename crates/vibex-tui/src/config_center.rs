@@ -360,8 +360,9 @@ pub fn columns(
     match section {
         ConfigSection::Agents => vec![
             strings.config_col_install(),
+            strings.config_col_version(),
             strings.config_col_runtime(),
-            strings.config_col_source(),
+            strings.config_col_auth(),
             strings.config_col_models(),
         ],
         ConfigSection::Providers => vec![
@@ -429,11 +430,233 @@ pub struct ConfigCenter {
     /// The record key each area's cursor was last resolved against, so a list
     /// that refreshed can keep the cursor on the same record.
     pinned: BTreeMap<&'static str, String>,
-    /// What the last mutation said, drawn under the table.
+    /// What the last write said, drawn under the table.
+    ///
+    /// It is the same sentence the reader was toasted with, kept in place so a
+    /// reader who looked away can still read what happened rather than having
+    /// to repeat the action to find out.
     pub notice: Option<(String, ConfigTone)>,
-    /// Row keys with an action in flight, so a press cannot be queued twice and
-    /// the row can say it is working.
-    pub pending: BTreeMap<String, String>,
+    /// Records with a write in flight, so a press cannot be queued twice, the
+    /// row can say it is working, and the answer can name what it was about.
+    pub pending: BTreeMap<String, PendingWrite>,
+}
+
+/// The key a form's write is filed under.
+///
+/// A form creates or edits a record the table has not drawn yet, so there is no
+/// row to wear the marker and nothing to name the answer after: while the form
+/// is open, the form *is* the record whose write is in flight.
+pub const FORM_RECORD: &str = "form";
+
+/// One record's write, from the moment it is asked for until it answers.
+///
+/// The key alone is not enough to report the result: a toast that read
+/// `agent:codex: refused` names the database row rather than the Agent, and a
+/// reader cannot tell "Check update" from "Install" once the call is over. The
+/// subject and the verb travel with the write so the answer is a sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWrite {
+    /// The record as the reader reads it — the row's own title.
+    pub subject: String,
+    pub verb: ConfigVerb,
+}
+
+impl PendingWrite {
+    /// What the reader is told as the write lands.
+    ///
+    /// The verb says what was done; the outcome says what came back, when the
+    /// runtime had something to say about it — a version, a verdict, how many
+    /// methods the Agent advertises.
+    pub fn message(&self, strings: Strings, outcome: &crate::app::MutationOutcome) -> String {
+        use crate::app::MutationOutcome as Outcome;
+        let done = self.verb.done(strings);
+        let detail = match outcome {
+            Outcome::Plain => None,
+            Outcome::UpToDate => Some(strings.config_result_up_to_date().to_string()),
+            Outcome::UpdateAvailable { version } => Some(format!(
+                "{} {version} {}",
+                strings.config_result_version(),
+                strings.config_result_available()
+            )),
+            Outcome::Installed { version } => Some(match version {
+                Some(version) => format!("{} {version}", strings.config_result_version()),
+                None => strings.config_result_installed().to_string(),
+            }),
+            Outcome::Auth {
+                methods,
+                account,
+                authenticated,
+            } => Some(if *authenticated {
+                account
+                    .clone()
+                    .unwrap_or_else(|| strings.config_result_signed_in().to_string())
+            } else {
+                // How many ways in there are is the useful half of "nobody is
+                // signed in": it says the verb found something to offer.
+                format!(
+                    "{} · {methods} {}",
+                    strings.config_result_signed_out(),
+                    strings.config_result_methods()
+                )
+            }),
+            Outcome::Models { count } => {
+                Some(format!("{count} {}", strings.config_result_models()))
+            }
+            Outcome::Verdict {
+                passed,
+                warned,
+                message,
+            } => Some(format!(
+                "{} · {message}",
+                if !passed {
+                    strings.config_result_failed()
+                } else if *warned {
+                    strings.config_result_warned()
+                } else {
+                    strings.config_result_ok()
+                }
+            )),
+        };
+        match detail {
+            Some(detail) if !detail.is_empty() => {
+                format!("{}: {done} · {detail}", self.subject)
+            }
+            _ => format!("{}: {done}", self.subject),
+        }
+    }
+
+    /// What the reader is told when the write was refused.
+    ///
+    /// The refusal names the record and the verb for the same reason the
+    /// success does: "install_agent: connection lost" says which row the key
+    /// was on to a reader who has to guess, and nothing about what was being
+    /// attempted.
+    pub fn failure(&self, strings: Strings, reason: &str) -> String {
+        format!(
+            "{}: {} · {}: {reason}",
+            self.subject,
+            self.verb.noun(strings),
+            strings.config_result_failed()
+        )
+    }
+}
+
+/// What a write is doing, as the two lines that report it read.
+///
+/// The verb is the record's alone; the subject is carried beside it. Together
+/// they are the whole report — `Codex: Installing…` while it runs and
+/// `Codex: Installed · version 1.3.0` when it lands — which is what a client
+/// needs to never leave the reader guessing whether a key did anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigVerb {
+    Install,
+    Rollback,
+    CheckUpdate,
+    RefreshSnapshot,
+    Enable,
+    Disable,
+    SignIn,
+    SignOut,
+    Uninstall,
+    Delete,
+    Save,
+    Create,
+    Activate,
+    Test,
+    FetchModels,
+    Validate,
+    Import,
+    InstallFromRegistry,
+    SetAgents,
+    Discover,
+    Search,
+}
+
+impl ConfigVerb {
+    /// What is happening, while it happens.
+    pub const fn running(self, strings: Strings) -> &'static str {
+        match self {
+            Self::Install => strings.config_running_install(),
+            Self::Rollback => strings.config_running_rollback(),
+            Self::CheckUpdate => strings.config_running_check_update(),
+            Self::RefreshSnapshot => strings.config_running_refresh(),
+            Self::Enable | Self::Disable => strings.config_running_toggle(),
+            Self::SignIn => strings.config_running_sign_in(),
+            Self::SignOut => strings.config_running_sign_out(),
+            Self::Uninstall => strings.config_running_uninstall(),
+            Self::Delete => strings.config_running_delete(),
+            Self::Save => strings.config_running_save(),
+            Self::Create => strings.config_running_create(),
+            Self::Activate => strings.config_running_activate(),
+            Self::Test => strings.config_running_test(),
+            Self::FetchModels => strings.config_running_fetch_models(),
+            Self::Validate => strings.config_running_validate(),
+            Self::Import => strings.config_running_import(),
+            Self::InstallFromRegistry => strings.config_running_registry_install(),
+            Self::SetAgents => strings.config_running_matrix(),
+            Self::Discover => strings.config_running_discover(),
+            Self::Search => strings.config_running_search(),
+        }
+    }
+
+    /// What was done, once it is done.
+    pub const fn done(self, strings: Strings) -> &'static str {
+        match self {
+            Self::Install => strings.config_done_install(),
+            Self::Rollback => strings.config_done_rollback(),
+            Self::CheckUpdate => strings.config_done_check_update(),
+            Self::RefreshSnapshot => strings.config_done_refresh(),
+            Self::Enable => strings.config_done_enable(),
+            Self::Disable => strings.config_done_disable(),
+            Self::SignIn => strings.config_done_sign_in(),
+            Self::SignOut => strings.config_done_sign_out(),
+            Self::Uninstall => strings.config_done_uninstall(),
+            Self::Delete => strings.config_done_delete(),
+            Self::Save => strings.config_done_save(),
+            Self::Create => strings.config_done_create(),
+            Self::Activate => strings.config_done_activate(),
+            Self::Test => strings.config_done_test(),
+            Self::FetchModels => strings.config_done_fetch_models(),
+            Self::Validate => strings.config_done_validate(),
+            Self::Import => strings.config_done_import(),
+            Self::InstallFromRegistry => strings.config_done_registry_install(),
+            Self::SetAgents => strings.config_done_matrix(),
+            Self::Discover => strings.config_done_discover(),
+            Self::Search => strings.config_done_search(),
+        }
+    }
+
+    /// What the verb is called when it did not happen.
+    ///
+    /// A refusal cannot borrow [`Self::done`]: "Installed · failed" contradicts
+    /// itself, and the past tense that reads as a record of what happened on
+    /// success reads as a mistake on failure. The noun is the phrase the reader
+    /// used when they pressed the key, so the sentence that names the failure
+    /// names the thing they asked for.
+    pub const fn noun(self, strings: Strings) -> &'static str {
+        match self {
+            Self::Install => strings.config_noun_install(),
+            Self::Rollback => strings.config_noun_rollback(),
+            Self::CheckUpdate => strings.config_noun_check_update(),
+            Self::RefreshSnapshot => strings.config_noun_refresh(),
+            Self::Enable | Self::Disable => strings.config_noun_toggle(),
+            Self::SignIn => strings.config_noun_sign_in(),
+            Self::SignOut => strings.config_noun_sign_out(),
+            Self::Uninstall => strings.config_noun_uninstall(),
+            Self::Delete => strings.config_noun_delete(),
+            Self::Save => strings.config_noun_save(),
+            Self::Create => strings.config_noun_create(),
+            Self::Activate => strings.config_noun_activate(),
+            Self::Test => strings.config_noun_test(),
+            Self::FetchModels => strings.config_noun_fetch_models(),
+            Self::Validate => strings.config_noun_validate(),
+            Self::Import => strings.config_noun_import(),
+            Self::InstallFromRegistry => strings.config_noun_registry_install(),
+            Self::SetAgents => strings.config_noun_matrix(),
+            Self::Discover => strings.config_noun_discover(),
+            Self::Search => strings.config_noun_search(),
+        }
+    }
 }
 
 impl Default for ConfigCenter {
@@ -618,17 +841,32 @@ impl ConfigCenter {
         self.pending.contains_key(key)
     }
 
-    pub fn begin_pending(&mut self, key: impl Into<String>, label: impl Into<String>) -> bool {
+    /// Note a write in flight. Answers false when the record already has one,
+    /// which is what keeps a held key from queueing the same call twice.
+    pub fn begin_pending(
+        &mut self,
+        key: impl Into<String>,
+        subject: impl Into<String>,
+        verb: ConfigVerb,
+    ) -> bool {
         let key = key.into();
         if self.pending.contains_key(&key) {
             return false;
         }
-        self.pending.insert(key, label.into());
+        self.pending.insert(
+            key,
+            PendingWrite {
+                subject: subject.into(),
+                verb,
+            },
+        );
         true
     }
 
-    pub fn finish_pending(&mut self, key: &str) {
-        self.pending.remove(key);
+    /// Retire a write and hand back what it was about, so the answer can name
+    /// the record and the verb rather than the key they were filed under.
+    pub fn finish_pending(&mut self, key: &str) -> Option<PendingWrite> {
+        self.pending.remove(key)
     }
 
     pub fn set_notice(&mut self, message: impl Into<String>, tone: ConfigTone) {
@@ -804,10 +1042,15 @@ fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
             } else {
                 actions.insert(0, ConfigAction::Install);
             }
+            // The authentication the runtime advertises for this Agent, when
+            // the reader has asked for it: the row says "not signed in" rather
+            // than leaving the sign-in verb looking like it did nothing.
+            let auth = auth_state(data, &agent.id);
             let mut row = ConfigRow::new(agent.id.as_str().to_string(), agent.label.clone())
                 .cell(install)
+                .cell(version_label(agent, strings))
                 .cell(runtime)
-                .cell(format!("{:?}", agent.source_kind))
+                .cell(auth.label(strings))
                 .cell(agent.models.len().to_string())
                 .chip(
                     if agent.enabled {
@@ -845,20 +1088,39 @@ fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                     ),
                 )
                 .detail(strings.config_field_version(), managed_line(agent, strings))
-                .detail(
-                    strings.config_field_configured(),
-                    if agent.configured {
-                        strings.config_yes()
-                    } else {
-                        strings.config_no()
-                    },
-                )
+                // The models the Agent advertises come before the flags: a
+                // detail pane scrolls, and what a reader opens this one for is
+                // what the Agent can run rather than whether it is configured.
                 .detail(
                     strings.config_field_models(),
                     if agent.models.is_empty() {
                         strings.config_agents_none().to_string()
                     } else {
                         agent.models.join(", ")
+                    },
+                )
+                .detail(
+                    strings.config_field_auth(),
+                    match &auth {
+                        AuthState::Unknown => strings.config_state_unknown().to_string(),
+                        AuthState::Required { methods } => {
+                            format!("{} ({methods})", strings.config_result_signed_out())
+                        }
+                        AuthState::SignedIn { account } => account
+                            .clone()
+                            .unwrap_or_else(|| strings.config_result_signed_in().to_string()),
+                    },
+                )
+                .detail(
+                    strings.config_field_source(),
+                    format!("{:?}", agent.source_kind),
+                )
+                .detail(
+                    strings.config_field_configured(),
+                    if agent.configured {
+                        strings.config_yes()
+                    } else {
+                        strings.config_no()
                     },
                 )
                 .detail(strings.config_field_command(), {
@@ -884,6 +1146,65 @@ fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
             row
         })
         .collect()
+}
+
+/// What the runtime last said about one Agent's account.
+///
+/// The TUI does not run the interactive sign-in itself, so this is what the
+/// runtime reports after a read: no context is "unknown" rather than "signed
+/// out", because a client that has not asked must not claim an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthState {
+    Unknown,
+    Required { methods: usize },
+    SignedIn { account: Option<String> },
+}
+
+impl AuthState {
+    fn label(&self, strings: Strings) -> String {
+        match self {
+            Self::Unknown => strings.config_state_unknown().to_string(),
+            Self::Required { .. } => strings.config_result_signed_out().to_string(),
+            Self::SignedIn { account } => account
+                .clone()
+                .unwrap_or_else(|| strings.config_result_signed_in().to_string()),
+        }
+    }
+}
+
+fn auth_state(data: &ManagementData, agent_id: &vibex_core::AgentId) -> AuthState {
+    let contexts = data
+        .agent_auth
+        .iter()
+        .filter(|context| context.agent_id == *agent_id)
+        .collect::<Vec<_>>();
+    if contexts.is_empty() {
+        return AuthState::Unknown;
+    }
+    let authenticated = contexts
+        .iter()
+        .find(|context| context.status == vibex_core::AgentAuthContextStatus::Authenticated);
+    match authenticated {
+        Some(context) => AuthState::SignedIn {
+            account: context.account_hint.clone(),
+        },
+        None => AuthState::Required {
+            methods: contexts.len(),
+        },
+    }
+}
+
+/// The version cell: what is installed, and what is waiting.
+fn version_label(agent: &vibex_core::AgentSnapshotEntry, strings: Strings) -> String {
+    let installed = agent.managed_install.installed_version.clone();
+    match (installed, agent.managed_install.available_version.clone()) {
+        (Some(installed), Some(available)) if available != installed => {
+            format!("{installed} → {available}")
+        }
+        (Some(installed), _) => installed,
+        (None, Some(available)) => format!("→ {available}"),
+        (None, None) => strings.config_agents_none().to_string(),
+    }
 }
 
 fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {

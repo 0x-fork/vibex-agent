@@ -2015,22 +2015,50 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 }
             }
         }
-        AppMessage::Mutation { key, result } => {
+        AppMessage::Mutation {
+            key,
+            record,
+            result,
+        } => {
             app.pending.remove(&key);
             // The write is over either way, so the row stops saying it is
-            // working. A failure says why below; it does not leave a spinner.
-            app.config_center.finish_pending(&key);
+            // working. What it was about comes back out with it: the answer
+            // names the record and the verb, which is the half a reader who
+            // looked away cannot reconstruct from the row alone.
+            let pending = record
+                .as_deref()
+                .and_then(|record| app.config_center.finish_pending(record));
             match result {
-                Ok(()) => {
+                Ok(outcome) => {
+                    if let Some(pending) = &pending {
+                        let message = pending.message(app.strings, &outcome);
+                        let tone = outcome.tone();
+                        app.toast(match tone {
+                            crate::config_center::ConfigTone::Bad => Toast::danger(message.clone()),
+                            crate::config_center::ConfigTone::Warn => {
+                                Toast::warning(message.clone())
+                            }
+                            _ => Toast::success(message.clone()),
+                        });
+                        // The toast is gone in seconds; the line under the
+                        // table stays, so the reader who was reading something
+                        // else when the answer landed can still see what it
+                        // was about.
+                        app.config_center.set_notice(message, tone);
+                    }
+                    // A form exists to make one write: it closes on the answer,
+                    // leaving the record it produced on the table behind it. A
+                    // refusal keeps it open, because the fix is in its fields.
+                    if record.as_deref() == Some(crate::config_center::FORM_RECORD)
+                        && matches!(app.overlay, Some(Overlay::Form { .. }))
+                    {
+                        app.overlay = None;
+                    }
                     if key == "resolve_permission" {
                         let message = app.strings.approval_resolved().to_string();
                         app.toast(Toast::success(message));
                     }
                     if key == "update_entry" {
-                        let message = app.strings.management_saved().to_string();
-                        app.toast(Toast::success(message));
-                    }
-                    if key == "provider_secret" {
                         let message = app.strings.management_saved().to_string();
                         app.toast(Toast::success(message));
                     }
@@ -2052,7 +2080,15 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 Err(error) => {
                     // A failed mutation rolls the optimistic UI back and says
                     // why, rather than leaving the user guessing.
-                    app.toast(Toast::danger(format!("{}: {}", key, error.message)));
+                    let message = match &pending {
+                        Some(pending) => pending.failure(app.strings, &error.message),
+                        None => format!("{}: {}", key, error.message),
+                    };
+                    app.toast(Toast::danger(message.clone()));
+                    if pending.is_some() {
+                        app.config_center
+                            .set_notice(message, crate::config_center::ConfigTone::Bad);
+                    }
                 }
             }
         }
@@ -2131,10 +2167,11 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             Err(error) => app.toast(Toast::danger(error.message)),
         },
         AppMessage::ProviderTest(result) => match result {
-            Ok(outcome) => {
+            Ok(tested) => {
+                let body = format!("{:?}\n\n{}\n{}", tested.status, tested.code, tested.message);
                 app.overlay = Some(Overlay::TextView {
                     title: app.strings.management_probe().to_string(),
-                    body: format!("{outcome:?}"),
+                    body,
                     scroll: 0,
                 });
             }
@@ -2174,19 +2211,28 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
-        AppMessage::AgentAuth(result) => match result {
+        AppMessage::AgentAuth { result, open } => match result {
             Ok(contexts) => {
-                let body = contexts
-                    .iter()
-                    .map(|context| format!("{}  {:?}", context.agent_id, context.status))
-                    .collect::<Vec<_>>()
-                    .join("\n");
                 app.management_data.agent_auth = contexts;
-                app.overlay = Some(Overlay::TextView {
-                    title: app.strings.management_login().to_string(),
-                    body,
-                    scroll: 0,
-                });
+                if open {
+                    let body =
+                        app.management_data
+                            .agent_auth
+                            .iter()
+                            .map(|context| {
+                                let account = context.account_hint.clone().unwrap_or_else(|| {
+                                    app.strings.config_result_signed_out().into()
+                                });
+                                format!("{}  ·  {account}", context.agent_id)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                    app.overlay = Some(Overlay::TextView {
+                        title: app.strings.management_login().to_string(),
+                        body,
+                        scroll: 0,
+                    });
+                }
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
@@ -2222,21 +2268,6 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 }
             }
             app.management_data.market_note = note;
-        }
-        AppMessage::Validation {
-            key,
-            message,
-            failed,
-        } => {
-            if let Some(key) = key {
-                app.config_center.finish_pending(&key);
-            }
-            let tone = if failed {
-                crate::config_center::ConfigTone::Bad
-            } else {
-                crate::config_center::ConfigTone::Ok
-            };
-            app.config_center.set_notice(message, tone);
         }
         AppMessage::ConfigReload => {
             let outcome = app.refresh_config_area();
@@ -4718,13 +4749,18 @@ mod tests {
         let (worker, _messages) =
             Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
         let mut app = test_app(120, 32);
-        app.config_center.begin_pending("mcp:filesystem", "delete");
+        app.config_center.begin_pending(
+            "mcp:filesystem",
+            "Filesystem",
+            crate::config_center::ConfigVerb::Delete,
+        );
         apply_message(
             &mut app,
             &worker,
             AppMessage::Mutation {
-                key: "mcp:filesystem".to_string(),
-                result: Ok(()),
+                key: "mcp_delete".to_string(),
+                record: Some("mcp:filesystem".to_string()),
+                result: Ok(crate::app::MutationOutcome::Plain),
             },
         )
         .unwrap();
@@ -4733,18 +4769,311 @@ mod tests {
         // A refusal is an answer too: the reader is told why, and the row is
         // not left spinning over a record that did not change.
         let mut app = test_app(120, 32);
-        app.config_center.begin_pending("mcp:filesystem", "delete");
+        app.config_center.begin_pending(
+            "mcp:filesystem",
+            "Filesystem",
+            crate::config_center::ConfigVerb::Delete,
+        );
         apply_message(
             &mut app,
             &worker,
             AppMessage::Mutation {
-                key: "mcp:filesystem".to_string(),
+                key: "mcp_delete".to_string(),
+                record: Some("mcp:filesystem".to_string()),
                 result: Err(vibex_backend::BackendError::failed("test", "refused")),
             },
         )
         .unwrap();
         assert!(!app.config_center.is_pending("mcp:filesystem"));
         assert!(app.toast.is_some(), "the refusal was silent");
+    }
+
+    /// Mark one record as working, the way a verb does before it is sent.
+    fn working(app: &mut App, key: &str, subject: &str, verb: crate::config_center::ConfigVerb) {
+        assert!(
+            app.config_center.begin_pending(key, subject, verb),
+            "{key} was already working"
+        );
+    }
+
+    /// Hand the client one write's answer, filed under `record`.
+    fn answer(worker: &Worker, app: &mut App, record: &str, outcome: crate::app::MutationOutcome) {
+        apply_message(
+            app,
+            worker,
+            AppMessage::Mutation {
+                key: "test".to_string(),
+                record: Some(record.to_string()),
+                result: Ok(outcome),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_answer_names_the_record_and_the_verb_it_was_about() {
+        // The reader pressed "Install" on the Codex row and looked away. The
+        // answer has to say what happened to what: the effect key the write
+        // travelled under is not a thing a reader has ever seen, and "done" on
+        // its own leaves them asking whether the key registered at all.
+        use crate::app::MutationOutcome as Outcome;
+        use crate::config_center::ConfigVerb as Verb;
+        let (worker, _messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+        let mut app = test_app(120, 32);
+        working(&mut app, "codex", "Codex", Verb::Install);
+        answer(
+            &worker,
+            &mut app,
+            "codex",
+            Outcome::Installed {
+                version: Some("1.3.0".to_string()),
+            },
+        );
+
+        let toast = app.toast.as_ref().expect("the install said nothing");
+        assert_eq!(toast.text, "Codex: Installed · version 1.3.0");
+        assert_eq!(toast.tone, crate::app::ToastTone::Success);
+        // The toast expires; the line under the table does not, so the answer
+        // outlives the seconds a reader might have been looking elsewhere.
+        let (notice, _) = app.config_center.notice.as_ref().expect("no notice");
+        assert_eq!(notice, "Codex: Installed · version 1.3.0");
+        assert!(!app.config_center.is_pending("codex"));
+    }
+
+    #[test]
+    fn a_check_for_updates_says_which_of_the_two_answers_it_found() {
+        // "Check update" exists to tell "up to date" from "a version is
+        // waiting". A toast that only said "checked" would leave the reader
+        // exactly where they were before they pressed it.
+        use crate::app::MutationOutcome as Outcome;
+        use crate::config_center::ConfigVerb as Verb;
+        let (worker, _messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+
+        let mut app = test_app(120, 32);
+        working(&mut app, "codex", "Codex", Verb::CheckUpdate);
+        answer(&worker, &mut app, "codex", Outcome::UpToDate);
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("Codex: Update checked · up to date")
+        );
+
+        let mut app = test_app(120, 32);
+        working(&mut app, "codex", "Codex", Verb::CheckUpdate);
+        answer(
+            &worker,
+            &mut app,
+            "codex",
+            Outcome::UpdateAvailable {
+                version: "1.3.0".to_string(),
+            },
+        );
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("Codex: Update checked · version 1.3.0 available")
+        );
+    }
+
+    #[test]
+    fn an_agent_account_read_says_who_is_signed_in() {
+        // Signing in is the runtime's to do; the client's half is to report
+        // what the runtime found, so the verb does not look like it did
+        // nothing on an Agent nobody has signed into yet.
+        use crate::app::MutationOutcome as Outcome;
+        use crate::config_center::ConfigVerb as Verb;
+        let (worker, _messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+
+        let mut app = test_app(120, 32);
+        working(&mut app, "codex", "Codex", Verb::SignIn);
+        answer(
+            &worker,
+            &mut app,
+            "codex",
+            Outcome::Auth {
+                methods: 2,
+                account: Some("bai@example.com".to_string()),
+                authenticated: true,
+            },
+        );
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("Codex: Sign-in methods read · bai@example.com")
+        );
+
+        // Nobody is signed in: how many ways in there are is the useful half,
+        // because it says the verb found something to offer.
+        let mut app = test_app(120, 32);
+        working(&mut app, "codex", "Codex", Verb::SignIn);
+        answer(
+            &worker,
+            &mut app,
+            "codex",
+            Outcome::Auth {
+                methods: 2,
+                account: None,
+                authenticated: false,
+            },
+        );
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("Codex: Sign-in methods read · not signed in · 2 sign-in methods")
+        );
+    }
+
+    #[test]
+    fn a_validation_reports_its_verdict_and_not_only_that_it_ran() {
+        // Three answers, three tones. A warning is neither a clean pass nor a
+        // failure, and drawing it as either is the client telling the reader
+        // something the authority did not say.
+        use crate::app::MutationOutcome as Outcome;
+        let (worker, _messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+
+        let cases = [
+            (
+                Outcome::Verdict {
+                    passed: true,
+                    warned: false,
+                    message: "mcp_ok · reachable".to_string(),
+                },
+                crate::app::ToastTone::Success,
+                "Filesystem: Validated · ok · mcp_ok · reachable",
+            ),
+            (
+                Outcome::Verdict {
+                    passed: true,
+                    warned: true,
+                    message: "mcp_slow · two seconds".to_string(),
+                },
+                crate::app::ToastTone::Warning,
+                "Filesystem: Validated · warning · mcp_slow · two seconds",
+            ),
+            (
+                Outcome::Verdict {
+                    passed: false,
+                    warned: false,
+                    message: "mcp_bad · no command".to_string(),
+                },
+                crate::app::ToastTone::Danger,
+                "Filesystem: Validated · failed · mcp_bad · no command",
+            ),
+        ];
+        for (outcome, tone, expected) in cases {
+            let mut app = test_app(120, 32);
+            working(
+                &mut app,
+                "mcp:filesystem",
+                "Filesystem",
+                crate::config_center::ConfigVerb::Validate,
+            );
+            answer(&worker, &mut app, "mcp:filesystem", outcome.clone());
+            let toast = app.toast.as_ref().expect("the validation said nothing");
+            assert_eq!(toast.text, expected, "wrong sentence for {outcome:?}");
+            assert_eq!(toast.tone, tone, "wrong tone for {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_names_what_did_not_happen() {
+        // "install_agent: connection lost" tells a reader which row the key was
+        // on only if they remember the key. The record they pressed it on and
+        // the verb they asked for are what the sentence is made of.
+        let (worker, _messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+        let mut app = test_app(120, 32);
+        working(
+            &mut app,
+            "codex",
+            "Codex",
+            crate::config_center::ConfigVerb::Install,
+        );
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Mutation {
+                key: "install_agent".to_string(),
+                record: Some("codex".to_string()),
+                result: Err(vibex_backend::BackendError::failed("test", "refused")),
+            },
+        )
+        .unwrap();
+
+        let toast = app.toast.as_ref().expect("the refusal was silent");
+        assert_eq!(toast.text, "Codex: Install · failed: refused");
+        assert_eq!(toast.tone, crate::app::ToastTone::Danger);
+        assert_eq!(
+            app.config_center
+                .notice
+                .as_ref()
+                .map(|(text, _)| text.as_str()),
+            Some("Codex: Install · failed: refused")
+        );
+        assert!(!app.config_center.is_pending("codex"));
+    }
+
+    #[test]
+    fn a_form_closes_on_its_answer_and_stays_open_on_a_refusal() {
+        // A form exists to make one write, so the answer is what closes it: the
+        // record it produced is on the table behind it. A refusal is not an
+        // answer to that write — the fix is in the form's own fields.
+        use crate::app::MutationOutcome as Outcome;
+        let (worker, _messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+
+        let mut app = test_app(120, 32);
+        app.overlay = Some(Overlay::Form {
+            form: crate::config_center::mcp_form(None, app.strings),
+        });
+        working(
+            &mut app,
+            crate::config_center::FORM_RECORD,
+            "New server",
+            crate::config_center::ConfigVerb::Create,
+        );
+        answer(
+            &worker,
+            &mut app,
+            crate::config_center::FORM_RECORD,
+            Outcome::Plain,
+        );
+        assert!(
+            app.overlay.is_none(),
+            "the form stayed open over the record it had just made"
+        );
+
+        let mut app = test_app(120, 32);
+        app.overlay = Some(Overlay::Form {
+            form: crate::config_center::mcp_form(None, app.strings),
+        });
+        working(
+            &mut app,
+            crate::config_center::FORM_RECORD,
+            "New server",
+            crate::config_center::ConfigVerb::Create,
+        );
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Mutation {
+                key: "mcp_create".to_string(),
+                record: Some(crate::config_center::FORM_RECORD.to_string()),
+                result: Err(vibex_backend::BackendError::failed(
+                    "test",
+                    "name is required",
+                )),
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(app.overlay, Some(Overlay::Form { .. })),
+            "a refusal closed the form the fix belongs in"
+        );
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("New server: Create · failed: name is required")
+        );
     }
 
     #[test]
@@ -4765,7 +5094,8 @@ mod tests {
             &worker,
             AppMessage::Mutation {
                 key: "uninstall_agent".to_string(),
-                result: Ok(()),
+                record: None,
+                result: Ok(crate::app::MutationOutcome::Plain),
             },
         )
         .unwrap();

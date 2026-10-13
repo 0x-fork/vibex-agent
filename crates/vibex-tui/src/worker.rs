@@ -71,12 +71,6 @@ pub enum AppMessage {
         /// anything: how much of the catalogue the page covers.
         note: Option<String>,
     },
-    /// A validation or preview line, shown against the record it describes.
-    Validation {
-        key: Option<String>,
-        message: String,
-        failed: bool,
-    },
     /// A configuration write finished, so the area it changed is re-read.
     ConfigReload,
     TeamLoaded {
@@ -137,9 +131,16 @@ pub enum AppMessage {
         send_id: u64,
         result: BackendResult<Vec<vibex_core::TimelineItem>>,
     },
+    /// A write finished: what it answered, and which record it was about.
+    ///
+    /// `key` is the operation, as the effect named it, because the client uses
+    /// it to decide what to re-read. `record` is the row the reader pressed the
+    /// verb on, which is what the answer is filed under — the two are not the
+    /// same thing, and the reader only ever sees the second.
     Mutation {
         key: String,
-        result: BackendResult<()>,
+        record: Option<String>,
+        result: BackendResult<crate::app::MutationOutcome>,
     },
     Workspaces(Vec<vibex_backend::WorkspaceSummary>),
     WorkspaceOpened {
@@ -155,7 +156,13 @@ pub enum AppMessage {
     ProviderTest(BackendResult<vibex_core::AgentModelProviderProfileTestResult>),
     ProviderModels(BackendResult<Vec<vibex_core::ProviderConfiguredModel>>),
     Agents(BackendResult<Vec<vibex_core::AgentSnapshotEntry>>),
-    AgentAuth(BackendResult<Vec<vibex_core::AgentAuthContext>>),
+    /// One Agent's accounts, and whether the reader asked to see them. A read
+    /// that answers a verb opens the account panel; a re-read that follows a
+    /// sign-out only refreshes the row.
+    AgentAuth {
+        result: BackendResult<Vec<vibex_core::AgentAuthContext>>,
+        open: bool,
+    },
     Mcp(BackendResult<Vec<vibex_core::McpServer>>),
     Skills(BackendResult<Vec<vibex_core::Skill>>),
     Prompts(BackendResult<Vec<vibex_core::Prompt>>),
@@ -352,6 +359,59 @@ fn home_directory() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/"))
 }
 
+/// What an install or a rollback left behind.
+///
+/// The authority answers these two with the record's whole managed-install
+/// state, so the version is read off it. A state that came back failed is not
+/// an error the transport noticed — the request succeeded and the installer did
+/// not — so it is reported as the verdict it is rather than as a failure of the
+/// call.
+fn install_outcome(state: &vibex_core::AgentManagedInstallState) -> crate::app::MutationOutcome {
+    use crate::app::MutationOutcome;
+    if let Some(message) = install_failure(state) {
+        return MutationOutcome::Verdict {
+            passed: false,
+            warned: false,
+            message,
+        };
+    }
+    MutationOutcome::Installed {
+        version: state.installed_version.clone(),
+    }
+}
+
+/// What a check for updates found.
+///
+/// "Up to date" and "a version is waiting" are the two answers the verb exists
+/// to tell apart: the reader pressed it to find out which one is true.
+fn check_outcome(state: &vibex_core::AgentManagedInstallState) -> crate::app::MutationOutcome {
+    use crate::app::MutationOutcome;
+    if let Some(message) = install_failure(state) {
+        return MutationOutcome::Verdict {
+            passed: false,
+            warned: false,
+            message,
+        };
+    }
+    match state.available_version.clone() {
+        Some(available) if state.installed_version.as_deref() != Some(available.as_str()) => {
+            MutationOutcome::UpdateAvailable { version: available }
+        }
+        _ => MutationOutcome::UpToDate,
+    }
+}
+
+/// The reason a managed-install state is a failure, if it is one.
+fn install_failure(state: &vibex_core::AgentManagedInstallState) -> Option<String> {
+    (state.status == vibex_core::AgentManagedInstallStatus::Failed).then(|| {
+        state
+            .last_error_message
+            .clone()
+            .or_else(|| state.last_error_code.clone())
+            .unwrap_or_else(|| "the installer failed".to_string())
+    })
+}
+
 /// Read the clipboard of the machine this client runs on.
 ///
 /// Image first: a clipboard can hold both, and the picture is the half a
@@ -440,16 +500,20 @@ impl Dispatch {
 
     /// Issue one configuration-centre write and report what it did.
     ///
-    /// Every arm ends the same way: report the outcome under the row's key and
-    /// ask the client to re-read the area. That is deliberate — the authority
-    /// is what decides what a record now looks like, and a client that patched
-    /// its own copy would be guessing at the parts of the record the request
-    /// did not carry.
-    async fn config_mutation(&mut self, mutation: crate::app::ConfigMutation) {
+    /// Every arm ends the same way: report what the authority answered under
+    /// the record the write was about, and ask the client to re-read the area.
+    /// That is deliberate — the authority is what decides what a record now
+    /// looks like, and a client that patched its own copy would be guessing at
+    /// the parts of the record the request did not carry. What the answer
+    /// carries instead is the part the re-read cannot show: the version that
+    /// landed, the verdict a validation returned, whether an account is signed
+    /// in.
+    async fn config_mutation(&mut self, mutation: crate::app::ConfigMutation, record: String) {
         use crate::app::ConfigMutation as M;
+        use crate::app::MutationOutcome as Outcome;
         use vibex_backend::MutationRequest;
-        let key = mutation.key();
-        let result: BackendResult<()> = match mutation {
+        let key = mutation.label().to_string();
+        let result: BackendResult<Outcome> = match mutation {
             M::ToggleAgent { agent_id, enabled } => {
                 let request = MutationRequest::new(vibex_core::AgentUpdateConfigRequest {
                     agent_id,
@@ -466,7 +530,7 @@ impl Dispatch {
                     .management()
                     .update_agent_config(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::RefreshAgentSnapshot { agent_id } => {
                 let request = vibex_core::AgentRefreshSnapshotRequest {
@@ -477,7 +541,9 @@ impl Dispatch {
                     .management()
                     .refresh_agent_snapshot(request)
                     .await
-                    .map(|_| ())
+                    .map(|response| Outcome::Models {
+                        count: response.agent.models.len(),
+                    })
             }
             M::CheckAgentUpdate { agent_id } => {
                 let request = MutationRequest::new(agent_id);
@@ -485,7 +551,7 @@ impl Dispatch {
                     .management()
                     .check_managed_agent_update(request)
                     .await
-                    .map(|_| ())
+                    .map(|state| check_outcome(&state))
             }
             M::RollbackAgent { agent_id } => {
                 let request = MutationRequest::new(agent_id);
@@ -493,7 +559,7 @@ impl Dispatch {
                     .management()
                     .rollback_managed_agent(request)
                     .await
-                    .map(|_| ())
+                    .map(|state| install_outcome(&state))
             }
             M::UpdateProviderProfile {
                 agent_id,
@@ -524,7 +590,7 @@ impl Dispatch {
                     .management()
                     .update_agent_model_provider_profile(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::DeleteProviderProfile {
                 agent_id,
@@ -539,7 +605,7 @@ impl Dispatch {
                     .management()
                     .delete_agent_model_provider_profile(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::CreateMcpServer(request) => {
                 let request = MutationRequest::new(*request);
@@ -547,7 +613,7 @@ impl Dispatch {
                     .management()
                     .create_mcp_server(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::UpdateMcpServer(request) => {
                 let request = MutationRequest::new(*request);
@@ -555,7 +621,7 @@ impl Dispatch {
                     .management()
                     .update_mcp_server(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::DeleteMcpServer { server_id } => {
                 let request = MutationRequest::new(vibex_core::McpServerDeleteRequest {
@@ -565,7 +631,7 @@ impl Dispatch {
                     .management()
                     .delete_mcp_server(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::ValidateMcpServer { server_id } => {
                 let request = vibex_core::McpServerValidateRequest {
@@ -577,11 +643,13 @@ impl Dispatch {
                     .validate_mcp_server(request)
                     .await
                     .map(|result| {
-                        self.send(AppMessage::Validation {
-                            key: None,
-                            message: format!("{} · {}", result.code, result.message),
-                            failed: result.status == vibex_core::McpServerValidationStatus::Fail,
-                        });
+                        use vibex_core::McpServerValidationStatus as Status;
+                        Outcome::verdict(
+                            result.status == Status::Warn,
+                            result.status == Status::Fail,
+                            &result.code,
+                            &result.message,
+                        )
                     })
             }
             M::SetMcpAgentMatrix { server_id, matrix } => {
@@ -593,7 +661,7 @@ impl Dispatch {
                     .management()
                     .set_mcp_server_agent_matrix(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::DiscoverMcpSources => {
                 let request = vibex_core::McpServerDiscoverRequest {
@@ -605,7 +673,7 @@ impl Dispatch {
                     mcp: result.map(|response| response.discoveries),
                     skill: None,
                 });
-                Ok(())
+                Ok(Outcome::Plain)
             }
             M::ImportMcpServer { selection } => {
                 let request = MutationRequest::new(vibex_core::McpServerImportRequest {
@@ -615,7 +683,7 @@ impl Dispatch {
                     .management()
                     .import_mcp_servers(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::SearchMcpMarket { query } => {
                 let request = vibex_core::McpMarketSearchRequest {
@@ -637,7 +705,7 @@ impl Dispatch {
                                 response.total_matches, response.catalog_size
                             )),
                         });
-                        Ok(())
+                        Ok(Outcome::Plain)
                     }
                     Err(error) => Err(error),
                 }
@@ -657,7 +725,7 @@ impl Dispatch {
                     .management()
                     .install_mcp_market_entry(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::CreateSkill(request) => {
                 let request = MutationRequest::new(*request);
@@ -665,7 +733,7 @@ impl Dispatch {
                     .management()
                     .create_skill(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::UpdateSkill(request) => {
                 let request = MutationRequest::new(*request);
@@ -673,7 +741,7 @@ impl Dispatch {
                     .management()
                     .update_skill(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::DeleteSkill { skill_id } => {
                 let request = MutationRequest::new(vibex_core::SkillDeleteRequest { skill_id });
@@ -681,7 +749,7 @@ impl Dispatch {
                     .management()
                     .delete_skill(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::ValidateSkill { skill_id } => {
                 let request = vibex_core::SkillValidateRequest {
@@ -693,11 +761,13 @@ impl Dispatch {
                     .validate_skill(request)
                     .await
                     .map(|result| {
-                        self.send(AppMessage::Validation {
-                            key: None,
-                            message: format!("{} · {}", result.code, result.message),
-                            failed: result.status == vibex_core::SkillValidationStatus::Fail,
-                        });
+                        use vibex_core::SkillValidationStatus as Status;
+                        Outcome::verdict(
+                            result.status == Status::Warn,
+                            result.status == Status::Fail,
+                            &result.code,
+                            &result.message,
+                        )
                     })
             }
             M::SetSkillAgentMatrix { skill_id, matrix } => {
@@ -709,7 +779,7 @@ impl Dispatch {
                     .management()
                     .set_skill_agent_matrix(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::DiscoverSkillSources => {
                 let request = vibex_core::SkillDiscoverRequest {
@@ -726,7 +796,7 @@ impl Dispatch {
                     mcp: Ok(Vec::new()),
                     skill: Some(result.map(|response| response.discoveries)),
                 });
-                Ok(())
+                Ok(Outcome::Plain)
             }
             M::ImportSkill { selection } => {
                 let request = MutationRequest::new(vibex_core::SkillImportRequest {
@@ -736,7 +806,7 @@ impl Dispatch {
                     .management()
                     .import_skills(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::SearchSkillMarket { query } => {
                 let request = vibex_core::SkillMarketSearchRequest {
@@ -754,7 +824,7 @@ impl Dispatch {
                             skill: Some(Ok(response.entries)),
                             note: None,
                         });
-                        Ok(())
+                        Ok(Outcome::Plain)
                     }
                     Err(error) => Err(error),
                 }
@@ -787,7 +857,7 @@ impl Dispatch {
                             .management()
                             .install_skill_market_entry(request)
                             .await
-                            .map(|_| ())
+                            .map(|_| Outcome::Plain)
                     }
                     Err(error) => Err(error),
                 }
@@ -798,7 +868,7 @@ impl Dispatch {
                     .management()
                     .create_prompt(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::UpdatePrompt(request) => {
                 let request = MutationRequest::new(*request);
@@ -806,7 +876,7 @@ impl Dispatch {
                     .management()
                     .update_prompt(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
             }
             M::DeletePrompt { prompt_id } => {
                 let request = MutationRequest::new(vibex_core::PromptDeleteRequest { prompt_id });
@@ -814,40 +884,75 @@ impl Dispatch {
                     .management()
                     .delete_prompt(request)
                     .await
-                    .map(|_| ())
+                    .map(|_| Outcome::Plain)
+            }
+            M::ValidatePrompt { prompt_id } => {
+                let request = vibex_core::PromptValidateRequest {
+                    prompt_id: Some(prompt_id),
+                    candidate: None,
+                };
+                self.facade
+                    .management()
+                    .validate_prompt(request)
+                    .await
+                    .map(|result| {
+                        use vibex_core::PromptValidationStatus as Status;
+                        Outcome::verdict(
+                            result.status == Status::Warn,
+                            result.status == Status::Fail,
+                            &result.code,
+                            &result.message,
+                        )
+                    })
             }
         };
         match result {
-            Ok(()) => {
+            Ok(outcome) => {
                 self.send(AppMessage::Mutation {
-                    key,
-                    result: Ok(()),
+                    key: key.clone(),
+                    record: Some(record),
+                    result: Ok(outcome),
                 });
                 self.send(AppMessage::ConfigReload);
             }
-            Err(error) => self.config_failed(&key, error),
+            Err(error) => self.config_failed(&key, Some(record), error),
         }
     }
 
-    fn config_failed(&mut self, key: &str, error: BackendError) {
+    fn config_failed(&mut self, key: &str, record: Option<String>, error: BackendError) {
         self.send(AppMessage::Mutation {
             key: key.to_string(),
+            record,
             result: Err(error),
         });
         self.send(AppMessage::ConfigReload);
     }
 
+    /// A write outside the configuration centre: there is no row, and nothing
+    /// to say beyond whether it worked.
     fn failure(&self, key: &str, error: BackendError) {
+        self.failure_for(key, None, error);
+    }
+
+    fn failure_for(&self, key: &str, record: Option<String>, error: BackendError) {
         self.send(AppMessage::Mutation {
             key: key.to_string(),
+            record,
             result: Err(error),
         });
     }
 
     fn ok(&self, key: &str) {
+        self.ok_with(key, None, crate::app::MutationOutcome::Plain);
+    }
+
+    /// A write that answered something: the record files the answer, and the
+    /// outcome is what it says.
+    fn ok_with(&self, key: &str, record: Option<String>, outcome: crate::app::MutationOutcome) {
         self.send(AppMessage::Mutation {
             key: key.to_string(),
-            result: Ok(()),
+            record,
+            result: Ok(outcome),
         });
     }
 
@@ -1292,6 +1397,7 @@ impl Dispatch {
                 self.send(AppMessage::Profiles(result));
             }
             Effect::RenameProfile { profile_id, name } => {
+                let record = profile_id.as_str().to_string();
                 let Some(request) = self.profile_update(profile_id, Some(name)).await else {
                     return;
                 };
@@ -1301,14 +1407,20 @@ impl Dispatch {
                     .update_agent_model_provider_profile(request)
                     .await
                 {
-                    Ok(_) => self.ok("rename_profile"),
-                    Err(error) => self.failure("rename_profile", error),
+                    Ok(_) => self.ok_with(
+                        "rename_profile",
+                        Some(record),
+                        crate::app::MutationOutcome::Plain,
+                    ),
+                    Err(error) => self.failure_for("rename_profile", Some(record), error),
                 }
             }
             Effect::SelectProfile { profile_id } => {
+                let record = profile_id.as_str().to_string();
                 let Some(agent_id) = self.agent_for_profile(&profile_id).await else {
-                    self.failure(
+                    self.failure_for(
                         "select_profile",
+                        Some(record),
                         BackendError::failed(
                             "provider_profile_unknown",
                             "the selected profile is no longer listed",
@@ -1323,14 +1435,20 @@ impl Dispatch {
                         scope: None,
                     });
                 match self.facade.management().select_profile(request).await {
-                    Ok(_) => self.ok("select_profile"),
-                    Err(error) => self.failure("select_profile", error),
+                    Ok(_) => self.ok_with(
+                        "select_profile",
+                        Some(record),
+                        crate::app::MutationOutcome::Plain,
+                    ),
+                    Err(error) => self.failure_for("select_profile", Some(record), error),
                 }
             }
             Effect::WriteProviderSecret { profile_id, secret } => {
+                let record = profile_id.as_str().to_string();
                 let Some(agent_id) = self.agent_for_profile(&profile_id).await else {
-                    self.failure(
+                    self.failure_for(
                         "provider_secret",
+                        Some(record),
                         BackendError::failed(
                             "provider_profile_unknown",
                             "the selected profile has no owning Agent",
@@ -1352,16 +1470,23 @@ impl Dispatch {
                     .mutate_agent_model_provider_profile_secret(request)
                     .await
                 {
-                    Ok(_) => self.ok("provider_secret"),
-                    Err(error) => self.failure("provider_secret", error),
+                    Ok(_) => self.ok_with(
+                        "provider_secret",
+                        Some(record),
+                        crate::app::MutationOutcome::Plain,
+                    ),
+                    Err(error) => self.failure_for("provider_secret", Some(record), error),
                 }
             }
             Effect::TestProviderProfile { profile_id } => {
+                let record = profile_id.as_str().to_string();
                 let Some(agent_id) = self.agent_for_profile(&profile_id).await else {
-                    self.send(AppMessage::ProviderTest(Err(BackendError::failed(
+                    let error = BackendError::failed(
                         "provider_profile_unknown",
                         "the selected profile has no owning Agent",
-                    ))));
+                    );
+                    self.send(AppMessage::ProviderTest(Err(error.clone())));
+                    self.failure_for("provider_test", Some(record), error);
                     return;
                 };
                 let request = vibex_core::AgentModelProviderProfileTestRequest {
@@ -1373,14 +1498,35 @@ impl Dispatch {
                     .management()
                     .test_agent_model_provider_profile(request)
                     .await;
+                match &result {
+                    Ok(tested) => {
+                        use vibex_core::AgentModelProviderTestStatus as Status;
+                        self.ok_with(
+                            "provider_test",
+                            Some(record),
+                            crate::app::MutationOutcome::verdict(
+                                tested.status == Status::Warn,
+                                tested.status == Status::Fail,
+                                &tested.code,
+                                &tested.message,
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        self.failure_for("provider_test", Some(record), error.clone());
+                    }
+                }
                 self.send(AppMessage::ProviderTest(result));
             }
             Effect::FetchProviderModels { profile_id } => {
+                let record = profile_id.as_str().to_string();
                 let Some(agent_id) = self.agent_for_profile(&profile_id).await else {
-                    self.send(AppMessage::ProviderModels(Err(BackendError::failed(
+                    let error = BackendError::failed(
                         "provider_profile_unknown",
                         "the selected profile has no owning Agent",
-                    ))));
+                    );
+                    self.send(AppMessage::ProviderModels(Err(error.clone())));
+                    self.failure_for("provider_models", Some(record), error);
                     return;
                 };
                 let request = vibex_core::AgentModelProviderProfileFetchModelsRequest {
@@ -1393,6 +1539,18 @@ impl Dispatch {
                     .fetch_agent_model_provider_profile_models(request)
                     .await
                     .map(|response| response.models);
+                match &result {
+                    Ok(models) => self.ok_with(
+                        "provider_models",
+                        Some(record),
+                        crate::app::MutationOutcome::Models {
+                            count: models.len(),
+                        },
+                    ),
+                    Err(error) => {
+                        self.failure_for("provider_models", Some(record), error.clone());
+                    }
+                }
                 self.send(AppMessage::ProviderModels(result));
             }
             Effect::ListAgents => {
@@ -1403,6 +1561,7 @@ impl Dispatch {
                 self.send(AppMessage::Agents(result.map(|response| response.agents)));
             }
             Effect::InstallAgent { agent_id } => {
+                let record = agent_id.as_str().to_string();
                 let request = MutationRequest::new(agent_id);
                 match self
                     .facade
@@ -1410,11 +1569,14 @@ impl Dispatch {
                     .install_managed_agent(request)
                     .await
                 {
-                    Ok(_) => self.ok("install_agent"),
-                    Err(error) => self.failure("install_agent", error),
+                    Ok(state) => {
+                        self.ok_with("install_agent", Some(record), install_outcome(&state))
+                    }
+                    Err(error) => self.failure_for("install_agent", Some(record), error),
                 }
             }
             Effect::UninstallAgent { agent_id } => {
+                let record = agent_id.as_str().to_string();
                 let request = MutationRequest::new(agent_id);
                 match self
                     .facade
@@ -1422,25 +1584,80 @@ impl Dispatch {
                     .uninstall_managed_agent(request)
                     .await
                 {
-                    Ok(_) => self.ok("uninstall_agent"),
-                    Err(error) => self.failure("uninstall_agent", error),
+                    Ok(_) => self.ok_with(
+                        "uninstall_agent",
+                        Some(record),
+                        crate::app::MutationOutcome::Plain,
+                    ),
+                    Err(error) => self.failure_for("uninstall_agent", Some(record), error),
                 }
             }
-            Effect::ListAgentAuth { .. } => {
+            Effect::ListAgentAuth { agent_id, open } => {
+                let record = agent_id.as_str().to_string();
                 let result = self.facade.agent().list_agent_auth_contexts().await;
-                self.send(AppMessage::AgentAuth(result));
+                // The answer is filed under the Agent the reader asked about,
+                // which is not the whole list the authority returns: the row
+                // says how many ways in *this* Agent has.
+                let outcome = result.as_ref().ok().map(|contexts| {
+                    let mine = contexts
+                        .iter()
+                        .filter(|context| context.agent_id == agent_id)
+                        .collect::<Vec<_>>();
+                    let signed_in = mine.iter().find(|context| {
+                        context.status == vibex_core::AgentAuthContextStatus::Authenticated
+                    });
+                    crate::app::MutationOutcome::Auth {
+                        methods: mine.len(),
+                        account: signed_in.and_then(|context| context.account_hint.clone()),
+                        authenticated: signed_in.is_some(),
+                    }
+                });
+                match (result, outcome) {
+                    (Ok(contexts), Some(outcome)) => {
+                        self.send(AppMessage::AgentAuth {
+                            result: Ok(contexts),
+                            open,
+                        });
+                        self.ok_with("agent_auth", Some(record), outcome);
+                    }
+                    (Err(error), _) => {
+                        self.failure_for("agent_auth", Some(record), error);
+                    }
+                    (Ok(_), None) => {}
+                }
             }
             Effect::LogoutAgent { agent_id } => {
+                let record = agent_id.as_str().to_string();
                 let request = MutationRequest::new(vibex_core::AgentLogoutRequest {
                     agent_id,
                     provider_profile_id: None,
                 });
                 match self.facade.agent().logout_agent(request).await {
-                    Ok(()) => self.ok("logout_agent"),
-                    Err(error) => self.failure("logout_agent", error),
+                    Ok(()) => {
+                        self.ok_with(
+                            "logout_agent",
+                            Some(record),
+                            crate::app::MutationOutcome::Plain,
+                        );
+                        // The account the row shows is the authority's to
+                        // state, so it is read again rather than assumed: the
+                        // row must not keep claiming a sign-in the reader just
+                        // ended. The answer is not put on screen — the verb
+                        // that asked for it is over.
+                        let contexts = self.facade.agent().list_agent_auth_contexts().await;
+                        if let Ok(contexts) = contexts {
+                            self.send(AppMessage::AgentAuth {
+                                result: Ok(contexts),
+                                open: false,
+                            });
+                        }
+                    }
+                    Err(error) => self.failure_for("logout_agent", Some(record), error),
                 }
             }
-            Effect::ConfigMutation { mutation } => self.config_mutation(mutation).await,
+            Effect::ConfigMutation { mutation, record } => {
+                self.config_mutation(mutation, record).await
+            }
             Effect::DiscoverSources { module } => {
                 use crate::config_center::ConfigModule;
                 match module {
@@ -1489,6 +1706,7 @@ impl Dispatch {
                 self.send(AppMessage::Prompts(result));
             }
             Effect::ToggleMcp { server_id, enabled } => {
+                let record = server_id.as_str().to_string();
                 let request = MutationRequest::new(vibex_core::McpServerUpdateRequest {
                     mcp_server_id: server_id,
                     display_name: None,
@@ -1510,11 +1728,16 @@ impl Dispatch {
                     tags: None,
                 });
                 match self.facade.management().update_mcp_server(request).await {
-                    Ok(_) => self.ok("toggle_entry"),
-                    Err(error) => self.failure("toggle_entry", error),
+                    Ok(_) => self.ok_with(
+                        "toggle_entry",
+                        Some(record),
+                        crate::app::MutationOutcome::Plain,
+                    ),
+                    Err(error) => self.failure_for("toggle_entry", Some(record), error),
                 }
             }
             Effect::ToggleSkill { skill_id, enabled } => {
+                let record = skill_id.as_str().to_string();
                 let request = MutationRequest::new(vibex_core::SkillUpdateRequest {
                     skill_id,
                     display_name: None,
@@ -1534,11 +1757,16 @@ impl Dispatch {
                     body: None,
                 });
                 match self.facade.management().update_skill(request).await {
-                    Ok(_) => self.ok("toggle_entry"),
-                    Err(error) => self.failure("toggle_entry", error),
+                    Ok(_) => self.ok_with(
+                        "toggle_entry",
+                        Some(record),
+                        crate::app::MutationOutcome::Plain,
+                    ),
+                    Err(error) => self.failure_for("toggle_entry", Some(record), error),
                 }
             }
             Effect::TogglePrompt { prompt_id, enabled } => {
+                let record = prompt_id.as_str().to_string();
                 let request = MutationRequest::new(vibex_core::PromptUpdateRequest {
                     prompt_id,
                     display_name: None,
@@ -1556,8 +1784,12 @@ impl Dispatch {
                     tags: None,
                 });
                 match self.facade.management().update_prompt(request).await {
-                    Ok(_) => self.ok("toggle_entry"),
-                    Err(error) => self.failure("toggle_entry", error),
+                    Ok(_) => self.ok_with(
+                        "toggle_entry",
+                        Some(record),
+                        crate::app::MutationOutcome::Plain,
+                    ),
+                    Err(error) => self.failure_for("toggle_entry", Some(record), error),
                 }
             }
             Effect::DiscoverCompletions {

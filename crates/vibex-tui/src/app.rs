@@ -6437,51 +6437,54 @@ pub enum ConfigMutation {
         owner_handle: Option<String>,
         version: Option<String>,
     },
-    // ---- Prompts and hooks ----------------------------------------------
+    // ---- Prompts ---------------------------------------------------------
     CreatePrompt(Box<vibex_core::PromptCreateRequest>),
     UpdatePrompt(Box<vibex_core::PromptUpdateRequest>),
     DeletePrompt {
         prompt_id: vibex_core::PromptId,
     },
+    ValidatePrompt {
+        prompt_id: vibex_core::PromptId,
+    },
 }
 
 impl ConfigMutation {
-    /// The pending key a row wears while this mutation is in flight.
+    /// The record this write is about, under the key its own row wears.
+    ///
+    /// The key is the row's, not the request's: the centre files a write under
+    /// what it drew, so the row that said it was working is the row the answer
+    /// takes the marker off. A row's key is the record's identifier and nothing
+    /// else, which is why the prefixes the effect keys carry do not appear here.
     pub fn key(&self) -> String {
         match self {
             Self::ToggleAgent { agent_id, .. }
             | Self::RefreshAgentSnapshot { agent_id }
             | Self::CheckAgentUpdate { agent_id }
-            | Self::RollbackAgent { agent_id } => format!("agent:{}", agent_id.as_str()),
+            | Self::RollbackAgent { agent_id } => agent_id.as_str().to_string(),
             Self::UpdateProviderProfile { profile_id, .. }
-            | Self::DeleteProviderProfile { profile_id, .. } => {
-                format!("provider:{}", profile_id.as_str())
-            }
+            | Self::DeleteProviderProfile { profile_id, .. } => profile_id.as_str().to_string(),
             Self::CreateMcpServer(_) => "mcp:new".to_string(),
-            Self::UpdateMcpServer(request) => format!("mcp:{}", request.mcp_server_id.as_str()),
+            Self::UpdateMcpServer(request) => request.mcp_server_id.as_str().to_string(),
             Self::DeleteMcpServer { server_id }
             | Self::ValidateMcpServer { server_id }
-            | Self::SetMcpAgentMatrix { server_id, .. } => {
-                format!("mcp:{}", server_id.as_str())
-            }
+            | Self::SetMcpAgentMatrix { server_id, .. } => server_id.as_str().to_string(),
             Self::DiscoverMcpSources => "mcp:sources".to_string(),
             Self::ImportMcpServer { selection } => selection.discovery_id.clone(),
             Self::SearchMcpMarket { .. } => "mcp:market".to_string(),
             Self::InstallMcpMarketEntry { entry_id, .. } => entry_id.clone(),
             Self::CreateSkill(_) => "skill:new".to_string(),
-            Self::UpdateSkill(request) => format!("skill:{}", request.skill_id.as_str()),
+            Self::UpdateSkill(request) => request.skill_id.as_str().to_string(),
             Self::DeleteSkill { skill_id }
             | Self::ValidateSkill { skill_id }
-            | Self::SetSkillAgentMatrix { skill_id, .. } => {
-                format!("skill:{}", skill_id.as_str())
-            }
+            | Self::SetSkillAgentMatrix { skill_id, .. } => skill_id.as_str().to_string(),
             Self::DiscoverSkillSources => "skill:sources".to_string(),
             Self::ImportSkill { selection } => selection.discovery_id.clone(),
             Self::SearchSkillMarket { .. } => "skill:market".to_string(),
             Self::InstallSkillMarketEntry { entry_id, .. } => entry_id.clone(),
             Self::CreatePrompt(_) => "prompt:new".to_string(),
-            Self::UpdatePrompt(request) => format!("prompt:{}", request.prompt_id.as_str()),
-            Self::DeletePrompt { prompt_id } => format!("prompt:{}", prompt_id.as_str()),
+            Self::UpdatePrompt(request) => request.prompt_id.as_str().to_string(),
+            Self::DeletePrompt { prompt_id } => prompt_id.as_str().to_string(),
+            Self::ValidatePrompt { prompt_id } => prompt_id.as_str().to_string(),
         }
     }
 
@@ -6515,6 +6518,111 @@ impl ConfigMutation {
             Self::CreatePrompt(_) => "prompt_create",
             Self::UpdatePrompt(_) => "prompt_update",
             Self::DeletePrompt { .. } => "prompt_delete",
+            Self::ValidatePrompt { .. } => "prompt_validate",
+        }
+    }
+
+    /// The verb the write wears, as the two lines that report it read it.
+    ///
+    /// The verb is what the reader asked for rather than what the request
+    /// happens to be called: a switch flipped on is "Enabled", and the check
+    /// that finds nothing new is still "Update checked".
+    pub fn verb(&self) -> crate::config_center::ConfigVerb {
+        use crate::config_center::ConfigVerb as Verb;
+        match self {
+            Self::ToggleAgent { enabled, .. } => {
+                if *enabled {
+                    Verb::Enable
+                } else {
+                    Verb::Disable
+                }
+            }
+            Self::RefreshAgentSnapshot { .. } => Verb::RefreshSnapshot,
+            Self::CheckAgentUpdate { .. } => Verb::CheckUpdate,
+            Self::RollbackAgent { .. } => Verb::Rollback,
+            Self::UpdateProviderProfile { .. } => Verb::Save,
+            Self::DeleteProviderProfile { .. } => Verb::Delete,
+            Self::CreateMcpServer(_) | Self::CreateSkill(_) | Self::CreatePrompt(_) => Verb::Create,
+            Self::UpdateMcpServer(_) | Self::UpdateSkill(_) | Self::UpdatePrompt(_) => Verb::Save,
+            Self::DeleteMcpServer { .. } | Self::DeleteSkill { .. } | Self::DeletePrompt { .. } => {
+                Verb::Delete
+            }
+            Self::ValidateMcpServer { .. }
+            | Self::ValidateSkill { .. }
+            | Self::ValidatePrompt { .. } => Verb::Validate,
+            Self::SetMcpAgentMatrix { .. } | Self::SetSkillAgentMatrix { .. } => Verb::SetAgents,
+            Self::DiscoverMcpSources | Self::DiscoverSkillSources => Verb::Discover,
+            Self::ImportMcpServer { .. } | Self::ImportSkill { .. } => Verb::Import,
+            Self::SearchMcpMarket { .. } | Self::SearchSkillMarket { .. } => Verb::Search,
+            Self::InstallMcpMarketEntry { .. } | Self::InstallSkillMarketEntry { .. } => {
+                Verb::InstallFromRegistry
+            }
+        }
+    }
+}
+
+/// What a configuration write answered, beyond whether it succeeded.
+///
+/// A toast that only says "done" is not an answer. The reader pressed "Check
+/// update" to find out whether there *is* an update, and "Install" to find out
+/// which version landed; the row went quiet for the same reason. The worker
+/// turns each response the authority gave it into one of these, so the sentence
+/// the reader gets names what came back while the wording itself stays in the
+/// locale, where every other sentence is.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum MutationOutcome {
+    /// The write answered nothing beyond "done".
+    #[default]
+    Plain,
+    /// A check found the record already carrying the newest version.
+    UpToDate,
+    /// A check found a version that is not the installed one.
+    UpdateAvailable { version: String },
+    /// An install or a rollback landed, with the version it left behind.
+    Installed { version: Option<String> },
+    /// An Agent's account was read: how many ways in it offers, and whether one
+    /// of them is already signed in.
+    Auth {
+        methods: usize,
+        account: Option<String>,
+        authenticated: bool,
+    },
+    /// A model catalogue was read.
+    Models { count: usize },
+    /// A validation ran. `passed` is the verdict and `warned` keeps the middle
+    /// answer — a warning is neither a clean pass nor a failure.
+    Verdict {
+        passed: bool,
+        warned: bool,
+        message: String,
+    },
+}
+
+impl MutationOutcome {
+    /// The verdict a backend validation result becomes, whichever of the three
+    /// modules it came from.
+    pub fn verdict(status_warns: bool, status_fails: bool, code: &str, message: &str) -> Self {
+        let detail = if message.trim().is_empty() {
+            code.to_string()
+        } else if code.trim().is_empty() {
+            message.to_string()
+        } else {
+            format!("{code} · {message}")
+        };
+        Self::Verdict {
+            passed: !status_fails,
+            warned: status_warns,
+            message: detail,
+        }
+    }
+
+    /// How the answer should be drawn.
+    pub fn tone(&self) -> crate::config_center::ConfigTone {
+        use crate::config_center::ConfigTone;
+        match self {
+            Self::Verdict { passed: false, .. } => ConfigTone::Bad,
+            Self::Verdict { warned: true, .. } => ConfigTone::Warn,
+            _ => ConfigTone::Ok,
         }
     }
 }
@@ -6685,6 +6793,9 @@ pub enum Effect {
     },
     ListAgentAuth {
         agent_id: vibex_core::AgentId,
+        /// Whether the answer should be put in front of the reader. The verb
+        /// asks for that; a re-read that only refreshes the row does not.
+        open: bool,
     },
     LogoutAgent {
         agent_id: vibex_core::AgentId,
@@ -6719,8 +6830,14 @@ pub enum Effect {
         entry: ManagementEntryEdit,
     },
     /// One configuration-centre write.
+    ///
+    /// `record` is the row the write was made from, as the centre files it. The
+    /// write travels with it so the answer can be filed under the same record —
+    /// a form's save is filed under the form, not under a row that is not on
+    /// screen yet.
     ConfigMutation {
         mutation: ConfigMutation,
+        record: String,
     },
     /// Read the Agent sources a module's resources can be imported from.
     DiscoverSources {
@@ -6777,7 +6894,7 @@ impl Effect {
             Effect::LoadSidebarOrganization => "sidebar_organization",
             Effect::ProbeAutoContinue { .. } => "auto_continue_probe",
             Effect::MutateSidebarOrganization { .. } => "sidebar_organization_mutation",
-            Effect::ConfigMutation { mutation } => mutation.label(),
+            Effect::ConfigMutation { mutation, .. } => mutation.label(),
             Effect::DiscoverSources { .. } => "config_sources",
             Effect::SearchRegistry { .. } => "config_registry",
             Effect::OpenSession { .. } => "open_session",

@@ -337,7 +337,7 @@ fn the_switch_verbs_ask_the_authority_rather_than_patching_the_row() {
     // The Agent's switch is a configuration write…
     let outcome = app.perform(vibex_tui::action::Intent::ToggleSelectedEntry);
     match outcome.effects.as_slice() {
-        [vibex_tui::app::Effect::ConfigMutation { mutation }] => {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
             assert_eq!(mutation.label(), "agent");
         }
         other => panic!("the Agent switch produced {other:?}"),
@@ -367,7 +367,7 @@ fn a_delete_is_a_question_before_it_is_a_write() {
     // Answering it is the write.
     let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
     match outcome.effects.as_slice() {
-        [vibex_tui::app::Effect::ConfigMutation { mutation }] => {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
             assert_eq!(mutation.label(), "mcp_delete");
         }
         other => panic!("the answer produced {other:?}"),
@@ -553,8 +553,12 @@ fn the_heading_row_sits_over_the_cells_it_names() {
             };
             let heading_at = buffer_find(&buffer, heading_row, column)
                 .unwrap_or_else(|| panic!("{column} is not in the heading row"));
-            let record_at = buffer_find(&buffer, record_row, cell)
-                .unwrap_or_else(|| panic!("{cell} is not in the record row"));
+            // The cell is looked for *from* the heading's own column: a short
+            // cell like `2` also appears inside a longer one to its left, and a
+            // search from the start of the row would compare a position with
+            // itself.
+            let record_at = buffer_find_from(&buffer, record_row, cell, heading_at)
+                .unwrap_or_else(|| panic!("{cell} is not under {column} in the record row"));
             assert_eq!(
                 heading_at, record_at,
                 "the {column} heading of {module:?} is not over its cell"
@@ -575,6 +579,16 @@ fn the_heading_row_sits_over_the_cells_it_names() {
 /// is empty, so a string index would drift one column per wide glyph and the
 /// alignment this test is about would be invisible.
 fn buffer_find(buffer: &ratatui::buffer::Buffer, row: u16, needle: &str) -> Option<u16> {
+    buffer_find_from(buffer, row, needle, 0)
+}
+
+/// As [`buffer_find`], starting the search at `from`.
+fn buffer_find_from(
+    buffer: &ratatui::buffer::Buffer,
+    row: u16,
+    needle: &str,
+    from: u16,
+) -> Option<u16> {
     let symbols = (0..buffer.area.width)
         .map(|column| {
             buffer
@@ -584,7 +598,7 @@ fn buffer_find(buffer: &ratatui::buffer::Buffer, row: u16, needle: &str) -> Opti
         })
         .collect::<Vec<_>>();
     let wanted = needle.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
-    (0..symbols.len())
+    (usize::from(from)..symbols.len())
         .find(|start| {
             wanted
                 .iter()
@@ -651,4 +665,164 @@ fn the_page_keys_scroll_the_detail_that_the_cursor_describes() {
     assert_eq!(app.config_center.cursor(1), 0);
     app.perform(vibex_tui::action::Intent::ScrollPageUp);
     assert_eq!(app.config_center.detail_scroll, before);
+}
+
+#[test]
+fn every_agent_verb_says_what_it_is_doing_on_the_row_it_was_pressed_on() {
+    // The complaint this covers: a verb ran and left the reader unable to tell
+    // whether the key had done anything at all, let alone what. Each verb marks
+    // the record it was about, and the action line says the verb rather than
+    // the effect key the write travels under.
+    use vibex_tui::config_center::ConfigVerb;
+    for (action, verb) in [
+        (ConfigAction::Install, ConfigVerb::Install),
+        (ConfigAction::CheckUpdate, ConfigVerb::CheckUpdate),
+        (ConfigAction::Rollback, ConfigVerb::Rollback),
+        (ConfigAction::RefreshSnapshot, ConfigVerb::RefreshSnapshot),
+        (ConfigAction::Auth, ConfigVerb::SignIn),
+        (ConfigAction::Logout, ConfigVerb::SignOut),
+        (ConfigAction::Uninstall, ConfigVerb::Uninstall),
+        // The fixture's Agent is enabled, so the switch asks for "disable".
+        (ConfigAction::Toggle, ConfigVerb::Disable),
+    ] {
+        let mut app = loaded(140, 40);
+        // These verbs are the authority's, and a client that never saw it
+        // advertise them refuses them: the row is marked only over work that
+        // was actually asked for. The Agent's accounts are the agent domain's;
+        // its install is the management domain's.
+        app.capabilities.agent = vibex_backend::DomainCapabilities::available([
+            vibex_backend::BackendOperation::AgentAuthRead,
+            vibex_backend::BackendOperation::AgentAuthManage,
+        ]);
+        app.capabilities.management = vibex_backend::DomainCapabilities::available([
+            vibex_backend::BackendOperation::ManagementAgents,
+        ]);
+        // The idle row wears its status mark; a working one wears a spinner
+        // instead, so its absence is what says the marker moved.
+        assert!(text(&mut app, 140, 40).contains('●'));
+        app.run_config_action_by_key("codex", action);
+        // Uninstall asks before it runs, and answering the question is what
+        // starts the write: the row is not marked over a question.
+        if matches!(app.overlay, Some(Overlay::Confirm { .. })) {
+            app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+        }
+
+        let pending = app
+            .config_center
+            .pending
+            .get("codex")
+            .unwrap_or_else(|| panic!("{action:?} left the row silent"));
+        assert_eq!(pending.verb, verb, "{action:?} named the wrong verb");
+        assert_eq!(
+            pending.subject, "Codex",
+            "{action:?} named the wrong record"
+        );
+
+        let screen = text(&mut app, 140, 40);
+        assert!(
+            screen.contains(verb.running(app.strings)),
+            "{action:?} says nothing while it works:\n{screen}"
+        );
+        assert!(
+            !screen.contains('●'),
+            "{action:?} left the row looking idle while it worked:\n{screen}"
+        );
+    }
+}
+
+#[test]
+fn a_second_press_on_a_working_record_is_refused_rather_than_queued() {
+    // Two of the same call in flight is how a row ends up describing a write
+    // that finished before the one it is waiting on. The second press is
+    // answered rather than sent.
+    let mut app = loaded(140, 40);
+    let first = app.run_config_action_by_key("codex", ConfigAction::CheckUpdate);
+    assert_eq!(
+        first.effects.len(),
+        1,
+        "the first press did not ask for work"
+    );
+
+    let second = app.run_config_action_by_key("codex", ConfigAction::CheckUpdate);
+    assert!(
+        second.effects.is_empty(),
+        "the same call was queued a second time"
+    );
+    let toast = app.toast.as_ref().expect("the refusal was silent");
+    assert_eq!(toast.tone, vibex_tui::app::ToastTone::Warning);
+
+    // Once it has answered, the record is free again.
+    app.config_center.finish_pending("codex");
+    let third = app.run_config_action_by_key("codex", ConfigAction::RefreshSnapshot);
+    assert_eq!(
+        third.effects.len(),
+        1,
+        "the record stayed blocked afterwards"
+    );
+}
+
+#[test]
+fn what_a_write_answered_is_drawn_under_the_table_after_the_toast_is_gone() {
+    // The toast is gone in seconds; a reader who looked away would have to
+    // repeat the action to find out what it did. The line under the table is
+    // the same sentence, kept.
+    use vibex_tui::config_center::ConfigTone;
+    let mut app = loaded(140, 40);
+    let answer = "Codex: Installed · version 9.9.9";
+    assert!(!text(&mut app, 140, 40).contains(answer));
+
+    app.config_center.set_notice(answer, ConfigTone::Ok);
+    let screen = text(&mut app, 140, 40);
+    assert!(screen.contains(answer), "{screen}");
+    // The verbs are still on the line: a notice reports the last write without
+    // taking away the next one.
+    assert!(screen.contains("Install"), "{screen}");
+}
+
+/// One drawn row of a frame, one string per terminal column.
+fn row_symbols(screen: &str, row: usize) -> Vec<String> {
+    screen
+        .lines()
+        .nth(row)
+        .expect("the row was drawn")
+        .chars()
+        .map(|character| character.to_string())
+        .collect()
+}
+
+#[test]
+fn a_notice_shifts_the_verb_buttons_without_losing_the_click() {
+    // The notice is drawn in front of the verbs, so the buttons move right when
+    // one is showing. Each frame republishes where they landed and a press is
+    // resolved against that, which is what keeps a mouse press on the verb the
+    // reader can see rather than on the one that used to be there.
+    use vibex_tui::config_center::{ConfigTone, ConfigVerb};
+    let mut app = loaded(140, 40);
+    app.capabilities.management = vibex_backend::DomainCapabilities::available([
+        vibex_backend::BackendOperation::ManagementAgents,
+    ]);
+    app.config_center
+        .set_notice("Codex: Installed · version 1.3.0", ConfigTone::Ok);
+    let screen = text(&mut app, 140, 40);
+
+    let (rect, action) = app
+        .regions
+        .config_buttons
+        .iter()
+        .find(|(_, action)| *action == ConfigAction::CheckUpdate)
+        .copied()
+        .expect("the verbs were not published as buttons");
+    let drawn: String = row_symbols(&screen, usize::from(rect.y))
+        [usize::from(rect.x)..usize::from(rect.x + rect.width)]
+        .concat();
+    assert_eq!(drawn, format!(" {} ", action.label(app.strings)));
+
+    app.click_config_control(rect.x + 2, rect.y)
+        .expect("the press found no control");
+    let pending = app
+        .config_center
+        .pending
+        .get("codex")
+        .expect("the press did not start the verb it was over");
+    assert_eq!(pending.verb, ConfigVerb::CheckUpdate);
 }

@@ -4474,6 +4474,7 @@ fn render_config_table(
             Style::default().fg(theme.roles.gray)
         };
         let marker = if row.enabled { "●" } else { "○" };
+        let working = app.config_center.is_pending(&row.key);
         let mut spans = vec![
             // The focus bar marks the row the keys act on: accent while the
             // records pane owns the keyboard, a plain space while it does not.
@@ -4483,9 +4484,27 @@ fn render_config_table(
                 if focused && is_selected { "▌" } else { " " },
                 Style::default().fg(theme.roles.accent_user),
             ),
+            // A working row rotates in place of its status mark, so a write in
+            // flight is visible on every row rather than only on the one the
+            // action bar happens to be describing.
             Span::styled(
-                format!(" {marker}"),
-                if row.enabled {
+                if working {
+                    format!(
+                        " {}",
+                        crate::glyphs::frame_at(
+                            crate::glyphs::spinner_frames(app.glyph_tier()),
+                            app.animation_phase(),
+                            crate::glyphs::SPINNER_TICKS_PER_FRAME,
+                        )
+                    )
+                } else {
+                    format!(" {marker}")
+                },
+                if working {
+                    Style::default()
+                        .fg(theme.roles.warning)
+                        .add_modifier(Modifier::BOLD)
+                } else if row.enabled {
                     Style::default().fg(theme.roles.success)
                 } else {
                     Style::default().fg(theme.roles.gray_dim)
@@ -4706,23 +4725,59 @@ fn render_config_footer(
             .add_modifier(Modifier::BOLD),
     )];
     let mut used = display_width(&badge) as u16;
-    if let Some(row) = row {
+    // Cloned rather than borrowed: the buttons below are written into the app's
+    // own regions, which a live borrow of the pending map would forbid.
+    let pending = row.and_then(|row| app.config_center.pending.get(&row.key).cloned());
+    // A record whose write is in flight says what it is doing where its verbs
+    // were. The buttons are the one thing on this line that would do nothing
+    // while it works, and the phrase is the answer to the question the reader
+    // is actually asking — whether their key landed at all.
+    if let Some(pending) = &pending {
+        let label = format!(
+            " {} {} ",
+            crate::glyphs::frame_at(
+                crate::glyphs::spinner_frames(app.glyph_tier()),
+                app.animation_phase(),
+                crate::glyphs::SPINNER_TICKS_PER_FRAME,
+            ),
+            pending.verb.running(strings),
+        );
+        let width = display_width(&label) as u16;
+        spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(theme.roles.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+        used += width;
+    }
+    // What the last write answered, before the verbs rather than after them:
+    // the answer is the whole reason the reader looks at this line, and a
+    // notice squeezed in behind eight buttons is cut down to "Codex: Install…",
+    // which says nothing the row did not already say. The verbs are still one
+    // `Enter` away when they are the ones that do not fit.
+    if let Some((notice, tone)) = &app.config_center.notice {
+        let text = truncate_to_width(
+            notice,
+            usize::from(area.width).saturating_sub(usize::from(used) + 2),
+            "…",
+        );
+        if !text.is_empty() {
+            spans.push(Span::styled("  ", Style::default()));
+            let width = display_width(&text) as u16;
+            spans.push(Span::styled(text, chip_style(*tone, theme)));
+            used += width + 2;
+        }
+    }
+    if pending.is_none()
+        && let Some(row) = row
+    {
         for action in &row.actions {
             let label = format!(" {} ", action.label(strings));
             let width = display_width(&label) as u16;
             if used + width + 1 > area.width {
                 break;
             }
-            let pending = app.config_center.is_pending(&row.key);
-            let style = if pending {
-                Style::default()
-                    .fg(theme.roles.warning)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(theme.roles.gray_bright)
-                    .bg(theme.roles.surface)
-            };
             app.regions.config_buttons.push((
                 Rect {
                     x: area.x + used,
@@ -4732,20 +4787,14 @@ fn render_config_footer(
                 },
                 *action,
             ));
-            spans.push(Span::styled(label, style));
+            spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(theme.roles.gray_bright)
+                    .bg(theme.roles.surface),
+            ));
             spans.push(Span::raw(" "));
             used += width + 1;
-        }
-    }
-    if let Some((notice, tone)) = &app.config_center.notice {
-        let text = truncate_to_width(
-            notice,
-            usize::from(area.width).saturating_sub(usize::from(used) + 2),
-            "…",
-        );
-        if !text.is_empty() {
-            spans.push(Span::styled("  ", Style::default()));
-            spans.push(Span::styled(text, chip_style(*tone, theme)));
         }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -5834,7 +5883,10 @@ fn render_config_form(
     theme: &TuiTheme,
 ) {
     let strings = app.strings;
-    let saving = app.config_center.pending.contains_key("form");
+    let saving = app
+        .config_center
+        .pending
+        .contains_key(crate::config_center::FORM_RECORD);
     let chrome = modal_chrome(
         app,
         &form.title,

@@ -1233,8 +1233,12 @@ impl App {
                     return Outcome::quiet();
                 };
                 let agent_id = agent.id.clone();
-                self.guard(
+                let subject = agent.label.clone();
+                self.guard_record(
                     BackendOperation::ManagementAgents,
+                    key,
+                    subject,
+                    crate::config_center::ConfigVerb::Install,
                     Effect::InstallAgent { agent_id },
                 )
             }
@@ -1264,8 +1268,12 @@ impl App {
                 let Some(agent_id) = self.agent_id(key) else {
                     return Outcome::quiet();
                 };
-                self.guard(
+                let subject = self.config_row_subject(key);
+                self.guard_record(
                     BackendOperation::ManagementAgents,
+                    key,
+                    subject,
+                    crate::config_center::ConfigVerb::Uninstall,
                     Effect::UninstallAgent { agent_id },
                 )
             }
@@ -1273,17 +1281,28 @@ impl App {
                 let Some(agent_id) = self.agent_id(key) else {
                     return Outcome::quiet();
                 };
-                self.guard(
+                let subject = self.config_row_subject(key);
+                self.guard_record(
                     BackendOperation::AgentAuthRead,
-                    Effect::ListAgentAuth { agent_id },
+                    key,
+                    subject,
+                    crate::config_center::ConfigVerb::SignIn,
+                    Effect::ListAgentAuth {
+                        agent_id,
+                        open: true,
+                    },
                 )
             }
             (ConfigSection::Agents, ConfigAction::Logout) => {
                 let Some(agent_id) = self.agent_id(key) else {
                     return Outcome::quiet();
                 };
-                self.guard(
+                let subject = self.config_row_subject(key);
+                self.guard_record(
                     BackendOperation::AgentAuthManage,
+                    key,
+                    subject,
+                    crate::config_center::ConfigVerb::SignOut,
                     Effect::LogoutAgent { agent_id },
                 )
             }
@@ -1291,8 +1310,12 @@ impl App {
                 let Some(profile_id) = self.provider_id(key) else {
                     return Outcome::quiet();
                 };
-                self.guard(
+                let subject = self.config_row_subject(key);
+                self.guard_record(
                     BackendOperation::ManagementProfileSelect,
+                    key,
+                    subject,
+                    crate::config_center::ConfigVerb::Activate,
                     Effect::SelectProfile { profile_id },
                 )
             }
@@ -1308,8 +1331,12 @@ impl App {
                 let Some(profile_id) = self.provider_id(key) else {
                     return Outcome::quiet();
                 };
-                self.guard(
+                let subject = self.config_row_subject(key);
+                self.guard_record(
                     BackendOperation::ManagementProviderProfileTest,
+                    key,
+                    subject,
+                    crate::config_center::ConfigVerb::Test,
                     Effect::TestProviderProfile { profile_id },
                 )
             }
@@ -1317,8 +1344,12 @@ impl App {
                 let Some(profile_id) = self.provider_id(key) else {
                     return Outcome::quiet();
                 };
-                self.guard(
+                let subject = self.config_row_subject(key);
+                self.guard_record(
                     BackendOperation::ManagementProviderModelFetch,
+                    key,
+                    subject,
+                    crate::config_center::ConfigVerb::FetchModels,
                     Effect::FetchProviderModels { profile_id },
                 )
             }
@@ -1338,10 +1369,12 @@ impl App {
                 let Some(server) = self.mcp_server(key) else {
                     return Outcome::quiet();
                 };
-                Outcome::effects(vec![Effect::ToggleMcp {
+                let enabled = server.status != vibex_core::McpServerStatus::Enabled;
+                let effect = Effect::ToggleMcp {
                     server_id: server.id.clone(),
-                    enabled: server.status != vibex_core::McpServerStatus::Enabled,
-                }])
+                    enabled,
+                };
+                self.begin_toggle(key, enabled, effect)
             }
             (ConfigSection::Servers, ConfigAction::Validate) => {
                 let Some(server) = self.mcp_server(key) else {
@@ -1367,10 +1400,12 @@ impl App {
                 let Some(skill) = self.skill(key) else {
                     return Outcome::quiet();
                 };
-                Outcome::effects(vec![Effect::ToggleSkill {
+                let enabled = skill.status != vibex_core::SkillStatus::Enabled;
+                let effect = Effect::ToggleSkill {
                     skill_id: skill.id.clone(),
-                    enabled: skill.status != vibex_core::SkillStatus::Enabled,
-                }])
+                    enabled,
+                };
+                self.begin_toggle(key, enabled, effect)
             }
             (ConfigSection::Installed, ConfigAction::Validate) => {
                 let Some(skill) = self.skill(key) else {
@@ -1390,10 +1425,12 @@ impl App {
                 let Some(prompt) = self.prompt(key) else {
                     return Outcome::quiet();
                 };
-                Outcome::effects(vec![Effect::TogglePrompt {
+                let enabled = prompt.status != vibex_core::PromptStatus::Enabled;
+                let effect = Effect::TogglePrompt {
                     prompt_id: prompt.id.clone(),
-                    enabled: prompt.status != vibex_core::PromptStatus::Enabled,
-                }])
+                    enabled,
+                };
+                self.begin_toggle(key, enabled, effect)
             }
             (ConfigSection::Prompts, ConfigAction::Delete) => {
                 let Some(prompt) = self.prompt(key) else {
@@ -1403,10 +1440,11 @@ impl App {
                 self.begin_config_mutation(crate::app::ConfigMutation::DeletePrompt { prompt_id })
             }
             (ConfigSection::Prompts, ConfigAction::Validate) => {
-                self.toast(Toast::info(
-                    self.strings.config_action_validate().to_string(),
-                ));
-                Outcome::quiet()
+                let Some(prompt) = self.prompt(key) else {
+                    return Outcome::quiet();
+                };
+                let prompt_id = prompt.id.clone();
+                self.begin_config_mutation(crate::app::ConfigMutation::ValidatePrompt { prompt_id })
             }
             (ConfigSection::Catalog, ConfigAction::Install) => self.install_registry_entry(key),
             (ConfigSection::Sources, ConfigAction::Import) => self.import_discovery(key),
@@ -1934,12 +1972,29 @@ impl App {
     }
 
     /// `Ctrl+S`: write the form.
+    ///
+    /// The write is filed under the form rather than under a row: the form is
+    /// what the reader is looking at, and a record that does not exist until
+    /// the write lands has no row to wear the marker. That is also why the
+    /// answer closes the form — the record it produced is on the table behind
+    /// it.
     fn submit_form(&mut self, mut form: crate::config_center::ConfigForm) -> Outcome {
         match self.form_mutation(&form) {
             Ok(mutation) => {
                 form.error = None;
+                let verb = mutation.verb();
+                let subject = form.title.clone();
                 self.overlay = Some(Overlay::Form { form });
-                self.begin_config_mutation(mutation)
+                let effects = vec![Effect::ConfigMutation {
+                    mutation,
+                    record: crate::config_center::FORM_RECORD.to_string(),
+                }];
+                self.begin_record_work(
+                    crate::config_center::FORM_RECORD.to_string(),
+                    subject,
+                    verb,
+                    effects,
+                )
             }
             Err(message) => {
                 form.error = Some(message.to_string());
@@ -2208,19 +2263,100 @@ impl App {
     }
 
     /// Mark a write in flight and ask the worker for it.
+    ///
+    /// The record's own row wears the marker, so the key is the row's and the
+    /// sentence the answer will be made of is taken from it here — the title
+    /// the reader sees, not the id the write travels under.
     fn begin_config_mutation(&mut self, mutation: crate::app::ConfigMutation) -> Outcome {
         let key = mutation.key();
-        if !self.config_center.begin_pending(key, mutation.label()) {
-            self.toast(Toast::warning(self.strings.config_working().to_string()));
+        let subject = self.config_row_subject(&key);
+        let verb = mutation.verb();
+        let effects = vec![Effect::ConfigMutation {
+            mutation,
+            record: key.clone(),
+        }];
+        self.begin_record_work(key, subject, verb, effects)
+    }
+
+    /// Mark one record as working and hand back the effects that do the work.
+    ///
+    /// Every verb in the configuration centre goes through here, whether it is
+    /// a write boxed as a [`crate::app::ConfigMutation`] or one of the reads
+    /// and updates the authority already had. What matters to the reader is the
+    /// same either way: the row says it is working while it works, and the
+    /// answer comes back filed under the record it was about. A second press on
+    /// a record that is already working is refused rather than queued, because
+    /// two of the same call in flight is how a row ends up describing a write
+    /// that finished before the one it is waiting on.
+    fn begin_record_work(
+        &mut self,
+        key: String,
+        subject: String,
+        verb: crate::config_center::ConfigVerb,
+        effects: Vec<Effect>,
+    ) -> Outcome {
+        if !self.config_center.begin_pending(key, subject, verb) {
+            self.toast(Toast::warning(
+                self.strings.config_action_blocked().to_string(),
+            ));
             return Outcome::quiet();
         }
-        Outcome::effects(vec![Effect::ConfigMutation { mutation }])
+        Outcome::effects(effects)
+    }
+
+    /// The title of the record a key names, as the table draws it.
+    ///
+    /// The answer is a sentence about a record the reader can see, so it is
+    /// read off the row rather than reconstructed from the identifier: a form's
+    /// save names the form, and a record that is no longer listed falls back to
+    /// the key, which is at least true.
+    fn config_row_subject(&self, key: &str) -> String {
+        self.config_center
+            .rows(&self.management_data, self.strings)
+            .into_iter()
+            .find(|row| row.key == key)
+            .map(|row| row.title)
+            .unwrap_or_else(|| key.to_string())
+    }
+
+    /// Mark a record's switch as working, naming the half of the switch it
+    /// asked for.
+    ///
+    /// "Enabled" and "Disabled" are the same call to the authority and two
+    /// different things to the reader, so the direction is what the row says.
+    fn begin_toggle(&mut self, key: &str, enabled: bool, effect: Effect) -> Outcome {
+        let verb = if enabled {
+            crate::config_center::ConfigVerb::Enable
+        } else {
+            crate::config_center::ConfigVerb::Disable
+        };
+        let subject = self.config_row_subject(key);
+        self.begin_record_work(key.to_string(), subject, verb, vec![effect])
     }
 
     fn guard(&mut self, operation: BackendOperation, effect: Effect) -> Outcome {
         match self.unavailable_outcome(operation) {
             Some(outcome) => outcome,
             None => Outcome::effects(vec![effect]),
+        }
+    }
+
+    /// [`Self::guard`] for one record's verb.
+    ///
+    /// The order matters: a backend that cannot run the operation answers
+    /// before the row is marked, so the row never says it is working over a
+    /// call that was never made.
+    fn guard_record(
+        &mut self,
+        operation: BackendOperation,
+        key: &str,
+        subject: String,
+        verb: crate::config_center::ConfigVerb,
+        effect: Effect,
+    ) -> Outcome {
+        match self.unavailable_outcome(operation) {
+            Some(outcome) => outcome,
+            None => self.begin_record_work(key.to_string(), subject, verb, vec![effect]),
         }
     }
 
