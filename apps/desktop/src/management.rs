@@ -263,15 +263,16 @@ fn request_url_names_opencode_zen(url: &str) -> bool {
         .contains(OPENCODE_ZEN_ENDPOINT_MARKER)
 }
 
-/// What the editor tells the user when it enables the Zen session header.
+/// What the editor tells the user when it enables the session header for an
+/// OpenCode Go subscription address.
 ///
 /// The message names the header: the row it added sits in a section the user may
 /// never have opened, so the hint has to say what changed.
 fn opencode_zen_session_header_notice() -> String {
     management_locale_text(
-        "This address is OpenCode Zen: the x-opencode-session request header was enabled for you.",
-        "该地址是 OpenCode Zen，已自动为你启用 x-opencode-session 请求头。",
-        "該位址是 OpenCode Zen，已自動為你啟用 x-opencode-session 請求標頭。",
+        "OpenCode Go subscription address detected: the x-opencode-session request header was enabled for you.",
+        "检测到 OpenCode Go 订阅地址，已自动为你启用 x-opencode-session 请求头。",
+        "偵測到 OpenCode Go 訂閱位址，已自動為你啟用 x-opencode-session 請求標頭。",
     )
     .to_string()
 }
