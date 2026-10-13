@@ -59,6 +59,7 @@ pub mod modal;
 pub mod notify;
 pub mod onboarding;
 pub mod preview;
+pub mod queue_prefs;
 pub mod reduce;
 pub mod run;
 pub mod runtime_picker;
@@ -212,6 +213,7 @@ pub fn run(facade: BackendFacade, options: TuiOptions) -> BackendResult<ExitReas
             sidebar_path: App::sidebar_arrangement_path(),
             runtime_path: App::runtime_preferences_path(),
             preferences_path,
+            queue_path: App::queue_preferences_path(),
             notify_path: App::notification_preferences_path(),
         },
     );

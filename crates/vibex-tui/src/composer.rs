@@ -1771,7 +1771,11 @@ fn file_uri(path: &str) -> String {
 /// when the message is the only owner. `None` when the platform will not have
 /// it: the data URL still reaches the Agent, it is only the picture that the
 /// other clients cannot draw.
-fn materialise_attachment(mime_type: &str, bytes: &[u8]) -> Option<String> {
+///
+/// Shared with [`crate::queue_prefs`], which has to file a held message's
+/// pictures somewhere before it can write the queue down: a state file carrying
+/// raw pixels would grow by megabytes for one screenshot.
+pub(crate) fn materialise_attachment(mime_type: &str, bytes: &[u8]) -> Option<String> {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     mime_type.hash(&mut hasher);

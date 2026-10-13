@@ -972,6 +972,9 @@ pub struct App {
     /// Where the interface's own settings are written; `None` keeps them in
     /// memory only, which is what a preview or a test wants.
     pub preferences_path: Option<std::path::PathBuf>,
+    /// Where the Composer's held messages are written; `None` keeps the queue
+    /// in memory only, which is what a preview or a test wants.
+    pub queue_path: Option<std::path::PathBuf>,
     /// The last left click, so two clicks in the same cell can be told apart
     /// from two clicks in different ones.
     pub last_click: Option<(std::time::Instant, usize, u16)>,
@@ -1469,6 +1472,10 @@ impl App {
             None => Keymap::built_in(),
         };
         let arrangement = SidebarArrangement::load(options.sidebar_path.as_deref());
+        // A queue the previous run left behind, read before the first frame: a
+        // message given an hour to wait is still waiting after the terminal is
+        // closed and opened again, which is what makes the hour worth setting.
+        let queued = crate::queue_prefs::HeldQueue::load(options.queue_path.as_deref());
         let mut navigation = CompactNavigation::default();
         navigation.select_global(GlobalDestination::Sessions);
         let mut app = Self {
@@ -1496,6 +1503,7 @@ impl App {
             },
             sidebar_path: options.sidebar_path,
             preferences_path: options.preferences_path,
+            queue_path: options.queue_path,
             transcript: Transcript::new(),
             scroll: ScrollState::default(),
             pending_timeline_details: BTreeSet::new(),
@@ -1582,7 +1590,7 @@ impl App {
             dock_collapsed: std::collections::BTreeSet::new(),
             dock_hide_done: false,
             last_click: None,
-            queued_messages: Vec::new(),
+            queued_messages: queued,
             queue_selection: None,
             draft_schedules: BTreeMap::new(),
             schedule_shown_second: None,
@@ -2418,6 +2426,20 @@ impl App {
         Some(Self::interface_home()?.join("tui-interface.json"))
     }
 
+    /// Where the Composer's held messages are written.
+    ///
+    /// Beside the arrangement and the settings, for the same reason — and it is
+    /// the file a reader deletes when they want a queue they no longer trust
+    /// forgotten without resetting the rest of the interface.
+    pub fn queue_preferences_path() -> Option<std::path::PathBuf> {
+        if let Ok(explicit) = std::env::var("VIBEX_TUI_QUEUE")
+            && !explicit.trim().is_empty()
+        {
+            return Some(std::path::PathBuf::from(explicit));
+        }
+        Some(Self::interface_home()?.join("tui-queue.json"))
+    }
+
     /// The directory the interface's own files live in.
     pub(crate) fn interface_home() -> Option<std::path::PathBuf> {
         if let Ok(explicit) = std::env::var("VIBEX_TUI_HOME")
@@ -2511,6 +2533,21 @@ impl App {
             return;
         };
         self.interface_preferences().save(Some(path));
+    }
+
+    /// Persist the Composer's held messages.
+    ///
+    /// Called from every path that changes the queue rather than from the frame
+    /// loop: a client killed between two frames — which is how a terminal
+    /// client ends — would otherwise lose the change. A failure is silent for
+    /// the same reason the other files' is: losing a held message to a full
+    /// disk is not worth interrupting the reader over, and the next change
+    /// tries again.
+    pub fn save_queue(&self) {
+        let Some(path) = self.queue_path.as_deref() else {
+            return;
+        };
+        crate::queue_prefs::HeldQueue::of(&self.queued_messages).save(Some(path));
     }
 
     /// Fold the loaded session ids into the arrangement, keeping the reader's
@@ -4246,6 +4283,7 @@ impl App {
         if creation.scheduled_at_ms.is_some() {
             self.queued_messages
                 .retain(|queued| &queued.session_id != request_id);
+            self.save_queue();
         }
         let on_failed_session =
             self.page_shows_session() && self.selected_session_id() == Some(request_id);
@@ -4294,6 +4332,7 @@ impl App {
                 queued.session_id = self.new_draft_id.clone();
             }
         }
+        self.save_queue();
         self.new_session_runtime = failed.creation.runtime;
         self.workspace_path = Some(failed.creation.workspace_root);
         self.switch_composer(ComposerTarget::Draft(self.new_draft_id.clone()));
@@ -5116,6 +5155,7 @@ impl App {
             scheduled_at_ms,
         });
         self.queue_selection = Some(self.queued_for_active().len().saturating_sub(1));
+        self.save_queue();
     }
 
     /// Indices into [`Self::queued_messages`] that belong to the open session,
@@ -5203,6 +5243,7 @@ impl App {
         }
         self.focus = Focus::Composer;
         self.composer_mode = ComposerMode::Normal;
+        self.save_queue();
         true
     }
 
@@ -5215,6 +5256,7 @@ impl App {
         let remaining = self.queued_for_active().len();
         self.queue_selection =
             (remaining > 0).then(|| self.queue_selection.unwrap_or(0).min(remaining - 1));
+        self.save_queue();
         true
     }
 
@@ -5233,6 +5275,7 @@ impl App {
         }
         self.queued_messages.swap(index, rows[target as usize]);
         self.queue_selection = Some(target as usize);
+        self.save_queue();
         true
     }
 
@@ -5261,6 +5304,7 @@ impl App {
         self.queue_selection =
             (remaining > 0).then(|| self.queue_selection.unwrap_or(0).min(remaining - 1));
         let attachments = self.wire_attachments(&queued.images);
+        self.save_queue();
         Some((queued.text, attachments))
     }
 
@@ -5318,6 +5362,12 @@ impl App {
             self.history.push(queued.text.clone());
             let attachments = self.wire_attachments(&queued.images);
             released.push((session_id, queued.text, attachments));
+        }
+        if !released.is_empty() {
+            // Only a pass that actually released something rewrote the queue:
+            // this runs on every worker message, and a file write per pass
+            // would be a file write per frame of a running turn.
+            self.save_queue();
         }
         released
     }
@@ -6207,6 +6257,14 @@ pub struct AppOptions {
     /// reader who wants the interface back at its shipped defaults deletes it
     /// without losing the arrangement or the switcher's memory.
     pub preferences_path: Option<std::path::PathBuf>,
+    /// Where the Composer's held messages are kept.
+    ///
+    /// The one file here that is not a preference: a held message is work the
+    /// reader did, and a message given an hour to wait has to outlive the
+    /// process that took it or the schedule it carries means nothing. `None`
+    /// keeps the queue in memory for the run, which is what a preview or a test
+    /// wants.
+    pub queue_path: Option<std::path::PathBuf>,
     /// Where the notification layer's choices are kept.
     ///
     /// `None` reads nothing and writes nothing, which is what a preview and a
@@ -6235,6 +6293,13 @@ impl AppOptions {
             sidebar_path: App::sidebar_arrangement_path(),
             runtime_path: App::runtime_preferences_path(),
             preferences_path: App::interface_preferences_path(),
+            // Not `App::queue_preferences_path()`: the other three hold
+            // preferences, which a preview or a test may reasonably take from
+            // the reader's home, while this one holds the reader's own words.
+            // A test that enqueued a message would otherwise write into the
+            // home of whoever ran it — and would race every test doing the same
+            // — so the composition root is the only place that names the file.
+            queue_path: None,
             // Not `App::notification_preferences_path()`: a test that flips a
             // notification switch writes the file, and the settings page's own
             // tests are the ones that do it.
@@ -7004,6 +7069,20 @@ mod tests {
         )
     }
 
+    /// An app whose held messages live in `path` and nowhere else.
+    fn queue_app(path: &std::path::Path) -> App {
+        App::new(
+            vibex_backend::DisconnectedBackend::facade(),
+            AppOptions {
+                sidebar_path: None,
+                runtime_path: None,
+                preferences_path: None,
+                queue_path: Some(path.to_path_buf()),
+                ..AppOptions::default()
+            },
+        )
+    }
+
     /// A shipped theme for `mode` that is not its catalog default, so applying
     /// it is a visible change even from an empty slot.
     fn non_default_theme(mode: vibex_ui::GpuiThemeMode) -> &'static str {
@@ -7596,6 +7675,66 @@ mod tests {
         assert_eq!(
             app.schedule_status_label(now_ms - 1, &session_id, now_ms),
             app.strings.schedule_due_running()
+        );
+    }
+
+    #[test]
+    fn a_scheduled_message_is_still_waiting_after_the_client_restarts() {
+        // The hour a reader sets is an instruction to a client that may not be
+        // running when it arrives. A queue kept in memory alone made the
+        // schedule the one thing the reader could not rely on: closing the
+        // terminal threw the message away, and with it the session that existed
+        // only to wait for it.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tui-queue.json");
+        let session_id = VibexSessionId::new();
+        let at_ms = vibex_core::unix_timestamp_ms() + 3_600_000;
+
+        let mut first = queue_app(&path);
+        first.enqueue_scheduled(
+            session_id.clone(),
+            "tomorrow's message".to_string(),
+            Vec::new(),
+            Some(at_ms),
+        );
+        assert!(path.exists(), "the queue was never written down");
+        drop(first);
+
+        // A second run reads the same file and finds the message where the
+        // first left it, deadline and all.
+        let second = queue_app(&path);
+        assert_eq!(second.queued_messages.len(), 1);
+        assert_eq!(second.queued_messages[0].session_id, session_id);
+        assert_eq!(second.queued_messages[0].text, "tomorrow's message");
+        assert_eq!(second.queued_messages[0].scheduled_at_ms, Some(at_ms));
+        assert_eq!(second.next_scheduled_message_at(&session_id), Some(at_ms));
+    }
+
+    #[test]
+    fn a_message_sent_or_dropped_is_taken_out_of_the_file() {
+        // The file follows the queue in both directions: a message that has
+        // gone out must not come back on the next run, or a schedule would
+        // send the same words twice.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tui-queue.json");
+        let session_id = VibexSessionId::new();
+        let mut app = queue_app(&path);
+        // The queue is acted on through the session in front of the reader, so
+        // the rows have to belong to one before they can be dropped or sent.
+        app.agent.state.selected_session_id = Some(session_id.clone());
+        app.navigate_to(Page::Agent);
+        app.enqueue_scheduled(session_id.clone(), "dropped".to_string(), Vec::new(), None);
+        app.enqueue_scheduled(session_id.clone(), "sent".to_string(), Vec::new(), None);
+        app.queue_selection = Some(0);
+        assert!(app.delete_queued_message());
+        app.queue_selection = Some(0);
+        assert!(app.take_queued_message().is_some());
+
+        let restored = queue_app(&path);
+        assert!(
+            restored.queued_messages.is_empty(),
+            "a message the reader dropped or sent is still queued: {:?}",
+            restored.queued_messages
         );
     }
 
