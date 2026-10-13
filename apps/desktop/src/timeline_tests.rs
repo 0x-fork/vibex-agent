@@ -1818,21 +1818,6 @@ fn a_prefetch_that_cannot_start_keeps_the_history_budget(cx: &mut TestAppContext
     );
 }
 
-/// The summed render count of the process units the focused timeline retains.
-fn retained_unit_render_count(
-    workbench: &Entity<VibexWorkbench>,
-    cx: &VisualTestContext,
-) -> usize {
-    workbench.read_with(cx, |workbench, cx| {
-        workbench
-            .timeline_unit_views
-            .values()
-            .filter_map(|view| view.upgrade())
-            .map(|view| view.read(cx).render_count())
-            .sum()
-    })
-}
-
 /// Draws frames the way the platform does when nothing has asked for a full
 /// refresh, which is the state a retained element tree is reused in.
 ///
@@ -1860,26 +1845,60 @@ fn retained_process_units_render_only_when_their_key_moves(cx: &mut TestAppConte
     cx.update(gpui_component::init);
     let (workbench, cx) = live_tool_timeline(cx, false);
     draw_live_timeline_frames(&workbench, cx, 4);
-    let before = retained_unit_render_count(&workbench, cx);
-    assert!(
-        before > 0,
-        "the focused timeline should retain its process units"
-    );
+    // One unit, held for the length of the test so that a frame which stops
+    // mounting it cannot be mistaken for one that did not render it.
+    let (unit_id, unit) = workbench.read_with(cx, |workbench, _| {
+        workbench
+            .timeline_unit_views
+            .iter()
+            .find_map(|(id, view)| view.upgrade().map(|view| (id.clone(), view)))
+            .expect("the focused timeline should retain its process units")
+    });
+    let renders = |cx: &VisualTestContext| unit.read_with(cx, |view, _| view.render_count());
+    let before = renders(cx);
+    assert!(before > 0);
 
     draw_plain_timeline_frames(cx, 4);
     assert_eq!(
-        retained_unit_render_count(&workbench, cx),
+        renders(cx),
         before,
         "a frame that changes nothing must not render a retained unit again"
     );
 
+    // A workbench notify on its own is what every streamed chunk produces, and
+    // it must not rebuild the retained trees either.
+    workbench.update(cx, |_, cx| cx.notify());
+    draw_plain_timeline_frames(cx, 2);
+    assert_eq!(
+        renders(cx),
+        before,
+        "a workbench notify on its own must not render a retained unit again"
+    );
+
+    // A disclosure is the other half of the contract: its click handler only
+    // inserts into an expansion map, so the key has to carry that state or the
+    // clicked row keeps painting its previous shape while hover, which notifies
+    // the element's own view, still responds.
+    workbench.update(cx, |workbench, cx| {
+        workbench
+            .timeline_command_expansion
+            .insert(unit_id.clone(), true);
+        cx.notify();
+    });
+    draw_plain_timeline_frames(cx, 2);
+    assert!(
+        renders(cx) > before,
+        "toggling a disclosure must render the retained unit again"
+    );
+
+    let after_disclosure = renders(cx);
     let end = workbench.read_with(cx, |workbench, _| {
         workbench.timeline.authoritative_end_sequence.unwrap()
     });
     apply_live_timeline_item(&workbench, cx, progress_tool(end + 1, 23));
     draw_live_timeline_frames(&workbench, cx, 2);
     assert!(
-        retained_unit_render_count(&workbench, cx) > before,
+        renders(cx) > after_disclosure,
         "a new tool item must render the unit that holds it"
     );
 }

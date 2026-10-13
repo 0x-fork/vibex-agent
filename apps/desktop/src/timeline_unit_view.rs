@@ -47,8 +47,15 @@ struct TimelineUnitRenderBase {
     locale: locale::ResolvedLocale,
     /// Enhanced command and file-operation display.
     flags: u8,
-    /// Folded find-in-conversation and session-search highlight state.
+    /// Folded find-in-conversation and session-search highlight state, including
+    /// a pending reveal.
     search: u64,
+    /// Every disclosure the units can paint: a click handler only inserts into
+    /// one of these maps, so a key without them leaves the clicked row showing
+    /// its previous shape — hover still repaints the unit, because a hover
+    /// change notifies the element's own view, which is exactly what made the
+    /// missing disclosure state look like a dead click.
+    expansion: u64,
     /// The colors elements inherit rather than carry in their own style.
     theme: u64,
 }
@@ -338,6 +345,27 @@ impl VibexWorkbench {
         self.conversation_find_active_item_id.hash(&mut search);
         self.session_search_highlight_query.hash(&mut search);
         self.session_search_highlight_item_id.hash(&mut search);
+        self.pending_session_search_reveal_item_id.hash(&mut search);
+        self.pending_permission_reveal_item_id.hash(&mut search);
+        // The disclosure maps are hashed whole rather than by the unit's own
+        // entry: a unit's row may read any of them — a plain tool row reads the
+        // command map, a reasoning row the reasoning map, an answer the file
+        // change map — and every toggle is a reader action, so rebuilding the
+        // visible units once is cheaper than keeping a per-kind index in step
+        // with four maps.
+        let mut expansion = std::collections::hash_map::DefaultHasher::new();
+        for map in [
+            &self.timeline_command_expansion,
+            &self.timeline_process_expansion,
+            &self.timeline_file_changes_expansion,
+            &self.reasoning_expansion,
+        ] {
+            map.len().hash(&mut expansion);
+            for (id, open) in map {
+                id.hash(&mut expansion);
+                open.hash(&mut expansion);
+            }
+        }
         let mut theme = std::collections::hash_map::DefaultHasher::new();
         let tokens = cx.theme();
         let hash_color = |color: Hsla, state: &mut std::collections::hash_map::DefaultHasher| {
@@ -356,9 +384,14 @@ impl VibexWorkbench {
         cx.theme().is_dark().hash(&mut theme);
         TimelineUnitRenderBase {
             locale: locale::current_locale(),
+            // The live flag is part of what a row paints — a running label
+            // shimmers, a settled one does not — and a session can go idle
+            // without any row revision moving.
             flags: u8::from(self.ui_state.session.enhanced_command_execution_display)
-                | (u8::from(self.ui_state.session.enhanced_file_operation_display) << 1),
+                | (u8::from(self.ui_state.session.enhanced_file_operation_display) << 1)
+                | (u8::from(self.borrowed_session_turn_is_live()) << 2),
             search: search.finish(),
+            expansion: expansion.finish(),
             theme: theme.finish(),
         }
     }
