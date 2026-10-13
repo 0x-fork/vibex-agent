@@ -227,6 +227,9 @@ pub struct MobileWorkbench {
     terminal_active_search_match: usize,
     busy: bool,
     notice: Option<String>,
+    /// The timer that clears `notice` again, replaced whenever a new
+    /// confirmation is raised.
+    notice_clear_task: Option<Task<()>>,
     error: Option<BackendError>,
     tasks: Vec<Task<()>>,
 }
@@ -298,6 +301,7 @@ impl MobileWorkbench {
             terminal_active_search_match: 0,
             busy: false,
             notice: None,
+            notice_clear_task: None,
             error: None,
             tasks: Vec::new(),
         };
@@ -590,19 +594,44 @@ impl MobileWorkbench {
         cx.notify();
     }
 
+    /// Shows a transient confirmation above the surface.
+    ///
+    /// The bar is a confirmation, not a log: it clears itself, so a stale
+    /// "Copied" never sits over the next thing the reader looks at. A newer
+    /// notice is left alone — the timer belongs to the text it was raised for.
+    fn show_notice(&mut self, text: String, cx: &mut Context<Self>) {
+        self.notice = Some(text.clone());
+        let entity = cx.weak_entity();
+        // One notice at a time: the timer that clears the previous one is
+        // replaced by the timer for this one.
+        self.notice_clear_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(2_600))
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.notice.as_deref() == Some(text.as_str()) {
+                    this.notice = None;
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
     /// Returns from the full-screen file view to the file tree. The editor
     /// keeps its loaded content so re-opening the file is instant.
     fn close_file_screen(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.file_editor_is_dirty(cx) {
             // Leaving the screen keeps the buffer, so the only thing to warn
             // about is losing sight of it; the file stays open behind the tree.
-            self.notice = Some(
+            self.show_notice(
                 locale::text(
                     "Unsaved edits stay in the editor",
                     "未保存的修改仍保留在编辑器中",
                     "未儲存的修改仍保留在編輯器中",
                 )
                 .to_string(),
+                cx,
             );
         }
         self.file_screen_open = false;
@@ -651,8 +680,10 @@ impl MobileWorkbench {
             self.pending_file_editor_content = Some(content);
         }
         self.error = None;
-        self.notice = Some(locale::common("Desktop file version loaded").to_string());
-        cx.notify();
+        self.show_notice(
+            locale::common("Desktop file version loaded").to_string(),
+            cx,
+        );
     }
 
     fn refresh_git(&mut self, cx: &mut Context<Self>) {
@@ -1794,7 +1825,7 @@ impl MobileWorkbench {
             && !text.is_empty()
         {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
-            self.notice = Some(locale::text("Copied", "已复制", "已複製").to_string());
+            self.show_notice(locale::text("Copied", "已复制", "已複製").to_string(), cx);
         }
         self.dismiss_terminal_selection(cx);
     }
