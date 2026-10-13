@@ -13,13 +13,13 @@ use std::time::{Duration, Instant};
 use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::StreamExt as _;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext as _, ClipboardItem, Context, DispatchPhase,
-    ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, Image, ImageFormat, IntoElement,
-    KeyBinding, ListAlignment, ListOffset, ListState, LongPressEvent, MouseButton, MouseUpEvent,
-    ObjectFit, ParentElement as _, Pixels, Point, Render, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, Styled as _, Task, TouchPhase, Transformation, UniformListScrollHandle,
-    WeakEntity, Window, div, ease_in_out, ease_out_quint, img, list, percentage, point, prelude::*,
-    px, relative, rgb, svg, uniform_list,
+    Animation, AnimationExt as _, App, AppContext as _, Bounds, ClipboardItem, Context,
+    DispatchPhase, ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, Image, ImageFormat,
+    IntoElement, KeyBinding, ListAlignment, ListOffset, ListState, LongPressEvent, MouseButton,
+    MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, Styled as _, Task, TouchDragEvent, TouchPhase, Transformation,
+    UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint, img, list,
+    percentage, point, prelude::*, px, relative, rgb, svg, uniform_list,
 };
 use vibex_app_update::{UpdateSnapshot, UpdateState};
 use vibex_backend::{
@@ -32,12 +32,13 @@ use vibex_core::{
     AgentCommandExecutionBehavior, AgentCommandSourceKind, AgentCommandTrigger, AgentId,
     AgentListRequest, AgentSessionState, AgentTimelineDisplaySettings,
     AgentTimelineReasoningDisplayMode, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    ElicitationFieldKind, ElicitationResolutionAction, ForkAgentSessionRequest, MessageAttachment,
-    OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PermissionRiskCategory,
-    PlanStepPayload, PlanStepStatus, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState,
-    RemoteServerKind, RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
-    RemoteSidebarOrganizationMutation, RenameAgentSessionRequest, RequestId,
-    ResolvePermissionRequest, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
+    ElicitationFieldKind, ElicitationResolutionAction, ForkAgentSessionRequest, GoalPhase,
+    GoalSnapshot, MessageAttachment, OpenWorkspaceRequest, PermissionResolution,
+    PermissionResponseKind, PermissionRiskCategory, PlanStepPayload, PlanStepStatus,
+    RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteServerKind,
+    RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
+    RemoteSidebarOrganizationMutation, RenameAgentSessionRequest, ReplaceUserMessagePayload,
+    RequestId, ResolvePermissionRequest, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
     RuntimeAuthSourceSummary, RuntimeModelSelection, RuntimeOptionAvailability,
     RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
     SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
@@ -47,10 +48,11 @@ use vibex_core::{
     WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
-    NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice, RuntimeCascadeProjection,
-    SidebarHierarchyMode, SidebarOrganizationItem, SidebarOrganizationView, SidebarProjectLogo,
-    SidebarProjectLogoColor, SidebarState, ThemeSelection, TimelineConversationTurn, TimelineModel,
-    TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
+    ActiveGoal, NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice,
+    RuntimeCascadeProjection, SidebarHierarchyMode, SidebarOrganizationItem,
+    SidebarOrganizationView, SidebarProjectLogo, SidebarProjectLogoColor, SidebarState,
+    ThemeSelection, TimelineConversationTurn, TimelineModel, TimelineProcessActivityGroup,
+    TimelineRow, TimelineRowKind,
 };
 use vibex_remote_client::{
     ClientDeviceIdentity, RemoteConnectionState, RemoteLifecycleSignal, WebRemoteBackend,
@@ -104,6 +106,13 @@ const TIMELINE_ACTION_BUTTON_SIZE_PX: f32 = 32.0;
 const TIMELINE_EVENT_BATCH_LIMIT: usize = 256;
 const TIMELINE_EVENT_COALESCE_DELAY: Duration = Duration::from_millis(16);
 const TIMELINE_MARKDOWN_VIEW_CACHE_LIMIT: usize = 64;
+/// How many past prompts the history sheet shows before its "show older"
+/// control. The sheet is for recall, not for reading a transcript.
+const COMPOSER_HISTORY_PAGE: usize = 20;
+/// The distance from one queue row's top to the next, used to turn a drag's
+/// travel into a drop index. It must match what the queue paints — a touch
+/// target plus the gap between rows — or a drag lands one row off.
+const COMPOSER_QUEUE_ROW_PITCH_PX: f32 = theme::TOUCH_TARGET + theme::SPACING_XS;
 const TIMELINE_RUNTIME_LABEL_MAX_CHARS: usize = 48;
 /// One complete sweep of the collapsed thinking label's shimmer. Desktop
 /// parity: `AGENT_THINKING_SHIMMER_SWEEP` — the hand-rolled indicator ran ten
@@ -520,6 +529,36 @@ struct PendingMobileUserMessage {
     attachments: Vec<MessageAttachment>,
 }
 
+/// A queued prompt being slid to another place in the queue.
+///
+/// The target is computed from the finger's travel divided by the row height,
+/// so a drag never has to measure the list: the rows are one fixed height and
+/// the drop position is the start index plus however many rows the finger
+/// passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MobileQueueDrag {
+    id: u64,
+    start_index: usize,
+    start_y: i32,
+    target_index: usize,
+}
+
+/// A user message the composer is rewriting in place.
+///
+/// The two sequences are what the authority needs to replace it safely: the
+/// message's own sequence, and the end of the timeline the reader was looking
+/// at when they asked. Anything else means the transcript moved underneath
+/// them, and the edit is refused rather than applied to the wrong message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MobileComposerMessageEdit {
+    row_id: String,
+    user_sequence: i64,
+    expected_end_sequence: i64,
+    /// The runtime the message was sent with, so a rewrite keeps the session's
+    /// own model instead of falling back to whatever the phone defaults to.
+    runtime: SessionRuntimeSelection,
+}
+
 impl PendingMobileUserMessage {
     fn is_confirmed_by(&self, timeline: &TimelineModel) -> bool {
         timeline.session_id.as_ref() == Some(&self.session_id)
@@ -580,7 +619,20 @@ enum TimelineMetadataTip {
 struct MobileAttachmentPreview {
     label: String,
     image: Arc<Image>,
+    /// 1.0 fits the picture to the screen. A phone has no scroll wheel to zoom
+    /// with, so the scale is stepped by taps and the picture is panned by
+    /// dragging it once it is larger than the screen.
+    zoom: f32,
+    /// How far the zoomed picture has been dragged from the centre.
+    offset: Point<Pixels>,
+    /// The touch that is panning and the offset it started from, so the pan
+    /// follows the finger instead of accumulating rounding drift.
+    pan: Option<(Point<Pixels>, Point<Pixels>)>,
 }
+
+/// How far a tap can zoom in, and the step a zoom control takes.
+const ATTACHMENT_PREVIEW_ZOOM_MAX: f32 = 4.0;
+const ATTACHMENT_PREVIEW_ZOOM_STEP: f32 = 1.5;
 
 /// Touch shells cannot rely on hover, so the sidebar keeps only the most-used
 /// action on the row itself and moves the rest behind this sheet.
@@ -1125,6 +1177,7 @@ struct PlatformEventStreams {
     update_actions: UnboundedReceiver<update::UpdateAction>,
     lan_discovery_events: UnboundedReceiver<LanDiscoveryEvent>,
     lifecycle_events: UnboundedReceiver<MobileLifecycleEvent>,
+    launch_shortcuts: UnboundedReceiver<crate::shortcut::LaunchShortcut>,
 }
 
 impl PlatformEventStreams {
@@ -1136,6 +1189,7 @@ impl PlatformEventStreams {
             update_actions: update::subscribe_actions(),
             lan_discovery_events: crate::discovery::subscribe(),
             lifecycle_events: crate::lifecycle::subscribe(),
+            launch_shortcuts: crate::shortcut::subscribe(),
         }
     }
 
@@ -1148,6 +1202,7 @@ impl PlatformEventStreams {
             update_actions: futures_channel::mpsc::unbounded().1,
             lan_discovery_events: futures_channel::mpsc::unbounded().1,
             lifecycle_events: futures_channel::mpsc::unbounded().1,
+            launch_shortcuts: futures_channel::mpsc::unbounded().1,
         }
     }
 }
@@ -1178,6 +1233,13 @@ pub struct MobileApp {
     /// observed in an async task with no window, so the check-and-write is
     /// deferred to the next paint.
     pending_composer_restore: Option<String>,
+    /// Text another app shared into Vibex, waiting for the next paint to land
+    /// in the composer. Appended rather than replacing: the field may already
+    /// hold a half-written prompt.
+    pending_shared_text: Option<String>,
+    /// A launcher shortcut waiting for the next paint, which is the first
+    /// moment there is a window to open a page in.
+    pending_launch_shortcut: Option<crate::shortcut::LaunchShortcut>,
     /// The slash commands the open session's Agent offers. Discovered once per
     /// session and filtered locally, so typing `/p` never waits on the wire.
     composer_commands: Vec<AgentCommandEntry>,
@@ -1198,12 +1260,32 @@ pub struct MobileApp {
     /// Attachments per session, like the text drafts: what was attached to A
     /// must not be sent with a prompt typed in B.
     composer_attachment_drafts: BTreeMap<String, Vec<MessageAttachment>>,
+    /// The user message the composer is rewriting, when the reader asked to
+    /// edit one. The composer keeps the whole pipeline (attachments, mentions,
+    /// slash commands), so an edit borrows it rather than growing a second
+    /// editor with its own rules.
+    composer_message_edit: Option<MobileComposerMessageEdit>,
+    /// The draft the composer held before an edit borrowed it, restored when
+    /// the edit is cancelled or fails.
+    composer_edit_stashed_draft: Option<String>,
+    /// The attachments that belonged to the stashed draft.
+    composer_edit_stashed_attachments: Vec<MessageAttachment>,
+    /// The message-history sheet, open or closed. The list is projected from
+    /// the open session's user rows when it is drawn, so it never goes stale.
+    composer_history_open: bool,
+    /// How many messages the history sheet lists at once. Paged rather than
+    /// unbounded: a long session has thousands of prompts and the sheet only
+    /// ever shows the newest handful without a scroll.
+    composer_history_limit: usize,
     /// The plan bar the reader has opened, as the session and plan it belongs
     /// to. One bar at a time: the composer has room for exactly one.
     composer_plan_expanded: Option<(String, i64)>,
     /// Plan bars the reader closed. Identity is the session plus the plan
     /// revision, so a new plan from the Agent shows up again on its own.
     dismissed_composer_plans: BTreeSet<(String, i64)>,
+    /// Whether the goal bar is showing its objective in full. A phone has room
+    /// for the phase and one line of objective, and no more.
+    composer_goal_expanded: bool,
     /// Prompts written while a turn was running, oldest first.
     ///
     /// The desktop keeps a full scheduler here; a phone needs the part that
@@ -1211,6 +1293,11 @@ pub struct MobileApp {
     /// when the turn settles (or force it in now).
     composer_queue: Vec<MobileQueuedMessage>,
     composer_queue_next_id: u64,
+    /// The queued prompt being dragged to a new place, and where it would land.
+    /// A phone reorders by holding a row and sliding it, the way the sidebar
+    /// already does; the drop target is derived from the finger's travel and
+    /// the queue's uniform row height rather than from measured bounds.
+    composer_queue_drag: Option<MobileQueueDrag>,
     /// One draft per session.
     ///
     /// The composer used to be a single buffer that survived a session switch,
@@ -1372,6 +1459,12 @@ pub struct MobileApp {
     /// Top edge and right edge of the row list in window space, recorded during
     /// paint so a touch pan can be resolved to a row without hit-test plumbing.
     sidebar_list_frame: Rc<Cell<(f32, f32)>>,
+    /// The queue's painted top edge, recorded so a long press can be resolved
+    /// to a queue row without per-row bounds.
+    composer_queue_frame: Rc<Cell<(f32, f32)>>,
+    /// The image preview's stage size, so a pan can be clamped and a zoom step
+    /// can be taken against the surface the picture is actually drawn on.
+    attachment_preview_frame: Rc<Cell<(f32, f32)>>,
     session_action_input: Entity<InputState>,
     session_action_busy: bool,
     runtime_options_open: bool,
@@ -1635,6 +1728,62 @@ fn current_mobile_plan(items: &[TimelineItem]) -> Option<MobilePlanProjection> {
                 steps: steps.clone(),
             })
         })
+}
+
+/// The goal phase as a word, and the colour it reads in.
+///
+/// A paused goal must not look like a running one, and a blocked or limited
+/// goal has to say why it stopped: the objective is still there, and a bar
+/// that only said "Goal" would hide the reason it is not moving.
+fn goal_phase_label(phase: GoalPhase) -> (&'static str, gpui::Hsla) {
+    match phase {
+        GoalPhase::Active => (
+            locale::text("Working toward it", "进行中", "進行中"),
+            theme::accent_success(),
+        ),
+        GoalPhase::Paused => (
+            locale::text("Paused", "已暂停", "已暫停"),
+            theme::text_muted(),
+        ),
+        GoalPhase::Blocked => (
+            locale::text("Blocked", "受阻", "受阻"),
+            theme::accent_yellow(),
+        ),
+        GoalPhase::UsageLimited | GoalPhase::BudgetLimited => (
+            locale::text("Out of budget", "用量受限", "用量受限"),
+            theme::accent_yellow(),
+        ),
+        GoalPhase::Complete => (
+            locale::text("Reached", "已完成", "已完成"),
+            theme::text_secondary(),
+        ),
+        GoalPhase::Unknown => (locale::text("Goal", "目标", "目標"), theme::text_muted()),
+    }
+}
+
+/// What the provider is counting against the goal, if anything.
+///
+/// Providers differ in what they report — one counts rounds, another tokens or
+/// time — so the line names whichever counters exist instead of inventing a
+/// progress bar that would be empty on half of them.
+fn goal_progress_label(goal: &GoalSnapshot) -> Option<String> {
+    let mut parts = Vec::new();
+    if let (Some(used), Some(budget)) = (goal.tokens_used, goal.token_budget) {
+        parts.push(format!("{used} / {budget} tokens"));
+    } else if let Some(used) = goal.tokens_used {
+        parts.push(format!("{used} tokens"));
+    }
+    if let (Some(rounds), Some(max)) = (goal.rounds_started, goal.max_rounds) {
+        parts.push(format!("{rounds} / {max} rounds"));
+    } else if let Some(rounds) = goal.rounds_started {
+        parts.push(format!("{rounds} rounds"));
+    }
+    if let Some(seconds) = goal.time_used_seconds {
+        // The goal's own clock, not a timestamp: the formatter reads a start
+        // and an end, so the elapsed time is handed over as the whole span.
+        parts.push(format_compact_duration(0, Some(seconds * 1_000)));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 fn plan_step_status_label(status: PlanStepStatus) -> &'static str {
@@ -2024,6 +2173,71 @@ fn settings_empty_note(text: &'static str) -> gpui::AnyElement {
         .into_any_element()
 }
 
+/// Where a reordered queue entry belongs, as an index into the whole queue.
+///
+/// `remaining` holds the indices of the session's messages after the moved one
+/// was taken out, and `target` is where it should sit among them. A target at
+/// or past the end means "after the last one", which is the only place that is
+/// not "before the message currently there".
+fn queue_insert_index(remaining: &[usize], target: usize, queue_len: usize) -> usize {
+    match remaining.get(target) {
+        Some(index) => *index,
+        None => remaining
+            .last()
+            .map(|last| last + 1)
+            .unwrap_or(queue_len)
+            .min(queue_len),
+    }
+}
+
+/// A round control on the image preview's footer bar.
+fn attachment_preview_button(
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    enabled: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .aria_label(label.to_string())
+        .size(px(theme::TOUCH_TARGET))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .when(enabled, |button| {
+            button
+                .cursor_pointer()
+                .active(|style| style.bg(theme::row_pressed_bg()))
+        })
+        .when(!enabled, |button| button.opacity(0.4))
+        .child(
+            svg()
+                .path(icon)
+                .size(px(theme::ICON_SM))
+                .text_color(theme::text_secondary()),
+        )
+}
+
+/// Keeps a zoomed picture from being dragged off the screen.
+///
+/// At zoom 1 there is nothing to pan, and beyond it the picture may travel by
+/// half the extra width the zoom added, which is exactly where its edge meets
+/// the screen's.
+fn clamp_attachment_preview_offset(
+    offset: Point<Pixels>,
+    zoom: f32,
+    size: gpui::Size<Pixels>,
+) -> Point<Pixels> {
+    let slack_x = (f32::from(size.width) * (zoom - 1.0) / 2.0).max(0.0);
+    let slack_y = (f32::from(size.height) * (zoom - 1.0) / 2.0).max(0.0);
+    point(
+        px(f32::from(offset.x).clamp(-slack_x, slack_x)),
+        px(f32::from(offset.y).clamp(-slack_y, slack_y)),
+    )
+}
+
 fn timeline_action_button(
     id: impl Into<ElementId>,
     icon: &'static str,
@@ -2234,6 +2448,8 @@ impl MobileApp {
             composer_input,
             selection_menu,
             pending_composer_restore: None,
+            pending_shared_text: None,
+            pending_launch_shortcut: None,
             composer_drafts: restored_composer.drafts,
             composer_commands: Vec::new(),
             composer_commands_generation: 0,
@@ -2241,10 +2457,17 @@ impl MobileApp {
             composer_armed_mentions: Vec::new(),
             composer_attachments: Vec::new(),
             composer_attachment_drafts: restored_composer.attachments,
+            composer_message_edit: None,
+            composer_edit_stashed_draft: None,
+            composer_edit_stashed_attachments: Vec::new(),
+            composer_history_open: false,
+            composer_history_limit: COMPOSER_HISTORY_PAGE,
             composer_plan_expanded: None,
             dismissed_composer_plans: BTreeSet::new(),
+            composer_goal_expanded: false,
             composer_queue: restored_composer.queue,
             composer_queue_next_id: restored_composer.next_queue_id,
+            composer_queue_drag: None,
             timeline_turns: Arc::new(Vec::new()),
             timeline_markdown_views: RefCell::new(BTreeMap::new()),
             pending_user_message: None,
@@ -2390,6 +2613,8 @@ impl MobileApp {
             sidebar_batch_mode: false,
             sidebar_batch_delete_confirmation: false,
             sidebar_list_frame: Rc::new(Cell::new((0.0, 0.0))),
+            composer_queue_frame: Rc::new(Cell::new((0.0, 0.0))),
+            attachment_preview_frame: Rc::new(Cell::new((0.0, 0.0))),
             session_action_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(locale::text(
                     "Session name",
@@ -2456,6 +2681,7 @@ impl MobileApp {
         app.start_notification_action_stream(events.notification_actions, cx);
         app.start_lan_discovery_event_stream(events.lan_discovery_events, cx);
         app.start_lifecycle_stream(events.lifecycle_events, cx);
+        app.start_launch_shortcut_stream(events.launch_shortcuts, cx);
         if updates_enabled {
             app.start_update_streams(events.update_actions, cx);
             update::spawn_checks();
@@ -2636,6 +2862,35 @@ impl MobileApp {
         self.tasks.push(task);
     }
 
+    /// Applies a launcher shortcut the host reported.
+    ///
+    /// A shortcut is a request to start something, so it opens the new-session
+    /// page once the panel is on a workspace: before pairing there is nothing
+    /// to create a session on, and the request is dropped rather than queued
+    /// into a screen the user cannot use.
+    fn start_launch_shortcut_stream(
+        &mut self,
+        mut shortcuts: UnboundedReceiver<crate::shortcut::LaunchShortcut>,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            while let Some(shortcut) = shortcuts.next().await {
+                // The page is opened on the next paint: this path has no window
+                // and the overlay needs one.
+                if entity
+                    .update(cx, |this, cx| {
+                        this.pending_launch_shortcut = Some(shortcut);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self.tasks.push(task);
+    }
+
     /// Applies one trip to the image picker.
     fn handle_attachment_pick(
         &mut self,
@@ -2672,6 +2927,16 @@ impl MobileApp {
             }
             crate::attachment::AttachmentPickEvent::Failed(message) => {
                 self.hint(Tone::Error, message);
+            }
+            // Text another app shared in goes into the field rather than out as
+            // a prompt: what the user shares is usually something they want to
+            // write about, and a share that sent itself would be a surprise.
+            crate::attachment::AttachmentPickEvent::SharedText(text) => {
+                self.pending_shared_text = Some(text);
+                self.hint(
+                    Tone::Info,
+                    locale::text("Shared text added", "已加入分享的内容", "已加入分享的內容"),
+                );
             }
         }
         cx.notify();
@@ -5271,8 +5536,21 @@ impl MobileApp {
             self.persist_active_session_timeline();
             // Park the draft with the session it was typed in and restore the
             // target's own draft before the first frame of the new conversation.
-            let current = self.composer_input.read(cx).value().to_string();
-            let current_attachments = std::mem::take(&mut self.composer_attachments);
+            // An armed rewrite belongs to the session being left. What gets
+            // parked is the draft the edit interrupted, not the message that
+            // was being rewritten: the reader's own un-sent work is what has
+            // to be waiting for them when they come back.
+            let rewriting = self.composer_message_edit.take().is_some();
+            let current = if rewriting {
+                self.composer_edit_stashed_draft.take().unwrap_or_default()
+            } else {
+                self.composer_input.read(cx).value().to_string()
+            };
+            let current_attachments = if rewriting {
+                std::mem::take(&mut self.composer_edit_stashed_attachments)
+            } else {
+                std::mem::take(&mut self.composer_attachments)
+            };
             // With no session open — the reader deleted the one they were in,
             // say — the field's text belongs to no conversation yet, so it
             // follows them into the session they open next rather than being
@@ -5351,6 +5629,11 @@ impl MobileApp {
         self.composer_commands.clear();
         self.composer_armed_command = None;
         self.composer_armed_mentions.clear();
+        // The rewrite itself is dropped above, with the reader's own draft
+        // parked in the session it belonged to. What is left to clear is the
+        // furniture that belongs to the session being left.
+        self.composer_history_open = false;
+        self.composer_goal_expanded = false;
         self.refresh_token_usage(cx);
         self.refresh_composer_commands(cx);
         self.expanded_process.clear();
@@ -7755,6 +8038,12 @@ impl MobileApp {
         if self.operation_busy || self.runtime_switch_busy_generation.is_some() {
             return;
         }
+        // An armed edit owns the field: the same button means "replace" until
+        // the reader cancels it.
+        if self.composer_message_edit.is_some() {
+            self.submit_user_message_edit(window, cx);
+            return;
+        }
         let text = self.composer_input.read(cx).value().trim().to_string();
         if text.is_empty() && self.composer_attachments.is_empty() {
             return;
@@ -7912,6 +8201,420 @@ impl MobileApp {
             None,
             cx,
         );
+    }
+
+    /// Whether this row is the newest prompt in the open session.
+    ///
+    /// A row rendered outside its turn's own path still has to know, because
+    /// only the newest prompt may be rewritten.
+    fn user_row_is_latest(&self, row: &TimelineRow) -> bool {
+        self.timeline_turns
+            .last()
+            .and_then(|turn| turn.user_row.as_ref())
+            .is_some_and(|latest| latest.id == row.id)
+    }
+
+    /// Whether the newest user message may be rewritten.
+    ///
+    /// Only the last one, and only between turns: everything after it was
+    /// written against it, and the authority refuses a rewrite that would
+    /// invalidate what followed.
+    fn user_message_edit_available(&self, is_latest_turn: bool, turn_complete: bool) -> bool {
+        if !is_latest_turn || !turn_complete || self.operation_busy {
+            return false;
+        }
+        self.controller.as_ref().is_some_and(|controller| {
+            // The rewrite needs the transcript's own end and the runtime the
+            // session runs on; without either the request would be refused, so
+            // the control stays dim rather than doing nothing when tapped.
+            controller
+                .state
+                .timeline
+                .authoritative_end_sequence
+                .is_some()
+                && controller.state.runtime_selection.value.is_some()
+                && controller
+                    .state
+                    .active_session
+                    .value
+                    .as_ref()
+                    .is_some_and(|session| {
+                        matches!(
+                            session.state,
+                            AgentSessionState::Idle | AgentSessionState::Error
+                        )
+                    })
+        })
+    }
+
+    /// Borrows the composer to rewrite a message that has already gone out.
+    ///
+    /// The draft is stashed rather than dropped: the reader may have been
+    /// halfway through the next prompt when they decided to fix the last one,
+    /// and cancelling has to give it back unharmed.
+    fn begin_user_message_edit(
+        &mut self,
+        row: &TimelineRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.composer_message_edit.is_some() || self.operation_busy {
+            return;
+        }
+        let Some(controller) = self.controller.as_ref() else {
+            return;
+        };
+        let Some(expected_end_sequence) = controller.state.timeline.authoritative_end_sequence
+        else {
+            return;
+        };
+        // The rewrite keeps the session's own runtime; falling back to the
+        // phone's default would silently re-model the message.
+        let Some(runtime) = controller
+            .state
+            .runtime_selection
+            .value
+            .as_ref()
+            .map(|state| state.desired.clone())
+        else {
+            return;
+        };
+        let attachments = self.timeline_row_user_attachments(row);
+        self.composer_edit_stashed_draft = Some(self.composer_input.read(cx).value().to_string());
+        self.composer_edit_stashed_attachments = std::mem::take(&mut self.composer_attachments);
+        self.composer_attachments = attachments;
+        self.composer_armed_mentions.clear();
+        self.composer_armed_command = None;
+        self.composer_message_edit = Some(MobileComposerMessageEdit {
+            row_id: row.id.clone(),
+            user_sequence: row.first_sequence,
+            expected_end_sequence,
+            runtime,
+        });
+        let text = row.body.clone();
+        let selection_end = text.len();
+        self.composer_input.update(cx, |input, cx| {
+            input.set_value(text, window, cx);
+            input.set_selected_range(0..selection_end, cx);
+            input.focus(window, cx);
+        });
+        crate::platform::show_keyboard();
+        self.timeline_metadata_tip = None;
+        self.composer_history_open = false;
+        cx.notify();
+    }
+
+    /// Gives the composer back to the draft the edit interrupted.
+    fn cancel_user_message_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_message_edit.take().is_none() {
+            return;
+        }
+        self.composer_attachments = std::mem::take(&mut self.composer_edit_stashed_attachments);
+        let draft = self.composer_edit_stashed_draft.take().unwrap_or_default();
+        let selection_end = draft.len();
+        self.composer_input.update(cx, |input, cx| {
+            input.set_value(draft, window, cx);
+            input.set_selected_range(0..selection_end, cx);
+        });
+        cx.notify();
+    }
+
+    /// Replaces the message the composer is holding instead of appending one.
+    ///
+    /// Both sequences travel with the request: the authority rewrites the
+    /// message only when the transcript still ends where the reader saw it
+    /// end, so a moving session refuses the edit rather than corrupting it.
+    fn submit_user_message_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation_busy || self.runtime_switch_busy_generation.is_some() {
+            return;
+        }
+        let Some(edit) = self.composer_message_edit.clone() else {
+            return;
+        };
+        let text = self.composer_input.read(cx).value().trim().to_string();
+        if text.is_empty() && self.composer_attachments.is_empty() {
+            return;
+        }
+        let mentions = self.armed_mentions(cx);
+        let attachments = std::mem::take(&mut self.composer_attachments);
+        self.composer_armed_mentions.clear();
+        self.composer_armed_command = None;
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let submitted_at_ms = unix_timestamp_ms();
+        let request = MutationRequest::new(ReplaceUserMessagePayload {
+            user_sequence: edit.user_sequence,
+            expected_end_sequence: edit.expected_end_sequence,
+            message: SendAgentMessageRequest {
+                session_id: session_id.clone(),
+                message_idempotency_key: format!(
+                    "mobile:edit:{}:{}:{submitted_at_ms}",
+                    session_id.as_str(),
+                    edit.user_sequence
+                ),
+                desired_runtime: edit.runtime.clone(),
+                text,
+                attachments,
+                reasoning_effort: edit.runtime.reasoning_effort.clone(),
+                correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
+                prompt_context: None,
+                provenance: vibex_core::MessageProvenance::HumanInput,
+                mentions,
+            },
+        });
+        self.composer_message_edit = None;
+        self.composer_edit_stashed_draft = None;
+        self.composer_edit_stashed_attachments.clear();
+        self.composer_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.mark_composer_state_dirty(cx);
+        self.operation_busy = true;
+        self.rebuild_timeline_turns();
+        self.timeline_list.scroll_to_end();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            (backend.replace_user_message(request).await, session_id)
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let Ok((outcome, session_id)) = runner.await else {
+                return;
+            };
+            let _ = entity.update(cx, |this, cx| {
+                this.operation_busy = false;
+                match outcome {
+                    Ok(_) => {
+                        this.hint(
+                            Tone::Success,
+                            locale::text("Message replaced", "消息已重发", "訊息已重送"),
+                        );
+                        // The rewrite is authoritative, so the open window is
+                        // re-read rather than patched locally.
+                        this.reload_selected_session(cx);
+                    }
+                    Err(error) => {
+                        this.fail(error);
+                        // The text is still in the composer only when the
+                        // request never left; a refusal means the reader has to
+                        // see the message again before rewriting it.
+                        if this
+                            .controller
+                            .as_ref()
+                            .and_then(|controller| controller.state.selected_session_id.clone())
+                            .as_ref()
+                            == Some(&session_id)
+                        {
+                            this.reload_selected_session(cx);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// The prompts already sent in the open session, newest last.
+    ///
+    /// Projected from the turns on screen rather than stored: the transcript is
+    /// the only list of what was actually sent, including prompts that arrived
+    /// from another client.
+    fn composer_history(&self) -> Vec<String> {
+        let mut history = Vec::new();
+        for turn in self.timeline_turns.iter() {
+            if let Some(row) = turn.user_row.as_ref()
+                && !row.body.trim().is_empty()
+            {
+                history.push(row.body.clone());
+            }
+        }
+        history
+    }
+
+    fn open_composer_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer_history_limit = COMPOSER_HISTORY_PAGE;
+        self.composer_history_open = true;
+        // The keyboard would cover the sheet it just opened.
+        let _ = window;
+        crate::platform::hide_keyboard();
+        cx.notify();
+    }
+
+    fn close_composer_history(&mut self, cx: &mut Context<Self>) {
+        if self.composer_history_open {
+            self.composer_history_open = false;
+            cx.notify();
+        }
+    }
+
+    fn show_older_composer_history(&mut self, cx: &mut Context<Self>) {
+        self.composer_history_limit = self
+            .composer_history_limit
+            .saturating_add(COMPOSER_HISTORY_PAGE);
+        cx.notify();
+    }
+
+    /// Puts a recalled prompt back in the field, appending when the reader had
+    /// already started typing: the field is theirs, and a recall must not throw
+    /// away a half-written sentence.
+    fn recall_composer_history(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self.composer_input.read(cx).value().to_string();
+        let combined = if existing.trim().is_empty() {
+            text
+        } else {
+            format!("{existing}{text}")
+        };
+        let selection_end = combined.len();
+        self.composer_input.update(cx, |input, cx| {
+            input.set_value(combined, window, cx);
+            input.set_selected_range(0..selection_end, cx);
+            input.focus(window, cx);
+        });
+        self.composer_history_open = false;
+        crate::platform::show_keyboard();
+        cx.notify();
+    }
+
+    /// Arms a queue row for reordering from the long press that started it.
+    ///
+    /// The queue is drawn as uniform rows, so the row under the finger is its
+    /// offset divided by that height — no per-row bounds have to be threaded
+    /// through paint, which is the same reason the sidebar does it this way.
+    fn begin_queue_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let (top, _) = self.composer_queue_frame.get();
+        let queued = self.composer_queue_for_open_session();
+        if queued.is_empty() {
+            return;
+        }
+        let offset = f32::from(position.y) - top;
+        if offset < 0.0 {
+            return;
+        }
+        let index = (offset / COMPOSER_QUEUE_ROW_PITCH_PX).floor() as usize;
+        let Some(message) = queued.get(index) else {
+            return;
+        };
+        self.composer_queue_drag = Some(MobileQueueDrag {
+            id: message.id,
+            start_index: index,
+            start_y: f32::from(position.y) as i32,
+            target_index: index,
+        });
+        cx.notify();
+    }
+
+    fn on_queue_row_long_press(&mut self, event: &LongPressEvent, cx: &mut Context<Self>) {
+        match event.phase {
+            TouchPhase::Started => self.begin_queue_drag(event.position, cx),
+            TouchPhase::Moved => {
+                if self.composer_queue_drag.is_some() {
+                    self.advance_queue_drag(event.position, cx);
+                    cx.stop_propagation();
+                }
+            }
+            TouchPhase::Ended => {
+                if self.composer_queue_drag.is_some() {
+                    self.finish_queue_drag(false, cx);
+                    cx.stop_propagation();
+                }
+            }
+            TouchPhase::Cancelled => {
+                if self.composer_queue_drag.is_some() {
+                    self.finish_queue_drag(true, cx);
+                    cx.stop_propagation();
+                }
+            }
+        }
+    }
+
+    fn advance_queue_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(drag) = self.composer_queue_drag else {
+            return;
+        };
+        let queued = self.composer_queue_for_open_session();
+        if queued.is_empty() {
+            return;
+        }
+        let travelled = f32::from(position.y) - drag.start_y as f32;
+        let steps = (travelled / COMPOSER_QUEUE_ROW_PITCH_PX).round() as i64;
+        let last = queued.len().saturating_sub(1) as i64;
+        let target = (drag.start_index as i64 + steps).clamp(0, last) as usize;
+        if target != drag.target_index {
+            self.composer_queue_drag = Some(MobileQueueDrag {
+                target_index: target,
+                ..drag
+            });
+            cx.notify();
+        }
+    }
+
+    fn finish_queue_drag(&mut self, cancelled: bool, cx: &mut Context<Self>) {
+        let Some(drag) = self.composer_queue_drag.take() else {
+            return;
+        };
+        if cancelled || drag.target_index == drag.start_index {
+            cx.notify();
+            return;
+        }
+        self.move_queued_message(drag.id, drag.target_index, cx);
+    }
+
+    /// Moves one queued prompt to a new place in its session's queue.
+    fn move_queued_message(&mut self, id: u64, target_index: usize, cx: &mut Context<Self>) {
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        // The queue is global with a session stamp, so the move happens inside
+        // the block this session owns rather than across the whole vector.
+        let positions: Vec<usize> = self
+            .composer_queue
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.session_id == session_id)
+            .map(|(index, _)| index)
+            .collect();
+        let Some(from) = positions
+            .iter()
+            .position(|index| self.composer_queue[*index].id == id)
+        else {
+            return;
+        };
+        let target = target_index.min(positions.len().saturating_sub(1));
+        if from == target {
+            return;
+        }
+        let message = self.composer_queue.remove(positions[from]);
+        // The positions are recomputed after the removal: every index behind
+        // the one that left has shifted down, and dropping against a stale
+        // index would land one row off.
+        let remaining: Vec<usize> = self
+            .composer_queue
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.session_id == session_id)
+            .map(|(index, _)| index)
+            .collect();
+        let insert_at = queue_insert_index(&remaining, target, self.composer_queue.len());
+        self.composer_queue.insert(insert_at, message);
+        self.mark_composer_state_dirty(cx);
+        cx.notify();
     }
 
     /// Sends the oldest queued prompt once the open session's turn has settled.
@@ -10681,6 +11384,9 @@ impl MobileApp {
                 .when(self.composer_attach_menu_open, |root| {
                     root.child(self.render_composer_attach_sheet(cx))
                 })
+                .when(self.composer_history_open, |root| {
+                    root.child(self.render_composer_history_sheet(cx))
+                })
                 .when_some(attachment_preview, |root, preview| {
                     root.child(self.render_attachment_preview(preview, cx))
                 })
@@ -10696,35 +11402,287 @@ impl MobileApp {
         preview: MobileAttachmentPreview,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let frame = self.attachment_preview_frame.clone();
+        let gesture_entity = cx.weak_entity();
         div()
             .id("mobile-attachment-preview")
             .absolute()
             .inset_0()
+            .occlude()
             .bg(theme::backdrop(0.94))
             .flex()
-            .items_center()
-            .justify_center()
-            .p_4()
-            .cursor_pointer()
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(Self::close_attachment_preview),
+            .flex_col()
+            .child(
+                // The picture takes the whole screen and owns every touch on
+                // it: a tap zooms, a drag pans, and only the backdrop behind
+                // it dismisses. A phone has no keyboard to press Escape on.
+                div()
+                    .id("mobile-attachment-preview-stage")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .relative()
+                    .overflow_hidden()
+                    .child({
+                        gpui::canvas(
+                            move |bounds, _, _| {
+                                frame.set((
+                                    f32::from(bounds.size.width),
+                                    f32::from(bounds.size.height),
+                                ));
+                            },
+                            move |bounds, _, window, _| {
+                                window.on_mouse_event({
+                                    let entity = gesture_entity.clone();
+                                    move |event: &TouchDragEvent,
+                                          phase: DispatchPhase,
+                                          _: &mut Window,
+                                          cx: &mut gpui::App| {
+                                        if phase != DispatchPhase::Bubble {
+                                            return;
+                                        }
+                                        let _ = entity.update(cx, |this, cx| {
+                                            this.on_attachment_preview_touch(event, bounds, cx)
+                                        });
+                                    }
+                                });
+                            },
+                        )
+                        .absolute()
+                        .size_full()
+                    })
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                // Zoom is a size, not a transform: this GPUI
+                                // only transforms SVG, so the picture grows by
+                                // taking a larger share of the stage and is
+                                // moved by its own margins.
+                                div()
+                                    .w(relative(preview.zoom))
+                                    .h(relative(preview.zoom))
+                                    .ml(preview.offset.x)
+                                    .mt(preview.offset.y)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        img(preview.image.clone())
+                                            .max_w_full()
+                                            .max_h_full()
+                                            .object_fit(ObjectFit::Contain),
+                                    ),
+                            ),
+                    ),
             )
             .child(
                 div()
-                    .w_full()
-                    .h_full()
+                    .flex_shrink_0()
+                    .px(px(theme::SPACING_MD))
+                    .py(px(theme::SPACING_SM))
                     .flex()
                     .items_center()
-                    .justify_center()
+                    .gap(px(theme::SPACING_SM))
                     .child(
-                        img(preview.image)
-                            .max_w_full()
-                            .max_h_full()
-                            .object_fit(ObjectFit::Contain),
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(theme::font_caption())
+                            .text_color(theme::text_secondary())
+                            .child(preview.label.clone()),
+                    )
+                    .child(
+                        attachment_preview_button(
+                            "attachment-preview-zoom-out",
+                            "icons/minus.svg",
+                            locale::text("Zoom out", "缩小", "縮小"),
+                            preview.zoom > 1.001,
+                        )
+                        .when(preview.zoom > 1.001, |button| {
+                            button.on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.step_attachment_preview_zoom(
+                                        1.0 / ATTACHMENT_PREVIEW_ZOOM_STEP,
+                                        cx,
+                                    )
+                                }),
+                            )
+                        }),
+                    )
+                    .child(
+                        attachment_preview_button(
+                            "attachment-preview-copy",
+                            "icons/copy.svg",
+                            locale::text("Copy image", "复制图片", "複製圖片"),
+                            true,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.copy_attachment_preview_image(cx)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .min_w(px(48.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_muted())
+                            .child(format!("{:.0}%", preview.zoom * 100.0)),
+                    )
+                    .child(
+                        attachment_preview_button(
+                            "attachment-preview-zoom-in",
+                            "icons/plus.svg",
+                            locale::text("Zoom in", "放大", "放大"),
+                            preview.zoom < ATTACHMENT_PREVIEW_ZOOM_MAX,
+                        )
+                        .when(
+                            preview.zoom < ATTACHMENT_PREVIEW_ZOOM_MAX,
+                            |button| {
+                                button.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.step_attachment_preview_zoom(
+                                            ATTACHMENT_PREVIEW_ZOOM_STEP,
+                                            cx,
+                                        )
+                                    }),
+                                )
+                            },
+                        ),
+                    )
+                    .child(
+                        attachment_preview_button(
+                            "attachment-preview-close",
+                            "icons/x.svg",
+                            locale::common("Close"),
+                            true,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(Self::close_attachment_preview),
+                        ),
                     ),
             )
             .into_any_element()
+    }
+
+    /// One finger on the picture: a drag pans it once it is larger than the
+    /// screen, and a touch that never travelled zooms it in or out.
+    fn on_attachment_preview_touch(
+        &mut self,
+        event: &TouchDragEvent,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(preview) = self.attachment_preview.as_ref() else {
+            return;
+        };
+        match event.phase {
+            TouchPhase::Started => {
+                let base = preview.offset;
+                if let Some(preview) = self.attachment_preview.as_mut() {
+                    preview.pan = Some((event.position, base));
+                }
+            }
+            TouchPhase::Moved => {
+                let Some((origin, base)) = preview.pan else {
+                    return;
+                };
+                if !bounds.contains(&origin) {
+                    return;
+                }
+                let travelled = event.position - origin;
+                let offset =
+                    clamp_attachment_preview_offset(base + travelled, preview.zoom, bounds.size);
+                if let Some(preview) = self.attachment_preview.as_mut() {
+                    preview.offset = offset;
+                }
+                cx.notify();
+            }
+            TouchPhase::Ended => {
+                let Some((origin, _)) = preview.pan else {
+                    return;
+                };
+                if let Some(preview) = self.attachment_preview.as_mut() {
+                    preview.pan = None;
+                }
+                let travelled = event.position - origin;
+                if f32::from(travelled.x).abs() < 8.0 && f32::from(travelled.y).abs() < 8.0 {
+                    self.toggle_attachment_preview_zoom(bounds, cx);
+                } else {
+                    cx.notify();
+                }
+            }
+            TouchPhase::Cancelled => {
+                if let Some(preview) = self.attachment_preview.as_mut() {
+                    preview.pan = None;
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Steps the preview between fitting the screen and being zoomed in.
+    fn toggle_attachment_preview_zoom(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+        let Some(preview) = self.attachment_preview.as_mut() else {
+            return;
+        };
+        preview.zoom = if preview.zoom > 1.001 {
+            1.0
+        } else {
+            ATTACHMENT_PREVIEW_ZOOM_STEP
+        };
+        preview.offset = if preview.zoom > 1.001 {
+            clamp_attachment_preview_offset(preview.offset, preview.zoom, bounds.size)
+        } else {
+            point(px(0.0), px(0.0))
+        };
+        cx.notify();
+    }
+
+    fn step_attachment_preview_zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let (width, height) = self.attachment_preview_frame.get();
+        let size = gpui::size(px(width), px(height));
+        let Some(preview) = self.attachment_preview.as_mut() else {
+            return;
+        };
+        let zoom = (preview.zoom * delta).clamp(1.0, ATTACHMENT_PREVIEW_ZOOM_MAX);
+        preview.zoom = zoom;
+        preview.offset = if zoom > 1.001 {
+            clamp_attachment_preview_offset(preview.offset, zoom, size)
+        } else {
+            point(px(0.0), px(0.0))
+        };
+        cx.notify();
+    }
+
+    /// Puts the picture on the system clipboard.
+    ///
+    /// The desktop reads the file off its own disk for this; the phone already
+    /// holds the decoded bytes, which is what it copied them for.
+    fn copy_attachment_preview_image(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = self.attachment_preview.as_ref() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_image(&preview.image));
+        self.hint(
+            Tone::Success,
+            locale::text("Image copied", "图片已复制", "圖片已複製"),
+        );
+        cx.notify();
     }
 
     fn render_attachment_preview_loading(
@@ -12722,7 +13680,7 @@ impl MobileApp {
         &self,
         turn: &TimelineConversationTurn,
         is_first: bool,
-        _is_last: bool,
+        is_last: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -12748,7 +13706,7 @@ impl MobileApp {
             // `pb`, so only the leading edge is added here.
             .when(!is_first, |turn| turn.pt(px(theme::SPACING_LG)))
             .when_some(turn.user_row.as_ref(), |container, row| {
-                container.child(self.render_user_message_row(row, cx))
+                container.child(self.render_user_message_row(row, is_last, turn.complete, cx))
             })
             .when(!turn.process_rows.is_empty(), |container| {
                 container.child(
@@ -12921,6 +13879,9 @@ impl MobileApp {
             self.attachment_preview = Some(MobileAttachmentPreview {
                 label: attachment.label.clone(),
                 image: Arc::new(Image::from_bytes(format, bytes)),
+                zoom: 1.0,
+                offset: point(px(0.0), px(0.0)),
+                pan: None,
             });
             self.attachment_preview_loading = None;
             cx.notify();
@@ -12970,6 +13931,9 @@ impl MobileApp {
                         this.attachment_preview = Some(MobileAttachmentPreview {
                             label: label.clone(),
                             image: Arc::new(Image::from_bytes(format, bytes)),
+                            zoom: 1.0,
+                            offset: point(px(0.0), px(0.0)),
+                            pan: None,
                         });
                     }
                     Err(error) => this.fail(error),
@@ -13097,7 +14061,10 @@ impl MobileApp {
     ) -> gpui::AnyElement {
         let settings = self.effective_timeline_display_settings();
         match row.kind {
-            TimelineRowKind::UserMessage => self.render_user_message_row(row, cx),
+            TimelineRowKind::UserMessage => {
+                let latest = self.user_row_is_latest(row);
+                self.render_user_message_row(row, latest, turn.complete, cx)
+            }
             TimelineRowKind::AgentMessage => {
                 self.render_agent_message_row(turn, row, conversation_conclusion, cx)
             }
@@ -13131,6 +14098,8 @@ impl MobileApp {
     fn render_user_message_row(
         &self,
         row: &TimelineRow,
+        is_latest_turn: bool,
+        turn_complete: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let attachments = self.timeline_row_user_attachments(row);
@@ -13222,15 +14191,102 @@ impl MobileApp {
             )
             // A permanent timestamp. The desktop reveals its actions on hover;
             // a phone has no hover, and the row's duration hint needed a press.
-            .when_some(submitted_at, |container, submitted_at| {
-                container.child(
-                    div()
-                        .mt(px(2.0))
-                        .pr(px(2.0))
-                        .text_size(theme::font_micro())
-                        .text_color(theme::text_muted())
-                        .child(session_sidebar_time_label(submitted_at)),
-                )
+            .child({
+                let copy_text = row.body.clone();
+                let share_user_text = row.body.clone();
+                let editing = self
+                    .composer_message_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.row_id == row.id);
+                let edit_enabled = !editing
+                    && self.user_message_edit_available(is_latest_turn, turn_complete)
+                    && !self.composer_history_open;
+                let edit_row = row.clone();
+                div()
+                    .w(gpui::relative(0.78))
+                    .max_w(px(520.0))
+                    .mt(px(2.0))
+                    .pr(px(2.0))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_1()
+                    .when_some(submitted_at, |line, submitted_at| {
+                        line.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(theme::font_micro())
+                                .text_color(theme::text_muted())
+                                .child(session_sidebar_time_label(submitted_at)),
+                        )
+                    })
+                    .child(
+                        timeline_action_button(
+                            format!("copy-user-message:{}", row.id),
+                            "icons/copy.svg",
+                            locale::text("Copy", "复制", "複製"),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                            }),
+                        ),
+                    )
+                    .child(
+                        timeline_action_button(
+                            format!("share-user-message:{}", row.id),
+                            "icons/upload.svg",
+                            locale::text("Share", "分享", "分享"),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                if let Err(error) = crate::share::share_text(&share_user_text) {
+                                    this.fail(error);
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    // Only the newest prompt can be rewritten, so the control
+                    // is drawn there and dimmed when the session is mid-turn:
+                    // hiding it entirely would leave the reader guessing why
+                    // the desktop has an edit and the phone does not.
+                    .when(is_latest_turn, |line| {
+                        line.child(
+                            timeline_action_button(
+                                format!("edit-user-message:{}", row.id),
+                                if editing {
+                                    "icons/x.svg"
+                                } else {
+                                    "icons/pencil.svg"
+                                },
+                                if editing {
+                                    locale::text("Cancel editing", "取消编辑", "取消編輯")
+                                } else {
+                                    locale::text("Edit", "编辑", "編輯")
+                                },
+                            )
+                            .when(edit_enabled || editing, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            if this.composer_message_edit.is_some() {
+                                                this.cancel_user_message_edit(window, cx);
+                                            } else {
+                                                this.begin_user_message_edit(&edit_row, window, cx);
+                                            }
+                                        }),
+                                    )
+                            })
+                            .when(!edit_enabled && !editing, |button| button.opacity(0.4)),
+                        )
+                    })
             })
             .into_any_element()
     }
@@ -13332,6 +14388,7 @@ impl MobileApp {
         let turn_id = turn.id.clone();
         let row_id = row.id.clone();
         let copy_text = row.body.clone();
+        let share_text = row.body.clone();
         let fork_sequence = row.last_sequence;
         let fork_available = fork_sequence > 0
             && !self.fork_session_busy
@@ -13465,6 +14522,24 @@ impl MobileApp {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 copy_text.clone(),
                                             ));
+                                        }),
+                                    ),
+                                )
+                                .child(
+                                    timeline_action_button(
+                                        format!("share-answer:{}", row.id),
+                                        "icons/upload.svg",
+                                        locale::text("Share", "分享", "分享"),
+                                    )
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            if let Err(error) =
+                                                crate::share::share_text(&share_text)
+                                            {
+                                                this.fail(error);
+                                            }
+                                            cx.notify();
                                         }),
                                     ),
                                 )
@@ -14699,6 +15774,8 @@ impl MobileApp {
         let attach_enabled = state.is_some()
             && !self.operation_busy
             && self.composer_attachments.len() < MOBILE_MAX_COMPOSER_ATTACHMENTS;
+        let editing_message = self.composer_message_edit.is_some();
+        let history_enabled = !self.operation_busy && !turns.is_empty();
         let stop_enabled = state.is_some() && !self.operation_busy && !runtime_switch_pending;
         let usage_fraction = self.token_usage.as_ref().and_then(token_usage_fraction);
         let usage_percent = usage_fraction.unwrap_or(0.0) * 100.0;
@@ -14711,6 +15788,7 @@ impl MobileApp {
         let command_suggestions = self.composer_command_suggestions(cx);
         let mention_suggestions = self.composer_mention_suggestions(cx);
         let composer_plan = self.render_composer_plan(cx);
+        let composer_goal = self.render_composer_goal(cx);
         let queued = self.composer_queue_for_open_session();
         let runtime_selection = self.controller.as_ref().and_then(|controller| {
             controller
@@ -14749,9 +15827,15 @@ impl MobileApp {
             })
             // What the Agent is working through, then what the reader has
             // written ahead: both sit between the suggestions and the field.
+            // The standing objective sits above the plan it is being worked
+            // through: the goal is why, the plan is how.
+            .when_some(composer_goal, |composer, goal| composer.child(goal))
             .when_some(composer_plan, |composer, plan| composer.child(plan))
             .when(!queued.is_empty(), |composer| {
                 composer.child(self.render_composer_queue(&queued, cx))
+            })
+            .when(editing_message, |composer| {
+                composer.child(self.render_composer_edit_banner(cx))
             })
             .when(!self.composer_attachments.is_empty(), |composer| {
                 composer.child(self.render_composer_attachments(cx))
@@ -14858,6 +15942,44 @@ impl MobileApp {
                                 ),
                         )
                     })
+                    // Recall rather than retype: the prompts already sent in
+                    // this session are one tap away.
+                    .child(
+                        div()
+                            .id("composer-history")
+                            .size(px(theme::TOUCH_TARGET))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .aria_label(
+                                locale::text("Earlier messages", "历史消息", "歷史訊息")
+                                    .to_string(),
+                            )
+                            .when(history_enabled, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.open_composer_history(window, cx)
+                                        }),
+                                    )
+                            })
+                            .when(!history_enabled, |button| button.opacity(0.45))
+                            .child(
+                                svg()
+                                    .path("icons/clock.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(if history_enabled {
+                                        theme::text_secondary()
+                                    } else {
+                                        theme::text_muted()
+                                    }),
+                            ),
+                    )
                     // The attach menu offers the two things a phone can hand
                     // over: a photo the host scales down, or a file it carries
                     // whole.
@@ -14903,7 +16025,9 @@ impl MobileApp {
                             .items_center()
                             .justify_center()
                             .rounded(px(theme::RADIUS_CONTROL))
-                            .aria_label(if running {
+                            .aria_label(if editing_message {
+                                locale::text("Replace message", "替换消息", "取代訊息")
+                            } else if running {
                                 locale::text("Steer the turn", "引导当前回合", "引導目前回合")
                             } else {
                                 locale::common("Send")
@@ -15492,6 +16616,188 @@ impl MobileApp {
         )
     }
 
+    /// The session's standing objective, as the authority last reported it.
+    ///
+    /// The goal is not a message: it is a durable instruction the Agent keeps
+    /// working toward, and the desktop keeps it in a bar above the composer.
+    /// The phone reads the same snapshot out of the timeline, so a goal set on
+    /// either client shows up on both.
+    fn current_goal(&self) -> Option<ActiveGoal> {
+        let controller = self.controller.as_ref()?;
+        let items = controller.state.timeline.items.as_slice();
+        vibex_desktop_model::current_active_goal(items)
+    }
+
+    /// The goal bar: phase, objective, and what the provider is counting.
+    ///
+    /// Set and clear are not on the phone's wire — the protocol carries goal
+    /// *snapshots* but no control call — so the bar is a read-out. Where the
+    /// Agent offers a `goal` command, the expanded bar hands the reader the
+    /// composer with that command spelled out, which is the one route to a new
+    /// objective a phone actually has.
+    fn render_composer_goal(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let active = self.current_goal()?;
+        let expanded = self.composer_goal_expanded;
+        let phase = active.goal.phase;
+        let (phase_label, phase_color) = goal_phase_label(phase);
+        let objective = active.goal.objective.clone();
+        let progress = goal_progress_label(&active.goal);
+        let can_edit = self.composer_has_goal_command(cx);
+        let expanded_body = expanded.then(|| {
+            div()
+                .px(px(theme::SPACING_MD))
+                .pb(px(theme::SPACING_SM))
+                .flex()
+                .flex_col()
+                .gap(px(theme::SPACING_XS))
+                .child(
+                    div()
+                        .text_size(theme::font_body())
+                        .line_height(px(20.0))
+                        .text_color(theme::text_primary())
+                        .child(objective.clone()),
+                )
+                .children(progress.clone().map(|progress| {
+                    div()
+                        .text_size(theme::font_micro())
+                        .text_color(theme::text_muted())
+                        .child(progress)
+                }))
+                .when(can_edit, |body| {
+                    body.child(
+                        div()
+                            .id("composer-goal-edit")
+                            .mt(px(theme::SPACING_XS))
+                            .min_h(px(36.0))
+                            .px(px(theme::SPACING_MD))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .text_size(theme::font_caption())
+                            .text_color(theme::text_secondary())
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.begin_composer_goal_edit(window, cx)
+                                }),
+                            )
+                            .child(locale::text(
+                                "Rewrite the objective",
+                                "重写目标",
+                                "重寫目標",
+                            )),
+                    )
+                })
+        });
+        Some(
+            div()
+                .id("mobile-composer-goal")
+                .debug_selector(|| "mobile-composer-goal".to_string())
+                .mb(px(theme::SPACING_SM))
+                .rounded(px(theme::RADIUS_CARD))
+                .border_1()
+                .border_color(theme::border_default())
+                .bg(theme::bg_card())
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .id("mobile-composer-goal-header")
+                        .min_h(px(theme::TOUCH_TARGET))
+                        .px(px(theme::SPACING_MD))
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::SPACING_SM))
+                        .cursor_pointer()
+                        .active(|style| style.bg(theme::row_pressed_bg()))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.composer_goal_expanded = !this.composer_goal_expanded;
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            svg()
+                                .path("icons/crosshair.svg")
+                                .size(px(theme::ICON_SM))
+                                .flex_shrink_0()
+                                .text_color(theme::primary()),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(theme::font_micro())
+                                .text_color(phase_color)
+                                .child(phase_label),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(theme::font_caption())
+                                .text_color(theme::text_primary())
+                                .child(objective),
+                        )
+                        .child(
+                            svg()
+                                .path(if expanded {
+                                    "icons/chevron-down.svg"
+                                } else {
+                                    "icons/chevron-right.svg"
+                                })
+                                .size(px(14.0))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted()),
+                        ),
+                )
+                .children(expanded_body)
+                .into_any_element(),
+        )
+    }
+
+    /// Whether the open session's Agent offers a `goal` command.
+    ///
+    /// Only then can the phone hand the reader a way to set one: the control
+    /// call the desktop makes is local-only, so an Agent that does not spell
+    /// the command itself has no objective path from a phone at all.
+    fn composer_has_goal_command(&self, cx: &gpui::App) -> bool {
+        let _ = cx;
+        self.composer_commands.iter().any(|command| {
+            command
+                .command_name
+                .as_deref()
+                .or(Some(command.label.as_str()))
+                .is_some_and(|name| name.trim_start_matches('/').eq_ignore_ascii_case("goal"))
+        })
+    }
+
+    /// Prefills the composer with the Agent's own goal command.
+    fn begin_composer_goal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active) = self.current_goal() else {
+            return;
+        };
+        let draft = format!("/goal {}", active.goal.objective);
+        let selection_end = draft.len();
+        self.composer_goal_expanded = false;
+        self.composer_input.update(cx, |input, cx| {
+            input.set_value(draft, window, cx);
+            input.set_selected_range(0..selection_end, cx);
+            input.focus(window, cx);
+        });
+        crate::platform::show_keyboard();
+        cx.notify();
+    }
+
     /// The prompts waiting for the running turn to finish.
     ///
     /// One row per message: tapping the row puts it back in the field to edit,
@@ -15501,6 +16807,7 @@ impl MobileApp {
         queued: &[MobileQueuedMessage],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let drag = self.composer_queue_drag;
         div()
             .id("mobile-composer-queue")
             .debug_selector(|| "mobile-composer-queue".to_string())
@@ -15508,6 +16815,40 @@ impl MobileApp {
             .flex()
             .flex_col()
             .gap(px(theme::SPACING_XS))
+            // The rows are one fixed pitch, so recording the list's own top
+            // edge is enough to resolve a touch to a row without threading
+            // per-row bounds through paint.
+            .child({
+                let frame = self.composer_queue_frame.clone();
+                let drag_entity = cx.weak_entity();
+                gpui::canvas(
+                    move |bounds, _, _| {
+                        frame.set((f32::from(bounds.origin.y), f32::from(bounds.size.height)));
+                    },
+                    move |bounds, _, window, _| {
+                        window.on_mouse_event({
+                            let entity = drag_entity.clone();
+                            move |event: &LongPressEvent,
+                                  phase: DispatchPhase,
+                                  _: &mut Window,
+                                  cx: &mut gpui::App| {
+                                if phase != DispatchPhase::Bubble
+                                    || !bounds.contains(&event.position)
+                                {
+                                    return;
+                                }
+                                if let Some(entity) = entity.upgrade() {
+                                    entity.update(cx, |this, cx| {
+                                        this.on_queue_row_long_press(event, cx)
+                                    });
+                                }
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_full()
+            })
             .children(queued.iter().enumerate().map(|(index, message)| {
                 let edit_id = message.id;
                 let send_id = message.id;
@@ -15522,13 +16863,22 @@ impl MobileApp {
                 } else {
                     message.text.clone()
                 };
+                let lifted = drag.is_some_and(|drag| drag.id == message.id);
+                let drop_gap =
+                    drag.is_some_and(|drag| drag.id != message.id && drag.target_index == index);
                 div()
                     .id(format!("mobile-composer-queue-row-{}", message.id))
                     .min_h(px(theme::TOUCH_TARGET))
                     .rounded(px(theme::RADIUS_CARD))
                     .border_1()
-                    .border_color(theme::border_default())
+                    .border_color(if lifted {
+                        theme::primary()
+                    } else {
+                        theme::border_default()
+                    })
+                    .when(drop_gap, |row| row.border_color(theme::primary()))
                     .bg(theme::bg_card())
+                    .when(lifted, |row| row.opacity(0.75))
                     .flex()
                     .items_center()
                     .gap(px(theme::SPACING_XS))
@@ -18153,6 +19503,28 @@ impl Render for MobileApp {
             self.composer_input
                 .update(cx, |input, cx| input.set_value(text, window, cx));
         }
+        // Shared text joins whatever is already in the field: a share is an
+        // addition to the prompt being written, never a replacement for it.
+        if let Some(text) = self.pending_shared_text.take() {
+            let existing = self.composer_input.read(cx).value().to_string();
+            let combined = if existing.trim().is_empty() {
+                text
+            } else {
+                format!("{existing}\n{text}")
+            };
+            self.composer_input
+                .update(cx, |input, cx| input.set_value(combined, window, cx));
+        }
+        // A launcher shortcut asked for a page; the paint is where one can open.
+        if let Some(shortcut) = self.pending_launch_shortcut.take() {
+            match shortcut {
+                crate::shortcut::LaunchShortcut::NewSession => {
+                    if self.mode == RootMode::Workspace {
+                        self.show_overlay(MobileOverlay::NewSession, window, cx);
+                    }
+                }
+            }
+        }
         // Writes recorded by paths that have no window. `InputState` refuses a
         // programmatic edit without one, so they land here instead.
         let mut pending_writes = std::mem::take(&mut self.pending_input_writes);
@@ -18810,6 +20182,229 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// The prompts already sent in this session, newest first.
+    ///
+    /// A sheet rather than the desktop's up/down keys: a phone has no arrow
+    /// keys while the keyboard is up, and a list lets the reader recognise the
+    /// sentence they want instead of paging back to it one prompt at a time.
+    fn render_composer_history_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let history = self.composer_history();
+        let total = history.len();
+        let shown = self.composer_history_limit.min(total);
+        let rows = history
+            .into_iter()
+            .rev()
+            .take(shown)
+            .enumerate()
+            .map(|(index, text)| {
+                let recall = text.clone();
+                div()
+                    .id(("composer-history-row", index))
+                    .w_full()
+                    .min_w_0()
+                    .px(px(theme::SPACING_MD))
+                    .py(px(theme::SPACING_SM))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.recall_composer_history(recall.clone(), window, cx)
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::font_body())
+                            .text_color(theme::text_primary())
+                            .line_height(px(20.0))
+                            // Long prompts are clipped to three lines: the
+                            // sheet is for recognition, and the full text is
+                            // one tap away in the field.
+                            .line_clamp(3)
+                            .child(text),
+                    )
+            })
+            .collect::<Vec<_>>();
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.45))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_composer_history(cx)),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "mobile-composer-history-sheet".to_string())
+                    .w_full()
+                    .max_h(gpui::relative(0.7))
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px(px(theme::SPACING_MD))
+                            .py(px(theme::SPACING_SM))
+                            .border_b_1()
+                            .border_color(theme::border_subtle())
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(theme::font_title())
+                                    .text_color(theme::text_primary())
+                                    .child(locale::text(
+                                        "Earlier messages",
+                                        "历史消息",
+                                        "歷史訊息",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("composer-history-close")
+                                    .aria_label(locale::common("Close"))
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.close_composer_history(cx)
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/x.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_secondary()),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("composer-history-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .p(px(theme::SPACING_SM))
+                            .when(rows.is_empty(), |list| {
+                                list.child(
+                                    div()
+                                        .p(px(theme::SPACING_MD))
+                                        .text_size(theme::font_body())
+                                        .text_color(theme::text_muted())
+                                        .child(locale::text(
+                                            "Nothing has been sent in this session yet.",
+                                            "这个会话还没有发送过消息。",
+                                            "這個工作階段還沒有傳送過訊息。",
+                                        )),
+                                )
+                            })
+                            .children(rows)
+                            .when(shown < total, |list| {
+                                list.child(
+                                    div()
+                                        .id("composer-history-older")
+                                        .w_full()
+                                        .py(px(theme::SPACING_SM))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .text_size(theme::font_body())
+                                        .text_color(theme::primary())
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.show_older_composer_history(cx)
+                                            }),
+                                        )
+                                        .child(locale::text("Show older", "显示更早", "顯示更早")),
+                                )
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The strip that says the field is rewriting a message instead of writing
+    /// a new one, and how to get out of it.
+    fn render_composer_edit_banner(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .id("composer-edit-banner")
+            .mb(px(theme::SPACING_SM))
+            .px(px(theme::SPACING_SM))
+            .py(px(theme::SPACING_XS))
+            .rounded(px(theme::RADIUS_CONTROL))
+            .border_1()
+            .border_color(theme::primary())
+            .bg(theme::bg_card_dim())
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                svg()
+                    .path("icons/pencil.svg")
+                    .size(px(theme::ICON_SM))
+                    .flex_shrink_0()
+                    .text_color(theme::primary()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(theme::font_caption())
+                    .text_color(theme::text_secondary())
+                    .child(locale::text(
+                        "Editing the last sent message. Send replaces it.",
+                        "正在编辑最后一条消息，发送后将替换原消息。",
+                        "正在編輯最後一則訊息，傳送後將取代原訊息。",
+                    )),
+            )
+            .child(
+                div()
+                    .id("composer-edit-cancel")
+                    .flex_shrink_0()
+                    .h(px(28.0))
+                    .px(px(theme::SPACING_SM))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .text_size(theme::font_caption())
+                    .text_color(theme::text_secondary())
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.cancel_user_message_edit(window, cx)
+                        }),
+                    )
+                    .child(locale::common("Cancel")),
+            )
+            .into_any_element()
+    }
+
     /// The composer's attach menu: one image, or any other file.
     fn render_composer_attach_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entries = [
@@ -18823,6 +20418,13 @@ impl MobileApp {
                     "傳送前會先縮放",
                 ),
                 crate::attachment::AttachmentKind::Image,
+            ),
+            (
+                "attach-photo-camera",
+                "icons/file-video-camera.svg",
+                locale::text("Camera", "拍照", "拍照"),
+                locale::text("Take a photograph now", "现在拍一张照片", "現在拍一張照片"),
+                crate::attachment::AttachmentKind::Camera,
             ),
             (
                 "attach-any-file",
@@ -23922,6 +25524,87 @@ mod tests {
         assert_eq!(truncate_single_line("abcdef", 3), "...");
         assert_eq!(truncate_single_line("abcdef", 2), "..");
         assert_eq!(truncate_single_line("abcdef", 0), "");
+    }
+
+    #[test]
+    fn a_reordered_queue_entry_lands_where_the_finger_dropped_it() {
+        // A queue that is only this session's: dropping the first entry last.
+        assert_eq!(queue_insert_index(&[0, 1], 2, 2), 2);
+        // Dropping the last entry first.
+        assert_eq!(queue_insert_index(&[0, 1], 0, 2), 0);
+        // Dropping the first entry into the middle.
+        assert_eq!(queue_insert_index(&[0, 2], 1, 3), 2);
+        // Other sessions' prompts sit in the same vector and must not be
+        // crossed: the drop stays among this session's own rows.
+        assert_eq!(queue_insert_index(&[1, 2], 2, 4), 3);
+        assert_eq!(queue_insert_index(&[2, 3], 0, 4), 2);
+        // An empty remainder can only mean the queue emptied around the move.
+        assert_eq!(queue_insert_index(&[], 0, 0), 0);
+    }
+
+    #[test]
+    fn a_zoomed_preview_cannot_be_pulled_off_the_screen() {
+        let size = gpui::size(px(400.0), px(800.0));
+        // At fit there is no slack at all, so every offset collapses to zero.
+        assert_eq!(
+            clamp_attachment_preview_offset(point(px(120.0), px(-90.0)), 1.0, size),
+            point(px(0.0), px(0.0))
+        );
+        // At 2x the picture may travel by half the width the zoom added.
+        assert_eq!(
+            clamp_attachment_preview_offset(point(px(999.0), px(-999.0)), 2.0, size),
+            point(px(200.0), px(-400.0))
+        );
+        // An offset already inside the slack is left exactly where it is.
+        assert_eq!(
+            clamp_attachment_preview_offset(point(px(30.0), px(-40.0)), 2.0, size),
+            point(px(30.0), px(-40.0))
+        );
+    }
+
+    #[test]
+    fn a_goal_reports_only_the_counters_the_provider_sent() {
+        let mut goal = GoalSnapshot::new("ship it", GoalPhase::Active);
+        assert_eq!(goal_progress_label(&goal), None);
+
+        goal.rounds_started = Some(3);
+        goal.max_rounds = Some(10);
+        assert_eq!(goal_progress_label(&goal).as_deref(), Some("3 / 10 rounds"));
+
+        goal.tokens_used = Some(1_500);
+        assert_eq!(
+            goal_progress_label(&goal).as_deref(),
+            Some("1500 tokens · 3 / 10 rounds")
+        );
+
+        goal.tokens_used = None;
+        goal.token_budget = Some(9_000);
+        goal.time_used_seconds = Some(90);
+        assert_eq!(
+            goal_progress_label(&goal).as_deref(),
+            Some("3 / 10 rounds · 1m 30s")
+        );
+    }
+
+    #[test]
+    fn a_goal_phase_reads_as_a_state_a_reader_can_act_on() {
+        assert_eq!(
+            goal_phase_label(GoalPhase::Active).0,
+            locale::text("Working toward it", "进行中", "進行中")
+        );
+        assert_eq!(
+            goal_phase_label(GoalPhase::Paused).0,
+            locale::text("Paused", "已暂停", "已暫停")
+        );
+        assert_eq!(
+            goal_phase_label(GoalPhase::Blocked).0,
+            locale::text("Blocked", "受阻", "受阻")
+        );
+        // An unknown phase stays honest instead of claiming the goal is fine.
+        assert_eq!(
+            goal_phase_label(GoalPhase::Unknown).0,
+            locale::text("Goal", "目标", "目標")
+        );
     }
 
     #[test]

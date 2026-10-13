@@ -21,6 +21,7 @@ import android.net.nsd.NsdServiceInfo;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.PowerManager;
+import android.provider.MediaStore;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
@@ -50,6 +51,7 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.IOException;
 import java.io.InputStream;
 import java.net.Inet4Address;
 import java.net.InetAddress;
@@ -80,6 +82,7 @@ public final class GpuiHostActivity extends Activity {
     private static final int NOTIFICATION_PERMISSION_REQUEST = 4103;
     private static final int PICK_IMAGE_REQUEST = 4104;
     private static final int PICK_FILE_REQUEST = 4105;
+    private static final int CAPTURE_PHOTO_REQUEST = 4106;
     /** The longest side a picked image is scaled down to before it is encoded. */
     private static final int ATTACHMENT_MAX_EDGE = 2048;
     /** The encoded attachment budget; a phone photograph has to fit the relay. */
@@ -100,6 +103,9 @@ public final class GpuiHostActivity extends Activity {
     private static final String NOTIFICATION_PERMISSION_REQUESTED = "permission_requested";
     private static final String VIBEX_SERVICE_TYPE = "_vibex._tcp.";
     private static final String UPDATE_FILE_AUTHORITY_SUFFIX = ".updates";
+    private static final String CAPTURE_FILE_AUTHORITY_SUFFIX = ".captures";
+    /** The action a launcher shortcut uses to open a fresh session. */
+    private static final String ACTION_NEW_SESSION = "ai.vibex.mobile.NEW_SESSION";
     /**
      * The host id every native call carries.
      *
@@ -124,6 +130,8 @@ public final class GpuiHostActivity extends Activity {
 
     private SurfaceView surfaceView;
     private InputProxy input;
+    /** The file a pending camera capture writes into, cleared once it reports. */
+    private File captureTarget;
 
     private NsdManager nsdManager;
     private NsdManager.DiscoveryListener lanDiscoveryListener;
@@ -144,6 +152,10 @@ public final class GpuiHostActivity extends Activity {
     private static native void nativeOnUpdateNotificationActivated();
     private static native void nativeOnAttachmentPicked(String label, String mimeType, String dataUrl);
     private static native void nativeOnAttachmentPickFailed(String message);
+    /** Text shared into Vibex from another app, which lands in the composer. */
+    private static native void nativeOnSharedText(String text);
+    /** A launcher shortcut was used: open a new session instead of restoring. */
+    private static native void nativeOnLaunchShortcut(String shortcut);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -183,6 +195,7 @@ public final class GpuiHostActivity extends Activity {
         createAgentNotificationChannel();
         createUpdateNotificationChannel();
         handleNotificationIntent(getIntent());
+        handleIncomingIntent(getIntent());
         nativeStart(this, getFilesDir().getAbsolutePath());
     }
 
@@ -191,6 +204,42 @@ public final class GpuiHostActivity extends Activity {
         super.onNewIntent(intent);
         setIntent(intent);
         handleNotificationIntent(intent);
+        handleIncomingIntent(intent);
+    }
+
+    /**
+     * Routes the two intents that are not notification taps: content another
+     * app shared in, and a launcher shortcut.
+     *
+     * The intent is consumed here so a configuration change or a return to the
+     * task does not deliver the same shared picture twice.
+     */
+    private void handleIncomingIntent(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        String shortcut = intent.getAction();
+        if (ACTION_NEW_SESSION.equals(shortcut)) {
+            intent.setAction(null);
+            nativeOnLaunchShortcut("new_session");
+            return;
+        }
+        if (!Intent.ACTION_SEND.equals(shortcut)) {
+            return;
+        }
+        String type = intent.getType();
+        intent.setAction(null);
+        if (type != null && type.startsWith("image/")) {
+            Uri uri = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+            if (uri != null) {
+                reportAttachment(uri, true, "shared-image");
+            }
+            return;
+        }
+        String text = intent.getStringExtra(Intent.EXTRA_TEXT);
+        if (text != null && !text.isBlank()) {
+            nativeOnSharedText(text);
+        }
     }
 
     @Override
@@ -242,9 +291,52 @@ public final class GpuiHostActivity extends Activity {
         }
     }
 
+    /**
+     * Opens the system camera and attaches the photograph it takes.
+     *
+     * The capture is written to a file this app owns, so the result needs no
+     * storage permission and no media scan; it is scaled and encoded by the
+     * same path a picked image takes.
+     */
+    public void gpuiCapturePhotoAttachment() {
+        Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+        if (intent.resolveActivity(getPackageManager()) == null) {
+            nativeOnAttachmentPickFailed("No camera app is available on this device");
+            return;
+        }
+        try {
+            File directory = new File(getCacheDir(), "captures");
+            if (!directory.exists() && !directory.mkdirs()) {
+                throw new IOException("the capture directory could not be created");
+            }
+            File target = File.createTempFile("capture-", ".jpg", directory);
+            captureTarget = target;
+            Uri output = FileProvider.getUriForFile(
+                    this,
+                    getPackageName() + CAPTURE_FILE_AUTHORITY_SUFFIX,
+                    target);
+            intent.putExtra(MediaStore.EXTRA_OUTPUT, output);
+            intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            startActivityForResult(intent, CAPTURE_PHOTO_REQUEST);
+        } catch (Exception error) {
+            captureTarget = null;
+            nativeOnAttachmentPickFailed("The camera could not be opened");
+        }
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == CAPTURE_PHOTO_REQUEST) {
+            File captured = captureTarget;
+            captureTarget = null;
+            if (resultCode != RESULT_OK || captured == null || !captured.exists()) {
+                // A cancelled capture is not a failure.
+                return;
+            }
+            reportAttachment(Uri.fromFile(captured), true, "photo");
+            return;
+        }
         boolean image = requestCode == PICK_IMAGE_REQUEST;
         if (!image && requestCode != PICK_FILE_REQUEST) {
             return;
@@ -255,11 +347,19 @@ public final class GpuiHostActivity extends Activity {
             // composer simply keeps the attachments it already had.
             return;
         }
-        // Decoding and encoding a camera-sized image takes long enough to drop
-        // frames, so it happens off the UI thread and reports back through the
-        // Activity's own thread.
+        reportAttachment(uri, image, image ? "image" : "file");
+    }
+
+    /**
+     * Reads, scales, and encodes one item, then reports it to the panel.
+     *
+     * Decoding and encoding a camera-sized image takes long enough to drop
+     * frames, so it happens off the UI thread and reports back through the
+     * Activity's own thread.
+     */
+    private void reportAttachment(Uri uri, boolean image, String fallbackLabel) {
         new Thread(() -> {
-            String label = attachmentLabel(uri, image ? "image" : "file");
+            String label = attachmentLabel(uri, fallbackLabel);
             try {
                 String mimeType = getContentResolver().getType(uri);
                 byte[] encoded = image ? encodeAttachment(uri) : readAttachment(uri);
@@ -279,6 +379,30 @@ public final class GpuiHostActivity extends Activity {
                         : "The picked file could not be read"));
             }
         }).start();
+    }
+
+    /**
+     * Hands text to whichever app the user picks.
+     *
+     * The mirror of the share intent-filter: a phone's share sheet is the way
+     * a transcript leaves the app, and the desktop has no equivalent.
+     */
+    public void gpuiShareText(String text) {
+        runOnUiThread(() -> {
+            if (text == null || text.isBlank()) {
+                return;
+            }
+            Intent send = new Intent(Intent.ACTION_SEND);
+            send.setType("text/plain");
+            send.putExtra(Intent.EXTRA_TEXT, text);
+            Intent chooser = Intent.createChooser(send, "Share");
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            try {
+                startActivity(chooser);
+            } catch (ActivityNotFoundException error) {
+                // Nothing to share with; the copy button is still there.
+            }
+        });
     }
 
     /** Reads one picked file whole, up to the wire budget. */
@@ -713,6 +837,7 @@ public final class GpuiHostActivity extends Activity {
                     .setContentText(body)
                     .setCategory(Notification.CATEGORY_MESSAGE)
                     .setAutoCancel(true)
+                    .setNumber(1)
                     .setContentIntent(pendingIntent)
                     .build();
             NotificationManager manager = getSystemService(NotificationManager.class);
@@ -727,6 +852,10 @@ public final class GpuiHostActivity extends Activity {
                 "Agent activity",
                 NotificationManager.IMPORTANCE_DEFAULT);
         channel.setDescription("Agent approvals, input requests, and completed work");
+        // A launcher badge is a property of the channel: the agent channel is
+        // the one that stands for work waiting for the user, so it is the one
+        // that is allowed to leave a mark on the icon.
+        channel.setShowBadge(true);
         manager.createNotificationChannel(channel);
     }
 

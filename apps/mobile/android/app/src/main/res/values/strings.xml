@@ -4,4 +4,6 @@
     <string name="remote_connection_channel_description">Vibex desktop connection status</string>
     <string name="remote_connection_notification_title">Vibex</string>
     <string name="remote_connection_notification_body">Connected to desktop</string>
+    <string name="shortcut_new_session">New session</string>
+    <string name="shortcut_new_session_long">Start a new session</string>
 </resources>

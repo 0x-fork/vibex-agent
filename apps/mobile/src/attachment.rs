@@ -20,6 +20,8 @@ pub enum AttachmentKind {
     Image,
     /// Any other file, carried whole.
     File,
+    /// The camera, whose capture is scaled the way a picked image is.
+    Camera,
 }
 
 /// One picked item the picker handed back, already encoded.
@@ -38,6 +40,12 @@ pub enum AttachmentPickEvent {
     /// The pick failed for a reason worth showing. A cancelled pick reports
     /// nothing at all, so the composer keeps what it had.
     Failed(String),
+    /// Text another app shared into Vibex, which belongs in the composer.
+    ///
+    /// It travels on this channel because it arrives the same way a picked
+    /// attachment does: out of band, from the host, whenever the user shares
+    /// something with the app. An image shared in is reported as `Picked`.
+    SharedText(String),
 }
 
 fn event_sender() -> &'static Mutex<Option<UnboundedSender<AttachmentPickEvent>>> {
@@ -81,6 +89,7 @@ mod android {
         let method = match kind {
             AttachmentKind::Image => jni::jni_str!("gpuiPickImageAttachment"),
             AttachmentKind::File => jni::jni_str!("gpuiPickFileAttachment"),
+            AttachmentKind::Camera => jni::jni_str!("gpuiCapturePhotoAttachment"),
         };
         crate::android_bridge::with_activity(|env, activity| {
             env.call_method(activity, method, jni::jni_sig!(() -> ()), &[])?;
@@ -114,6 +123,35 @@ mod android {
                     mime_type: (!mime_type.is_empty()).then_some(mime_type),
                     data_url,
                 }));
+                Ok(())
+            })
+            .resolve::<jni::errors::LogErrorAndDefault>()
+    }
+
+    /// Text shared into Vibex from another app.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeOnSharedText<'caller>(
+        mut unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+        text: JString<'caller>,
+    ) {
+        unowned_env
+            .with_env(|_| -> jni::errors::Result<()> {
+                enqueue(AttachmentPickEvent::SharedText(text.to_string()));
+                Ok(())
+            })
+            .resolve::<jni::errors::LogErrorAndDefault>()
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeOnLaunchShortcut<'caller>(
+        mut unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+        shortcut: JString<'caller>,
+    ) {
+        unowned_env
+            .with_env(|_| -> jni::errors::Result<()> {
+                crate::shortcut::deliver(&shortcut.to_string());
                 Ok(())
             })
             .resolve::<jni::errors::LogErrorAndDefault>()
@@ -167,6 +205,17 @@ mod tests {
                 mime_type: Some("image/png".to_string()),
                 data_url: "data:image/png;base64,aGVsbG8=".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn shared_text_reaches_the_subscriber() {
+        let mut receiver = subscribe();
+        enqueue(AttachmentPickEvent::SharedText("look at this".to_string()));
+
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AttachmentPickEvent::SharedText("look at this".to_string())
         );
     }
 

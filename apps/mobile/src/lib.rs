@@ -25,6 +25,8 @@ mod power;
 mod scanner;
 mod scroll_capture;
 mod selection_menu;
+mod share;
+mod shortcut;
 mod sidebar;
 mod storage;
 mod theme;

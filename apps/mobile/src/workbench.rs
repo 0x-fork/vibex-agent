@@ -2,20 +2,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Bounds, ClipboardItem, Context, DispatchPhase, Entity, FontWeight, IntoElement, LongPressEvent,
-    MouseButton, MouseUpEvent, ParentElement as _, Pixels, Point, Render, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchDragEvent, TouchPhase, WeakEntity,
-    Window, canvas, div, prelude::*, px, relative, rgb, svg,
+    Bounds, ClipboardItem, Context, DispatchPhase, Entity, FontWeight, Image, ImageFormat,
+    IntoElement, LongPressEvent, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _, Pixels,
+    Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchDragEvent,
+    TouchPhase, WeakEntity, Window, canvas, div, img, prelude::*, px, relative, rgb, svg,
 };
 use vibex_backend::{
-    BackendError, BackendOperation, BackendResult, MutationRequest, TerminalBackend as _,
+    BackendError, BackendOperation, BackendResult, GitBackend as _, MutationRequest,
+    TerminalBackend as _,
 };
 use vibex_core::{
-    FileEntryKind, FileSearchRequest, GitChange, GitChangeKind, GitCommitDetail,
-    GitCommitDetailRequest, GitCommitFileChange, GitCommitSummary, GitDiffResponse,
-    GitHistoryRequest, GitRemoteActionKind, GitRemoteActionRequest, GitStageRequest,
-    RemoteActionClass, TerminalCreateRequest, TerminalId, TerminalSnapshot, TerminalStatus,
-    VibexSessionId, WorkspaceId,
+    FileEntryKind, FilePreviewKind, FileSearchRequest, GitBranchSummary, GitChange, GitChangeKind,
+    GitCommitDetail, GitCommitDetailRequest, GitCommitFileChange, GitCommitSummary,
+    GitDiffResponse, GitHistoryRequest, GitRemoteActionKind, GitRemoteActionRequest,
+    GitStageRequest, RemoteActionClass, TerminalCreateRequest, TerminalId, TerminalSnapshot,
+    TerminalStatus, VibexSessionId, WorkspaceId,
 };
 use vibex_desktop_model::{
     FileGitSignal, FileIconDescriptor, FileIconKind, GitPathSelectionState, GitQueryKind,
@@ -32,6 +33,7 @@ use vibex_ui::{
 };
 
 use crate::locale;
+use crate::markdown;
 use crate::theme;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 
@@ -117,6 +119,31 @@ enum DiffLineKind {
     Added,
     Removed,
     Hunk,
+}
+
+/// Which face of a file the full-screen viewer shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MobileFilePreviewMode {
+    /// The editor buffer, editable and saveable.
+    Source,
+    /// The rendered file: Markdown as Markdown, an image as itself.
+    Preview,
+}
+
+impl MobileFilePreviewMode {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Source => Self::Preview,
+            Self::Preview => Self::Source,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Source => locale::common("Source"),
+            Self::Preview => locale::common("Preview"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +249,19 @@ pub struct MobileWorkbench {
     /// Opening it immediately would overwrite the buffer, so the choice is
     /// theirs to make first.
     file_discard_prompt: Option<String>,
+    /// Which face of a chosen file the screen shows. A Markdown file opens as
+    /// its rendered self — that is what makes it readable on a phone — with
+    /// the source one tap away; every other kind opens as source.
+    file_preview_mode: MobileFilePreviewMode,
+    /// The image a `FilePreviewKind::Image` file turned out to be, once its
+    /// bytes have come back from the workspace.
+    file_image: Option<Arc<Image>>,
+    /// The path whose bytes are being fetched, so a slow read cannot paint
+    /// over the file the reader moved on to.
+    file_image_loading: Option<String>,
+    /// The rendered Markdown view, kept across frames so a preview does not
+    /// rebuild its text layout on every paint. Keyed by path and revision.
+    file_markdown_view: Option<(String, Entity<markdown::MarkdownView>)>,
     git_diff: Option<GitDiffResponse>,
     /// The scroll handle for the diff sheet, so a freshly opened diff starts at
     /// its first line instead of wherever the tree behind it was scrolled to.
@@ -239,6 +279,12 @@ pub struct MobileWorkbench {
     git_commit_confirmation: bool,
     git_history_loading: bool,
     git_history_request_generation: u64,
+    /// Every branch the repository has, read on demand for the filter sheet.
+    /// The desktop gets the same list from `git_branch_list`, and without it
+    /// the phone was stuck reading history from whichever branch it was on.
+    git_branches: Option<Vec<GitBranchSummary>>,
+    git_branches_loading: bool,
+    git_branch_sheet_open: bool,
     /// Next chunk sequence to feed into the render model; 0 forces a rebuild
     /// from the retained snapshot window.
     terminal_render_sequence: i64,
@@ -327,6 +373,10 @@ impl MobileWorkbench {
             pending_file_editor_content: None,
             file_editor_path: None,
             file_discard_prompt: None,
+            file_preview_mode: MobileFilePreviewMode::Source,
+            file_image: None,
+            file_image_loading: None,
+            file_markdown_view: None,
             git_diff: None,
             git_diff_scroll: ScrollHandle::new(),
             git_revert_confirmation: None,
@@ -336,6 +386,9 @@ impl MobileWorkbench {
             git_commit_confirmation: false,
             git_history_loading: false,
             git_history_request_generation: 0,
+            git_branches: None,
+            git_branches_loading: false,
+            git_branch_sheet_open: false,
             terminal_render_sequence: 0,
             terminal_close_confirmation: None,
             terminal_fit_size: None,
@@ -511,21 +564,102 @@ impl MobileWorkbench {
                 return;
             }
         };
+        // The bytes a preview needs are not the editor's business, and for an
+        // image the read carries no text at all, so the fetch is started
+        // alongside the read rather than after it.
+        let preview_kind = file_preview_kind_for_path(&ticket.path);
+        if preview_kind == FilePreviewKind::Image {
+            self.start_file_image_load(ticket.path.clone(), cx);
+        }
         let runner = gpui_tokio::Tokio::spawn(cx, self.files.read_file(ticket.clone()));
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
                 this.files.apply_file_read(&ticket, outcome);
                 this.error = this.files.state.last_error.clone();
+                this.file_preview_mode = match preview_kind {
+                    FilePreviewKind::Markdown => MobileFilePreviewMode::Preview,
+                    FilePreviewKind::Image if this.file_image.is_some() => {
+                        MobileFilePreviewMode::Preview
+                    }
+                    _ => MobileFilePreviewMode::Source,
+                };
                 if let Some(content) = this.files.state.view().editor_content {
                     this.file_editor_path = Some(ticket.path.clone());
-                    this.pending_file_editor_content = Some(content);
+                    this.pending_file_editor_content = Some(content.clone());
                     this.file_screen_open = true;
+                    if preview_kind == FilePreviewKind::Markdown {
+                        let revision = this
+                            .files
+                            .state
+                            .view()
+                            .active_file
+                            .as_ref()
+                            .map(|file| file.content_revision.clone())
+                            .unwrap_or_default();
+                        let key = format!("{}:{revision}", ticket.path);
+                        this.file_markdown_view = Some((
+                            key,
+                            cx.new(|cx| {
+                                markdown::render(Arc::from(content.as_str()), 0, false, cx)
+                            }),
+                        ));
+                    }
                 }
                 cx.notify();
             });
         });
         self.tasks.push(task);
+    }
+
+    /// Fetches an image file's bytes so the viewer can show the picture itself.
+    ///
+    /// The desktop reads images off its own disk; a phone has to ask the
+    /// authority for them, which is the same route an attachment preview takes.
+    fn start_file_image_load(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(format) = image_format_for_path(&path) else {
+            return;
+        };
+        let backend = self.backend.clone();
+        let workspace_id = self.workspace_id.clone();
+        let requested = path.clone();
+        self.file_image = None;
+        self.file_image_loading = Some(path.clone());
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.download_file(workspace_id, path).await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                // A read that came back after the reader opened another file is
+                // dropped rather than painted over the file they are on.
+                if this.file_image_loading.as_deref() != Some(requested.as_str()) {
+                    return;
+                }
+                this.file_image_loading = None;
+                match outcome {
+                    Ok(bytes) => {
+                        this.file_image = Some(Arc::new(Image::from_bytes(format, bytes)));
+                        if this.file_editor_path.as_deref() == Some(requested.as_str()) {
+                            this.file_preview_mode = MobileFilePreviewMode::Preview;
+                        }
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+    }
+
+    fn toggle_file_preview_mode(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_preview_mode = self.file_preview_mode.toggle();
+        cx.notify();
     }
 
     fn activate_file_row(
@@ -790,25 +924,86 @@ impl MobileWorkbench {
         cx.notify();
     }
 
+    /// Reads the repository's branches, for the history filter's sheet.
+    ///
+    /// Read fresh each time the sheet opens: branches appear when a worktree is
+    /// created or a fetch lands, and a cached list would quietly go stale.
+    fn load_git_branches(&mut self, cx: &mut Context<Self>) {
+        if !self
+            .git
+            .capabilities()
+            .supports(BackendOperation::GitBranchList)
+        {
+            return;
+        }
+        self.git_branches_loading = true;
+        let backend = self.backend.clone();
+        let workspace_id = self.workspace_id.clone();
+        let runner =
+            gpui_tokio::Tokio::spawn(
+                cx,
+                async move { backend.git_branch_list(workspace_id).await },
+            );
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.git_branches_loading = false;
+                match outcome {
+                    Ok(branches) => {
+                        this.git_branches = Some(branches.branches);
+                        this.error = None;
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    fn open_git_branch_sheet(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.git_branch_sheet_open = true;
+        self.load_git_branches(cx);
+        cx.notify();
+    }
+
+    fn close_git_branch_sheet(&mut self, cx: &mut Context<Self>) {
+        if self.git_branch_sheet_open {
+            self.git_branch_sheet_open = false;
+            cx.notify();
+        }
+    }
+
+    /// Points the history filter at one branch, or at every branch at once.
+    ///
+    /// `None` is the whole repository: the desktop's branch select offers the
+    /// same "all" case, and on a phone it is the way to see a commit that
+    /// landed on another branch without walking over to the desktop.
+    fn set_git_history_branch(&mut self, branch: Option<String>, cx: &mut Context<Self>) {
+        let mut filter = self.git.state.model.history_filter.clone();
+        if filter.ref_name == branch {
+            self.git_branch_sheet_open = false;
+            cx.notify();
+            return;
+        }
+        filter.ref_name = branch;
+        self.git.state.model.set_history_filter(filter);
+        self.git_branch_sheet_open = false;
+        self.refresh_git_history(false, cx);
+        cx.notify();
+    }
+
     fn refresh_git_history(&mut self, append: bool, cx: &mut Context<Self>) {
         if self.git_history_loading && !append {
             self.git_history_request_generation =
                 self.git_history_request_generation.wrapping_add(1);
         }
-        let mut filter = self.git.state.model.history_filter.clone();
-        if filter.ref_name.is_none() {
-            let branch = self
-                .git
-                .state
-                .model
-                .status
-                .as_ref()
-                .and_then(|status| status.branch.clone());
-            if branch.is_some() {
-                filter.ref_name = branch;
-                self.git.state.model.set_history_filter(filter.clone());
-            }
-        }
+        // The filter is whatever the reader last chose. It used to be filled
+        // with the current branch on every refresh, which made the branch chip
+        // unchangeable: picking "all branches" was overwritten on the next
+        // load.
+        let filter = self.git.state.model.history_filter.clone();
         let before_commit = append
             .then(|| {
                 self.git
@@ -2389,6 +2584,81 @@ impl MobileWorkbench {
             .unwrap_or_default();
         let file_name = path.rsplit('/').next().unwrap_or(&path).to_string();
         let icon = file_icon_descriptor(&file_name, FileEntryKind::File);
+        // A Markdown file and an image both have a face the source cannot show;
+        // everything else is only ever text, so the switch stays off them.
+        let preview_kind = file_preview_kind_for_path(&path);
+        let previewable = preview_kind == FilePreviewKind::Markdown
+            || (preview_kind == FilePreviewKind::Image && self.file_image.is_some());
+        let showing_preview =
+            previewable && self.file_preview_mode == MobileFilePreviewMode::Preview;
+        let body = if showing_preview {
+            match preview_kind {
+                FilePreviewKind::Markdown => {
+                    match self
+                        .file_markdown_view
+                        .as_ref()
+                        .map(|(_, view)| view.clone())
+                    {
+                        Some(entity) => div()
+                            .id("file-screen-markdown")
+                            .flex_1()
+                            .min_h_0()
+                            .m_2()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::bg_card())
+                            .overflow_y_scroll()
+                            .p_3()
+                            .child(entity)
+                            .into_any_element(),
+                        None => div().flex_1().into_any_element(),
+                    }
+                }
+                FilePreviewKind::Image => match self.file_image.clone() {
+                    Some(image) => div()
+                        .id("file-screen-image")
+                        .flex_1()
+                        .min_h_0()
+                        .m_2()
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .border_1()
+                        .border_color(theme::border_default())
+                        .bg(theme::bg_card())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .overflow_hidden()
+                        .child(
+                            img(image)
+                                .max_w_full()
+                                .max_h_full()
+                                .object_fit(ObjectFit::Contain),
+                        )
+                        .into_any_element(),
+                    None => div().flex_1().into_any_element(),
+                },
+                _ => div().flex_1().into_any_element(),
+            }
+        } else {
+            div()
+                .id("file-screen-editor")
+                .flex_1()
+                .min_h_0()
+                .m_2()
+                .rounded(px(theme::RADIUS_CONTROL))
+                .border_1()
+                .border_color(theme::border_default())
+                .bg(theme::bg_card())
+                .overflow_hidden()
+                // A code buffer in the interface font reads as prose; the
+                // desktop editor is monospace and so is this one.
+                .font_family("IBM Plex Mono")
+                .text_size(px(13.0))
+                .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
+                .child(textarea_element(self.file_editor_input.as_ref()))
+                .into_any_element()
+        };
 
         div()
             .size_full()
@@ -2465,26 +2735,46 @@ impl MobileWorkbench {
                                 .text_color(status_color)
                                 .child(status),
                         ),
-                    ),
+                    )
+                    .when(previewable, |header| {
+                        header.child(
+                            div()
+                                .id("file-preview-toggle")
+                                .flex_shrink_0()
+                                .h(px(32.0))
+                                .px_2()
+                                .mr_1()
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(if showing_preview {
+                                    theme::primary()
+                                } else {
+                                    theme::border_default()
+                                })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .text_size(theme::font_micro())
+                                .text_color(if showing_preview {
+                                    theme::primary()
+                                } else {
+                                    theme::text_secondary()
+                                })
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::toggle_file_preview_mode),
+                                )
+                                .child(if showing_preview {
+                                    MobileFilePreviewMode::Source.label()
+                                } else {
+                                    MobileFilePreviewMode::Preview.label()
+                                }),
+                        )
+                    }),
             )
-            .child(
-                div()
-                    .id("file-screen-editor")
-                    .flex_1()
-                    .min_h_0()
-                    .m_2()
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_card())
-                    .overflow_hidden()
-                    // A code buffer in the interface font reads as prose; the
-                    // desktop editor is monospace and so is this one.
-                    .font_family("IBM Plex Mono")
-                    .text_size(px(13.0))
-                    .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
-                    .child(textarea_element(self.file_editor_input.as_ref())),
-            )
+            .child(body)
             .child(
                 div()
                     .flex_shrink_0()
@@ -2525,6 +2815,192 @@ impl MobileWorkbench {
                             button.on_mouse_up(MouseButton::Left, cx.listener(Self::save_file))
                         })
                         .when(!can_write, |button| button.opacity(0.55)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The branch list the history filter picks from.
+    ///
+    /// A sheet rather than a select: a repository can carry dozens of branches
+    /// and a phone list scrolls, where a popup would have to be a full screen
+    /// anyway. The current branch is marked, and "All branches" is the way back
+    /// to the whole repository.
+    fn render_git_branch_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let selected = self.git.state.model.history_filter.ref_name.clone();
+        let loading = self.git_branches_loading && self.git_branches.is_none();
+        let mut rows: Vec<(Option<String>, String, Option<String>)> =
+            vec![(None, locale::common("All branches").to_string(), None)];
+        for branch in self.git_branches.iter().flatten() {
+            let mut detail = Vec::new();
+            if branch.current {
+                detail.push(locale::common("Current").to_string());
+            }
+            if branch.ahead > 0 {
+                detail.push(format!("↑{}", branch.ahead));
+            }
+            if branch.behind > 0 {
+                detail.push(format!("↓{}", branch.behind));
+            }
+            if branch.detached {
+                detail.push(locale::common("Detached").to_string());
+            }
+            rows.push((
+                Some(branch.name.clone()),
+                branch.name.clone(),
+                (!detail.is_empty()).then(|| detail.join(" · ")),
+            ));
+        }
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.45))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_git_branch_sheet(cx)),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "mobile-git-branch-sheet".to_string())
+                    .w_full()
+                    .max_h(gpui::relative(0.7))
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(theme::border_subtle())
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(theme::font_title())
+                                    .text_color(theme::text_primary())
+                                    .child(locale::text("History branch", "历史分支", "歷史分支")),
+                            )
+                            .child(
+                                div()
+                                    .id("git-branch-sheet-close")
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.close_git_branch_sheet(cx)
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/x.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_secondary()),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("git-branch-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .p_2()
+                            .when(loading, |list| {
+                                list.child(
+                                    div()
+                                        .p_3()
+                                        .text_size(theme::font_body())
+                                        .text_color(theme::text_muted())
+                                        .child(locale::common("Loading")),
+                                )
+                            })
+                            .children(rows.into_iter().enumerate().map(
+                                |(index, (value, label, detail))| {
+                                    let chosen = value == selected;
+                                    let target = value.clone();
+                                    div()
+                                        .id(("git-branch-row", index))
+                                        .w_full()
+                                        .min_h(px(theme::TOUCH_TARGET))
+                                        .px_3()
+                                        .py_1()
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.set_git_history_branch(target.clone(), cx)
+                                            }),
+                                        )
+                                        .child(
+                                            svg()
+                                                .path("icons/git-branch.svg")
+                                                .size(px(theme::ICON_SM))
+                                                .flex_shrink_0()
+                                                .text_color(if chosen {
+                                                    theme::primary()
+                                                } else {
+                                                    theme::text_muted()
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .text_size(theme::font_body())
+                                                .text_color(if chosen {
+                                                    theme::primary()
+                                                } else {
+                                                    theme::text_primary()
+                                                })
+                                                .child(label),
+                                        )
+                                        .when_some(detail, |row, detail| {
+                                            row.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_size(theme::font_micro())
+                                                    .text_color(theme::text_muted())
+                                                    .child(detail),
+                                            )
+                                        })
+                                        .when(chosen, |row| {
+                                            row.child(
+                                                svg()
+                                                    .path("icons/check.svg")
+                                                    .size(px(theme::ICON_SM))
+                                                    .flex_shrink_0()
+                                                    .text_color(theme::primary()),
+                                            )
+                                        })
+                                },
+                            )),
                     ),
             )
             .into_any_element()
@@ -3170,6 +3646,24 @@ impl MobileWorkbench {
                         )
                         .child(
                             compact_action(
+                                "git-history-branch",
+                                self.git
+                                    .state
+                                    .model
+                                    .history_filter
+                                    .ref_name
+                                    .as_deref()
+                                    .map(|branch| short_branch_label(branch, 18))
+                                    .unwrap_or_else(|| locale::common("All branches").to_string()),
+                            )
+                            .h(px(30.0))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::open_git_branch_sheet),
+                            ),
+                        )
+                        .child(
+                            compact_action(
                                 "git-history-author",
                                 self.git
                                     .state
@@ -3356,6 +3850,9 @@ impl MobileWorkbench {
             // visible way out.
             .when_some(self.git_diff.clone(), |root, diff| {
                 root.child(self.render_git_diff(diff, cx))
+            })
+            .when(self.git_branch_sheet_open, |root| {
+                root.child(self.render_git_branch_sheet(cx))
             })
             .into_any_element()
     }
@@ -5528,6 +6025,56 @@ fn file_tree_guides_mobile(depth: usize) -> Vec<gpui::AnyElement> {
         .collect()
 }
 
+/// What a path is, for the purposes of showing it rather than editing it.
+///
+/// The authority sends a `preview_kind` with every read, but the phone has to
+/// know before the answer arrives: an image's bytes are fetched on a different
+/// route from its text, and the fetch is started alongside the read.
+fn file_preview_kind_for_path(path: &str) -> FilePreviewKind {
+    let extension = path
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("md" | "markdown" | "mdx") => FilePreviewKind::Markdown,
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "avif") => {
+            FilePreviewKind::Image
+        }
+        Some("svg") => FilePreviewKind::Image,
+        _ => FilePreviewKind::Text,
+    }
+}
+
+/// The decoder an image path needs, or `None` when the extension names a
+/// format this build cannot draw.
+fn image_format_for_path(path: &str) -> Option<ImageFormat> {
+    let extension = path
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, extension)| extension.to_ascii_lowercase())?;
+    match extension.as_str() {
+        "png" => Some(ImageFormat::Png),
+        "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+        "gif" => Some(ImageFormat::Gif),
+        "webp" => Some(ImageFormat::Webp),
+        "svg" => Some(ImageFormat::Svg),
+        "bmp" => Some(ImageFormat::Bmp),
+        "ico" => Some(ImageFormat::Ico),
+        _ => None,
+    }
+}
+
+/// A branch name clipped to what a chip can show.
+fn short_branch_label(branch: &str, max_chars: usize) -> String {
+    if branch.chars().count() <= max_chars {
+        return branch.to_string();
+    }
+    let head: String = branch.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
 fn mobile_file_tree_icon(
     icon: FileIconDescriptor,
     ignored: bool,
@@ -6462,6 +7009,63 @@ mod tests {
         // A point past the row's own width clamps into it rather than panicking.
         assert_eq!(terminal_word_range(&row, 40), (8, 9));
         assert_eq!(terminal_word_range(&[], 3), (3, 3));
+    }
+
+    #[test]
+    fn a_file_preview_kind_follows_the_extension_it_was_opened_with() {
+        assert_eq!(
+            file_preview_kind_for_path("docs/README.md"),
+            FilePreviewKind::Markdown
+        );
+        assert_eq!(
+            file_preview_kind_for_path("notes/deep/plan.MARKDOWN"),
+            FilePreviewKind::Markdown
+        );
+        assert_eq!(
+            file_preview_kind_for_path("shots/screen.png"),
+            FilePreviewKind::Image
+        );
+        assert_eq!(
+            file_preview_kind_for_path("icons/logo.svg"),
+            FilePreviewKind::Image
+        );
+        // No extension, or one the viewer has no second face for.
+        assert_eq!(
+            file_preview_kind_for_path("Makefile"),
+            FilePreviewKind::Text
+        );
+        assert_eq!(
+            file_preview_kind_for_path("src/main.rs"),
+            FilePreviewKind::Text
+        );
+        // A dot in a directory name must not be read as the file's extension.
+        assert_eq!(
+            file_preview_kind_for_path("v1.2/notes"),
+            FilePreviewKind::Text
+        );
+    }
+
+    #[test]
+    fn only_formats_this_build_can_draw_get_a_decoder() {
+        assert_eq!(image_format_for_path("a/b.png"), Some(ImageFormat::Png));
+        assert_eq!(image_format_for_path("a/b.JPG"), Some(ImageFormat::Jpeg));
+        assert_eq!(image_format_for_path("a/b.jpeg"), Some(ImageFormat::Jpeg));
+        assert_eq!(image_format_for_path("a/b.gif"), Some(ImageFormat::Gif));
+        assert_eq!(image_format_for_path("a/b.webp"), Some(ImageFormat::Webp));
+        assert_eq!(image_format_for_path("a/b.svg"), Some(ImageFormat::Svg));
+        assert_eq!(image_format_for_path("a/b.tiff"), None);
+        assert_eq!(image_format_for_path("a/b"), None);
+    }
+
+    #[test]
+    fn a_branch_label_is_clipped_rather_than_overflowing_its_chip() {
+        assert_eq!(short_branch_label("main", 18), "main");
+        assert_eq!(
+            short_branch_label("feature/a-very-long-branch-name", 10),
+            "feature/a…"
+        );
+        // Multi-byte names are counted in characters, not bytes.
+        assert_eq!(short_branch_label("分支名称很长很长很长", 5), "分支名称…");
     }
 
     #[test]
