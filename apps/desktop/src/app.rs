@@ -4456,6 +4456,13 @@ pub struct SessionView {
     timeline_duration_tick_task: Option<Task<()>>,
     timeline_scrollbar_interaction_active: bool,
     timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>,
+    /// The timeline revision [`Self::timeline_row_sizes`] was built for.
+    ///
+    /// A parked view is not rendered, so a projection replaced while it was
+    /// parked leaves extents that describe the conversation as it stood then.
+    /// Comparing the stamp against the live revision is what tells a restore its
+    /// table is stale before the first frame clamps the scroll offset to it.
+    timeline_row_sizes_revision: u64,
     timeline_measured_turn_heights: BTreeMap<String, f32>,
     timeline_measured_turn_layout_signatures: BTreeMap<String, u64>,
     timeline_streaming_shrink_candidates: BTreeMap<String, StreamingShrinkCandidate>,
@@ -4599,6 +4606,7 @@ impl SessionView {
             timeline_duration_tick_task: None,
             timeline_scrollbar_interaction_active: false,
             timeline_row_sizes: Rc::new(Vec::new()),
+            timeline_row_sizes_revision: 0,
             timeline_measured_turn_heights: BTreeMap::new(),
             timeline_measured_turn_layout_signatures: BTreeMap::new(),
             timeline_streaming_shrink_candidates: BTreeMap::new(),
@@ -20798,6 +20806,18 @@ impl VibexWorkbench {
         if geometry_changed || turns_cache_changed {
             self.rebuild_timeline_sizes();
         }
+        // A view parked while its session kept working comes back with a
+        // projection its row table no longer describes: nothing measured the
+        // parked view while the replacement landed. The table is what the
+        // virtual list clamps the restored offset against before the frame
+        // measures anything, so extents that describe the parked projection have
+        // to go before the first frame resolves its rows. Dropping the turn
+        // heights keeps the process units, which still describe the units the
+        // replacement did not change; the estimator drops the ones it did.
+        if self.timeline.revision != self.timeline_row_sizes_revision {
+            self.invalidate_timeline_layout_measurements();
+            self.rebuild_timeline_sizes();
+        }
         // Retain the last painted geometry while the live document catches up.
         // Releasing the shrink guard allows its next real measurement to settle
         // without routing the restored view through character-count estimates.
@@ -23389,6 +23409,7 @@ impl VibexWorkbench {
 
     fn rebuild_timeline_sizes(&mut self) -> bool {
         self.timeline_pending_turn_heights.clear();
+        let revision = self.timeline.revision;
         let turns = self.conversation_turns_cached();
         self.streaming_row_state = turns
             .last()
@@ -23417,6 +23438,9 @@ impl VibexWorkbench {
             };
             row_sizes.push(size(px(content_width), px(height)));
         }
+        // The table is current for this projection whichever way the comparison
+        // goes, so the stamp is refreshed on both paths.
+        self.timeline_row_sizes_revision = revision;
         if self.timeline_row_sizes.as_ref() == &row_sizes {
             return false;
         }
@@ -98487,9 +98511,8 @@ mod tests {
         let window = cx.open_window(gpui::size(px(1_600.0), px(1_000.0)), |window, cx| {
             let mut ui_state = DesktopUiStateV1::default();
             ui_state.appearance.locale = LocaleMode::En;
-            let workbench = cx.new(|cx| {
-                VibexWorkbench::with_initial_state(None, ui_state, None, window, cx)
-            });
+            let workbench =
+                cx.new(|cx| VibexWorkbench::with_initial_state(None, ui_state, None, window, cx));
             ColumnsProbe { workbench }
         });
         cx.run_until_parked();
