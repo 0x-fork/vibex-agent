@@ -43214,7 +43214,6 @@ impl VibexWorkbench {
         // The pane's rail spans the pane, composer and all: a pane whose plan
         // panel grows must not move the ticks beside its own conversation.
         let rail = self.render_session_pane_rail(cx);
-        let terminal_panel = self.render_composer_terminal_panel(cx);
         v_flex()
             .size_full()
             .min_w_0()
@@ -43231,7 +43230,6 @@ impl VibexWorkbench {
             .when_some(conversation_find, |this, find| this.child(find))
             .child(composer)
             .when_some(rail, |this, rail| this.child(rail))
-            .when_some(terminal_panel, |this, panel| this.child(panel))
             .into_any_element()
     }
 
@@ -51142,22 +51140,13 @@ impl VibexWorkbench {
             .then(|| self.render_conversation_find(cx))
             .flatten();
         let composer = include_composer.then(|| self.render_composer(window, cx, true));
-        // The bottom terminal panel belongs to the Composer's surface, so only
-        // a pane that mounts a Composer mounts it. It is the last row of the
-        // page: raising it is what lifts the input.
-        let composer_terminal_panel = include_composer
-            .then(|| self.render_composer_terminal_panel(cx))
-            .flatten();
         // Terminal mode routes its own near-fullscreen expansion through the
         // same timeline-collapse path as the input composer's expanded state.
-        // The bottom terminal panel borrows the same expansion: a maximized
-        // panel takes the room the timeline gives up.
-        let composer_fullscreen =
-            if self.composer_terminal_mode || self.composer_terminal_panel_open {
-                self.composer_terminal_expanded
-            } else {
-                self.composer_expanded
-            };
+        let composer_fullscreen = if self.composer_terminal_mode {
+            self.composer_terminal_expanded
+        } else {
+            self.composer_expanded
+        };
         // The follow-the-agent affordance floats over the timeline instead of
         // occupying a row above the composer. A reserved row shortened the
         // timeline viewport by its full height, so the band it painted hid the
@@ -51339,7 +51328,6 @@ impl VibexWorkbench {
             .when_some(conversation_find, |this, find| this.child(find))
             .when_some(composer, |this, composer| this.child(composer))
             .when_some(turn_preview_rail, |this, rail| this.child(rail))
-            .when_some(composer_terminal_panel, |this, panel| this.child(panel))
             .into_any_element()
     }
 
@@ -52311,25 +52299,32 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
-    /// The Composer terminal as a full-width panel under the input.
+    /// The Composer terminal as a full-width panel under the workbench.
     ///
-    /// The panel is the last row of the session page, so raising it lifts the
-    /// Composer — and the conversation above it — by the panel's height. It is
-    /// not mounted at all while there is no terminal to show: an empty panel
-    /// would push the input up for an empty state the Composer's own terminal
-    /// button already answers.
+    /// The panel is the bottom row of the shell — the sidebar keeps its own
+    /// column, everything else rises by the panel's height — so it runs the
+    /// whole width the Composer works in and the rail is not left standing
+    /// beside it. It is not mounted at all while there is no terminal to show:
+    /// an empty panel would lift the Composer for an empty state the Composer's
+    /// own terminal button already answers.
     fn render_composer_terminal_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.composer_terminal_panel_mounted || self.composer_terminals.is_empty() {
             return None;
         }
         let (min_terminal_height, max_terminal_height) = self.composer_terminal_height_limits();
-        let terminal_height = self
-            .composer_terminal_height
-            .clamp(min_terminal_height, max_terminal_height);
-        // The panel owns the window's bottom edge, so its height is the
+        // Maximizing a docked panel means taking the tallest height the window
+        // can spare, not the whole column: the Composer above it stays on
+        // screen, so the reader keeps the input the terminal was opened from.
+        let expanded = self.composer_terminal_expanded;
+        let terminal_height = if expanded {
+            max_terminal_height
+        } else {
+            self.composer_terminal_height
+                .clamp(min_terminal_height, max_terminal_height)
+        };
+        // The panel sits on the window's bottom edge, so its height is the
         // terminal plus the resize strip above it.
         let panel_height = terminal_height + COMPOSER_TERMINAL_RESIZE_HANDLE_HEIGHT_PX;
-        let expanded = self.composer_terminal_expanded;
         let resize_handle = if expanded {
             None
         } else {
@@ -52342,7 +52337,6 @@ impl VibexWorkbench {
             .w_full()
             .min_w_0()
             .flex_none()
-            .when(expanded, |this| this.flex_1().min_h_0())
             .overflow_hidden()
             .bg(cx.theme().background)
             .pt(px(COMPOSER_TERMINAL_RESIZE_HANDLE_HEIGHT_PX))
@@ -52350,16 +52344,15 @@ impl VibexWorkbench {
             .child(
                 v_flex()
                     .w_full()
-                    .when(!expanded, |this| this.h(px(terminal_height)))
-                    .when(expanded, |this| this.flex_1().min_h_0())
+                    .h(px(terminal_height))
                     .min_w_0()
                     .overflow_hidden()
                     .child(card),
             );
-        if self.ui_state.appearance.reduced_motion || expanded {
+        if self.ui_state.appearance.reduced_motion {
             return Some(panel.into_any_element());
         }
-        // A closed panel stays mounted for one transition so the Composer
+        // A closed panel stays mounted for one transition so the workbench
         // settles back down instead of snapping.
         Some(if self.composer_terminal_panel_open {
             Transition::new(COMPOSER_TERMINAL_PANEL_TRANSITION_DURATION)
@@ -52490,8 +52483,15 @@ impl VibexWorkbench {
             })
             .collect::<Vec<_>>();
         let card_border = cx.theme().border;
+        // The card takes the height its host grants it. Both hosts size the
+        // card's container — a fixed terminal height, or the expanded page —
+        // and the live surface only lays its grid out against a definite box,
+        // so a card left at its content height would draw the chrome and no
+        // terminal at all.
         let card = v_flex()
             .w_full()
+            .flex_1()
+            .min_h_0()
             .min_w_0()
             .overflow_hidden()
             .when(chrome == ComposerTerminalChrome::Composer, |this| {
@@ -63115,15 +63115,25 @@ impl VibexWorkbench {
             window,
             cx,
         );
+        // The Composer's terminal panel is composed before the page. A session
+        // group renders its panes by borrowing their own views, and the panel
+        // belongs to the selected session's Composer — the view the root still
+        // holds at this point — not to whichever pane happened to be painted
+        // last.
+        let terminal_panel = (agent_open && !new_session_open)
+            .then(|| self.render_composer_terminal_panel(cx))
+            .flatten();
 
+        // The columns the sidebar leaves. The terminal panel is composed as a
+        // row under this row and beside the sidebar, so the panel runs the full
+        // width the Composer works in and the rail above it is lifted instead
+        // of standing beside the panel.
         let mut shell = h_flex()
-            .id("foundation-shell")
             .relative()
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .overflow_hidden()
-            .child(inline_sidebar);
+            .overflow_hidden();
         // Full screen is drawn by the panel's own slot, which fills what the
         // columns beside it leave. The page the editor sweeps over travels with
         // that slot, so the column keeps neither the page nor any width while
@@ -63327,7 +63337,7 @@ impl VibexWorkbench {
                 .child(panel)
                 .child(resize_handle)
         });
-        shell
+        let workbench = shell
             .when(placement.overlay, |this| {
                 this.child(
                     div()
@@ -63347,7 +63357,27 @@ impl VibexWorkbench {
                         ),
                 )
             })
-            .when_some(floating_right_rail, |this, panel| this.child(panel))
+            .when_some(floating_right_rail, |this, panel| this.child(panel));
+        // The panel spans what the sidebar leaves and lifts every column above
+        // it, the rail included, instead of stopping at the conversation's own
+        // right edge.
+        h_flex()
+            .id("foundation-shell")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_hidden()
+            .child(inline_sidebar)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(workbench)
+                    .when_some(terminal_panel, |this, panel| this.child(panel)),
+            )
             .into_any_element()
     }
 }
@@ -86007,10 +86037,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_controls("))
             .map(|(body, _)| body)
             .expect("agent workbench renderer should remain inspectable");
-        assert!(
-            workbench
-                .contains("if self.composer_terminal_mode || self.composer_terminal_panel_open {")
-        );
+        assert!(workbench.contains("let composer_fullscreen = if self.composer_terminal_mode {"));
         assert!(workbench.contains(".when(!composer_fullscreen, |this| this.flex_1())"));
         assert!(workbench.contains(".when(composer_fullscreen, |this| this.h_0().flex_none())"));
 
@@ -86034,10 +86061,28 @@ mod tests {
         assert!(panel.contains("COMPOSER_TERMINAL_PANEL_TRANSITION_DURATION"));
         assert!(panel.contains("\"composer-terminal-panel-open\""));
         assert!(panel.contains("\"composer-terminal-panel-close\""));
-        // The panel pulls the full width of the session page rather than
-        // matching the input's content column.
+        // The panel pulls the full width the Composer works in rather than
+        // matching the input's content column, and it is one surface for the
+        // whole workbench instead of one per conversation pane.
         assert!(panel.contains(".w_full()"));
         assert!(!panel.contains("content_max_width"));
+
+        let shell = source
+            .split_once("    fn render_shell(")
+            .and_then(|(_, tail)| tail.split_once("\nfn preview_panel_placement("))
+            .map(|(body, _)| body)
+            .expect("shell should remain inspectable");
+        assert!(shell.contains("let terminal_panel = (agent_open && !new_session_open)"));
+        assert!(shell.contains(".when_some(terminal_panel, |this, panel| this.child(panel))"));
+        // The columns sit above the panel inside the sidebar's sibling, which
+        // is what lifts the rail and not just the conversation.
+        assert!(shell.contains(".child(workbench)\n                    .when_some(terminal_panel"));
+        let page = source
+            .split_once("    fn render_agent_workbench_for(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_pane_rail("))
+            .map(|(body, _)| body)
+            .expect("the session page should remain inspectable");
+        assert!(!page.contains("render_composer_terminal_panel"));
 
         let toggle = source
             .split_once("    fn toggle_composer_terminal(")
