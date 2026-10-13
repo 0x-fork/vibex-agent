@@ -2422,7 +2422,6 @@ const MARKDOWN_TEXT_STATE_LIMIT: usize = 192;
 struct AgentReasoningSummary {
     plain: Arc<str>,
     preview: Arc<str>,
-    tooltip: Arc<str>,
     has_more: bool,
 }
 
@@ -2467,14 +2466,11 @@ fn timeline_reasoning_summary_cached_at(
     }
 
     let (plain, _) = agent_markdown_summary(source);
-    let plain: Arc<str> = Arc::from(plain);
     let preview: Arc<str> = Arc::from(reasoning_preview_text(&plain));
-    let tooltip: Arc<str> = Arc::from(plain.trim());
     let summary = AgentReasoningSummary {
         has_more: plain.chars().count() > AGENT_THINKING_LABEL_MAX_CHARS,
-        plain,
+        plain: Arc::from(plain),
         preview,
-        tooltip,
     };
     insert_bounded_timeline_projection(
         cache,
@@ -2494,7 +2490,6 @@ fn timeline_reasoning_summary_cached_at(
                 .plain
                 .len()
                 .saturating_add(snapshot.summary.preview.len())
-                .saturating_add(snapshot.summary.tooltip.len())
         },
     );
     summary
@@ -53889,7 +53884,7 @@ impl VibexWorkbench {
                     response = response.child(render_agent_thinking_indicator(
                         &turn.id,
                         &agent_progress_label(&pending_label, strings.agent_pending_response),
-                        &pending_tooltip,
+                        Some(&pending_tooltip),
                         live,
                         cx,
                     ));
@@ -55675,7 +55670,7 @@ impl VibexWorkbench {
                     // its window no longer draws.
                     let (_, remaining) = reasoning_source_parts(&row.body);
                     match self.reasoning_window(row.streaming, remaining) {
-                        Some(window) => reasoning_window_row_height(window) + 4.0,
+                        Some(height) => height + 4.0,
                         None => estimated_markdown_body_height(&row.body, chars_per_line) + 4.0,
                     }
                 } else {
@@ -56249,7 +56244,7 @@ impl VibexWorkbench {
                                 // window while the Agent is still thinking.
                                 let (_, remaining) = reasoning_source_parts(body);
                                 match self.reasoning_window(true, remaining) {
-                                    Some(window) => reasoning_window_row_height(window) + 4.0,
+                                    Some(height) => height + 4.0,
                                     None => {
                                         estimated_markdown_body_height(body, chars_per_line) + 4.0
                                     }
@@ -56991,7 +56986,6 @@ impl VibexWorkbench {
             body.remaining,
             body.window,
             reveal,
-            cx,
         )
         .id(row_id)
         .cursor_pointer()
@@ -57004,8 +56998,8 @@ impl VibexWorkbench {
         .into_any_element()
     }
 
-    /// The window a live reasoning body is drawn in, or `None` while the
-    /// reader's expansion mode asks for the whole thought.
+    /// The height a live reasoning body is held to, or `None` while the reader's
+    /// expansion mode asks for the whole thought.
     ///
     /// Only a body that is still arriving is windowed: the window exists to keep
     /// a growing thought from rewriting the timeline under the reader's hand,
@@ -57013,15 +57007,11 @@ impl VibexWorkbench {
     /// same six rows the TUI keeps are measured from the body that goes *into*
     /// the window — everything after the first line, which is drawn beside the
     /// brain rather than inside the box.
-    fn reasoning_window(
-        &self,
-        streaming: bool,
-        remaining: Option<&str>,
-    ) -> Option<ReasoningWindow> {
+    fn reasoning_window(&self, streaming: bool, remaining: Option<&str>) -> Option<f32> {
         if !self.live_reasoning_uses_window(streaming) {
             return None;
         }
-        Some(reasoning_window_for(
+        Some(reasoning_window_height(
             remaining.unwrap_or_default(),
             self.estimated_timeline_chars_per_line(),
         ))
@@ -57079,8 +57069,7 @@ impl VibexWorkbench {
             Instant::now(),
         );
         let live = self.borrowed_session_turn_is_live();
-        let content =
-            render_agent_thinking_indicator(&row_id, &summary.preview, &summary.tooltip, live, cx);
+        let content = render_agent_thinking_indicator(&row_id, &summary.preview, None, live, cx);
         let toggle_id = row_id.clone();
         let mut container = h_flex()
             .id(row_id.clone())
@@ -57166,7 +57155,7 @@ impl VibexWorkbench {
         let disclosure_visible = summary.has_more;
         let content = if row.streaming {
             let live = self.borrowed_session_turn_is_live();
-            render_agent_thinking_indicator(&row_id, &summary.preview, &summary.tooltip, live, cx)
+            render_agent_thinking_indicator(&row_id, &summary.preview, None, live, cx)
         } else {
             div()
                 .id(format!("reasoning-preview:{row_id}"))
@@ -65243,50 +65232,18 @@ const REASONING_WINDOW_LINE_HEIGHT: f32 = 22.0;
 /// the Agent is still producing it.
 const REASONING_WINDOW_HEIGHT: f32 = REASONING_WINDOW_LINES * REASONING_WINDOW_LINE_HEIGHT;
 
-/// The row of air that says older reasoning rows are above the window.
-const REASONING_WINDOW_FOLD_MARKER: &str = "…";
-
-/// How tall that fold marker row is: one line of small text with a little air.
-const REASONING_WINDOW_FOLD_MARKER_HEIGHT: f32 = 20.0;
-
-/// The fixed-height viewport a live reasoning body is drawn in.
-///
-/// `height` is the box the body is clipped to; `fold` says the body has already
-/// outgrown it, which the row answers with a marker above the window rather than
-/// inside it — a marker that were part of the clipped column would be the first
-/// thing pushed out of sight.
-#[derive(Clone, Copy)]
-struct ReasoningWindow {
-    height: f32,
-    fold: bool,
-}
-
-/// Whether a reasoning body has outgrown the window, and what the window costs
-/// the timeline row: the body capped at the window, plus the marker row once
-/// the body no longer fits.
+/// The height a live reasoning body is held to: its natural height while the
+/// thought still fits the window, the window's cap once it outgrows it.
 ///
 /// The measurement is the same wrapped-line estimate the timeline already sizes
 /// its rows with, so the row's height and the drawn window agree about when the
 /// content stopped fitting. It is an estimate: Markdown reflows the source, and
-/// a body estimated just over the cap draws a marker above a window that turns
-/// out to hold all of it.
-fn reasoning_window_for(body: &str, chars_per_line: usize) -> ReasoningWindow {
-    let natural = estimated_markdown_body_height(body, chars_per_line);
-    ReasoningWindow {
-        height: natural.min(REASONING_WINDOW_HEIGHT),
-        fold: natural > REASONING_WINDOW_HEIGHT,
-    }
-}
-
-/// The pixel height [`reasoning_window_for`] costs a timeline row, marker
-/// included, so the estimator and the renderer cannot drift apart.
-fn reasoning_window_row_height(window: ReasoningWindow) -> f32 {
-    window.height
-        + if window.fold {
-            REASONING_WINDOW_FOLD_MARKER_HEIGHT
-        } else {
-            0.0
-        }
+/// a body measured a hair over the cap is clipped a hair sooner than the
+/// estimate predicted. Nothing is drawn to announce the rows that leave the
+/// top — the window is the newest rows, and the reader who wants the rest opens
+/// the row rather than reading a marker.
+fn reasoning_window_height(body: &str, chars_per_line: usize) -> f32 {
+    estimated_markdown_body_height(body, chars_per_line).min(REASONING_WINDOW_HEIGHT)
 }
 
 /// Hold a reasoning body to its window.
@@ -65311,19 +65268,6 @@ fn reasoning_window_body(body: AnyElement, height: f32) -> AnyElement {
         .into_any_element()
 }
 
-/// The marker row that says rows have left the top of the window.
-fn reasoning_window_fold_marker(cx: &App) -> AnyElement {
-    div()
-        .w_full()
-        .min_w_0()
-        .h(px(REASONING_WINDOW_FOLD_MARKER_HEIGHT))
-        .flex_none()
-        .truncate()
-        .text_color(cx.theme().muted_foreground)
-        .child(REASONING_WINDOW_FOLD_MARKER)
-        .into_any_element()
-}
-
 /// The body an expanded reasoning row draws under its first line.
 ///
 /// The two halves travel together: a body is only ever windowed when there is
@@ -65332,8 +65276,9 @@ struct ReasoningBody {
     /// Everything after the first line, already rendered. `None` for a thought
     /// that is a single line.
     remaining: Option<AnyElement>,
-    /// The window the body is held to while the Agent is still producing it.
-    window: Option<ReasoningWindow>,
+    /// The height the body is clipped to while the Agent is still producing it;
+    /// `None` draws every row the thought has.
+    window: Option<f32>,
 }
 
 /// How far an expanded reasoning row has revealed the body under its first
@@ -65375,17 +65320,16 @@ impl ReasoningReveal {
 /// connector. Interaction handlers are attached by the caller.
 ///
 /// The connector is the height bar of the body it stands beside: it stretches
-/// to whatever the remaining content takes, so a body held to
-/// [`ReasoningWindow`] draws a bar exactly as tall as the window the reader is
-/// watching instead of as tall as the whole thought. The whole second row rides
-/// inside `reveal`, so the bar grows and shrinks with the body it belongs to.
+/// to whatever the remaining content takes, so a body held to the reasoning
+/// window draws a bar exactly as tall as the window the reader is watching
+/// instead of as tall as the whole thought. The whole second row rides inside
+/// `reveal`, so the bar grows and shrinks with the body it belongs to.
 fn render_reasoning_first_line_layout(
     icon_color: Hsla,
     first_line: AnyElement,
     remaining: Option<AnyElement>,
-    window: Option<ReasoningWindow>,
+    window: Option<f32>,
     reveal: ReasoningReveal,
-    cx: &App,
 ) -> gpui::Div {
     let connector_color = icon_color.opacity(0.46);
     let first_line_row = h_flex()
@@ -65427,19 +65371,10 @@ fn render_reasoning_first_line_layout(
     if let Some(remaining) = remaining
         && reveal.draws_body()
     {
-        // A windowed body is a column of its own so the fold marker can sit
-        // above the box without being clipped with the rows it announces; a
-        // body with no window stays the single element it has always been.
+        // A windowed body is clipped to its height; a body with no window is
+        // the single element it has always been.
         let body = match window {
-            Some(window) => {
-                let mut column = v_flex().min_w_0().flex_1();
-                if window.fold {
-                    column = column.child(reasoning_window_fold_marker(cx));
-                }
-                column
-                    .child(reasoning_window_body(remaining, window.height))
-                    .into_any_element()
-            }
+            Some(height) => reasoning_window_body(remaining, height),
             None => remaining,
         };
         content = content.child(timeline_disclosure_body(
@@ -65465,15 +65400,22 @@ fn render_reasoning_first_line_layout(
     h_flex().w_full().min_w_0().items_stretch().child(content)
 }
 
+/// The muted line that stands for work still in flight: a shimmering label with
+/// an optional hover hint.
+///
+/// `tooltip` is for a caller whose label is an abbreviation of something the
+/// reader cannot see anywhere else — a pending status, say. A collapsed thought
+/// passes `None`: its preview is the whole shape the row means to show, and the
+/// body behind it belongs to the disclosure rather than to a hover.
 fn render_agent_thinking_indicator(
     turn_id: &str,
     label: &str,
-    tooltip: &str,
+    tooltip: Option<&str>,
     live: bool,
     cx: &App,
 ) -> AnyElement {
     let label: SharedString = truncate_agent_thinking_label(label).into();
-    let tooltip = tooltip.to_string();
+    let tooltip = tooltip.map(|tooltip| tooltip.to_string());
     let element_id = format!("agent-thinking-{turn_id}");
     let animation_id = format!("{element_id}-animation");
     // The kit's `ShimmerText` owns the sweep: the label stays one text node,
@@ -65516,7 +65458,9 @@ fn render_agent_thinking_indicator(
                 .min_w_0()
                 .overflow_hidden()
                 .text_sm()
-                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .when_some(tooltip, |this, tooltip| {
+                    this.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                })
                 .child(body),
         )
         .into_any_element()
@@ -82998,7 +82942,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_thinking_indicator_shimmers_without_scrolling_and_keeps_full_tooltip() {
+    fn agent_thinking_indicator_shimmers_without_scrolling_and_hints_only_when_given_one() {
         let source = include_str!("app.rs");
         let renderer = source
             .split_once("fn render_agent_thinking_indicator(")
@@ -83013,7 +82957,26 @@ mod tests {
         assert!(!renderer.contains("ScrollHandle"));
         assert!(!renderer.contains("set_offset"));
         assert!(!renderer.contains("overflow_x_scroll"));
+        // The hint is opt-in: only a caller that passes one gets a hover.
+        assert!(renderer.contains("tooltip: Option<&str>"));
+        assert!(renderer.contains("when_some(tooltip"));
         assert!(renderer.contains("Tooltip::new(tooltip.clone())"));
+        // A collapsed thought never surfaces its full body on hover: the
+        // preview is the shape, and the row's chevron carries the only hint.
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(body, _)| body)
+            .unwrap_or(source);
+        assert_eq!(
+            production
+                .matches(
+                    "render_agent_thinking_indicator(&row_id, &summary.preview, None, live, cx)"
+                )
+                .count(),
+            2,
+            "both collapsed reasoning surfaces must pass no tooltip"
+        );
+        assert!(!production.contains("summary.tooltip"));
         // The sweep repeats for as long as it is mounted, so it only runs for a
         // turn that is actually in flight. A row's `streaming` flag outlives an
         // interrupted turn, and a shimmer left running there kept every pane
@@ -83023,10 +82986,6 @@ mod tests {
         assert!(renderer.contains(
             "let body: AnyElement = if live && timeline_activity::live_labels_animate() {"
         ));
-        let production = source
-            .split_once("\n#[cfg(test)]\nmod tests {")
-            .map(|(body, _)| body)
-            .unwrap_or(source);
         assert_eq!(
             production
                 .matches("let live = self.borrowed_session_turn_is_live();")
@@ -91285,28 +91244,19 @@ mod tests {
     }
 
     #[test]
-    fn a_reasoning_window_caps_the_body_and_folds_only_what_outgrows_it() {
-        // A thought the window holds: the box is as tall as the thought, and
-        // nothing has left the top.
-        let short = reasoning_window_for("checking the parser", 80);
-        assert!(!short.fold);
-        assert!(short.height < REASONING_WINDOW_HEIGHT);
-        assert_eq!(reasoning_window_row_height(short), short.height);
+    fn a_reasoning_window_caps_the_body_at_its_row_budget() {
+        // A thought the window holds: the body is as tall as the thought.
+        let short = reasoning_window_height("checking the parser", 80);
+        assert!(short < REASONING_WINDOW_HEIGHT);
 
-        // A thought it does not: the box is the cap, and the row pays for the
-        // marker row that says older rows are above it.
+        // A thought it does not: the body is the cap, and nothing above the
+        // window is charged for or drawn.
         let long = "reasoning row ".repeat(200);
-        let windowed = reasoning_window_for(&long, 80);
-        assert!(windowed.fold, "a body past the cap must fold");
-        assert_eq!(windowed.height, REASONING_WINDOW_HEIGHT);
-        assert_eq!(
-            reasoning_window_row_height(windowed),
-            REASONING_WINDOW_HEIGHT + REASONING_WINDOW_FOLD_MARKER_HEIGHT
-        );
+        assert_eq!(reasoning_window_height(&long, 80), REASONING_WINDOW_HEIGHT);
 
-        // The same body measured against a wider pane still folds: the window
-        // is a row count, so it is the wrapped line count that decides.
-        assert!(reasoning_window_for(&long, 400).fold);
+        // The same body measured against a wider pane is still capped: the
+        // window is a row count, so it is the wrapped line count that decides.
+        assert_eq!(reasoning_window_height(&long, 400), REASONING_WINDOW_HEIGHT);
     }
 
     #[test]
@@ -91316,12 +91266,12 @@ mod tests {
         // The policy: the window is for a body that is still arriving, and only
         // while the reader's choice asks for one.
         let policy = source
-            .split_once("    fn reasoning_window(\n")
+            .split_once("    fn reasoning_window(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_live_reasoning("))
             .map(|(body, _)| body)
             .expect("the window policy should remain inspectable");
         assert!(policy.contains("live_reasoning_uses_window(streaming)"));
-        assert!(policy.contains("reasoning_window_for("));
+        assert!(policy.contains("reasoning_window_height("));
 
         let rule = source
             .split_once("    fn live_reasoning_uses_window(")
@@ -102859,7 +102809,6 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first.plain, &second.plain));
         assert!(Arc::ptr_eq(&first.preview, &second.preview));
-        assert!(Arc::ptr_eq(&first.tooltip, &second.tooltip));
         assert_eq!(first.preview.as_ref(), "Inspecting the workspace");
     }
 
@@ -103885,7 +103834,6 @@ mod tests {
                         remaining,
                         None,
                         ReasoningReveal::new("reasoning-probe".into(), true, 1.0),
-                        cx,
                     )),
             )
         }

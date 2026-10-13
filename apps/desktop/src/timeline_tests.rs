@@ -625,12 +625,8 @@ impl Render for ReasoningTimelineProbe {
                                 cx.theme().muted_foreground,
                                 div().h(px(20.0)).child("Thinking").into_any_element(),
                                 Some(div().h(px(280.0)).flex_none().into_any_element()),
-                                windowed_reasoning.then_some(ReasoningWindow {
-                                    height: REASONING_WINDOW_HEIGHT,
-                                    fold: true,
-                                }),
+                                windowed_reasoning.then_some(REASONING_WINDOW_HEIGHT),
                                 ReasoningReveal::new("reasoning".into(), true, 1.0),
-                                cx,
                             )
                         } else {
                             div().w_full().h(px(20.0)).child("Thinking")
@@ -752,7 +748,8 @@ fn reasoning_disclosures_preserve_history_and_never_reverse_bottom_follow(cx: &m
                                 layout_width: Some(500.0),
                                 layout_invalidated: false,
                                 height: if index + 1 == unit_count {
-                                    if windowed_reasoning { 172.0 } else { 300.0 }
+                                    // Header plus the window, or the whole body.
+                                    if windowed_reasoning { 152.0 } else { 300.0 }
                                 } else {
                                     180.0
                                 },
@@ -1221,7 +1218,6 @@ impl Render for ReasoningRevealProbe {
                         self.progress > 0.0,
                         self.progress,
                     ),
-                    cx,
                 )),
         )
     }
