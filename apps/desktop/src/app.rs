@@ -8989,17 +8989,20 @@ impl VibexWorkbench {
     /// the cursor it was asked for, because a backend that predates the cursor
     /// answers with its newest page and prepending that would move the reader
     /// to the wrong end of the conversation.
+    /// Returns whether a read was really issued. The caller spends the view's
+    /// in-flight budget with this answer, because a read that never started must
+    /// not hold a slot that only a completion can release.
     fn load_older_agent_timeline(
         &mut self,
         session_id: VibexSessionId,
         before_sequence: i64,
         generation: u64,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let runtime = self.runtime.clone();
         let backend = self.backend.clone();
         if runtime.is_none() && backend.is_none() {
-            return;
+            return false;
         }
         let request_session_id = session_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -9044,9 +9047,16 @@ impl VibexWorkbench {
             },
         )
         .detach();
+        true
     }
 
     /// Merges an older page into the borrowed view.
+    ///
+    /// The page's slot in the in-flight budget is released whichever way the
+    /// read ended, and on the view that spent it rather than on the one that
+    /// happens to be borrowed now: a page that a session switch superseded has
+    /// no other path to a release, so a view that kept one would believe a read
+    /// is still travelling and never prefetch its history again.
     fn finish_older_timeline_load(
         &mut self,
         session_id: &VibexSessionId,
@@ -9057,6 +9067,10 @@ impl VibexWorkbench {
         if self.selected_session_id.as_ref() != Some(session_id)
             || self.session_generation != generation
         {
+            // The reader has moved on. The page is dropped — its cursor
+            // describes a window this view may already have replaced — but the
+            // slot it spent still belongs to the view it was read for.
+            self.release_older_timeline_in_flight(session_id);
             return;
         }
         self.timeline_older_in_flight = self.timeline_older_in_flight.saturating_sub(1);
@@ -9097,6 +9111,21 @@ impl VibexWorkbench {
         self.rebuild_timeline_sizes();
     }
 
+    /// Releases one older-page slot on the view that asked for the page.
+    ///
+    /// The read can finish while another pane is the borrowed one, so the
+    /// budget is addressed by the session the page was read for and reaches a
+    /// parked view through the store.
+    fn release_older_timeline_in_flight(&mut self, session_id: &VibexSessionId) {
+        if self.view_session_id.as_ref() == Some(session_id) {
+            self.timeline_older_in_flight = self.timeline_older_in_flight.saturating_sub(1);
+            return;
+        }
+        if let Some(view) = self.session_views.get_mut(session_id.as_str()) {
+            view.timeline_older_in_flight = view.timeline_older_in_flight.saturating_sub(1);
+        }
+    }
+
     /// Starts an older-history read when the reader is close enough to the top.
     ///
     /// Waiting for the literal top would show an empty band while the page
@@ -9111,18 +9140,32 @@ impl VibexWorkbench {
             in_flight: self.timeline_older_in_flight,
             following_bottom: self.timeline_follow.following_bottom,
             scrollable: self.timeline_scroll.max_offset().y > px(0.0),
-            loading: self.agent_loading,
+            // A restored view keeps the content it already holds on screen while
+            // the window that replaces it travels, so `agent_loading` is false
+            // there. The load's own buffer is what says a read is still coming:
+            // a page asked for below a window that is about to be replaced is
+            // merged against a cursor the replacement no longer has.
+            loading: self.agent_loading || self.timeline_load_updates.upgrade().is_some(),
         }) {
             return;
         }
         let Some(before_sequence) = self.timeline.items.first().map(|item| item.sequence) else {
             return;
         };
-        let Some(session_id) = self.selected_session_id.clone() else {
+        // Everything above was read off the borrowed view — its cursor, its
+        // history flag, its budget — so the page is read for that view's
+        // session, not for the selected one. A session group renders a pane
+        // whose session is not the selection, and a page asked for below
+        // another session's cursor would spend this pane's budget while
+        // clearing the selected session's claim to its own history.
+        let Some(session_id) = self.timeline.session_id.clone() else {
             return;
         };
+        if !self.load_older_agent_timeline(session_id, before_sequence, self.session_generation, cx)
+        {
+            return;
+        }
         self.timeline_older_in_flight += 1;
-        self.load_older_agent_timeline(session_id, before_sequence, self.session_generation, cx);
     }
 
     /// Asks for the tool detail of every activity the reader has opened.
@@ -9170,9 +9213,11 @@ impl VibexWorkbench {
         };
         let runtime = self.runtime.clone();
         let backend = self.backend.clone();
-        let Some(session_id) = self.selected_session_id.clone() else {
-            return;
-        };
+        // The row was resolved out of the borrowed view, so the session that
+        // owns the read is the one whose timeline carries the item — not the
+        // selection: a session group pane reads detail for its own session
+        // while the selection names the focused one.
+        let session_id = item.session_id.clone();
         let generation = self.session_generation;
         let row_id = row_id.to_string();
         self.timeline_detail_in_flight.insert(row_id.clone());
@@ -9220,10 +9265,17 @@ impl VibexWorkbench {
         generation: u64,
         outcome: vibex_core::VibexResult<vibex_core::TimelineItem>,
     ) {
-        self.timeline_detail_in_flight.remove(row_id);
+        // The slot belongs to the view the row was opened in, which may not be
+        // the borrowed one by the time the answer lands. Releasing it there is
+        // what keeps a pane's budget from being spent twice on one read and
+        // never returned: two of those and that session stops reading detail.
+        self.release_timeline_detail_in_flight(session_id, row_id);
         if self.selected_session_id.as_ref() != Some(session_id)
             || self.session_generation != generation
+            || self.view_session_id.as_ref() != Some(session_id)
         {
+            // A detail that missed its own view is not applied to another one.
+            // Its row is still open, so the next render asks for it again.
             return;
         }
         let item = match outcome {
@@ -9258,6 +9310,21 @@ impl VibexWorkbench {
             self.invalidate_timeline_turn_measurement(&turn_id);
         }
         self.rebuild_timeline_sizes();
+    }
+
+    /// Releases one activity's read slot on the view the row was opened in.
+    ///
+    /// The answer can land while another pane is the borrowed one, so the set is
+    /// addressed by the session the row belongs to and reaches a parked view
+    /// through the store.
+    fn release_timeline_detail_in_flight(&mut self, session_id: &VibexSessionId, row_id: &str) {
+        if self.view_session_id.as_ref() == Some(session_id) {
+            self.timeline_detail_in_flight.remove(row_id);
+            return;
+        }
+        if let Some(view) = self.session_views.get_mut(session_id.as_str()) {
+            view.timeline_detail_in_flight.remove(row_id);
+        }
     }
 
     /// Whether a rendered row's item still has tool detail to read.

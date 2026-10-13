@@ -1718,3 +1718,104 @@ impl Render for MarkdownTableProbe {
         div()
     }
 }
+
+/// A page the reader's switch superseded must not keep its in-flight slot.
+///
+/// The older-history budget is per view and only a completion ever releases it.
+/// A read that finishes while the reader is looking at another session used to
+/// return before touching the count, so the parked view kept the slot for the
+/// rest of its life: once two of those had accumulated it stopped prefetching
+/// its own history at all, which is what a session that is switched to while it
+/// runs looks like from the reader's side.
+#[gpui::test]
+fn a_history_page_a_switch_superseded_returns_its_slot(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let session_a = VibexSessionId::parse("session_layout").unwrap();
+    let session_b = VibexSessionId::parse("session_switch_b").unwrap();
+    let (workbench, cx) = live_tool_timeline(cx, true);
+    let generation = workbench.update(cx, |workbench, _| {
+        workbench.timeline_has_older = true;
+        workbench.timeline_older_in_flight = 1;
+        workbench.ensure_session_view(&session_b);
+        workbench.session_generation
+    });
+    // The reader switches away while the page travels, so its answer arrives
+    // for a view that is no longer the borrowed one.
+    workbench.update(cx, |workbench, _| {
+        workbench.selected_session_id = Some(session_b.clone());
+        let _ = workbench.borrow_session_view(&session_b);
+        workbench.finish_older_timeline_load(
+            &session_a,
+            4,
+            generation,
+            Ok(TimelinePage {
+                session_id: session_a.clone(),
+                items: Vec::new(),
+                start_sequence: None,
+                end_sequence: None,
+                has_older: false,
+                has_newer: false,
+            }),
+        );
+    });
+    let slots = workbench.read_with(cx, |workbench, _| {
+        workbench
+            .session_views
+            .get(session_a.as_str())
+            .map(|view| view.timeline_older_in_flight)
+    });
+    assert_eq!(
+        slots,
+        Some(0),
+        "the parked view must not keep the slot its superseded page spent"
+    );
+}
+
+/// A prefetch that could not start a read keeps the whole budget.
+///
+/// The slot is spent for a page that is really travelling; spending one for a
+/// request that never left would leave the reader unable to ask for history,
+/// because only a completion can give the slot back.
+#[gpui::test]
+fn a_prefetch_that_cannot_start_keeps_the_history_budget(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, cx) = live_tool_timeline(cx, true);
+    let _ = draw_live_timeline_frames(&workbench, cx, 2);
+    // Park the reader at the top of a transcript that claims older history,
+    // with no authority to read it from.
+    workbench.update(cx, |workbench, _| {
+        workbench.timeline_has_older = true;
+        workbench.agent_loading = false;
+        workbench.timeline_follow.set_following_bottom(false);
+        workbench
+            .timeline_scroll
+            .set_offset(point(px(0.0), px(0.0)));
+    });
+    // The precondition is asserted rather than assumed: an empty viewport would
+    // hold the prefetch back on its own and the test would pass without a fix.
+    let ready = workbench.read_with(cx, |workbench, _| {
+        timeline_should_prefetch_older(TimelineOlderPrefetch {
+            distance_to_top: workbench.timeline_distance_to_top(),
+            viewport_height: f32::from(workbench.timeline_scroll.bounds().size.height),
+            has_older: workbench.timeline_has_older,
+            in_flight: workbench.timeline_older_in_flight,
+            following_bottom: workbench.timeline_follow.following_bottom,
+            scrollable: workbench.timeline_scroll.max_offset().y > px(0.0),
+            loading: workbench.agent_loading,
+        })
+    });
+    assert!(
+        ready,
+        "the fixture must be in the prefetching state for this test to mean anything"
+    );
+    workbench.update(cx, |workbench, cx| {
+        for _ in 0..4 {
+            workbench.prefetch_older_timeline_if_needed(cx);
+        }
+    });
+    let slots = workbench.read_with(cx, |workbench, _| workbench.timeline_older_in_flight);
+    assert_eq!(
+        slots, 0,
+        "a read that never started must not spend a slot that only a completion can release"
+    );
+}
