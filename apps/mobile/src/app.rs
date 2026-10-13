@@ -13,12 +13,13 @@ use std::time::{Duration, Instant};
 use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::StreamExt as _;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext as _, ClipboardItem, Context, ElementId, Entity,
-    FocusHandle, Focusable, FontWeight, Hsla, Image, ImageFormat, IntoElement, KeyBinding,
-    ListAlignment, ListOffset, ListState, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _,
-    Pixels, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchPhase,
-    Transformation, UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint,
-    img, list, percentage, point, prelude::*, px, relative, rgb, svg, uniform_list,
+    Animation, AnimationExt as _, App, AppContext as _, ClipboardItem, Context, DispatchPhase,
+    ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, Image, ImageFormat, IntoElement,
+    KeyBinding, ListAlignment, ListOffset, ListState, LongPressEvent, MouseButton, MouseUpEvent,
+    ObjectFit, ParentElement as _, Pixels, Point, Render, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, Styled as _, Task, TouchPhase, Transformation, UniformListScrollHandle,
+    WeakEntity, Window, div, ease_in_out, ease_out_quint, img, list, percentage, point, prelude::*,
+    px, relative, rgb, svg, uniform_list,
 };
 use vibex_app_update::{UpdateSnapshot, UpdateState};
 use vibex_backend::{
@@ -588,13 +589,6 @@ struct SidebarDrag {
     index: usize,
     row: SidebarRow,
     target: Option<SidebarDropTarget>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct SidebarDragCandidate {
-    index: usize,
-    row: SidebarRow,
-    motion: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1348,8 +1342,6 @@ pub struct MobileApp {
     sidebar_sync_busy: bool,
     sidebar_sync_queued: bool,
     sidebar_drag: Option<SidebarDrag>,
-    sidebar_drag_candidate: Option<SidebarDragCandidate>,
-    sidebar_drag_long_press: Option<Task<()>>,
     sidebar_batch_mode: bool,
     /// Whether the batch-delete confirmation sheet is up.
     sidebar_batch_delete_confirmation: bool,
@@ -2341,8 +2333,6 @@ impl MobileApp {
             sidebar_sync_busy: false,
             sidebar_sync_queued: false,
             sidebar_drag: None,
-            sidebar_drag_candidate: None,
-            sidebar_drag_long_press: None,
             sidebar_batch_mode: false,
             sidebar_batch_delete_confirmation: false,
             sidebar_list_frame: Rc::new(Cell::new((0.0, 0.0))),
@@ -6035,25 +6025,31 @@ impl MobileApp {
         cx.notify();
     }
 
-    /// Arms a long-press move for the row body. Trailing buttons remain normal
-    /// tap targets and never start a drag underneath themselves.
-    fn begin_sidebar_drag(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    /// Picks the row body up for a move.
+    ///
+    /// This runs from the long-press recognizer, not from the touch's scroll
+    /// stream: the platform reports a pan only once the finger has already
+    /// travelled past its slop, so a stationary press never reached the old
+    /// arming path at all. By the time this is called the press has already
+    /// been held, so the drag starts immediately. Trailing buttons remain
+    /// normal tap targets and never start a drag underneath themselves.
+    fn begin_sidebar_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         if self.sidebar_search_open || self.sidebar_batch_mode {
             return;
         }
         let (list_top, list_right) = self.sidebar_list_frame.get();
         let rows = self.mobile_sidebar_rows(self.sidebar_search_input.read(cx).value().as_ref());
         let offset_y = f32::from(self.drawer_scroll.0.borrow().base_handle.offset().y);
-        let position = row_at_position(
-            f32::from(event.position.y),
+        let row_position = row_at_position(
+            f32::from(position.y),
             list_top,
             offset_y,
             theme::SIDEBAR_ROW_HEIGHT,
         );
-        if position < 0.0 {
+        if row_position < 0.0 {
             return;
         }
-        let index = position.floor() as usize;
+        let index = row_position.floor() as usize;
         let Some(row) = rows.get(index).cloned() else {
             return;
         };
@@ -6070,55 +6066,59 @@ impl MobileApp {
             return;
         }
         if press_is_on_trailing_actions(
-            f32::from(event.position.x),
+            f32::from(position.x),
             list_right,
             self.sidebar_drag_action_width(&row),
         ) {
             return;
         }
-        self.sidebar_drag_candidate = Some(SidebarDragCandidate {
+        self.sidebar_drag = Some(SidebarDrag {
             index,
             row,
-            motion: 0.0,
+            target: None,
         });
-        let entity = cx.weak_entity();
-        self.sidebar_drag_long_press = Some(cx.spawn(async move |_, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(380))
-                .await;
-            let _ = entity.update(cx, |this, cx| {
-                if let Some(candidate) = this.sidebar_drag_candidate.take() {
-                    this.sidebar_drag = Some(SidebarDrag {
-                        index: candidate.index,
-                        row: candidate.row,
-                        target: None,
-                    });
-                    cx.notify();
-                }
-            });
-        }));
+        cx.notify();
     }
 
-    fn advance_sidebar_drag(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
-        let Some(drag) = self.sidebar_drag.as_ref() else {
-            if let Some(candidate) = self.sidebar_drag_candidate.as_mut()
-                && let ScrollDelta::Pixels(delta) = event.delta
-            {
-                candidate.motion += f32::from(delta.x).hypot(f32::from(delta.y));
-                if candidate.motion > 10.0 {
-                    self.sidebar_drag_candidate = None;
-                    self.sidebar_drag_long_press = None;
+    /// A long press picks a row up; the recognizer keeps reporting that same
+    /// touch as it travels, which is the drag that moves the row. A plain pan
+    /// never reaches here, so scrolling the list can never start a move.
+    fn on_sidebar_row_long_press(&mut self, event: &LongPressEvent, cx: &mut Context<Self>) {
+        match event.phase {
+            TouchPhase::Started => self.begin_sidebar_drag(event.position, cx),
+            TouchPhase::Moved => {
+                if self.sidebar_drag.is_some() {
+                    self.advance_sidebar_drag(event.position, cx);
+                    cx.stop_propagation();
                 }
             }
+            TouchPhase::Ended => {
+                if self.sidebar_drag.is_some() {
+                    self.finish_sidebar_drag(false, cx);
+                    cx.stop_propagation();
+                }
+            }
+            TouchPhase::Cancelled => {
+                if self.sidebar_drag.is_some() {
+                    self.finish_sidebar_drag(true, cx);
+                    cx.stop_propagation();
+                }
+            }
+        }
+    }
+
+    fn advance_sidebar_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(drag) = self.sidebar_drag.as_ref() else {
             return;
         };
         let index = drag.index;
         let rows = self.mobile_sidebar_rows(self.sidebar_search_input.read(cx).value().as_ref());
         let (list_top, _) = self.sidebar_list_frame.get();
         let offset_y = f32::from(self.drawer_scroll.0.borrow().base_handle.offset().y);
-        let pointer_y = f32::from(event.position.y);
-        let position = row_at_position(pointer_y, list_top, offset_y, theme::SIDEBAR_ROW_HEIGHT);
-        let mut target = drop_target(&rows, index, position);
+        let pointer_y = f32::from(position.y);
+        let row_position =
+            row_at_position(pointer_y, list_top, offset_y, theme::SIDEBAR_ROW_HEIGHT);
+        let mut target = drop_target(&rows, index, row_position);
         if let Some(candidate) = target.as_ref() {
             let candidate_row = &rows[candidate.index];
             if candidate_row.kind == SidebarRowKind::EmptyWorkspace {
@@ -6254,11 +6254,8 @@ impl MobileApp {
 
     fn finish_sidebar_drag(&mut self, cancelled: bool, cx: &mut Context<Self>) {
         let Some(drag) = self.sidebar_drag.take() else {
-            self.sidebar_drag_candidate = None;
-            self.sidebar_drag_long_press = None;
             return;
         };
-        self.sidebar_drag_long_press = None;
         cx.notify();
         let Some(target) = drag.target.filter(|_| !cancelled) else {
             return;
@@ -6413,8 +6410,6 @@ impl MobileApp {
         self.sidebar_sync_busy = false;
         self.sidebar_sync_queued = false;
         self.sidebar_drag = None;
-        self.sidebar_drag_candidate = None;
-        self.sidebar_drag_long_press = None;
         self.sidebar_batch_mode = false;
         self.sidebar_batch_delete_confirmation = false;
         self.sidebar_row_menu = None;
@@ -8930,40 +8925,6 @@ impl MobileApp {
         // the swipe just revealed.
         self.drawer_fling_owned = was_dragging;
         self.start_drawer_snap(target, Some(window), cx);
-    }
-
-    /// Touch pans over the row list. Holding a row body arms movement; ordinary
-    /// pans remain list scrolling and never become horizontal page swipes.
-    fn sidebar_list_pan(
-        &mut self,
-        event: &ScrollWheelEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event.touch_phase {
-            TouchPhase::Started => self.begin_sidebar_drag(event, cx),
-            TouchPhase::Moved => {
-                if self.sidebar_drag.is_some() {
-                    self.advance_sidebar_drag(event, cx);
-                    cx.stop_propagation();
-                    return;
-                }
-                if self.sidebar_drag_candidate.is_some() {
-                    self.advance_sidebar_drag(event, cx);
-                }
-            }
-            TouchPhase::Ended | TouchPhase::Cancelled => {
-                if self.sidebar_drag.is_some() {
-                    let cancelled = event.touch_phase == TouchPhase::Cancelled;
-                    self.finish_sidebar_drag(cancelled, cx);
-                    cx.stop_propagation();
-                    return;
-                }
-                self.sidebar_drag_candidate = None;
-                self.sidebar_drag_long_press = None;
-            }
-        }
-        cx.stop_propagation();
     }
 
     /// The GPUI scroll element updates its handle before bubble listeners run.
@@ -17192,7 +17153,8 @@ impl MobileApp {
                             // Rows are a uniform height, so recording the list
                             // frame is enough to resolve a touch to a row
                             // without threading per-row bounds through paint.
-                            .child(
+                            .child({
+                                let long_press_entity = cx.weak_entity();
                                 gpui::canvas(
                                     move |bounds, _, _| {
                                         list_frame.set((
@@ -17200,11 +17162,35 @@ impl MobileApp {
                                             f32::from(bounds.origin.x + bounds.size.width),
                                         ));
                                     },
-                                    |_, _, _, _| (),
+                                    move |bounds, _, window, _| {
+                                        // A row is picked up by a long press,
+                                        // and the platform keeps reporting that
+                                        // same touch as it travels. Registering
+                                        // the listener from the list's own paint
+                                        // pass is what makes the gesture the
+                                        // list's to claim: a press anywhere else
+                                        // is never a row move.
+                                        window.on_mouse_event({
+                                            let entity = long_press_entity.clone();
+                                            move |event: &LongPressEvent,
+                                                  phase: DispatchPhase,
+                                                  _: &mut Window,
+                                                  cx: &mut gpui::App| {
+                                                if phase != DispatchPhase::Bubble
+                                                    || !bounds.contains(&event.position)
+                                                {
+                                                    return;
+                                                }
+                                                let _ = entity.update(cx, |this, cx| {
+                                                    this.on_sidebar_row_long_press(event, cx)
+                                                });
+                                            }
+                                        });
+                                    },
                                 )
                                 .absolute()
-                                .inset_0(),
-                            )
+                                .inset_0()
+                            })
                             .child(
                                 uniform_list(
                                     "drawer-project-sessions",
@@ -17235,7 +17221,7 @@ impl MobileApp {
                                     restrict_scroll_to_axis: Some(true),
                                     ..Default::default()
                                 })
-                                .on_scroll_wheel(cx.listener(Self::sidebar_list_pan))
+                                .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
                                 .size_full()
                                 .py(px(2.0)),
                             ),
@@ -25675,6 +25661,54 @@ mod tests {
         assert!(hook.contains(".context_menu("));
         assert!(hook.contains("menu.open(cx)"));
         assert!(source.contains("self.selection_menu.clone()"));
+    }
+
+    /// A row is picked up by a long press, and the platform reports a touch as
+    /// a pan only once the finger has travelled past its slop — so arming from
+    /// the scroll stream could never fire for the stationary press the gesture
+    /// is. The list has to listen for the long press itself, and the drag has
+    /// to be driven by that same touch as it moves.
+    #[test]
+    fn the_sidebar_drag_is_armed_by_a_long_press() {
+        let source = include_str!("app.rs");
+        let drawer = source
+            .split_once("fn render_drawer")
+            .map(|(_, tail)| tail)
+            .expect("the drawer should still be one renderer");
+        let listener = drawer
+            .split_once("move |event: &LongPressEvent")
+            .map(|(_, tail)| tail)
+            .expect("the drawer's row list should listen for a long press");
+
+        assert!(listener.contains("bounds.contains(&event.position)"));
+        assert!(listener.contains("on_sidebar_row_long_press"));
+        assert!(
+            drawer.contains(".on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))"),
+            "a pan over the list is a scroll, never the start of a row move"
+        );
+
+        // Both drag steps take the touch position the long press reports: a
+        // scroll event carries no position once the recognizer has claimed the
+        // gesture as a press.
+        for function in ["fn begin_sidebar_drag", "fn advance_sidebar_drag"] {
+            let body = source
+                .split_once(function)
+                .map(|(_, tail)| tail.split_once("\n    fn ").map_or(tail, |(body, _)| body))
+                .unwrap_or_else(|| panic!("{function} should stay inspectable"));
+            assert!(
+                body.contains("position: Point<Pixels>"),
+                "{function} should take the long press's position"
+            );
+        }
+
+        let handler = source
+            .split_once("fn on_sidebar_row_long_press")
+            .map(|(_, tail)| tail.split_once("\n    fn ").map_or(tail, |(body, _)| body))
+            .expect("the long-press handler should stay inspectable");
+        assert!(handler.contains("self.begin_sidebar_drag(event.position, cx)"));
+        assert!(handler.contains("self.advance_sidebar_drag(event.position, cx)"));
+        assert!(handler.contains("self.finish_sidebar_drag(false, cx)"));
+        assert!(handler.contains("self.finish_sidebar_drag(true, cx)"));
     }
 
     fn host_bundle(server_id: &str, display_name: &str) -> MobileCredentialBundle {
