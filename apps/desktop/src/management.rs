@@ -243,6 +243,39 @@ fn provider_header_variable_label(
     }
 }
 
+/// The part of a request address that identifies the OpenCode Zen gateway.
+///
+/// Zen answers behind the same host as the rest of OpenCode's site, so the path
+/// — not the host — is what marks it.
+const OPENCODE_ZEN_ENDPOINT_MARKER: &str = "opencode.ai/zen/go";
+
+/// The header that names the serving session to the OpenCode Zen gateway.
+const OPENCODE_ZEN_SESSION_HEADER: &str = "x-opencode-session";
+
+/// Whether one request address names the OpenCode Zen gateway.
+///
+/// Matched case-insensitively and by containment, so a pasted
+/// `https://opencode.ai/zen/go/v1` counts and a host spelled in capitals is
+/// still recognised.
+fn request_url_names_opencode_zen(url: &str) -> bool {
+    url.trim()
+        .to_ascii_lowercase()
+        .contains(OPENCODE_ZEN_ENDPOINT_MARKER)
+}
+
+/// What the editor tells the user when it enables the Zen session header.
+///
+/// The message names the header: the row it added sits in a section the user may
+/// never have opened, so the hint has to say what changed.
+fn opencode_zen_session_header_notice() -> String {
+    management_locale_text(
+        "This address is OpenCode Zen: the x-opencode-session request header was enabled for you.",
+        "该地址是 OpenCode Zen，已自动为你启用 x-opencode-session 请求头。",
+        "該位址是 OpenCode Zen，已自動為你啟用 x-opencode-session 請求標頭。",
+    )
+    .to_string()
+}
+
 /// Headers the editor offers as one-click additions.
 fn provider_common_headers() -> Vec<(
     &'static str,
@@ -250,7 +283,7 @@ fn provider_common_headers() -> Vec<(
 )> {
     vec![
         (
-            "x-opencode-session",
+            OPENCODE_ZEN_SESSION_HEADER,
             Some(vibex_core::ModelProviderHeaderVariable::SessionId),
         ),
         ("User-Agent", None),
@@ -1114,6 +1147,13 @@ pub struct ManagementCenter {
     profile_headers_import: Entity<TextareaState>,
     /// The headers editor's problem, rendered inside the section.
     profile_headers_error: Option<String>,
+    /// Whether the OpenCode Zen session header was already offered to the
+    /// Profile the editor is holding.
+    ///
+    /// The address field is read on every keystroke, so this is what keeps one
+    /// detection from adding the row again — including after the user deleted
+    /// the row they did not ask for.
+    profile_opencode_session_header_offered: bool,
     profile_provider_options: vibex_core::ProviderOptions,
     selected_acp_profile_id: Option<String>,
     acp_config_draft: Option<vibex_core::AcpProviderConfig>,
@@ -1534,14 +1574,19 @@ impl ManagementCenter {
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
-            cx.subscribe(&profile_base_url, |this, _, event: &InputEvent, cx| {
-                if !management_input_changed(event) {
-                    return;
-                }
-                this.projection_editor.mark_draft_changed();
-                this.navigation.mark_dirty(ManagementSection::Agents, true);
-                cx.notify();
-            }),
+            cx.subscribe_in(
+                &profile_base_url,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if !management_input_changed(event) {
+                        return;
+                    }
+                    this.projection_editor.mark_draft_changed();
+                    this.navigation.mark_dirty(ManagementSection::Agents, true);
+                    this.sync_opencode_session_header(window, cx);
+                    cx.notify();
+                },
+            ),
             // Enter in the Model-id field adds the row it names. Enter is also
             // the Dialog's own confirm, so this field answers it and stops it
             // there instead of letting the keystroke reach Save.
@@ -1903,6 +1948,7 @@ impl ManagementCenter {
             profile_headers_import_open: false,
             profile_headers_import,
             profile_headers_error: None,
+            profile_opencode_session_header_offered: false,
             profile_provider_options: vibex_core::ProviderOptions::empty(),
             selected_acp_profile_id: None,
             acp_config_draft: None,
@@ -4800,15 +4846,19 @@ impl ManagementCenter {
                     .default_value(value)
                     .placeholder("https://provider.example")
             });
-            self._subscriptions
-                .push(cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+            self._subscriptions.push(cx.subscribe_in(
+                &input,
+                window,
+                |this, _, event, window, cx| {
                     if !management_input_changed(event) {
                         return;
                     }
                     this.projection_editor.mark_draft_changed();
                     this.navigation.mark_dirty(ManagementSection::Agents, true);
+                    this.sync_opencode_session_header(window, cx);
                     cx.notify();
-                }));
+                },
+            ));
             self.profile_protocol_base_urls.push((wire_api, input));
         }
     }
@@ -4828,11 +4878,17 @@ impl ManagementCenter {
     }
 
     /// Empties the request-header editor.
+    ///
+    /// Forgetting the OpenCode Zen answer here is what gives the next Profile
+    /// its own one: every path that opens an editor replaces the rows through
+    /// this call, so a Profile that already carries the header is recognised as
+    /// such instead of being offered it again.
     fn clear_profile_headers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.profile_headers.clear();
         self.profile_headers_open = false;
         self.profile_headers_import_open = false;
         self.profile_headers_error = None;
+        self.profile_opencode_session_header_offered = false;
         self.profile_headers_import
             .update(cx, |state, cx| state.set_value("", window, cx));
     }
@@ -4937,6 +4993,85 @@ impl ManagementCenter {
         self.projection_editor.mark_draft_changed();
         self.navigation.mark_dirty(ManagementSection::Agents, true);
         cx.notify();
+    }
+
+    /// Enables the request header OpenCode Zen needs as soon as the address the
+    /// user typed names its gateway, and says what it did.
+    ///
+    /// Zen rejects a request that does not carry `x-opencode-session` with a
+    /// failure that names nothing the user configured, and the address field is
+    /// the only thing in the editor that says a Provider talks to Zen — the
+    /// Agent does not decide it, because the same Agent can be pointed at any
+    /// gateway. The editor therefore adds the header the address implies rather
+    /// than leaving the user to find the requirement in Zen's documentation.
+    ///
+    /// It only ever adds, and only once per editing session: a row the user
+    /// deleted is not restored by their next keystroke in the address field, and
+    /// a Profile that already declares the header is never given a second row.
+    ///
+    /// Callers record the draft change themselves — the address edit that
+    /// triggered this is the change, and the row is part of it.
+    fn sync_opencode_session_header(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.profile_opencode_session_header_offered {
+            return;
+        }
+        // An Agent without a header map stores a row no request ever carries, so
+        // the section, and this with it, stays out of that editor.
+        if !self.projection_editor.supports_request_headers() {
+            return;
+        }
+        if !self.draft_request_url_names_opencode_zen(cx) {
+            return;
+        }
+        // The answer is recorded before the row is added, so a detection that
+        // finds the header already configured is answered once and for all.
+        self.profile_opencode_session_header_offered = true;
+        if self.profile_declares_opencode_session_header(cx) {
+            return;
+        }
+        self.push_profile_header(
+            OPENCODE_ZEN_SESSION_HEADER.to_string(),
+            String::new(),
+            Some(vibex_core::ModelProviderHeaderVariable::SessionId),
+            window,
+            cx,
+        );
+        // The row is only useful if the user can see it, so the section opens
+        // itself and the hint says where the row came from.
+        self.profile_headers_open = true;
+        self.profile_headers_error = None;
+        self.notice = Some(opencode_zen_session_header_notice());
+        cx.notify();
+    }
+
+    /// Whether the request addresses the draft holds name the OpenCode Zen
+    /// gateway.
+    ///
+    /// The per-protocol overrides count: they are the same Provider's request
+    /// addresses, and the header map they would need is the one this Provider
+    /// owns.
+    fn draft_request_url_names_opencode_zen(&self, cx: &Context<Self>) -> bool {
+        request_url_names_opencode_zen(&self.profile_base_url.read(cx).value())
+            || self
+                .profile_protocol_base_urls
+                .iter()
+                .any(|(_, input)| request_url_names_opencode_zen(&input.read(cx).value()))
+    }
+
+    /// Whether the header editor already declares the Zen session header.
+    ///
+    /// The name is compared as an HTTP field name is, case-insensitively, so a
+    /// row the user spelled `X-OpenCode-Session` still counts as the same header
+    /// and is left exactly as the user wrote it.
+    fn profile_declares_opencode_session_header(&self, cx: &Context<Self>) -> bool {
+        self.profile_headers.iter().any(|draft| {
+            draft
+                .name
+                .read(cx)
+                .value()
+                .trim()
+                .eq_ignore_ascii_case(OPENCODE_ZEN_SESSION_HEADER)
+        })
     }
 
     /// Reads the editor's rows into the shape the override persists.
@@ -25742,6 +25877,156 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn opencode_zen_request_urls_are_recognised_by_their_gateway_path() {
+        for url in [
+            "https://opencode.ai/zen/go",
+            "https://opencode.ai/zen/go/v1",
+            "  https://OpenCode.ai/Zen/Go/v1  ",
+        ] {
+            assert!(request_url_names_opencode_zen(url), "{url}");
+        }
+        // Zen sits beside the rest of OpenCode's endpoints, so only its own path
+        // counts: a neighbouring address is a different gateway with its own
+        // rules.
+        for url in [
+            "",
+            "https://opencode.ai/zen/v1",
+            "https://opencode.ai/zen",
+            "https://api.example.com/v1",
+        ] {
+            assert!(!request_url_names_opencode_zen(url), "{url}");
+        }
+    }
+
+    /// One Provider capability whose projection owns a request-header map, which
+    /// is what puts the header section — and the OpenCode Zen rule with it — in
+    /// the editor at all.
+    fn projection_capability_with_request_headers() -> vibex_core::AgentProviderProjectionCapability
+    {
+        let mut capability = projection_capability_with_models();
+        capability.provider_control = vibex_core::AgentProviderControl::ManagedConfigOverlay {
+            strategy: vibex_core::ConfigOverlayStrategy::OpenCodeInlineProvider,
+        };
+        capability
+    }
+
+    /// Types one request address into the draft the Provider editor holds.
+    ///
+    /// The value is written through the field's own state and then announced as
+    /// a change — the pair a keystroke produces. `set_value` alone is silent by
+    /// design, so loading a saved Profile is never mistaken for typing. The
+    /// answer is left unpumped: a caller reads the draft, and the next frame is
+    /// what presents it.
+    fn type_profile_request_url(
+        center: &Entity<ManagementCenter>,
+        handle: gpui::AnyWindowHandle,
+        url: &str,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center
+                    .profile_base_url
+                    .update(cx, |state, cx| state.set_value(url, window, cx));
+            });
+        });
+        center
+            .read_with(cx, |center, _| center.profile_base_url.clone())
+            .update(cx, |_, cx| cx.emit(InputEvent::Change));
+    }
+
+    /// Draws one frame of the management window and lets it settle.
+    ///
+    /// The editor's notice is taken by the center's next render and pushed onto
+    /// the hint layer from there, so the frame is what turns the message the
+    /// editor queued into the card the user reads.
+    fn present_management_frame(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    /// An OpenCode Zen address is the only thing in the editor that says the
+    /// gateway's session header is mandatory, so the row is added, shown, and
+    /// announced — once, and never for an address that does not name that
+    /// gateway.
+    #[gpui::test]
+    fn opencode_zen_request_url_enables_the_session_header_once(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(hint_layer::init);
+        // The center's window is a `Root`, because the announcement it presents
+        // is a hint on the layer that root owns — the same layer that keeps the
+        // message readable over the editor's own dialog.
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        center.update(cx, |center, _| {
+            center.selected_agent_id = Some("opencode".to_string());
+            center
+                .projection_editor
+                .replace_capability(projection_capability_with_request_headers());
+        });
+        let handle = cx.windows().pop().expect("test window");
+
+        // Another gateway's address leaves the header editor alone.
+        type_profile_request_url(&center, handle, "https://api.example.com/v1", cx);
+        center.read_with(cx, |center, _| {
+            assert!(center.profile_headers.is_empty());
+            assert!(center.notice.is_none());
+        });
+
+        // The Zen address adds the header the gateway requires, filled from the
+        // serving session, and opens the section that shows it.
+        type_profile_request_url(&center, handle, "https://opencode.ai/zen/go/v1", cx);
+        center.read_with(cx, |center, cx| {
+            assert_eq!(center.profile_headers.len(), 1);
+            assert_eq!(
+                center.profile_headers[0].name.read(cx).value().trim(),
+                OPENCODE_ZEN_SESSION_HEADER
+            );
+            assert_eq!(
+                center.profile_headers[0].variable,
+                Some(vibex_core::ModelProviderHeaderVariable::SessionId)
+            );
+            assert!(center.profile_headers_open);
+        });
+
+        // The prompt names the header it enabled, and reaches the user as one
+        // card on the layer above the editor's own dialog.
+        assert!(
+            opencode_zen_session_header_notice().contains(OPENCODE_ZEN_SESSION_HEADER),
+            "the message says which header was enabled"
+        );
+        present_management_frame(cx);
+        cx.update(|window, cx| {
+            let hints = hint_layer::list(window, cx).expect("the window carries a hint layer");
+            assert_eq!(hints.read(cx).hints().len(), 1);
+        });
+
+        // A row the user deletes is not restored by the next keystroke: the
+        // address still names Zen, so only the remembered answer prevents it —
+        // and the gateway is not announced a second time.
+        center.update(cx, |center, cx| center.remove_profile_header(0, cx));
+        type_profile_request_url(&center, handle, "https://opencode.ai/zen/go/v2", cx);
+        present_management_frame(cx);
+        center.read_with(cx, |center, _| assert!(center.profile_headers.is_empty()));
+        cx.update(|window, cx| {
+            let hints = hint_layer::list(window, cx).expect("the window carries a hint layer");
+            assert_eq!(
+                hints.read(cx).hints().len(),
+                1,
+                "a gateway already answered for is not announced twice"
+            );
+        });
     }
 
     #[test]
