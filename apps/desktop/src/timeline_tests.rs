@@ -169,10 +169,10 @@ fn tool_progress_preserves_the_measured_timeline_extent(cx: &mut TestAppContext)
             let before = *frames.last().unwrap();
             assert!(frames[12..].iter().all(|frame| *frame == before));
             workbench.read_with(cx, |workbench, _| {
-                assert_eq!(
-                    !workbench.timeline_process_unit_heights.is_empty(),
-                    windowed
-                );
+                // A unit that is not retained yet reports the height the flow
+                // gave it, so the table is filled whether the section lays out in
+                // flow or through the windowed run.
+                assert!(!workbench.timeline_process_unit_heights.is_empty());
             });
             let end = workbench.read_with(cx, |workbench, _| {
                 workbench.timeline.authoritative_end_sequence.unwrap()
@@ -677,6 +677,7 @@ impl Render for ReasoningTimelineProbe {
                         pinned_unit: None,
                         session_id: None,
                         entity: WeakEntity::new_invalid(),
+                        record_measurements: true,
                         build_unit: Box::new(build_unit),
                     }
                     .into_any_element()
@@ -1080,6 +1081,7 @@ impl Render for ProcessRunProbe {
                 pinned_unit: None,
                 session_id: None,
                 entity: WeakEntity::new_invalid(),
+                record_measurements: true,
                 build_unit: Box::new(move |index, _, _| {
                     let bounds = bounds.clone();
                     div()
@@ -1909,5 +1911,198 @@ fn an_older_page_moves_the_views_leading_end(cx: &mut TestAppContext) {
     assert!(
         !workbench.read_with(cx, |workbench, _| workbench.timeline_starts_mid_turn),
         "a page that opens on a boundary finishes the turn above it"
+    );
+}
+
+/// A finished tool call for `tool`, which is what a unit can be retained from.
+fn settled_tool(sequence: i64, tool: usize) -> TimelineItem {
+    live_timeline_item(
+        sequence,
+        TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+            tool_call_id: format!("tool-{tool}"),
+            tool_name: "exec_command".into(),
+            status: vibex_core::ToolCallStatus::Completed,
+            summary: "Ran command".into(),
+            input_summary: Some("cargo check --locked".into()),
+            output_summary: Some("Checking workspace".into()),
+            raw_extension: None,
+        }),
+    )
+}
+
+/// Settles every tool the live fixture started and adds a line of prose followed
+/// by one more tool call, so the timeline holds units whose content has stopped
+/// moving.
+///
+/// The prose is not final and is followed by a tool call on purpose: a final
+/// answer ends the turn and is painted as its conclusion, outside the process
+/// section, while this one stays a settled process row — a row *inside* a unit
+/// that keeps a Markdown surface, which is what the retention test needs.
+fn settle_live_tools(workbench: &Entity<VibexWorkbench>, cx: &mut VisualTestContext) {
+    let end = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline.authoritative_end_sequence.unwrap()
+    });
+    let mut sequence = end;
+    for tool in 0..24 {
+        sequence += 1;
+        apply_live_timeline_item(workbench, cx, settled_tool(sequence, tool));
+    }
+    sequence += 1;
+    apply_live_timeline_item(
+        workbench,
+        cx,
+        live_timeline_item(
+            sequence,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: "The workspace checks out.".into(),
+                is_final: false,
+            }),
+        ),
+    );
+    sequence += 1;
+    apply_live_timeline_item(workbench, cx, settled_tool(sequence, 99));
+}
+
+/// Draws frames the way the platform does when nothing has asked for a full
+/// refresh, which is the state a retained element tree is reused in.
+///
+/// `Window::refresh` deliberately ignores every cached subtree, so a frame that
+/// wants to see the reuse has to be drawn without it.
+fn draw_plain_timeline_frames(cx: &mut VisualTestContext, count: usize) {
+    for _ in 0..count {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+}
+
+/// A settled unit's element tree survives a frame that does not touch it, and is
+/// rebuilt the moment something it paints does move.
+///
+/// The timeline rebuilds its visible turns on every streamed chunk, and an
+/// expanded tool group made each of those frames lay its rows out again:
+/// prepaint measured 12 to 42ms a frame against 4 to 6ms collapsed, with element
+/// construction flat at ~1ms. A settled unit that owns its tree is therefore
+/// only rendered again when its render key moves — and a unit that is still
+/// streaming is never retained at all, because the cached box is the height the
+/// table held when the view was mounted.
+#[gpui::test]
+fn retained_process_units_render_only_when_their_key_moves(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, cx) = live_tool_timeline(cx, false);
+
+    // While the tools are still running nothing may be retained.
+    draw_live_timeline_frames(&workbench, cx, 4);
+    assert!(
+        workbench.read_with(cx, |workbench, _| workbench.timeline_unit_views.is_empty()),
+        "a streaming unit must stay inline"
+    );
+
+    settle_live_tools(&workbench, cx);
+    draw_live_timeline_frames(&workbench, cx, 6);
+    // Strong handles for the length of the test, so that a frame which stops
+    // mounting a unit cannot be mistaken for one that did not render it.
+    let units: Vec<Entity<timeline_unit_view::TimelineUnitView>> =
+        workbench.read_with(cx, |workbench, _| {
+            workbench
+                .timeline_unit_views
+                .values()
+                .filter_map(|view| view.upgrade())
+                .collect()
+        });
+    assert!(
+        !units.is_empty(),
+        "a settled unit should be retained once it has been measured"
+    );
+    let renders = |cx: &VisualTestContext| {
+        units
+            .iter()
+            .map(|unit| unit.read_with(cx, |view, _| view.render_count()))
+            .sum::<usize>()
+    };
+    let before = renders(cx);
+    assert!(before > 0);
+
+    draw_plain_timeline_frames(cx, 4);
+    assert_eq!(
+        renders(cx),
+        before,
+        "a frame that changes nothing must not render a retained unit again"
+    );
+
+    // A workbench notify on its own is what every streamed chunk produces, and
+    // it must not rebuild the retained trees either.
+    workbench.update(cx, |_, cx| cx.notify());
+    draw_plain_timeline_frames(cx, 2);
+    assert_eq!(
+        renders(cx),
+        before,
+        "a workbench notify on its own must not render a retained unit again"
+    );
+
+    // A disclosure is the other half of the contract: its click handler only
+    // inserts into an expansion map, so the key has to carry that state or the
+    // clicked row keeps painting its previous shape while hover, which notifies
+    // the element's own view, still responds.
+    let unit_id = workbench.read_with(cx, |workbench, _| {
+        workbench
+            .timeline_unit_views
+            .keys()
+            .next()
+            .cloned()
+            .expect("a retained unit")
+    });
+    workbench.update(cx, |workbench, cx| {
+        workbench
+            .timeline_command_expansion
+            .insert(unit_id.clone(), true);
+        cx.notify();
+    });
+    draw_plain_timeline_frames(cx, 2);
+    assert!(
+        renders(cx) > before,
+        "toggling a disclosure must render the retained unit again"
+    );
+
+    // A Markdown parse lands after the frame that asked for it, and the parse is
+    // what the unit paints, so the view has to hear about it. The fixture's
+    // Markdown rows are painted beside the process section rather than inside a
+    // unit, so the subscription a unit makes for its own rows is exercised
+    // directly here: that a surface's change reaches the view is the whole
+    // contract.
+    let (surface_unit, surface_id, surface) = workbench.read_with(cx, |workbench, _| {
+        let (id, entry) = workbench
+            .markdown_text_states
+            .iter()
+            .next()
+            .expect("the live turn keeps a Markdown surface");
+        let unit = workbench
+            .timeline_unit_views
+            .values()
+            .filter_map(|view| view.upgrade())
+            .next()
+            .expect("a settled unit was retained");
+        (unit, id.clone(), entry.state.clone())
+    });
+    surface_unit.update(cx, |view, cx| {
+        view.observe_markdown_surfaces(&BTreeSet::from([surface_id]), cx);
+    });
+    let before_parse = surface_unit.read_with(cx, |view, _| view.render_count());
+    surface.update(cx, |_, cx| cx.notify());
+    draw_plain_timeline_frames(cx, 2);
+    assert!(
+        surface_unit.read_with(cx, |view, _| view.render_count()) > before_parse,
+        "a Markdown surface that changed must render its unit again"
+    );
+
+    let after_parse = renders(cx);
+    let end = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline.authoritative_end_sequence.unwrap()
+    });
+    apply_live_timeline_item(&workbench, cx, settled_tool(end + 1, 100));
+    draw_live_timeline_frames(&workbench, cx, 2);
+    assert!(
+        renders(cx) > after_parse,
+        "a new tool item must render the unit that holds it"
     );
 }
