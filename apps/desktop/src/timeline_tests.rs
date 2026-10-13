@@ -169,10 +169,10 @@ fn tool_progress_preserves_the_measured_timeline_extent(cx: &mut TestAppContext)
             let before = *frames.last().unwrap();
             assert!(frames[12..].iter().all(|frame| *frame == before));
             workbench.read_with(cx, |workbench, _| {
-                // A unit that is not retained yet reports the height the flow
-                // gave it, so the table is filled whether the section lays out in
-                // flow or through the windowed run.
-                assert!(!workbench.timeline_process_unit_heights.is_empty());
+                assert_eq!(
+                    !workbench.timeline_process_unit_heights.is_empty(),
+                    windowed
+                );
             });
             let end = workbench.read_with(cx, |workbench, _| {
                 workbench.timeline.authoritative_end_sequence.unwrap()
@@ -677,7 +677,6 @@ impl Render for ReasoningTimelineProbe {
                         pinned_unit: None,
                         session_id: None,
                         entity: WeakEntity::new_invalid(),
-                        record_measurements: true,
                         build_unit: Box::new(build_unit),
                     }
                     .into_any_element()
@@ -1081,7 +1080,6 @@ impl Render for ProcessRunProbe {
                 pinned_unit: None,
                 session_id: None,
                 entity: WeakEntity::new_invalid(),
-                record_measurements: true,
                 build_unit: Box::new(move |index, _, _| {
                     let bounds = bounds.clone();
                     div()
@@ -1914,55 +1912,6 @@ fn an_older_page_moves_the_views_leading_end(cx: &mut TestAppContext) {
     );
 }
 
-/// A finished tool call for `tool`, which is what a unit can be retained from.
-fn settled_tool(sequence: i64, tool: usize) -> TimelineItem {
-    live_timeline_item(
-        sequence,
-        TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
-            tool_call_id: format!("tool-{tool}"),
-            tool_name: "exec_command".into(),
-            status: vibex_core::ToolCallStatus::Completed,
-            summary: "Ran command".into(),
-            input_summary: Some("cargo check --locked".into()),
-            output_summary: Some("Checking workspace".into()),
-            raw_extension: None,
-        }),
-    )
-}
-
-/// Settles every tool the live fixture started and adds a line of prose followed
-/// by one more tool call, so the timeline holds units whose content has stopped
-/// moving.
-///
-/// The prose is not final and is followed by a tool call on purpose: a final
-/// answer ends the turn and is painted as its conclusion, outside the process
-/// section, while this one stays a settled process row — a row *inside* a unit
-/// that keeps a Markdown surface, which is what the retention test needs.
-fn settle_live_tools(workbench: &Entity<VibexWorkbench>, cx: &mut VisualTestContext) {
-    let end = workbench.read_with(cx, |workbench, _| {
-        workbench.timeline.authoritative_end_sequence.unwrap()
-    });
-    let mut sequence = end;
-    for tool in 0..24 {
-        sequence += 1;
-        apply_live_timeline_item(workbench, cx, settled_tool(sequence, tool));
-    }
-    sequence += 1;
-    apply_live_timeline_item(
-        workbench,
-        cx,
-        live_timeline_item(
-            sequence,
-            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
-                text: "The workspace checks out.".into(),
-                is_final: false,
-            }),
-        ),
-    );
-    sequence += 1;
-    apply_live_timeline_item(workbench, cx, settled_tool(sequence, 99));
-}
-
 /// Draws frames the way the platform does when nothing has asked for a full
 /// refresh, which is the state a retained element tree is reused in.
 ///
@@ -1976,157 +1925,99 @@ fn draw_plain_timeline_frames(cx: &mut VisualTestContext, count: usize) {
     }
 }
 
-/// A settled unit's element tree survives a frame that does not touch it, and is
-/// rebuilt the moment something it paints does move.
+/// Whether a hover change and a click reach an element inside a cached view.
 ///
-/// The timeline rebuilds its visible turns on every streamed chunk, and an
-/// expanded tool group made each of those frames lay its rows out again:
-/// prepaint measured 12 to 42ms a frame against 4 to 6ms collapsed, with element
-/// construction flat at ~1ms. A settled unit that owns its tree is therefore
-/// only rendered again when its render key moves — and a unit that is still
-/// streaming is never retained at all, because the cached box is the height the
-/// table held when the view was mounted.
+/// A retained process unit is mounted through `Entity::cached`, and the fork
+/// replays a cached view's paint range instead of painting it again. This probe
+/// isolates that from the timeline: the same child view is mounted plainly in one
+/// pass and cached in the next, and both are hovered and clicked in the same
+/// place.
+struct CachedClickChild {
+    clicks: Rc<std::cell::Cell<usize>>,
+    renders: Rc<std::cell::Cell<usize>>,
+}
+
+impl Render for CachedClickChild {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        let clicks = self.clicks.clone();
+        div()
+            .debug_selector(|| "cached-click-child".to_string())
+            .w_full()
+            .h(px(40.0))
+            .hover(|style| style.opacity(0.5))
+            .on_mouse_down(MouseButton::Left, move |_, _, _| clicks.set(clicks.get() + 1))
+    }
+}
+
+struct CachedClickProbe {
+    child: Entity<CachedClickChild>,
+    cached: bool,
+}
+
+impl Render for CachedClickProbe {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        if self.cached {
+            div()
+                .size_full()
+                .child(
+                    self.child
+                        .clone()
+                        .cached(StyleRefinement::default().size_full()),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .size_full()
+                .child(self.child.clone())
+                .into_any_element()
+        }
+    }
+}
+
 #[gpui::test]
-fn retained_process_units_render_only_when_their_key_moves(cx: &mut TestAppContext) {
+fn a_click_and_a_hover_reach_an_element_inside_a_cached_view(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
-    let (workbench, cx) = live_tool_timeline(cx, false);
-
-    // While the tools are still running nothing may be retained.
-    draw_live_timeline_frames(&workbench, cx, 4);
-    assert!(
-        workbench.read_with(cx, |workbench, _| workbench.timeline_unit_views.is_empty()),
-        "a streaming unit must stay inline"
-    );
-
-    settle_live_tools(&workbench, cx);
-    draw_live_timeline_frames(&workbench, cx, 6);
-    // Strong handles for the length of the test, so that a frame which stops
-    // mounting a unit cannot be mistaken for one that did not render it.
-    let retained: Vec<(String, Entity<timeline_unit_view::TimelineUnitView>)> =
-        workbench.read_with(cx, |workbench, _| {
-            workbench
-                .timeline_unit_views
-                .iter()
-                .filter_map(|(id, view)| view.upgrade().map(|view| (id.clone(), view)))
-                .collect()
+    for cached in [false, true] {
+        let clicks = Rc::new(std::cell::Cell::new(0));
+        let renders = Rc::new(std::cell::Cell::new(0));
+        let observed_clicks = clicks.clone();
+        let observed_renders = renders.clone();
+        let (_, cx) = cx.add_window_view(|_, cx| CachedClickProbe {
+            child: cx.new(|_| CachedClickChild { clicks, renders }),
+            cached,
         });
-    let units: Vec<Entity<timeline_unit_view::TimelineUnitView>> =
-        retained.iter().map(|(_, view)| view.clone()).collect();
-    assert!(
-        !units.is_empty(),
-        "a settled unit should be retained once it has been measured"
-    );
-    // A retained unit is mounted at the height the table holds and paints inside
-    // that box. An empty one still reserves its space, so the frame has to be
-    // checked for a real box rather than for the view having rendered.
-    let boxed_unit = retained[0].0.clone();
-    let painted_box = units[0].read_with(cx, |view, _| view.box_height());
-    let reserved = workbench.read_with(cx, |workbench, _| {
-        workbench
-            .timeline_process_unit_heights
-            .get(&boxed_unit)
-            .map(|entry| entry.height)
-    });
-    assert!(
-        painted_box > 0.0,
-        "a retained unit must fill the box its parent reserved, not collapse to nothing"
-    );
-    if let Some(reserved) = reserved {
-        assert!(
-            (painted_box - reserved).abs() <= 1.0,
-            "a retained unit paints at the height the table holds: {painted_box} vs {reserved}"
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let bounds = cx
+            .debug_bounds("cached-click-child")
+            .expect("the child paints");
+        let before_hover = observed_renders.get();
+        cx.simulate_mouse_move(bounds.center(), None, Modifiers::none());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        if !cached {
+            assert!(
+                observed_renders.get() > before_hover,
+                "a hover change must reach a plainly mounted view"
+            );
+        }
+        // A cached view is not notified when the hover changes, so its hover
+        // wash goes stale until something else renders it. Recorded rather than
+        // asserted: a retained unit cannot rely on hover to repaint itself, which
+        // is one of the two reasons the retention was reverted.
+        let hovered_through_cache = observed_renders.get() > before_hover;
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            observed_clicks.get(),
+            1,
+            "a click inside a cached view must reach its listener (cached={cached}, hover-through-cache={hovered_through_cache})"
         );
     }
-
-    let renders = |cx: &VisualTestContext| {
-        units
-            .iter()
-            .map(|unit| unit.read_with(cx, |view, _| view.render_count()))
-            .sum::<usize>()
-    };
-    let before = renders(cx);
-    assert!(before > 0);
-
-    draw_plain_timeline_frames(cx, 4);
-    assert_eq!(
-        renders(cx),
-        before,
-        "a frame that changes nothing must not render a retained unit again"
-    );
-
-    // A workbench notify on its own is what every streamed chunk produces, and
-    // it must not rebuild the retained trees either.
-    workbench.update(cx, |_, cx| cx.notify());
-    draw_plain_timeline_frames(cx, 2);
-    assert_eq!(
-        renders(cx),
-        before,
-        "a workbench notify on its own must not render a retained unit again"
-    );
-
-    // A disclosure is the other half of the contract: its click handler only
-    // inserts into an expansion map, so the key has to carry that state or the
-    // clicked row keeps painting its previous shape while hover, which notifies
-    // the element's own view, still responds.
-    let unit_id = workbench.read_with(cx, |workbench, _| {
-        workbench
-            .timeline_unit_views
-            .keys()
-            .next()
-            .cloned()
-            .expect("a retained unit")
-    });
-    workbench.update(cx, |workbench, cx| {
-        workbench
-            .timeline_command_expansion
-            .insert(unit_id.clone(), true);
-        cx.notify();
-    });
-    draw_plain_timeline_frames(cx, 2);
-    assert!(
-        renders(cx) > before,
-        "toggling a disclosure must render the retained unit again"
-    );
-
-    // A Markdown parse lands after the frame that asked for it, and the parse is
-    // what the unit paints, so the view has to hear about it. The fixture's
-    // Markdown rows are painted beside the process section rather than inside a
-    // unit, so the subscription a unit makes for its own rows is exercised
-    // directly here: that a surface's change reaches the view is the whole
-    // contract.
-    let (surface_unit, surface_id, surface) = workbench.read_with(cx, |workbench, _| {
-        let (id, entry) = workbench
-            .markdown_text_states
-            .iter()
-            .next()
-            .expect("the live turn keeps a Markdown surface");
-        let unit = workbench
-            .timeline_unit_views
-            .values()
-            .filter_map(|view| view.upgrade())
-            .next()
-            .expect("a settled unit was retained");
-        (unit, id.clone(), entry.state.clone())
-    });
-    surface_unit.update(cx, |view, cx| {
-        view.observe_markdown_surfaces(&BTreeSet::from([surface_id]), cx);
-    });
-    let before_parse = surface_unit.read_with(cx, |view, _| view.render_count());
-    surface.update(cx, |_, cx| cx.notify());
-    draw_plain_timeline_frames(cx, 2);
-    assert!(
-        surface_unit.read_with(cx, |view, _| view.render_count()) > before_parse,
-        "a Markdown surface that changed must render its unit again"
-    );
-
-    let after_parse = renders(cx);
-    let end = workbench.read_with(cx, |workbench, _| {
-        workbench.timeline.authoritative_end_sequence.unwrap()
-    });
-    apply_live_timeline_item(&workbench, cx, settled_tool(end + 1, 100));
-    draw_live_timeline_frames(&workbench, cx, 2);
-    assert!(
-        renders(cx) > after_parse,
-        "a new tool item must render the unit that holds it"
-    );
 }
