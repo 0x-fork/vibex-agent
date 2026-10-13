@@ -106,6 +106,7 @@ fn run_tui(local: bool) {
     };
     let options = vibex_tui::TuiOptions {
         seat: seat.kind,
+        runtime_kind: seat.runtime_kind,
         ..vibex_tui::TuiOptions::default()
     };
     let result = vibex_tui::run(seat.facade.clone(), options);

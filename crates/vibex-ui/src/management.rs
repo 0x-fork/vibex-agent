@@ -2053,6 +2053,30 @@ mod tests {
             error_future()
         }
 
+        fn start_lan_pairing(
+            &self,
+            _request: MutationRequest<vibex_core::RemoteStartLanPairingRequest>,
+        ) -> BackendFuture<'_, vibex_core::RemoteLanPairingWindowSnapshot> {
+            error_future()
+        }
+
+        fn lan_pairing_window(
+            &self,
+        ) -> BackendFuture<'_, Option<vibex_core::RemoteLanPairingWindowSnapshot>> {
+            error_future()
+        }
+
+        fn decide_lan_pairing(
+            &self,
+            _request: MutationRequest<vibex_core::RemoteLanPairingDecision>,
+        ) -> BackendFuture<'_, vibex_core::RemoteLanPairingWindowSnapshot> {
+            error_future()
+        }
+
+        fn cancel_lan_pairing(&self) -> BackendFuture<'_, ()> {
+            error_future()
+        }
+
         fn list_devices(&self) -> BackendFuture<'_, Vec<RemoteDeviceDetail>> {
             error_future()
         }

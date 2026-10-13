@@ -143,6 +143,10 @@ impl App {
                 self.should_quit = true;
                 Outcome::effects(vec![])
             }
+            // A pairing panel is a surface inside the page, so `Esc` puts it
+            // down before it becomes a walk back to the page the reader came
+            // from.
+            Intent::Back if self.device_panel_is_open() => self.close_device_panel(),
             Intent::Back => self.go_back(),
             Intent::FocusNext => {
                 self.focus = if self.page.is_session_page() {
@@ -1030,24 +1034,11 @@ impl App {
 
             // ---- management ------------------------------------------------
             Intent::ReloadManagement => self.refresh_current_page(),
-            Intent::CreatePairingCode => {
-                let availability = self.availability(BackendOperation::DevicePairing);
-                match availability {
-                    Availability::Available => Outcome::effects(vec![Effect::CreatePairingOffer]),
-                    Availability::RequiresPermission => {
-                        self.toast(Toast::warning(
-                            self.strings.permission_required_for().to_string(),
-                        ));
-                        Outcome::quiet()
-                    }
-                    _ => {
-                        self.toast(Toast::warning(
-                            self.strings.toast_action_unavailable().to_string(),
-                        ));
-                        Outcome::quiet()
-                    }
-                }
-            }
+            Intent::ActivateDevicePairing => self.activate_device_pairing(),
+            Intent::DevicesTabNext => self.step_device_tab(1),
+            Intent::DevicesTabPrevious => self.step_device_tab(-1),
+            Intent::AllowLanPairing => self.decide_lan_pairing(true),
+            Intent::RefuseLanPairing => self.decide_lan_pairing(false),
             Intent::RevokeSelectedDevice => self.begin_revoke_device(),
             Intent::OpenDeviceAudit => Outcome::effects(vec![Effect::ListAudit]),
 
@@ -2684,7 +2675,6 @@ impl App {
                 }
                 _ => Outcome::quiet(),
             },
-            Overlay::PairingCode { .. } => Outcome::quiet(),
             Overlay::RuntimePicker { view, selected } => {
                 self.perform_runtime_picker(intent, view, selected)
             }
@@ -2967,8 +2957,7 @@ impl App {
                 Outcome::effects(vec![Effect::UnarchiveSession { session_id }])
             }
             Intent::RevokeSelectedDevice => {
-                let index = self.selection_for(Scope::Devices);
-                let Some(device) = self.management_data.devices.get(index) else {
+                let Some(device) = self.selected_paired_device() else {
                     return Outcome::quiet();
                 };
                 let device_id = device.device_id.clone();
@@ -3076,8 +3065,7 @@ impl App {
                 }
             }
             PromptField::DeviceRevokeReason => {
-                let index = self.selection_for(Scope::Devices);
-                let Some(device) = self.management_data.devices.get(index) else {
+                let Some(device) = self.selected_paired_device() else {
                     return Outcome::quiet();
                 };
                 let device_id = device.device_id.clone();
@@ -3256,6 +3244,9 @@ impl App {
         }
         if self.page == Page::Management {
             return self.move_config_selection(delta);
+        }
+        if self.page == Page::Devices {
+            return self.move_device_selection(delta);
         }
         let count = self.page_row_count();
         if count == 0 {
@@ -3556,6 +3547,136 @@ impl App {
             field: PromptField::RenameSession,
             value: title,
         });
+        Outcome::effects(vec![])
+    }
+
+    /// Open the highlighted pairing row, or close it.
+    ///
+    /// Opening asks the runtime for what the panel draws: an offer for the QR
+    /// and the link, a window for the local network. A window that has run out
+    /// is a row the reader presses to look again rather than to close — the
+    /// panel it would close already says the window is gone.
+    fn activate_device_pairing(&mut self) -> Outcome {
+        use crate::device_center::{Activation, DeviceTab, Opening, PairMethod};
+        if self.page != Page::Devices || self.device_center.tab != DeviceTab::Pair {
+            return Outcome::quiet();
+        }
+        let Some(method) = self.selected_pair_method() else {
+            return Outcome::quiet();
+        };
+        let operation = match method {
+            PairMethod::LocalNetwork => BackendOperation::DeviceLanPairing,
+            PairMethod::QrCode | PairMethod::CodeOrLink => BackendOperation::DevicePairing,
+        };
+        let availability = self.availability(operation);
+        if availability != Availability::Available {
+            let message = match availability {
+                Availability::RequiresPermission => self.strings.permission_required_for(),
+                _ => self.strings.toast_action_unavailable(),
+            };
+            self.toast(Toast::warning(message.to_string()));
+            return Outcome::quiet();
+        }
+        // A panel with nothing live behind it is a panel the press reopens:
+        // the window closed, the code expired, or the last answer was a
+        // failure. The row stays open and asks the runtime again, which is what
+        // the reader meant by pressing it a second time.
+        let spent = self.device_center.open == Some(method)
+            && self
+                .device_center
+                .pairing
+                .spent(method, vibex_core::unix_timestamp_ms());
+        let activation = if spent {
+            self.device_center.open = Some(method);
+            Activation::Opened(method.opening())
+        } else {
+            self.device_center.toggle(method)
+        };
+        match activation {
+            Activation::Opened(Opening::Offer) => {
+                self.device_center.pairing.busy = Some(method);
+                self.device_center.pairing.error = None;
+                Outcome::effects(vec![Effect::CreatePairingOffer])
+            }
+            Activation::Opened(Opening::Window) => self.start_lan_pairing(),
+            Activation::Closed { cancel_window } => {
+                if cancel_window {
+                    return self.close_device_panel();
+                }
+                Outcome::effects(vec![])
+            }
+        }
+    }
+
+    /// Ask the runtime to advertise itself on the local network.
+    fn start_lan_pairing(&mut self) -> Outcome {
+        use crate::device_center::PairMethod;
+        // The old window is given up rather than drawn until the answer lands:
+        // it belonged to a window this one replaces.
+        self.device_center.pairing.window = None;
+        self.device_center.pairing.busy = Some(PairMethod::LocalNetwork);
+        self.device_center.pairing.error = None;
+        Outcome::effects(vec![Effect::StartLanPairing {
+            // The same level the TUI has always offered: full control, which is
+            // what a device paired from this client is granted. Choosing a
+            // narrower level is a decision the page does not yet ask for.
+            permission_level: vibex_core::RemoteDevicePermissionLevel::FullControl,
+            ttl_ms: vibex_core::DEFAULT_PAIRING_TTL_MS,
+        }])
+    }
+
+    /// Approve or refuse the device waiting on the open window.
+    fn decide_lan_pairing(&mut self, approve: bool) -> Outcome {
+        use crate::device_center::PairMethod;
+        if !self.device_center.lan_panel_open() {
+            return Outcome::quiet();
+        }
+        let Some(request_id) = self
+            .device_center
+            .pairing
+            .pending()
+            .map(|request| request.request_id.clone())
+        else {
+            return Outcome::quiet();
+        };
+        self.device_center.pairing.busy = Some(PairMethod::LocalNetwork);
+        self.device_center.pairing.error = None;
+        Outcome::effects(vec![Effect::DecideLanPairing {
+            request_id,
+            approve,
+        }])
+    }
+
+    /// Close the open pairing panel. The window panel takes its advertisement
+    /// down with it: the panel is the only place the window is drawn, so a
+    /// runtime left discoverable behind it would pair a phone the reader never
+    /// saw. The client stops believing in the window either way — if the
+    /// runtime refuses to take it down, the reader is told rather than shown a
+    /// window that is still up.
+    fn close_device_panel(&mut self) -> Outcome {
+        use crate::device_center::PairMethod;
+        let Some(method) = self.device_center.open.take() else {
+            return Outcome::quiet();
+        };
+        if method != PairMethod::LocalNetwork {
+            return Outcome::effects(vec![]);
+        }
+        self.device_center.pairing.window = None;
+        self.device_center.pairing.busy = None;
+        Outcome::effects(vec![Effect::CancelLanPairing])
+    }
+
+    /// Switch halves of the devices page.
+    fn step_device_tab(&mut self, delta: i64) -> Outcome {
+        if self.page != Page::Devices {
+            return Outcome::quiet();
+        }
+        if self.device_center.step_tab(delta) {
+            // The window belonged to the half the reader just left, and nothing
+            // on screen can close it any more.
+            self.device_center.pairing.busy = None;
+            return Outcome::effects(vec![Effect::CancelLanPairing]);
+        }
         Outcome::effects(vec![])
     }
 

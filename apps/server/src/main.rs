@@ -231,6 +231,7 @@ async fn tui(local: bool) -> Result<(), Box<dyn Error>> {
     let seat = vibex_client::seat::Seat::resolve(request).await?;
     let options = vibex_tui::TuiOptions {
         seat: seat.kind,
+        runtime_kind: seat.runtime_kind,
         ..vibex_tui::TuiOptions::default()
     };
     let result = vibex_tui::run(seat.facade.clone(), options);

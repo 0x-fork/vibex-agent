@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use vibex_backend::DomainCapabilities;
 use vibex_backend::{BackendCapabilitySnapshot, BackendFacade, BackendOperation};
-use vibex_core::{AgentSession, RemoteDeviceDetail, RemoteDevicePermissionLevel, VibexSessionId};
+use vibex_core::{AgentSession, RemoteDeviceDetail, VibexSessionId};
 use vibex_desktop_model::{SidebarState, TimelineRow};
 use vibex_ui::shell::{CompactNavigation, GlobalDestination, SessionDestination, ShellKind};
 use vibex_ui::{AgentWorkflowController, ManagementWorkflowController};
@@ -110,6 +110,14 @@ const OLDER_HISTORY_PREFETCH_HALF_SCREENS: usize = 3;
 /// worker's queue. What is left is asked for again as the answers land.
 const TIMELINE_DETAIL_BATCH: usize = 4;
 
+/// Ticks between two reads of an open LAN pairing window.
+///
+/// The tick is 200 ms, so five of them put a request on screen about a second
+/// after the phone asks — quick enough to read as live, slow enough that the
+/// poll is not traffic of its own. Only the pairing panel polls; every other
+/// surface still repaints only when something changed.
+const LAN_PAIRING_POLL_TICKS: u8 = 5;
+
 /// A page the reader left, and the pane that owned the keyboard on it.
 ///
 /// `Esc` returns here: the focus comes back with the page, so a reader who
@@ -195,12 +203,6 @@ pub enum Overlay {
     Approval { selected: usize },
     /// The pending elicitation form.
     Elicitation { field: usize },
-    /// A one-time pairing code, shown once and never persisted.
-    PairingCode {
-        code: String,
-        link: String,
-        permission: RemoteDevicePermissionLevel,
-    },
     /// The runtime and model picker.
     ///
     /// `view` is which half of it is on screen and `selected` indexes the rows
@@ -768,6 +770,9 @@ pub struct App {
     pub facade: BackendFacade,
     pub capabilities: BackendCapabilitySnapshot,
     pub seat: SeatKind,
+    /// What kind of runtime this client is attached to, as the composition root
+    /// resolved it.
+    pub runtime_kind: vibex_core::RemoteServerKind,
 
     pub theme: TuiTheme,
     pub capability: ColorCapability,
@@ -825,6 +830,12 @@ pub struct App {
     /// It lives beside the data rather than inside a page because the centre
     /// keeps its place while the reader works in the timeline and comes back.
     pub config_center: crate::config_center::ConfigCenter,
+    /// The devices page's own navigation and the pairing facts behind it.
+    ///
+    /// It lives beside the data for the same reason the configuration centre's
+    /// state does: the page keeps its place — which tab, which row, which panel
+    /// is open — while the reader works in a session and comes back.
+    pub device_center: crate::device_center::DeviceCenter,
     /// The record a confirmation is about, for the two destructive verbs that
     /// ask first. It is carried as the record's key and the verb rather than as
     /// the cursor's index, so an answer that arrives after a refresh still
@@ -992,6 +1003,13 @@ pub struct App {
     /// The countdown second the surfaces last painted, so a tick that does not
     /// move the display is not a reason to repaint it.
     pub schedule_shown_second: Option<i64>,
+    /// Ticks left before the LAN pairing window is re-read.
+    ///
+    /// The window is the one pairing fact the client cannot learn from an
+    /// answer to its own action: a device asks from outside, and the only way
+    /// to hear about it is to ask again. Zero means "not polling", which is
+    /// what the rest of the client does.
+    lan_poll_ticks: u8,
     /// The message that has been sent but not yet echoed back by the runtime.
     ///
     /// The timeline belongs to the runtime, and its copy of the reader's own
@@ -1211,6 +1229,10 @@ pub struct FrameRegions {
     pub config_tabs: Vec<(ratatui::layout::Rect, crate::config_center::ConfigModule)>,
     pub config_sections: Vec<(ratatui::layout::Rect, crate::config_center::ConfigSection)>,
     pub config_buttons: Vec<(ratatui::layout::Rect, crate::config_center::ConfigAction)>,
+    /// The devices page's tab strip and its rows. A tab switches halves; a row
+    /// takes the cursor, and a second press on a pairing row opens it.
+    pub device_tabs: Vec<(ratatui::layout::Rect, crate::device_center::DeviceTab)>,
+    pub device_rows: Vec<(ratatui::layout::Rect, usize)>,
     /// The runtime switcher's rows, when it is the modal on screen. Its cursor
     /// indexes a window rather than a rect, so the region carries where the
     /// window started as well as where it was drawn.
@@ -1240,6 +1262,8 @@ impl FrameRegions {
         self.config_tabs.clear();
         self.config_sections.clear();
         self.config_buttons.clear();
+        self.device_tabs.clear();
+        self.device_rows.clear();
         self.runtime_picker = None;
         self.palette = None;
         // A list, a banner row, a composer's box and a modal's close affordance
@@ -1482,6 +1506,7 @@ impl App {
             facade,
             capabilities,
             seat: options.seat,
+            runtime_kind: options.runtime_kind,
             theme: theme.clone(),
             capability,
             strings,
@@ -1534,6 +1559,7 @@ impl App {
             },
             management_data: ManagementData::default(),
             config_center: crate::config_center::ConfigCenter::default(),
+            device_center: crate::device_center::DeviceCenter::default(),
             pending_config_action: None,
             selection: BTreeMap::new(),
             filter: String::new(),
@@ -1594,6 +1620,7 @@ impl App {
             queue_selection: None,
             draft_schedules: BTreeMap::new(),
             schedule_shown_second: None,
+            lan_poll_ticks: 0,
             pending_sends: BTreeMap::new(),
             inflight_sends: BTreeMap::new(),
             pending_send_serial: 0,
@@ -2953,6 +2980,58 @@ impl App {
         self.refresh_config_area()
     }
 
+    /// A press on the devices page's own controls, if the point is over one.
+    ///
+    /// A tab switches halves; a row takes the cursor, and a second press on a
+    /// pairing row opens it — the same two-step contract every other list in the
+    /// client keeps, so a pointer never opens something the keyboard would have
+    /// needed a second press for.
+    pub fn click_device_control(
+        &mut self,
+        column: u16,
+        row: u16,
+    ) -> Option<crate::reduce::Outcome> {
+        if let Some((_, tab)) = self
+            .regions
+            .device_tabs
+            .iter()
+            .find(|(rect, _)| App::rect_contains(*rect, column, row))
+            .copied()
+        {
+            if self.device_center.tab == tab {
+                return Some(crate::reduce::Outcome::quiet());
+            }
+            if self.device_center.select_tab(tab) {
+                // The window belonged to the half the reader just left.
+                self.device_center.pairing.busy = None;
+                return Some(crate::reduce::Outcome::effects(vec![
+                    Effect::CancelLanPairing,
+                ]));
+            }
+            return Some(crate::reduce::Outcome::effects(vec![]));
+        }
+        let index = self
+            .regions
+            .device_rows
+            .iter()
+            .find(|(rect, _)| App::rect_contains(*rect, column, row))
+            .map(|(_, index)| *index)?;
+        let tab = self.device_center.tab;
+        let methods = self.device_pair_methods().len();
+        let devices = self.management_data.devices.len();
+        if index >= self.device_center.row_count(tab, methods, devices) {
+            return Some(crate::reduce::Outcome::quiet());
+        }
+        let already = self.device_cursor() == index;
+        self.device_center.set_cursor(tab, index);
+        if tab == crate::device_center::DeviceTab::Pair
+            && (already || self.double_click_at(column, row))
+        {
+            return Some(self.perform(Intent::ActivateDevicePairing));
+        }
+        Some(crate::reduce::Outcome::effects(vec![]))
+    }
+
     pub fn show_config_section(
         &mut self,
         section: crate::config_center::ConfigSection,
@@ -3046,6 +3125,70 @@ impl App {
     }
 
     /// Row count for the page that currently owns the selection.
+    /// The ways this runtime can pair a device right now, in the order the
+    /// pairing half of the devices page draws them.
+    ///
+    /// The page asks the backend the same question the backend answers: an
+    /// operation the runtime does not support and one this device's grant
+    /// forbids are different sentences to the reader, so both are resolved here
+    /// rather than guessed at from the runtime's kind.
+    pub fn device_pair_methods(&self) -> Vec<crate::device_center::PairMethod> {
+        crate::device_center::pair_methods(
+            self.runtime_kind,
+            self.availability(BackendOperation::DevicePairing),
+            self.availability(BackendOperation::DeviceLanPairing),
+        )
+    }
+
+    /// The pairing row the keyboard is on, when the pairing half is open.
+    pub fn selected_pair_method(&self) -> Option<crate::device_center::PairMethod> {
+        self.device_pair_methods()
+            .get(self.device_cursor())
+            .copied()
+    }
+
+    /// The device the keyboard is on, when the devices half is open.
+    pub fn selected_paired_device(&self) -> Option<&vibex_core::RemoteDeviceDetail> {
+        if self.device_center.tab != crate::device_center::DeviceTab::Devices {
+            return None;
+        }
+        self.management_data.devices.get(self.device_cursor())
+    }
+
+    /// The row the keyboard is on, clamped to the rows the open half has.
+    pub fn device_cursor(&self) -> usize {
+        self.device_center.clamped_cursor(
+            self.device_pair_methods().len(),
+            self.management_data.devices.len(),
+        )
+    }
+
+    /// Move inside the devices page, where the same two keys mean "the next way
+    /// to pair" or "the next device" depending on which half is open.
+    pub(crate) fn move_device_selection(&mut self, delta: i64) -> crate::reduce::Outcome {
+        let methods = self.device_pair_methods().len();
+        let devices = self.management_data.devices.len();
+        let count = self
+            .device_center
+            .row_count(self.device_center.tab, methods, devices);
+        if count == 0 {
+            return crate::reduce::Outcome::quiet();
+        }
+        let current = self.device_cursor() as i64;
+        let next = (current + delta).clamp(0, count as i64 - 1) as usize;
+        if next == current as usize {
+            return crate::reduce::Outcome::quiet();
+        }
+        self.device_center.set_cursor(self.device_center.tab, next);
+        crate::reduce::Outcome::effects(vec![])
+    }
+
+    /// Whether the devices page has a panel open that `Esc` should close before
+    /// it becomes a walk back to the page the reader came from.
+    pub fn device_panel_is_open(&self) -> bool {
+        self.page == Page::Devices && self.device_center.open.is_some()
+    }
+
     pub fn page_row_count(&self) -> usize {
         match self.page {
             Page::NewSession => 0,
@@ -3054,7 +3197,11 @@ impl App {
                 .config_center
                 .visible(&self.management_data, self.strings)
                 .len(),
-            Page::Devices => self.management_data.devices.len(),
+            Page::Devices => self.device_center.row_count(
+                self.device_center.tab,
+                self.device_pair_methods().len(),
+                self.management_data.devices.len(),
+            ),
             Page::Providers | Page::Agents | Page::Mcp | Page::Skills | Page::Prompts => 0,
             Page::Settings => self.visible_settings().len(),
             Page::Agent => self.transcript.len(),
@@ -3161,6 +3308,14 @@ impl App {
             {
                 continue;
             }
+            // The devices page's verbs belong to a row that may not be there:
+            // `Allow` and `Refuse` mean nothing without a window and a device
+            // waiting on it, and `Revoke` means nothing without a device. A bar
+            // that offered them anyway would be promising keys that answer with
+            // nothing.
+            if self.page == Page::Devices && !self.device_key_applies(binding.intent) {
+                continue;
+            }
             advertised.push((binding.scope, binding));
         }
         // The page's own keys lead the bar: a reader looking at the
@@ -3174,6 +3329,31 @@ impl App {
                 .unwrap_or(usize::MAX)
         });
         advertised
+    }
+
+    /// Whether one of the devices page's own verbs has anything to act on.
+    ///
+    /// The page's keys are bound for the whole scope, because a key that comes
+    /// and goes with the state is a key the reader cannot learn. What changes is
+    /// whether the bar names it: a verb with no subject is left out rather than
+    /// offered as a press that does nothing.
+    pub fn device_key_applies(&self, intent: Intent) -> bool {
+        match intent {
+            Intent::AllowLanPairing | Intent::RefuseLanPairing => {
+                self.device_center.lan_panel_open()
+                    && self.device_center.pairing.pending().is_some()
+            }
+            Intent::ActivateDevicePairing => {
+                self.device_center.tab == crate::device_center::DeviceTab::Pair
+                    && self.selected_pair_method().is_some()
+            }
+            Intent::DevicesTabNext | Intent::DevicesTabPrevious => true,
+            Intent::RevokeSelectedDevice => self.selected_paired_device().is_some(),
+            Intent::OpenDeviceAudit => {
+                self.device_center.tab == crate::device_center::DeviceTab::Devices
+            }
+            _ => true,
+        }
     }
 
     /// Whether the reducer still answers this intent while a modal or a filter
@@ -3768,7 +3948,7 @@ impl App {
             Page::Mcp => strings.management_mcp(),
             Page::Skills => strings.management_skills(),
             Page::Prompts => strings.management_prompts(),
-            Page::Devices => strings.devices_title(),
+            Page::Devices => strings.management_devices(),
             Page::Settings => strings.nav_settings(),
             Page::Help => strings.nav_help(),
         }
@@ -4024,9 +4204,29 @@ impl App {
         // released by `drain_queue`, which every pass of the event loop already
         // calls.
         let counting = self.tick_schedules(now_ms);
+        // A LAN pairing window is the one pairing fact that arrives from
+        // outside: a phone asks, and nothing in this process hears about it.
+        // While its panel is open the window is re-read on a slow clock — slow
+        // enough that the poll is not the client's own traffic, quick enough
+        // that a reader watching for a request sees it — and each read is also
+        // what expires the countdown the panel draws.
+        let mut poll = false;
+        if self.device_center.lan_panel_open() && self.device_center.pairing.window.is_some() {
+            self.lan_poll_ticks = self.lan_poll_ticks.saturating_sub(1);
+            if self.lan_poll_ticks == 0 {
+                self.lan_poll_ticks = LAN_PAIRING_POLL_TICKS;
+                poll = true;
+            }
+        } else {
+            self.lan_poll_ticks = 0;
+        }
+        let mut effects: Vec<Effect> = actions.into_iter().map(auto_continue_effect).collect();
+        if poll {
+            effects.push(Effect::LanPairingStatus);
+        }
         crate::reduce::Outcome {
-            effects: actions.into_iter().map(auto_continue_effect).collect(),
-            dirty: dirty || moved || counting,
+            effects,
+            dirty: dirty || moved || counting || poll,
         }
     }
 
@@ -6264,6 +6464,11 @@ impl Availability {
 #[derive(Debug, Clone)]
 pub struct AppOptions {
     pub seat: SeatKind,
+    /// What kind of runtime this client is attached to. The devices page reads
+    /// it to decide whether a desktop client may pair here at all; the client
+    /// cannot work it out for itself, because the license is a property of the
+    /// runtime rather than of the connection.
+    pub runtime_kind: vibex_core::RemoteServerKind,
     pub capability: ColorCapability,
     /// The theme this run was started with, when the composition root named
     /// one (`--theme`, `VIBEX_THEME`). It seeds the slot for `mode`; the other
@@ -6324,6 +6529,7 @@ impl AppOptions {
     fn with_default_paths() -> Self {
         Self {
             seat: SeatKind::Remote,
+            runtime_kind: vibex_core::RemoteServerKind::Unknown,
             capability: ColorCapability::detect(),
             theme_id: None,
             mode: vibex_ui::GpuiThemeMode::Dark,
@@ -6339,9 +6545,9 @@ impl AppOptions {
             // home of whoever ran it — and would race every test doing the same
             // — so the composition root is the only place that names the file.
             queue_path: None,
-            // Not `App::notification_preferences_path()`: a test that flips a
-            // notification switch writes the file, and the settings page's own
-            // tests are the ones that do it.
+            // Not `App::notification_preferences_path()` either: a test that
+            // flips a notification switch writes the file, and the settings
+            // page's own tests are the ones that do it.
             notify_path: None,
         }
     }
@@ -6894,6 +7100,24 @@ pub enum Effect {
     },
     ListDevices,
     CreatePairingOffer,
+    /// Open a LAN pairing window, which puts an advertisement on the local
+    /// network and holds the requests that answer it.
+    StartLanPairing {
+        permission_level: vibex_core::RemoteDevicePermissionLevel,
+        ttl_ms: u32,
+    },
+    /// Re-read the window being advertised. The requests arrive from outside
+    /// the client, so this is the read the tick keeps asking for while the
+    /// panel is open.
+    LanPairingStatus,
+    /// Approve or refuse the device that asked to pair.
+    DecideLanPairing {
+        request_id: vibex_core::RequestId,
+        approve: bool,
+    },
+    /// Take the advertisement down. Also what closes the panel, so a window
+    /// the reader walked away from is not left discoverable.
+    CancelLanPairing,
     RevokeDevice {
         device_id: vibex_core::DeviceId,
         reason: Option<String>,
@@ -7050,6 +7274,10 @@ impl Effect {
             Effect::BrowseDirectories { .. } => "browse",
             Effect::ListDevices => "devices",
             Effect::CreatePairingOffer => "pairing_offer",
+            Effect::StartLanPairing { .. } => "lan_pairing_start",
+            Effect::LanPairingStatus => "lan_pairing_status",
+            Effect::DecideLanPairing { .. } => "lan_pairing_decision",
+            Effect::CancelLanPairing => "lan_pairing_cancel",
             Effect::RevokeDevice { .. } => "revoke_device",
             Effect::ListAudit => "audit",
             Effect::ListProfiles => "profiles",

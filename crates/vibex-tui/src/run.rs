@@ -1322,6 +1322,16 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 dispatch_all(worker, &outcome);
                 return true;
             }
+            // The devices page has its own strip and its own rows, which the
+            // shared list region cannot describe: the pairing rows are ways to
+            // pair rather than records, so they carry no scope.
+            if app.overlay.is_none()
+                && app.page == crate::app::Page::Devices
+                && let Some(outcome) = app.click_device_control(mouse.column, mouse.row)
+            {
+                dispatch_all(worker, &outcome);
+                return true;
+            }
             // The switcher's rows select and activate exactly as the other
             // lists do, headings included: a heading is the control that folds
             // its group, and a double click is how the mouse presses it.
@@ -2135,14 +2145,57 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         AppMessage::PairingOffer(result) => match result {
             Ok(response) => {
                 // The code is shown once and never stored: it is not written to
-                // logs, configuration, or the scrollback export.
-                app.overlay = Some(Overlay::PairingCode {
-                    code: response.offer.one_time_challenge.clone(),
-                    link: response.launch_fragment.clone(),
-                    permission: response.offer.summary.permission_level,
-                });
+                // logs, configuration, or the scrollback export. It lives on the
+                // pairing page, which drops it the moment the reader leaves the
+                // tab, and the row that asked for it stops spinning.
+                app.device_center.pairing.busy = None;
+                app.device_center.pairing.error = None;
+                app.device_center.pairing.offer =
+                    Some(crate::device_center::PairingOffer::from_response(&response));
             }
-            Err(error) => app.toast(Toast::danger(error.message)),
+            Err(error) => {
+                let method = app
+                    .device_center
+                    .pairing
+                    .busy
+                    .unwrap_or(crate::device_center::PairMethod::QrCode);
+                app.device_center
+                    .pairing
+                    .fail(crate::device_center::PairingError {
+                        method,
+                        code: error.code.clone(),
+                        message: error.message.clone(),
+                    });
+            }
+        },
+        AppMessage::LanPairing(result) => match result {
+            Ok(window) => {
+                app.device_center
+                    .pairing
+                    .settle(window.map(|window| *window));
+            }
+            Err(error) => {
+                // The answer names what failed, so the panel can say which row
+                // it was and how to recover; a panel the reader has already
+                // closed has nowhere to say it, so the toast does.
+                let method = app
+                    .device_center
+                    .pairing
+                    .busy
+                    .unwrap_or(crate::device_center::PairMethod::LocalNetwork);
+                if app.device_center.lan_panel_open() {
+                    app.device_center
+                        .pairing
+                        .fail(crate::device_center::PairingError {
+                            method,
+                            code: error.code.clone(),
+                            message: error.message.clone(),
+                        });
+                } else {
+                    app.device_center.pairing.busy = None;
+                    app.toast(Toast::danger(error.message));
+                }
+            }
         },
         AppMessage::Audit(result) => match result {
             Ok(records) => {

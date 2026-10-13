@@ -122,10 +122,17 @@ impl NativeBackend {
             .gateway()
             .pairing_routes_available()
         {
+            // Both pairing shapes are offers underneath: without a route to
+            // offer, neither a scanned QR nor a discovered window could be
+            // claimed, so the runtime stops claiming it can pair at all.
             snapshot
                 .device
                 .operations
                 .remove(&BackendOperation::DevicePairing);
+            snapshot
+                .device
+                .operations
+                .remove(&BackendOperation::DeviceLanPairing);
         }
         snapshot
     }
@@ -4200,6 +4207,74 @@ impl DeviceBackend for NativeBackend {
                 .management()
                 .remote()
                 .cancel_pairing_offer(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn start_lan_pairing(
+        &self,
+        request: MutationRequest<vibex_core::RemoteStartLanPairingRequest>,
+    ) -> BackendFuture<'_, vibex_core::RemoteLanPairingWindowSnapshot> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            let ttl_ms = request
+                .payload
+                .ttl_ms
+                .unwrap_or(vibex_core::DEFAULT_PAIRING_TTL_MS);
+            // The controller, not the gateway, owns the window: it probes the
+            // Direct route for mobile-compatible TLS and puts the mDNS
+            // advertisement up, and it takes both back down on cancel.
+            runtime
+                .remote_connectivity()
+                .start_lan_pairing_window(request.payload.permission_level, ttl_ms)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn lan_pairing_window(
+        &self,
+    ) -> BackendFuture<'_, Option<vibex_core::RemoteLanPairingWindowSnapshot>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            match runtime.remote_connectivity().lan_pairing_window_status() {
+                Ok(window) => Ok(Some(window)),
+                // A window that expired or was claimed is the same answer as
+                // one that was never opened: this runtime is not looking.
+                Err(error) if error.code == "remote_lan_pairing_window_unavailable" => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
+
+    fn decide_lan_pairing(
+        &self,
+        request: MutationRequest<vibex_core::RemoteLanPairingDecision>,
+    ) -> BackendFuture<'_, vibex_core::RemoteLanPairingWindowSnapshot> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            let connectivity = runtime.remote_connectivity();
+            let decision = if request.payload.approve {
+                connectivity.approve_lan_pairing_request(&request.payload.request_id)
+            } else {
+                connectivity.reject_lan_pairing_request(&request.payload.request_id)
+            };
+            decision.map_err(Into::into)
+        })
+    }
+
+    fn cancel_lan_pairing(&self) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .remote_connectivity()
+                .cancel_lan_pairing_window()
                 .map_err(Into::into)
         })
     }

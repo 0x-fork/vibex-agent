@@ -78,6 +78,17 @@ fn capable_app(columns: u16, rows: u16) -> App {
     app
 }
 
+/// An app attached to a runtime of a given kind.
+///
+/// The devices page is the one surface whose rows depend on what the runtime
+/// is rather than on what it can do, so its tests have to say which runtime
+/// they are looking at.
+fn device_app(columns: u16, rows: u16, kind: vibex_core::RemoteServerKind) -> App {
+    let mut app = capable_app(columns, rows);
+    app.runtime_kind = kind;
+    app
+}
+
 /// Something only the composing page draws.
 ///
 /// The page stopped naming itself — it is the prompt, and a reader who typed the
@@ -3727,16 +3738,18 @@ fn the_palette_files_its_sections_in_reading_order() {
         "the palette drew its sections out of order"
     );
 
-    // The two device commands share the merged heading, and the pairing one is
-    // named for what it does rather than for the page it used to live on.
+    // Pairing and managing the devices are one page, so the heading has one
+    // command in it: the page carries both halves, and a second verb that
+    // opened the same page would be a second name for one destination.
     let pairing = entries
         .iter()
         .filter(|listing| listing.group == PaletteGroup::Pairing)
         .map(|listing| listing.entry.label(Strings::for_locale(Locale::ZhCn)))
         .collect::<Vec<_>>();
-    assert!(
-        pairing.contains(&"设备配对") && pairing.contains(&"设备管理"),
-        "the pairing section is not the device section: {pairing:?}"
+    assert_eq!(
+        pairing,
+        vec!["设备"],
+        "the pairing section is not the device page: {pairing:?}"
     );
 }
 
@@ -3856,6 +3869,142 @@ fn the_palette_sends_device_management_to_the_paired_devices() {
     assert!(
         screen.contains("Paired devices"),
         "the device command did not open the paired devices:\n{screen}"
+    );
+}
+
+/// The page behind the device command: pairing on the half it opens on, the
+/// trust store one press away.
+#[test]
+fn the_devices_page_pairs_on_one_half_and_lists_on_the_other() {
+    use vibex_core::RemoteServerKind;
+    use vibex_tui::action::Intent;
+    let mut app = device_app(120, 40, RemoteServerKind::Desktop);
+    app.perform(Intent::GotoDevices);
+    let screen = text(&render(&mut app, 120, 40));
+    // The pairing half is the one it opens on, and it names the ways this
+    // runtime can be paired: a phone scans, or is found on this network.
+    assert!(
+        screen.contains("Pair with a QR code"),
+        "the pairing half did not open:\n{screen}"
+    );
+    assert!(
+        screen.contains("Find a device on this network"),
+        "the local-network row is missing on a desktop runtime:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Pair with a code or link"),
+        "a desktop shell does not accept a second desktop as a client:\n{screen}"
+    );
+    // A tab strip names both halves and the runtime the page pairs.
+    assert!(screen.contains("Paired devices"), "{screen}");
+    assert!(screen.contains("Desktop runtime"), "{screen}");
+
+    // The other half is one press away, and it is the trust store rather than
+    // a second copy of the pairing rows.
+    app.perform(Intent::DevicesTabNext);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("No paired devices"),
+        "the devices half did not open:\n{screen}"
+    );
+    assert!(!screen.contains("Pair with a QR code"), "{screen}");
+}
+
+/// A headless runtime pairs a second desktop; a phone-only runtime does not.
+#[test]
+fn a_headless_runtime_offers_a_code_and_a_link_to_a_second_desktop() {
+    use vibex_core::RemoteServerKind;
+    use vibex_tui::action::Intent;
+    let mut app = device_app(120, 40, RemoteServerKind::Headless);
+    app.perform(Intent::GotoDevices);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("Pair with a code or link"),
+        "a headless runtime did not offer the desktop row:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Find a device on this network"),
+        "the local-network row is not a cloud runtime's to offer:\n{screen}"
+    );
+    assert!(screen.contains("Headless runtime"), "{screen}");
+}
+
+/// Opening a pairing row draws what the reader does with it, and the QR is
+/// only claimed when the terminal can hold a code a camera could read.
+#[test]
+fn an_open_pairing_row_draws_the_offer_it_minted() {
+    use vibex_tui::action::Intent;
+    use vibex_tui::device_center::{PairMethod, PairingOffer};
+    let mut app = device_app(200, 60, vibex_core::RemoteServerKind::Desktop);
+    app.perform(Intent::GotoDevices);
+    app.device_center.toggle(PairMethod::QrCode);
+    app.device_center.pairing.offer = Some(PairingOffer {
+        code: "4821-7390".to_string(),
+        url: "vibex://open/direct#/pair/AAAA".to_string(),
+        permission: vibex_core::RemoteDevicePermissionLevel::FullControl,
+        expires_at_ms: i64::MAX,
+    });
+    let screen = text(&render(&mut app, 200, 60));
+    assert!(screen.contains("4821-7390"), "{screen}");
+    assert!(
+        screen.contains("vibex://open/direct#/pair/AAAA"),
+        "{screen}"
+    );
+    assert!(screen.contains("Shown once"), "{screen}");
+    // A link this short is a small code, so a large terminal draws one: the
+    // half-block renderer leaves block characters on screen.
+    assert!(
+        screen.contains('█') || screen.contains('▀') || screen.contains('▄'),
+        "the QR code was not drawn on a terminal that can hold it:\n{screen}"
+    );
+
+    // A terminal too small for the code says so instead of drawing a partial
+    // one, and still hands over the link.
+    let mut small = device_app(60, 20, vibex_core::RemoteServerKind::Desktop);
+    small.perform(Intent::GotoDevices);
+    small.device_center.toggle(PairMethod::QrCode);
+    small.device_center.pairing.offer = Some(PairingOffer {
+        code: "4821-7390".to_string(),
+        url: "vibex://open/direct#/pair/AAAA".to_string(),
+        permission: vibex_core::RemoteDevicePermissionLevel::FullControl,
+        expires_at_ms: i64::MAX,
+    });
+    let screen = text(&render(&mut small, 60, 20));
+    assert!(
+        screen.contains("too small for the code"),
+        "a small terminal did not say why there is no code:\n{screen}"
+    );
+    assert!(
+        screen.contains("vibex://open/direct#/pair/AAAA"),
+        "{screen}"
+    );
+}
+
+/// A failed offer is reported on the row that asked for it, in the reader's
+/// language rather than the runtime's.
+#[test]
+fn a_failed_pairing_row_says_what_to_do_next() {
+    use vibex_tui::action::Intent;
+    use vibex_tui::device_center::{PairMethod, PairingError};
+    let mut app = device_app(120, 40, vibex_core::RemoteServerKind::Desktop);
+    app.perform(Intent::GotoDevices);
+    app.device_center.toggle(PairMethod::LocalNetwork);
+    app.device_center.pairing.fail(PairingError {
+        method: PairMethod::LocalNetwork,
+        code: "remote_lan_direct_unavailable".to_string(),
+        message: "LAN pairing requires a validated Direct HTTPS route".to_string(),
+    });
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("Remote Access"),
+        "the recovery copy is missing:\n{screen}"
+    );
+    // The runtime's own sentence travels with it, wrapped over as many lines as
+    // it needs: the recovery copy says what to do, and the sentence says what
+    // happened.
+    assert!(
+        screen.contains("requires a validated Direct"),
+        "the runtime's own sentence was dropped:\n{screen}"
     );
 }
 

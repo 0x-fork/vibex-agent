@@ -1251,11 +1251,38 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::SelectNext,
         "Next",
     ),
+    // The two halves of the page are one press apart, the way the
+    // configuration centre's modules are: the tabs are a strip, not a pane the
+    // reader has to walk into.
     binding(
         Scope::Devices,
-        Chord::plain(KeyCode::Char('p')),
-        Intent::CreatePairingCode,
-        "Pair a device",
+        Chord::plain(KeyCode::Left),
+        Intent::DevicesTabPrevious,
+        "Tab",
+    ),
+    binding(
+        Scope::Devices,
+        Chord::plain(KeyCode::Right),
+        Intent::DevicesTabNext,
+        "Tab",
+    ),
+    binding(
+        Scope::Devices,
+        Chord::plain(KeyCode::Enter),
+        Intent::ActivateDevicePairing,
+        "Open",
+    ),
+    binding(
+        Scope::Devices,
+        Chord::plain(KeyCode::Char('a')),
+        Intent::AllowLanPairing,
+        "Allow",
+    ),
+    binding(
+        Scope::Devices,
+        Chord::plain(KeyCode::Char('r')),
+        Intent::RefuseLanPairing,
+        "Refuse",
     ),
     binding(
         Scope::Devices,

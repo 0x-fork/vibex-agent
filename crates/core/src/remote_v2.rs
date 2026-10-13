@@ -30,6 +30,11 @@ macro_rules! impl_unknown_safe_enum {
 
 pub const REMOTE_PROTOCOL_V2_MAJOR: u16 = 2;
 pub const REMOTE_PROTOCOL_V2_MINOR: u16 = 0;
+/// How long a pairing offer, and the LAN window that carries one, stays live
+/// when the caller does not name a lifetime. Ninety seconds is long enough to
+/// walk a phone over to the screen and short enough that a code read off a
+/// photograph is already dead.
+pub const DEFAULT_PAIRING_TTL_MS: u32 = 90_000;
 /// Upper bound on a runtime or device display name. It is short enough for a
 /// picker row and long enough for a hostname or a phone model.
 pub const REMOTE_DISPLAY_NAME_MAX_CHARS: usize = 64;
@@ -1214,6 +1219,10 @@ pub struct RemoteCancelPairingOfferRequest {
 pub enum RemoteDeviceOperationKind {
     CreatePairingOffer,
     CancelPairingOffer,
+    StartLanPairing,
+    LanPairingStatus,
+    DecideLanPairing,
+    CancelLanPairing,
     ListDevices,
     RevokeDevice,
     RenameDevice,
@@ -1266,6 +1275,115 @@ impl fmt::Debug for RemoteDeviceCancelPairingOfferRequest {
             .field("offer_id", &self.request.offer_id)
             .finish()
     }
+}
+
+/// Asks the runtime to open a LAN pairing window.
+///
+/// A window is the discovery half of pairing rather than a second offer shape:
+/// the runtime publishes an advertisement over the local network, a phone that
+/// finds it asks to pair, and the request only becomes a pairing offer once the
+/// operator approves it here. Nothing about the device is trusted before then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteStartLanPairingRequest {
+    pub permission_level: RemoteDevicePermissionLevel,
+    /// Lifetime of the window. Absent means the runtime's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceStartLanPairingRequest {
+    pub auth: RemoteAuthProof,
+    pub request: RemoteStartLanPairingRequest,
+}
+
+impl fmt::Debug for RemoteDeviceStartLanPairingRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteDeviceStartLanPairingRequest")
+            .field("auth", &self.auth)
+            .field("permission_level", &self.request.permission_level)
+            .field("ttl_ms", &self.request.ttl_ms)
+            .finish()
+    }
+}
+
+/// Reads the window this runtime is advertising.
+///
+/// The window is a singleton: a runtime advertises one at a time, so there is
+/// nothing to address by id beyond the snapshot's own `window_id`, which the
+/// caller already holds.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceLanPairingStatusRequest {
+    pub auth: RemoteAuthProof,
+}
+
+impl fmt::Debug for RemoteDeviceLanPairingStatusRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteDeviceLanPairingStatusRequest")
+            .field("auth", &self.auth)
+            .finish()
+    }
+}
+
+/// The device a LAN pairing request names, approved or refused.
+///
+/// A refusal is a decision rather than a cancel: the waiting phone learns that
+/// the operator said no, instead of waiting for a window that will never answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteLanPairingDecision {
+    pub request_id: RequestId,
+    pub approve: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceLanPairingDecisionRequest {
+    pub auth: RemoteAuthProof,
+    pub decision: RemoteLanPairingDecision,
+}
+
+impl fmt::Debug for RemoteDeviceLanPairingDecisionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteDeviceLanPairingDecisionRequest")
+            .field("auth", &self.auth)
+            .field("request_id", &self.decision.request_id)
+            .field("approve", &self.decision.approve)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceCancelLanPairingRequest {
+    pub auth: RemoteAuthProof,
+}
+
+impl fmt::Debug for RemoteDeviceCancelLanPairingRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteDeviceCancelLanPairingRequest")
+            .field("auth", &self.auth)
+            .finish()
+    }
+}
+
+/// The window this runtime is advertising, if it is advertising one.
+///
+/// Absence is a state rather than an error: a runtime that has never opened a
+/// window and one whose window just expired answer the same way, and a client
+/// renders both as "not looking for a device right now".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceLanPairingResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<RemoteLanPairingWindowSnapshot>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1396,6 +1514,12 @@ pub struct RemoteDeviceRenamed {
 pub enum RemoteDeviceRequest {
     CreatePairingOffer(RemoteDeviceCreatePairingOfferRequest),
     CancelPairingOffer(RemoteDeviceCancelPairingOfferRequest),
+    /// Opens a LAN pairing window, which is how a phone that can see this
+    /// machine on its own network asks to pair without a camera.
+    StartLanPairing(RemoteDeviceStartLanPairingRequest),
+    LanPairingStatus(RemoteDeviceLanPairingStatusRequest),
+    DecideLanPairing(RemoteDeviceLanPairingDecisionRequest),
+    CancelLanPairing(RemoteDeviceCancelLanPairingRequest),
     ListDevices(RemoteDeviceListRequest),
     RevokeDevice(RemoteDeviceRevokeRequest),
     RenameDevice(RemoteDeviceRenameRequest),
@@ -1484,6 +1608,10 @@ impl RemoteDeviceRequest {
         match self {
             Self::CreatePairingOffer(_) => RemoteDeviceOperationKind::CreatePairingOffer,
             Self::CancelPairingOffer(_) => RemoteDeviceOperationKind::CancelPairingOffer,
+            Self::StartLanPairing(_) => RemoteDeviceOperationKind::StartLanPairing,
+            Self::LanPairingStatus(_) => RemoteDeviceOperationKind::LanPairingStatus,
+            Self::DecideLanPairing(_) => RemoteDeviceOperationKind::DecideLanPairing,
+            Self::CancelLanPairing(_) => RemoteDeviceOperationKind::CancelLanPairing,
             Self::ListDevices(_) => RemoteDeviceOperationKind::ListDevices,
             Self::RevokeDevice(_) => RemoteDeviceOperationKind::RevokeDevice,
             Self::RenameDevice(_) => RemoteDeviceOperationKind::RenameDevice,
@@ -1992,6 +2120,59 @@ mod tests {
             assert!(!debug.contains("private-route.invalid"));
             assert!(!debug.contains("private-revoke-reason-sentinel"));
         }
+    }
+
+    #[test]
+    fn the_lan_pairing_requests_round_trip_and_name_their_operation() {
+        let auth = RemoteAuthProof {
+            device_id: DeviceId::parse("device_one").unwrap(),
+            auth_token: "device-auth-token-sentinel".to_string(),
+        };
+        let start = RemoteDeviceRequest::StartLanPairing(RemoteDeviceStartLanPairingRequest {
+            auth: auth.clone(),
+            request: RemoteStartLanPairingRequest {
+                permission_level: RemoteDevicePermissionLevel::FullControl,
+                ttl_ms: Some(DEFAULT_PAIRING_TTL_MS),
+            },
+        });
+        assert_eq!(
+            start.operation_kind(),
+            RemoteDeviceOperationKind::StartLanPairing
+        );
+        let decoded: RemoteDeviceRequest =
+            serde_json::from_value(serde_json::to_value(&start).expect("encode")).expect("decode");
+        assert_eq!(decoded, start);
+        // The proof is a secret: the request's debug line says it is there
+        // without saying what it is.
+        assert!(!format!("{start:?}").contains("device-auth-token-sentinel"));
+
+        // A refusal is a decision the waiting phone can render, so it travels
+        // as one rather than as a cancellation.
+        let decision =
+            RemoteDeviceRequest::DecideLanPairing(RemoteDeviceLanPairingDecisionRequest {
+                auth,
+                decision: RemoteLanPairingDecision {
+                    request_id: RequestId::new(),
+                    approve: false,
+                },
+            });
+        assert_eq!(
+            decision.operation_kind(),
+            RemoteDeviceOperationKind::DecideLanPairing
+        );
+        let decoded: RemoteDeviceRequest =
+            serde_json::from_value(serde_json::to_value(&decision).expect("encode"))
+                .expect("decode");
+        assert_eq!(decoded, decision);
+
+        // An absent window is a state rather than an error, so it encodes as an
+        // answer a client can read without special-casing the empty object.
+        let empty =
+            serde_json::to_value(RemoteDeviceLanPairingResponse { window: None }).expect("encode");
+        assert_eq!(empty, serde_json::json!({}));
+        let decoded: RemoteDeviceLanPairingResponse =
+            serde_json::from_value(empty).expect("decode");
+        assert!(decoded.window.is_none());
     }
 
     #[test]

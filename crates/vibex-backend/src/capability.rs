@@ -107,6 +107,10 @@ pub enum BackendOperation {
     ManagementHealth,
     ManagementRelay,
     DevicePairing,
+    /// The runtime can advertise itself on the local network and hold the
+    /// pairing requests a device on that network sends. A runtime without it
+    /// pairs by offer alone, which needs a camera on the other side.
+    DeviceLanPairing,
     DeviceList,
     DeviceRevoke,
     DeviceAudit,
@@ -324,6 +328,7 @@ impl BackendCapabilitySnapshot {
             ]),
             device: DomainCapabilities::available([
                 DevicePairing,
+                DeviceLanPairing,
                 DeviceList,
                 DeviceRevoke,
                 DeviceAudit,

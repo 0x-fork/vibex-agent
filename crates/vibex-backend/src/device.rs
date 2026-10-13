@@ -2,7 +2,8 @@ use vibex_core::{
     RemoteAuditListRequest, RemoteAuditRecord, RemoteCancelPairingOfferRequest,
     RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
-    RemotePairingOfferSummary, RemoteRenameDeviceRequest, RemoteRevokeDeviceRequest,
+    RemoteLanPairingDecision, RemoteLanPairingWindowSnapshot, RemotePairingOfferSummary,
+    RemoteRenameDeviceRequest, RemoteRevokeDeviceRequest, RemoteStartLanPairingRequest,
 };
 
 use crate::{BackendBound, BackendFuture, MutationRequest};
@@ -22,6 +23,27 @@ pub trait DeviceBackend: BackendBound {
         &self,
         request: MutationRequest<RemoteCancelPairingOfferRequest>,
     ) -> BackendFuture<'_, RemotePairingOfferSummary>;
+
+    /// Opens a LAN pairing window: the runtime advertises itself on the local
+    /// network, and a device that finds it asks to pair rather than scanning an
+    /// offer. The window is the discovery half of pairing, so nothing about the
+    /// device is trusted until [`Self::decide_lan_pairing`] approves it.
+    fn start_lan_pairing(
+        &self,
+        request: MutationRequest<RemoteStartLanPairingRequest>,
+    ) -> BackendFuture<'_, RemoteLanPairingWindowSnapshot>;
+
+    /// The window this runtime is advertising, or `None` when there is none.
+    fn lan_pairing_window(&self) -> BackendFuture<'_, Option<RemoteLanPairingWindowSnapshot>>;
+
+    /// Approves or refuses one device that asked to pair through a window.
+    fn decide_lan_pairing(
+        &self,
+        request: MutationRequest<RemoteLanPairingDecision>,
+    ) -> BackendFuture<'_, RemoteLanPairingWindowSnapshot>;
+
+    /// Takes the advertisement down.
+    fn cancel_lan_pairing(&self) -> BackendFuture<'_, ()>;
 
     fn list_devices(&self) -> BackendFuture<'_, Vec<RemoteDeviceDetail>>;
 

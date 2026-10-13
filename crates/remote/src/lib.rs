@@ -147,6 +147,7 @@ struct RemoteRouterState {
     agent_install: Option<Arc<dyn RemoteAgentInstallSource>>,
     composer_commands: Option<Arc<dyn RemoteAgentCommandDiscoverySource>>,
     recovery: Option<Arc<dyn RemoteRecoverySource>>,
+    lan_pairing: Option<Arc<dyn RemoteLanPairingSource>>,
     sidebar_organization: Option<Arc<dyn RemoteSidebarOrganizationSource>>,
     team_service: Option<Arc<dyn RemoteTeamService>>,
     workbench: Option<RemoteWorkbenchRuntime>,
@@ -487,6 +488,39 @@ pub trait RemoteRecoverySource: Send + Sync {
     ) -> VibexResult<vibex_core::BackupRestoreOutcome>;
 }
 
+/// LAN pairing windows, driven by the runtime that owns the advertisement.
+///
+/// A window is more than an offer: the runtime must publish an mDNS
+/// advertisement naming its Direct route, hold the requests that arrive, and
+/// take the advertisement down again. The advertiser lives in the runtime, and
+/// `vibex-remote` sits below it, so the runtime installs this source and the
+/// gateway routes the device operations through it. One implementation then
+/// serves the local seat and a paired client on the network alike.
+#[async_trait]
+pub trait RemoteLanPairingSource: Send + Sync {
+    /// Opens a window, or answers the window already open.
+    async fn start_lan_pairing_window(
+        &self,
+        permission_level: vibex_core::RemoteDevicePermissionLevel,
+        ttl_ms: u32,
+    ) -> VibexResult<vibex_core::RemoteLanPairingWindowSnapshot>;
+
+    /// The window being advertised, or `None` when there is none.
+    async fn lan_pairing_window(
+        &self,
+    ) -> VibexResult<Option<vibex_core::RemoteLanPairingWindowSnapshot>>;
+
+    async fn decide_lan_pairing_request(
+        &self,
+        request_id: &vibex_core::RequestId,
+        approve: bool,
+    ) -> VibexResult<vibex_core::RemoteLanPairingWindowSnapshot>;
+
+    /// Takes the advertisement down. Cancelling a window that is already gone
+    /// is not an error: the caller wanted it stopped, and it is.
+    async fn cancel_lan_pairing_window(&self) -> VibexResult<()>;
+}
+
 #[async_trait]
 pub trait RemoteManagementSnapshotSource: Send + Sync {
     async fn management_snapshot(
@@ -730,6 +764,7 @@ impl RemoteRouterState {
             agent_install: None,
             composer_commands: None,
             recovery: None,
+            lan_pairing: None,
             management_snapshot: None,
             sidebar_organization: None,
             team_service: None,
@@ -756,6 +791,7 @@ impl RemoteRouterState {
             agent_install: None,
             composer_commands: None,
             recovery: None,
+            lan_pairing: None,
             management_snapshot: None,
             sidebar_organization: None,
             team_service: None,
@@ -787,6 +823,7 @@ impl RemoteRouterState {
             agent_install: None,
             composer_commands: None,
             recovery: None,
+            lan_pairing: None,
             management_snapshot: None,
             sidebar_organization: None,
             team_service: None,
@@ -820,6 +857,7 @@ impl RemoteRouterState {
             agent_install: None,
             composer_commands: None,
             recovery: None,
+            lan_pairing: None,
             management_snapshot: None,
             sidebar_organization: None,
             team_service: None,
@@ -1000,6 +1038,19 @@ impl RemoteDispatcher {
 
     pub fn has_recovery_source(&self) -> bool {
         self.state.recovery.is_some()
+    }
+
+    pub fn has_lan_pairing_source(&self) -> bool {
+        self.state.lan_pairing.is_some()
+    }
+
+    pub fn lan_pairing_source(&self) -> Option<&Arc<dyn RemoteLanPairingSource>> {
+        self.state.lan_pairing.as_ref()
+    }
+
+    pub fn with_lan_pairing_source(mut self, source: Arc<dyn RemoteLanPairingSource>) -> Self {
+        self.state.lan_pairing = Some(source);
+        self
     }
 
     pub fn has_composer_command_source(&self) -> bool {
@@ -9996,6 +10047,7 @@ mod tests {
                 agent_install: None,
                 composer_commands: None,
                 recovery: None,
+                lan_pairing: None,
                 sidebar_organization: None,
                 team_service: None,
                 workbench: None,

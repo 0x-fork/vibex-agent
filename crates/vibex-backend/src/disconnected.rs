@@ -1501,6 +1501,30 @@ impl DeviceBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn start_lan_pairing(
+        &self,
+        _request: MutationRequest<vibex_core::RemoteStartLanPairingRequest>,
+    ) -> BackendFuture<'_, vibex_core::RemoteLanPairingWindowSnapshot> {
+        disconnected_future!()
+    }
+
+    fn lan_pairing_window(
+        &self,
+    ) -> BackendFuture<'_, Option<vibex_core::RemoteLanPairingWindowSnapshot>> {
+        disconnected_future!()
+    }
+
+    fn decide_lan_pairing(
+        &self,
+        _request: MutationRequest<vibex_core::RemoteLanPairingDecision>,
+    ) -> BackendFuture<'_, vibex_core::RemoteLanPairingWindowSnapshot> {
+        disconnected_future!()
+    }
+
+    fn cancel_lan_pairing(&self) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
     fn list_devices(&self) -> BackendFuture<'_, Vec<RemoteDeviceDetail>> {
         disconnected_future!()
     }

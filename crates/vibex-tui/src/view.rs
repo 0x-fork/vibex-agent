@@ -185,7 +185,6 @@ fn palette_label(intent: Intent, strings: Strings) -> &'static str {
         Intent::SwitchAgentRuntime => strings.palette_cmd_switch_runtime(),
         Intent::ProbeAgentRuntime => strings.palette_cmd_probe_runtimes(),
         Intent::GotoDevices => strings.palette_cmd_devices(),
-        Intent::CreatePairingCode => strings.palette_cmd_pair_device(),
         Intent::ReloadKeymap => strings.palette_cmd_reload_keys(),
         Intent::Refresh => strings.palette_cmd_refresh(),
         Intent::RequestQuit => strings.palette_cmd_quit(),
@@ -209,7 +208,6 @@ fn palette_hint(intent: Intent, strings: Strings) -> &'static str {
         Intent::SwitchAgentRuntime => strings.palette_hint_switch_runtime(),
         Intent::ProbeAgentRuntime => strings.palette_hint_probe_runtimes(),
         Intent::GotoDevices => strings.palette_hint_devices(),
-        Intent::CreatePairingCode => strings.palette_hint_pair_device(),
         Intent::ReloadKeymap => strings.palette_hint_reload_keys(),
         Intent::Refresh => strings.palette_hint_refresh(),
         Intent::RequestQuit => strings.palette_hint_quit(),
@@ -257,9 +255,6 @@ pub const PALETTE: &[PaletteEntry] = &[
     },
     PaletteEntry {
         intent: Intent::GotoDevices,
-    },
-    PaletteEntry {
-        intent: Intent::CreatePairingCode,
     },
     PaletteEntry {
         intent: Intent::ReloadKeymap,
@@ -313,10 +308,9 @@ pub const fn palette_group(intent: Intent) -> PaletteGroup {
         | Intent::ToggleSidebar
         | Intent::FocusNext
         | Intent::FocusPrevious => PaletteGroup::View,
-        Intent::GotoDevices
-        | Intent::CreatePairingCode
-        | Intent::RevokeSelectedDevice
-        | Intent::OpenDeviceAudit => PaletteGroup::Pairing,
+        Intent::GotoDevices | Intent::RevokeSelectedDevice | Intent::OpenDeviceAudit => {
+            PaletteGroup::Pairing
+        }
         Intent::NewSession
         | Intent::BeginRenameSession
         | Intent::ForkSession
@@ -4857,6 +4851,20 @@ fn textwrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// The devices page: pairing on one half, the trust store on the other.
+///
+/// Pairing a device and checking that it arrived are one job — the reader opens
+/// this page to let something in, and the list of what is already in is how
+/// they check that it worked — so the two share a page and are separated by a
+/// tab strip rather than by a palette verb.
+///
+/// The pairing half lists the ways *this* runtime can be paired and nothing
+/// else. A phone always scans; a phone on the same network can also be found
+/// when the runtime can advertise itself; a second desktop can only be handed a
+/// code or a link by a headless runtime, because a desktop shell pairs phones
+/// and does not accept another desktop as a client. A row that cannot work is
+/// absent rather than disabled: a page that lists a verb the runtime will
+/// refuse teaches the reader to distrust the page.
 fn render_devices(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -4864,11 +4872,497 @@ fn render_devices(
     theme: &TuiTheme,
     strings: Strings,
 ) {
-    let inner = page_frame(frame, area, theme, strings.devices_title(), true);
-    let rows = Layout::default()
+    let inner = page_frame(frame, area, theme, strings.management_devices(), true);
+    if inner.width < 24 || inner.height < 4 {
+        empty_state(frame, inner, theme, strings.devices_pair_unavailable());
+        return;
+    }
+    let bands = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
+    render_device_tabs(frame, bands[0], app, theme, strings);
+    // The rule under the strip is the strip's own bottom edge, in the
+    // configuration centre's language: the tabs are a strip rather than a pane,
+    // so the rule belongs to them.
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(usize::from(bands[1].width)),
+            Style::default().fg(theme.roles.gray_dim),
+        ))),
+        bands[1],
+    );
+    match app.device_center.tab {
+        crate::device_center::DeviceTab::Pair => {
+            render_pair_rows(frame, bands[2], app, theme, strings);
+        }
+        crate::device_center::DeviceTab::Devices => {
+            render_paired_devices(frame, bands[2], app, theme, strings);
+        }
+    }
+    render_device_footer(frame, bands[3], app, theme, strings);
+}
+
+/// The page's two halves, drawn as the configuration centre draws its modules.
+///
+/// What sits on the right is the runtime this page pairs and what kind it is.
+/// The kind is why a row is missing, so it is worth naming before the reader
+/// wonders where the desktop row went.
+fn render_device_tabs(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0u16;
+    for tab in crate::device_center::DeviceTab::ALL {
+        let active = tab == app.device_center.tab;
+        let label = format!(" {} ", tab.label(strings));
+        let width = display_width(&label) as u16;
+        if used + width > area.width {
+            break;
+        }
+        let style = if active {
+            Style::default()
+                .fg(theme.roles.background)
+                .bg(theme.roles.accent_user)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.roles.gray)
+        };
+        app.regions.device_tabs.push((
+            Rect {
+                x: area.x + used,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            tab,
+        ));
+        spans.push(Span::styled(label, style));
+        spans.push(Span::styled(" ", Style::default()));
+        used += width + 1;
+    }
+    let kind = runtime_kind_label(app.runtime_kind, strings);
+    let kind_label = format!("{kind}  ");
+    let kind_width = display_width(&kind_label) as u16;
+    if used + kind_width + 2 < area.width {
+        spans.push(Span::raw(
+            " ".repeat(usize::from(area.width - used - kind_width - 1)),
+        ));
+        spans.push(Span::styled(
+            kind_label,
+            Style::default().fg(theme.roles.gray_dim),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The runtime's kind, as the tab strip names it.
+fn runtime_kind_label(kind: vibex_core::RemoteServerKind, strings: Strings) -> &'static str {
+    match kind {
+        vibex_core::RemoteServerKind::Desktop => strings.devices_runtime_desktop(),
+        vibex_core::RemoteServerKind::Headless => strings.devices_runtime_headless(),
+        vibex_core::RemoteServerKind::Unknown => strings.devices_runtime_unknown(),
+    }
+}
+
+/// The pairing half: one row per way to pair, with the open row's panel under
+/// it.
+fn render_pair_rows(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let methods = app.device_pair_methods();
+    if methods.is_empty() {
+        // "This runtime cannot pair one" and "your grant does not allow it" are
+        // different answers, and only one of them is the reader's to fix.
+        let message = match app.availability(vibex_backend::BackendOperation::DevicePairing) {
+            Availability::RequiresPermission => strings.permission_required_for(),
+            _ => strings.devices_pair_unavailable(),
+        };
+        empty_state(frame, area, theme, message);
+        return;
+    }
+    let selected = app.device_cursor();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut rows: Vec<(usize, usize)> = Vec::new();
+    for (index, method) in methods.iter().enumerate() {
+        let open = app.device_center.open == Some(*method);
+        rows.push((lines.len(), index));
+        lines.push(pair_row_line(
+            *method,
+            index == selected,
+            open,
+            area.width,
+            app.glyph_tier(),
+            theme,
+            strings,
+        ));
+        if open {
+            push_pair_panel(&mut lines, *method, app, area, theme, strings);
+        }
+    }
+    for (offset, index) in rows {
+        if offset >= usize::from(area.height) {
+            continue;
+        }
+        app.regions.device_rows.push((
+            Rect {
+                x: area.x,
+                y: area.y + offset as u16,
+                width: area.width,
+                height: 1,
+            },
+            index,
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// One way to pair: the reader's action, and who can take it.
+fn pair_row_line(
+    method: crate::device_center::PairMethod,
+    selected: bool,
+    open: bool,
+    width: u16,
+    tier: crate::glyphs::GlyphTier,
+    theme: &TuiTheme,
+    strings: Strings,
+) -> Line<'static> {
+    let scope = method.scope(strings);
+    let label_width = usize::from(width)
+        .saturating_sub(6 + display_width(scope))
+        .max(8);
+    let label = truncate_to_width(method.label(strings), label_width, "…");
+    Line::from(vec![
+        // The bar marks the row the keyboard is on; the others are indented by
+        // its width so the labels line up.
+        Span::styled(
+            if selected {
+                format!("{} ", crate::glyphs::accent_bar(tier))
+            } else {
+                "  ".to_string()
+            },
+            Style::default().fg(theme.roles.accent_user),
+        ),
+        Span::styled(
+            format!("{} ", crate::glyphs::disclosure(open, tier)),
+            Style::default().fg(theme.roles.gray_dim),
+        ),
+        Span::styled(
+            format!("{label:<label_width$}"),
+            if selected {
+                theme.selected()
+            } else {
+                theme.base()
+            },
+        ),
+        Span::styled(
+            format!("  {scope}"),
+            Style::default().fg(theme.roles.gray_dim),
+        ),
+    ])
+}
+
+/// The panel under an open pairing row: what the reader does with the way they
+/// opened.
+fn push_pair_panel(
+    lines: &mut Vec<Line<'static>>,
+    method: crate::device_center::PairMethod,
+    app: &App,
+    area: Rect,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    use crate::device_center::PairMethod;
+    let pairing = &app.device_center.pairing;
+    let indent = "    ";
+    if pairing.busy == Some(method) {
+        let frames = crate::glyphs::spinner_frames(app.glyph_tier());
+        let frame = crate::glyphs::frame_at(frames, app.animation_phase(), 2);
+        lines.push(Line::from(Span::styled(
+            format!("{indent}{frame} {}", strings.devices_pair_working()),
+            theme.muted(),
+        )));
+        return;
+    }
+    if let Some(error) = pairing
+        .error
+        .as_ref()
+        .filter(|error| error.method == method)
+    {
+        lines.push(Line::from(Span::styled(
+            format!("{indent}{}", pairing_error_copy(strings, error)),
+            theme.danger(),
+        )));
+        return;
+    }
+    match method {
+        PairMethod::QrCode | PairMethod::CodeOrLink => {
+            push_offer_panel(lines, method, app, area, theme, strings);
+        }
+        PairMethod::LocalNetwork => push_window_panel(lines, app, theme, strings),
+    }
+}
+
+/// The offer, drawn as a QR code for a phone and as a link for a desktop.
+fn push_offer_panel(
+    lines: &mut Vec<Line<'static>>,
+    method: crate::device_center::PairMethod,
+    app: &App,
+    area: Rect,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    use crate::device_center::PairMethod;
+    let indent = "    ";
+    let text_width = usize::from(area.width).saturating_sub(indent.len()).max(8);
+    let now_ms = vibex_core::unix_timestamp_ms();
+    let Some(offer) = app.device_center.pairing.live_offer(now_ms) else {
+        // A code the runtime has stopped accepting is not a code: the row says
+        // so, and the next press mints a new one.
+        let message = if app.device_center.pairing.offer.is_some() {
+            strings.devices_offer_expired()
+        } else {
+            strings.devices_pair_hint()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{indent}{message}"),
+            theme.muted(),
+        )));
+        return;
+    };
+    // What the reader has to hand decides which half of the panel matters: a
+    // phone reads the code, a desktop pastes the link.
+    let hint = if method == PairMethod::QrCode {
+        strings.devices_qr_hint()
+    } else {
+        strings.devices_link_hint()
+    };
+    lines.push(Line::from(Span::styled(
+        format!("{indent}{hint}"),
+        theme.accent(),
+    )));
+    if method == PairMethod::QrCode {
+        // The QR is the whole point of this row, so it is drawn first and the
+        // link below it is the fallback. A terminal that cannot hold it says so
+        // rather than drawing a code no camera could read: a code that is cut
+        // off is worse than no code, because it looks scannable.
+        let link_lines = textwrap(&offer.url, text_width).len();
+        // The hint above, the code line, the link and its label, the closing
+        // hint: everything the QR must leave room for.
+        let reserved = 4 + link_lines;
+        let room = usize::from(area.height)
+            .saturating_sub(lines.len())
+            .saturating_sub(reserved);
+        let blocks = qr_blocks(&offer.url, text_width, room, app.glyph_tier());
+        match blocks {
+            Some(blocks) => {
+                for block in blocks {
+                    lines.push(Line::from(Span::styled(
+                        format!("{indent}{block}"),
+                        theme.base(),
+                    )));
+                }
+            }
+            None => {
+                // Two different reasons, two different answers: a terminal whose
+                // font has no half blocks cannot draw a code at any size, and
+                // one that is merely small can be widened.
+                let message = if app.glyph_tier() == crate::glyphs::GlyphTier::Full {
+                    strings.devices_qr_no_room()
+                } else {
+                    strings.devices_qr_no_glyphs()
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{indent}{message}"),
+                    theme.warning(),
+                )));
+            }
+        }
+    }
+    let permission = match offer.permission {
+        vibex_core::RemoteDevicePermissionLevel::ReadOnly => strings.permission_read_only(),
+        vibex_core::RemoteDevicePermissionLevel::ApproveOnly => strings.permission_approve_only(),
+        vibex_core::RemoteDevicePermissionLevel::FullControl => strings.permission_full_control(),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{indent}{}: ", strings.devices_pairing_code()),
+            theme.muted(),
+        ),
+        Span::styled(
+            offer.code.clone(),
+            theme.strong().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("   {}: ", strings.devices_permission()),
+            theme.muted(),
+        ),
+        Span::styled(permission.to_string(), theme.accent()),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!("{indent}{}:", strings.devices_link()),
+        theme.muted(),
+    )));
+    for piece in textwrap(&offer.url, text_width) {
+        lines.push(Line::from(Span::styled(
+            format!("{indent}{piece}"),
+            theme.muted(),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("{indent}{}", strings.devices_code_hint()),
+        theme.warning(),
+    )));
+}
+
+/// The advertisement, and whoever has answered it so far.
+fn push_window_panel(
+    lines: &mut Vec<Line<'static>>,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let indent = "    ";
+    let pairing = &app.device_center.pairing;
+    let now_ms = vibex_core::unix_timestamp_ms();
+    let live = pairing.window.as_ref().filter(|_| !pairing.expired(now_ms));
+    let Some(window) = live else {
+        // No window, or one the runtime has taken down: both are the reader
+        // being told there is nothing to answer, and the next press starts a
+        // new one.
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{indent}{} — {}",
+                strings.devices_lan_expired(),
+                strings.devices_lan_restart()
+            ),
+            theme.warning(),
+        )));
+        return;
+    };
+    let remaining = (window.discovery.expires_at_ms - now_ms)
+        .div_euclid(1_000)
+        .max(0);
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{indent}{}", strings.devices_lan_advertising()),
+            theme.accent(),
+        ),
+        Span::styled(
+            format!("   {} {remaining}s", strings.devices_lan_closes_in()),
+            theme.muted(),
+        ),
+    ]));
+    match pairing.pending() {
+        None => lines.push(Line::from(Span::styled(
+            format!("{indent}{}", strings.devices_lan_waiting()),
+            theme.muted(),
+        ))),
+        Some(request) => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{indent}{}: ", strings.devices_lan_request()),
+                    theme.muted(),
+                ),
+                Span::styled(request.display_name.clone(), theme.strong()),
+                Span::styled(
+                    format!(" · {}", request.device_fingerprint),
+                    theme.dimmed(theme.roles.gray),
+                ),
+                Span::styled(
+                    format!("   {}: ", strings.devices_pairing_code()),
+                    theme.muted(),
+                ),
+                Span::styled(
+                    request.verification_code.clone(),
+                    theme
+                        .strong()
+                        .add_modifier(Modifier::BOLD)
+                        .fg(theme.roles.accent_user),
+                ),
+            ]));
+            if pairing.waiting() > 1 {
+                lines.push(Line::from(Span::styled(
+                    format!("{indent}{}", strings.devices_lan_more()),
+                    theme.muted(),
+                )));
+            }
+        }
+    }
+}
+
+/// The QR code for one link, or nothing when the terminal cannot hold it.
+///
+/// A QR code has to be square in modules, and one character cell is about twice
+/// as tall as it is wide, so the half-block renderer puts two module rows in
+/// every text row. A link this long needs a large terminal; one that is too
+/// small is told so rather than shown a code that cannot be read.
+fn qr_blocks(
+    url: &str,
+    width: usize,
+    height: usize,
+    tier: crate::glyphs::GlyphTier,
+) -> Option<Vec<String>> {
+    if tier != crate::glyphs::GlyphTier::Full || width == 0 || height == 0 {
+        return None;
+    }
+    let code = QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::L).ok()?;
+    let image = code.render::<Dense1x2>().quiet_zone(true).build();
+    let blocks: Vec<String> = image.lines().map(str::to_string).collect();
+    let block_width = blocks.iter().map(|block| display_width(block)).max()?;
+    if block_width > width || blocks.len() > height {
+        return None;
+    }
+    Some(blocks)
+}
+
+/// What a failed pairing action means for the reader, and what to do next.
+///
+/// The runtime's own sentence is the fallback: the codes worth naming are the
+/// ones with a recovery the reader can act on, and inventing copy for the rest
+/// would be guessing at a cause the runtime already stated.
+fn pairing_error_copy(strings: Strings, error: &crate::device_center::PairingError) -> String {
+    let recovery = match error.code.as_str() {
+        "remote_lan_direct_unavailable" | "remote_lan_tls_incompatible" => {
+            Some(strings.devices_error_direct_unavailable())
+        }
+        "remote_lan_pairing_unavailable" => Some(strings.devices_error_lan_unavailable()),
+        "remote_lan_pairing_window_unavailable" | "remote_lan_pairing_request_unavailable" => {
+            Some(strings.devices_error_request_settled())
+        }
+        "remote_permission_denied" => Some(strings.devices_error_permission()),
+        _ => None,
+    };
+    match recovery {
+        Some(copy) => format!("{copy} ({})", error.message),
+        None => error.message.clone(),
+    }
+}
+
+/// The trust store: the devices this runtime has paired.
+fn render_paired_devices(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
     // A backend that does not offer device management says so rather than
     // drawing an empty list: "no devices" and "this runtime cannot pair one"
     // are different answers, and only one of them is the reader's to fix.
@@ -4877,55 +5371,80 @@ fn render_devices(
             Availability::RequiresPermission => strings.permission_required_for(),
             _ => strings.toast_action_unavailable(),
         };
-        empty_state(frame, rows[0], theme, message);
+        empty_state(frame, area, theme, message);
         return;
     }
     if app.management_data.devices.is_empty() {
-        empty_state(frame, rows[0], theme, strings.devices_empty());
-    } else {
-        let selected = app.selection_for(Scope::Devices);
-        let items = app
-            .management_data
-            .devices
-            .iter()
-            .enumerate()
-            .map(|(index, device)| {
-                let style = if index == selected {
-                    theme.selected()
-                } else {
-                    theme.base()
-                };
-                let permission = match device.permission_level {
-                    vibex_core::RemoteDevicePermissionLevel::ReadOnly => {
-                        strings.permission_read_only()
-                    }
-                    vibex_core::RemoteDevicePermissionLevel::ApproveOnly => {
-                        strings.permission_approve_only()
-                    }
-                    vibex_core::RemoteDevicePermissionLevel::FullControl => {
-                        strings.permission_full_control()
-                    }
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{:<24}", truncate_to_width(&device.display_name, 24, "…")),
-                        style,
-                    ),
-                    Span::styled(format!("{permission:<14}"), theme.muted()),
-                    Span::styled(format!("{:?}", device.status), theme.muted()),
-                ]))
-            })
-            .collect::<Vec<_>>();
-        let mut state = ratatui::widgets::ListState::default();
-        state.select(Some(selected.min(app.management_data.devices.len() - 1)));
-        frame.render_stateful_widget(List::new(items), rows[0], &mut state);
+        empty_state(frame, area, theme, strings.devices_empty());
+        return;
     }
-    let audit_hint = format!(
-        "{}: {}",
-        strings.devices_audit(),
-        app.management_data.audit.len()
-    );
-    frame.render_widget(Paragraph::new(audit_hint).style(theme.muted()), rows[1]);
+    let selected = app.device_cursor();
+    let items = app
+        .management_data
+        .devices
+        .iter()
+        .enumerate()
+        .map(|(index, device)| {
+            let style = if index == selected {
+                theme.selected()
+            } else {
+                theme.base()
+            };
+            let permission = match device.permission_level {
+                vibex_core::RemoteDevicePermissionLevel::ReadOnly => strings.permission_read_only(),
+                vibex_core::RemoteDevicePermissionLevel::ApproveOnly => {
+                    strings.permission_approve_only()
+                }
+                vibex_core::RemoteDevicePermissionLevel::FullControl => {
+                    strings.permission_full_control()
+                }
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<24}", truncate_to_width(&device.display_name, 24, "…")),
+                    style,
+                ),
+                Span::styled(format!("{permission:<14}"), theme.muted()),
+                Span::styled(format!("{:?}", device.status), theme.muted()),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    for (index, _) in app.management_data.devices.iter().enumerate() {
+        if index >= usize::from(area.height) {
+            break;
+        }
+        app.regions.device_rows.push((
+            Rect {
+                x: area.x,
+                y: area.y + index as u16,
+                width: area.width,
+                height: 1,
+            },
+            index,
+        ));
+    }
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(selected.min(app.management_data.devices.len() - 1)));
+    frame.render_stateful_widget(List::new(items), area, &mut state);
+}
+
+/// The line under the two halves: what the open half counts, or what to press.
+fn render_device_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let text = match app.device_center.tab {
+        crate::device_center::DeviceTab::Pair => strings.devices_pair_hint().to_string(),
+        crate::device_center::DeviceTab::Devices => format!(
+            "{}: {}",
+            strings.devices_audit(),
+            app.management_data.audit.len()
+        ),
+    };
+    frame.render_widget(Paragraph::new(text).style(theme.muted()), area);
 }
 
 fn render_settings(
@@ -6541,13 +7060,6 @@ fn render_overlay(
         }
         Overlay::Approval { selected } => render_approval(frame, area, app, *selected, theme),
         Overlay::Elicitation { field } => render_elicitation(frame, area, app, *field, theme),
-        Overlay::PairingCode {
-            code,
-            link,
-            permission,
-        } => {
-            render_pairing(frame, area, app, code, link, *permission, theme);
-        }
         Overlay::RuntimePicker { view, selected } => {
             render_runtime_picker(frame, area, app, *view, *selected, theme);
         }
@@ -6946,62 +7458,6 @@ fn summarize_answer(
         }
         Some(vibex_core::ElicitationAnswerValue::StringArray(values)) => values.join(", "),
         None => String::new(),
-    }
-}
-
-fn render_pairing(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &mut App,
-    code: &str,
-    link: &str,
-    permission: vibex_core::RemoteDevicePermissionLevel,
-    theme: &TuiTheme,
-) {
-    let strings = app.strings;
-    let chrome = modal_chrome(
-        app,
-        strings.devices_pairing_code(),
-        ModalSizing::picker(),
-        vec![ModalHint::new("Esc", strings.close())],
-    );
-    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
-        return;
-    };
-    let rows = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(24), Constraint::Length(46)])
-        .split(layout.content);
-
-    let permission_label = match permission {
-        vibex_core::RemoteDevicePermissionLevel::ReadOnly => strings.permission_read_only(),
-        vibex_core::RemoteDevicePermissionLevel::ApproveOnly => strings.permission_approve_only(),
-        vibex_core::RemoteDevicePermissionLevel::FullControl => strings.permission_full_control(),
-    };
-    let lines = vec![
-        Line::from(Span::styled(
-            code.to_string(),
-            theme.strong().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(format!("{}: ", strings.devices_permission()), theme.muted()),
-            Span::styled(permission_label, theme.accent()),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(link.to_string(), theme.muted())),
-        Line::from(""),
-        Line::from(Span::styled(strings.devices_code_hint(), theme.warning())),
-    ];
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }),
-        rows[0],
-    );
-
-    // The QR is rendered from the link, which already carries the TLS pin.
-    if let Ok(qr) = QrCode::with_error_correction_level(link.as_bytes(), qrcode::EcLevel::L) {
-        let image = qr.render::<Dense1x2>().quiet_zone(false).build();
-        frame.render_widget(Paragraph::new(image).style(theme.base()), rows[1]);
     }
 }
 

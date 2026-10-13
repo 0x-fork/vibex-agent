@@ -93,6 +93,15 @@ impl std::error::Error for SeatError {}
 /// A resolved, ready-to-run client.
 pub struct Seat {
     pub kind: SeatKind,
+    /// What the runtime on the other end is.
+    ///
+    /// The interface answers two different questions with it — which clients
+    /// this runtime can pair, and whether it can advertise itself on the local
+    /// network — and neither is derivable from the seat: the same authority
+    /// seat is a desktop shell on one machine and a headless daemon on another.
+    /// `Unknown` is a real answer: a peer that predates the field is rendered
+    /// without a kind rather than guessed at.
+    pub runtime_kind: vibex_core::RemoteServerKind,
     pub facade: BackendFacade,
     /// The home this client resolved. The authority seat keeps a handle to the
     /// runtime so the home lock lives as long as the process.
@@ -272,6 +281,9 @@ impl Seat {
         // A locally started runtime must accept its own clients, otherwise the
         // next `vibex tui` on this machine hits the same wall.
         config.remote_gateway.service.enabled = true;
+        // Read before the config is moved into the runtime: which flavour this
+        // home is decides what the pairing page may offer.
+        let runtime_kind = config.remote_gateway.server_kind;
         let runtime =
             DesktopRuntime::start(config)
                 .await
@@ -281,6 +293,7 @@ impl Seat {
         let facade = Arc::new(NativeBackend::new(runtime.clone())).facade();
         Ok(Self {
             kind: SeatKind::Authority,
+            runtime_kind,
             facade,
             home,
             _runtime: Some(runtime),
@@ -354,7 +367,13 @@ impl Seat {
         remote.client_id = "vibex-tui".to_string();
         remote.client_type = RemoteClientType::Native;
         remote.allow_insecure_local_dev = stored.allow_insecure_local_dev;
-        Self::from_remote_config(remote, stored.pinned_tls_certificate_der, None, home).map(Some)
+        Self::from_remote_config(
+            remote,
+            stored.pinned_tls_certificate_der,
+            stored.server_kind,
+            home,
+        )
+        .map(Some)
     }
 
     async fn from_saved_url(home: &Path, url: &str) -> Result<Self, SeatError> {
@@ -480,13 +499,13 @@ impl Seat {
         remote.client_id = "vibex-tui".to_string();
         remote.client_type = RemoteClientType::Native;
         remote.allow_insecure_local_dev = !is_tls;
-        Self::from_remote_config(remote, pin, None, home)
+        Self::from_remote_config(remote, pin, bundle.server_kind, home)
     }
 
     fn from_remote_config(
         remote: RemoteClientConfig,
         pinned: Option<String>,
-        _bundle: Option<&vibex_remote_client::PairingCodeClientBundle>,
+        runtime_kind: vibex_core::RemoteServerKind,
         home: &Path,
     ) -> Result<Self, SeatError> {
         remote.validate().map_err(|error| SeatError::Environment {
@@ -509,6 +528,7 @@ impl Seat {
         let facade = Arc::new(WebRemoteBackend::from_auto(transport)).facade();
         Ok(Self {
             kind: SeatKind::Remote,
+            runtime_kind,
             facade,
             home: home.to_path_buf(),
             _runtime: None,
@@ -755,6 +775,12 @@ struct StoredCredential {
     pinned_tls_certificate_der: Option<String>,
     #[serde(default)]
     allow_insecure_local_dev: bool,
+    /// What the runtime called itself when this credential was claimed. Kept
+    /// beside the credential because the kind is a property of the runtime, not
+    /// of the connection, and re-reading it would mean being online. A
+    /// credential written before the field exists decodes as `Unknown`.
+    #[serde(default)]
+    server_kind: vibex_core::RemoteServerKind,
 }
 
 /// Persist a freshly claimed credential with owner-only permissions.
@@ -783,6 +809,7 @@ fn save_bundle_credential(
         server_identity_public_key: bundle.credential.server_identity_public_key.clone(),
         pinned_tls_certificate_der: pinned.map(str::to_string),
         allow_insecure_local_dev: pinned.is_none(),
+        server_kind: bundle.server_kind,
     };
     let encoded = serde_json::to_vec(&stored).map_err(|error| SeatError::Environment {
         detail: format!("could not encode the credential: {error}"),

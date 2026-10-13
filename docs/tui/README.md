@@ -693,7 +693,8 @@ option. Elicitation forms are filled field by field and submitted with `s`.
 
 ### Management
 
-Agents, Providers, MCP servers, Skills, Prompts and Devices.
+Agents, Providers, MCP servers, Skills and Prompts. Devices have a page of
+their own, below.
 Every row shows its availability: an operation the authority does not offer, or
 that this device's grant does not permit, is visible and explains itself rather
 than disappearing.
@@ -703,9 +704,33 @@ explains the value is sent to the runtime and cleared locally.
 
 ### Devices
 
-Pairing issues a one-time code with a scannable link, shows it once, and never
-writes it to logs or configuration. Devices can be renamed and revoked, and the
-remote-protocol audit trail is readable here.
+Pairing a device and checking what is already paired are one job, so they share
+one page with two halves and a tab strip: `←`/`→`, or a click, moves between
+**Pair** and **Paired devices**.
+
+The pairing half lists the ways *this* runtime can be paired, and nothing else —
+a row the runtime would refuse is absent rather than disabled:
+
+| Row | Offered when | What it does |
+| --- | --- | --- |
+| Pair with a QR code | always | mints a one-time offer and draws it as a QR code, a one-time code and a link |
+| Find a device on this network | the runtime is a desktop shell that can advertise itself | opens a local-network pairing window and approves what answers it |
+| Pair with a code or link | the runtime is headless | shows the link a second desktop pastes into its add-runtime form |
+
+`Enter` opens the highlighted row in place and `Esc` closes it. The QR code is
+drawn only when the terminal can hold a code a camera could read; a smaller
+terminal says so and gives the link instead. A one-time code is shown once, is
+never written to logs or configuration, and is dropped when the reader leaves
+the pairing half.
+
+While the local-network row is open, `a` allows and `r` refuses the device
+waiting on it — the panel names the device and the verification code both
+screens show. The window closes itself after ninety seconds; `Enter` on the
+closed panel looks again.
+
+The devices half is the trust store: what is paired, at which permission level
+and whether it is connected, with `x` to revoke and `u` for the remote-protocol
+audit trail.
 
 ### Settings
 

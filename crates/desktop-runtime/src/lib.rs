@@ -1456,6 +1456,87 @@ impl vibex_remote::RemoteRecoverySource for RecoverySource {
     }
 }
 
+/// Serves LAN pairing windows to the gateway.
+///
+/// A window needs more than the gateway: the Direct route must be probed for
+/// mobile-compatible TLS and the advertisement must go up over mDNS, and both
+/// of those belong to the connectivity controller. The dispatcher is built
+/// before the controller, so the slot is filled once the runtime exists. A
+/// runtime that never fills it — a headless service that cannot advertise
+/// itself — answers the device operations with a capability error instead of
+/// opening a window nobody would ever see.
+pub struct LanPairingSource {
+    connectivity: Arc<std::sync::OnceLock<RemoteConnectivityController>>,
+}
+
+impl LanPairingSource {
+    pub fn new() -> (Self, Arc<std::sync::OnceLock<RemoteConnectivityController>>) {
+        let cell = Arc::new(std::sync::OnceLock::new());
+        (
+            Self {
+                connectivity: cell.clone(),
+            },
+            cell,
+        )
+    }
+
+    fn connectivity(&self) -> VibexResult<&RemoteConnectivityController> {
+        self.connectivity.get().ok_or_else(|| {
+            VibexError::capability(
+                "remote_lan_pairing_unavailable",
+                "this runtime cannot advertise itself for local-network pairing",
+            )
+        })
+    }
+}
+
+#[async_trait]
+impl vibex_remote::RemoteLanPairingSource for LanPairingSource {
+    async fn start_lan_pairing_window(
+        &self,
+        permission_level: vibex_core::RemoteDevicePermissionLevel,
+        ttl_ms: u32,
+    ) -> VibexResult<vibex_core::RemoteLanPairingWindowSnapshot> {
+        self.connectivity()?
+            .start_lan_pairing_window(permission_level, ttl_ms)
+            .await
+    }
+
+    async fn lan_pairing_window(
+        &self,
+    ) -> VibexResult<Option<vibex_core::RemoteLanPairingWindowSnapshot>> {
+        // A window that has expired, been claimed, or never existed is the same
+        // answer to the client: this runtime is not looking for a device.
+        match self.connectivity()?.lan_pairing_window_status() {
+            Ok(window) => Ok(Some(window)),
+            Err(error) if error.code == "remote_lan_pairing_window_unavailable" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn decide_lan_pairing_request(
+        &self,
+        request_id: &vibex_core::RequestId,
+        approve: bool,
+    ) -> VibexResult<vibex_core::RemoteLanPairingWindowSnapshot> {
+        let connectivity = self.connectivity()?;
+        if approve {
+            connectivity.approve_lan_pairing_request(request_id)
+        } else {
+            connectivity.reject_lan_pairing_request(request_id)
+        }
+    }
+
+    async fn cancel_lan_pairing_window(&self) -> VibexResult<()> {
+        match self.connectivity() {
+            Ok(connectivity) => connectivity.cancel_lan_pairing_window(),
+            // No controller means no advertisement was ever started, which is
+            // the state the caller asked for.
+            Err(_) => Ok(()),
+        }
+    }
+}
+
 /// Serves managed-Agent installation to the gateway.
 pub struct AgentInstallSource {
     agent: AgentHandle,
@@ -2441,6 +2522,7 @@ impl DesktopRuntime {
         );
         let management_snapshot_cell;
         let recovery_cell;
+        let lan_pairing_cell;
         let sidebar_organization = SidebarOrganizationBridge::new();
         let timeline_display_settings = TimelineDisplaySettingsBridge::new();
         // The presentation bridge is separate from the sidebar organization
@@ -2505,6 +2587,11 @@ impl DesktopRuntime {
             .with_recovery_source({
                 let (source, cell) = RecoverySource::new();
                 recovery_cell = cell;
+                Arc::new(source)
+            })
+            .with_lan_pairing_source({
+                let (source, cell) = LanPairingSource::new();
+                lan_pairing_cell = cell;
                 Arc::new(source)
             })
             .with_automation_source(Arc::new(AutomationSource::new(AutomationHandle {
@@ -2764,6 +2851,7 @@ impl DesktopRuntime {
         }
         let _ = management_snapshot_cell.set(runtime.management());
         let _ = recovery_cell.set(runtime.management());
+        let _ = lan_pairing_cell.set(runtime.remote_connectivity());
         startup_stage("timeline_compaction_spawn", || {
             runtime.spawn_timeline_compaction()
         })?;

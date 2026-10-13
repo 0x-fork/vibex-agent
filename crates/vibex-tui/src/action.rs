@@ -204,7 +204,11 @@ intents! {
     // ---- providers ------------------------------------------------------
 
     // ---- devices --------------------------------------------------------
-    CreatePairingCode => { scope: Devices, id: "device_pair", label: "Pair", help: "Issue a one-time pairing code and link." },
+    ActivateDevicePairing => { scope: Devices, id: "device_pair_activate", label: "Open", help: "Open the highlighted way to pair a device." },
+    DevicesTabNext => { scope: Devices, id: "device_tab_next", label: "Tab", help: "Move to the other half of the devices page." },
+    DevicesTabPrevious => { scope: Devices, id: "device_tab_previous", label: "Tab", help: "Move to the other half of the devices page." },
+    AllowLanPairing => { scope: Devices, id: "device_lan_allow", label: "Allow", help: "Approve the device that asked to pair on this network." },
+    RefuseLanPairing => { scope: Devices, id: "device_lan_refuse", label: "Refuse", help: "Refuse the device that asked to pair on this network." },
     RevokeSelectedDevice => { scope: Devices, id: "device_revoke", label: "Revoke", help: "Revoke the highlighted device's access." },
     OpenDeviceAudit => { scope: Devices, id: "device_audit", label: "Audit", help: "Show the remote-protocol audit trail." },
 
@@ -242,7 +246,9 @@ impl Intent {
                 | Intent::ArchiveSession
                 | Intent::UnarchiveSession
                 | Intent::DeleteSession
-                | Intent::CreatePairingCode
+                | Intent::ActivateDevicePairing
+                | Intent::AllowLanPairing
+                | Intent::RefuseLanPairing
                 | Intent::RevokeSelectedDevice
                 | Intent::ToggleSelectedEntry
                 | Intent::EditSelectedEntry

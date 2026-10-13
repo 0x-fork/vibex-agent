@@ -164,6 +164,7 @@ fn run(arguments: Vec<String>) -> Result<ExitCode, Failure> {
 
     let mut options = TuiOptions {
         seat: seat.kind,
+        runtime_kind: seat.runtime_kind,
         ..TuiOptions::default()
     };
     if let Some(theme) = theme {

@@ -6557,6 +6557,105 @@ impl DeviceBackend for WebRemoteBackend {
         })
     }
 
+    fn start_lan_pairing(
+        &self,
+        request: MutationRequest<vibex_core::RemoteStartLanPairingRequest>,
+    ) -> BackendFuture<'_, vibex_core::RemoteLanPairingWindowSnapshot> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteDeviceRequest::StartLanPairing(
+                vibex_core::RemoteDeviceStartLanPairingRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            // Opening a window probes the Direct route and raises the mDNS
+            // advertisement, which is slower than a trust-store write.
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            decode::<vibex_core::RemoteDeviceLanPairingResponse>(value)?
+                .window
+                .ok_or_else(lan_pairing_window_missing)
+        })
+    }
+
+    fn lan_pairing_window(
+        &self,
+    ) -> BackendFuture<'_, Option<vibex_core::RemoteLanPairingWindowSnapshot>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteDeviceRequest::LanPairingStatus(
+                vibex_core::RemoteDeviceLanPairingStatusRequest { auth: this.auth() },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteDeviceLanPairingResponse>(value)?.window)
+        })
+    }
+
+    fn decide_lan_pairing(
+        &self,
+        request: MutationRequest<vibex_core::RemoteLanPairingDecision>,
+    ) -> BackendFuture<'_, vibex_core::RemoteLanPairingWindowSnapshot> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteDeviceRequest::DecideLanPairing(
+                vibex_core::RemoteDeviceLanPairingDecisionRequest {
+                    auth: this.auth(),
+                    decision: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            decode::<vibex_core::RemoteDeviceLanPairingResponse>(value)?
+                .window
+                .ok_or_else(lan_pairing_window_missing)
+        })
+    }
+
+    fn cancel_lan_pairing(&self) -> BackendFuture<'_, ()> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteDeviceRequest::CancelLanPairing(
+                vibex_core::RemoteDeviceCancelLanPairingRequest { auth: this.auth() },
+            );
+            this.rpc(
+                RemoteOperationKind::DeviceManagement,
+                payload,
+                None,
+                None,
+                vibex_core::RemoteTimeoutClass::Standard,
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
     fn list_devices(&self) -> BackendFuture<'_, Vec<RemoteDeviceDetail>> {
         let this = self.clone();
         Box::pin(async move {
@@ -6686,6 +6785,19 @@ fn decode<T: DeserializeOwned>(value: serde_json::Value) -> BackendResult<T> {
     })
 }
 
+/// A window was expected and the runtime answered without one.
+///
+/// Opening or deciding a request answers with the window it changed, so an
+/// absent window means the runtime dropped it between the call and the reply —
+/// the advertisement is gone and the client should re-read rather than pretend
+/// it still holds one.
+fn lan_pairing_window_missing() -> BackendError {
+    BackendError::failed(
+        "remote_lan_pairing_window_missing",
+        "the runtime answered without the LAN pairing window it was asked about",
+    )
+}
+
 fn is_unknown_mutation_error(error: &BackendError) -> bool {
     matches!(
         error.code.as_str(),
@@ -6768,6 +6880,7 @@ fn remote_capabilities_for_grant(
     let has_device = features.contains("device_management");
     let has_recovery = features.contains("recovery");
     let has_device_pairing = features.contains("device_pairing");
+    let has_lan_pairing = features.contains("device_lan_pairing");
     let permits = |action: RemoteActionClass| {
         if assume_permitted {
             return true;
@@ -7152,6 +7265,10 @@ fn remote_capabilities_for_grant(
                 (
                     BackendOperation::DevicePairing,
                     has_device_pairing && permits(RemoteActionClass::MutateDeviceManagement),
+                ),
+                (
+                    BackendOperation::DeviceLanPairing,
+                    has_lan_pairing && permits(RemoteActionClass::MutateDeviceManagement),
                 ),
                 (
                     BackendOperation::DeviceList,

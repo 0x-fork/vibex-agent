@@ -48,6 +48,7 @@ pub mod auto_continue;
 pub mod composer;
 pub mod config_center;
 pub mod console;
+pub mod device_center;
 pub mod glyphs;
 pub mod interface_prefs;
 pub mod keymap;
@@ -100,6 +101,11 @@ use crate::interface_prefs::InterfacePreferences;
 #[derive(Debug, Clone)]
 pub struct TuiOptions {
     pub seat: SeatKind,
+    /// What the runtime on the other end is. The pairing page answers "which
+    /// clients can pair here" with it, and only the composition root knows: a
+    /// remote seat learns it in the handshake, an authority seat is whatever
+    /// flavour the host started.
+    pub runtime_kind: vibex_core::RemoteServerKind,
     pub theme_id: Option<String>,
     pub mode: Option<vibex_ui::GpuiThemeMode>,
     pub locale: Option<Locale>,
@@ -110,6 +116,7 @@ impl Default for TuiOptions {
     fn default() -> Self {
         Self {
             seat: SeatKind::Remote,
+            runtime_kind: vibex_core::RemoteServerKind::Unknown,
             theme_id: None,
             mode: None,
             locale: None,
@@ -202,6 +209,7 @@ pub fn run(facade: BackendFacade, options: TuiOptions) -> BackendResult<ExitReas
         facade,
         AppOptions {
             seat: options.seat,
+            runtime_kind: options.runtime_kind,
             capability: ColorCapability {
                 mode: options.capability.mode,
                 glyphs: startup.glyphs,
@@ -231,6 +239,7 @@ mod tests {
     fn options() -> TuiOptions {
         TuiOptions {
             seat: SeatKind::Remote,
+            runtime_kind: vibex_core::RemoteServerKind::Unknown,
             theme_id: None,
             mode: None,
             locale: None,

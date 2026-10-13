@@ -216,6 +216,21 @@ Rules that make this work:
   scrolls under the caret and republishes the rows it scrolled as
   `FrameRegions::composer_scroll`, which is what a click adds back to map a
   visible row onto the row the draft wrapped to.
+* **A page with two halves says so with a tab strip.** The configuration
+  centre's modules and the devices page's pairing and trust halves are peers
+  under one title, so the page leads with pills and one rule beneath them, the
+  active pill filled, and the arrow keys — or a click, through
+  `FrameRegions::device_tabs` — move between them. The strip costs two rows and
+  never replaces the content: each half keeps its own rows, its own cursor and
+  its own footer line, and a panel opened in one half is closed by leaving it.
+* **A row is absent when the runtime would refuse the verb.** The devices page
+  lists a way to pair only when it can work here — a phone always scans, a local
+  network can only be searched where the runtime advertises itself, and a second
+  desktop can only be handed a code by a headless runtime. A disabled row would
+  teach the reader to distrust the page; an absent one sends them to the way that
+  works. `Esc` closes an open pairing panel before it becomes a walk back to the
+  page the reader came from, and the per-row verbs (`a` allow, `r` refuse) are
+  bound for the whole scope but advertised only while they have a subject.
 * **The key legend belongs to the pages that are navigated, not written on.**
   `band_request` gives the shortcut band zero height on a session page
   (`is_session_page`: the session view and the composing page), so those pages
@@ -1137,7 +1152,7 @@ exactly two channels:
 
 | Rule | Requirement |
 | --- | --- |
-| R1 | No API key, token, private key or stored provider secret is ever written to TUI configuration, logs, diagnostics or scrollback exports. A one-time pairing code is shown once, on a dedicated surface, and never persisted. |
+| R1 | No API key, token, private key or stored provider secret is ever written to TUI configuration, logs, diagnostics or scrollback exports. A one-time pairing code is shown once, on the pairing panel that minted it, dropped when the reader leaves that half of the page, and never persisted. |
 | R2 | Stored credentials are never rendered back. The credential form is masked, explains that the value replaces the stored one, and clears the value after submission. |
 | R3 | Destructive actions carry an audit row on the authority; the client only references ids. |
 | R4 | Every mutation carries an `idempotency_key`; a conflict is surfaced as "already executed with different content", never swallowed. |

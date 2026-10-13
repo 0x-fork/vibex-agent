@@ -151,6 +151,10 @@ pub enum AppMessage {
     DirectoryListing(BackendResult<vibex_core::RemoteWorkspaceDirectoryListing>),
     Devices(BackendResult<Vec<vibex_core::RemoteDeviceDetail>>),
     PairingOffer(BackendResult<Box<vibex_core::RemoteCreatePairingOfferResponse>>),
+    /// Every LAN-pairing answer: opening a window, re-reading one, deciding a
+    /// request, and taking it down all answer with the window the runtime now
+    /// holds. `None` is a state rather than an error — the window is gone.
+    LanPairing(BackendResult<Option<Box<vibex_core::RemoteLanPairingWindowSnapshot>>>),
     Audit(BackendResult<Vec<vibex_core::RemoteAuditRecord>>),
     Profiles(BackendResult<Vec<vibex_core::ProviderProfileSummary>>),
     ProviderTest(BackendResult<vibex_core::AgentModelProviderProfileTestResult>),
@@ -1373,6 +1377,58 @@ impl Dispatch {
                 // reach; the v1 code path is authority-only.
                 let result = self.facade.device().create_pairing_offer_v2(request).await;
                 self.send(AppMessage::PairingOffer(result.map(Box::new)));
+            }
+            Effect::StartLanPairing {
+                permission_level,
+                ttl_ms,
+            } => {
+                let request = MutationRequest::new(vibex_core::RemoteStartLanPairingRequest {
+                    permission_level,
+                    ttl_ms: Some(ttl_ms),
+                });
+                // The window is opened by the runtime that owns the
+                // advertisement, so this is the one pairing call that can take
+                // as long as a TLS probe.
+                let result = self
+                    .facade
+                    .device()
+                    .start_lan_pairing(request)
+                    .await
+                    .map(|window| Some(Box::new(window)));
+                self.send(AppMessage::LanPairing(result));
+            }
+            Effect::LanPairingStatus => {
+                let result = self
+                    .facade
+                    .device()
+                    .lan_pairing_window()
+                    .await
+                    .map(|window| window.map(Box::new));
+                self.send(AppMessage::LanPairing(result));
+            }
+            Effect::DecideLanPairing {
+                request_id,
+                approve,
+            } => {
+                let request = MutationRequest::new(vibex_core::RemoteLanPairingDecision {
+                    request_id,
+                    approve,
+                });
+                let result = self
+                    .facade
+                    .device()
+                    .decide_lan_pairing(request)
+                    .await
+                    .map(|window| Some(Box::new(window)));
+                self.send(AppMessage::LanPairing(result));
+            }
+            Effect::CancelLanPairing => {
+                let result = self.facade.device().cancel_lan_pairing().await;
+                // Taking a window down answers with no window, which is exactly
+                // the state the panel was just put into.
+                self.send(AppMessage::LanPairing(
+                    result.map(|()| None).map_err(Into::into),
+                ));
             }
             Effect::RevokeDevice { device_id, reason } => {
                 let request = MutationRequest::new(vibex_core::RemoteRevokeDeviceRequest {

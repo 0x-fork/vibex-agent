@@ -38,18 +38,19 @@ use vibex_core::{
     RemoteBinaryFrameKind, RemoteCancelPairingOfferRequest, RemoteClaimPairingCodeRequest,
     RemoteClaimPairingCodeResponse, RemoteClaimPairingOfferRequest,
     RemoteClaimPairingOfferResponse, RemoteCloseCode, RemoteCloseReason, RemoteControlMessageV2,
-    RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceListResponse,
-    RemoteDevicePermissionLevel, RemoteDeviceRequest, RemoteEventV2, RemoteHello,
-    RemoteJsonMessageV2, RemoteLanPairingDiscoverySummary, RemoteLanPairingRequest,
-    RemoteLanPairingRequestAccepted, RemoteLanPairingStatusRequest, RemoteLanPairingStatusResponse,
-    RemoteLanPairingWindowSnapshot, RemoteLiveEventEnvelope, RemoteMutationContract,
-    RemoteOperationKind, RemotePairingCandidate, RemotePairingOfferSummary, RemotePairingTransport,
-    RemotePing, RemoteProtocolError, RemoteProtocolVersion, RemoteProtocolVersionRange,
-    RemoteResyncRequired, RemoteRetryClass, RemoteRpcRequestV2, RemoteRpcResponseV2,
-    RemoteRpcResultMetadata, RemoteServerInfoV2, RemoteSubscribeRequestV2,
-    RemoteSubscriptionAcceptedV2, RemoteTimeoutClass, RemoteWsTicketRequest,
-    RemoteWsTicketResponse, RemoteZeroConfigLanPairingHello, RequestId, TerminalId, VibexError,
-    VibexResult, WorkspaceId, remote_permissions_for_level, unix_timestamp_ms,
+    RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse,
+    RemoteDeviceLanPairingResponse, RemoteDeviceListResponse, RemoteDevicePermissionLevel,
+    RemoteDeviceRequest, RemoteEventV2, RemoteHello, RemoteJsonMessageV2,
+    RemoteLanPairingDiscoverySummary, RemoteLanPairingRequest, RemoteLanPairingRequestAccepted,
+    RemoteLanPairingStatusRequest, RemoteLanPairingStatusResponse, RemoteLanPairingWindowSnapshot,
+    RemoteLiveEventEnvelope, RemoteMutationContract, RemoteOperationKind, RemotePairingCandidate,
+    RemotePairingOfferSummary, RemotePairingTransport, RemotePing, RemoteProtocolError,
+    RemoteProtocolVersion, RemoteProtocolVersionRange, RemoteResyncRequired, RemoteRetryClass,
+    RemoteRpcRequestV2, RemoteRpcResponseV2, RemoteRpcResultMetadata, RemoteServerInfoV2,
+    RemoteSubscribeRequestV2, RemoteSubscriptionAcceptedV2, RemoteTimeoutClass,
+    RemoteWsTicketRequest, RemoteWsTicketResponse, RemoteZeroConfigLanPairingHello, RequestId,
+    TerminalId, VibexError, VibexResult, WorkspaceId, remote_permissions_for_level,
+    unix_timestamp_ms,
 };
 use vibex_db::RemotePairingOfferRepository;
 use vibex_terminal::TerminalManager;
@@ -64,10 +65,10 @@ use super::zero_config_pairing::{
     seal_json as seal_zero_config_json,
 };
 use super::{
-    RemoteDispatcher, RemoteIdentity, RemoteIdentityStore, RemoteRecoverySource,
-    RemoteRequestEnvelope, RemoteResponseEnvelope, RemoteServiceConfig, RemoteTrustService,
-    build_router_with_dispatcher, file_service_for_workspace, open_migrated_database,
-    remote_timeline_event,
+    RemoteDispatcher, RemoteIdentity, RemoteIdentityStore, RemoteLanPairingSource,
+    RemoteRecoverySource, RemoteRequestEnvelope, RemoteResponseEnvelope, RemoteServiceConfig,
+    RemoteTrustService, build_router_with_dispatcher, file_service_for_workspace,
+    open_migrated_database, remote_timeline_event,
 };
 
 const DEFAULT_WS_TICKET_TTL_MS: u32 = 30_000;
@@ -4612,6 +4613,22 @@ async fn process_device_management_rpc(
             request.auth.clone(),
             RemoteActionClass::MutateDeviceManagement,
         ),
+        RemoteDeviceRequest::StartLanPairing(request) => (
+            request.auth.clone(),
+            RemoteActionClass::MutateDeviceManagement,
+        ),
+        RemoteDeviceRequest::LanPairingStatus(request) => (
+            request.auth.clone(),
+            RemoteActionClass::ReadDeviceManagement,
+        ),
+        RemoteDeviceRequest::DecideLanPairing(request) => (
+            request.auth.clone(),
+            RemoteActionClass::MutateDeviceManagement,
+        ),
+        RemoteDeviceRequest::CancelLanPairing(request) => (
+            request.auth.clone(),
+            RemoteActionClass::MutateDeviceManagement,
+        ),
         RemoteDeviceRequest::ListDevices(request) => (
             request.auth.clone(),
             RemoteActionClass::ReadDeviceManagement,
@@ -4679,6 +4696,41 @@ async fn process_device_management_rpc(
         RemoteDeviceRequest::CancelPairingOffer(request) => serde_json::to_value(
             RemoteTrustService::cancel_pairing_offer(&connection, request.request)?,
         ),
+        RemoteDeviceRequest::StartLanPairing(request) => {
+            let _ = request;
+            let window = lan_pairing_source(state)?
+                .start_lan_pairing_window(
+                    request.request.permission_level,
+                    request
+                        .request
+                        .ttl_ms
+                        .unwrap_or(vibex_core::DEFAULT_PAIRING_TTL_MS),
+                )
+                .await?;
+            serde_json::to_value(RemoteDeviceLanPairingResponse {
+                window: Some(window),
+            })
+        }
+        RemoteDeviceRequest::LanPairingStatus(request) => {
+            let _ = request;
+            let window = lan_pairing_source(state)?.lan_pairing_window().await?;
+            serde_json::to_value(RemoteDeviceLanPairingResponse { window })
+        }
+        RemoteDeviceRequest::DecideLanPairing(request) => {
+            let window = lan_pairing_source(state)?
+                .decide_lan_pairing_request(&request.decision.request_id, request.decision.approve)
+                .await?;
+            serde_json::to_value(RemoteDeviceLanPairingResponse {
+                window: Some(window),
+            })
+        }
+        RemoteDeviceRequest::CancelLanPairing(request) => {
+            let _ = request;
+            lan_pairing_source(state)?
+                .cancel_lan_pairing_window()
+                .await?;
+            serde_json::to_value(RemoteDeviceLanPairingResponse { window: None })
+        }
         RemoteDeviceRequest::ListDevices(request) => {
             let _ = request;
             let devices = vibex_db::RemoteDeviceRepository::list(&connection)?
@@ -4834,6 +4886,25 @@ fn recovery_source(state: &GatewayState) -> VibexResult<Arc<dyn RemoteRecoverySo
             "diagnostic export and database backup are not available on this service",
         )
     })
+}
+
+/// The runtime's LAN pairing windows.
+///
+/// A runtime that never installs this source is one that cannot advertise
+/// itself on the local network at all — a headless service behind a proxy, for
+/// instance — and the client is told so rather than being handed a window
+/// nobody will ever see.
+fn lan_pairing_source(state: &GatewayState) -> VibexResult<Arc<dyn RemoteLanPairingSource>> {
+    state
+        .dispatcher
+        .lan_pairing_source()
+        .cloned()
+        .ok_or_else(|| {
+            VibexError::capability(
+                "remote_lan_pairing_unavailable",
+                "this runtime cannot advertise itself for local-network pairing",
+            )
+        })
 }
 
 fn authorize_device_management(
@@ -5784,6 +5855,9 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
         .unwrap_or(false)
     {
         features.push("device_pairing".to_string());
+    }
+    if state.dispatcher.has_lan_pairing_source() {
+        features.push("device_lan_pairing".to_string());
     }
     if state.dispatcher.has_scheduled_task_source() {
         features.push("scheduled_tasks".to_string());
@@ -7749,6 +7823,243 @@ mod tests {
             "stopping the TLS listener releases its socket"
         );
     }
+    /// A LAN pairing window is the runtime's to hold, not the gateway's: the
+    /// advertisement and the Direct-route probe live above this crate, so the
+    /// operation is routed to the installed source. A read-only device cannot
+    /// open one, and the window a client reads back is the one the source
+    /// answered with.
+    #[tokio::test]
+    async fn lan_pairing_rpc_runs_on_the_runtime_and_reports_the_window() {
+        #[derive(Default)]
+        struct TestLanPairingSource {
+            calls: Mutex<Vec<&'static str>>,
+            window: Mutex<Option<vibex_core::RemoteLanPairingWindowSnapshot>>,
+        }
+
+        fn window() -> vibex_core::RemoteLanPairingWindowSnapshot {
+            vibex_core::RemoteLanPairingWindowSnapshot {
+                discovery: vibex_core::RemoteLanPairingDiscoverySummary {
+                    schema_version: "vibex-lan-pairing.v1".to_string(),
+                    window_id: vibex_core::RequestId::new(),
+                    server_id: "server-one".to_string(),
+                    server_identity_public_key: "server-key".to_string(),
+                    protocol_range: vibex_core::RemoteProtocolVersionRange::v2(),
+                    permission_level: RemoteDevicePermissionLevel::FullControl,
+                    expires_at_ms: vibex_core::unix_timestamp_ms() + 90_000,
+                },
+                advertisement: vibex_core::RemoteLanPairingAdvertisement {
+                    advertisement_id: "advertisement-one".to_string(),
+                    service_instance: "vibex-test".to_string(),
+                    display_name: "test runtime".to_string(),
+                    direct_origin: "https://127.0.0.1:1428".to_string(),
+                    protocol_min: 2,
+                    protocol_max: 2,
+                },
+                pending_requests: vec![vibex_core::RemoteLanPairingPendingRequestSummary {
+                    request_id: vibex_core::RequestId::new(),
+                    display_name: "Pixel".to_string(),
+                    device_fingerprint: "A1B2C3".to_string(),
+                    verification_code: "4821".to_string(),
+                    state: vibex_core::RemoteLanPairingRequestState::Pending,
+                    expires_at_ms: vibex_core::unix_timestamp_ms() + 90_000,
+                }],
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RemoteLanPairingSource for TestLanPairingSource {
+            async fn start_lan_pairing_window(
+                &self,
+                permission_level: RemoteDevicePermissionLevel,
+                ttl_ms: u32,
+            ) -> VibexResult<vibex_core::RemoteLanPairingWindowSnapshot> {
+                self.calls.lock().unwrap().push("start");
+                assert_eq!(permission_level, RemoteDevicePermissionLevel::FullControl);
+                // The client names no lifetime, so the gateway's default is what
+                // the runtime advertises.
+                assert_eq!(ttl_ms, vibex_core::DEFAULT_PAIRING_TTL_MS);
+                let window = window();
+                *self.window.lock().unwrap() = Some(window.clone());
+                Ok(window)
+            }
+
+            async fn lan_pairing_window(
+                &self,
+            ) -> VibexResult<Option<vibex_core::RemoteLanPairingWindowSnapshot>> {
+                self.calls.lock().unwrap().push("status");
+                Ok(self.window.lock().unwrap().clone())
+            }
+
+            async fn decide_lan_pairing_request(
+                &self,
+                _request_id: &vibex_core::RequestId,
+                approve: bool,
+            ) -> VibexResult<vibex_core::RemoteLanPairingWindowSnapshot> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(if approve { "allow" } else { "refuse" });
+                let mut guard = self.window.lock().unwrap();
+                let window = guard.as_mut().expect("a window was opened");
+                window.pending_requests[0].state = if approve {
+                    vibex_core::RemoteLanPairingRequestState::Approved
+                } else {
+                    vibex_core::RemoteLanPairingRequestState::Rejected
+                };
+                Ok(window.clone())
+            }
+
+            async fn cancel_lan_pairing_window(&self) -> VibexResult<()> {
+                self.calls.lock().unwrap().push("cancel");
+                *self.window.lock().unwrap() = None;
+                Ok(())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = RemoteGatewayConfig::loopback_enabled("127.0.0.1:0");
+        let database_path = directory.path().join("gateway.db");
+        let mut connection = open_migrated_database(&database_path).unwrap();
+        apply_migrations(&mut connection).unwrap();
+        let source = Arc::new(TestLanPairingSource::default());
+        let dispatcher = RemoteDispatcher::new(config.service.clone())
+            .with_lan_pairing_source(source.clone() as Arc<dyn RemoteLanPairingSource>);
+        let gateway = RemoteGateway::new(
+            config,
+            dispatcher,
+            &database_path,
+            directory.path().join("identity.json"),
+        );
+        let admin = pair_test_device(
+            &database_path,
+            RemoteDevicePermissionLevel::FullControl,
+            None,
+        );
+        let reader = pair_test_device(&database_path, RemoteDevicePermissionLevel::ReadOnly, None);
+        let state = gateway_state_for_test(&gateway);
+
+        assert!(
+            gateway_features(&state).contains(&"device_lan_pairing".to_string()),
+            "a runtime with a LAN pairing source advertises the feature"
+        );
+
+        let start = |auth: vibex_core::RemoteAuthProof| {
+            RemoteDeviceRequest::StartLanPairing(vibex_core::RemoteDeviceStartLanPairingRequest {
+                auth,
+                request: vibex_core::RemoteStartLanPairingRequest {
+                    permission_level: RemoteDevicePermissionLevel::FullControl,
+                    ttl_ms: None,
+                },
+            })
+        };
+        // A read-only device cannot make this runtime discoverable.
+        let mut denied = RemoteRpcRequestV2::new(
+            RemoteOperationKind::DeviceManagement,
+            Some(serde_json::to_value(start(reader.clone())).unwrap()),
+        );
+        denied.mutation = Some(RemoteMutationContract {
+            idempotency_key: "lan-pairing-denied".to_string(),
+            expected_revision: None,
+            expected_generation: None,
+        });
+        assert_eq!(
+            process_rpc_inner(&state, &reader, denied)
+                .await
+                .unwrap_err()
+                .code,
+            "remote_permission_denied"
+        );
+
+        let mut open = RemoteRpcRequestV2::new(
+            RemoteOperationKind::DeviceManagement,
+            Some(serde_json::to_value(start(admin.clone())).unwrap()),
+        );
+        open.mutation = Some(RemoteMutationContract {
+            idempotency_key: "lan-pairing-start".to_string(),
+            expected_revision: None,
+            expected_generation: None,
+        });
+        let opened = process_rpc_inner(&state, &admin, open).await.unwrap();
+        let opened: vibex_core::RemoteDeviceLanPairingResponse =
+            serde_json::from_value(opened.payload.unwrap()).unwrap();
+        let opened = opened.window.expect("the runtime answered with a window");
+        assert_eq!(opened.advertisement.service_instance, "vibex-test");
+        assert_eq!(opened.pending_requests.len(), 1);
+
+        // The read is a read: no mutation contract, and it answers with the
+        // window the runtime is holding.
+        let status = RemoteRpcRequestV2::new(
+            RemoteOperationKind::DeviceManagement,
+            Some(
+                serde_json::to_value(RemoteDeviceRequest::LanPairingStatus(
+                    vibex_core::RemoteDeviceLanPairingStatusRequest {
+                        auth: admin.clone(),
+                    },
+                ))
+                .unwrap(),
+            ),
+        );
+        let read = process_rpc_inner(&state, &admin, status).await.unwrap();
+        let read: vibex_core::RemoteDeviceLanPairingResponse =
+            serde_json::from_value(read.payload.unwrap()).unwrap();
+        assert!(read.window.is_some());
+
+        let request_id = opened.pending_requests[0].request_id.clone();
+        let mut decide = RemoteRpcRequestV2::new(
+            RemoteOperationKind::DeviceManagement,
+            Some(
+                serde_json::to_value(RemoteDeviceRequest::DecideLanPairing(
+                    vibex_core::RemoteDeviceLanPairingDecisionRequest {
+                        auth: admin.clone(),
+                        decision: vibex_core::RemoteLanPairingDecision {
+                            request_id,
+                            approve: true,
+                        },
+                    },
+                ))
+                .unwrap(),
+            ),
+        );
+        decide.mutation = Some(RemoteMutationContract {
+            idempotency_key: "lan-pairing-allow".to_string(),
+            expected_revision: None,
+            expected_generation: None,
+        });
+        let decided = process_rpc_inner(&state, &admin, decide).await.unwrap();
+        let decided: vibex_core::RemoteDeviceLanPairingResponse =
+            serde_json::from_value(decided.payload.unwrap()).unwrap();
+        assert_eq!(
+            decided.window.unwrap().pending_requests[0].state,
+            vibex_core::RemoteLanPairingRequestState::Approved
+        );
+
+        let mut cancel = RemoteRpcRequestV2::new(
+            RemoteOperationKind::DeviceManagement,
+            Some(
+                serde_json::to_value(RemoteDeviceRequest::CancelLanPairing(
+                    vibex_core::RemoteDeviceCancelLanPairingRequest {
+                        auth: admin.clone(),
+                    },
+                ))
+                .unwrap(),
+            ),
+        );
+        cancel.mutation = Some(RemoteMutationContract {
+            idempotency_key: "lan-pairing-cancel".to_string(),
+            expected_revision: None,
+            expected_generation: None,
+        });
+        let cancelled = process_rpc_inner(&state, &admin, cancel).await.unwrap();
+        let cancelled: vibex_core::RemoteDeviceLanPairingResponse =
+            serde_json::from_value(cancelled.payload.unwrap()).unwrap();
+        assert!(cancelled.window.is_none());
+
+        assert_eq!(
+            source.calls.lock().unwrap().as_slice(),
+            ["start", "status", "allow", "cancel"]
+        );
+    }
+
     /// Recovery operations must run where the runtime data lives: the client
     /// sends intent, the authority resolves the path, and read-only devices
     /// cannot trigger a restore.

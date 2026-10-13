@@ -1065,6 +1065,128 @@ strings! {
         "仅显示一次，不会写入日志或配置。",
         "僅顯示一次，不會寫入日誌或設定。"
     },
+    // ---- the devices page: two halves under one tab strip -----------------
+    devices_tab_pair => { "Pair", "配对", "配對" },
+    devices_pair_qr => { "Pair with a QR code", "用二维码配对", "用二維碼配對" },
+    devices_pair_qr_scope => { "Phone or tablet", "手机或平板", "手機或平板" },
+    devices_pair_lan => {
+        "Find a device on this network",
+        "在同一网络查找设备",
+        "在同一網路尋找裝置"
+    },
+    devices_pair_lan_scope => {
+        "A phone on the same network as this machine",
+        "与这台机器同一网络的手机",
+        "與這台機器同一網路的手機"
+    },
+    devices_pair_code => {
+        "Pair with a code or link",
+        "用配对码或链接配对",
+        "用配對碼或連結配對"
+    },
+    devices_pair_code_scope => { "A second desktop", "第二台桌面端", "第二台桌面端" },
+    devices_offer_expired => {
+        "That code has expired — press Enter to mint a new one.",
+        "配对码已过期——回车重新生成。",
+        "配對碼已過期——回車重新產生。"
+    },
+    devices_pair_working => { "Working…", "处理中…", "處理中…" },
+    devices_qr_no_room => {
+        "This terminal is too small for the code — widen it, or copy the link below.",
+        "终端太小，放不下二维码——请放大窗口，或复制下面的链接。",
+        "終端太小，放不下二維碼——請放大視窗，或複製下面的連結。"
+    },
+    devices_qr_no_glyphs => {
+        "This terminal's font cannot draw the code — copy the link below.",
+        "当前终端的字体画不出二维码——请复制下面的链接。",
+        "目前終端的字型畫不出二維碼——請複製下面的連結。"
+    },
+    devices_runtime_desktop => {
+        "Desktop runtime",
+        "桌面端内嵌运行时",
+        "桌面端內嵌執行時"
+    },
+    devices_runtime_headless => {
+        "Headless runtime",
+        "云端无头运行时",
+        "雲端無頭執行時"
+    },
+    devices_runtime_unknown => {
+        "Runtime kind unknown",
+        "运行时类型未知",
+        "執行時類型未知"
+    },
+    devices_pair_hint => {
+        "Enter opens the highlighted way to pair.",
+        "回车展开选中的配对方式。",
+        "回車展開選中的配對方式。"
+    },
+    devices_pair_unavailable => {
+        "This runtime cannot pair a device",
+        "该运行时无法配对设备",
+        "該執行時無法配對裝置"
+    },
+    devices_qr_hint => {
+        "Scan this with the Vibex mobile app.",
+        "用 Vibex 手机端扫描。",
+        "用 Vibex 手機端掃描。"
+    },
+    devices_link => { "Pairing link", "配对链接", "配對連結" },
+    devices_link_hint => {
+        "Paste the link into the desktop's add-runtime form.",
+        "在桌面端「添加运行时」中粘贴这条链接。",
+        "在桌面端「新增執行時」中貼上這條連結。"
+    },
+    devices_lan_advertising => {
+        "Looking for a device on this network",
+        "正在局域网内查找设备",
+        "正在區域網路內尋找裝置"
+    },
+    devices_lan_waiting => {
+        "Waiting for a device to ask…",
+        "等待设备发起请求…",
+        "等待裝置發起請求…"
+    },
+    devices_lan_request => { "Pairing request", "配对请求", "配對請求" },
+    devices_lan_allow => { "Allow", "允许", "允許" },
+    devices_lan_refuse => { "Refuse", "拒绝", "拒絕" },
+    devices_lan_more => {
+        "more waiting after this one",
+        "之后还有等待中的请求",
+        "之後還有等待中的請求"
+    },
+    devices_lan_expired => {
+        "The window closed",
+        "查找窗口已关闭",
+        "尋找視窗已關閉"
+    },
+    devices_lan_restart => { "Look again", "重新查找", "重新尋找" },
+    devices_lan_closes_in => { "Closes in", "剩余", "剩餘" },
+    devices_error_direct_unavailable => {
+        "Turn on Remote Access → Direct in the desktop app, then look again.",
+        "请在桌面端开启「远程访问 → Direct」，然后重新查找。",
+        "請在桌面端開啟「遠端存取 → Direct」，然後重新尋找。"
+    },
+    devices_error_lan_unavailable => {
+        "This runtime cannot advertise itself on the local network.",
+        "该运行时无法在局域网内广播自己。",
+        "該執行時無法在區域網路內廣播自己。"
+    },
+    devices_error_tls => {
+        "The mobile app cannot reach this runtime over its Direct route.",
+        "手机端无法通过当前的 Direct 地址连接该运行时。",
+        "手機端無法透過目前的 Direct 位址連線該執行時。"
+    },
+    devices_error_request_settled => {
+        "That request is no longer waiting.",
+        "该请求已不再等待。",
+        "該請求已不再等待。"
+    },
+    devices_error_permission => {
+        "This device's permission level does not allow pairing.",
+        "当前设备的权限级别不允许配对。",
+        "目前裝置的權限層級不允許配對。"
+    },
     permission_read_only => { "Read only", "只读", "唯讀" },
     permission_approve_only => { "Approve only", "仅审批", "僅審批" },
     permission_full_control => { "Full control", "完全控制", "完全控制" },
@@ -1252,9 +1374,9 @@ strings! {
         "測試通知已傳送"
     },
     settings_notify_test_none => {
-        "Nothing to send: notifications are off or every channel is",
-        "没有可发送的通道：通知已关闭，或所有通道都关闭了",
-        "沒有可傳送的通道：通知已關閉，或所有通道都關閉了"
+        "Nothing sent: notifications are off, or every channel is",
+        "未发送：通知已关闭，或所有通道都关闭了",
+        "未傳送：通知已關閉，或所有通道都關閉了"
     },
     settings_reasoning_display => { "Reasoning display", "推理显示方式", "推理顯示方式" },
     settings_reasoning_display_hint => {
@@ -1432,17 +1554,11 @@ strings! {
         "重新发现可用的 Agent",
         "重新探索可用的 Agent"
     },
-    palette_cmd_devices => { "Device management", "设备管理", "裝置管理" },
+    palette_cmd_devices => { "Devices", "设备", "裝置" },
     palette_hint_devices => {
-        "Manage the paired devices",
-        "管理已配对的设备",
-        "管理已配對的裝置"
-    },
-    palette_cmd_pair_device => { "Device pairing", "设备配对", "裝置配對" },
-    palette_hint_pair_device => {
-        "Issue a one-time pairing code",
-        "生成一次性配对码",
-        "產生一次性配對碼"
+        "Pair a phone or a second desktop, and manage the devices already paired",
+        "配对手机或第二台桌面端，并管理已配对的设备",
+        "配對手機或第二台桌面端，並管理已配對的裝置"
     },
     palette_cmd_reload_keys => { "Reload key bindings", "重新加载键位", "重新載入鍵位" },
     palette_hint_reload_keys => {
