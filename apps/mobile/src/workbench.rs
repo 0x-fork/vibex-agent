@@ -1608,7 +1608,7 @@ impl MobileWorkbench {
     /// Tapping the grid puts the software keyboard on the terminal.
     fn focus_terminal(
         &mut self,
-        _: &gpui::MouseDownEvent,
+        event: &gpui::MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1617,6 +1617,28 @@ impl MobileWorkbench {
         // this can never cut a selection drag short.
         self.dismiss_terminal_selection(cx);
         self.show_terminal_keyboard(window, cx);
+        self.click_terminal_cell(event.position, cx);
+    }
+
+    /// A tap belongs to the application when it asked for mouse reporting.
+    ///
+    /// tmux takes one to pick a pane, vim to move the cursor, htop to click a
+    /// row. The desktop keeps a tap local with Shift; a phone has no such key,
+    /// so here the application wins the tap and a long press is what selects
+    /// text locally instead.
+    fn click_terminal_cell(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(point) = self.terminal_cell_at(position) else {
+            return;
+        };
+        let Some(render) = self.terminal.state.render.as_ref() else {
+            return;
+        };
+        if !render.frame.modes.mouse_reporting {
+            return;
+        }
+        if let Some(input) = terminal_mouse_click(point, render.frame.modes.sgr_mouse) {
+            self.send_terminal_value(input, false, cx);
+        }
     }
 
     /// Focuses the terminal's key sink and raises the software keyboard.
@@ -4655,6 +4677,9 @@ impl MobileWorkbench {
                         .text_color(theme::text_secondary())
                         .cursor_pointer()
                         .active(|style| style.bg(theme::row_pressed_bg()))
+                        // The pill floats over the grid: a tap on it is not a
+                        // tap on the cell underneath.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_mouse_up(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
@@ -5603,6 +5628,33 @@ fn empty_terminal_cell(point: TerminalGridPoint) -> TerminalCellSnapshot {
     }
 }
 
+/// The press-and-release one tap sends to an application that asked for mouse
+/// reporting, in the encoding that application negotiated.
+///
+/// SGR carries the cell in decimal and reports the release with a trailing
+/// `m`; the older X10 form packs button and cell into three bytes that reach
+/// past ASCII. Both mirror the desktop's shared encoder, including the X10
+/// form's 223-column limit, past which there is no way to name the cell.
+fn terminal_mouse_click(point: TerminalGridPoint, sgr: bool) -> Option<TerminalInput> {
+    let column = u32::from(point.column) + 1;
+    let row = u32::from(point.row) + 1;
+    if sgr {
+        let sequence = format!("\u{1b}[<0;{column};{row}M\u{1b}[<0;{column};{row}m");
+        return Some(TerminalInput::Text(sequence));
+    }
+    if column > 223 || row > 223 {
+        return None;
+    }
+    Some(TerminalInput::Bytes(vec![
+        0x1b,
+        b'[',
+        b'M',
+        32,
+        column as u8 + 32,
+        row as u8 + 32,
+    ]))
+}
+
 /// Resolves a terminal cell color against the current theme, mirroring the
 /// desktop `terminal_color` mapping (RGB passthrough, 256-color palette, and
 /// the emulator's named defaults).
@@ -5773,6 +5825,40 @@ mod tests {
         assert!(terminal_feed_snapshot(&mut render, &mut applied, &gapped));
         assert_eq!(applied, 10);
         assert_eq!(terminal_visible_text(&render), "tail");
+    }
+
+    /// A tap inside an application that asked for mouse reporting has to arrive
+    /// in the encoding that application negotiated, and the older form has to
+    /// give up rather than send a cell it cannot name.
+    #[test]
+    fn a_terminal_tap_is_encoded_the_way_the_application_asked_for() {
+        let point = TerminalGridPoint { row: 4, column: 9 };
+
+        assert_eq!(
+            terminal_mouse_click(point, true),
+            Some(TerminalInput::Text(
+                "\u{1b}[<0;10;5M\u{1b}[<0;10;5m".to_string()
+            ))
+        );
+        assert_eq!(
+            terminal_mouse_click(point, false),
+            Some(TerminalInput::Bytes(vec![
+                0x1b,
+                b'[',
+                b'M',
+                32,
+                10 + 32,
+                5 + 32,
+            ]))
+        );
+
+        // The X10 report packs the cell into one byte, so it stops at 223.
+        let beyond = TerminalGridPoint {
+            row: 0,
+            column: 223,
+        };
+        assert!(terminal_mouse_click(beyond, false).is_none());
+        assert!(terminal_mouse_click(beyond, true).is_some());
     }
 
     #[test]

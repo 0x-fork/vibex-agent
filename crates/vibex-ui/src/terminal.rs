@@ -417,6 +417,7 @@ impl TerminalRenderModel {
     pub fn encode_input(&self, input: TerminalInput) -> Vec<u8> {
         match input {
             TerminalInput::Text(text) => text.replace('\0', "").into_bytes(),
+            TerminalInput::Bytes(bytes) => bytes,
             TerminalInput::Character(character) => character.to_string().into_bytes(),
             TerminalInput::Key(key, modifiers) => encode_key(key, modifiers, self.modes()),
         }
@@ -426,6 +427,12 @@ impl TerminalRenderModel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalInput {
     Text(String),
+    /// Bytes sent exactly as given.
+    ///
+    /// A client that has to build a sequence this crate cannot name still has
+    /// to get every byte right: the legacy X10 mouse report carries values
+    /// above ASCII, which UTF-8 text would turn into two bytes each.
+    Bytes(Vec<u8>),
     Character(char),
     Key(TerminalKey, TerminalKeyModifiers),
 }
