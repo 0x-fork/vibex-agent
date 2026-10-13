@@ -13,6 +13,7 @@
 //! console   `stderr` diversion while the interface owns the terminal
 //! terminal  raw mode, restoration, OSC 52, $EDITOR hand-off
 //! terminal_clipboard the clipboard the terminal holds, over OSC 5522
+//! terminal_image the picture a terminal draws for itself, when it can
 //! theme     design tokens → terminal colour with truecolor/256/16/none degradation
 //! text      grapheme-correct measurement, wrapping with joiners, bidi order
 //! locale    en / zh-CN / zh-TW product copy
@@ -70,6 +71,7 @@ pub mod settings;
 mod team;
 pub mod terminal;
 pub mod terminal_clipboard;
+pub mod terminal_image;
 pub mod text;
 pub mod theme;
 pub mod transcript;

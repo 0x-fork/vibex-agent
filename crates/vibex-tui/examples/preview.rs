@@ -23,7 +23,9 @@
 //! `--paste` and `--image` leave a collapsed chip under the caret, which is
 //! what the panel above the composer explains. `--image` draws a picture this
 //! example generates, so the raster has real pixels in it; `--ansi` is the only
-//! way to see them from a pipeline.
+//! way to see them from a pipeline. The raster is what this example can show —
+//! a terminal that speaks an image protocol is handed the picture itself, and
+//! that only happens in the interface the run loop is driving.
 //!
 //! `--ansi` emits real SGR codes instead of plain text, which is the only way
 //! to review the rails and background bands from a pipeline.

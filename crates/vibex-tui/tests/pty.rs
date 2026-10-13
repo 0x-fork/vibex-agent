@@ -1033,3 +1033,69 @@ fn a_gesture_with_nothing_to_take_never_asks_for_data() {
     );
     assert!(screen.contains("Image path"), "{screen}");
 }
+
+#[test]
+fn a_picture_is_handed_to_a_terminal_that_draws_them() {
+    // The panel is drawn from the draft on every terminal, but a terminal that
+    // speaks an image protocol is handed the picture itself, and the only
+    // proof that the escape *reaches* it is the bytes on the wire: the panel
+    // renderer queues them, and the run loop writes them after a frame. A
+    // `TestBackend` sees neither half.
+    let mut picture = image::RgbImage::new(48, 24);
+    for (x, _, pixel) in picture.enumerate_pixels_mut() {
+        *pixel = image::Rgb([(x * 5) as u8, 40, 200]);
+    }
+    let mut shot = Vec::new();
+    picture
+        .write_to(
+            &mut std::io::Cursor::new(&mut shot),
+            image::ImageFormat::Png,
+        )
+        .expect("the fixture encodes");
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("shot.png");
+    std::fs::write(&path, &shot).expect("the picture is written");
+
+    // The reader's terminal is named rather than detected: the environment a
+    // test runs in is not the environment the client ships to.
+    let mut session = Session::start_with(120, 40, &[("VIBEX_TUI_IMAGE", "kitty")]);
+    session.wait_for_first_frame();
+
+    // A bracketed paste of a path is the gesture that attaches a picture, and
+    // it leaves the caret on the chip's right edge — where the panel is.
+    session.send(format!("\x1b[200~{}\x1b[201~", path.display()).as_bytes());
+    let screen = session.wait_for(|screen| screen.contains("[Image #1]"));
+    assert!(
+        screen.contains("shot.png"),
+        "the panel is not drawn:\n{screen}"
+    );
+
+    let raw = String::from_utf8_lossy(&session.captured).to_string();
+    assert!(
+        raw.contains("\u{1b}_Ga=T,f=100"),
+        "the picture was never handed to the terminal:\n{}",
+        session.raw_tail()
+    );
+    assert!(
+        raw.contains("z=1,i=1,p=1"),
+        "the picture was not placed above the panel:\n{}",
+        session.raw_tail()
+    );
+
+    // And leaving the chip takes it back off the terminal: a kitty picture is
+    // a layer of its own and outlives the frame that showed it, so the frame
+    // that stops showing the panel has to delete it. A word after the chip
+    // moves the caret off the label, which is what closes the panel.
+    session.send(b" done");
+    let screen = session.wait_for(|screen| !screen.contains("shot.png"));
+    assert!(
+        screen.contains("[Image #1]"),
+        "the chip left the draft:\n{screen}"
+    );
+    let raw = String::from_utf8_lossy(&session.captured).to_string();
+    assert!(
+        raw.contains("\u{1b}_Ga=d,d=i,i=1"),
+        "the picture was left on the terminal:\n{}",
+        session.raw_tail()
+    );
+}

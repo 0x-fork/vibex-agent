@@ -37,6 +37,12 @@ fn app(columns: u16, rows: u16) -> App {
     // Rendering fixtures assert the built-in bindings, independent of a
     // developer's local key overrides.
     app.keymap = vibex_tui::keymap::Keymap::built_in();
+    // And no picture protocol, independent of the terminal the tests happen to
+    // be run from: a developer inside kitty would otherwise be asserting that
+    // the escapes a kitty terminal gets are absent.
+    app.terminal_images = vibex_tui::terminal_image::ImageSupport::forced(
+        vibex_tui::terminal_image::ImageProtocol::None,
+    );
     app.resize(columns, rows);
     app
 }
@@ -3666,6 +3672,93 @@ fn an_image_chip_is_previewed_as_pixels_and_a_caption() {
             "the caption lost {needle}:\n{screen}"
         );
     }
+}
+
+#[test]
+fn a_terminal_that_draws_pictures_is_handed_the_picture_itself() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    app.terminal_images = vibex_tui::terminal_image::ImageSupport::forced(
+        vibex_tui::terminal_image::ImageProtocol::Kitty,
+    );
+    let directory = tempfile::tempdir().expect("temp dir");
+    let shot = directory.path().join("shot.png");
+    std::fs::write(&shot, shot_png()).expect("write");
+    app.attach_image_path(&shot.display().to_string())
+        .expect("the image attaches");
+    app.composer.move_left();
+
+    // The panel still draws — the raster under the picture is what a terminal
+    // that drops the sequence is left with — and the picture itself is queued
+    // for the run loop to write after the frame.
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("shot.png"), "{screen}");
+    let control = String::from_utf8(app.take_terminal_control()).expect("escapes are text");
+    assert!(
+        control.contains("a=T,f=100"),
+        "the picture was not handed to the terminal: {control:?}"
+    );
+    assert!(control.contains("q=2,C=1,z=1"), "{control:?}");
+
+    // The frame after that one sends nothing: the terminal is holding it.
+    let _ = render(&mut app, 120, 40);
+    assert!(
+        app.take_terminal_control().is_empty(),
+        "the picture was sent twice"
+    );
+
+    // Leaving the chip takes the picture down with the panel.
+    app.composer.move_to_end();
+    app.composer.insert_str(" done");
+    let _ = render(&mut app, 120, 40);
+    let control = String::from_utf8(app.take_terminal_control()).expect("escapes are text");
+    assert!(
+        control.contains("a=d,d=i,i=1"),
+        "the picture was left on the terminal: {control:?}"
+    );
+    let _ = render(&mut app, 120, 40);
+    assert!(
+        app.take_terminal_control().is_empty(),
+        "the picture was deleted twice"
+    );
+}
+
+#[test]
+fn iterm2_is_handed_the_file_and_a_plain_terminal_is_not() {
+    let mut iterm = app(120, 40);
+    iterm.navigate_to(Page::Agent);
+    iterm.focus = vibex_tui::app::Focus::Composer;
+    iterm.terminal_images = vibex_tui::terminal_image::ImageSupport::forced(
+        vibex_tui::terminal_image::ImageProtocol::Iterm2,
+    );
+    let directory = tempfile::tempdir().expect("temp dir");
+    let shot = directory.path().join("shot.png");
+    std::fs::write(&shot, shot_png()).expect("write");
+    iterm
+        .attach_image_path(&shot.display().to_string())
+        .expect("the image attaches");
+    iterm.composer.move_left();
+    let _ = render(&mut iterm, 120, 40);
+    let control = String::from_utf8(iterm.take_terminal_control()).expect("escapes are text");
+    assert!(control.contains("\x1b]1337;File=inline=1"), "{control:?}");
+
+    // A terminal with no protocol is sent nothing at all: the raster is the
+    // whole of its picture, and the panel is drawn from the draft.
+    let mut plain = app(120, 40);
+    plain.navigate_to(Page::Agent);
+    plain.focus = vibex_tui::app::Focus::Composer;
+    plain
+        .attach_image_path(&shot.display().to_string())
+        .expect("the image attaches");
+    plain.composer.move_left();
+    let screen = text(&render(&mut plain, 120, 40));
+    assert!(screen.contains("shot.png"), "{screen}");
+    assert!(
+        plain.take_terminal_control().is_empty(),
+        "a terminal that draws no pictures was sent one"
+    );
+    assert!(!plain.terminal_images.supports_pixels());
 }
 
 #[test]

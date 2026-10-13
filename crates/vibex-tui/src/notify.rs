@@ -531,7 +531,7 @@ impl Notifier {
 /// sequence with every `ESC` doubled. It is only delivered when the reader has
 /// `allow-passthrough on`; without it tmux discards the whole envelope, so this
 /// degrades to "no notification" rather than to stray text on the screen.
-fn tmux_passthrough(inner: &str) -> String {
+pub(crate) fn tmux_passthrough(inner: &str) -> String {
     format!("\x1bPtmux;{}\x1b\\", inner.replace('\x1b', "\x1b\x1b"))
 }
 
@@ -687,6 +687,18 @@ impl App {
     /// Take the terminal escapes the notifier produced, if any.
     pub fn take_terminal_notifications(&mut self) -> Vec<u8> {
         self.notify.take_pending()
+    }
+
+    /// Take every control sequence the last frame owes the terminal.
+    ///
+    /// One door for the run loop to write through, whatever produced the
+    /// bytes: a notification raised by an event, or the picture the chip
+    /// preview placed. Both have to leave after the frame rather than inside
+    /// it, and neither is the frame's own business.
+    pub fn take_terminal_control(&mut self) -> Vec<u8> {
+        let mut control = self.take_terminal_notifications();
+        control.extend_from_slice(&self.picture.take_escapes());
+        control
     }
 
     /// The message one notification says.

@@ -323,9 +323,9 @@ fn event_loop(
         // frame owns the buffer, and a control sequence injected between two of
         // its writes would land in the middle of a row. A queued notification
         // is reason enough to write even when nothing repainted.
-        let notifications = app.take_terminal_notifications();
-        if !notifications.is_empty() {
-            crate::terminal::write_control(&notifications)?;
+        let control = app.take_terminal_control();
+        if !control.is_empty() {
+            crate::terminal::write_control(&control)?;
         }
 
         if app.should_quit {

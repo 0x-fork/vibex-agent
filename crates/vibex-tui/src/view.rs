@@ -564,10 +564,10 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     // The chip under the caret explains itself in the room above the composer,
     // which is why this is drawn after the transcript and before any modal: the
     // panel belongs to the draft rather than to the page, and a modal that is
-    // open is a different conversation.
-    if app.overlay.is_none() {
-        crate::preview::render(frame, composer_preview_area(area, &bands), app, &theme);
-    }
+    // open is a different conversation. It is called on every frame rather than
+    // only the ones that draw a panel, because a picture it put on the terminal
+    // outlives the frame that drew it and has to be taken down from here.
+    crate::preview::render(frame, composer_preview_area(area, &bands), app, &theme);
 
     if let Some(overlay) = app.overlay.clone() {
         render_overlay(frame, area, app, &overlay, &theme);

@@ -23,6 +23,14 @@
 //!   is attached (see [`thumbnail`]) because the panel is drawn on every frame
 //!   the caret rests on the chip, and decoding a screenshot is not a thing to
 //!   do at that rate. What is left here is drawing.
+//! * **The raster is a floor, not a picture.** A terminal that speaks an image
+//!   protocol is handed the picture itself ([`crate::terminal_image`]) and
+//!   draws it in the panel's rectangle, at its own resolution; the raster is
+//!   painted under it for the terminal that does not, or that drops a sequence
+//!   it never received. A picture is then sharp wherever it can be, and a
+//!   picture rather than a hole wherever it cannot.
+
+use std::sync::Arc;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -46,9 +54,17 @@ pub const PASTE_PREVIEW_LINES: usize = 3;
 /// It is the largest raster the panel is ever asked to draw, so one decode
 /// when the image is attached covers every frame it is previewed on — and a
 /// smaller panel only ever samples what is already there.
-pub const THUMBNAIL_COLS: u16 = 120;
+pub const THUMBNAIL_COLS: u16 = 160;
 /// How many cell rows the decoded box holds. See [`THUMBNAIL_COLS`].
-pub const THUMBNAIL_ROWS: u16 = 16;
+pub const THUMBNAIL_ROWS: u16 = 24;
+
+/// How much taller a terminal cell is than it is wide.
+///
+/// A cell rectangle is not a pixel rectangle, and a picture has to be scaled
+/// into one: this is the ratio that turns a picture's shape into the cells it
+/// needs. The terminal knows its own geometry and the client cannot ask, so
+/// both the raster and the placement are sized from this one assumption.
+const CELL_ASPECT: f32 = 2.0;
 
 /// The width the panel asks for, as a share of the room above the composer.
 const PANEL_WIDTH_SHARE_NUMERATOR: u16 = 3;
@@ -120,6 +136,40 @@ fn pixel(pixels: &image::RgbImage, column: u16, row: u32) -> [u8; 3] {
 // Drawing
 // ---------------------------------------------------------------------------
 
+/// The picture the panel last put on the terminal, and the escapes the next
+/// frame owes it.
+///
+/// The panel is redrawn every frame, but a picture is not cheap to send: at a
+/// few hundred kilobytes it is orders of magnitude more than a frame, and the
+/// caret can rest on a chip for minutes. So the frame paints the box and the
+/// caption and this remembers what the terminal is holding — which picture, in
+/// which rectangle — and the escapes the run loop has to write for the two to
+/// agree again.
+#[derive(Debug, Default)]
+pub struct PlacedPicture {
+    /// The picture the terminal holds, by the label of the chip it belongs to.
+    label: Option<String>,
+    /// The cell rectangle it was placed in.
+    rect: Option<Rect>,
+    /// The bytes that were sent for it, so a placement move does not have to
+    /// read the file again or encode a format the terminal cannot take.
+    bytes: Option<Arc<Vec<u8>>>,
+    /// Escapes this frame queued, for the run loop to write after it.
+    pending: Vec<u8>,
+}
+
+impl PlacedPicture {
+    /// Take the escapes the frame queued, leaving none behind.
+    pub fn take_escapes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Whether the terminal is holding a picture this client put there.
+    pub fn is_holding(&self) -> bool {
+        self.label.is_some()
+    }
+}
+
 /// What the panel draws with, gathered once per frame.
 struct Panel<'a> {
     theme: &'a TuiTheme,
@@ -134,13 +184,18 @@ struct Panel<'a> {
 ///
 /// `area` is the room above the composer stack. Nothing is drawn without a
 /// chip under the caret, without focus in the composer, or in a space too
-/// small for a bordered panel to mean anything.
-pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &TuiTheme) {
-    if app.focus != Focus::Composer || area.height < PANEL_MIN_AREA_HEIGHT {
-        return;
-    }
-    let Some(peek) = app.composer.chip_peek() else {
-        return;
+/// small for a bordered panel to mean anything — and a picture the terminal is
+/// still holding is taken down in every one of those cases, which is why this
+/// runs on frames that draw nothing at all.
+pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTheme) {
+    let showing = app.overlay.is_none()
+        && app.page.is_session_page()
+        && app.focus == Focus::Composer
+        && area.height >= PANEL_MIN_AREA_HEIGHT;
+    let peek = if showing {
+        app.composer.chip_peek()
+    } else {
+        None
     };
     let panel = Panel {
         theme,
@@ -148,10 +203,119 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &TuiTheme) {
         tier: app.glyph_tier(),
         mode: app.capability.mode,
     };
-    match peek.payload {
-        ChipPeekPayload::Paste(content) => render_paste(frame, area, &peek, content, &panel),
-        ChipPeekPayload::Image(image) => render_image(frame, area, &peek, image, &panel),
+    match &peek {
+        Some(peek) => match peek.payload {
+            ChipPeekPayload::Paste(content) => {
+                // A paste has no picture to take down, but a picture left over
+                // from the chip the caret came from has to go.
+                clear_picture(&app.terminal_images, &mut app.picture);
+                render_paste(frame, area, peek, content, &panel);
+            }
+            ChipPeekPayload::Image(image) => {
+                // The terminal first: whatever the frame paints below, the
+                // picture it is holding has to be the one this panel is about.
+                match image_panel(area, image, &panel) {
+                    Some((popup, box_area)) => {
+                        place_picture(
+                            &app.terminal_images,
+                            &mut app.picture,
+                            peek.label,
+                            &image.source,
+                            box_area,
+                        );
+                        render_image(frame, popup, peek, image, box_area, &panel);
+                    }
+                    // No room for even a one-row box: the picture goes with it.
+                    None => clear_picture(&app.terminal_images, &mut app.picture),
+                }
+            }
+        },
+        None => clear_picture(&app.terminal_images, &mut app.picture),
     }
+}
+
+/// Put the picture the panel is standing in for on the terminal itself.
+///
+/// Three cases, in order of what they cost: the same picture in the same
+/// rectangle is already there and sends nothing; the same picture in another
+/// rectangle is a placement, which is a few dozen bytes; anything else is the
+/// picture itself, which also replaces whatever the terminal was holding under
+/// this client's id.
+fn place_picture(
+    support: &crate::terminal_image::ImageSupport,
+    picture: &mut PlacedPicture,
+    label: &str,
+    source: &crate::composer::ImageSource,
+    rect: Rect,
+) {
+    if !support.supports_pixels() || rect.width == 0 || rect.height == 0 {
+        clear_picture(support, picture);
+        return;
+    }
+    let placement = crate::terminal_image::Placement {
+        x: rect.x,
+        y: rect.y,
+        cols: rect.width,
+        rows: rect.height,
+    };
+    let holding_this_one = picture.label.as_deref() == Some(label);
+    if holding_this_one && picture.rect == Some(rect) {
+        return;
+    }
+    if holding_this_one && let Some(escape) = support.place(placement) {
+        picture.pending.extend_from_slice(escape.as_bytes());
+        picture.rect = Some(rect);
+        return;
+    }
+    let Some(bytes) = picture_bytes(support, picture, label, source) else {
+        // Bytes this client cannot read: the panel says so in words, and a
+        // picture of the last chip is not the answer to this one.
+        clear_picture(support, picture);
+        return;
+    };
+    if let Some(escape) = support.transmit(&bytes, placement) {
+        picture.pending.extend_from_slice(escape.as_bytes());
+        picture.label = Some(label.to_string());
+        picture.rect = Some(rect);
+    }
+}
+
+/// Take the picture off the terminal, if it is holding one.
+fn clear_picture(support: &crate::terminal_image::ImageSupport, picture: &mut PlacedPicture) {
+    if let Some(escape) = picture.label.is_some().then(|| support.clear()).flatten() {
+        picture.pending.extend_from_slice(escape.as_bytes());
+    }
+    picture.label = None;
+    picture.rect = None;
+    picture.bytes = None;
+}
+
+/// The bytes to send for one picture, prepared once and kept while it is the
+/// one on screen.
+///
+/// A clipboard picture is already in memory, shared with the attachment; a
+/// picture named by a path is read here, because the frame that first shows it
+/// is the first moment the reader has asked for it. Reading it is a memory
+/// copy of something the kernel is holding, and it happens once per chip
+/// rather than once per frame.
+fn picture_bytes(
+    support: &crate::terminal_image::ImageSupport,
+    picture: &mut PlacedPicture,
+    label: &str,
+    source: &crate::composer::ImageSource,
+) -> Option<Arc<Vec<u8>>> {
+    if picture.label.as_deref() == Some(label)
+        && let Some(bytes) = &picture.bytes
+    {
+        return Some(bytes.clone());
+    }
+    let raw = match source {
+        crate::composer::ImageSource::Bytes(bytes) => bytes.clone(),
+        crate::composer::ImageSource::Path(path) => Arc::new(std::fs::read(path).ok()?),
+    };
+    let prepared = support.prepare(&raw)?;
+    picture.bytes = Some(prepared.clone());
+    Some(prepared)
 }
 
 /// The paste preview: head, elision, tail, and the key that opens it.
@@ -187,40 +351,94 @@ fn render_paste(
     );
 }
 
-/// The image preview: the picture when this terminal can hold one, and what is
-/// known about it either way.
+/// The image panel's rectangle and the cell box the picture fills in it.
+///
+/// The panel is sized *to the picture*: a rectangle of another shape is a
+/// picture of another shape once the terminal scales it, and the reader would
+/// be looking at a stretched screenshot. The picture's pixel shape becomes the
+/// cell shape through [`CELL_ASPECT`], and whatever the room cannot hold, the
+/// picture gives up first.
+fn image_panel(area: Rect, image: &ImageAttachment, panel: &Panel<'_>) -> Option<(Rect, Rect)> {
+    let meta_rows = 1 + u16::from(image.thumbnail.is_none());
+    let room = Rect {
+        width: panel_width(area).saturating_sub(4),
+        height: area.height.saturating_sub(2 + meta_rows),
+        ..area
+    };
+    let (width, height) = match &image.thumbnail {
+        Some(thumbnail) => picture_box(thumbnail.width, thumbnail.height, room),
+        // Nothing was decoded, so nothing is known about its shape and the
+        // panel is as wide as the sentence that says so.
+        None => (
+            content_width(&image_caption(image, usize::MAX, panel.theme))
+                .max(content_width(panel.strings.preview_unavailable()))
+                .saturating_add(2)
+                .min(room.width.max(1)),
+            1,
+        ),
+    };
+    let popup = panel_rect(area, width.saturating_add(4), height + meta_rows + 2)?;
+    let content = Rect {
+        x: popup.x + 2,
+        y: popup.y + 1,
+        width: popup.width.saturating_sub(4),
+        height: popup.height.saturating_sub(2),
+    };
+    let raster = Rect {
+        height: content.height.saturating_sub(meta_rows),
+        ..content
+    };
+    Some((popup, raster))
+}
+
+/// How many cells a sentence needs, in the display width the terminal counts.
+fn content_width(text: &str) -> u16 {
+    u16::try_from(crate::text::display_width(text)).unwrap_or(u16::MAX)
+}
+
+/// The cell box a picture of `width` by `height` pixels fills in `room`.
+fn picture_box(width: u32, height: u32, room: Rect) -> (u16, u16) {
+    if width == 0 || height == 0 || room.width == 0 || room.height == 0 {
+        return (1, 1);
+    }
+    let max_cols = room.width.clamp(1, THUMBNAIL_COLS);
+    let max_rows = room.height.clamp(1, THUMBNAIL_ROWS);
+    // Start from the full height, because a picture is usually wider than the
+    // room is tall, and give back what the width cannot hold.
+    let rows = max_rows;
+    let cols = ((f32::from(rows) * CELL_ASPECT * width as f32 / height as f32).round() as u16)
+        .clamp(1, max_cols);
+    let rows = ((f32::from(cols) * height as f32 / (CELL_ASPECT * width as f32)).round() as u16)
+        .clamp(1, max_rows);
+    (cols, rows)
+}
+
+/// The image preview: the picture the terminal draws, and what is known about
+/// it underneath.
+///
+/// `box_area` is the cell rectangle the picture occupies; when the terminal
+/// was handed the picture, that is where it is already drawn, and the raster
+/// under it is for the terminal that never received it.
 fn render_image(
     frame: &mut Frame<'_>,
-    area: Rect,
+    popup: Rect,
     peek: &ChipPeek<'_>,
     image: &ImageAttachment,
+    box_area: Rect,
     panel: &Panel<'_>,
 ) {
     let theme = panel.theme;
-    let width = panel_width(area);
-    let inner_width = usize::from(width).saturating_sub(4);
-    // Room for the footer and the borders; what is left is the picture's, and
-    // it is the picture that gives way when the terminal is short.
-    let meta_rows = 1 + u16::from(image.thumbnail.is_none());
-    let wanted = THUMBNAIL_ROWS.min(area.height.saturating_sub(2 + meta_rows));
-    let raster_rows = if image.thumbnail.is_some() && panel.mode == ColorMode::TrueColor {
-        wanted
-    } else {
-        0
-    };
-    let height = raster_rows + meta_rows + 2;
-    let Some(popup) = panel_rect(area, width, height) else {
+    if popup.height < 3 || popup.width < 4 {
         return;
-    };
+    }
     let content_area = draw_panel(frame, popup, peek.label, None, theme);
-    let raster_area = Rect {
-        height: content_area.height.saturating_sub(meta_rows),
-        ..content_area
-    };
-    if raster_rows > 0
+    let meta_rows = 1 + u16::from(image.thumbnail.is_none());
+    if box_area.width > 0
+        && box_area.height > 0
+        && panel.mode == ColorMode::TrueColor
         && let Some(thumbnail) = &image.thumbnail
     {
-        draw_raster(frame, raster_area, thumbnail, panel.tier);
+        draw_raster(frame, box_area, thumbnail, panel.tier);
     }
     // The footer is the last row of the panel, under whatever was drawn.
     let footer = Rect {
@@ -229,7 +447,7 @@ fn render_image(
         ..content_area
     };
     let mut lines = vec![Line::from(Span::styled(
-        image_caption(image, inner_width, theme),
+        image_caption(image, usize::from(content_area.width), theme),
         theme.muted(),
     ))];
     if image.thumbnail.is_none() {
@@ -416,10 +634,13 @@ fn render_border_hint(frame: &mut Frame<'_>, popup: Rect, hint: &str, theme: &Tu
 
 /// Paint a thumbnail into `area` as half blocks, centred, aspect preserved.
 ///
-/// The theme is deliberately not consulted. A picture has no token to resolve
-/// to, and a preview that mixed a terminal's sixteen colours would be a diagram
-/// of the picture rather than the picture; whether to draw one at all is
-/// [`Panel::mode`]'s question, answered before this is called.
+/// The area has already been sized to the picture, so the centring only ever
+/// absorbs the rounding of a cell; it is still the terminal that decides how
+/// many pixels a cell is. The theme is deliberately not consulted: a picture
+/// has no token to resolve to, and a preview that mixed a terminal's sixteen
+/// colours would be a diagram of the picture rather than the picture.
+/// Whether to draw one at all is [`Panel::mode`]'s question, answered before
+/// this is called.
 fn draw_raster(frame: &mut Frame<'_>, area: Rect, thumbnail: &ImageThumbnail, tier: GlyphTier) {
     if area.width == 0 || area.height == 0 || thumbnail.cols == 0 || thumbnail.rows == 0 {
         return;
@@ -681,5 +902,141 @@ mod tests {
 
         // Nothing is drawn in a space too short to hold a border.
         assert!(panel_rect(area, 40, 0).is_none());
+    }
+
+    /// Whether a cell box has the shape of a picture of `width` by `height`
+    /// pixels, within the rounding of a cell.
+    fn keeps_picture_shape(cols: u16, rows: u16, width: u32, height: u32) -> bool {
+        let boxed = f64::from(cols) / (f64::from(rows) * f64::from(CELL_ASPECT));
+        let picture = f64::from(width) / f64::from(height);
+        (boxed - picture).abs() / picture < 0.06
+    }
+
+    #[test]
+    fn a_pictures_panel_is_sized_to_the_pictures_own_shape() {
+        let room = Rect::new(0, 0, 90, 24);
+        // Twice as wide as it is tall, and a cell is two pixels tall, so the
+        // cell box is four times as wide: 24 rows would ask for 96 columns,
+        // and the room has 90 — which gives back a row rather than a shape.
+        let (cols, rows) = picture_box(400, 200, room);
+        assert_eq!(cols, 90, "the picture takes the width the room has");
+        assert_eq!(rows, 23, "and keeps its shape while taking it");
+        assert!(keeps_picture_shape(cols, rows, 400, 200));
+
+        // A tall picture is bounded by the height instead: a phone screenshot
+        // is a strip, not a box stretched to the panel's width.
+        let (cols, rows) = picture_box(100, 400, room);
+        assert!(cols < rows, "{cols}x{rows} is not a tall picture");
+        assert!(rows <= 24);
+
+        // Room that cannot hold either shape still gives one cell of picture.
+        assert_eq!(picture_box(400, 200, Rect::new(0, 0, 0, 0)), (1, 1));
+        assert_eq!(picture_box(0, 0, room), (1, 1));
+    }
+
+    #[test]
+    fn a_picture_is_sent_once_and_moved_when_the_panel_moves() {
+        use crate::composer::ImageSource;
+        use crate::terminal_image::{ImageProtocol, ImageSupport};
+
+        let support = ImageSupport::forced(ImageProtocol::Kitty);
+        let mut picture = PlacedPicture::default();
+        let source = ImageSource::Bytes(std::sync::Arc::new(png(40, 20)));
+        let first = Rect::new(4, 6, 40, 10);
+
+        place_picture(&support, &mut picture, "[Image #1]", &source, first);
+        let sent = String::from_utf8(picture.take_escapes()).expect("escapes are text");
+        assert!(
+            sent.contains("a=T,f=100"),
+            "the picture was not sent: {sent:?}"
+        );
+        assert!(picture.is_holding());
+
+        // The next frame is the same frame: the terminal already has it.
+        place_picture(&support, &mut picture, "[Image #1]", &source, first);
+        assert!(
+            picture.take_escapes().is_empty(),
+            "an unchanged frame sent the picture again"
+        );
+
+        // Another rectangle is a placement, not a transmission.
+        let moved = Rect::new(8, 7, 40, 10);
+        place_picture(&support, &mut picture, "[Image #1]", &source, moved);
+        let placed = String::from_utf8(picture.take_escapes()).expect("escapes are text");
+        assert!(
+            placed.contains("a=p,"),
+            "the picture was not moved: {placed:?}"
+        );
+        assert!(
+            !placed.contains("f=100"),
+            "a move carried the picture again"
+        );
+
+        // Another chip replaces it, and taking the panel down deletes it.
+        place_picture(
+            &support,
+            &mut picture,
+            "[Image #2]",
+            &ImageSource::Bytes(std::sync::Arc::new(png(10, 10))),
+            moved,
+        );
+        assert!(picture.take_escapes().windows(4).any(|w| w == b"a=T,"));
+        clear_picture(&support, &mut picture);
+        let cleared = String::from_utf8(picture.take_escapes()).expect("escapes are text");
+        assert_eq!(cleared, "\x1b_Ga=d,d=i,i=1,q=2\x1b\\");
+        assert!(!picture.is_holding());
+
+        // Nothing left to clear is nothing sent.
+        clear_picture(&support, &mut picture);
+        assert!(picture.take_escapes().is_empty());
+    }
+
+    #[test]
+    fn a_terminal_without_pixels_is_sent_no_picture_at_all() {
+        use crate::composer::ImageSource;
+        use crate::terminal_image::{ImageProtocol, ImageSupport};
+
+        let support = ImageSupport::forced(ImageProtocol::None);
+        let mut picture = PlacedPicture::default();
+        place_picture(
+            &support,
+            &mut picture,
+            "[Image #1]",
+            &ImageSource::Bytes(std::sync::Arc::new(png(40, 20))),
+            Rect::new(4, 6, 40, 10),
+        );
+        assert!(picture.take_escapes().is_empty());
+        assert!(!picture.is_holding());
+    }
+
+    #[test]
+    fn a_picture_the_client_cannot_read_leaves_nothing_on_the_terminal() {
+        use crate::composer::ImageSource;
+        use crate::terminal_image::{ImageProtocol, ImageSupport};
+
+        let support = ImageSupport::forced(ImageProtocol::Kitty);
+        let mut picture = PlacedPicture::default();
+        // A readable picture first, then an unreadable one in the same place.
+        place_picture(
+            &support,
+            &mut picture,
+            "[Image #1]",
+            &ImageSource::Bytes(std::sync::Arc::new(png(40, 20))),
+            Rect::new(4, 6, 40, 10),
+        );
+        let _ = picture.take_escapes();
+        place_picture(
+            &support,
+            &mut picture,
+            "[Image #2]",
+            &ImageSource::Bytes(std::sync::Arc::new(b"not a picture".to_vec())),
+            Rect::new(4, 6, 40, 10),
+        );
+        let escapes = String::from_utf8(picture.take_escapes()).expect("escapes are text");
+        assert!(
+            escapes.contains("a=d"),
+            "the old picture was left behind: {escapes:?}"
+        );
+        assert!(!picture.is_holding());
     }
 }

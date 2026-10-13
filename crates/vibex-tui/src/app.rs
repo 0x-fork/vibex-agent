@@ -1017,6 +1017,14 @@ pub struct App {
     /// is not looking at it. The bytes are queued here and written by the run
     /// loop after the frame, so no reducer ever touches the terminal.
     pub notify: crate::notify::Notifier,
+    /// What this terminal can draw a picture with, and how the escapes reach
+    /// it. Detected once, because the answer is a property of the terminal the
+    /// client was started in — and named apart from the draft's own `images`,
+    /// which are messages' attachments rather than a capability.
+    pub terminal_images: crate::terminal_image::ImageSupport,
+    /// The picture the chip preview put on the terminal, and the escapes the
+    /// run loop still has to write for it. See [`crate::preview`].
+    pub picture: crate::preview::PlacedPicture,
     /// A transient message above the composer, dismissed on the next key.
     pub banner: Option<Banner>,
     /// When the running turn started, for the elapsed-time readout.
@@ -1584,6 +1592,8 @@ impl App {
             unread_sessions: std::collections::BTreeSet::new(),
             session_echoes: BTreeMap::new(),
             notify: crate::notify::Notifier::new(),
+            terminal_images: crate::terminal_image::ImageSupport::detect(),
+            picture: crate::preview::PlacedPicture::default(),
             banner: None,
             turn_started: None,
             turn_readout: crate::turn::TurnReadout::default(),
