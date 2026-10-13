@@ -1,17 +1,28 @@
-//! Picking an image attachment from the phone.
+//! Picking an attachment from the phone.
 //!
 //! The desktop reads attachments from paths it can open; a phone's picker never
 //! hands out a path at all. The Android host therefore reads the picked item
-//! itself, scales it down, and encodes it as a `data:` URL, which is the one
-//! attachment URI the authoritative runtime can materialize on its own side.
-//! This module is only the phone half of that: launch, and receive.
+//! itself and encodes it as a `data:` URL, which is the one attachment URI the
+//! authoritative runtime can materialize on its own side. An image is scaled
+//! down first, because a camera-sized photograph is far past what the relay
+//! carries; any other file travels whole up to the wire budget. This module is
+//! only the phone half of that: launch, and receive.
 
 use std::sync::{Mutex, OnceLock};
 
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use vibex_backend::{BackendError, BackendResult};
 
-/// One image the picker handed back, already encoded.
+/// Which picker the composer asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentKind {
+    /// A photograph or screenshot, scaled down before it is encoded.
+    Image,
+    /// Any other file, carried whole.
+    File,
+}
+
+/// One picked item the picker handed back, already encoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PickedAttachment {
     pub label: String,
@@ -53,7 +64,7 @@ pub fn subscribe() -> UnboundedReceiver<AttachmentPickEvent> {
 fn unavailable() -> BackendError {
     BackendError::unsupported(
         "mobile_attachment_picker_unavailable",
-        "Attaching images is unavailable on this device",
+        "Attaching files is unavailable on this device",
     )
 }
 
@@ -64,22 +75,21 @@ mod android {
         objects::{JClass, JString},
     };
 
-    use super::{AttachmentPickEvent, BackendError, BackendResult, enqueue};
+    use super::{AttachmentKind, AttachmentPickEvent, BackendError, BackendResult, enqueue};
 
-    pub fn launch() -> BackendResult<()> {
+    pub fn launch(kind: AttachmentKind) -> BackendResult<()> {
+        let method = match kind {
+            AttachmentKind::Image => jni::jni_str!("gpuiPickImageAttachment"),
+            AttachmentKind::File => jni::jni_str!("gpuiPickFileAttachment"),
+        };
         crate::android_bridge::with_activity(|env, activity| {
-            env.call_method(
-                activity,
-                jni::jni_str!("gpuiPickImageAttachment"),
-                jni::jni_sig!(() -> ()),
-                &[],
-            )?;
+            env.call_method(activity, method, jni::jni_sig!(() -> ()), &[])?;
             Ok(())
         })
         .ok_or_else(|| {
             BackendError::failed(
                 "mobile_attachment_picker_launch_failed",
-                "The image picker could not be opened",
+                "The file picker could not be opened",
             )
         })
     }
@@ -130,9 +140,9 @@ mod android {
 pub use android::launch;
 
 /// Android is the platform this ships on first; another host has to provide its
-/// own picker bridge before the composer offers the button.
+/// own picker bridge before the composer offers the buttons.
 #[cfg(not(target_os = "android"))]
-pub fn launch() -> BackendResult<()> {
+pub fn launch(_kind: AttachmentKind) -> BackendResult<()> {
     Err(unavailable())
 }
 

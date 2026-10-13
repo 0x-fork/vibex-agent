@@ -79,10 +79,16 @@ public final class GpuiHostActivity extends Activity {
     private static final int LOCAL_NETWORK_PERMISSION_REQUEST = 4102;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 4103;
     private static final int PICK_IMAGE_REQUEST = 4104;
+    private static final int PICK_FILE_REQUEST = 4105;
     /** The longest side a picked image is scaled down to before it is encoded. */
     private static final int ATTACHMENT_MAX_EDGE = 2048;
     /** The encoded attachment budget; a phone photograph has to fit the relay. */
     private static final int ATTACHMENT_MAX_BYTES = 6 * 1024 * 1024;
+    /**
+     * The budget for a picked file, which is carried whole rather than scaled.
+     * It is the same wire the relay already carries a photograph over.
+     */
+    private static final int FILE_ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024;
     private static final String AGENT_NOTIFICATION_CHANNEL = "agent_activity";
     private static final String UPDATE_NOTIFICATION_CHANNEL = "app_updates";
     private static final String UPDATE_NOTIFICATION_TAG = "vibex_update";
@@ -203,10 +209,29 @@ public final class GpuiHostActivity extends Activity {
         }
     }
 
+    /**
+     * Opens the system picker for any one file to attach to the composer.
+     *
+     * The image path scales a photograph down; this one carries the bytes as
+     * they are, so a log, a patch, or a document keeps its own format. The
+     * budget is the file's whole size, which is what the relay has to carry.
+     */
+    public void gpuiPickFileAttachment() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        try {
+            startActivityForResult(intent, PICK_FILE_REQUEST);
+        } catch (ActivityNotFoundException error) {
+            nativeOnAttachmentPickFailed("No file picker is available on this device");
+        }
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != PICK_IMAGE_REQUEST) {
+        boolean image = requestCode == PICK_IMAGE_REQUEST;
+        if (!image && requestCode != PICK_FILE_REQUEST) {
             return;
         }
         Uri uri = (resultCode == RESULT_OK && data != null) ? data.getData() : null;
@@ -219,11 +244,13 @@ public final class GpuiHostActivity extends Activity {
         // frames, so it happens off the UI thread and reports back through the
         // Activity's own thread.
         new Thread(() -> {
-            String label = attachmentLabel(uri);
+            String label = attachmentLabel(uri, image ? "image" : "file");
             try {
-                byte[] encoded = encodeAttachment(uri);
                 String mimeType = getContentResolver().getType(uri);
-                if (mimeType == null || !mimeType.startsWith("image/")) {
+                byte[] encoded = image ? encodeAttachment(uri) : readAttachment(uri);
+                if (mimeType == null || mimeType.isBlank()) {
+                    mimeType = image ? "image/jpeg" : "application/octet-stream";
+                } else if (image && !mimeType.startsWith("image/")) {
                     mimeType = "image/jpeg";
                 }
                 String dataUrl = "data:" + mimeType + ";base64,"
@@ -232,10 +259,32 @@ public final class GpuiHostActivity extends Activity {
                 String finalMimeType = mimeType;
                 runOnUiThread(() -> nativeOnAttachmentPicked(finalLabel, finalMimeType, dataUrl));
             } catch (Exception error) {
-                runOnUiThread(() -> nativeOnAttachmentPickFailed(
-                        "The picked image could not be read"));
+                runOnUiThread(() -> nativeOnAttachmentPickFailed(image
+                        ? "The picked image could not be read"
+                        : "The picked file could not be read"));
             }
         }).start();
+    }
+
+    /** Reads one picked file whole, up to the wire budget. */
+    private byte[] readAttachment(Uri uri) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[64 * 1024];
+        long total = 0;
+        try (InputStream stream = getContentResolver().openInputStream(uri)) {
+            if (stream == null) {
+                throw new IllegalStateException("the picked file cannot be opened");
+            }
+            int read;
+            while ((read = stream.read(buffer)) > 0) {
+                total += read;
+                if (total > FILE_ATTACHMENT_MAX_BYTES) {
+                    throw new IllegalStateException("the picked file is too large to attach");
+                }
+                out.write(buffer, 0, read);
+            }
+        }
+        return out.toByteArray();
     }
 
     /** Reads one picked image, scaled down to what a relayed prompt can carry. */
@@ -287,7 +336,7 @@ public final class GpuiHostActivity extends Activity {
     }
 
     /** The name the reader sees on the attachment chip. */
-    private String attachmentLabel(Uri uri) {
+    private String attachmentLabel(Uri uri, String fallback) {
         String displayName = null;
         try (android.database.Cursor cursor = getContentResolver().query(
                 uri, new String[]{android.provider.OpenableColumns.DISPLAY_NAME},
@@ -305,7 +354,7 @@ public final class GpuiHostActivity extends Activity {
         if (displayName == null || displayName.isBlank()) {
             String lastSegment = uri.getLastPathSegment();
             displayName = (lastSegment == null || lastSegment.isBlank())
-                    ? "image"
+                    ? fallback
                     : lastSegment;
         }
         return displayName;

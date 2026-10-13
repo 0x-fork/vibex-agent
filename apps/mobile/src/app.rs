@@ -282,6 +282,8 @@ enum BackScreen {
     SessionAction,
     /// The runtime selection sheet.
     RuntimeOptions,
+    /// A choice list the new-session page opened along its bottom edge.
+    NewSessionPicker,
     /// The Sessions drawer.
     SessionsDrawer,
     /// The Workbench drawer.
@@ -427,6 +429,26 @@ enum WorkspaceActionKind {
 enum RuntimeOptionsTarget {
     ActiveSession,
     NewSession,
+}
+
+/// Which list the new-session page has open along its bottom edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewSessionPicker {
+    /// The projects the paired runtime knows about.
+    Project,
+    /// The worktrees of the selected project.
+    Workspace,
+}
+
+/// One row of a new-session choice list.
+struct NewSessionPickerRow {
+    id: String,
+    title: String,
+    subtitle: String,
+    selected: bool,
+    /// Whether picking it is a project choice (which also picks a worktree) or
+    /// a worktree choice.
+    is_project: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1351,6 +1373,14 @@ pub struct MobileApp {
     session_action_input: Entity<InputState>,
     session_action_busy: bool,
     runtime_options_open: bool,
+    /// The choice list the new-session page has open, if any.
+    ///
+    /// Projects and worktrees are lists, not cycles: a phone cycling through
+    /// every project to reach the fourth one is the one interaction the new
+    /// session page could not make pleasant, and the desktop picks from a list.
+    new_session_picker: Option<NewSessionPicker>,
+    /// Whether the composer's attach menu is up.
+    composer_attach_menu_open: bool,
     runtime_options_target: RuntimeOptionsTarget,
     runtime_draft: Option<SessionRuntimeSelection>,
     runtime_sheet_search: Option<Entity<InputState>>,
@@ -2345,6 +2375,8 @@ impl MobileApp {
             }),
             session_action_busy: false,
             runtime_options_open: false,
+            new_session_picker: None,
+            composer_attach_menu_open: false,
             runtime_options_target: RuntimeOptionsTarget::ActiveSession,
             runtime_draft: None,
             runtime_sheet_search: None,
@@ -2601,7 +2633,7 @@ impl MobileApp {
                 });
                 self.hint(
                     Tone::Info,
-                    locale::text("Image attached", "已添加图片", "已新增圖片"),
+                    locale::text("Attachment added", "已添加附件", "已新增附件"),
                 );
             }
             crate::attachment::AttachmentPickEvent::Failed(message) => {
@@ -2612,13 +2644,35 @@ impl MobileApp {
     }
 
     /// Opens the platform image picker for the composer.
-    fn pick_composer_attachment(
+    /// Opens the attach menu: an image from the gallery, or any other file.
+    ///
+    /// Two entries rather than two buttons because the composer's trailing
+    /// strip is where the send button lives, and the choice belongs to the
+    /// reader at the moment they attach something.
+    fn open_composer_attach_menu(
         &mut self,
         _: &MouseUpEvent,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) = crate::attachment::launch() {
+        self.composer_attach_menu_open = true;
+        cx.notify();
+    }
+
+    fn close_composer_attach_menu(&mut self, cx: &mut Context<Self>) {
+        if self.composer_attach_menu_open {
+            self.composer_attach_menu_open = false;
+            cx.notify();
+        }
+    }
+
+    fn pick_composer_attachment(
+        &mut self,
+        kind: crate::attachment::AttachmentKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer_attach_menu_open = false;
+        if let Err(error) = crate::attachment::launch(kind) {
             self.fail(error);
             cx.notify();
         }
@@ -6420,6 +6474,7 @@ impl MobileApp {
         self.new_session_project_id = None;
         self.new_session_workspace_id = None;
         self.new_session_runtime = None;
+        self.new_session_picker = None;
         self.sidebar_projects_initialized = false;
         self.sidebar_search_open = false;
         Self::remove_back_screens(&mut self.back_stack, |screen| {
@@ -6770,6 +6825,7 @@ impl MobileApp {
             self.runtime_options_open = false;
             self.new_session_project_id = None;
             self.new_session_workspace_id = None;
+            self.new_session_picker = None;
         }
         self.overlay = None;
         self.overlay_parents.clear();
@@ -6802,6 +6858,7 @@ impl MobileApp {
     fn sync_back_stack_with_ui(&mut self) {
         let session_action_open = self.session_action.is_some();
         let runtime_options_open = self.runtime_options_open;
+        let new_session_picker_open = self.new_session_picker.is_some();
         let settled_target = self.settled_drawer_target();
         let sidebar_search_open = self.sidebar_search_open;
         let sidebar_batch_mode = self.sidebar_batch_mode;
@@ -6826,6 +6883,7 @@ impl MobileApp {
             }
             BackScreen::SessionAction => session_action_open,
             BackScreen::RuntimeOptions => runtime_options_open,
+            BackScreen::NewSessionPicker => new_session_picker_open,
             BackScreen::SessionsDrawer => settled_target == DrawerPage::Sessions.open_offset(),
             BackScreen::WorkbenchDrawer => settled_target == DrawerPage::Workbench.open_offset(),
             BackScreen::SidebarSearch => sidebar_search_open,
@@ -6874,6 +6932,12 @@ impl MobileApp {
             cx.notify();
             return;
         }
+        // The attach menu is the topmost thing on the composer, so back closes
+        // it before it reaches the screen behind it.
+        if self.composer_attach_menu_open {
+            self.close_composer_attach_menu(cx);
+            return;
+        }
         if matches!(self.mode, RootMode::Connecting) {
             self.stop_connection_tasks();
             self.operation_busy = false;
@@ -6912,6 +6976,9 @@ impl MobileApp {
                 }
             }
             BackScreen::RuntimeOptions => self.close_runtime_options(&noop_mouse_up(), window, cx),
+            BackScreen::NewSessionPicker => {
+                self.close_new_session_picker(&noop_mouse_up(), window, cx)
+            }
             BackScreen::Overlay(_) => self.dismiss_overlay(Some(window), cx),
             BackScreen::SessionsDrawer | BackScreen::WorkbenchDrawer => {
                 self.start_drawer_snap(0.0, Some(window), cx)
@@ -6952,6 +7019,7 @@ impl MobileApp {
             self.runtime_options_open = false;
             self.new_session_project_id = None;
             self.new_session_workspace_id = None;
+            self.new_session_picker = None;
         }
         self.overlay = None;
         self.overlay_returns_to_drawer = false;
@@ -10416,6 +10484,12 @@ impl MobileApp {
                 })
                 .when(self.runtime_options_open, |root| {
                     root.child(self.render_runtime_options_sheet(cx))
+                })
+                .when_some(self.new_session_picker, |root, _| {
+                    root.child(self.render_new_session_picker_sheet(cx))
+                })
+                .when(self.composer_attach_menu_open, |root| {
+                    root.child(self.render_composer_attach_sheet(cx))
                 })
                 .when_some(attachment_preview, |root, preview| {
                     root.child(self.render_attachment_preview(preview, cx))
@@ -14594,11 +14668,12 @@ impl MobileApp {
                                 ),
                         )
                     })
-                    // The picker is the phone's whole attachment surface: one
-                    // image per trip, scaled and encoded before it leaves.
+                    // The attach menu offers the two things a phone can hand
+                    // over: a photo the host scales down, or a file it carries
+                    // whole.
                     .child(
                         div()
-                            .id("attach-image")
+                            .id("attach-file")
                             .size(px(theme::TOUCH_TARGET))
                             .flex_shrink_0()
                             .flex()
@@ -14606,7 +14681,7 @@ impl MobileApp {
                             .justify_center()
                             .rounded(px(theme::RADIUS_CONTROL))
                             .aria_label(
-                                locale::text("Attach an image", "添加图片", "新增圖片").to_string(),
+                                locale::text("Attach a file", "添加附件", "新增附件").to_string(),
                             )
                             .when(attach_enabled, |button| {
                                 button
@@ -14614,13 +14689,13 @@ impl MobileApp {
                                     .active(|style| style.bg(theme::row_pressed_bg()))
                                     .on_mouse_up(
                                         MouseButton::Left,
-                                        cx.listener(Self::pick_composer_attachment),
+                                        cx.listener(Self::open_composer_attach_menu),
                                     )
                             })
                             .when(!attach_enabled, |button| button.opacity(0.45))
                             .child(
                                 svg()
-                                    .path("icons/image.svg")
+                                    .path("icons/file-plus.svg")
                                     .size(px(theme::ICON_SM))
                                     .text_color(if attach_enabled {
                                         theme::text_secondary()
@@ -18453,32 +18528,20 @@ fn update_status_detail(state: Option<&UpdateState>) -> String {
 }
 
 impl MobileApp {
-    fn cycle_new_session_project(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let projects = self.sidebar_projects();
-        if projects.is_empty() {
-            return;
-        }
-        let next = self
-            .new_session_project_id
-            .as_ref()
-            .and_then(|id| projects.iter().position(|project| &project.id == id))
-            .map(|index| (index + 1) % projects.len())
-            .unwrap_or(0);
-        self.new_session_project_id = Some(projects[next].id.clone());
+    /// Chooses a project for the new session, and the worktree it should start
+    /// in: the project's current checkout when it has one, its first worktree
+    /// otherwise.
+    fn select_new_session_project(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        self.new_session_project_id = Some(project_id.to_string());
         self.new_session_workspace_id = self
             .workspace_summaries
             .iter()
-            .filter(|summary| summary.project.id.as_str() == projects[next].id)
+            .filter(|summary| summary.project.id.as_str() == project_id)
             .find(|summary| summary.workspace.mode == WorkspaceMode::CurrentCheckout)
             .or_else(|| {
                 self.workspace_summaries
                     .iter()
-                    .find(|summary| summary.project.id.as_str() == projects[next].id)
+                    .find(|summary| summary.project.id.as_str() == project_id)
             })
             .map(|summary| summary.workspace.id.as_str().to_string());
         if let Some(workspace_id) = self.new_session_workspace_id.as_deref()
@@ -18496,37 +18559,51 @@ impl MobileApp {
         cx.notify();
     }
 
-    fn cycle_new_session_workspace(
+    fn select_new_session_workspace(&mut self, workspace_id: &str, cx: &mut Context<Self>) {
+        let Some(mode) = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id.as_str() == workspace_id)
+            .map(|workspace| workspace.mode)
+        else {
+            return;
+        };
+        self.new_session_workspace_id = Some(workspace_id.to_string());
+        self.new_session_workspace_mode = self.normalize_new_session_workspace_mode(mode);
+        cx.notify();
+    }
+
+    /// Opens one of the new-session chips as a list along the bottom edge.
+    fn open_new_session_picker(&mut self, picker: NewSessionPicker, cx: &mut Context<Self>) {
+        self.new_session_picker = Some(picker);
+        self.push_back_screen(BackScreen::NewSessionPicker);
+        cx.notify();
+    }
+
+    fn close_new_session_picker(
         &mut self,
         _: &MouseUpEvent,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(project_id) = self.new_session_project_id.as_deref() else {
-            return;
-        };
-        let workspaces = self
-            .workspaces
-            .iter()
-            .filter(|workspace| workspace.project_id.as_str() == project_id)
-            .collect::<Vec<_>>();
-        if workspaces.is_empty() {
-            return;
+        self.dismiss_new_session_picker(cx);
+    }
+
+    fn dismiss_new_session_picker(&mut self, cx: &mut Context<Self>) {
+        if self.new_session_picker.take().is_some() {
+            crate::platform::hide_keyboard();
+            cx.notify();
         }
-        let next = self
-            .new_session_workspace_id
-            .as_ref()
-            .and_then(|id| {
-                workspaces
-                    .iter()
-                    .position(|workspace| workspace.id.as_str() == id)
-            })
-            .map(|index| (index + 1) % workspaces.len())
-            .unwrap_or(0);
-        self.new_session_workspace_id = Some(workspaces[next].id.as_str().to_string());
-        self.new_session_workspace_mode =
-            self.normalize_new_session_workspace_mode(workspaces[next].mode);
-        cx.notify();
+    }
+
+    fn choose_new_session_project(&mut self, project_id: String, cx: &mut Context<Self>) {
+        self.new_session_picker = None;
+        self.select_new_session_project(&project_id, cx);
+    }
+
+    fn choose_new_session_workspace(&mut self, workspace_id: String, cx: &mut Context<Self>) {
+        self.new_session_picker = None;
+        self.select_new_session_workspace(&workspace_id, cx);
     }
 
     fn toggle_new_session_workspace_mode(
@@ -18541,6 +18618,411 @@ impl MobileApp {
         }
         self.new_session_workspace_mode = mode;
         cx.notify();
+    }
+
+    /// The composer's attach menu: one image, or any other file.
+    fn render_composer_attach_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let entries = [
+            (
+                "attach-photo",
+                "icons/image.svg",
+                locale::text("Photo", "图片", "圖片"),
+                locale::text(
+                    "Scaled down before it is sent",
+                    "发送前会先缩放",
+                    "傳送前會先縮放",
+                ),
+                crate::attachment::AttachmentKind::Image,
+            ),
+            (
+                "attach-any-file",
+                "icons/file-plus.svg",
+                locale::text("File", "文件", "檔案"),
+                locale::text(
+                    "Sent as it is, up to 8 MB",
+                    "原样发送，最大 8 MB",
+                    "原樣傳送，最大 8 MB",
+                ),
+                crate::attachment::AttachmentKind::File,
+            ),
+        ];
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.45))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_composer_attach_menu(cx)),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "mobile-composer-attach-menu".to_string())
+                    .w_full()
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w_full()
+                            .pt(px(theme::SPACING_SM))
+                            .flex()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .w(px(36.0))
+                                    .h(px(4.0))
+                                    .rounded_full()
+                                    .bg(theme::border_default()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .h(px(theme::TOUCH_TARGET))
+                            .pl(px(theme::SPACING_LG))
+                            .pr(px(theme::SPACING_SM))
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(theme::font_heading())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_primary())
+                                    .child(locale::text("Attach", "添加附件", "新增附件")),
+                            )
+                            .child(
+                                div()
+                                    .id("composer-attach-close")
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .aria_label(locale::common("Close"))
+                                    .cursor_pointer()
+                                    .active(|style| style.opacity(0.6))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.close_composer_attach_menu(cx)
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/x.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_secondary()),
+                                    ),
+                            ),
+                    )
+                    .children(entries.into_iter().map(|(id, icon, label, detail, kind)| {
+                        div()
+                            .id(id)
+                            .flex_shrink_0()
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .px(px(theme::SPACING_LG))
+                            .py(px(theme::SPACING_SM))
+                            .pb(px(theme::SPACING_MD))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_MD))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.pick_composer_attachment(kind, cx)
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .bg(theme::bg_card_dim())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        svg()
+                                            .path(icon)
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_secondary()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_size(theme::font_body())
+                                            .text_color(theme::text_primary())
+                                            .child(label),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(theme::font_micro())
+                                            .text_color(theme::text_muted())
+                                            .child(detail),
+                                    ),
+                            )
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// The new-session page's choice list, along the bottom edge.
+    ///
+    /// It is a list rather than a cycle because the desktop picks from a list:
+    /// a phone tapping through five projects to reach the last one is slower
+    /// than reading five names, and there is no way to go back a step.
+    fn render_new_session_picker_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(picker) = self.new_session_picker else {
+            return div().into_any_element();
+        };
+        let (title, rows) = match picker {
+            NewSessionPicker::Project => (
+                locale::text("Choose project", "选择项目", "選擇專案"),
+                self.sidebar_projects()
+                    .into_iter()
+                    .map(|project| {
+                        let workspaces = self
+                            .workspace_summaries
+                            .iter()
+                            .filter(|summary| summary.project.id.as_str() == project.id)
+                            .count();
+                        NewSessionPickerRow {
+                            selected: self.new_session_project_id.as_deref()
+                                == Some(project.id.as_str()),
+                            id: project.id,
+                            title: project.label,
+                            subtitle: match workspaces {
+                                0 => locale::text("No workspace yet", "暂无工作区", "尚無工作區")
+                                    .to_string(),
+                                1 => locale::text("1 workspace", "1 个工作区", "1 個工作區")
+                                    .to_string(),
+                                count => format!(
+                                    "{count} {}",
+                                    locale::text("workspaces", "个工作区", "個工作區")
+                                ),
+                            },
+                            is_project: true,
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            NewSessionPicker::Workspace => {
+                let project_id = self.new_session_project_id.clone();
+                (
+                    locale::text("Choose workspace", "选择工作区", "選擇工作區"),
+                    self.workspaces
+                        .iter()
+                        .filter(|workspace| {
+                            project_id
+                                .as_deref()
+                                .is_none_or(|id| workspace.project_id.as_str() == id)
+                        })
+                        .map(|workspace| {
+                            let summary = self.workspace_summaries.iter().find(|summary| {
+                                summary.workspace.id.as_str() == workspace.id.as_str()
+                            });
+                            let title = self
+                                .sidebar_view
+                                .worktree_titles
+                                .get(workspace.id.as_str())
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    workspace_label(&workspace.root_path).to_string()
+                                });
+                            let mut subtitle = workspace_mode_label(workspace.mode).to_string();
+                            if let Some(branch) = summary
+                                .and_then(|summary| summary.git_branch.as_deref())
+                                .filter(|branch| !branch.trim().is_empty())
+                            {
+                                subtitle = format!("{subtitle} · {branch}");
+                            }
+                            NewSessionPickerRow {
+                                selected: self.new_session_workspace_id.as_deref()
+                                    == Some(workspace.id.as_str()),
+                                id: workspace.id.as_str().to_string(),
+                                title,
+                                subtitle,
+                                is_project: false,
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+        };
+
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.45))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.dismiss_new_session_picker(cx)),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "mobile-new-session-picker".to_string())
+                    .w_full()
+                    .max_h(px(460.0))
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    // The sheet itself is not the dismiss target.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w_full()
+                            .pt(px(theme::SPACING_SM))
+                            .flex()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .w(px(36.0))
+                                    .h(px(4.0))
+                                    .rounded_full()
+                                    .bg(theme::border_default()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .h(px(theme::TOUCH_TARGET))
+                            .pl(px(theme::SPACING_LG))
+                            .pr(px(theme::SPACING_SM))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(theme::font_heading())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_primary())
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .id("new-session-picker-close")
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .aria_label(locale::common("Close"))
+                                    .cursor_pointer()
+                                    .active(|style| style.opacity(0.6))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::close_new_session_picker),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/x.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_secondary()),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("new-session-picker-rows")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .pb(px(theme::SPACING_SM))
+                            .children(rows.into_iter().map(|row| {
+                                let id = row.id.clone();
+                                let is_project = row.is_project;
+                                div()
+                                    .id(format!("new-session-picker:{}", row.id))
+                                    .flex_shrink_0()
+                                    .min_h(px(theme::TOUCH_TARGET))
+                                    .px(px(theme::SPACING_LG))
+                                    .py(px(theme::SPACING_SM))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(theme::SPACING_MD))
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .when(row.selected, |row| row.bg(theme::sidebar_selected_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            if is_project {
+                                                this.choose_new_session_project(id.clone(), cx)
+                                            } else {
+                                                this.choose_new_session_workspace(id.clone(), cx)
+                                            }
+                                        }),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .overflow_hidden()
+                                                    .text_ellipsis()
+                                                    .whitespace_nowrap()
+                                                    .text_size(theme::font_body())
+                                                    .text_color(theme::text_primary())
+                                                    .child(row.title),
+                                            )
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .overflow_hidden()
+                                                    .text_ellipsis()
+                                                    .whitespace_nowrap()
+                                                    .text_size(theme::font_micro())
+                                                    .text_color(theme::text_muted())
+                                                    .child(row.subtitle),
+                                            ),
+                                    )
+                                    .when(row.selected, |row| {
+                                        row.child(
+                                            svg()
+                                                .path("icons/check.svg")
+                                                .size(px(theme::ICON_SM))
+                                                .text_color(theme::accent_green()),
+                                        )
+                                    })
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_new_session_mode_button(
@@ -18796,7 +19278,9 @@ impl MobileApp {
                                 locale::common("Project"),
                                 project_label,
                                 false,
-                                cx.listener(Self::cycle_new_session_project),
+                                cx.listener(|this, _, _, cx| {
+                                    this.open_new_session_picker(NewSessionPicker::Project, cx)
+                                }),
                             ))
                             .child(new_session_chip(
                                 "mobile-new-session-workspace",
@@ -18804,7 +19288,9 @@ impl MobileApp {
                                 locale::common("Workspace"),
                                 workspace_display,
                                 false,
-                                cx.listener(Self::cycle_new_session_workspace),
+                                cx.listener(|this, _, _, cx| {
+                                    this.open_new_session_picker(NewSessionPicker::Workspace, cx)
+                                }),
                             )),
                     )
                     .child(
@@ -25426,6 +25912,7 @@ mod tests {
             BackScreen::Overlay(_) => false,
             BackScreen::SessionAction => session_action_open,
             BackScreen::RuntimeOptions => false,
+            BackScreen::NewSessionPicker => false,
             BackScreen::SessionsDrawer => true,
             BackScreen::WorkbenchDrawer => true,
             BackScreen::SidebarSearch => false,
