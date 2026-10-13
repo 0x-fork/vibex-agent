@@ -25,7 +25,7 @@ The leaf of the home path decides which runtime flavour the client starts:
 
 | Home ends with | Flavour | Local listener |
 | --- | --- | --- |
-| `desktop-preview`, `desktop-rc`, `desktop-stable` | that desktop channel | the desktop Direct port, 1428 |
+| `desktop-preview`, `desktop-rc`, `desktop-stable` | that desktop channel | the local-client port, 1429, then the Direct port, 1428 |
 | anything else | server | 8765, or `VIBEX_BIND_ADDR` |
 
 The flavour has to come from the path because the runtime refuses to start a
@@ -34,10 +34,14 @@ throwaway server-style runtime, which is the quickest way to try the client
 without touching a real home.
 
 Local attachment never trusts the loopback interface on its own: the client
-reads the runtime's identity public key from the home's own
-`relay/desktop-identity.json` and compares it with what the runtime presents.
-Plain HTTP is used only for a loopback route whose runtime does not terminate
-TLS, and only with the explicit development opt-in.
+reads the runtime's identity public key — and, from it, the certificate the
+runtime terminates TLS with — out of the home's own
+`relay/desktop-identity.json`, and compares both with what the runtime presents.
+A desktop serves clients on this machine on its pinned-certificate Gateway
+narrowed to the loopback address, so that door is open whenever the desktop is,
+independently of Remote Access. The plaintext Direct port stays behind it as a
+fallback for a desktop that predates it, and plain HTTP is used only with the
+explicit development opt-in.
 
 ## Packaging
 
@@ -62,8 +66,9 @@ The status band names the mode, and *Settings → Connection* shows the same wor
 | **Remote mode** | another runtime owns the home, or a link was given | the client is a network peer; steering degrades to interrupt + resend |
 
 If the home is locked and the runtime is not accepting local clients, the client
-prints three ways out: enable *Settings → Remote Access → Direct*, quit the
-desktop app, or connect to another runtime with `vibex connect`.
+prints the endpoints it tried and three ways out: enable *Settings → Remote
+Access → Local clients* in the desktop app, quit the desktop app, or connect to
+another runtime with `vibex connect`.
 
 ## Screen composition
 

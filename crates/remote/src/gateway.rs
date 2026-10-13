@@ -883,21 +883,48 @@ impl RemoteGateway {
     /// on the local network. The certificate is deterministically bound to the
     /// Desktop identity and is accepted by mobile only after encrypted pairing.
     pub async fn start_local_lan_gateway(&self, port: u16) -> VibexResult<LocalLanGatewayInfo> {
+        self.start_local_gateway(Ipv4Addr::UNSPECIFIED, port).await
+    }
+
+    /// Starts the same pinned-certificate Gateway on the loopback address, for
+    /// clients running on this machine.
+    ///
+    /// It is one listener with one certificate and one policy — only the bind
+    /// address differs — so a same-machine client authenticates exactly like a
+    /// paired phone and the runtime never needs a second, plaintext surface to
+    /// serve `vibex tui`. A local-network binding already covers loopback, and
+    /// asking for this scope while one is up is a no-op.
+    pub async fn start_local_client_gateway(&self, port: u16) -> VibexResult<LocalLanGatewayInfo> {
+        self.start_local_gateway(Ipv4Addr::LOCALHOST, port).await
+    }
+
+    async fn start_local_gateway(
+        &self,
+        bind_addr: Ipv4Addr,
+        port: u16,
+    ) -> VibexResult<LocalLanGatewayInfo> {
         let _lifecycle_guard = self.inner.lifecycle_guard.lock().await;
         if let Some(info) = self.local_lan_gateway_info() {
-            return Ok(info);
+            if info.bound_addr.ip() == bind_addr {
+                return Ok(info);
+            }
+            // The listener is up for the other audience. Swapping the bind is a
+            // restart, and it belongs here rather than at the call site: a
+            // wildcard bind left in place after local-network pairing is
+            // switched off is exactly the exposure the narrower scope exists to
+            // drop.
+            self.stop_local_lan_gateway_locked().await;
         }
 
         let identity = self.identity()?;
         let tls_identity = derive_local_lan_tls_identity(&identity)?;
-        let listener =
-            std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).map_err(|error| {
-                VibexError::process(
-                    "remote_local_lan_listener_bind_failed",
-                    "local LAN Gateway could not bind its HTTPS listener",
-                )
-                .with_diagnostic("errorKind", format!("{:?}", error.kind()))
-            })?;
+        let listener = std::net::TcpListener::bind((bind_addr, port)).map_err(|error| {
+            VibexError::process(
+                "remote_local_lan_listener_bind_failed",
+                "local Gateway could not bind its HTTPS listener",
+            )
+            .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+        })?;
         listener.set_nonblocking(true).map_err(|error| {
             VibexError::process(
                 "remote_local_lan_listener_config_failed",

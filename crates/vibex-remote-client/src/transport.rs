@@ -814,16 +814,48 @@ pub fn claim_pairing_code_with_identity(
     allow_insecure_local_dev: bool,
     previous_identity: Option<ClientDeviceIdentity>,
 ) -> BackendFuture<'static, PairingCodeClientBundle> {
+    claim_pairing_code_with_identity_and_certificate(
+        base_url,
+        pairing_code,
+        display_name,
+        allow_insecure_local_dev,
+        None,
+        previous_identity,
+    )
+}
+
+/// Pair over a route that terminates its own certificate, without a link to
+/// carry it.
+///
+/// A client that is already inside this machine's file permissions can derive
+/// the runtime's pinned certificate from the identity file beside the database
+/// instead of receiving it from an operator. That is the same value a pairing
+/// link would have carried, so the pin is authenticated by the filesystem
+/// rather than by the wire, and everything after pairing verifies against it.
+/// The certificate is required to describe an HTTPS local address, exactly as
+/// [`claim_pairing_code_link_with_identity`] enforces for a link.
+pub fn claim_pairing_code_with_identity_and_certificate(
+    base_url: impl Into<String>,
+    pairing_code: impl Into<String>,
+    display_name: impl Into<String>,
+    allow_insecure_local_dev: bool,
+    pinned_tls_certificate_base64: Option<String>,
+    previous_identity: Option<ClientDeviceIdentity>,
+) -> BackendFuture<'static, PairingCodeClientBundle> {
     let base_url = base_url.into();
     let pairing_code = pairing_code.into();
     let display_name = display_name.into();
     Box::pin(async move {
+        let pinned_certificate_der = match pinned_tls_certificate_base64.as_deref() {
+            Some(encoded) => Some(decode_pinned_tls_certificate(encoded)?),
+            None => None,
+        };
         complete_pairing_code_claim(
             base_url,
             pairing_code,
             display_name,
             allow_insecure_local_dev,
-            None,
+            pinned_certificate_der,
             previous_identity,
         )
         .await

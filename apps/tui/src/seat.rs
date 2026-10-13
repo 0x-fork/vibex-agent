@@ -31,7 +31,7 @@ use vibex_remote::{RemoteIdentityStore, RemoteTrustService};
 use vibex_remote_client::{
     AutoRemoteTransport, AutoRemoteTransportConfig, ClientDeviceIdentity, DirectCandidate,
     RemoteClientConfig, WebRemoteBackend, claim_pairing_code_link_with_identity,
-    claim_pairing_code_with_identity,
+    claim_pairing_code_with_identity, claim_pairing_code_with_identity_and_certificate,
 };
 use vibex_tui::SeatKind;
 
@@ -39,7 +39,15 @@ use vibex_tui::SeatKind;
 #[derive(Debug)]
 pub enum SeatError {
     /// Another runtime owns this home and it is not accepting local clients.
-    HomeLocked { home: PathBuf },
+    HomeLocked {
+        home: PathBuf,
+        /// The endpoints that were dialled before giving up, so the message
+        /// names the doors that turned out to be closed instead of guessing at
+        /// one of them.
+        endpoints: Vec<String>,
+        /// Why the last attempt failed.
+        detail: String,
+    },
     /// The requested remote runtime could not be reached.
     Unreachable { url: String, detail: String },
     /// The provided link or code was rejected.
@@ -51,14 +59,23 @@ pub enum SeatError {
 impl std::fmt::Display for SeatError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SeatError::HomeLocked { home } => write!(
+            SeatError::HomeLocked {
+                home,
+                endpoints,
+                detail,
+            } => write!(
                 formatter,
-                "Another Vibex runtime already owns {}.\n\n\
-                 Vibex Desktop is running and is not accepting local clients. Either:\n\
-                 \x20 1. enable Settings → Remote Access → Direct in the desktop app, then retry\n\
+                "Another Vibex runtime already owns {} and is not accepting \
+                 clients on this machine.\n\n\
+                 Tried: {}\n\
+                 Last error: {}\n\n\
+                 Either:\n\
+                 \x20 1. open Settings → Remote Access in the desktop app and turn on local clients, then retry\n\
                  \x20 2. quit the desktop app and retry\n\
                  \x20 3. connect to another runtime with `vibex connect <vibex://…>`",
-                home.display()
+                home.display(),
+                endpoints.join(", "),
+                detail
             ),
             SeatError::Unreachable { url, detail } => {
                 write!(formatter, "could not reach the runtime at {url}: {detail}")
@@ -94,6 +111,16 @@ pub struct SeatRequest {
     pub prefer_authority: bool,
 }
 
+/// The loopback address a desktop runtime serves clients running on this
+/// machine at.
+///
+/// It is the desktop's pinned-certificate Gateway narrowed to the loopback
+/// address, so a same-machine client authenticates the runtime with the
+/// identity key it reads from the home instead of trusting the loopback
+/// interface. Unlike the Direct listener it is not part of Remote Access: it is
+/// there whenever the desktop is.
+pub const DESKTOP_LOCAL_CLIENT_LOOPBACK: &str = "https://127.0.0.1:1429";
+
 /// The loopback address a desktop runtime listens on when Remote Access →
 /// Direct is enabled.
 pub const DESKTOP_DIRECT_LOOPBACK: &str = "http://127.0.0.1:1428";
@@ -101,31 +128,80 @@ pub const DESKTOP_DIRECT_LOOPBACK: &str = "http://127.0.0.1:1428";
 /// The loopback address a headless server listens on by default.
 pub const SERVER_LOOPBACK: &str = "http://127.0.0.1:8765";
 
+/// One endpoint a local bootstrap may dial.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalCandidate {
+    endpoint: String,
+    /// Whether the runtime terminates TLS there with the certificate derived
+    /// from its identity file. A route without a pin is only ever the explicit
+    /// loopback development exception.
+    pinned: bool,
+}
+
+/// Where a headless server answers local clients: `VIBEX_BIND_ADDR` when it is
+/// set, the documented default otherwise.
+fn server_loopback_endpoint() -> String {
+    std::env::var("VIBEX_BIND_ADDR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.contains("://") {
+                value
+            } else {
+                format!("http://{value}")
+            }
+        })
+        .unwrap_or_else(|| SERVER_LOOPBACK.to_string())
+}
+
+/// Every endpoint a runtime owning this home may answer local clients on, in
+/// the order they should be tried.
+///
+/// The desktop flavours serve same-machine clients on the pinned-certificate
+/// Gateway first. The Direct listener stays behind it as a fallback, so a
+/// desktop that predates the local-client listener keeps working instead of
+/// regressing into "not accepting local clients". A headless server has neither
+/// listener and moves with `VIBEX_BIND_ADDR`.
+fn local_candidates(flavour: HomeFlavour) -> Vec<LocalCandidate> {
+    match flavour {
+        HomeFlavour::Preview | HomeFlavour::ReleaseCandidate | HomeFlavour::Stable => vec![
+            LocalCandidate {
+                endpoint: DESKTOP_LOCAL_CLIENT_LOOPBACK.to_string(),
+                pinned: true,
+            },
+            LocalCandidate {
+                endpoint: DESKTOP_DIRECT_LOOPBACK.to_string(),
+                pinned: false,
+            },
+        ],
+        HomeFlavour::Server => vec![LocalCandidate {
+            endpoint: server_loopback_endpoint(),
+            pinned: false,
+        }],
+    }
+}
+
 /// Where a runtime that owns a given home answers local clients.
 ///
-/// The two flavours listen in different places: the desktop app's Direct
-/// listener defaults to 1428, while a headless server defaults to 8765 and moves
-/// with `VIBEX_BIND_ADDR`. Dialling the wrong one produces a connection error
-/// that looks like "the runtime is not accepting clients", which is the exact
-/// confusion the seat messages exist to avoid.
+/// This is the first candidate: the endpoint a fresh bootstrap dials, and the
+/// one `status` should name. Dialling a listener the runtime does not have
+/// produces a connection error that looks like "the runtime is not accepting
+/// clients", which is the exact confusion the seat messages exist to avoid.
 pub fn loopback_endpoint(flavour: HomeFlavour) -> String {
-    match flavour {
-        HomeFlavour::Preview | HomeFlavour::ReleaseCandidate | HomeFlavour::Stable => {
-            DESKTOP_DIRECT_LOOPBACK.to_string()
-        }
-        HomeFlavour::Server => std::env::var("VIBEX_BIND_ADDR")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(|value| {
-                if value.contains("://") {
-                    value
-                } else {
-                    format!("http://{value}")
-                }
-            })
-            .unwrap_or_else(|| SERVER_LOOPBACK.to_string()),
-    }
+    local_candidates(flavour)
+        .into_iter()
+        .next()
+        .map(|candidate| candidate.endpoint)
+        .unwrap_or_else(|| SERVER_LOOPBACK.to_string())
+}
+
+/// The endpoints a failure message should name, in the order they were dialled.
+fn local_endpoint_list(flavour: HomeFlavour) -> Vec<String> {
+    local_candidates(flavour)
+        .into_iter()
+        .map(|candidate| candidate.endpoint)
+        .collect()
 }
 
 impl Seat {
@@ -152,7 +228,12 @@ impl Seat {
                 }
                 Err(error) if error.code == "desktop_runtime_home_locked" => {
                     if request.prefer_authority {
-                        return Err(SeatError::HomeLocked { home });
+                        return Err(SeatError::HomeLocked {
+                            endpoints: local_endpoint_list(HomeFlavour::of(&home)),
+                            home,
+                            detail: "--prefer-authority was requested, so no client endpoint was dialled"
+                                .to_string(),
+                        });
                     }
                 }
                 Err(error) => {
@@ -171,16 +252,17 @@ impl Seat {
         // Otherwise bootstrap a device credential for this machine.
         match Self::bootstrap_local(home.clone(), config).await {
             Ok(seat) => Ok(seat),
-            Err(error) => {
-                if matches!(error, SeatError::Unreachable { .. }) {
-                    // The runtime is running but not listening: the lock is the
-                    // signal, so report the actionable message rather than a
-                    // connection error the user cannot act on.
-                    Err(SeatError::HomeLocked { home })
-                } else {
-                    Err(error)
-                }
+            Err(SeatError::Unreachable { url, detail }) => {
+                // The runtime is running but not listening on any endpoint this
+                // client knows: the lock is the signal, so report the actionable
+                // message rather than the last connection error alone.
+                Err(SeatError::HomeLocked {
+                    endpoints: local_endpoint_list(HomeFlavour::of(&home)),
+                    home,
+                    detail: format!("{url}: {detail}"),
+                })
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -292,7 +374,14 @@ impl Seat {
     /// The trust anchor is the identity file on disk: reading it already
     /// requires being inside this machine's per-user file permissions, and the
     /// public key is then pinned on the transport so a different process cannot
-    /// impersonate the runtime.
+    /// impersonate the runtime. The certificate the runtime terminates TLS with
+    /// is derived from that same file, which is why a pinned route needs no
+    /// operator-supplied link.
+    ///
+    /// Which endpoint answers is discovered by dialling rather than by reading
+    /// the runtime's settings: the client has to behave the same against a
+    /// desktop whose home it can read and a runtime whose configuration it never
+    /// sees, and the settings file is not a promise that a listener came up.
     async fn bootstrap_local(
         home: PathBuf,
         config: DesktopRuntimeConfig,
@@ -302,14 +391,7 @@ impl Seat {
             .map_err(|error| SeatError::Environment {
                 detail: format!("could not read the runtime identity: {error}"),
             })?;
-        // Only a listener that actually terminates TLS can be pinned. Under the
-        // loopback development policy the runtime serves plain HTTP, and asking
-        // for a pinned route there is rejected by the client's own validation.
-        let endpoint = loopback_endpoint(HomeFlavour::of(&home));
-        let pinned = endpoint
-            .starts_with("https://")
-            .then(|| vibex_remote::pinned_tls_certificate_base64(&identity).ok())
-            .flatten();
+        let candidates = local_candidates(HomeFlavour::of(&home));
 
         // The runtime is running, so the database is shared. WAL mode plus the
         // runtime's own 15 s busy timeout make a short-lived read safe, and this
@@ -322,34 +404,56 @@ impl Seat {
         vibex_db::apply_migrations(&mut connection).map_err(|error| SeatError::Environment {
             detail: format!("could not migrate the runtime database: {error}"),
         })?;
-        let response = RemoteTrustService::create_pairing_code(
-            &connection,
-            RemoteCreatePairingCodeRequest {
-                permission_level: RemoteDevicePermissionLevel::FullControl,
-                ttl_ms: Some(120_000),
-            },
-        )
-        .map_err(|error| SeatError::Environment {
-            detail: format!("could not mint a local pairing code: {error}"),
-        })?;
 
-        let base_url = endpoint;
-        let bundle = claim_pairing_code_with_identity(
-            base_url.clone(),
-            response.pairing_code.clone(),
-            "Vibex TUI",
-            true,
-            None,
-        )
-        .await
-        .map_err(|error| SeatError::Unreachable {
-            url: base_url,
-            detail: error.message,
-        })?;
-
-        let seat = Self::from_bundle(&bundle, pinned.clone(), &home)?;
-        save_bundle_credential(&home, &bundle, pinned.as_deref())?;
-        Ok(seat)
+        let mut last = SeatError::Unreachable {
+            url: local_endpoint_list(HomeFlavour::of(&home)).join(", "),
+            detail: "no local endpoint is configured for this home".to_string(),
+        };
+        for candidate in candidates {
+            // A pairing code is single use, so every attempt mints its own
+            // rather than letting a failed dial burn the one code for the next
+            // candidate.
+            let response = RemoteTrustService::create_pairing_code(
+                &connection,
+                RemoteCreatePairingCodeRequest {
+                    permission_level: RemoteDevicePermissionLevel::FullControl,
+                    ttl_ms: Some(120_000),
+                },
+            )
+            .map_err(|error| SeatError::Environment {
+                detail: format!("could not mint a local pairing code: {error}"),
+            })?;
+            // Only a listener that actually terminates TLS can be pinned. Under
+            // the loopback development policy the runtime serves plain HTTP, and
+            // asking for a pin there is rejected by the client's own validation.
+            let pin = candidate
+                .pinned
+                .then(|| vibex_remote::pinned_tls_certificate_base64(&identity).ok())
+                .flatten();
+            let claim = claim_pairing_code_with_identity_and_certificate(
+                candidate.endpoint.clone(),
+                response.pairing_code.clone(),
+                "Vibex TUI",
+                !candidate.pinned,
+                pin.clone(),
+                None,
+            )
+            .await;
+            let bundle = match claim {
+                Ok(bundle) => bundle,
+                Err(error) => {
+                    last = SeatError::Unreachable {
+                        url: candidate.endpoint,
+                        detail: error.message,
+                    };
+                    continue;
+                }
+            };
+            let seat = Self::from_bundle(&bundle, pin.clone(), &home)?;
+            save_bundle_credential(&home, &bundle, pin.as_deref())?;
+            return Ok(seat);
+        }
+        Err(last)
     }
 
     fn from_bundle(
@@ -794,11 +898,18 @@ mod tests {
     fn locked_home_message_offers_every_way_out() {
         let error = SeatError::HomeLocked {
             home: PathBuf::from("/home/dev/.vibex/desktop-preview"),
+            endpoints: local_endpoint_list(HomeFlavour::Preview),
+            detail: "http://127.0.0.1:1428: connection refused".to_string(),
         };
         let text = error.to_string();
         assert!(text.contains("Remote Access"));
+        assert!(text.contains("turn on local clients"));
         assert!(text.contains("quit the desktop app"));
         assert!(text.contains("vibex connect"));
+        // The doors that were actually tried, so the report is not a guess.
+        assert!(text.contains(DESKTOP_LOCAL_CLIENT_LOOPBACK), "{text}");
+        assert!(text.contains(DESKTOP_DIRECT_LOOPBACK), "{text}");
+        assert!(text.contains("connection refused"), "{text}");
     }
 
     #[test]
@@ -815,6 +926,23 @@ mod tests {
         // A LAN or public default here would silently expose the runtime.
         assert!(SERVER_LOOPBACK.contains("127.0.0.1"));
         assert!(DESKTOP_DIRECT_LOOPBACK.contains("127.0.0.1"));
+        assert!(DESKTOP_LOCAL_CLIENT_LOOPBACK.contains("127.0.0.1"));
+        // Same-machine clients reach the runtime over TLS, never in the clear,
+        // so the pin derived from the identity file is always in play.
+        assert!(DESKTOP_LOCAL_CLIENT_LOOPBACK.starts_with("https://"));
+    }
+
+    #[test]
+    fn the_pinned_local_listener_is_tried_before_the_plaintext_one() {
+        // The pinned listener is the one the desktop maintains for this machine
+        // and it is the only one that authenticates the runtime. Direct is the
+        // fallback for a desktop that predates it, so it must not shadow it.
+        let candidates = local_candidates(HomeFlavour::Preview);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].endpoint, DESKTOP_LOCAL_CLIENT_LOOPBACK);
+        assert!(candidates[0].pinned);
+        assert_eq!(candidates[1].endpoint, DESKTOP_DIRECT_LOOPBACK);
+        assert!(!candidates[1].pinned);
     }
 
     #[test]
@@ -844,21 +972,30 @@ mod tests {
 
     #[test]
     fn each_flavour_dials_its_own_listener() {
-        // The desktop Direct listener and the headless server listen on
-        // different ports; dialling the wrong one reads as "not accepting
+        // The desktop's own listeners and the headless server's listen in
+        // different places; dialling the wrong one reads as "not accepting
         // local clients".
         assert_eq!(
             loopback_endpoint(HomeFlavour::Preview),
-            DESKTOP_DIRECT_LOOPBACK
+            DESKTOP_LOCAL_CLIENT_LOOPBACK
         );
         assert_eq!(
             loopback_endpoint(HomeFlavour::ReleaseCandidate),
-            DESKTOP_DIRECT_LOOPBACK
+            DESKTOP_LOCAL_CLIENT_LOOPBACK
         );
         assert_eq!(
             loopback_endpoint(HomeFlavour::Stable),
-            DESKTOP_DIRECT_LOOPBACK
+            DESKTOP_LOCAL_CLIENT_LOOPBACK
         );
         assert_eq!(loopback_endpoint(HomeFlavour::Server), SERVER_LOOPBACK);
+    }
+
+    #[test]
+    fn a_server_home_has_exactly_one_local_listener() {
+        // A headless runtime moves with `VIBEX_BIND_ADDR` and serves plain HTTP
+        // behind it; there is no second, pinned door to try.
+        let candidates = local_candidates(HomeFlavour::Server);
+        assert_eq!(candidates.len(), 1);
+        assert!(!candidates[0].pinned);
     }
 }

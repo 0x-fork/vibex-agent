@@ -163,6 +163,26 @@ pub struct RemoteConnectivitySnapshot {
     pub relay_connected: bool,
     pub gateway_running: bool,
     pub gateway_bound_addr: Option<SocketAddr>,
+    /// Same-machine client access, which is independent of every remote method
+    /// above and reports separately so a settings surface can offer it without
+    /// implying the desktop is reachable from outside this machine.
+    pub local_clients: LocalClientsSnapshot,
+}
+
+/// State of the loopback listener that serves clients on this machine.
+///
+/// `enabled` is the stored intent and `listening` is what actually happened, so
+/// a port conflict reads as "requested but not listening" instead of a switch
+/// that silently does nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalClientsSnapshot {
+    pub enabled: bool,
+    pub listening: bool,
+    /// Where the local Gateway is bound. It is the loopback address when only
+    /// same-machine clients are allowed, and the wildcard address when
+    /// local-network pairing has widened it.
+    pub bound_addr: Option<SocketAddr>,
 }
 
 impl fmt::Debug for RemoteConnectivitySnapshot {
@@ -183,6 +203,7 @@ impl fmt::Debug for RemoteConnectivitySnapshot {
             .field("relay_connected", &self.relay_connected)
             .field("gateway_running", &self.gateway_running)
             .field("gateway_bound_addr", &self.gateway_bound_addr)
+            .field("local_clients", &self.local_clients)
             .finish()
     }
 }
@@ -270,6 +291,16 @@ pub struct RemoteConnectivitySettingsV1 {
     pub desired_enabled: bool,
     #[serde(default)]
     pub local_network_enabled: bool,
+    /// Whether clients running on this machine may attach to this runtime.
+    ///
+    /// Deliberately neither a [`RemoteConnectivityMethod`] nor part of
+    /// `desired_enabled`: it opens the pinned-certificate Gateway on the
+    /// loopback address only, so it publishes no route and grants nothing that
+    /// is not already on this machine. Folding it into the master switch would
+    /// report a desktop as remotely reachable while nothing outside the machine
+    /// can reach it.
+    #[serde(default = "default_local_clients_enabled")]
+    pub local_clients_enabled: bool,
     pub generation: u64,
     pub tailscale: TailscaleSettings,
     pub direct: DirectSettings,
@@ -284,6 +315,7 @@ impl Default for RemoteConnectivitySettingsV1 {
             schema_version: REMOTE_CONNECTIVITY_SCHEMA_VERSION,
             desired_enabled: false,
             local_network_enabled: false,
+            local_clients_enabled: default_local_clients_enabled(),
             generation: 0,
             tailscale: TailscaleSettings::default(),
             direct: DirectSettings::default(),
@@ -1856,11 +1888,20 @@ impl RemoteConnectivityController {
             .iter()
             .find(|item| item.candidate_available)
             .map(|item| item.method);
+        let local_gateway_addr = local_lan_info.as_ref().map(|info| info.bound_addr);
+        // The same listener serves both audiences, but only a local-network
+        // binding is remote reachability. Counting a loopback binding here would
+        // report every desktop as remotely reachable the moment it starts.
+        let local_network_listening =
+            local_gateway_addr.is_some() && state.settings.local_network_enabled;
+        let remote_gateway_addr = local_network_listening
+            .then_some(local_gateway_addr)
+            .flatten();
         RemoteConnectivitySnapshot {
             schema_version: REMOTE_CONNECTIVITY_SCHEMA_VERSION,
             desired_enabled: state.settings.desired_enabled,
             running: gateway_status.running
-                || local_lan_info.is_some()
+                || local_network_listening
                 || relay_status.state == crate::RelayClientConnectionState::Connected,
             generation: state.settings.generation,
             methods,
@@ -1868,10 +1909,13 @@ impl RemoteConnectivityController {
             last_successful_pairing_entry: state.settings.last_successful_pairing_entry,
             direct_route_count,
             relay_connected: relay_status.state == crate::RelayClientConnectionState::Connected,
-            gateway_running: gateway_status.running || local_lan_info.is_some(),
-            gateway_bound_addr: gateway_status
-                .bound_addr
-                .or_else(|| local_lan_info.map(|info| info.bound_addr)),
+            gateway_running: gateway_status.running || local_network_listening,
+            gateway_bound_addr: gateway_status.bound_addr.or(remote_gateway_addr),
+            local_clients: LocalClientsSnapshot {
+                enabled: state.settings.local_clients_enabled,
+                listening: local_gateway_addr.is_some(),
+                bound_addr: local_gateway_addr,
+            },
         }
     }
 
@@ -2000,7 +2044,10 @@ impl RemoteConnectivityController {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 if !was_local_network_enabled {
-                    self.inner.gateway.stop_local_lan_gateway().await;
+                    // The bind was just widened for a window that never opened.
+                    // Narrowing it back keeps serving the clients on this
+                    // machine instead of closing their door as collateral.
+                    let _ = self.sync_local_client_listener().await;
                 }
                 return Err(error);
             }
@@ -2029,7 +2076,7 @@ impl RemoteConnectivityController {
         if let Err(error) = self.inner.zero_config_lan_advertiser.start(&advertisement) {
             let _ = self.inner.gateway.cancel_zero_config_lan_pairing().await;
             if !was_local_network_enabled {
-                self.inner.gateway.stop_local_lan_gateway().await;
+                let _ = self.sync_local_client_listener().await;
             }
             return Err(error);
         }
@@ -2048,7 +2095,9 @@ impl RemoteConnectivityController {
             if let Err(error) = persist_result {
                 let _ = self.inner.zero_config_lan_advertiser.stop();
                 let _ = self.inner.gateway.cancel_zero_config_lan_pairing().await;
-                self.inner.gateway.stop_local_lan_gateway().await;
+                // The setting was never persisted, so the listener goes back to
+                // the audience the stored settings still describe.
+                let _ = self.sync_local_client_listener().await;
                 return Err(error);
             }
         }
@@ -2171,6 +2220,12 @@ impl RemoteConnectivityController {
 
     pub async fn reconcile_on_startup(&self) -> VibexResult<RemoteConnectivitySnapshot> {
         let _lifecycle = self.inner.lifecycle_operation.write().await;
+        // Reconciled before the master switch is consulted: same-machine client
+        // access is not remote reachability, and a desktop with every remote
+        // method switched off still has to serve the TUI on this machine. That
+        // is the whole point of the setting, so it cannot live behind the
+        // `desired_enabled` early return below.
+        self.sync_local_client_listener().await?;
         let mut state = self.inner.state.lock().await;
         if !state.settings.desired_enabled {
             for runtime in state.methods.values_mut() {
@@ -2816,9 +2871,87 @@ impl RemoteConnectivityController {
             let _gateway = self.inner.gateway_operation.lock().await;
             let _ = self.inner.zero_config_lan_advertiser.stop();
             self.inner.gateway.cancel_zero_config_lan_pairing().await?;
-            self.inner.gateway.stop_local_lan_gateway().await;
+            // "Disable all" is about remote reachability. Same-machine clients
+            // are not remote reachability, and closing their door here would
+            // silently break `vibex tui` for a user who only meant to stop
+            // publishing this runtime.
+            self.sync_local_client_listener().await?;
         }
         Ok(self.snapshot().await)
+    }
+
+    /// Turn same-machine client access on or off.
+    ///
+    /// This is not a connectivity method: there is no route to publish and no
+    /// probe to run, only a listener whose bind address follows the setting.
+    pub async fn set_local_clients_enabled(
+        &self,
+        enabled: bool,
+    ) -> VibexResult<RemoteConnectivitySnapshot> {
+        let _lifecycle = self.inner.lifecycle_operation.write().await;
+        {
+            let mut state = self.inner.state.lock().await;
+            if state.settings.local_clients_enabled != enabled {
+                let mut settings = state.settings.clone();
+                settings.local_clients_enabled = enabled;
+                settings.generation = settings.generation.saturating_add(1);
+                settings.updated_at_ms = unix_timestamp_ms();
+                persist_state(&self.inner.store, &settings)?;
+                state.settings = settings;
+            }
+        }
+        self.sync_local_client_listener().await?;
+        Ok(self.snapshot().await)
+    }
+
+    /// Keep the pinned-certificate listener pointed at the audience the settings
+    /// currently allow.
+    ///
+    /// One listener serves both audiences: a local-network binding already
+    /// covers loopback, so same-machine clients never need a second socket and
+    /// the endpoint a client dials does not move when local-network pairing is
+    /// switched on. The Gateway restarts the listener when the bind has to
+    /// change, in either direction.
+    async fn sync_local_client_listener(&self) -> VibexResult<()> {
+        let (local_network_enabled, local_clients_enabled) = {
+            let state = self.inner.state.lock().await;
+            (
+                state.settings.local_network_enabled,
+                state.settings.local_clients_enabled,
+            )
+        };
+        if local_network_enabled {
+            // A local-network binding is a published pairing surface, so
+            // failing to get its port is a failure the caller has to see.
+            self.inner
+                .gateway
+                .start_local_lan_gateway(self.inner.local_lan_port)
+                .await?;
+            return Ok(());
+        }
+        if local_clients_enabled {
+            if let Err(error) = self
+                .inner
+                .gateway
+                .start_local_client_gateway(self.inner.local_lan_port)
+                .await
+            {
+                // Port 1429 being taken is a real problem for the client on this
+                // machine, but it is not a remote-access failure and the callers
+                // here are mid-way through reconciling routes. The snapshot
+                // reports `listening: false`, which is what the settings surface
+                // shows, so the honest failure stays visible without taking down
+                // methods that were just reconciled.
+                tracing::warn!(
+                    target: "vibex_desktop",
+                    error_code = %error.code,
+                    "local client listener could not start"
+                );
+            }
+            return Ok(());
+        }
+        self.inner.gateway.stop_local_lan_gateway().await;
+        Ok(())
     }
 
     async fn method_operation(&self, method: RemoteConnectivityMethod) -> MutexGuard<'_, ()> {
@@ -2889,7 +3022,6 @@ impl RemoteConnectivityController {
         network_origins: Vec<String>,
         listener_enabled: bool,
     ) -> VibexResult<()> {
-        let local_network_enabled = self.inner.state.lock().await.settings.local_network_enabled;
         let previous = self.inner.gateway.current_config();
         if previous.pairing_routes != routes {
             let _ = self.inner.zero_config_lan_advertiser.stop();
@@ -2941,13 +3073,7 @@ impl RemoteConnectivityController {
             if was_running {
                 let _ = self.inner.gateway.start().await;
             }
-            if local_network_enabled {
-                let _ = self
-                    .inner
-                    .gateway
-                    .start_local_lan_gateway(self.inner.local_lan_port)
-                    .await;
-            }
+            let _ = self.sync_local_client_listener().await;
             return Err(error);
         }
         if listener_enabled && let Err(error) = self.inner.gateway.start().await {
@@ -2960,12 +3086,9 @@ impl RemoteConnectivityController {
                 if was_running {
                     self.inner.gateway.start().await?;
                 }
-                if local_network_enabled {
-                    self.inner
-                        .gateway
-                        .start_local_lan_gateway(self.inner.local_lan_port)
-                        .await?;
-                }
+                // The listener's audience follows the settings, not the rollback
+                // path, so it is re-established from the settings either way.
+                self.sync_local_client_listener().await?;
                 Ok::<(), VibexError>(())
             }
             .await;
@@ -2978,12 +3101,10 @@ impl RemoteConnectivityController {
             }
             return Err(error);
         }
-        if local_network_enabled {
-            self.inner
-                .gateway
-                .start_local_lan_gateway(self.inner.local_lan_port)
-                .await?;
-        }
+        // `RemoteGateway::stop` above tore the pinned-certificate listener down
+        // with the main one, so it is re-established here for whichever audience
+        // the settings allow — same-machine clients included.
+        self.sync_local_client_listener().await?;
         self.stop_lan_advertiser_if_inactive();
         Ok(())
     }
@@ -3382,6 +3503,20 @@ impl RemoteConnectivityController {
             .collect();
         self.configure_gateway_locked(routes, origins, true).await
     }
+}
+
+/// Same-machine client access is on unless someone turns it off.
+///
+/// The listener is loopback-only, terminates TLS with a certificate derived
+/// from the identity file beside the database, and still requires a device
+/// grant the runtime itself issues — so reaching it already means being able to
+/// read this home's private files, which is the trust the database itself
+/// assumes. Defaulting it off would preserve the state where a desktop and a
+/// TUI cannot share one runtime, which is the problem the setting exists to
+/// solve. A settings file written before the field exists therefore upgrades to
+/// enabled, not disabled.
+fn default_local_clients_enabled() -> bool {
+    true
 }
 
 fn desired_for(settings: &RemoteConnectivitySettingsV1, method: RemoteConnectivityMethod) -> bool {
@@ -3981,6 +4116,142 @@ mod tests {
     }
 
     #[test]
+    fn settings_without_the_local_clients_flag_upgrade_to_enabled() {
+        // A settings file written before same-machine client access existed has
+        // to read back as enabled, otherwise upgrading keeps the desktop and the
+        // TUI on one machine unable to share a runtime — the problem the field
+        // exists to solve.
+        let encoded = serde_json::to_value(RemoteConnectivitySettingsV1::default()).unwrap();
+        let mut object = encoded.as_object().unwrap().clone();
+        object.remove("localClientsEnabled");
+        let decoded: RemoteConnectivitySettingsV1 =
+            serde_json::from_value(serde_json::Value::Object(object)).unwrap();
+        assert!(decoded.local_clients_enabled);
+        // It must not read as remote reachability: the master switch would then
+        // claim this desktop is reachable from outside when nothing is.
+        assert!(!decoded.desired_enabled);
+        decoded.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_machine_clients_listen_by_default_without_remote_access() {
+        let _guard = CONTROLLER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        let direct = Arc::new(FakeDirectProbe::default());
+        let (controller, gateway) = test_controller_with_lan_advertiser(
+            directory.path(),
+            direct,
+            Arc::new(FakeLanAdvertiser::default()),
+            Arc::new(FakeZeroConfigLanAdvertiser::default()),
+        )
+        .await;
+
+        let snapshot = controller.reconcile_on_startup().await.unwrap();
+
+        assert!(!snapshot.desired_enabled);
+        assert!(
+            snapshot
+                .methods
+                .iter()
+                .all(|method| !method.desired_enabled),
+            "no remote method may be switched on by the local listener"
+        );
+        assert!(
+            !snapshot.running,
+            "a loopback listener is not remote reachability"
+        );
+        assert!(snapshot.local_clients.enabled);
+        assert!(snapshot.local_clients.listening);
+        assert_eq!(
+            snapshot
+                .local_clients
+                .bound_addr
+                .map(|address| address.ip()),
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            "the default bind must not be reachable from the network"
+        );
+        let info = gateway
+            .local_lan_gateway_info()
+            .expect("the loopback listener is up");
+        assert!(info.bound_addr.ip().is_loopback());
+
+        controller.disable_all().await.unwrap();
+        drop(gateway);
+    }
+
+    #[tokio::test]
+    async fn turning_same_machine_clients_off_closes_the_listener() {
+        let _guard = CONTROLLER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        let direct = Arc::new(FakeDirectProbe::default());
+        let (controller, gateway) = test_controller_with_lan_advertiser(
+            directory.path(),
+            direct,
+            Arc::new(FakeLanAdvertiser::default()),
+            Arc::new(FakeZeroConfigLanAdvertiser::default()),
+        )
+        .await;
+        controller.reconcile_on_startup().await.unwrap();
+        assert!(gateway.local_lan_gateway_info().is_some());
+
+        let snapshot = controller.set_local_clients_enabled(false).await.unwrap();
+
+        assert!(!snapshot.local_clients.enabled);
+        assert!(!snapshot.local_clients.listening);
+        assert!(snapshot.local_clients.bound_addr.is_none());
+        assert!(
+            gateway.local_lan_gateway_info().is_none(),
+            "the switch has to close the surface, not just record an intent"
+        );
+        drop(gateway);
+    }
+
+    #[tokio::test]
+    async fn local_network_pairing_widens_the_bind_and_giving_it_up_narrows_it_back() {
+        let _guard = CONTROLLER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        let direct = Arc::new(FakeDirectProbe::default());
+        let (controller, gateway) = test_controller_with_lan_advertiser(
+            directory.path(),
+            direct,
+            Arc::new(FakeLanAdvertiser::default()),
+            Arc::new(FakeZeroConfigLanAdvertiser::default()),
+        )
+        .await;
+        controller.reconcile_on_startup().await.unwrap();
+        assert!(gateway.local_lan_gateway_info().is_some());
+
+        controller
+            .start_zero_config_lan_pairing(RemoteDevicePermissionLevel::ReadOnly, 60_000)
+            .await
+            .unwrap();
+        let widened = gateway
+            .local_lan_gateway_info()
+            .expect("the pairing window keeps the listener up");
+        assert_eq!(
+            widened.bound_addr.ip(),
+            std::net::Ipv4Addr::UNSPECIFIED,
+            "a pairing window has to be reachable from the network"
+        );
+
+        // Giving up the pairing window must narrow the surface again instead of
+        // leaving a wildcard bind behind. (The port is ephemeral in this test;
+        // production pins it so a same-machine client's endpoint never moves.)
+        let snapshot = controller.disable_all().await.unwrap();
+        assert!(!snapshot.desired_enabled);
+        assert!(
+            snapshot.local_clients.listening,
+            "same-machine clients survive disabling remote access"
+        );
+        let narrowed = gateway
+            .local_lan_gateway_info()
+            .expect("the listener stays up for same-machine clients");
+        assert!(narrowed.bound_addr.ip().is_loopback());
+        assert!(!snapshot.running, "nothing remote is left running");
+        drop(gateway);
+    }
+
+    #[test]
     fn corrupt_settings_are_quarantined_and_never_enabled() {
         let directory = tempdir().unwrap();
         let store = RemoteConnectivityStore::for_home(directory.path());
@@ -4323,7 +4594,13 @@ mod tests {
         );
         assert!(gateway.local_lan_gateway_info().is_some());
         controller.disable_all().await.unwrap();
-        assert!(gateway.local_lan_gateway_info().is_none());
+        // Disabling remote access narrows the listener back to this machine
+        // instead of tearing it down: same-machine clients are not remote
+        // access, so the desktop keeps serving `vibex tui` here.
+        let narrowed = gateway
+            .local_lan_gateway_info()
+            .expect("the loopback listener stays up");
+        assert!(narrowed.bound_addr.ip().is_loopback());
     }
 
     #[tokio::test]
@@ -4348,7 +4625,12 @@ mod tests {
         let snapshot = controller.snapshot().await;
         assert!(!snapshot.desired_enabled);
         assert!(!snapshot.running);
-        assert!(gateway.local_lan_gateway_info().is_none());
+        // The window never opened, so the bind goes back to the audience the
+        // stored settings describe instead of staying wide or being torn down.
+        let narrowed = gateway
+            .local_lan_gateway_info()
+            .expect("the loopback listener is restored");
+        assert!(narrowed.bound_addr.ip().is_loopback());
         assert!(gateway.zero_config_lan_pairing_listener_addr().is_none());
     }
 

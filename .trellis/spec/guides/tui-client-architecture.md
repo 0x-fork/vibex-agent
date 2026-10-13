@@ -45,9 +45,9 @@ client is in one of two seats:
 | **Remote** | another process owns the home, or an explicit link/code was given | the client is a network peer; steering degrades to interrupt + resend; recovery runs on the authority |
 
 Seat selection is visible in the status bar. When the home is locked and the
-runtime is not accepting local clients, the client must print the three ways out
-(enable Remote Access → Direct, quit the desktop app, or `vibex connect`) rather
-than a bare connection error.
+runtime is not accepting local clients, the client must print the endpoints it
+tried and the three ways out (enable Remote Access → Local clients, quit the
+desktop app, or `vibex connect`) rather than a bare connection error.
 
 ### Local bootstrap trust model
 
@@ -56,13 +56,20 @@ the home. Its trust anchor is **the filesystem**, not the loopback interface:
 
 1. the runtime identity public key is read from
    `<home>/relay/desktop-identity.json`;
-2. a pairing code is minted against the same database the running runtime uses
+2. the certificate the runtime terminates TLS with is derived from that same
+   identity, so a pinned route needs no operator-supplied link;
+3. a pairing code is minted against the same database the running runtime uses
    (safe because the database runs in WAL mode with a busy timeout, and
    `vibex-server pairing-code` already does exactly this);
-3. the claim pins the identity public key, so a different local process cannot
+4. the claim pins the identity public key, so a different local process cannot
    impersonate the runtime;
-4. the credential is written to `<home>/local-clients/tui-credential.json` with
+5. the credential is written to `<home>/local-clients/tui-credential.json` with
    mode 0600 at creation.
+
+A desktop serves same-machine clients on its pinned-certificate Gateway narrowed
+to the loopback address, and that listener is **not** part of Remote Access: it
+is up whenever the desktop is. The Direct listener is dialled only as a fallback
+for a desktop that predates the local-client listener.
 
 Plain HTTP is only acceptable as an explicit, loopback, bootstrap fallback.
 Pinned TLS is preferred whenever the runtime advertises a certificate, and a

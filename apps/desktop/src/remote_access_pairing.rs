@@ -15,6 +15,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     notification::NotificationType,
     pagination::Pagination,
+    switch::Switch,
     tab::{Tab, TabBar},
     tag::Tag,
     v_flex,
@@ -67,6 +68,7 @@ enum RemoteAccessMutation {
     Disable(RemoteConnectivityMethod),
     Repair(RemoteConnectivityMethod),
     DisableAll,
+    SetLocalClients(bool),
     CreateOffer,
     RegenerateOffer,
     CancelOffer,
@@ -84,7 +86,12 @@ enum RemoteAccessEntry {
     TailscaleServe,
     Direct,
     SelfHostedRelay,
+    /// Local-network pairing, which is a way to reach this runtime from
+    /// elsewhere on the network.
     LocalNetwork,
+    /// Clients running on this computer, which is not remote access at all and
+    /// is listed here only because this is where the listener is configured.
+    LocalClients,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +115,7 @@ impl RemoteAccessEntry {
             Self::TailscaleServe => Some(RemoteConnectivityMethod::TailscaleServe),
             Self::Direct => Some(RemoteConnectivityMethod::Direct),
             Self::SelfHostedRelay => Some(RemoteConnectivityMethod::SelfHostedRelay),
-            Self::LocalNetwork => None,
+            Self::LocalNetwork | Self::LocalClients => None,
         }
     }
 }
@@ -122,6 +129,7 @@ enum RemoteAccessAction {
     DisableMethod(RemoteConnectivityMethod),
     RepairMethod(RemoteConnectivityMethod),
     DisableAll,
+    SetLocalClients(bool),
     SetPermission(RemoteDevicePermissionLevel),
     SetZeroConfigPermission(RemoteDevicePermissionLevel),
     CreateOffer,
@@ -751,6 +759,9 @@ impl RemoteAccessPairing {
             RemoteAccessAction::DisableMethod(method) => self.disable_method(method, cx),
             RemoteAccessAction::RepairMethod(method) => self.repair_method(method, cx),
             RemoteAccessAction::DisableAll => self.disable_all(cx),
+            RemoteAccessAction::SetLocalClients(enabled) => {
+                self.set_local_clients_enabled(enabled, cx)
+            }
             RemoteAccessAction::SetPermission(permission) => self.set_permission(permission, cx),
             RemoteAccessAction::SetZeroConfigPermission(permission) => {
                 self.set_zero_config_permission(permission, cx)
@@ -1582,6 +1593,24 @@ impl RemoteAccessPairing {
                 .await
                 .map(RemoteAccessMutationOutcome::DisabledAll)
         });
+    }
+
+    /// Turn the same-machine client listener on or off.
+    ///
+    /// It is not a connectivity method, so there is nothing to publish and the
+    /// snapshot that comes back differs only in its `local_clients` field.
+    fn set_local_clients_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let controller = self.controller.clone();
+        self.begin_mutation(
+            RemoteAccessMutation::SetLocalClients(enabled),
+            cx,
+            async move {
+                controller
+                    .set_local_clients_enabled(enabled)
+                    .await
+                    .map(RemoteAccessMutationOutcome::Connectivity)
+            },
+        );
     }
 
     fn create_offer(&mut self, cx: &mut Context<Self>) {
@@ -2779,6 +2808,7 @@ impl RemoteAccessPairing {
             .child(self.render_connection_row(RemoteAccessEntry::Direct, cx))
             .child(self.render_connection_row(RemoteAccessEntry::SelfHostedRelay, cx))
             .child(self.render_connection_row(RemoteAccessEntry::LocalNetwork, cx))
+            .child(self.render_connection_row(RemoteAccessEntry::LocalClients, cx))
             .into_any_element()
     }
 
@@ -2946,6 +2976,30 @@ impl RemoteAccessPairing {
                 cx.theme().muted_foreground,
             );
         }
+        if entry == RemoteAccessEntry::LocalClients {
+            // The stored intent and the listener are reported separately, so a
+            // switch that is on while the port is taken says so instead of
+            // looking healthy.
+            let local_clients = self
+                .state
+                .connectivity
+                .as_ref()
+                .map(|connectivity| connectivity.local_clients.clone());
+            return match local_clients {
+                Some(local_clients) if local_clients.listening => (
+                    locale::text("Listening", "监听中", "監聽中"),
+                    cx.theme().success,
+                ),
+                Some(local_clients) if local_clients.enabled => (
+                    locale::text("Unavailable", "不可用", "無法使用"),
+                    cx.theme().danger,
+                ),
+                _ => (
+                    locale::text("Off", "已关闭", "已關閉"),
+                    cx.theme().muted_foreground,
+                ),
+            };
+        }
         let Some(method) = entry.remote_method() else {
             return (
                 method_state_label(RemoteMethodState::Disabled),
@@ -2968,6 +3022,9 @@ impl RemoteAccessPairing {
     ) -> AnyElement {
         if entry == RemoteAccessEntry::LocalNetwork {
             return self.render_local_network_panel(cx);
+        }
+        if entry == RemoteAccessEntry::LocalClients {
+            return self.render_local_clients_panel(cx);
         }
         let method = match entry.remote_method() {
             Some(method) => method,
@@ -3278,6 +3335,112 @@ impl RemoteAccessPairing {
                     }),
             )
             .into_any_element()
+    }
+
+    /// Same-machine client access.
+    ///
+    /// It sits in this list because this is where the listener is configured,
+    /// but it is not a way to reach the runtime from outside: the switch only
+    /// opens the pinned-certificate Gateway on the loopback address, so a
+    /// desktop with every remote method off can still serve `vibex tui` on this
+    /// computer.
+    fn render_local_clients_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.weak_entity();
+        let local_clients = self
+            .state
+            .connectivity
+            .as_ref()
+            .map(|connectivity| connectivity.local_clients.clone());
+        let enabled = local_clients.as_ref().is_some_and(|state| state.enabled);
+        let pending = matches!(
+            self.state.pending,
+            Some(RemoteAccessMutation::SetLocalClients(_))
+        );
+        let (status, status_color) =
+            self.connection_entry_status(RemoteAccessEntry::LocalClients, cx);
+        let bound = local_clients
+            .as_ref()
+            .filter(|state| state.listening)
+            .and_then(|state| state.bound_addr)
+            .map(|address| address.to_string());
+
+        let mut panel =
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_3()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(cx.theme().primary.opacity(0.30))
+                .bg(cx.theme().muted.opacity(0.14))
+                .p_4()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .items_center()
+                                .gap_2()
+                                .child(icon_tile(IconName::SquareTerminal, px(28.0), px(15.0), cx))
+                                .child(
+                                    div().min_w_0().truncate().text_sm().font_semibold().child(
+                                        connection_entry_name(RemoteAccessEntry::LocalClients),
+                                    ),
+                                )
+                                .child(status_pill(status, status_color)),
+                        )
+                        .child(
+                            Switch::new("remote-access-local-clients")
+                                .checked(enabled)
+                                .disabled(pending)
+                                .on_click(move |enabled, _, cx| {
+                                    let enabled = *enabled;
+                                    let _ = entity.update(cx, |this, cx| {
+                                        this.dispatch_action(
+                                            RemoteAccessAction::SetLocalClients(enabled),
+                                            cx,
+                                        )
+                                    });
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(connection_entry_description(
+                            RemoteAccessEntry::LocalClients,
+                        )),
+                );
+        if enabled && bound.is_none() {
+            // The switch is on but nothing is listening. Saying so is the whole
+            // reason the intent and the listener are tracked separately.
+            panel = panel.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(Icon::new(IconName::TriangleAlert).size(px(14.0)))
+                    .child(locale::text(
+                        "The local listener could not start; its port may be in use.",
+                        "本机监听未能启动，端口可能已被占用。",
+                        "本機監聽未能啟動，連接埠可能已被占用。",
+                    )),
+            );
+        } else if let Some(bound) = bound {
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(SharedString::from(bound)),
+            );
+        }
+        panel.into_any_element()
     }
 
     fn render_permission_selector(&self, zero_config: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -4627,27 +4790,51 @@ fn method_short_name(method: RemoteConnectivityMethod) -> &'static str {
 }
 
 fn connection_entry_name(entry: RemoteAccessEntry) -> &'static str {
-    match entry.remote_method() {
-        Some(method) => method_short_name(method),
-        None => locale::text("Local network pairing", "局域网配对", "區域網路配對"),
+    match entry {
+        RemoteAccessEntry::LocalNetwork => {
+            locale::text("Local network pairing", "局域网配对", "區域網路配對")
+        }
+        RemoteAccessEntry::LocalClients => {
+            locale::text("Local clients", "本机客户端", "本機用戶端")
+        }
+        entry => match entry.remote_method() {
+            Some(method) => method_short_name(method),
+            None => locale::text("Remote access", "远程访问", "遠端存取"),
+        },
     }
 }
 
 fn connection_entry_description(entry: RemoteAccessEntry) -> &'static str {
-    match entry.remote_method() {
-        Some(method) => method_description(method),
-        None => locale::text(
+    match entry {
+        RemoteAccessEntry::LocalNetwork => locale::text(
             "Discover this computer on the same network",
             "在同一网络中发现此电脑",
             "在同一網路中探索此電腦",
         ),
+        RemoteAccessEntry::LocalClients => locale::text(
+            "Let Vibex TUI on this computer attach to this runtime",
+            "允许本机上的 Vibex TUI 接入此运行时",
+            "允許本機上的 Vibex TUI 接入此執行階段",
+        ),
+        entry => match entry.remote_method() {
+            Some(method) => method_description(method),
+            None => locale::text(
+                "Reach this runtime remotely",
+                "远程访问此运行时",
+                "遠端存取此執行階段",
+            ),
+        },
     }
 }
 
 fn connection_entry_id(entry: RemoteAccessEntry) -> String {
-    match entry.remote_method() {
-        Some(method) => format!("remote-access-method-{}", method.wire_name()),
-        None => "remote-access-method-local-network".to_string(),
+    match entry {
+        RemoteAccessEntry::LocalNetwork => "remote-access-method-local-network".to_string(),
+        RemoteAccessEntry::LocalClients => "remote-access-method-local-clients".to_string(),
+        entry => match entry.remote_method() {
+            Some(method) => format!("remote-access-method-{}", method.wire_name()),
+            None => "remote-access-method-unknown".to_string(),
+        },
     }
 }
 
@@ -4993,8 +5180,8 @@ mod tests {
         remote_permissions_for_level,
     };
     use vibex_desktop_runtime::{
-        REMOTE_CONNECTIVITY_SCHEMA_VERSION, RemoteMethodSnapshot, RemoteRecoveryAction,
-        RemoteRouteOwnership,
+        LocalClientsSnapshot, REMOTE_CONNECTIVITY_SCHEMA_VERSION, RemoteMethodSnapshot,
+        RemoteRecoveryAction, RemoteRouteOwnership,
     };
 
     fn connectivity(
@@ -5034,6 +5221,15 @@ mod tests {
             relay_connected: true,
             gateway_running: true,
             gateway_bound_addr: None,
+            local_clients: LocalClientsSnapshot {
+                enabled: true,
+                listening: true,
+                bound_addr: Some(
+                    "127.0.0.1:1429"
+                        .parse()
+                        .expect("a literal loopback address"),
+                ),
+            },
         }
     }
 
@@ -5345,6 +5541,15 @@ mod tests {
             "LAN rows keep the previously selected remote method intact"
         );
         assert_eq!(state.selected_entry, RemoteAccessEntry::LocalNetwork);
+        assert_eq!(state.page, RemoteAccessPage::Setup);
+
+        state.select_connection_entry(RemoteAccessEntry::LocalClients);
+        assert_eq!(
+            state.selected_method,
+            RemoteConnectivityMethod::Direct,
+            "local-client rows are not remote methods either"
+        );
+        assert_eq!(state.selected_entry, RemoteAccessEntry::LocalClients);
         assert_eq!(state.page, RemoteAccessPage::Setup);
 
         state.select_connection_entry(RemoteAccessEntry::SelfHostedRelay);
