@@ -1257,8 +1257,12 @@ fn composer_suggestion_description(entry: &AgentCommandEntry) -> Option<String> 
     }
     entry
         .description
-        .clone()
+        .as_deref()
         .filter(|value| !value.trim().is_empty())
+        // A collaborator is described by the account it runs as and the model
+        // it runs — both written by the runtime — and the account is the one
+        // name this client has a word of its own for.
+        .map(runtime_attribution_line)
 }
 
 /// The icon a suggestion row draws beside its name.
@@ -53552,6 +53556,7 @@ impl VibexWorkbench {
             Some(self.render_timeline_runtime_header(&turn.id, attribution.clone(), cx))
         } else {
             turn.runtime_attribution.as_ref().map(|attribution| {
+                let attribution = runtime_attribution_line(attribution);
                 let runtime_label = attribution
                     .split(" · ")
                     .skip(1)
@@ -54108,7 +54113,8 @@ impl VibexWorkbench {
         let text_color = cx.theme().muted_foreground.opacity(0.80);
         let runtime_label = format!(
             "{} · {}",
-            attribution.auth_source_label, attribution.model_label
+            runtime_attribution_auth_label(&attribution),
+            attribution.model_label
         );
         div()
             .id(SharedString::from(format!("turn-runtime:{turn_id}")))
@@ -54144,7 +54150,8 @@ impl VibexWorkbench {
         let muted_foreground = cx.theme().muted_foreground;
         let runtime_label = format!(
             "{} · {}",
-            attribution.auth_source_label, attribution.model_label
+            runtime_attribution_auth_label(attribution),
+            attribution.model_label
         );
         let duration = format_compact_duration(
             turn.started_at_ms,
@@ -63393,7 +63400,9 @@ impl VibexWorkbench {
             .child(inline_sidebar)
             .child(
                 v_flex()
+                    .debug_selector(|| "foundation-workbench-columns".into())
                     .flex_1()
+                    .self_stretch()
                     .min_h_0()
                     .min_w_0()
                     .overflow_hidden()
@@ -68844,6 +68853,46 @@ fn runtime_auth_source_selection_label(auth_source: &RuntimeAuthSource, fallback
         }
         RuntimeAuthSource::ProviderProfile { .. } => fallback.to_string(),
     }
+}
+
+/// The account a turn ran as, named in the reader's language.
+///
+/// The runtime writes the account's label itself, in English, because it serves
+/// every client at once; an Agent account is the product's own concept, so this
+/// client names it from the kind instead, while a Provider Profile keeps the
+/// name its owner gave it. A record written before the kind travelled with the
+/// label has only the label, so there the runtime's own wording is what decides
+/// — which is how a turn that ran before the account was renamed still reads as
+/// an Agent account.
+fn runtime_attribution_auth_label(
+    attribution: &vibex_core::TurnExecutionAttributionView,
+) -> String {
+    match attribution.auth_source.as_ref() {
+        Some(vibex_core::RuntimeAuthSource::AgentAccount { .. }) => {
+            locale::agent_account_display_label(&attribution.auth_source_label)
+        }
+        Some(vibex_core::RuntimeAuthSource::ProviderProfile { .. }) => {
+            attribution.auth_source_label.clone()
+        }
+        None => locale::agent_account_display_label(&attribution.auth_source_label),
+    }
+}
+
+/// A line the runtime composed out of names, with its Agent account named in the
+/// reader's language.
+///
+/// A turn whose rows no longer carry the item they were projected from has only
+/// this composed line — Agent, account, model — and no account kind to name the
+/// account by, and a collaborator reference is described by a line of the same
+/// shape. The runtime's own wording is what is recognised here, so a Provider
+/// Profile keeps the name its owner gave it.
+fn runtime_attribution_line(attribution: &str) -> String {
+    const SEPARATOR: &str = " · ";
+    attribution
+        .split(SEPARATOR)
+        .map(locale::agent_account_display_label)
+        .collect::<Vec<_>>()
+        .join(SEPARATOR)
 }
 
 fn runtime_provider_model_label(
@@ -80999,6 +81048,7 @@ mod tests {
 
     use super::*;
     use crate::assets::{AgentBrandAsset, agent_brand_asset};
+    use crate::locale::agent_account_display_label;
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use vibex_core::{
         AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentId,
@@ -81030,6 +81080,73 @@ mod tests {
                 ..ComputerAvailability::unavailable(ComputerUnavailableReason::EngineMissing, None)
             },
         }
+    }
+
+    #[test]
+    fn an_agent_account_is_named_in_the_readers_language() {
+        let account = locale::text("Agent account", "Agent 账户", "Agent 帳戶");
+        // The runtime's own wording is renamed, and the account hint it keeps
+        // behind the name survives.
+        assert_eq!(agent_account_display_label("Agent account"), account);
+        assert_eq!(
+            agent_account_display_label("Default CLI account"),
+            account,
+            "a label written before the account was renamed still reads as one"
+        );
+        assert_eq!(
+            agent_account_display_label("Agent account - you@example.com"),
+            format!("{account} - you@example.com")
+        );
+        // Names that are not the runtime's wording are left as written.
+        assert_eq!(
+            agent_account_display_label("Agent account holder"),
+            "Agent account holder"
+        );
+        assert_eq!(agent_account_display_label("Work"), "Work");
+
+        let attribution =
+            |auth_source, auth_source_label: &str| vibex_core::TurnExecutionAttributionView {
+                agent_label: "Codex".to_string(),
+                auth_source_label: auth_source_label.to_string(),
+                auth_source,
+                model_label: "gpt-5".to_string(),
+            };
+        let agent_account = attribution(
+            Some(vibex_core::RuntimeAuthSource::agent_account(
+                vibex_core::AgentAuthContextId::new(),
+            )),
+            "Agent account - you@example.com",
+        );
+        assert_eq!(
+            runtime_attribution_auth_label(&agent_account),
+            format!("{account} - you@example.com")
+        );
+        let profile = attribution(
+            Some(vibex_core::RuntimeAuthSource::provider_profile(
+                ProviderProfileId::new(),
+            )),
+            "Work",
+        );
+        assert_eq!(runtime_attribution_auth_label(&profile), "Work");
+        let unnamed = attribution(None, "Default CLI account - you@example.com");
+        assert_eq!(
+            runtime_attribution_auth_label(&unnamed),
+            format!("{account} - you@example.com"),
+            "a record written before the kind travelled with the label still reads as an account"
+        );
+        let named_by_its_owner = attribution(None, "Work");
+        assert_eq!(runtime_attribution_auth_label(&named_by_its_owner), "Work");
+
+        // The composed line a turn without its items left keeps the account's
+        // own name too.
+        assert_eq!(
+            runtime_attribution_line("Codex · Agent account · gpt-5"),
+            format!("Codex · {account} · gpt-5")
+        );
+        assert_eq!(
+            runtime_attribution_line("Codex · Work · gpt-5"),
+            "Codex · Work · gpt-5"
+        );
     }
 
     #[test]
@@ -85223,6 +85340,16 @@ mod tests {
         assert_eq!(
             composer_suggestion_description(&collaborator).as_deref(),
             Some("Main account · gpt-5")
+        );
+        // The Agent's own account is the product's, not the owner's, so the row
+        // names it the reader's way and keeps the hint behind it.
+        collaborator.description = Some("Agent account - you@example.com · gpt-5".into());
+        assert_eq!(
+            composer_suggestion_description(&collaborator),
+            Some(format!(
+                "{} - you@example.com · gpt-5",
+                locale::text("Agent account", "Agent 账户", "Agent 帳戶")
+            ))
         );
         assert!(matches!(
             composer_suggestion_icon(&collaborator),
@@ -98181,6 +98308,58 @@ mod tests {
         assert!(open_update_settings.contains("highlighted_title"));
     }
 
+    /// The columns the sidebar leaves fill the window, terminal panel and all.
+    ///
+    /// `h_flex` centers a child that does not stretch, so the wrapper column
+    /// that hosts the workbench and the Composer's terminal panel has to say
+    /// `self_stretch`. Without it the wrapper shrink-wrapped to the center
+    /// column's content height and floated mid-window: every page body and the
+    /// timeline hid behind a zero-height column while the Composer and the
+    /// right rail painted from the collapsed box's own bottom edge.
+    #[gpui::test]
+    fn the_workbench_columns_fill_the_window_height(cx: &mut TestAppContext) {
+        struct ColumnsProbe {
+            workbench: Entity<VibexWorkbench>,
+        }
+
+        impl Render for ColumnsProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.workbench.clone()
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let window = cx.open_window(gpui::size(px(1_600.0), px(1_000.0)), |window, cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            let workbench = cx.new(|cx| {
+                VibexWorkbench::with_initial_state(None, ui_state, None, window, cx)
+            });
+            ColumnsProbe { workbench }
+        });
+        cx.run_until_parked();
+        let probe = window.root(cx).expect("probe root");
+        let workbench = probe.read_with(cx, |probe, _| probe.workbench.clone());
+        // The runtime never comes up in a test, and the failure page draws the
+        // shell not at all; the columns are only measurable on the live shell.
+        workbench.update(cx, |workbench, cx| {
+            workbench.runtime_status = RuntimeStatus::Ready;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        use std::ops::Deref as _;
+        let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let columns = cx
+            .debug_bounds("foundation-workbench-columns")
+            .expect("the columns should be laid out");
+        assert_eq!(columns.size.height, px(1_000.0));
+        assert_eq!(columns.origin.y, px(0.0));
+    }
+
     /// Activating a section must not reach back into the workbench from inside
     /// its own update.
     ///
@@ -101478,7 +101657,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("answer metadata renderer should remain inspectable");
         assert!(metadata_renderer.contains("runtime_agent_icon"));
-        assert!(metadata_renderer.contains("auth_source_label"));
+        // The account is named through the helper, so it reads in the reader's
+        // language rather than in the runtime's English; the model the row
+        // prints beside it is a name the runtime already writes for the reader.
+        assert!(metadata_renderer.contains("runtime_attribution_auth_label"));
         assert!(metadata_renderer.contains("model_label"));
         assert!(metadata_renderer.contains("format_compact_duration"));
         assert!(metadata_renderer.contains("icons/vibex/clock.svg"));

@@ -292,7 +292,7 @@ impl App {
                 let matches = indices
                     .iter()
                     .copied()
-                    .filter(|index| entry_matches(&catalog.options[*index], &query))
+                    .filter(|index| entry_matches(&catalog.options[*index], &query, &self.strings))
                     .collect::<Vec<_>>();
                 if matches.is_empty() {
                     continue;
@@ -576,10 +576,16 @@ pub fn normalized_query(query: &str) -> String {
 
 /// Whether one catalogue entry answers a filter: its Agent, its account and its
 /// model, whichever the reader half-remembers.
-pub fn entry_matches(option: &SessionRuntimeOption, query: &str) -> bool {
+pub fn entry_matches(option: &SessionRuntimeOption, query: &str, strings: &Strings) -> bool {
     query.is_empty()
         || option.agent_label.to_lowercase().contains(query)
+        // The account is matched under both names: the runtime's own label, so
+        // a reader who knows it can still type it, and the name this client
+        // draws, so a reader can search for what they can see.
         || option.auth_source_label.to_lowercase().contains(query)
+        || runtime_option_auth_label(strings, option)
+            .to_lowercase()
+            .contains(query)
         || option.model_label.to_lowercase().contains(query)
 }
 
@@ -643,12 +649,11 @@ mod tests {
         )
     }
 
-    #[test]
-    fn a_filter_matches_each_of_the_three_names() {
-        let option = SessionRuntimeOption {
-            selection: selection("deepseek-harness", "deepseek-v4.1-flash"),
+    fn option(selection: SessionRuntimeSelection, auth_source_label: &str) -> SessionRuntimeOption {
+        SessionRuntimeOption {
+            selection,
             agent_label: "DeepSeek Harness".to_string(),
-            auth_source_label: "Default CLI account".to_string(),
+            auth_source_label: auth_source_label.to_string(),
             model_label: "bai/deepseek-v4.1-flash".to_string(),
             reasoning_efforts: vec![SessionConfigValue {
                 value: "high".to_string(),
@@ -657,17 +662,53 @@ mod tests {
             modes: Vec::new(),
             features: Vec::new(),
             availability: RuntimeOptionAvailability::Available,
-        };
-        for query in ["deepseek", "harness", "cli", "v4.1", "flash"] {
+        }
+    }
+
+    #[test]
+    fn a_filter_matches_each_of_the_three_names() {
+        let option = option(selection("deepseek-harness", "deepseek-v4.1-flash"), "Work");
+        let strings = Strings::for_locale(crate::locale::Locale::En);
+        for query in ["deepseek", "harness", "work", "v4.1", "flash"] {
             assert!(
-                entry_matches(&option, &normalized_query(query)),
+                entry_matches(&option, &normalized_query(query), &strings),
                 "{query} did not match"
             );
         }
-        assert!(!entry_matches(&option, &normalized_query("openrouter")));
+        assert!(!entry_matches(
+            &option,
+            &normalized_query("openrouter"),
+            &strings
+        ));
         assert_eq!(
             normalized_query("  DeepSeek   Harness "),
             "deepseek harness"
         );
+    }
+
+    #[test]
+    fn an_agent_account_is_named_and_filtered_in_the_readers_language() {
+        let account = option(
+            SessionRuntimeSelection::agent_default(
+                AgentId::parse("deepseek-harness").expect("agent id"),
+                vibex_core::AgentAuthContextId::new(),
+            ),
+            "Agent account",
+        );
+        let chinese = Strings::for_locale(crate::locale::Locale::ZhCn);
+        assert_eq!(runtime_option_auth_label(&chinese, &account), "Agent 账户");
+        assert!(entry_matches(&account, &normalized_query("账户"), &chinese));
+        // The runtime's own label still answers a filter, so a reader who knows
+        // it by that name is not left with an empty list.
+        assert!(entry_matches(
+            &account,
+            &normalized_query("account"),
+            &chinese
+        ));
+
+        // A Provider Profile is named by its owner, so the runtime's label is
+        // already the name and the client does not overwrite it.
+        let profile = option(selection("deepseek-harness", "deepseek-v4.1-flash"), "Work");
+        assert_eq!(runtime_option_auth_label(&chinese, &profile), "Work");
     }
 }

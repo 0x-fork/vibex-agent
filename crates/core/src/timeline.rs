@@ -198,6 +198,7 @@ impl TurnExecutionAttribution {
         TurnExecutionAttributionView {
             agent_label: self.agent_label.clone(),
             auth_source_label: self.auth_source_label.clone(),
+            auth_source: Some(self.auth_source.clone()),
             model_label: self.model_label.clone(),
         }
     }
@@ -209,6 +210,15 @@ pub struct TurnExecutionAttributionView {
     pub agent_label: String,
     #[serde(alias = "providerProfileLabel")]
     pub auth_source_label: String,
+    /// The account `auth_source_label` names, when the writer knew it.
+    ///
+    /// The label is written by the runtime in English, but an Agent account is
+    /// the product's own concept rather than a name the reader chose, so a
+    /// client that renders a locale names it from the kind instead. Absent on
+    /// records written before the kind travelled with the label, and then the
+    /// label is all there is to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_source: Option<RuntimeAuthSource>,
     pub model_label: String,
 }
 

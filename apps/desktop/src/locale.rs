@@ -936,6 +936,24 @@ pub fn text(en: &'static str, zh_cn: &'static str, zh_tw: &'static str) -> &'sta
     text_for(current_locale(), en, zh_cn, zh_tw)
 }
 
+/// The runtime's own name for an Agent account, said in the reader's language.
+///
+/// The runtime writes one account label for every client, and writes it in
+/// English, because an Agent account is the product's own concept rather than a
+/// name the reader chose. A stored label keeps whatever the runtime wrote when
+/// the turn ran — including the wording it used before the account was renamed
+/// — and this is what turns either into the reader's name. Anything that is not
+/// the runtime's wording, such as a Provider Profile's own name, is returned
+/// exactly as written, and the account hint behind the name is kept.
+pub fn agent_account_display_label(label: &str) -> String {
+    let account = text("Agent account", "Agent 账户", "Agent 帳戶");
+    match vibex_core::agent_account_label_hint(label) {
+        Some("") => account.to_string(),
+        Some(hint) => format!("{account} - {hint}"),
+        None => label.to_string(),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct MessageTranslation {
     en: &'static str,

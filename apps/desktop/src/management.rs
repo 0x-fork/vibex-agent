@@ -2702,9 +2702,9 @@ impl ManagementCenter {
                             this.notice = Some(
                                 management_locale_text_for(
                                     active_locale,
-                                    "Default Agent account verified",
-                                    "Agent 默认账号已验证",
-                                    "Agent 預設帳號已驗證",
+                                    "Agent account verified",
+                                    "Agent 账户已验证",
+                                    "Agent 帳戶已驗證",
                                 )
                                 .to_string(),
                             );
@@ -3221,9 +3221,9 @@ impl ManagementCenter {
                         this.agent_auth_error = None;
                         this.notice = Some(
                             management_locale_text(
-                                "Default Agent account verified",
-                                "Agent 默认账号已验证",
-                                "Agent 預設帳號已驗證",
+                                "Agent account verified",
+                                "Agent 账户已验证",
+                                "Agent 帳戶已驗證",
                             )
                             .to_string(),
                         );
@@ -3320,8 +3320,8 @@ impl ManagementCenter {
                             "{} ({model_count})",
                             management_locale_text(
                                 "Agent account models refreshed",
-                                "Agent 账号模型已刷新",
-                                "Agent 帳號模型已重新整理",
+                                "Agent 账户模型已刷新",
+                                "Agent 帳戶模型已重新整理",
                             )
                         ));
                     }
@@ -3605,9 +3605,9 @@ impl ManagementCenter {
                             "{} ({affected_count})",
                             management_locale_text_for(
                                 active_locale,
-                                "Default Agent account signed out; affected sessions",
-                                "Agent 默认账号已退出；受影响会话数",
-                                "Agent 預設帳號已登出；受影響工作階段數",
+                                "Agent account signed out; affected sessions",
+                                "Agent 账户已退出；受影响会话数",
+                                "Agent 帳戶已登出；受影響工作階段數",
                             )
                         ));
                     }
@@ -4846,7 +4846,7 @@ impl ManagementCenter {
         ) else {
             return;
         };
-        let entries = parse_profile_header_override(&raw);
+        let entries = parse_profile_header_override(raw);
         self.profile_headers_open = !entries.is_empty();
         for (name, value) in entries {
             let (literal, variable) = match value {
@@ -14160,7 +14160,7 @@ impl ManagementCenter {
                 IconName::Globe,
             ),
             ProjectionCredentialSurface::AgentManaged => (
-                management_locale_text("Agent account", "Agent 账号", "Agent 帳號"),
+                management_locale_text("Agent account", "Agent 账户", "Agent 帳戶"),
                 management_locale_text(
                     "Authentication is managed by the Agent",
                     "认证由 Agent 管理",
@@ -14730,8 +14730,8 @@ impl ManagementCenter {
                     .flex_1()
                     .child(Input::new(&name_input).small().w_full()),
             )
-            .child(if variable.is_some() {
-                div()
+            .child(match variable {
+                Some(variable) => div()
                     .min_w_0()
                     .flex_1()
                     .h(px(26.0))
@@ -14744,15 +14744,14 @@ impl ManagementCenter {
                     .text_color(cx.theme().muted_foreground)
                     .child(format!(
                         "{{{{{}}}}}",
-                        provider_header_variable_label(variable.expect("checked above"))
+                        provider_header_variable_label(variable)
                     ))
-                    .into_any_element()
-            } else {
-                div()
+                    .into_any_element(),
+                None => div()
                     .min_w_0()
                     .flex_1()
                     .child(Input::new(&value_input).small().w_full())
-                    .into_any_element()
+                    .into_any_element(),
             });
         row = row.child(
             Button::new(SharedString::from(format!(
@@ -15251,9 +15250,9 @@ impl ManagementCenter {
             if methods.is_empty() {
                 content = content.child(compact_empty_state(
                     management_locale_text(
-                        "No default-account sign-in method reported",
-                        "Agent 未上报默认账号登录方式",
-                        "Agent 未回報預設帳號登入方式",
+                        "No Agent account sign-in method reported",
+                        "Agent 未上报账户登录方式",
+                        "Agent 未回報帳戶登入方式",
                     ),
                     management_locale_text(
                         "Use Verify account to reuse an existing external CLI sign-in.",

@@ -1324,7 +1324,7 @@ impl AgentManager {
                 if context.status != AgentAuthContextStatus::Authenticated {
                     return Err(VibexError::validation(
                         "agent_authentication_required",
-                        "Agent default account must be verified before creating a session",
+                        "Agent account must be verified before creating a session",
                     ));
                 }
                 if AgentAuthenticationOperationRepository::get_active_for_context(
@@ -5597,11 +5597,14 @@ impl AgentManager {
                             "Agent account for turn execution attribution was not found",
                         )
                     })?;
+                // The label the runtime writes for its own account, written the
+                // one way every client can recognise: the name, and the account
+                // hint behind it when there is one to name.
                 let label = context
                     .account_hint
                     .filter(|hint| !hint.trim().is_empty())
-                    .map(|hint| format!("Default CLI account - {hint}"))
-                    .unwrap_or_else(|| "Default CLI account".to_string());
+                    .map(|hint| format!("{} - {hint}", vibex_core::AGENT_ACCOUNT_LABEL))
+                    .unwrap_or_else(|| vibex_core::AGENT_ACCOUNT_LABEL.to_string());
                 let model_label = effective_model_id
                     .map(str::to_string)
                     .unwrap_or_else(|| "Agent default".to_string());

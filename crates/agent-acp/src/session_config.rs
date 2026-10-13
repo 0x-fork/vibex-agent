@@ -1164,7 +1164,7 @@ pub fn append_agent_account_runtime_options(
         source: source.clone(),
         auth_source_revision: context.revision,
         agent_id: agent.id.clone(),
-        label: "Default CLI account".to_string(),
+        label: vibex_core::AGENT_ACCOUNT_LABEL.to_string(),
         kind: RuntimeAuthSourceKind::AgentAccount,
         availability,
         account_hint: context.account_hint.as_deref().map(bounded_catalog_label),
@@ -1194,7 +1194,7 @@ pub fn append_agent_account_runtime_options(
                 catalog.options.push(SessionRuntimeOption {
                     selection,
                     agent_label: bounded_catalog_label(&agent.label),
-                    auth_source_label: "Default CLI account".to_string(),
+                    auth_source_label: vibex_core::AGENT_ACCOUNT_LABEL.to_string(),
                     model_label: bounded_catalog_label(&model.label),
                     reasoning_efforts,
                     modes,
@@ -1211,7 +1211,7 @@ pub fn append_agent_account_runtime_options(
             catalog.options.push(SessionRuntimeOption {
                 selection,
                 agent_label: bounded_catalog_label(&agent.label),
-                auth_source_label: "Default CLI account".to_string(),
+                auth_source_label: vibex_core::AGENT_ACCOUNT_LABEL.to_string(),
                 model_label: "Selected automatically by Agent".to_string(),
                 reasoning_efforts: snapshot.default_reasoning_efforts.clone(),
                 modes: snapshot.default_modes.clone(),
@@ -2306,6 +2306,14 @@ mod tests {
             RuntimeAuthSourceAvailability::Available
         );
         assert_eq!(source.account_hint.as_deref(), Some("work account"));
+        // The runtime writes one name for every client, and writes it in
+        // English; a client that renders a locale names the account itself from
+        // the kind, and the hint it was told here.
+        assert_eq!(source.label, vibex_core::AGENT_ACCOUNT_LABEL);
+        assert_eq!(
+            catalog.options[0].auth_source_label,
+            vibex_core::AGENT_ACCOUNT_LABEL
+        );
         assert!(
             source
                 .supported_actions
