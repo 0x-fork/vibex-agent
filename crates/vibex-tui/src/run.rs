@@ -2320,11 +2320,21 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                             .iter()
                             .chain(discovery.quick_phrases.iter())
                             .chain(discovery.delegation_entries.iter())
-                            .map(|entry| crate::composer::Completion {
-                                insert: entry.insertion_text.clone(),
-                                label: entry.label.clone(),
-                                detail: entry.description.clone().unwrap_or_default(),
-                                group: format!("{:?}", entry.source_kind),
+                            .map(|entry| {
+                                // A delegation target is described by the
+                                // account it runs as and the model it runs,
+                                // both written by the runtime; the account is
+                                // the one name this client says for itself.
+                                let detail = entry.description.clone().unwrap_or_default();
+                                crate::composer::Completion {
+                                    insert: entry.insertion_text.clone(),
+                                    label: entry.label.clone(),
+                                    detail: crate::transcript::runtime_attribution_line(
+                                        app.strings,
+                                        &detail,
+                                    ),
+                                    group: format!("{:?}", entry.source_kind),
+                                }
                             })
                             .collect::<Vec<_>>();
                         entries.dedup_by(|left, right| left.insert == right.insert);
@@ -4880,6 +4890,57 @@ mod tests {
         .unwrap();
         assert!(app.toast.is_none());
         assert!(app.completion.as_ref().unwrap().loading);
+    }
+
+    #[test]
+    fn a_collaborator_row_names_its_account_in_the_readers_language() {
+        // The row's second line is the runtime's own description — the account
+        // and the model — and the account is the one name this client says for
+        // itself, so a reader of a locale does not read the runtime's English.
+        let worker = isolation_worker();
+        let mut app = test_app(120, 32);
+        app.strings = crate::locale::Strings::for_locale(crate::locale::Locale::ZhCn);
+        app.composer.set_text("@");
+        app.refresh_completion();
+        let ticket = app.composer_ticket();
+        let discovery = vibex_core::AgentCommandDiscovery {
+            response: vibex_core::AgentCommandDiscoverResponse {
+                entries: vec![vibex_core::AgentCommandEntry {
+                    id: "reference:agent:codex:work".to_string(),
+                    trigger: vibex_core::AgentCommandTrigger::Mention,
+                    source_kind: vibex_core::AgentCommandSourceKind::Reference,
+                    label: "@Codex".to_string(),
+                    description: Some("Agent account - you@example.com · gpt-5".to_string()),
+                    insertion_text: "@Codex ".to_string(),
+                    command_name: None,
+                    provider_kind: None,
+                    prompt_id: None,
+                    skill_id: None,
+                    reference_path: None,
+                    selection_behavior: vibex_core::AgentCommandSelectionBehavior::Insert,
+                    execution_behavior: vibex_core::AgentCommandExecutionBehavior::None,
+                    destructive: false,
+                    metadata: Vec::new(),
+                }],
+                diagnostics: Vec::new(),
+            },
+            slash_commands: true,
+            skills: true,
+            quick_phrases: Vec::new(),
+            delegation_entries: Vec::new(),
+        };
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Completions {
+                ticket,
+                result: Ok(Box::new(discovery)),
+            },
+        )
+        .unwrap();
+        let items = &app.completion.as_ref().expect("a completion menu").items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].detail, "Agent 账户 - you@example.com · gpt-5");
     }
     #[test]
     fn remembered_default_and_late_catalogue_do_not_block_creation_recovery() {

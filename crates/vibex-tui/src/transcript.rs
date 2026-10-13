@@ -2583,6 +2583,37 @@ pub fn render_block_in_run_with_body(
     )
 }
 
+/// The separator between the names in a line the runtime composed: an
+/// attribution line's Agent, account and model, or a reference's account, model
+/// and configuration.
+const RUNTIME_ATTRIBUTION_SEPARATOR: &str = " · ";
+
+/// A line the runtime composed out of names, with the Agent account named in
+/// the reader's language.
+///
+/// The line is composed by the shared projection out of labels the runtime
+/// wrote, and the account is the one part of it this client has a name of its
+/// own for: an Agent account is a product concept, while the Agent, the model
+/// and a Provider Profile are all names the reader already knows. Only the
+/// account segment is touched, and only when
+/// [`vibex_core::agent_account_label_hint`] recognises the runtime's own
+/// wording, so a Profile whose owner named it "Agent account" is never renamed.
+/// The account hint stays behind the name.
+pub(crate) fn runtime_attribution_line(strings: Strings, attribution: &str) -> String {
+    let account = strings.runtime_auth_agent_account();
+    attribution
+        .split(RUNTIME_ATTRIBUTION_SEPARATOR)
+        .map(
+            |segment| match vibex_core::agent_account_label_hint(segment) {
+                Some("") => account.to_string(),
+                Some(hint) => format!("{account} - {hint}"),
+                None => segment.to_string(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join(RUNTIME_ATTRIBUTION_SEPARATOR)
+}
+
 /// As [`render_block_in_run_with_body`], told whether this row carries the
 /// runtime's name.
 ///
@@ -2972,7 +3003,10 @@ fn render_block_inner(
     // Agent under their words says the opposite of what happened.
     let attributed = show_attribution && block.kind != TimelineRowKind::UserMessage && body_open;
     if let Some(runtime) = block.runtime_attribution.as_ref().filter(|_| attributed) {
-        status.push((format!("[{runtime}]"), theme.muted()));
+        status.push((
+            format!("[{}]", runtime_attribution_line(strings, runtime)),
+            theme.muted(),
+        ));
     }
     for (text, style) in status {
         let text = truncate_to_width(&text, content_width, "…");
@@ -4745,6 +4779,42 @@ mod density_tests {
         assert_eq!(
             action("{\"command\":\"cargo test\"}\n42 tests passed"),
             "cargo test"
+        );
+    }
+
+    #[test]
+    fn the_agent_account_is_named_in_the_readers_language() {
+        let chinese = Strings::for_locale(Locale::ZhCn);
+        assert_eq!(
+            runtime_attribution_line(
+                chinese,
+                "DeepSeek Harness · Agent account · deepseek-v4.1-flash"
+            ),
+            "DeepSeek Harness · Agent 账户 · deepseek-v4.1-flash"
+        );
+        // A transcript written before the account was renamed reads the same as
+        // a new one.
+        assert_eq!(
+            runtime_attribution_line(
+                chinese,
+                "DeepSeek Harness · Default CLI account · deepseek-v4.1-flash"
+            ),
+            "DeepSeek Harness · Agent 账户 · deepseek-v4.1-flash"
+        );
+        // The hint a signed-in account carries stays behind the name.
+        assert_eq!(
+            runtime_attribution_line(chinese, "codex · Agent account - bai@example.com · gpt-5"),
+            "codex · Agent 账户 - bai@example.com · gpt-5"
+        );
+        // A Profile is named by its owner, so a name that merely starts with the
+        // runtime's wording is left alone.
+        assert_eq!(
+            runtime_attribution_line(chinese, "codex · Agent account holder · gpt-5"),
+            "codex · Agent account holder · gpt-5"
+        );
+        assert_eq!(
+            runtime_attribution_line(chinese, "codex · bai · gpt-5"),
+            "codex · bai · gpt-5"
         );
     }
 

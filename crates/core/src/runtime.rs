@@ -568,6 +568,40 @@ impl RuntimeAuthSource {
     }
 }
 
+/// The name the runtime writes for an Agent's own account.
+///
+/// The runtime serves every client at once, so it writes one name and writes it
+/// in English. A client that renders a locale names the account from
+/// [`RuntimeAuthSourceKind::AgentAccount`] instead — it is the product's own
+/// concept, not a name the reader chose — and uses this name only to recognise
+/// the runtime's own wording.
+pub const AGENT_ACCOUNT_LABEL: &str = "Agent account";
+
+/// The name the runtime wrote for an Agent's own account before it was renamed.
+///
+/// Kept so a label stored in an older timeline or an older catalogue still
+/// reads as an Agent account to a client that names it in its own language.
+pub const LEGACY_AGENT_ACCOUNT_LABEL: &str = "Default CLI account";
+
+/// The account hint behind an Agent account label, when `label` is one.
+///
+/// The runtime writes the label alone for an account it cannot name, and the
+/// label followed by ` - ` and the hint for one it can, so a client keeps the
+/// hint (`you@example.com`) while replacing the name in front of it. `None`
+/// means the label says something else — a Provider Profile, an Agent or a
+/// model — and must be left exactly as written.
+pub fn agent_account_label_hint(label: &str) -> Option<&str> {
+    [AGENT_ACCOUNT_LABEL, LEGACY_AGENT_ACCOUNT_LABEL]
+        .into_iter()
+        .find_map(|name| {
+            let hint = label.strip_prefix(name)?;
+            match hint {
+                "" => Some(""),
+                hint => hint.strip_prefix(" - "),
+            }
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeAuthSourceKind {
@@ -1722,6 +1756,29 @@ mod tests {
         let mut hash_map = std::collections::HashMap::new();
         hash_map.insert(route_key("codex", "codex-acp"), "x");
         assert_eq!(hash_map.get(&route_key("codex", "codex-acp")), Some(&"x"));
+    }
+
+    #[test]
+    fn an_agent_account_label_is_recognised_with_and_without_a_hint() {
+        assert_eq!(agent_account_label_hint(AGENT_ACCOUNT_LABEL), Some(""));
+        assert_eq!(
+            agent_account_label_hint(LEGACY_AGENT_ACCOUNT_LABEL),
+            Some(""),
+            "a label written before the account was renamed still reads as one"
+        );
+        assert_eq!(
+            agent_account_label_hint("Agent account - you@example.com"),
+            Some("you@example.com")
+        );
+        assert_eq!(
+            agent_account_label_hint("Default CLI account - you@example.com"),
+            Some("you@example.com")
+        );
+        // Names that are not the runtime's own wording are not accounts: a
+        // Provider Profile, an Agent or a model named after one keeps its name.
+        assert_eq!(agent_account_label_hint("Agent account holder"), None);
+        assert_eq!(agent_account_label_hint("Work"), None);
+        assert_eq!(agent_account_label_hint("codex"), None);
     }
 
     #[test]

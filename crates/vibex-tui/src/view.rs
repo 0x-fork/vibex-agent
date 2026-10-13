@@ -24,7 +24,7 @@ use crate::keymap::Scope;
 use crate::layout::Bands;
 use crate::locale::Strings;
 use crate::modal::{self, ModalChrome, ModalHint, ModalLayout, ModalSizing};
-use crate::runtime_picker::RuntimePickerRow;
+use crate::runtime_picker::{RuntimePickerRow, runtime_option_auth_label};
 use crate::text::{display_width, pad_to_width, truncate_to_width};
 use crate::theme::TuiTheme;
 
@@ -7379,13 +7379,14 @@ fn runtime_picker_entry_line(
     let status_gap = if status_width > 0 { 2 } else { 0 };
     let available = width.saturating_sub(indent + 2 + status_width + status_gap);
     // The model is what a reader scans for, so it takes the larger share and the
-    // account truncates first: "Default CLI account/…" names the provenance, but
+    // account truncates first: "Agent account/…" names the provenance, but
     // two rows of the same model on two accounts are still two rows.
+    let auth_label = runtime_option_auth_label(&strings, option);
     let body = if in_group {
         let (auth_width, model_width) = runtime_columns(available);
         format!(
             "{} · {}",
-            truncate_to_width(&option.auth_source_label, auth_width, "…"),
+            truncate_to_width(&auth_label, auth_width, "…"),
             truncate_to_width(&option.model_label, model_width, "…"),
         )
     } else {
@@ -7393,7 +7394,7 @@ fn runtime_picker_entry_line(
         format!(
             "{} · {} · {}",
             truncate_to_width(&option.agent_label, agent_width, "…"),
-            truncate_to_width(&option.auth_source_label, auth_width, "…"),
+            truncate_to_width(&auth_label, auth_width, "…"),
             truncate_to_width(&option.model_label, model_width, "…"),
         )
     };

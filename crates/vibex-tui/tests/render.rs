@@ -8693,3 +8693,73 @@ fn reasoning_toggle_opens_and_closes_every_member_of_a_group() {
         vibex_tui::transcript::GroupRole::Head { members: 4 }
     ));
 }
+
+#[test]
+fn an_agent_account_is_named_in_the_readers_language_on_the_runtime_surfaces() {
+    // The runtime writes one account label for every client, and writes it in
+    // English; an Agent account is the product's own concept, so a reader of a
+    // localized client gets that client's name for it — on the row `Ctrl+G`
+    // opens and on the line under the composer that names what Enter will send
+    // through. The wording the runtime wrote before the account was renamed
+    // travels in older catalogues and older timelines, so the client has to read
+    // it as the same concept rather than print it.
+    for (locale, account) in [(Locale::En, "Agent account"), (Locale::ZhCn, "Agent 账户")] {
+        let mut app = app(120, 40);
+        app.strings = Strings::for_locale(locale);
+        app.live = vibex_tui::app::LiveState::Ready;
+        // The transition would scramble the line the assertions read.
+        app.settings.transitions = false;
+        let agent_id = vibex_core::AgentId::parse("codex").expect("agent id");
+        let option = vibex_core::SessionRuntimeOption {
+            selection: vibex_core::SessionRuntimeSelection::agent_default(
+                agent_id.clone(),
+                vibex_core::AgentAuthContextId::new(),
+            ),
+            agent_label: "codex".to_string(),
+            auth_source_label: "Default CLI account".to_string(),
+            model_label: "gpt-5".to_string(),
+            reasoning_efforts: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability: vibex_core::RuntimeOptionAvailability::Available,
+        };
+        let selection = option.selection.clone();
+        app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option],
+        });
+
+        // `Ctrl+G`: the entry's row names the account the reader's way.
+        app.show_runtime_picker();
+        app.fold_runtime_group(&agent_id, false);
+        let screen = text(&render(&mut app, 120, 40));
+        assert!(
+            unspaced(&screen).contains(&unspaced(&format!("{account} · gpt-5"))),
+            "the picker's row does not name the account the reader's way:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Default CLI account"),
+            "the picker's row printed the runtime's own wording:\n{screen}"
+        );
+
+        // The info line under the composer gives the same answer as the row.
+        app.overlay = None;
+        app.new_session_runtime = Some(selection);
+        let screen = text(&render(&mut app, 120, 40));
+        assert!(
+            unspaced(&screen).contains(&unspaced(&format!("codex · {account} · gpt-5"))),
+            "the composer's info line does not name the account the reader's way:\n{screen}"
+        );
+    }
+}
+
+/// The screen with its blanks taken out.
+///
+/// A wide glyph is drawn in one cell and leaves the next one blank, so a name
+/// written in Chinese arrives in the buffer one cell per glyph plus a spacer.
+/// Assertions about such a name compare the two sides the same way.
+fn unspaced(screen: &str) -> String {
+    screen.replace(' ', "")
+}
