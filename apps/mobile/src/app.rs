@@ -5978,8 +5978,13 @@ impl MobileApp {
             .as_ref()
             .and_then(|controller| controller.state.active_session.value.as_ref())
             .map(|session| session.workspace_id.clone());
-        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let discovery = backend
+        // The catalogue is a remote read, so it belongs on the Tokio runtime:
+        // a `vibex-remote-client` future builds its timer from the runtime
+        // context it is polled in, and the GPUI foreground executor has none.
+        // Polling it here would abort the process on the render thread, which
+        // is what a session switch used to do.
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
                 .discover_agent_commands(AgentCommandDiscoverRequest {
                     agent_id,
                     provider_profile_id: None,
@@ -5991,7 +5996,10 @@ impl MobileApp {
                     query: None,
                     limit: Some(64),
                 })
-                .await;
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let discovery = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
                 if generation != this.composer_commands_generation {
                     return;
@@ -6204,8 +6212,15 @@ impl MobileApp {
         self.composer_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.operation_busy = true;
+        // Same rule as the command catalogue: the request runs on the Tokio
+        // runtime and only its answer comes back to the GPUI task.
+        let runner =
+            gpui_tokio::Tokio::spawn(
+                cx,
+                async move { backend.execute_agent_command(request).await },
+            );
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let outcome = backend.execute_agent_command(request).await;
+            let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
                 this.operation_busy = false;
                 match outcome {
@@ -28066,6 +28081,149 @@ mod tests {
         let head = &source[..index];
         let (_, tail) = head.rsplit_once("\nfn ")?;
         tail.split(['(', '<', ' ']).next()
+    }
+
+    /// The bracketed body of the call whose opening bracket is at `open`.
+    fn call_body(source: &str, open: usize) -> &str {
+        let mut depth = 0usize;
+        for (offset, character) in source[open..].char_indices() {
+            match character {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open..open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the call at byte {open} is never closed")
+    }
+
+    /// The statement that ends where `index` points, brackets balanced.
+    ///
+    /// A closing brace at depth zero closed the statement before this one:
+    /// walking further back would pull an unrelated expression — and the
+    /// `backend.` it names — into the statement being inspected.
+    fn statement_before(source: &str, index: usize) -> &str {
+        let mut depth = 0usize;
+        let mut start = 0;
+        for (offset, character) in source[..index].char_indices().rev() {
+            match character {
+                '}' if depth == 0 => {
+                    start = offset + character.len_utf8();
+                    break;
+                }
+                ')' | ']' | '}' => depth += 1,
+                '(' | '[' | '{' => {
+                    if depth == 0 {
+                        start = offset + character.len_utf8();
+                        break;
+                    }
+                    depth -= 1;
+                }
+                ';' if depth == 0 => {
+                    start = offset + 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        source[start..index].trim()
+    }
+
+    /// Whether the statement calls a method on `owner`, across a line break.
+    ///
+    /// The app writes a long call as the receiver, a newline, and the method:
+    /// `backend` and its `.` are never adjacent in the source, so the search is
+    /// for the name followed by whatever whitespace the formatter chose.
+    fn calls_a_method_on(statement: &str, owner: &str) -> bool {
+        statement.match_indices(owner).any(|(offset, _)| {
+            let before = statement[..offset].chars().next_back();
+            if before.is_some_and(|character| character.is_alphanumeric() || character == '_') {
+                return false;
+            }
+            statement[offset + owner.len()..]
+                .trim_start()
+                .starts_with('.')
+        })
+    }
+
+    /// Every backend future a GPUI task awaits itself, with its byte offset.
+    ///
+    /// The answer a GPUI task works on arrives from a `runner`, so an awaited
+    /// statement that names the backend — or a controller, which is the same
+    /// request one layer up — is a request polled on the foreground executor.
+    fn backend_futures_awaited_by_gpui_tasks(source: &str) -> Vec<String> {
+        // The test module quotes the very patterns this scan looks for.
+        let source = source
+            .split("\nmod tests {")
+            .next()
+            .expect("the module has production code");
+        let mut found = Vec::new();
+        for (spawn, _) in source.match_indices("cx.spawn(") {
+            let open = spawn + "cx.spawn".len();
+            let body = call_body(source, open);
+            for (offset, _) in body.match_indices(".await") {
+                let statement = statement_before(body, offset);
+                if calls_a_method_on(statement, "backend")
+                    || calls_a_method_on(statement, "controller")
+                {
+                    found.push(format!("byte {}: {statement}", open + offset));
+                }
+            }
+        }
+        found
+    }
+
+    /// A backend request belongs on the Tokio runtime, never on the GPUI task.
+    ///
+    /// `vibex-remote-client` futures build their timeouts from the Tokio
+    /// context of the thread that polls them, and the GPUI foreground executor
+    /// has none: a request awaited inside `cx.spawn` panics on the render
+    /// thread. That panic cannot unwind out of the looper callback the platform
+    /// runs main-thread work in, so Android aborts the process instead of
+    /// reporting anything — the phone closed on every session switch until the
+    /// command catalogue moved behind `gpui_tokio::Tokio::spawn`. A new request
+    /// has to enter the same way: the GPUI task awaits its `runner`, and only
+    /// the answer crosses back.
+    #[test]
+    fn gpui_tasks_never_poll_a_backend_future() {
+        for (name, source) in [
+            ("android_insets.rs", include_str!("android_insets.rs")),
+            ("app.rs", include_str!("app.rs")),
+            ("team.rs", include_str!("team.rs")),
+            ("workbench.rs", include_str!("workbench.rs")),
+        ] {
+            let found = backend_futures_awaited_by_gpui_tasks(source);
+            assert!(
+                found.is_empty(),
+                "{name}: run these requests through `gpui_tokio::Tokio::spawn` \
+                 instead of polling them in the GPUI task: {found:#?}"
+            );
+        }
+    }
+
+    /// The guard above is only worth its keep if it sees a real violation.
+    #[test]
+    fn the_backend_future_guard_recognizes_a_violation() {
+        let sample = r#"
+fn session_opened(cx: &mut Context<Self>) {
+    let task = cx.spawn(async move |entity, cx| {
+        let discovery = backend
+            .discover_agent_commands(AgentCommandDiscoverRequest {
+                trigger: None,
+                limit: Some(64),
+            })
+            .await;
+        let _ = entity.update(cx, |_, cx| cx.notify());
+    });
+    let _ = task;
+}
+"#;
+
+        assert_eq!(backend_futures_awaited_by_gpui_tasks(sample).len(), 1);
     }
 
     /// Every text field the phone renders has to ask for the keyboard on a tap.

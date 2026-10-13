@@ -201,12 +201,43 @@ pub fn notify_lifecycle(phase: gpui::AppLifecyclePhase) {
 ///
 /// Routing `log` to logcat has to happen before the first frame, or everything
 /// the platform layer reports is dropped.
+///
+/// The Activity recreation path calls this again for every new instance, so the
+/// hooks are installed exactly once: a panic hook that chained itself on each
+/// start would print one backtrace per recreation.
 pub fn install_diagnostics() {
     #[cfg(target_os = "android")]
     {
-        gpui_mobile::android::init_logger();
-        gpui_mobile::android::jni::install_panic_hook();
+        static HOOKS: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        HOOKS.get_or_init(|| {
+            gpui_mobile::android::init_logger();
+            gpui_mobile::android::jni::install_panic_hook();
+            install_panic_backtrace();
+        });
     }
+}
+
+/// Adds a captured backtrace after whatever the platform's hook reports.
+///
+/// A panic in main-thread work is fatal on Android: it unwinds into the looper
+/// callback that work runs in, which cannot unwind, so the process aborts. The
+/// crash dump written afterwards carries native frames only — the Rust frames
+/// are popped while the first panic unwinds — which is what leaves a message
+/// like "there is no reactor running" without the call site that caused it.
+/// Capturing the backtrace while the panic is still on the stack keeps those
+/// frames in logcat. A release build keeps no symbols, so its addresses are
+/// read against the unstripped `.so` the same source builds.
+#[cfg(target_os = "android")]
+fn install_panic_backtrace() {
+    let platform_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        platform_hook(info);
+        // The platform logger is what turns this into a logcat line.
+        log::error!(
+            "panic backtrace:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }));
 }
 
 /// Opens this app's page in the OS settings.
