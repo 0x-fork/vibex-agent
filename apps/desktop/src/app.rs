@@ -27,8 +27,6 @@ mod timeline_disclosure;
 mod timeline_loading;
 #[path = "timeline_tool_detail.rs"]
 mod timeline_tool_detail;
-#[path = "timeline_unit_view.rs"]
-mod timeline_unit_view;
 use gpui::{
     AccessibleAction, Anchor, Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App,
     AvailableSpace, Bounds, BoxShadow, ClickEvent, ClipboardEntry, ClipboardItem, Context,
@@ -8705,11 +8703,6 @@ pub struct VibexWorkbench {
     /// The child Agent rail's own render boundary, created on first render. See
     /// [`ChildAgentRailView`]; `None` only before the first frame.
     child_agent_rail_view: Option<Entity<ChildAgentRailView>>,
-    /// One retained element tree per visible process unit of the focused
-    /// timeline. See [`timeline_unit_view::TimelineUnitView`]; entries are weak,
-    /// so a unit that scrolls out of view drops its view with the frame that
-    /// mounted it.
-    timeline_unit_views: BTreeMap<String, WeakEntity<timeline_unit_view::TimelineUnitView>>,
     /// Unsent Composer content, one entry per session, kept outside the view
     /// cache.
     ///
@@ -10195,7 +10188,6 @@ impl VibexWorkbench {
             sidebar_view: None,
             timeline_view: None,
             child_agent_rail_view: None,
-            timeline_unit_views: BTreeMap::new(),
             composer_drafts: ComposerDraftStore::default(),
             pending_timeline_turn_measurements: BTreeMap::new(),
             pending_composer_geometries: BTreeMap::new(),
@@ -23729,7 +23721,6 @@ impl VibexWorkbench {
         self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
         self.timeline_activity_projections.clear();
-        self.timeline_unit_views.clear();
         self.timeline_file_diff_previews.clear();
         self.timeline_file_diff_scrolls.clear();
         self.timeline_turn_file_changes.clear();
@@ -54306,14 +54297,12 @@ impl VibexWorkbench {
         if units.is_empty() {
             return Vec::new();
         }
-        // A short section lays its units out in flow. The focused timeline
-        // mounts each one as a retained view there; the child-agent rail and
-        // session group panes keep the inline element, and with it the natural
-        // height the flow measured.
+        // A short section, and every child-agent preview, lays out in flow
+        // where the measured height is always the real one.
         if self.rendering_child_agent_timeline() || units.len() <= TIMELINE_PROCESS_RUN_FLOW_LIMIT {
             return units
                 .iter()
-                .map(|unit| self.timeline_process_unit_element(turn, unit, window, cx))
+                .map(|unit| self.render_timeline_process_unit(turn, unit, window, cx))
                 .collect();
         }
         let (sizes, origins) = self.timeline_process_run_layout(&units);
@@ -54338,10 +54327,6 @@ impl VibexWorkbench {
         // first estimates, and the slack they left painted as a blank band.
         let run_session_id = self.timeline.session_id.clone();
         let build_session_id = run_session_id.clone();
-        // Units that own their element tree measure themselves and report the
-        // height; the run must not record the box it reserved for them as if it
-        // were a measurement of their content.
-        let record_measurements = !self.retaining_timeline_process_units();
         vec![
             TimelineProcessRun {
                 units,
@@ -54350,7 +54335,6 @@ impl VibexWorkbench {
                 pinned_unit,
                 session_id: run_session_id,
                 entity,
-                record_measurements,
                 build_unit: Box::new(move |index, window, cx| {
                     let turn = turns
                         .borrow()
@@ -54363,7 +54347,7 @@ impl VibexWorkbench {
                     build_entity
                         .update(cx, |this, cx| {
                             this.with_session_view_for_render(build_session_id.as_ref(), |this| {
-                                this.timeline_process_unit_element(&turn, unit, window, cx)
+                                this.render_timeline_process_unit(&turn, unit, window, cx)
                             })
                         })
                         .unwrap_or_else(|_| Empty.into_any_element())
@@ -63189,20 +63173,13 @@ impl VibexWorkbench {
 
     /// The workbench column's own page: the open session group, or the timeline
     /// when no group is in front.
-    ///
-    /// The timeline is mounted uncached on purpose: `gpui-pre` stops consulting a
-    /// cached view's descendants while an ancestor view re-renders, and this view
-    /// re-renders on every streamed chunk. The element trees that are worth
-    /// keeping belong to the process units below it — see
-    /// [`timeline_unit_view::TimelineUnitView`] — and they can only be reused
-    /// from a plain tree. What this boundary still buys is that a repaint
-    /// elsewhere in the window does not reach the timeline at all: a workbench
-    /// frame that does not touch this view replays its ranges whole.
     fn render_column_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let page = if let Some((group_id, group)) = self.active_session_group() {
             self.render_session_group_workspace(&group_id, &group, cx)
         } else {
-            self.ensure_timeline_view(cx).into_any_element()
+            self.ensure_timeline_view(cx)
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element()
         };
         // A duel opened from the composer's companion covers the session page
         // the way the home page's own duel covers the new-session page.
@@ -66493,11 +66470,6 @@ struct TimelineProcessRun {
     session_id: Option<VibexSessionId>,
     /// The workbench, for recording what the run measured.
     entity: WeakEntity<VibexWorkbench>,
-    /// Whether the run's own measurement of a unit is a measurement of its
-    /// content. It is not when the unit owns its element tree: the box this run
-    /// reserved for it is all `layout_as_root` can report there, and recording
-    /// that as a measurement would freeze an estimate as if content had settled.
-    record_measurements: bool,
     /// Builds unit `index` on demand.
     build_unit: TimelineProcessUnitBuilder,
 }
@@ -66754,9 +66726,6 @@ impl Element for TimelineProcessRun {
             });
             measurements.push((index, f32::from(measured.height)));
             layout.units.push(unit);
-        }
-        if !self.record_measurements {
-            return;
         }
         if !measurements.is_empty() {
             let units = self.units.clone();

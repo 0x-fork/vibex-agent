@@ -169,10 +169,10 @@ fn tool_progress_preserves_the_measured_timeline_extent(cx: &mut TestAppContext)
             let before = *frames.last().unwrap();
             assert!(frames[12..].iter().all(|frame| *frame == before));
             workbench.read_with(cx, |workbench, _| {
-                // A unit that owns its element tree reports the height it
-                // measured, so the table is filled whether the section lays out
-                // in flow or through the windowed run.
-                assert!(!workbench.timeline_process_unit_heights.is_empty());
+                assert_eq!(
+                    !workbench.timeline_process_unit_heights.is_empty(),
+                    windowed
+                );
             });
             let end = workbench.read_with(cx, |workbench, _| {
                 workbench.timeline.authoritative_end_sequence.unwrap()
@@ -677,7 +677,6 @@ impl Render for ReasoningTimelineProbe {
                         pinned_unit: None,
                         session_id: None,
                         entity: WeakEntity::new_invalid(),
-                        record_measurements: true,
                         build_unit: Box::new(build_unit),
                     }
                     .into_any_element()
@@ -1081,7 +1080,6 @@ impl Render for ProcessRunProbe {
                 pinned_unit: None,
                 session_id: None,
                 entity: WeakEntity::new_invalid(),
-                record_measurements: true,
                 build_unit: Box::new(move |index, _, _| {
                     let bounds = bounds.clone();
                     div()
@@ -1815,90 +1813,5 @@ fn a_prefetch_that_cannot_start_keeps_the_history_budget(cx: &mut TestAppContext
     assert_eq!(
         slots, 0,
         "a read that never started must not spend a slot that only a completion can release"
-    );
-}
-
-/// Draws frames the way the platform does when nothing has asked for a full
-/// refresh, which is the state a retained element tree is reused in.
-///
-/// `Window::refresh` deliberately ignores every cached subtree, so a frame that
-/// wants to see the reuse has to be drawn without it.
-fn draw_plain_timeline_frames(cx: &mut VisualTestContext, count: usize) {
-    for _ in 0..count {
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-    }
-}
-
-/// A process unit's element tree survives a frame that does not touch it.
-///
-/// The timeline rebuilds its visible turns on every streamed chunk, and an
-/// expanded tool group made each of those frames lay its rows out again:
-/// prepaint measured 12 to 42ms a frame against 4 to 6ms collapsed, with
-/// element construction flat at ~1ms. A unit that owns its tree and is mounted
-/// through `Entity::cached` is therefore only rendered again when its render
-/// key moves — an idle frame must not render it at all, and a new tool item
-/// must.
-#[gpui::test]
-fn retained_process_units_render_only_when_their_key_moves(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
-    let (workbench, cx) = live_tool_timeline(cx, false);
-    draw_live_timeline_frames(&workbench, cx, 4);
-    // One unit, held for the length of the test so that a frame which stops
-    // mounting it cannot be mistaken for one that did not render it.
-    let (unit_id, unit) = workbench.read_with(cx, |workbench, _| {
-        workbench
-            .timeline_unit_views
-            .iter()
-            .find_map(|(id, view)| view.upgrade().map(|view| (id.clone(), view)))
-            .expect("the focused timeline should retain its process units")
-    });
-    let renders = |cx: &VisualTestContext| unit.read_with(cx, |view, _| view.render_count());
-    let before = renders(cx);
-    assert!(before > 0);
-
-    draw_plain_timeline_frames(cx, 4);
-    assert_eq!(
-        renders(cx),
-        before,
-        "a frame that changes nothing must not render a retained unit again"
-    );
-
-    // A workbench notify on its own is what every streamed chunk produces, and
-    // it must not rebuild the retained trees either.
-    workbench.update(cx, |_, cx| cx.notify());
-    draw_plain_timeline_frames(cx, 2);
-    assert_eq!(
-        renders(cx),
-        before,
-        "a workbench notify on its own must not render a retained unit again"
-    );
-
-    // A disclosure is the other half of the contract: its click handler only
-    // inserts into an expansion map, so the key has to carry that state or the
-    // clicked row keeps painting its previous shape while hover, which notifies
-    // the element's own view, still responds.
-    workbench.update(cx, |workbench, cx| {
-        workbench
-            .timeline_command_expansion
-            .insert(unit_id.clone(), true);
-        cx.notify();
-    });
-    draw_plain_timeline_frames(cx, 2);
-    assert!(
-        renders(cx) > before,
-        "toggling a disclosure must render the retained unit again"
-    );
-
-    let after_disclosure = renders(cx);
-    let end = workbench.read_with(cx, |workbench, _| {
-        workbench.timeline.authoritative_end_sequence.unwrap()
-    });
-    apply_live_timeline_item(&workbench, cx, progress_tool(end + 1, 23));
-    draw_live_timeline_frames(&workbench, cx, 2);
-    assert!(
-        renders(cx) > after_disclosure,
-        "a new tool item must render the unit that holds it"
     );
 }
