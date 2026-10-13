@@ -1535,6 +1535,11 @@ impl MobileWorkbench {
                     }
                     this.terminal_render_sequence = 0;
                     this.start_terminal_poll(terminal_id, cx);
+                    if this.terminal_search_open {
+                        // The resize rebuilt the emulator, so the matches found
+                        // against the old grid point at cells that are gone.
+                        this.refresh_terminal_search(cx);
+                    }
                 }
                 this.error = this.terminal.state.last_error.clone();
                 cx.notify();
@@ -4680,11 +4685,7 @@ impl MobileWorkbench {
                         });
                     },
                     {
-                        let gesture_entity = weak_entity.clone();
-                        move |bounds, _, window, cx| {
-                            let _ = gesture_entity.update(cx, |this, _| {
-                                this.terminal_grid_bounds = Some(bounds);
-                            });
+                        move |bounds, _, window, _: &mut gpui::App| {
                             // A long press is the one touch the grid has to
                             // claim from the platform: the recognizer keeps
                             // reporting that same touch through `Moved`, which
