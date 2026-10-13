@@ -90,7 +90,13 @@ pub enum MarkdownPresentation {
 /// The style a presentation renders with.
 ///
 /// `None` leaves the text view on the defaults the component theme installed,
-/// which is what the agent and document surfaces want.
+/// which is what the agent and document surfaces want: the kit's own body
+/// typography, tracked as the kit revises it. That is deliberate. The paragraph
+/// gap, heading scale, and table metrics are tuned as one set, so pinning a
+/// single value back would match neither the old design nor the new one.
+/// gpui-kit 0.7.2 tightened the gap from `rems(1.)` to `rems(0.75)`; restoring
+/// the old spacing is one `.with_paragraph_gap(rems(1.))` on a
+/// `TextViewStyle::default()` built here.
 pub fn text_view_style(presentation: MarkdownPresentation, cx: &App) -> Option<TextViewStyle> {
     match presentation {
         MarkdownPresentation::Thought => {

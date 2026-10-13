@@ -188,6 +188,12 @@ impl Platform for BoundedFontPlatform {
         self.inner.primary_display()
     }
 
+    /// Forwarded like every other call: the wrapper only replaces the text
+    /// system, so display changes still come from the real Linux platform.
+    fn on_displays_changed(&self, callback: Box<dyn FnMut()>) {
+        self.inner.on_displays_changed(callback)
+    }
+
     fn active_window(&self) -> Option<AnyWindowHandle> {
         self.inner.active_window()
     }

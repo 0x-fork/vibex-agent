@@ -1385,42 +1385,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:async-compression@0.4.42:c19b7c6f923b580a",
-      "name": "async-compression",
-      "version": "0.4.42",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/async-compression@0.4.42",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/Nullus157/async-compression"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:async-executor@1.14.0:c19b7c6f923b580a",
       "name": "async-executor",
       "version": "1.14.0",
@@ -2496,42 +2460,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/RustCrypto/formats"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:bindgen@0.72.1:c19b7c6f923b580a",
-      "name": "bindgen",
-      "version": "0.72.1",
-      "licenses": [
-        {
-          "expression": "BSD-3-Clause"
-        }
-      ],
-      "purl": "pkg:cargo/bindgen@0.72.1",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "BSD-3-Clause"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/rust-lang/rust-bindgen"
         }
       ]
     },
@@ -3761,42 +3689,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:cexpr@0.6.0:c19b7c6f923b580a",
-      "name": "cexpr",
-      "version": "0.6.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0 OR MIT"
-        }
-      ],
-      "purl": "pkg:cargo/cexpr@0.6.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/jethrogb/rust-cexpr"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:cfg-expr@0.15.8:c19b7c6f923b580a",
       "name": "cfg-expr",
       "version": "0.15.8",
@@ -3900,42 +3792,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/katharostech/cfg_aliases"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:cgl@0.3.2:c19b7c6f923b580a",
-      "name": "cgl",
-      "version": "0.3.2",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/cgl@0.3.2",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/servo/cgl-rs"
         }
       ]
     },
@@ -4080,42 +3936,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/RustCrypto/traits"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:clang-sys@1.8.1:c19b7c6f923b580a",
-      "name": "clang-sys",
-      "version": "1.8.1",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/clang-sys@1.8.1",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/KyleMayes/clang-sys"
         }
       ]
     },
@@ -4476,78 +4296,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/ParkMyCar/compact_str"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:compression-codecs@0.4.38:c19b7c6f923b580a",
-      "name": "compression-codecs",
-      "version": "0.4.38",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/compression-codecs@0.4.38",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/Nullus157/async-compression"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:compression-core@0.4.32:c19b7c6f923b580a",
-      "name": "compression-core",
-      "version": "0.4.32",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/compression-core@0.4.32",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/Nullus157/async-compression"
         }
       ]
     },
@@ -5165,42 +4913,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:core-graphics2@0.5.2:c19b7c6f923b580a",
-      "name": "core-graphics2",
-      "version": "0.5.2",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/core-graphics2@0.5.2",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/rust-media/apple-media-rs"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:core-text@21.0.0:c19b7c6f923b580a",
       "name": "core-text",
       "version": "21.0.0",
@@ -5232,42 +4944,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/servo/core-foundation-rs"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:core-video@0.5.2:c19b7c6f923b580a",
-      "name": "core-video",
-      "version": "0.5.2",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/core-video@0.5.2",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/rust-media/apple-media-rs"
         }
       ]
     },
@@ -10565,15 +10241,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-base@0.7.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-base@0.7.3:c19b7c6f923b580a",
       "name": "gpui-base",
-      "version": "0.7.1",
+      "version": "0.7.3",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-base@0.7.1",
+      "purl": "pkg:cargo/gpui-base@0.7.3",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10601,15 +10277,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-component@0.7.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-component@0.7.3:c19b7c6f923b580a",
       "name": "gpui-component",
-      "version": "0.7.1",
+      "version": "0.7.3",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-component@0.7.1",
+      "purl": "pkg:cargo/gpui-component@0.7.3",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10673,15 +10349,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-fps@0.7.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-fps@0.7.3:c19b7c6f923b580a",
       "name": "gpui-fps",
-      "version": "0.7.1",
+      "version": "0.7.3",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-fps@0.7.1",
+      "purl": "pkg:cargo/gpui-fps@0.7.3",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10709,15 +10385,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-kit-assets@0.7.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-kit-assets@0.7.3:c19b7c6f923b580a",
       "name": "gpui-kit-assets",
-      "version": "0.7.1",
+      "version": "0.7.3",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-kit-assets@0.7.1",
+      "purl": "pkg:cargo/gpui-kit-assets@0.7.3",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10745,15 +10421,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre@0.3.8",
+      "purl": "pkg:cargo/gpui-pre@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10781,15 +10457,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-apple@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-apple@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-apple",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-apple@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-apple@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10817,15 +10493,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-collections@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-collections@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-collections",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-collections@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-collections@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10853,15 +10529,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-derive-refineable@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-derive-refineable@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-derive-refineable",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-derive-refineable@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-derive-refineable@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10889,15 +10565,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-http-client@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-http-client@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-http-client",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-http-client@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-http-client@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10925,15 +10601,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-linux@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-linux@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-linux",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-linux@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-linux@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10961,15 +10637,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-macos@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-macos@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-macos",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-macos@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-macos@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10997,15 +10673,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-macros@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-macros@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-macros",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-macros@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-macros@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -11033,51 +10709,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-perf@0.3.8:c19b7c6f923b580a",
-      "name": "gpui-pre-perf",
-      "version": "0.3.8",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/gpui-pre-perf@0.3.8",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/zed-industries/zed"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:gpui-pre-platform@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-platform@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-platform",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-platform@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-platform@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -11105,15 +10745,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-refineable@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-refineable@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-refineable",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-refineable@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-refineable@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -11177,15 +10817,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-scheduler@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-scheduler@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-scheduler",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-scheduler@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-scheduler@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -11213,15 +10853,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-shared-string@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-shared-string@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-shared-string",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-shared-string@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-shared-string@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -11249,15 +10889,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-sum-tree@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-sum-tree@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-sum-tree",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-sum-tree@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-sum-tree@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -11285,15 +10925,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-util@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-util@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-util",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-util@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-util@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -11321,51 +10961,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-util-macros@0.3.8:c19b7c6f923b580a",
-      "name": "gpui-pre-util-macros",
-      "version": "0.3.8",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/gpui-pre-util-macros@0.3.8",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/zed-industries/zed"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:gpui-pre-web@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-web@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-web",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-web@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-web@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -11393,15 +10997,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-wgpu@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-wgpu@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-wgpu",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-wgpu@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-wgpu@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -11429,15 +11033,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-windows@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-windows@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-windows",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-windows@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-windows@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -11465,51 +11069,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-zlog@0.3.8:c19b7c6f923b580a",
-      "name": "gpui-pre-zlog",
-      "version": "0.3.8",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/gpui-pre-zlog@0.3.8",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/zed-industries/zed"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:gpui-pre-ztracing@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-ztracing@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-ztracing",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-ztracing@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-ztracing@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -11537,15 +11105,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-ztracing-macro@0.3.8:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-pre-ztracing-macro@0.3.9:c19b7c6f923b580a",
       "name": "gpui-pre-ztracing-macro",
-      "version": "0.3.8",
+      "version": "0.3.9",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-ztracing-macro@0.3.8",
+      "purl": "pkg:cargo/gpui-pre-ztracing-macro@0.3.9",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -13913,42 +13481,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:io-surface@0.16.1:c19b7c6f923b580a",
-      "name": "io-surface",
-      "version": "0.16.1",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/io-surface@0.16.1",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/servo/core-foundation-rs"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:ipnet@2.12.0:c19b7c6f923b580a",
       "name": "ipnet",
       "version": "2.12.0",
@@ -14808,78 +14340,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/rust-lang-nursery/lazy-static.rs"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:leak@0.1.2:c19b7c6f923b580a",
-      "name": "leak",
-      "version": "0.1.2",
-      "licenses": [
-        {
-          "expression": "Apache-2.0 OR MIT"
-        }
-      ],
-      "purl": "pkg:cargo/leak@0.1.2",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/jmesmon/leak.git"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:leaky-cow@0.1.1:c19b7c6f923b580a",
-      "name": "leaky-cow",
-      "version": "0.1.1",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/leaky-cow@0.1.1",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/notriddle/rust-leaky-cow"
         }
       ]
     },
@@ -16073,15 +15533,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:mach2@0.5.0:c19b7c6f923b580a",
+      "bom-ref": "cargo:mach2@0.6.0:c19b7c6f923b580a",
       "name": "mach2",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "licenses": [
         {
           "expression": "BSD-2-Clause OR MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/mach2@0.5.0",
+      "purl": "pkg:cargo/mach2@0.6.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -17405,42 +16865,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:nu-ansi-term@0.50.3:c19b7c6f923b580a",
-      "name": "nu-ansi-term",
-      "version": "0.50.3",
-      "licenses": [
-        {
-          "expression": "MIT"
-        }
-      ],
-      "purl": "pkg:cargo/nu-ansi-term@0.50.3",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/nushell/nu-ansi-term"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:num@0.4.3:c19b7c6f923b580a",
       "name": "num",
       "version": "0.4.3",
@@ -18161,78 +17585,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:objc2-core-audio@0.3.2:c19b7c6f923b580a",
-      "name": "objc2-core-audio",
-      "version": "0.3.2",
-      "licenses": [
-        {
-          "expression": "Zlib OR Apache-2.0 OR MIT"
-        }
-      ],
-      "purl": "pkg:cargo/objc2-core-audio@0.3.2",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Zlib"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/madsmtm/objc2"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:objc2-core-audio-types@0.3.2:c19b7c6f923b580a",
-      "name": "objc2-core-audio-types",
-      "version": "0.3.2",
-      "licenses": [
-        {
-          "expression": "Zlib OR Apache-2.0 OR MIT"
-        }
-      ],
-      "purl": "pkg:cargo/objc2-core-audio-types@0.3.2",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Zlib"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/madsmtm/objc2"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:objc2-core-data@0.2.2:c19b7c6f923b580a",
       "name": "objc2-core-data",
       "version": "0.2.2",
@@ -18422,78 +17774,6 @@
         }
       ],
       "purl": "pkg:cargo/objc2-core-image@0.3.2",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Zlib"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/madsmtm/objc2"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:objc2-core-location@0.3.2:c19b7c6f923b580a",
-      "name": "objc2-core-location",
-      "version": "0.3.2",
-      "licenses": [
-        {
-          "expression": "Zlib OR Apache-2.0 OR MIT"
-        }
-      ],
-      "purl": "pkg:cargo/objc2-core-location@0.3.2",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Zlib"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/madsmtm/objc2"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:objc2-core-media@0.3.2:c19b7c6f923b580a",
-      "name": "objc2-core-media",
-      "version": "0.3.2",
-      "licenses": [
-        {
-          "expression": "Zlib OR Apache-2.0 OR MIT"
-        }
-      ],
-      "purl": "pkg:cargo/objc2-core-media@0.3.2",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -18917,15 +18197,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:objc2-screen-capture-kit@0.3.2:c19b7c6f923b580a",
-      "name": "objc2-screen-capture-kit",
+      "bom-ref": "cargo:objc2-security@0.3.2:c19b7c6f923b580a",
+      "name": "objc2-security",
       "version": "0.3.2",
       "licenses": [
         {
           "expression": "Zlib OR Apache-2.0 OR MIT"
         }
       ],
-      "purl": "pkg:cargo/objc2-screen-capture-kit@0.3.2",
+      "purl": "pkg:cargo/objc2-security@0.3.2",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -21072,42 +20352,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/EmbarkStudios/presser"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:prettyplease@0.2.37:c19b7c6f923b580a",
-      "name": "prettyplease",
-      "version": "0.2.37",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/prettyplease@0.2.37",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/dtolnay/prettyplease"
         }
       ]
     },
@@ -25865,42 +25109,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:sharded-slab@0.1.7:c19b7c6f923b580a",
-      "name": "sharded-slab",
-      "version": "0.1.7",
-      "licenses": [
-        {
-          "expression": "MIT"
-        }
-      ],
-      "purl": "pkg:cargo/sharded-slab@0.1.7",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/hawkw/sharded-slab"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:shell-words@1.1.1:c19b7c6f923b580a",
       "name": "shell-words",
       "version": "1.1.1",
@@ -25968,42 +25176,6 @@
         {
           "type": "vcs",
           "url": "https://gitlab.com/ijackson/rust-shellexpand"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:shlex@1.3.0:c19b7c6f923b580a",
-      "name": "shlex",
-      "version": "1.3.0",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/shlex@1.3.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/comex/rust-shlex"
         }
       ]
     },
@@ -26364,6 +25536,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/rusticstuff/simdutf8"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:similar@2.7.0:c19b7c6f923b580a",
+      "name": "similar",
+      "version": "2.7.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/similar@2.7.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mitsuhiko/similar"
         }
       ]
     },
@@ -28673,42 +27881,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:thread_local@1.1.10:c19b7c6f923b580a",
-      "name": "thread_local",
-      "version": "1.1.10",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/thread_local@1.1.10",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/Amanieu/thread_local-rs"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:tiff@0.11.3:c19b7c6f923b580a",
       "name": "tiff",
       "version": "0.11.3",
@@ -29942,78 +29114,6 @@
         }
       ],
       "purl": "pkg:cargo/tracing-core@0.1.36",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/tokio-rs/tracing"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:tracing-log@0.2.0:c19b7c6f923b580a",
-      "name": "tracing-log",
-      "version": "0.2.0",
-      "licenses": [
-        {
-          "expression": "MIT"
-        }
-      ],
-      "purl": "pkg:cargo/tracing-log@0.2.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/tokio-rs/tracing"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:tracing-subscriber@0.3.23:c19b7c6f923b580a",
-      "name": "tracing-subscriber",
-      "version": "0.3.23",
-      "licenses": [
-        {
-          "expression": "MIT"
-        }
-      ],
-      "purl": "pkg:cargo/tracing-subscriber@0.3.23",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -32268,42 +31368,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/rust-av/v_frame"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:valuable@0.1.1:c19b7c6f923b580a",
-      "name": "valuable",
-      "version": "0.1.1",
-      "licenses": [
-        {
-          "expression": "MIT"
-        }
-      ],
-      "purl": "pkg:cargo/valuable@0.1.1",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/tokio-rs/valuable"
         }
       ]
     },
@@ -40809,15 +39873,6 @@
       ]
     },
     {
-      "ref": "cargo:async-compression@0.4.42:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:compression-codecs@0.4.38:c19b7c6f923b580a",
-        "cargo:compression-core@0.4.32:c19b7c6f923b580a",
-        "cargo:futures-io@0.3.34:c19b7c6f923b580a",
-        "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:async-executor@1.14.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:async-task@4.7.1:c19b7c6f923b580a",
@@ -41117,23 +40172,6 @@
       "dependsOn": []
     },
     {
-      "ref": "cargo:bindgen@0.72.1:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
-        "cargo:cexpr@0.6.0:c19b7c6f923b580a",
-        "cargo:clang-sys@1.8.1:c19b7c6f923b580a",
-        "cargo:itertools@0.13.0:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:prettyplease@0.2.37:c19b7c6f923b580a",
-        "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
-        "cargo:quote@1.0.46:c19b7c6f923b580a",
-        "cargo:regex@1.12.4:c19b7c6f923b580a",
-        "cargo:rustc-hash@2.1.2:c19b7c6f923b580a",
-        "cargo:shlex@1.3.0:c19b7c6f923b580a",
-        "cargo:syn@2.0.118:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:bit-set@0.8.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bit-vec@0.8.0:c19b7c6f923b580a"
@@ -41229,6 +40267,7 @@
       "ref": "cargo:bstr@1.12.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:memchr@2.8.2:c19b7c6f923b580a",
+        "cargo:regex-automata@0.4.14:c19b7c6f923b580a",
         "cargo:serde_core@1.0.228:c19b7c6f923b580a"
       ]
     },
@@ -41351,12 +40390,6 @@
       ]
     },
     {
-      "ref": "cargo:cexpr@0.6.0:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:nom@7.1.3:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:cfg-expr@0.15.8:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:smallvec@1.15.2:c19b7c6f923b580a",
@@ -41370,12 +40403,6 @@
     {
       "ref": "cargo:cfg_aliases@0.2.1:c19b7c6f923b580a",
       "dependsOn": []
-    },
-    {
-      "ref": "cargo:cgl@0.3.2:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:libc@0.2.189:c19b7c6f923b580a"
-      ]
     },
     {
       "ref": "cargo:chacha20@0.9.1:c19b7c6f923b580a",
@@ -41412,14 +40439,6 @@
         "cargo:crypto-common@0.1.7:c19b7c6f923b580a",
         "cargo:inout@0.1.4:c19b7c6f923b580a",
         "cargo:zeroize@1.9.0:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:clang-sys@1.8.1:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:glob@0.3.3:c19b7c6f923b580a",
-        "cargo:libc@0.2.189:c19b7c6f923b580a",
-        "cargo:libloading@0.8.9:c19b7c6f923b580a"
       ]
     },
     {
@@ -41514,19 +40533,6 @@
         "cargo:ryu@1.0.23:c19b7c6f923b580a",
         "cargo:static_assertions@1.1.0:c19b7c6f923b580a"
       ]
-    },
-    {
-      "ref": "cargo:compression-codecs@0.4.38:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:bzip2@0.6.1:c19b7c6f923b580a",
-        "cargo:compression-core@0.4.32:c19b7c6f923b580a",
-        "cargo:flate2@1.1.9:c19b7c6f923b580a",
-        "cargo:memchr@2.8.2:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:compression-core@0.4.32:c19b7c6f923b580a",
-      "dependsOn": []
     },
     {
       "ref": "cargo:concurrent-queue@2.5.0:c19b7c6f923b580a",
@@ -41627,16 +40633,6 @@
       ]
     },
     {
-      "ref": "cargo:core-graphics2@0.5.2:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
-        "cargo:block@0.1.6:c19b7c6f923b580a",
-        "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
-        "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.189:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:core-graphics@0.23.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bitflags@1.3.2:c19b7c6f923b580a",
@@ -41663,17 +40659,6 @@
         "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
         "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
         "cargo:libc@0.2.189:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:core-video@0.5.2:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:block@0.1.6:c19b7c6f923b580a",
-        "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
-        "cargo:core-graphics2@0.5.2:c19b7c6f923b580a",
-        "cargo:io-surface@0.16.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.189:c19b7c6f923b580a",
-        "cargo:metal@0.33.0:c19b7c6f923b580a"
       ]
     },
     {
@@ -42243,9 +41228,7 @@
     },
     {
       "ref": "cargo:fastrand@2.4.1:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:getrandom@0.3.4:c19b7c6f923b580a"
-      ]
+      "dependsOn": []
     },
     {
       "ref": "cargo:fax@0.2.7:c19b7c6f923b580a",
@@ -42320,7 +41303,6 @@
     {
       "ref": "cargo:flume@0.12.0:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:fastrand@2.4.1:c19b7c6f923b580a",
         "cargo:futures-core@0.3.34:c19b7c6f923b580a",
         "cargo:futures-sink@0.3.34:c19b7c6f923b580a",
         "cargo:spin@0.9.9:c19b7c6f923b580a"
@@ -42760,7 +41742,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-base@0.7.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-base@0.7.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:aho-corasick@1.1.4:c19b7c6f923b580a",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
@@ -42769,9 +41751,9 @@
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:data-url@0.3.2:c19b7c6f923b580a",
         "cargo:futures@0.3.34:c19b7c6f923b580a",
-        "cargo:gpui-pre-macros@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-sum-tree@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-pre-macros@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-sum-tree@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:html5ever@0.27.0:c19b7c6f923b580a",
         "cargo:instant@0.1.13:c19b7c6f923b580a",
         "cargo:itertools@0.13.0:c19b7c6f923b580a",
@@ -42807,18 +41789,18 @@
       ]
     },
     {
-      "ref": "cargo:gpui-component@0.7.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-component@0.7.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:core-text@21.0.0:c19b7c6f923b580a",
         "cargo:enum-iterator@2.3.0:c19b7c6f923b580a",
-        "cargo:gpui-base@0.7.1:c19b7c6f923b580a",
+        "cargo:gpui-base@0.7.3:c19b7c6f923b580a",
         "cargo:gpui-component-macros@0.7.1:c19b7c6f923b580a",
-        "cargo:gpui-kit-assets@0.7.1:c19b7c6f923b580a",
-        "cargo:gpui-pre-macros@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-sum-tree@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-kit-assets@0.7.3:c19b7c6f923b580a",
+        "cargo:gpui-pre-macros@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-sum-tree@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:instant@0.1.13:c19b7c6f923b580a",
         "cargo:itertools@0.13.0:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
@@ -42840,6 +41822,7 @@
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:serde_repr@0.1.20:c19b7c6f923b580a",
+        "cargo:similar@2.7.0:c19b7c6f923b580a",
         "cargo:smallvec@1.15.2:c19b7c6f923b580a",
         "cargo:smol@2.0.2:c19b7c6f923b580a",
         "cargo:tracing@0.1.44:c19b7c6f923b580a",
@@ -42868,15 +41851,17 @@
         "cargo:tree-sitter-yaml@0.7.2:c19b7c6f923b580a",
         "cargo:tree-sitter-zig@1.1.2:c19b7c6f923b580a",
         "cargo:tree-sitter@0.26.13:c19b7c6f923b580a",
+        "cargo:unicode-segmentation@1.13.3:c19b7c6f923b580a",
+        "cargo:unicode-width@0.2.2:c19b7c6f923b580a",
         "cargo:uuid@1.23.3:c19b7c6f923b580a",
         "cargo:windows@0.58.0:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:gpui-fps@0.7.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-fps@0.7.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:objc2-core-foundation@0.3.2:c19b7c6f923b580a",
         "cargo:objc2-io-kit@0.3.2:c19b7c6f923b580a",
@@ -42888,12 +41873,12 @@
       ]
     },
     {
-      "ref": "cargo:gpui-kit-assets@0.7.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-kit-assets@0.7.3:c19b7c6f923b580a",
       "dependsOn": [
         "asset:gpui-kit-lucide-icons:efafb5ab9a148d12",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:gpui-pre-reqwest@0.12.15:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:rust-embed@8.12.0:c19b7c6f923b580a",
         "cargo:wasm-bindgen-futures@0.4.75:c19b7c6f923b580a",
@@ -42901,42 +41886,54 @@
       ]
     },
     {
-      "ref": "cargo:gpui-pre-apple@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-apple@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:async-task@4.7.1:c19b7c6f923b580a",
         "cargo:block2@0.6.2:c19b7c6f923b580a",
         "cargo:cbindgen@0.28.0:c19b7c6f923b580a",
+        "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
         "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
         "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
-        "cargo:core-video@0.5.2:c19b7c6f923b580a",
+        "cargo:core-text@21.0.0:c19b7c6f923b580a",
         "cargo:derive_more@2.1.1:c19b7c6f923b580a",
         "cargo:dispatch2@0.3.1:c19b7c6f923b580a",
         "cargo:etagere@0.2.15:c19b7c6f923b580a",
         "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
-        "cargo:gpui-pre-util@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+        "cargo:futures@0.3.34:c19b7c6f923b580a",
+        "cargo:gpui-pre-collections@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-util@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:mach2@0.5.0:c19b7c6f923b580a",
+        "cargo:mach2@0.6.0:c19b7c6f923b580a",
         "cargo:metal@0.33.0:c19b7c6f923b580a",
+        "cargo:objc2-core-foundation@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2-core-text@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2-core-video@0.3.2:c19b7c6f923b580a",
         "cargo:objc2-foundation@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2-metal@0.3.2:c19b7c6f923b580a",
         "cargo:objc2-quartz-core@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2-security@0.3.2:c19b7c6f923b580a",
         "cargo:objc2@0.6.4:c19b7c6f923b580a",
-        "cargo:parking_lot@0.12.5:c19b7c6f923b580a"
+        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
+        "cargo:pathfinder_geometry@0.5.1:c19b7c6f923b580a",
+        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
+        "cargo:thiserror@2.0.18:c19b7c6f923b580a",
+        "cargo:zed-font-kit@0.14.1-zed:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:gpui-pre-collections@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-collections@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:gpui-pre-util@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-pre-util@0.3.9:c19b7c6f923b580a",
         "cargo:indexmap@2.14.0:c19b7c6f923b580a",
         "cargo:rustc-hash@2.1.2:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:gpui-pre-derive-refineable@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-derive-refineable@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
         "cargo:quote@1.0.46:c19b7c6f923b580a",
@@ -42944,12 +41941,10 @@
       ]
     },
     {
-      "ref": "cargo:gpui-pre-http-client@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-http-client@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:async-compression@0.4.42:c19b7c6f923b580a",
         "cargo:bytes@1.12.0:c19b7c6f923b580a",
-        "cargo:derive_more@2.1.1:c19b7c6f923b580a",
         "cargo:futures@0.3.34:c19b7c6f923b580a",
         "cargo:http-body@1.0.1:c19b7c6f923b580a",
         "cargo:http@1.4.2:c19b7c6f923b580a",
@@ -42962,7 +41957,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-pre-linux@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-linux@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:accesskit@0.24.1:c19b7c6f923b580a",
         "cargo:accesskit_unix@0.22.1:c19b7c6f923b580a",
@@ -42974,11 +41969,11 @@
         "cargo:calloop@0.14.4:c19b7c6f923b580a",
         "cargo:filedescriptor@0.8.3:c19b7c6f923b580a",
         "cargo:futures@0.3.34:c19b7c6f923b580a",
-        "cargo:gpui-pre-collections@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-http-client@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-util@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-wgpu@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-pre-collections@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-http-client@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-util@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-wgpu@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:notify-rust@4.18.0:c19b7c6f923b580a",
@@ -43004,7 +41999,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-pre-macos@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-macos@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:accesskit@0.24.1:c19b7c6f923b580a",
         "cargo:accesskit_macos@0.26.3:c19b7c6f923b580a",
@@ -43014,40 +42009,34 @@
         "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
         "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
         "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
-        "cargo:core-text@21.0.0:c19b7c6f923b580a",
-        "cargo:core-video@0.5.2:c19b7c6f923b580a",
         "cargo:ctor@1.0.13:c19b7c6f923b580a",
         "cargo:dispatch2@0.3.1:c19b7c6f923b580a",
         "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
         "cargo:futures@0.3.34:c19b7c6f923b580a",
-        "cargo:gpui-pre-apple@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-collections@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-scheduler@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-util@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-pre-apple@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-collections@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-scheduler@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-util@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:itertools@0.14.0:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:objc2-app-kit@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2-core-graphics@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2-core-media@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2-core-video@0.3.2:c19b7c6f923b580a",
         "cargo:objc2-foundation@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2-screen-capture-kit@0.3.2:c19b7c6f923b580a",
         "cargo:objc2-user-notifications@0.3.2:c19b7c6f923b580a",
         "cargo:objc2@0.6.4:c19b7c6f923b580a",
         "cargo:objc@0.2.7:c19b7c6f923b580a",
         "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
-        "cargo:pathfinder_geometry@0.5.1:c19b7c6f923b580a",
         "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
         "cargo:semver@1.0.28:c19b7c6f923b580a",
         "cargo:smallvec@1.15.2:c19b7c6f923b580a",
         "cargo:strum@0.28.0:c19b7c6f923b580a",
-        "cargo:uuid@1.23.3:c19b7c6f923b580a",
-        "cargo:zed-font-kit@0.14.1-zed:c19b7c6f923b580a"
+        "cargo:uuid@1.23.3:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:gpui-pre-macros@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-macros@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:heck@0.5.0:c19b7c6f923b580a",
         "cargo:proc-macro-crate@3.5.0:c19b7c6f923b580a",
@@ -43057,29 +42046,21 @@
       ]
     },
     {
-      "ref": "cargo:gpui-pre-perf@0.3.8:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:gpui-pre-collections@0.3.8:c19b7c6f923b580a",
-        "cargo:serde@1.0.228:c19b7c6f923b580a",
-        "cargo:serde_json@1.0.150:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:gpui-pre-platform@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-platform@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:console_error_panic_hook@0.1.7:c19b7c6f923b580a",
-        "cargo:gpui-pre-linux@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-macos@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-web@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-windows@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.8:c19b7c6f923b580a"
+        "cargo:gpui-pre-linux@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-macos@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-web@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-windows@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.9:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:gpui-pre-refineable@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-refineable@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:gpui-pre-derive-refineable@0.3.8:c19b7c6f923b580a"
+        "cargo:gpui-pre-derive-refineable@0.3.9:c19b7c6f923b580a"
       ]
     },
     {
@@ -43130,7 +42111,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-pre-scheduler@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-scheduler@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:async-task@4.7.1:c19b7c6f923b580a",
         "cargo:backtrace@0.3.76:c19b7c6f923b580a",
@@ -43144,7 +42125,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-pre-shared-string@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-shared-string@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:schemars@1.2.1:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
@@ -43152,25 +42133,16 @@
       ]
     },
     {
-      "ref": "cargo:gpui-pre-sum-tree@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-sum-tree@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:gpui-pre-ztracing@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-pre-ztracing@0.3.9:c19b7c6f923b580a",
         "cargo:heapless@0.9.3:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:rayon@1.12.0:c19b7c6f923b580a",
         "cargo:tracing@0.1.44:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:gpui-pre-util-macros@0.3.8:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:gpui-pre-perf@0.3.8:c19b7c6f923b580a",
-        "cargo:quote@1.0.46:c19b7c6f923b580a",
-        "cargo:syn@2.0.118:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:gpui-pre-util@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-util@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
@@ -43178,15 +42150,16 @@
       ]
     },
     {
-      "ref": "cargo:gpui-pre-web@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-web@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:async-channel@2.5.0:c19b7c6f923b580a",
         "cargo:console_error_panic_hook@0.1.7:c19b7c6f923b580a",
         "cargo:futures@0.3.34:c19b7c6f923b580a",
-        "cargo:gpui-pre-http-client@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-scheduler@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-wgpu@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-pre-http-client@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-scheduler@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-wgpu@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:js-sys@0.3.102:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
@@ -43204,15 +42177,15 @@
       ]
     },
     {
-      "ref": "cargo:gpui-pre-wgpu@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-wgpu@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:bytemuck@1.25.0:c19b7c6f923b580a",
         "cargo:cosmic-text@0.19.0:c19b7c6f923b580a",
         "cargo:etagere@0.2.15:c19b7c6f923b580a",
-        "cargo:gpui-pre-collections@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-util@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-pre-collections@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-util@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:itertools@0.14.0:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
@@ -43228,7 +42201,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-pre-windows@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-windows@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:accesskit@0.24.1:c19b7c6f923b580a",
         "cargo:accesskit_windows@0.34.0:c19b7c6f923b580a",
@@ -43236,10 +42209,10 @@
         "cargo:dunce@1.0.5:c19b7c6f923b580a",
         "cargo:etagere@0.2.15:c19b7c6f923b580a",
         "cargo:futures@0.3.34:c19b7c6f923b580a",
-        "cargo:gpui-pre-collections@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-scheduler@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-util@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-pre-collections@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-scheduler@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-util@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:itertools@0.14.0:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
@@ -43255,39 +42228,26 @@
       ]
     },
     {
-      "ref": "cargo:gpui-pre-zlog@0.3.8:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:chrono@0.4.45:c19b7c6f923b580a",
-        "cargo:gpui-pre-collections@0.3.8:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:gpui-pre-ztracing-macro@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-ztracing-macro@0.3.9:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
-      "ref": "cargo:gpui-pre-ztracing@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre-ztracing@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:gpui-pre-zlog@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-ztracing-macro@0.3.8:c19b7c6f923b580a",
-        "cargo:tracing-subscriber@0.3.23:c19b7c6f923b580a",
+        "cargo:gpui-pre-ztracing-macro@0.3.9:c19b7c6f923b580a",
         "cargo:tracing@0.1.44:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+      "ref": "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:accesskit@0.24.1:c19b7c6f923b580a",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:async-channel@2.5.0:c19b7c6f923b580a",
         "cargo:async-task@4.7.1:c19b7c6f923b580a",
         "cargo:backtrace@0.3.76:c19b7c6f923b580a",
-        "cargo:bindgen@0.72.1:c19b7c6f923b580a",
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
-        "cargo:core-video@0.5.2:c19b7c6f923b580a",
         "cargo:ctor@1.0.13:c19b7c6f923b580a",
         "cargo:derive_more@2.1.1:c19b7c6f923b580a",
         "cargo:embed-resource@3.0.9:c19b7c6f923b580a",
@@ -43295,15 +42255,14 @@
         "cargo:futures-concurrency@7.7.1:c19b7c6f923b580a",
         "cargo:futures@0.3.34:c19b7c6f923b580a",
         "cargo:getrandom@0.3.4:c19b7c6f923b580a",
-        "cargo:gpui-pre-collections@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-http-client@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-macros@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-refineable@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-scheduler@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-shared-string@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-sum-tree@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-util-macros@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-util@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-pre-collections@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-http-client@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-macros@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-refineable@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-scheduler@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-shared-string@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-sum-tree@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-util@0.3.9:c19b7c6f923b580a",
         "cargo:hdrhistogram@7.6.0:c19b7c6f923b580a",
         "cargo:heapless@0.9.3:c19b7c6f923b580a",
         "cargo:image@0.25.10:c19b7c6f923b580a",
@@ -43343,7 +42302,6 @@
         "cargo:waker-fn@1.2.0:c19b7c6f923b580a",
         "cargo:web-time@1.1.0:c19b7c6f923b580a",
         "cargo:windows@0.62.2:c19b7c6f923b580a",
-        "cargo:zed-font-kit@0.14.1-zed:c19b7c6f923b580a",
         "cargo:zed-scap@0.0.8-zed:c19b7c6f923b580a"
       ]
     },
@@ -43351,8 +42309,8 @@
       "ref": "cargo:gpui-tokio@0.1.0-rc.7:a9a8ee941163297c",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:gpui-pre-util@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-pre-util@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a"
       ]
     },
@@ -43884,15 +42842,6 @@
       ]
     },
     {
-      "ref": "cargo:io-surface@0.16.1:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:cgl@0.3.2:c19b7c6f923b580a",
-        "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
-        "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
-        "cargo:leaky-cow@0.1.1:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:ipnet@2.12.0:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -44065,16 +43014,6 @@
     {
       "ref": "cargo:lazy_static@1.5.0:c19b7c6f923b580a",
       "dependsOn": []
-    },
-    {
-      "ref": "cargo:leak@0.1.2:c19b7c6f923b580a",
-      "dependsOn": []
-    },
-    {
-      "ref": "cargo:leaky-cow@0.1.1:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:leak@0.1.2:c19b7c6f923b580a"
-      ]
     },
     {
       "ref": "cargo:lebe@0.5.3:c19b7c6f923b580a",
@@ -44280,10 +43219,8 @@
       "dependsOn": []
     },
     {
-      "ref": "cargo:mach2@0.5.0:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:libc@0.2.189:c19b7c6f923b580a"
-      ]
+      "ref": "cargo:mach2@0.6.0:c19b7c6f923b580a",
+      "dependsOn": []
     },
     {
       "ref": "cargo:malloc_buf@0.0.6:c19b7c6f923b580a",
@@ -44563,12 +43500,6 @@
       ]
     },
     {
-      "ref": "cargo:nu-ansi-term@0.50.3:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:windows-sys@0.61.2:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:num-bigint-dig@0.9.1:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:libm@0.2.16:c19b7c6f923b580a",
@@ -44713,22 +43644,6 @@
       ]
     },
     {
-      "ref": "cargo:objc2-core-audio-types@0.3.2:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
-        "cargo:objc2@0.6.4:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:objc2-core-audio@0.3.2:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:dispatch2@0.3.1:c19b7c6f923b580a",
-        "cargo:objc2-core-audio-types@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2-core-foundation@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2@0.6.4:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:objc2-core-data@0.2.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
@@ -44780,25 +43695,6 @@
       ]
     },
     {
-      "ref": "cargo:objc2-core-location@0.3.2:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:objc2-foundation@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2@0.6.4:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:objc2-core-media@0.3.2:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
-        "cargo:dispatch2@0.3.1:c19b7c6f923b580a",
-        "cargo:objc2-core-audio-types@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2-core-audio@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2-core-foundation@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2-core-video@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2@0.6.4:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:objc2-core-text@0.3.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
@@ -44814,6 +43710,7 @@
         "cargo:objc2-core-foundation@0.3.2:c19b7c6f923b580a",
         "cargo:objc2-core-graphics@0.3.2:c19b7c6f923b580a",
         "cargo:objc2-io-surface@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2-metal@0.3.2:c19b7c6f923b580a",
         "cargo:objc2@0.6.4:c19b7c6f923b580a"
       ]
     },
@@ -44894,14 +43791,9 @@
       ]
     },
     {
-      "ref": "cargo:objc2-screen-capture-kit@0.3.2:c19b7c6f923b580a",
+      "ref": "cargo:objc2-security@0.3.2:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:block2@0.6.2:c19b7c6f923b580a",
-        "cargo:dispatch2@0.3.1:c19b7c6f923b580a",
-        "cargo:objc2-core-graphics@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2-core-media@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2-foundation@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2@0.6.4:c19b7c6f923b580a"
+        "cargo:objc2-core-foundation@0.3.2:c19b7c6f923b580a"
       ]
     },
     {
@@ -44909,7 +43801,6 @@
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:block2@0.6.2:c19b7c6f923b580a",
-        "cargo:objc2-core-location@0.3.2:c19b7c6f923b580a",
         "cargo:objc2-foundation@0.3.2:c19b7c6f923b580a",
         "cargo:objc2@0.6.4:c19b7c6f923b580a"
       ]
@@ -45314,8 +44205,6 @@
       "dependsOn": [
         "cargo:atomic@0.5.3:c19b7c6f923b580a",
         "cargo:crossbeam-queue@0.3.13:c19b7c6f923b580a",
-        "cargo:futures@0.3.34:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
         "cargo:pin-project@1.1.13:c19b7c6f923b580a",
         "cargo:pollster@0.2.5:c19b7c6f923b580a",
@@ -45346,13 +44235,6 @@
     {
       "ref": "cargo:presser@0.3.1:c19b7c6f923b580a",
       "dependsOn": []
-    },
-    {
-      "ref": "cargo:prettyplease@0.2.37:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
-        "cargo:syn@2.0.118:c19b7c6f923b580a"
-      ]
     },
     {
       "ref": "cargo:proc-macro-crate@1.3.1:c19b7c6f923b580a",
@@ -46494,12 +45376,6 @@
       ]
     },
     {
-      "ref": "cargo:sharded-slab@0.1.7:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:lazy_static@1.5.0:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:shell-words@1.1.1:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -46508,10 +45384,6 @@
       "dependsOn": [
         "cargo:dirs@6.0.0:c19b7c6f923b580a"
       ]
-    },
-    {
-      "ref": "cargo:shlex@1.3.0:c19b7c6f923b580a",
-      "dependsOn": []
     },
     {
       "ref": "cargo:shlex@2.0.1:c19b7c6f923b580a",
@@ -46572,6 +45444,13 @@
     {
       "ref": "cargo:simdutf8@0.1.5:c19b7c6f923b580a",
       "dependsOn": []
+    },
+    {
+      "ref": "cargo:similar@2.7.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:bstr@1.12.3:c19b7c6f923b580a",
+        "cargo:unicode-segmentation@1.13.3:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:similar@3.1.1:c19b7c6f923b580a",
@@ -47015,12 +45894,6 @@
       ]
     },
     {
-      "ref": "cargo:thread_local@1.1.10:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:cfg-if@1.0.4:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:tiff@0.11.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:fax@0.2.7:c19b7c6f923b580a",
@@ -47298,27 +46171,7 @@
     {
       "ref": "cargo:tracing-core@0.1.36:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:once_cell@1.21.4:c19b7c6f923b580a",
-        "cargo:valuable@0.1.1:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:tracing-log@0.2.0:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:once_cell@1.21.4:c19b7c6f923b580a",
-        "cargo:tracing-core@0.1.36:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:tracing-subscriber@0.3.23:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:nu-ansi-term@0.50.3:c19b7c6f923b580a",
-        "cargo:sharded-slab@0.1.7:c19b7c6f923b580a",
-        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
-        "cargo:thread_local@1.1.10:c19b7c6f923b580a",
-        "cargo:tracing-core@0.1.36:c19b7c6f923b580a",
-        "cargo:tracing-log@0.2.0:c19b7c6f923b580a"
+        "cargo:once_cell@1.21.4:c19b7c6f923b580a"
       ]
     },
     {
@@ -47768,10 +46621,6 @@
       ]
     },
     {
-      "ref": "cargo:valuable@0.1.1:c19b7c6f923b580a",
-      "dependsOn": []
-    },
-    {
       "ref": "cargo:value-bag-serde1@1.13.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:erased-serde@0.4.10:c19b7c6f923b580a",
@@ -47875,7 +46724,8 @@
         "cargo:thiserror@2.0.18:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a",
         "cargo:tracing@0.1.44:c19b7c6f923b580a",
-        "cargo:url@2.5.8:c19b7c6f923b580a"
+        "cargo:url@2.5.8:c19b7c6f923b580a",
+        "cargo:webpki-root-certs@1.0.8:c19b7c6f923b580a"
       ]
     },
     {
@@ -48087,13 +46937,13 @@
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:embed-resource@3.0.9:c19b7c6f923b580a",
         "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
-        "cargo:gpui-base@0.7.1:c19b7c6f923b580a",
-        "cargo:gpui-component@0.7.1:c19b7c6f923b580a",
-        "cargo:gpui-fps@0.7.1:c19b7c6f923b580a",
-        "cargo:gpui-kit-assets@0.7.1:c19b7c6f923b580a",
-        "cargo:gpui-pre-platform@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre-wgpu@0.3.8:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-base@0.7.3:c19b7c6f923b580a",
+        "cargo:gpui-component@0.7.3:c19b7c6f923b580a",
+        "cargo:gpui-fps@0.7.3:c19b7c6f923b580a",
+        "cargo:gpui-kit-assets@0.7.3:c19b7c6f923b580a",
+        "cargo:gpui-pre-platform@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-wgpu@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:gpui-tokio@0.1.0-rc.7:a9a8ee941163297c",
         "cargo:gtk@0.18.2:c19b7c6f923b580a",
         "cargo:image@0.25.10:c19b7c6f923b580a",
@@ -48281,6 +47131,7 @@
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:crossterm@0.29.0:c19b7c6f923b580a",
         "cargo:html5ever@0.27.0:c19b7c6f923b580a",
+        "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:markup5ever_rcdom@0.3.0:c19b7c6f923b580a",
         "cargo:pulldown-cmark@0.13.0:c19b7c6f923b580a",
         "cargo:qrcode@0.14.1:c19b7c6f923b580a",
@@ -48310,8 +47161,8 @@
         "asset:vibex-mobile-application-icons:b690a33c976cf781",
         "asset:vibex-mobile-brand-marks:84a77e160e305979",
         "asset:vibex-mobile-native-icons:4af6d4773e1b878b",
-        "cargo:gpui-component@0.7.1:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.8:c19b7c6f923b580a",
+        "cargo:gpui-component@0.7.3:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:markdown@1.0.0:c19b7c6f923b580a",
         "cargo:percent-encoding@2.3.2:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",

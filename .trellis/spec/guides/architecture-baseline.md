@@ -79,8 +79,18 @@ drop approval/error states.
 It builds its platform through `apps/mobile/src/platform.rs`, which wraps the
 pinned `gpui-pre-mobile` platform crate:
 
-- Android enters through `android_main`, initializes the `gpui-pre-mobile`
-  platform, and is packaged as a NativeActivity Gradle application.
+- Android enters through `GpuiHostActivity`, a plain `Activity` that owns a
+  `SurfaceView` and hands the surface, input, insets, and lifecycle to
+  `android_host.rs`. `gpui-pre-mobile`'s host entry owns a process-lived render
+  thread, so an Activity the system reclaims is recreated and re-attaches to the
+  same GPUI window instead of trying to build a second platform. `android_main`
+  is exported but never runs: the manifest declares no NativeActivity and no
+  `android.app.lib_name`.
+- The platform keys its windows by a host id the Java host names on every call.
+  Vibex names one constant id, because it shows one fullscreen panel: a
+  recreated Activity returns to the panel it left, with its state, rather than
+  opening a second window. Registering `on_open_window` before the first surface
+  arrives is what builds that window; without it the surface stays undrawn.
 - iOS exports `vibex_mobile_register_app` and `vibex_mobile_set_lifecycle`; the
   Objective-C host in `apps/mobile/ios/Vibex/main.m` enters `UIApplicationMain`,
   registers the root view, drives frames, and forwards lifecycle phases.

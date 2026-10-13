@@ -12,7 +12,10 @@
 //! The host entry owns a **process-lived** render thread instead. This module
 //! is the whole Rust half of that contract: [`GpuiHostActivity`] hands over the
 //! Activity, its surface, input, window insets and lifecycle, and a recreated
-//! Activity simply re-attaches its surface to the same GPUI window.
+//! Activity simply re-attaches its surface to the same GPUI window. The platform
+//! keys that window by a host id the Java side names; Vibex names exactly one,
+//! because it shows exactly one panel, so "the same GPUI window" survives every
+//! Activity instance.
 //!
 //! [`GpuiHostActivity`]: ../../../android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java
 
@@ -56,9 +59,15 @@ pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeStart<'caller
     let Some(data_dir) = launch_dir else {
         return;
     };
-    gpui_mobile::android::host::start_with_assets(MobileAssets, move |cx| {
-        crate::open_root_window(data_dir, cx);
+    // The platform keeps one GPUI window per host id and builds it through this
+    // callback the first time that host's surface arrives — the launch closure
+    // below only registers the assets. Vibex shows a single fullscreen panel, so
+    // the Java host names one constant id: a recreated Activity re-attaches to
+    // the window it left instead of stacking a second one.
+    gpui_mobile::android::host::on_open_window(move |_host, cx| {
+        crate::open_root_window(data_dir.clone(), cx);
     });
+    gpui_mobile::android::host::start_with_assets(MobileAssets, |_cx| {});
 }
 
 /// Points the platform TLS verifier at this Activity's application context.
@@ -80,11 +89,15 @@ fn initialize_android_tls(env: &mut Env<'_>, activity: &JObject<'_>) -> jni::err
     rustls_platform_verifier::android::init_with_env(env, context)
 }
 
-/// Hands a new `Surface` to the render thread.
+/// Hands one Activity's surface to the render thread.
+///
+/// `host` is the constant id the Java host names; the platform re-attaches that
+/// host's existing window when a recreated Activity presents a new surface.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeSurfaceCreated<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
+    host: jlong,
     surface: JObject<'caller>,
     scale: jfloat,
 ) {
@@ -100,7 +113,9 @@ pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeSurfaceCreate
                 )
             };
             match window {
-                Some(window) => gpui_mobile::android::host::surface_created(window, scale),
+                Some(window) => {
+                    gpui_mobile::android::host::surface_created(host.max(0) as u64, window, scale)
+                }
                 None => log::warn!("nativeSurfaceCreated: the Surface has no native window"),
             }
             Ok(())
@@ -113,10 +128,11 @@ pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeSurfaceCreate
 pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeSurfaceDestroyed<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
+    host: jlong,
 ) {
     unowned_env
         .with_env(|_| -> jni::errors::Result<()> {
-            gpui_mobile::android::host::surface_destroyed();
+            gpui_mobile::android::host::surface_destroyed(host.max(0) as u64);
             Ok(())
         })
         .resolve::<jni::errors::LogErrorAndDefault>();
@@ -127,16 +143,18 @@ pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeSurfaceDestro
 pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeOnAppLifecycle<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
+    host: jlong,
     foreground: jboolean,
 ) {
     unowned_env
         .with_env(|_| -> jni::errors::Result<()> {
+            let host = host.max(0) as u64;
             if foreground {
-                gpui_mobile::android::host::resumed();
+                gpui_mobile::android::host::resumed(host);
                 platform::notify_lifecycle(AppLifecyclePhase::Active);
             } else {
                 platform::notify_lifecycle(AppLifecyclePhase::Background);
-                gpui_mobile::android::host::paused();
+                gpui_mobile::android::host::paused(host);
             }
             Ok(())
         })

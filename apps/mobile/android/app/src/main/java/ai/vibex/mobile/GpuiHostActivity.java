@@ -100,6 +100,21 @@ public final class GpuiHostActivity extends Activity {
     private static final String NOTIFICATION_PERMISSION_REQUESTED = "permission_requested";
     private static final String VIBEX_SERVICE_TYPE = "_vibex._tcp.";
     private static final String UPDATE_FILE_AUTHORITY_SUFFIX = ".updates";
+    /**
+     * The host id every native call carries.
+     *
+     * <p>{@code gpui-pre-mobile} keeps one GPUI window per host id and builds it
+     * through {@code on_open_window} the first time that id's surface arrives.
+     * Vibex shows a single fullscreen panel, so it names one constant id: a
+     * recreated Activity re-attaches the surface to the window it left instead
+     * of opening a second one, and the panel keeps its state.
+     *
+     * <p>The id is never retired through {@code host_destroyed}. The foreground
+     * connection service keeps the process alive after the Activity finishes, so
+     * holding the window is what lets a later launch return to the panel as the
+     * user left it rather than rebuilding it from scratch.
+     */
+    private static final long HOST_ID = 1L;
 
     static {
         // A plain Activity has no `android.app.lib_name` meta-data to load the
@@ -115,9 +130,9 @@ public final class GpuiHostActivity extends Activity {
     private final Map<String, NsdManager.ResolveListener> pendingResolutions = new HashMap<>();
 
     private static native void nativeStart(Activity activity, String dataDir);
-    private static native void nativeSurfaceCreated(Surface surface, float scale);
-    private static native void nativeSurfaceDestroyed();
-    private static native void nativeOnAppLifecycle(boolean foreground);
+    private static native void nativeSurfaceCreated(long hostId, Surface surface, float scale);
+    private static native void nativeSurfaceDestroyed(long hostId);
+    private static native void nativeOnAppLifecycle(long hostId, boolean foreground);
     private static native void nativeInsets(int left, int top, int right, int bottom);
     private static native void nativeKeyboardState(boolean visible, float height);
     private static native void nativeIme(long session, int kind, String text, int start, int end);
@@ -154,7 +169,7 @@ public final class GpuiHostActivity extends Activity {
 
             @Override
             public void surfaceDestroyed(SurfaceHolder holder) {
-                nativeSurfaceDestroyed();
+                nativeSurfaceDestroyed(HOST_ID);
             }
         });
         setContentView(surfaceView);
@@ -181,12 +196,12 @@ public final class GpuiHostActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        nativeOnAppLifecycle(true);
+        nativeOnAppLifecycle(HOST_ID, true);
     }
 
     @Override
     protected void onPause() {
-        nativeOnAppLifecycle(false);
+        nativeOnAppLifecycle(HOST_ID, false);
         super.onPause();
     }
 
@@ -366,7 +381,7 @@ public final class GpuiHostActivity extends Activity {
         if (surface == null || !surface.isValid()) {
             return;
         }
-        nativeSurfaceCreated(surface, getResources().getDisplayMetrics().density);
+        nativeSurfaceCreated(HOST_ID, surface, getResources().getDisplayMetrics().density);
     }
 
     /** Reports the window insets GPUI has to lay out around. */

@@ -81,8 +81,8 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(!workspace.includes('"apps/mobile-wasm"'), "legacy_mobile_workspace_member_present");
   assert(manifest.includes('crate-type = ["cdylib", "staticlib", "rlib"]'), "native_mobile_crate_types_invalid");
   assert(manifest.includes('gpui-mobile = { package = "gpui-pre-mobile"'), "mobile_gpui_pre_mobile_dependency_missing");
-  assert(manifest.includes("Bombatomica64/gpui-mobile"), "mobile_gpui_pre_mobile_source_missing");
-  assert(manifest.includes('rev = "133337130c08ebc2db0622549b9fb1137b46638f"'), "mobile_gpui_pre_mobile_revision_missing");
+  assert(manifest.includes("longbridge/gpui-mobile"), "mobile_gpui_pre_mobile_source_missing");
+  assert(manifest.includes('rev = "9a2cf8bc4c2a7ab09e016cc6adcb8c3792b9d9cd"'), "mobile_gpui_pre_mobile_revision_missing");
   assert(!manifest.includes("vendor/zed"), "mobile_vendor_zed_dependency_present");
   assert(manifest.includes('rustls-platform-verifier = "0.7"'), "android_tls_platform_verifier_dependency_missing");
   assert(workspace.includes('webpki-root-certs = "1"'), "android_webpki_root_workspace_dependency_missing");
@@ -115,6 +115,10 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   // app flashed closed until the process was killed. The host entry owns a
   // process-lived render thread instead and must stay the only Android entry.
   assert(androidHost.includes("gpui_mobile::android::host::start_with_assets"), "android_host_entry_missing");
+  // The platform builds a host's window through `on_open_window`, and only when
+  // that callback is registered before the first surface arrives. Without it the
+  // surface opens a native window that GPUI never draws into.
+  assert(androidHost.includes("gpui_mobile::android::host::on_open_window"), "android_host_open_window_missing");
   assert(androidHost.includes("gpui_mobile::android::jni::set_host_activity"), "android_host_activity_bridge_missing");
   assert(
     androidHost.includes("Java_ai_vibex_mobile_GpuiHostActivity_nativeStart"),
@@ -482,6 +486,12 @@ function runSelfTest() {
     "gpui_mobile::android::host::start_with_assets",
     "gpui_mobile::android::jni::init_platform",
     "native_mobile_checker_self_test_accepted_android_host_process_platform_init"
+  );
+  expectRejected(
+    "apps/mobile/src/android_host.rs",
+    "gpui_mobile::android::host::on_open_window",
+    "gpui_mobile::android::host::on_missing_window",
+    "native_mobile_checker_self_test_accepted_missing_android_host_open_window"
   );
   expectRejected(
     "apps/mobile/ios/Vibex/main.m",
