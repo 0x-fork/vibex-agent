@@ -3304,6 +3304,180 @@ mod tests {
         assert!(opened.contains("clickable 1"), "{opened}");
     }
 
+    /// A row's rail is one line down the list: the mark beside a session's
+    /// title and the mark beside what it last did stand in the same column,
+    /// however deep the tree the row hangs in. Drawn before the row's own
+    /// indent instead, a nested row's rail broke in two — the title's mark
+    /// stood under the heading's children and the echo's at the page's edge.
+    #[test]
+    fn a_session_row_draws_one_rail_down_both_its_lines() {
+        let mut app = test_app(100, 24);
+        let project = vibex_core::ProjectId::new();
+        let workspace = vibex_core::WorkspaceId::new();
+        let sessions = (1..=2)
+            .map(|index| vibex_core::AgentSession {
+                id: vibex_core::VibexSessionId::parse(format!("session_rail{index:04}"))
+                    .expect("valid session id"),
+                title: format!("railed {index}"),
+                // One workspace, so the two are rows 1 and 2 under one heading.
+                project_id: project.clone(),
+                workspace_id: workspace.clone(),
+                workspace_root: "/tmp/vibex-rail-workspace".to_string(),
+                workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+                agent_id: vibex_core::AgentId::parse("claude").expect("valid agent id"),
+                state: vibex_core::AgentSessionState::Idle,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: index,
+                updated_at_ms: index,
+                last_message_at_ms: index,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            })
+            .collect::<Vec<_>>();
+        app.agent
+            .apply_sessions(Ok(sessions.clone()))
+            .expect("apply");
+        app.note_session_echo(&conversation_item(
+            &sessions[0].id,
+            1,
+            vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: "Read crates/vibex-tui/src/transcript.rs".to_string(),
+                is_final: true,
+            }),
+        ));
+        app.navigate_to(Page::Sessions);
+        // The arrangement decides which row a session lands on, so the cursor
+        // finds it rather than counting to it.
+        let index = app
+            .sidebar_rows()
+            .iter()
+            .position(|row| row.session_id.as_ref() == Some(&sessions[0].id))
+            .expect("the session is not in the list");
+        app.set_selection(crate::keymap::Scope::Sessions, index);
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::view::render(frame, &mut app))
+            .expect("the session list draws");
+        let buffer = terminal.backend().buffer();
+        let line = |row: u16| -> String {
+            (0..buffer.area.width)
+                .map(|column| {
+                    buffer
+                        .cell((column, row))
+                        .map(|cell| cell.symbol())
+                        .unwrap_or(" ")
+                })
+                .collect()
+        };
+        let echo_row = (0..buffer.area.height)
+            .find(|row| line(*row).contains("transcript.rs"))
+            .expect("the session's echo is not on screen");
+        let title_row = echo_row
+            .checked_sub(1)
+            .expect("the echo is on the page's first line");
+        assert!(
+            line(title_row).contains("railed 1"),
+            "the echo is not the second line of its own row:\n{}\n{}",
+            line(title_row),
+            line(echo_row)
+        );
+        // The row is the cursor's, so its rail is drawn rather than blanked.
+        let bar = crate::glyphs::accent_bar(app.glyph_tier());
+        let mark_column = |row: u16| -> Option<u16> {
+            (0..buffer.area.width).find(|column| {
+                buffer
+                    .cell((*column, row))
+                    .is_some_and(|cell| cell.symbol() == bar)
+            })
+        };
+        let first_column = |row: u16| -> Option<u16> {
+            (0..buffer.area.width).find(|column| {
+                buffer
+                    .cell((*column, row))
+                    .is_some_and(|cell| cell.symbol() != " ")
+            })
+        };
+        let text_column = |row: u16, after: u16| -> Option<u16> {
+            (after + 1..buffer.area.width).find(|column| {
+                buffer
+                    .cell((*column, row))
+                    .is_some_and(|cell| cell.symbol() != " ")
+            })
+        };
+        let mark = mark_column(title_row).expect("the row drew no rail");
+        // The row hangs under a heading, which is what the second line's indent
+        // had to keep: without the nest there is nothing to get wrong. The
+        // heading is found by the name the list gave it, so a sibling row drawn
+        // above this one is not mistaken for it.
+        let rows = app.sidebar_rows();
+        let heading = rows[..index]
+            .iter()
+            .rev()
+            .find(|row| row.kind != vibex_desktop_model::AgentSidebarRowKind::Session)
+            .expect("the session hangs under no heading");
+        let heading_row = (0..title_row)
+            .find(|row| line(*row).contains(&heading.label))
+            .expect("the row's heading is not on screen");
+        assert_eq!(
+            mark,
+            first_column(heading_row).expect("the heading is blank") + 2,
+            "the row is not indented under its heading:\n{}",
+            line(title_row)
+        );
+        assert_eq!(
+            Some(mark),
+            mark_column(echo_row),
+            "the row's two lines did not draw one rail:\n{}\n{}",
+            line(title_row),
+            line(echo_row)
+        );
+        // The echo opens in the column the title's own text took, which is what
+        // drawing the rail after the indent buys: four columns on from the mark
+        // for the rail, its gap, the state mark and its gap.
+        assert_eq!(
+            text_column(echo_row, mark),
+            Some(mark + 4),
+            "the echo does not open under its title:\n{}\n{}",
+            line(title_row),
+            line(echo_row)
+        );
+        // The band is the row, not the sentence: both of a row's lines end in
+        // the same column, and the echo's band runs on past its own text rather
+        // than stopping where the sentence happened to.
+        let band = app.theme.roles.surface_highlight;
+        let band_end = |row: u16| -> Option<u16> {
+            (0..buffer.area.width)
+                .filter(|column| {
+                    buffer
+                        .cell((*column, row))
+                        .is_some_and(|cell| cell.style().bg == Some(band))
+                })
+                .next_back()
+        };
+        let echo_text_end = (0..buffer.area.width)
+            .filter(|column| {
+                buffer
+                    .cell((*column, echo_row))
+                    .is_some_and(|cell| cell.symbol() != " ")
+            })
+            .next_back()
+            .expect("the echo has no text");
+        assert_eq!(
+            band_end(title_row),
+            band_end(echo_row),
+            "the row's two lines ended in different columns:\n{}\n{}",
+            line(title_row),
+            line(echo_row)
+        );
+        assert!(
+            band_end(echo_row).is_some_and(|end| end > echo_text_end),
+            "the echo's band stops at the sentence instead of the row:\n{}",
+            line(echo_row)
+        );
+    }
+
     /// A session row's own controls act on the row they were drawn for rather
     /// than on the row the cursor happens to be on. The pointer chose the
     /// target, and a delete button that removed a different session than the

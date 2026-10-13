@@ -1862,9 +1862,20 @@ fn session_row_lines(
             } else {
                 dim_style
             };
+            // The mark under the title stands in the column the title's own
+            // mark took: the indent comes first, exactly as it does above, and
+            // the text then opens under the title it belongs to. Drawn before
+            // the indent, a nested row's rail broke in two at every level.
+            let lead = format!("{}{bar}{}", " ".repeat(indent), " ".repeat(3));
+            let text = truncate_to_width(&text, budget, "…");
+            // What the echo does not reach keeps the band: the row is one
+            // object, so its second line is as wide as its first rather than
+            // ending where the sentence happened to.
+            let tail = " ".repeat(budget.saturating_sub(display_width(&text)));
             lines.push(Line::from(vec![
-                Span::styled(format!("{bar}{}", " ".repeat(indent + 3)), bar_style),
-                Span::styled(truncate_to_width(&text, budget, "…"), style),
+                Span::styled(lead, bar_style),
+                Span::styled(text, style),
+                Span::styled(tail, blank_style),
             ]));
         }
     }
