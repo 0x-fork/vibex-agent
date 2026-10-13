@@ -34,6 +34,7 @@ use gpui_component::{
     form::{Field, Form},
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
+    menu::{DropdownMenu as _, PopupMenuItem},
     notification::NotificationType,
     pagination::Pagination,
     scroll::ScrollableElement as _,
@@ -163,6 +164,100 @@ const PROVIDER_OPTION_CC_SWITCH_DB_PATH: &str = "ccSwitchDbPath";
 const PROVIDER_OPTION_CC_SWITCH_PROVIDER_ID: &str = "ccSwitchProviderId";
 const PROVIDER_OPTION_CC_SWITCH_APP_TYPE: &str = "ccSwitchAppType";
 const PROVIDER_OPTION_NATIVE_SOURCE: &str = "nativeSource";
+/// The Provider Profile option that carries user-configured request headers.
+///
+/// A JSON object keyed by header name: a string is a literal value, and an
+/// object of the form `{"variable":"session_id"}` is a value the runtime fills
+/// from the session serving the Agent process.
+const PROVIDER_OPTION_HEADER_OVERRIDE: &str = "headerOverrideJson";
+
+/// One persisted request-header value, in the shape the override stores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProfileHeaderOverrideValue {
+    Literal(String),
+    Variable(vibex_core::ModelProviderHeaderVariable),
+}
+
+impl ProfileHeaderOverrideValue {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Literal(value) => serde_json::Value::String(value.clone()),
+            Self::Variable(variable) => {
+                serde_json::json!({ "variable": variable.id() })
+            }
+        }
+    }
+}
+
+/// Read every header the override option declares.
+///
+/// Anything that is not a string or a known variable object is skipped rather
+/// than guessed at, so a hand-edited option never turns into a header the user
+/// never configured.
+fn parse_profile_header_override(raw: &str) -> Vec<(String, ProfileHeaderOverrideValue)> {
+    let Some(object) = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return Vec::new();
+    };
+    object
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            match &value {
+                serde_json::Value::String(literal) => {
+                    Some((name, ProfileHeaderOverrideValue::Literal(literal.clone())))
+                }
+                serde_json::Value::Object(fields) => fields
+                    .get("variable")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(vibex_core::ModelProviderHeaderVariable::from_id)
+                    .map(|variable| (name, ProfileHeaderOverrideValue::Variable(variable))),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Encode header rows for the override option.
+fn serialize_profile_header_override(entries: &[(String, ProfileHeaderOverrideValue)]) -> String {
+    let object = entries
+        .iter()
+        .map(|(name, value)| (name.clone(), value.to_json()))
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::Value::Object(object).to_string()
+}
+
+/// The headers' human name in the editor's variable picker.
+fn provider_header_variable_label(
+    variable: vibex_core::ModelProviderHeaderVariable,
+) -> &'static str {
+    match variable {
+        vibex_core::ModelProviderHeaderVariable::SessionId => {
+            management_locale_text("Session ID", "会话 ID", "工作階段 ID")
+        }
+    }
+}
+
+/// Headers the editor offers as one-click additions.
+fn provider_common_headers() -> Vec<(
+    &'static str,
+    Option<vibex_core::ModelProviderHeaderVariable>,
+)> {
+    vec![
+        (
+            "x-opencode-session",
+            Some(vibex_core::ModelProviderHeaderVariable::SessionId),
+        ),
+        ("User-Agent", None),
+        ("HTTP-Referer", None),
+        ("X-Title", None),
+    ]
+}
 
 fn management_input_changed(event: &InputEvent) -> bool {
     matches!(event, InputEvent::Change)
@@ -191,6 +286,17 @@ enum ProfileModelEditField {
     Id,
     Reasoning,
     Limits,
+}
+
+/// One request-header row in the Provider editor.
+///
+/// `variable` selects a value the runtime fills from the session; while it is
+/// `Some`, the literal input is kept (so switching back restores it) but the
+/// row shows the variable instead.
+struct ProfileHeaderDraft {
+    name: Entity<InputState>,
+    value: Entity<InputState>,
+    variable: Option<vibex_core::ModelProviderHeaderVariable>,
 }
 
 /// Why the MCP market is asking the runtime for a window of the registry.
@@ -284,6 +390,7 @@ impl ProfileCandidateRow {
 /// Disclosures the Provider editor owns, named so the toggle can find them.
 const PROFILE_MODEL_ADVANCED_DISCLOSURE_ID: &str = "provider-model-advanced";
 const PROFILE_PROTOCOL_DISCLOSURE_ID: &str = "provider-protocol-overrides";
+const PROFILE_HEADERS_DISCLOSURE_ID: &str = "provider-request-headers";
 
 struct ManagementCenterFeedbackNotification;
 
@@ -997,6 +1104,16 @@ pub struct ManagementCenter {
     /// Per-protocol endpoint overrides stay behind a disclosure: most Providers
     /// only ever configure the default address.
     profile_protocol_advanced_open: bool,
+    /// User-configured request headers, in editor row order.
+    profile_headers: Vec<ProfileHeaderDraft>,
+    /// The headers' editor starts collapsed; it opens itself when the Profile
+    /// already declares one, or after a rejected save.
+    profile_headers_open: bool,
+    /// The JSON import surface, shown only while the user asked for it.
+    profile_headers_import_open: bool,
+    profile_headers_import: Entity<TextareaState>,
+    /// The headers editor's problem, rendered inside the section.
+    profile_headers_error: Option<String>,
     profile_provider_options: vibex_core::ProviderOptions,
     selected_acp_profile_id: Option<String>,
     acp_config_draft: Option<vibex_core::AcpProviderConfig>,
@@ -1239,6 +1356,15 @@ impl ManagementCenter {
             InputState::new(window, cx)
                 .placeholder(PROVIDER_API_KEY_PLACEHOLDER)
                 .masked(true)
+        });
+        let profile_headers_import = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(4)
+                .placeholder(management_locale_text(
+                    "{\"x-opencode-session\": {\"variable\": \"session_id\"}}",
+                    "{\"x-opencode-session\": {\"variable\": \"session_id\"}}",
+                    "{\"x-opencode-session\": {\"variable\": \"session_id\"}}",
+                ))
         });
         let acp_command = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
@@ -1772,6 +1898,11 @@ impl ManagementCenter {
             profile_model_edit_error: None,
             profile_model_advanced_open: false,
             profile_protocol_advanced_open: false,
+            profile_headers: Vec::new(),
+            profile_headers_open: false,
+            profile_headers_import_open: false,
+            profile_headers_import,
+            profile_headers_error: None,
             profile_provider_options: vibex_core::ProviderOptions::empty(),
             selected_acp_profile_id: None,
             acp_config_draft: None,
@@ -4462,6 +4593,7 @@ impl ManagementCenter {
         self.profile_model_advanced_open = false;
         self.profile_protocol_advanced_open = false;
         self.profile_provider_options = vibex_core::ProviderOptions::empty();
+        self.clear_profile_headers(window, cx);
         self.rebuild_profile_protocol_base_urls(window, cx);
         self.profile_editor_open = true;
         self.error = None;
@@ -4545,6 +4677,7 @@ impl ManagementCenter {
             .map(|profile| profile.provider_options)
             .unwrap_or_else(vibex_core::ProviderOptions::empty);
         self.rebuild_profile_protocol_base_urls(window, cx);
+        self.load_profile_headers(window, cx);
         // An override the user already set stays visible instead of hiding
         // behind a disclosure that looks empty.
         self.profile_protocol_advanced_open = self.pending_protocol_overrides() > 0;
@@ -4650,6 +4783,7 @@ impl ManagementCenter {
         self.profile_protocol_advanced_open = false;
         self.profile_provider_options = vibex_core::ProviderOptions::empty();
         self.profile_protocol_base_urls.clear();
+        self.clear_profile_headers(window, cx);
         self.navigation.mark_dirty(ManagementSection::Agents, false);
         cx.notify();
     }
@@ -4691,6 +4825,249 @@ impl ManagementCenter {
                 .is_some_and(|value| !value.trim().is_empty())
             })
             .count()
+    }
+
+    /// Empties the request-header editor.
+    fn clear_profile_headers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.profile_headers.clear();
+        self.profile_headers_open = false;
+        self.profile_headers_import_open = false;
+        self.profile_headers_error = None;
+        self.profile_headers_import
+            .update(cx, |state, cx| state.set_value("", window, cx));
+    }
+
+    /// Fills the request-header editor from the Profile's stored override.
+    fn load_profile_headers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_profile_headers(window, cx);
+        let Some(raw) = provider_option_value(
+            &self.profile_provider_options,
+            PROVIDER_OPTION_HEADER_OVERRIDE,
+        ) else {
+            return;
+        };
+        let entries = parse_profile_header_override(&raw);
+        self.profile_headers_open = !entries.is_empty();
+        for (name, value) in entries {
+            let (literal, variable) = match value {
+                ProfileHeaderOverrideValue::Literal(value) => (value, None),
+                ProfileHeaderOverrideValue::Variable(variable) => (String::new(), Some(variable)),
+            };
+            self.push_profile_header(name, literal, variable, window, cx);
+        }
+    }
+
+    /// Appends one request-header row and subscribes to its inputs.
+    fn push_profile_header(
+        &mut self,
+        name: String,
+        value: String,
+        variable: Option<vibex_core::ModelProviderHeaderVariable>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(name)
+                .placeholder(management_locale_text(
+                    "Header name",
+                    "请求头名称",
+                    "請求標頭名稱",
+                ))
+        });
+        let value_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(value)
+                .placeholder(management_locale_text("Value", "请求头值", "請求標頭值"))
+        });
+        for input in [&name_input, &value_input] {
+            self._subscriptions
+                .push(cx.subscribe(input, |this, _, event: &InputEvent, cx| {
+                    if !management_input_changed(event) {
+                        return;
+                    }
+                    this.profile_headers_error = None;
+                    this.projection_editor.mark_draft_changed();
+                    this.navigation.mark_dirty(ManagementSection::Agents, true);
+                    cx.notify();
+                }));
+        }
+        self.profile_headers.push(ProfileHeaderDraft {
+            name: name_input,
+            value: value_input,
+            variable,
+        });
+    }
+
+    fn add_profile_header_row(
+        &mut self,
+        name: String,
+        variable: Option<vibex_core::ModelProviderHeaderVariable>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.profile_headers_open = true;
+        self.profile_headers_error = None;
+        self.push_profile_header(name, String::new(), variable, window, cx);
+        cx.notify();
+    }
+
+    fn remove_profile_header(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.profile_headers.len() {
+            return;
+        }
+        self.profile_headers.remove(index);
+        self.profile_headers_error = None;
+        self.projection_editor.mark_draft_changed();
+        self.navigation.mark_dirty(ManagementSection::Agents, true);
+        cx.notify();
+    }
+
+    fn set_profile_header_variable(
+        &mut self,
+        index: usize,
+        variable: Option<vibex_core::ModelProviderHeaderVariable>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(draft) = self.profile_headers.get_mut(index) else {
+            return;
+        };
+        draft.variable = variable;
+        self.profile_headers_error = None;
+        self.projection_editor.mark_draft_changed();
+        self.navigation.mark_dirty(ManagementSection::Agents, true);
+        cx.notify();
+    }
+
+    /// Reads the editor's rows into the shape the override persists.
+    ///
+    /// A row with a blank name and blank value is an unfinished new row the
+    /// user abandoned, not a header; it is dropped. Anything else is validated
+    /// here so a rejected save names the row the user can see.
+    fn profile_header_entries(
+        &self,
+        cx: &Context<Self>,
+    ) -> Result<Vec<(String, ProfileHeaderOverrideValue)>, String> {
+        let mut entries: Vec<(String, ProfileHeaderOverrideValue)> = Vec::new();
+        let mut seen = BTreeSet::new();
+        for draft in &self.profile_headers {
+            let name = draft.name.read(cx).value().trim().to_string();
+            let literal = draft.value.read(cx).value().trim().to_string();
+            if name.is_empty() {
+                if literal.is_empty() && draft.variable.is_none() {
+                    continue;
+                }
+                return Err(management_locale_text(
+                    "A request header needs a name",
+                    "请求头需要填写名称",
+                    "請求標頭需要填寫名稱",
+                )
+                .to_string());
+            }
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Err(format!(
+                    "{}{name}",
+                    management_locale_text(
+                        "Duplicate request header: ",
+                        "请求头名称重复：",
+                        "請求標頭名稱重複：",
+                    )
+                ));
+            }
+            let value = match draft.variable {
+                Some(variable) => ProfileHeaderOverrideValue::Variable(variable),
+                None => ProfileHeaderOverrideValue::Literal(literal),
+            };
+            entries.push((name, value));
+        }
+        Ok(entries)
+    }
+
+    /// Applies the JSON import surface, replacing the current rows.
+    fn apply_profile_headers_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.profile_headers_import.read(cx).value().to_string();
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            self.profile_headers_error = None;
+            self.profile_headers_import_open = false;
+            cx.notify();
+            return;
+        }
+        let Some(object) = serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+        else {
+            self.profile_headers_error = Some(
+                management_locale_text(
+                    "Import expects a JSON object of header names to values",
+                    "导入内容应为「请求头名称 → 值」的 JSON 对象",
+                    "匯入內容應為「請求標頭名稱 → 值」的 JSON 物件",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let mut entries = Vec::with_capacity(object.len());
+        for (name, value) in object {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let parsed = match &value {
+                serde_json::Value::String(literal) => {
+                    ProfileHeaderOverrideValue::Literal(literal.clone())
+                }
+                serde_json::Value::Object(fields) => {
+                    let Some(variable) = fields
+                        .get("variable")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(vibex_core::ModelProviderHeaderVariable::from_id)
+                    else {
+                        self.profile_headers_error = Some(format!(
+                            "{}{name}",
+                            management_locale_text(
+                                "Unknown variable in header: ",
+                                "请求头使用了未知动态变量：",
+                                "請求標頭使用了未知動態變數：",
+                            )
+                        ));
+                        cx.notify();
+                        return;
+                    };
+                    ProfileHeaderOverrideValue::Variable(variable)
+                }
+                _ => {
+                    self.profile_headers_error = Some(format!(
+                        "{}{name}",
+                        management_locale_text(
+                            "Header values must be strings or variables: ",
+                            "请求头值必须是字符串或动态变量：",
+                            "請求標頭值必須是字串或動態變數：",
+                        )
+                    ));
+                    cx.notify();
+                    return;
+                }
+            };
+            entries.push((name, parsed));
+        }
+        self.profile_headers.clear();
+        self.profile_headers_error = None;
+        self.profile_headers_open = true;
+        self.profile_headers_import_open = false;
+        self.profile_headers_import
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        for (name, value) in entries {
+            let (literal, variable) = match value {
+                ProfileHeaderOverrideValue::Literal(value) => (value, None),
+                ProfileHeaderOverrideValue::Variable(variable) => (String::new(), Some(variable)),
+            };
+            self.push_profile_header(name, literal, variable, window, cx);
+        }
+        self.projection_editor.mark_draft_changed();
+        self.navigation.mark_dirty(ManagementSection::Agents, true);
+        cx.notify();
     }
 
     fn present_profile_editor_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5018,6 +5395,9 @@ impl ManagementCenter {
         match id {
             PROFILE_PROTOCOL_DISCLOSURE_ID => {
                 self.profile_protocol_advanced_open = !self.profile_protocol_advanced_open;
+            }
+            PROFILE_HEADERS_DISCLOSURE_ID => {
+                self.profile_headers_open = !self.profile_headers_open;
             }
             PROFILE_MODEL_ADVANCED_DISCLOSURE_ID => {
                 self.profile_model_advanced_open = !self.profile_model_advanced_open;
@@ -5493,6 +5873,25 @@ impl ManagementCenter {
                 (!value.is_empty()).then_some(value),
             );
         }
+        // Request headers are part of the Provider, not of one save: a
+        // rejected row names itself and keeps the dialog open so the draft is
+        // not half-applied.
+        let profile_header_entries = match self.profile_header_entries(cx) {
+            Ok(entries) => entries,
+            Err(message) => {
+                self.profile_headers_error = Some(message);
+                self.profile_headers_open = true;
+                self.error = None;
+                cx.notify();
+                return;
+            }
+        };
+        provider_options = with_provider_option(
+            provider_options,
+            PROVIDER_OPTION_HEADER_OVERRIDE,
+            (!profile_header_entries.is_empty())
+                .then(|| serialize_profile_header_override(&profile_header_entries)),
+        );
         let editing_profile_id = match self
             .editing_profile_id
             .as_deref()
@@ -14130,12 +14529,310 @@ impl ManagementCenter {
                     .content(fields),
             );
         }
+        // Only the Agents whose projected config owns a header map read the
+        // rows; every other Agent would store them without a request ever
+        // carrying one.
+        if self.projection_editor.supports_request_headers() {
+            connection_content = connection_content.child(self.render_profile_headers_section(cx));
+        }
         profile_editor_section(
             management_locale_text("Connection & credentials", "连接与凭证", "連線與憑證"),
             None,
             connection_content.into_any_element(),
             cx,
         )
+    }
+
+    /// Request headers: user-authored rows plus built-in dynamic variables.
+    ///
+    /// The rows stay behind a disclosure like the protocol overrides, because
+    /// most Providers never add one; the count badge makes an already
+    /// configured Profile visible at a glance.
+    fn render_profile_headers_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.profile_headers_open;
+        let count = self.profile_headers.len();
+        let common_center = cx.weak_entity();
+        let mut content = v_flex().w_full().min_w_0().gap_2().child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(
+                    Button::new("provider-headers-add-common")
+                        .xsmall()
+                        .outline()
+                        .icon(IconName::Plus)
+                        .label(management_locale_text(
+                            "Add common header",
+                            "添加常用请求头",
+                            "新增常用請求標頭",
+                        ))
+                        .dropdown_menu(move |menu, _, _| {
+                            let mut menu = menu;
+                            for (name, variable) in provider_common_headers() {
+                                let label = match variable {
+                                    Some(variable) => format!(
+                                        "{name} · {}",
+                                        provider_header_variable_label(variable)
+                                    ),
+                                    None => name.to_string(),
+                                };
+                                let center = common_center.clone();
+                                menu = menu.item(PopupMenuItem::new(label).on_click(
+                                    move |_, window, cx| {
+                                        let _ = center.update(cx, |this, cx| {
+                                            this.add_profile_header_row(
+                                                name.to_string(),
+                                                variable,
+                                                window,
+                                                cx,
+                                            )
+                                        });
+                                    },
+                                ));
+                            }
+                            menu
+                        }),
+                )
+                .child(
+                    Button::new("provider-headers-import-toggle")
+                        .xsmall()
+                        .outline()
+                        .label(if self.profile_headers_import_open {
+                            management_locale_text("Cancel import", "取消导入", "取消匯入")
+                        } else {
+                            management_locale_text("Import JSON", "导入 JSON", "匯入 JSON")
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.profile_headers_import_open = !this.profile_headers_import_open;
+                            this.profile_headers_error = None;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("provider-headers-copy")
+                        .xsmall()
+                        .outline()
+                        .icon(IconName::Copy)
+                        .label(management_locale_text(
+                            "Copy headers JSON",
+                            "复制请求头 JSON",
+                            "複製請求標頭 JSON",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let json = this
+                                .profile_header_entries(cx)
+                                .map(|entries| serialize_profile_header_override(&entries))
+                                .unwrap_or_else(|_| {
+                                    serialize_profile_header_override(
+                                        &this.draft_header_entries(cx),
+                                    )
+                                });
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(json));
+                        })),
+                ),
+        );
+        if !open {
+            return Collapsible::new()
+                .w_full()
+                .open(false)
+                .child(profile_editor_disclosure(
+                    PROFILE_HEADERS_DISCLOSURE_ID,
+                    management_locale_text("Request headers", "请求头", "請求標頭").into(),
+                    false,
+                    (count > 0).then(|| management_status_badge(format!("{count}"), cx)),
+                    cx,
+                ))
+                .into_any_element();
+        }
+        if self.profile_headers_import_open {
+            content = content.child(
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        Textarea::new(&self.profile_headers_import)
+                            .small()
+                            .w_full()
+                            .h(px(88.0)),
+                    )
+                    .child(
+                        Button::new("provider-headers-import-apply")
+                            .xsmall()
+                            .primary()
+                            .label(management_locale_text(
+                                "Apply JSON",
+                                "应用 JSON",
+                                "套用 JSON",
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.apply_profile_headers_import(window, cx);
+                            })),
+                    ),
+            );
+        }
+        for index in 0..self.profile_headers.len() {
+            content = content.child(self.render_profile_header_row(index, cx));
+        }
+        content = content.child(
+            Button::new("provider-headers-add")
+                .xsmall()
+                .outline()
+                .icon(IconName::Plus)
+                .label(management_locale_text(
+                    "Add header",
+                    "添加请求头",
+                    "新增請求標頭",
+                ))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.add_profile_header_row(String::new(), None, window, cx);
+                })),
+        );
+        content = content.children(
+            self.profile_headers_error
+                .clone()
+                .map(|message| management_field_error(message, cx)),
+        );
+        Collapsible::new()
+            .w_full()
+            .open(true)
+            .child(profile_editor_disclosure(
+                PROFILE_HEADERS_DISCLOSURE_ID,
+                management_locale_text("Request headers", "请求头", "請求標頭").into(),
+                true,
+                (count > 0).then(|| management_status_badge(format!("{count}"), cx)),
+                cx,
+            ))
+            .content(content)
+            .into_any_element()
+    }
+
+    /// One header row: name, value (literal or variable), variable picker, and
+    /// a remove action.
+    fn render_profile_header_row(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(draft) = self.profile_headers.get(index) else {
+            return div().into_any_element();
+        };
+        let name_input = draft.name.clone();
+        let value_input = draft.value.clone();
+        let variable = draft.variable;
+        let center = cx.weak_entity();
+        let mut row = h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .child(Input::new(&name_input).small().w_full()),
+            )
+            .child(if variable.is_some() {
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .h(px(26.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .bg(cx.theme().muted.opacity(0.35))
+                    .px_2()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "{{{{{}}}}}",
+                        provider_header_variable_label(variable.expect("checked above"))
+                    ))
+                    .into_any_element()
+            } else {
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .child(Input::new(&value_input).small().w_full())
+                    .into_any_element()
+            });
+        row = row.child(
+            Button::new(SharedString::from(format!(
+                "provider-header-{index}-variable"
+            )))
+            .xsmall()
+            .outline()
+            .label(match variable {
+                Some(variable) => provider_header_variable_label(variable),
+                None => management_locale_text("Value", "值", "值"),
+            })
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu.item(
+                    PopupMenuItem::new(management_locale_text("Literal value", "固定值", "固定值"))
+                        .checked(variable.is_none())
+                        .on_click({
+                            let center = center.clone();
+                            move |_, _, cx| {
+                                let _ = center.update(cx, |this, cx| {
+                                    this.set_profile_header_variable(index, None, cx)
+                                });
+                            }
+                        }),
+                );
+                for candidate in vibex_core::ModelProviderHeaderVariable::ALL {
+                    let center = center.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(provider_header_variable_label(candidate))
+                            .checked(variable == Some(candidate))
+                            .on_click(move |_, _, cx| {
+                                let _ = center.update(cx, |this, cx| {
+                                    this.set_profile_header_variable(index, Some(candidate), cx)
+                                });
+                            }),
+                    );
+                }
+                menu
+            }),
+        );
+        row = row.child(
+            Button::new(SharedString::from(format!(
+                "provider-header-{index}-remove"
+            )))
+            .xsmall()
+            .ghost()
+            .icon(IconName::Close)
+            .tooltip(management_locale_text(
+                "Remove header",
+                "删除请求头",
+                "刪除請求標頭",
+            ))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.remove_profile_header(index, cx);
+            })),
+        );
+        row.into_any_element()
+    }
+
+    /// The rows as the override would store them, ignoring validation, for the
+    /// copy-JSON action.
+    fn draft_header_entries(
+        &self,
+        cx: &Context<Self>,
+    ) -> Vec<(String, ProfileHeaderOverrideValue)> {
+        self.profile_headers
+            .iter()
+            .filter_map(|draft| {
+                let name = draft.name.read(cx).value().trim().to_string();
+                if name.is_empty() {
+                    return None;
+                }
+                let value = match draft.variable {
+                    Some(variable) => ProfileHeaderOverrideValue::Variable(variable),
+                    None => ProfileHeaderOverrideValue::Literal(
+                        draft.value.read(cx).value().trim().to_string(),
+                    ),
+                };
+                Some((name, value))
+            })
+            .collect()
     }
 
     fn open_agent_auth_link(&mut self, url: String, cx: &mut Context<Self>) {
@@ -25004,6 +25701,48 @@ mod tests {
         assert!(credential_control.contains("provider-secret-clear"));
         assert!(save.contains("let replaces_secret = !api_key.is_empty() && secret_edited;"));
         assert!(save.contains("clear: secret_clear,"));
+    }
+
+    #[test]
+    fn profile_header_override_round_trips_literals_and_variables() {
+        let entries = vec![
+            (
+                "User-Agent".to_string(),
+                ProfileHeaderOverrideValue::Literal("vibex/1.0".to_string()),
+            ),
+            (
+                "x-opencode-session".to_string(),
+                ProfileHeaderOverrideValue::Variable(
+                    vibex_core::ModelProviderHeaderVariable::SessionId,
+                ),
+            ),
+        ];
+        let raw = serialize_profile_header_override(&entries);
+        let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(stored["User-Agent"], "vibex/1.0");
+        assert_eq!(stored["x-opencode-session"]["variable"], "session_id");
+        assert_eq!(parse_profile_header_override(&raw), entries);
+
+        // Shapes the editor cannot express are ignored rather than guessed at,
+        // so a hand-edited option never sends a header the user never set.
+        let parsed = parse_profile_header_override(
+            r#"{"ok":"v","var":{"variable":"session_id"},"number":7,"unknown":{"variable":"nope"}}"#,
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                (
+                    "ok".to_string(),
+                    ProfileHeaderOverrideValue::Literal("v".to_string())
+                ),
+                (
+                    "var".to_string(),
+                    ProfileHeaderOverrideValue::Variable(
+                        vibex_core::ModelProviderHeaderVariable::SessionId
+                    )
+                ),
+            ]
+        );
     }
 
     #[test]

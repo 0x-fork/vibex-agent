@@ -22,14 +22,14 @@ use vibex_core::{
     AgentProviderProjectionPreviewRequest, AgentProviderProjectionRegistry, AgentRuntimeProfile,
     AgentRuntimeProfileCreateRequest, AgentRuntimeProfileId, AgentRuntimeProfileUpdateRequest,
     ConfigOverlayStrategy, ManagedProjectionOverlay, ModelProviderCredentialReference,
-    ModelProviderEndpoint, ModelProviderHeaderValue, ModelProviderProfile,
-    ModelProviderProfileCreateRequest, ModelProviderProfileId, ModelProviderProfileUpdateRequest,
-    ModelProviderProxyPolicy, ProjectionAuthState, ProjectionDescriptorMatch,
-    ProjectionEvidenceState, ProjectionOverlayPreview, ProjectionSecretEnvReference,
-    ProjectionTargetKind, ProjectionTargetPreview, ProjectionVerificationState,
-    ProviderBindingMetadata, ProviderCredentialSecretMutationRequest, ProviderModelCapabilities,
-    ProviderSecretBackend, ProviderSecretSetupState, ProviderSwitchBehavior, RequestId, VibexError,
-    VibexResult, unix_timestamp_ms,
+    ModelProviderEndpoint, ModelProviderHeaderReference, ModelProviderHeaderValue,
+    ModelProviderProfile, ModelProviderProfileCreateRequest, ModelProviderProfileId,
+    ModelProviderProfileUpdateRequest, ModelProviderProxyPolicy, ProjectionAuthState,
+    ProjectionDescriptorMatch, ProjectionEvidenceState, ProjectionOverlayPreview,
+    ProjectionSecretEnvReference, ProjectionTargetKind, ProjectionTargetPreview,
+    ProjectionVerificationState, ProviderBindingMetadata, ProviderCredentialSecretMutationRequest,
+    ProviderModelCapabilities, ProviderSecretBackend, ProviderSecretSetupState,
+    ProviderSwitchBehavior, RequestId, VibexError, VibexResult, unix_timestamp_ms,
 };
 use vibex_db::{
     AgentModelProviderBindingRepository, AgentRuntimeProfileRepository,
@@ -101,6 +101,10 @@ pub struct ResolvedAgentProviderProjection {
     pub effective_model: Option<String>,
     pub switch_behavior: ProviderSwitchBehavior,
     pub fingerprint: String,
+    /// Environment keys referenced by the projected route's dynamic request
+    /// headers, in stable order. The launch fills them with the current Vibex
+    /// session id when the Agent process is session-scoped.
+    pub session_env_keys: Vec<String>,
 }
 
 /// Stable, non-secret launch identity for a legacy provider profile binding.
@@ -164,6 +168,7 @@ impl fmt::Debug for ResolvedAgentProviderProjection {
             .field("effective_model", &self.effective_model)
             .field("switch_behavior", &self.switch_behavior)
             .field("fingerprint", &self.fingerprint)
+            .field("session_env_keys", &self.session_env_keys)
             .finish()
     }
 }
@@ -380,6 +385,9 @@ impl AgentProviderProjectionEngine {
             fingerprint,
             preview,
             diagnostics,
+            session_env_keys: ModelProviderHeaderReference::dynamic_variable_env_keys(
+                &model_provider.headers,
+            ),
         })
     }
 
@@ -437,6 +445,7 @@ impl AgentProviderProjectionEngine {
             effective_model: plan.effective_model.clone(),
             switch_behavior: plan.switch_behavior,
             fingerprint: plan.fingerprint.clone(),
+            session_env_keys: plan.session_env_keys.clone(),
         })
     }
 }
@@ -2195,16 +2204,36 @@ fn opencode_overlay(
                 }
             }
             for header in &provider.headers {
-                if let ModelProviderHeaderValue::NonSecretLiteral(value) = &header.value {
-                    let headers = options
-                        .entry("headers".to_string())
-                        .or_insert_with(|| serde_json::json!({}));
-                    if let Some(headers) = headers.as_object_mut() {
-                        headers.insert(
-                            header.name.clone(),
-                            serde_json::Value::String(value.clone()),
-                        );
+                match &header.value {
+                    ModelProviderHeaderValue::NonSecretLiteral(value) => {
+                        let headers = options
+                            .entry("headers".to_string())
+                            .or_insert_with(|| serde_json::json!({}));
+                        if let Some(headers) = headers.as_object_mut() {
+                            headers.insert(
+                                header.name.clone(),
+                                serde_json::Value::String(value.clone()),
+                            );
+                        }
                     }
+                    // OpenCode substitutes `{env:...}` across its config, so a
+                    // session variable travels as an environment reference the
+                    // launch fills from the session that owns the process.
+                    ModelProviderHeaderValue::DynamicVariable(variable) => {
+                        let headers = options
+                            .entry("headers".to_string())
+                            .or_insert_with(|| serde_json::json!({}));
+                        if let Some(headers) = headers.as_object_mut() {
+                            headers.insert(
+                                header.name.clone(),
+                                serde_json::Value::String(format!(
+                                    "{{env:{}}}",
+                                    variable.env_key()
+                                )),
+                            );
+                        }
+                    }
+                    ModelProviderHeaderValue::SecretReference(_) => {}
                 }
             }
         }
@@ -3672,6 +3701,7 @@ fn deepseek_harness_route(
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
+    dynamic_headers: DeepseekHarnessDynamicHeaders,
 ) -> VibexResult<(String, serde_json::Value)> {
     let model_id = projection_model_id(model).unwrap_or("vibex-model");
     let provider_id = deepseek_harness_route_id(provider);
@@ -3724,6 +3754,10 @@ fn deepseek_harness_route(
             serde_json::json!({"supportsDeveloperRole": false}),
         );
     }
+    let headers = deepseek_harness_headers(provider, dynamic_headers);
+    if !headers.is_empty() {
+        route.insert("headers".to_string(), serde_json::Value::Object(headers));
+    }
     json_string_if_present(
         &mut route,
         "baseURL",
@@ -3735,6 +3769,95 @@ fn deepseek_harness_route(
     );
 
     Ok((provider_id, serde_json::Value::Object(route)))
+}
+
+/// How a Harness route spells a header whose value is a session variable.
+///
+/// The two overlay files do not support the same spelling. `settings.yaml` is
+/// read as plain YAML by the bundled runtime's own settings loader, which has
+/// no notion of an evaluated expression; `cordis.patch.yml` is composed by the
+/// Cordis loader, which evaluates `!!js` on every launch. A session variable
+/// therefore travels only through the home patch — the 0.1.5 settings loader
+/// would otherwise send the expression itself as the header value — while a
+/// literal header is written to both files unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeepseekHarnessDynamicHeaders {
+    /// Drop dynamic header rows, leaving only literal ones.
+    Omit,
+    /// Spell a dynamic value as a placeholder that the YAML encoder leaves as
+    /// a plain scalar and the writer expands into `!!js process.env.<KEY>`.
+    ///
+    /// `serde_yaml` cannot emit a secondary (`!!`) tag, so the expression is
+    /// assembled as text after encoding. The prefix is reserved for this
+    /// projection: an overlay that carries it in any other shape is refused
+    /// rather than expanded into an expression the user never asked for.
+    CordisExpression,
+}
+
+const DEEPSEEK_HARNESS_DYNAMIC_HEADER_PREFIX: &str = "VIBEX_DYNAMIC_HEADER_ENV_";
+
+fn deepseek_harness_headers(
+    provider: &ModelProviderProfile,
+    dynamic_headers: DeepseekHarnessDynamicHeaders,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut headers = serde_json::Map::new();
+    for header in &provider.headers {
+        match &header.value {
+            ModelProviderHeaderValue::NonSecretLiteral(value) => {
+                headers.insert(header.name.clone(), serde_json::json!(value));
+            }
+            ModelProviderHeaderValue::DynamicVariable(variable) => {
+                if dynamic_headers == DeepseekHarnessDynamicHeaders::CordisExpression {
+                    headers.insert(
+                        header.name.clone(),
+                        serde_json::json!(format!(
+                            "{DEEPSEEK_HARNESS_DYNAMIC_HEADER_PREFIX}{}",
+                            variable.env_key()
+                        )),
+                    );
+                }
+            }
+            // A Secret reference names the Profile credential, which the route
+            // already carries as `apiKeyEnv`; repeating it as a header would
+            // leak the credential into a second surface.
+            ModelProviderHeaderValue::SecretReference(_) => {}
+        }
+    }
+    headers
+}
+
+/// Expands the reserved dynamic-header placeholders into Core expression tags.
+///
+/// The encoded overlay is a plain scalar per placeholder because the whole
+/// document is ordinary YAML; only the reserved prefix turns one into an
+/// expression, and only when an environment key follows it.
+fn deepseek_harness_expand_dynamic_headers(overlay: String) -> VibexResult<String> {
+    let prefix = DEEPSEEK_HARNESS_DYNAMIC_HEADER_PREFIX;
+    if !overlay.contains(prefix) {
+        return Ok(overlay);
+    }
+    let mut rendered = String::with_capacity(overlay.len());
+    let mut rest = overlay.as_str();
+    while let Some(index) = rest.find(prefix) {
+        rendered.push_str(&rest[..index]);
+        let after = &rest[index + prefix.len()..];
+        let key_len = after
+            .bytes()
+            .take_while(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
+            .count();
+        if key_len == 0 {
+            return Err(VibexError::validation(
+                "agent_projection_overlay_encode_failed",
+                "typed Agent YAML overlay left a dynamic header placeholder unresolved",
+            )
+            .with_diagnostic("format", "yaml"));
+        }
+        rendered.push_str("!!js process.env.");
+        rendered.push_str(&after[..key_len]);
+        rest = &after[key_len..];
+    }
+    rendered.push_str(rest);
+    Ok(rendered)
 }
 
 /// The Harness `settings.yaml` overlay.
@@ -3752,8 +3875,14 @@ fn deepseek_harness_overlay(
     secret_env_key: &str,
 ) -> VibexResult<String> {
     let model_id = projection_model_id(model).unwrap_or("vibex-model");
-    let (provider_id, route) =
-        deepseek_harness_route(provider, binding, endpoint, model, secret_env_key)?;
+    let (provider_id, route) = deepseek_harness_route(
+        provider,
+        binding,
+        endpoint,
+        model,
+        secret_env_key,
+        DeepseekHarnessDynamicHeaders::Omit,
+    )?;
     serialized_yaml(serde_json::json!({
         "llm-pi-ai": {
             "providers": {provider_id.clone(): route},
@@ -3782,9 +3911,15 @@ fn deepseek_harness_cordis_patch(
     model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
 ) -> VibexResult<String> {
-    let (provider_id, route) =
-        deepseek_harness_route(provider, binding, endpoint, model, secret_env_key)?;
-    serialized_yaml(serde_json::json!([
+    let (provider_id, route) = deepseek_harness_route(
+        provider,
+        binding,
+        endpoint,
+        model,
+        secret_env_key,
+        DeepseekHarnessDynamicHeaders::CordisExpression,
+    )?;
+    let document = serde_yaml::to_string(&serde_json::json!([
         {
             "id": "llm-pi-ai",
             "config": {
@@ -3792,6 +3927,15 @@ fn deepseek_harness_cordis_patch(
             },
         }
     ]))
+    .map_err(|error| {
+        VibexError::validation(
+            "agent_projection_overlay_encode_failed",
+            "typed Agent YAML overlay could not be encoded",
+        )
+        .with_diagnostic("format", "yaml")
+        .with_diagnostic("error", error.to_string())
+    })?;
+    deepseek_harness_expand_dynamic_headers(document)
 }
 
 fn deepseek_harness_api(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
@@ -4102,7 +4246,7 @@ fn projection_fingerprint(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let canonical = serde_json::json!({
+    let mut canonical = serde_json::json!({
         "domain": PROJECTION_FINGERPRINT_DOMAIN,
         "bindingId": binding.id,
         "descriptorId": descriptor.id,
@@ -4125,6 +4269,12 @@ fn projection_fingerprint(
         "overlays": overlay_fingerprints,
         "processModel": process_model,
     });
+    // Only projected Profiles that actually declare request headers gain the
+    // field, so a header change always moves the fingerprint while a Profile
+    // that never had one keeps the fingerprint it was launched with.
+    if !provider.headers.is_empty() {
+        canonical["headers"] = serde_json::to_value(&provider.headers).map_err(encode_error)?;
+    }
     let bytes = serde_json::to_vec(&canonical).map_err(encode_error)?;
     Ok(format!(
         "sha256:{}",
@@ -4895,6 +5045,125 @@ mod tests {
             patch[0]["config"]["providers"]["matrix-provider"]["baseURL"].as_str(),
             Some("https://provider.example.invalid/v1/")
         );
+    }
+
+    #[test]
+    fn deepseek_harness_headers_travel_literally_and_dynamic_values_ride_the_home_patch() {
+        let (mut provider, _, binding, _) =
+            fixture(ConfigOverlayStrategy::DeepseekHarnessSettingsYaml);
+        provider.headers = vec![
+            vibex_core::ModelProviderHeaderReference {
+                name: "User-Agent".to_string(),
+                value: vibex_core::ModelProviderHeaderValue::NonSecretLiteral(
+                    "vibex/1.0".to_string(),
+                ),
+                redacted_hint: "non-secret header".to_string(),
+            },
+            vibex_core::ModelProviderHeaderReference {
+                name: "x-opencode-session".to_string(),
+                value: vibex_core::ModelProviderHeaderValue::DynamicVariable(
+                    vibex_core::ModelProviderHeaderVariable::SessionId,
+                ),
+                redacted_hint: "session variable".to_string(),
+            },
+        ];
+
+        // `settings.yaml` is read as plain YAML by the bundled runtime's own
+        // loader, which cannot evaluate an expression: a dynamic value would
+        // arrive as its own source text. Literal headers travel, dynamic ones
+        // wait for the home patch.
+        let settings_overlay = deepseek_harness_overlay(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            binding.configured_models.first(),
+            "DEEPSEEK_API_KEY",
+        )
+        .unwrap();
+        let settings: serde_yaml::Value = serde_yaml::from_str(&settings_overlay).unwrap();
+        let settings_headers = &settings["llm-pi-ai"]["providers"]["fake"]["headers"];
+        assert_eq!(settings_headers["User-Agent"].as_str(), Some("vibex/1.0"));
+        assert!(settings_headers.get("x-opencode-session").is_none());
+        assert!(!settings_overlay.contains("process.env"));
+
+        // The Cordis home patch evaluates `!!js` on every launch, so the
+        // session variable is spelled as the expression the loader runs.
+        let patch = deepseek_harness_cordis_patch(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            binding.configured_models.first(),
+            "DEEPSEEK_API_KEY",
+        )
+        .unwrap();
+        assert!(
+            patch.contains("!!js process.env.VIBEX_SESSION_ID"),
+            "{patch}"
+        );
+        let patch: serde_yaml::Value = serde_yaml::from_str(&patch).unwrap();
+        let patch_headers = &patch[0]["config"]["providers"]["fake"]["headers"];
+        assert_eq!(patch_headers["User-Agent"].as_str(), Some("vibex/1.0"));
+
+        // The plan names the environment keys the launch must fill.
+        let (mut provider, runtime, binding) = typed_projection_fixture(
+            vibex_core::catalog_projection_descriptors()
+                .unwrap()
+                .iter()
+                .find(|descriptor| descriptor.route.agent_id.as_str() == "deepseek-harness")
+                .expect("the DeepSeek Harness owns a projection descriptor"),
+        );
+        provider.headers = vec![vibex_core::ModelProviderHeaderReference {
+            name: "x-opencode-session".to_string(),
+            value: vibex_core::ModelProviderHeaderValue::DynamicVariable(
+                vibex_core::ModelProviderHeaderVariable::SessionId,
+            ),
+            redacted_hint: "session variable".to_string(),
+        }];
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            vibex_core::catalog_projection_descriptors()
+                .unwrap()
+                .iter()
+                .find(|descriptor| descriptor.route.agent_id.as_str() == "deepseek-harness")
+                .unwrap(),
+            "header-matrix",
+        )
+        .unwrap();
+        assert_eq!(plan.session_env_keys, vec!["VIBEX_SESSION_ID".to_string()]);
+    }
+
+    #[test]
+    fn opencode_inline_provider_spells_dynamic_headers_as_environment_references() {
+        let (mut provider, runtime, binding, descriptor) =
+            fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
+        provider.headers = vec![vibex_core::ModelProviderHeaderReference {
+            name: "x-opencode-session".to_string(),
+            value: vibex_core::ModelProviderHeaderValue::DynamicVariable(
+                vibex_core::ModelProviderHeaderVariable::SessionId,
+            ),
+            redacted_hint: "session variable".to_string(),
+        }];
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            &descriptor,
+            "opencode-headers",
+        )
+        .unwrap();
+        let config = plan
+            .non_secret_env
+            .get(OPENCODE_CONFIG_ENV)
+            .expect("the OpenCode projection rides the config environment");
+        let config: serde_json::Value = serde_json::from_str(config).unwrap();
+        let options = &config["provider"]["fake"]["options"];
+        assert_eq!(
+            options["headers"]["x-opencode-session"].as_str(),
+            Some("{env:VIBEX_SESSION_ID}")
+        );
+        assert_eq!(plan.session_env_keys, vec!["VIBEX_SESSION_ID".to_string()]);
     }
 
     #[test]

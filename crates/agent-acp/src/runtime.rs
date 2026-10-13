@@ -363,6 +363,10 @@ pub(crate) struct AcpProcessLaunch<'a> {
     pub(crate) purpose: AcpProcessPurpose,
     pub(crate) process_strategy_effective: AcpProcessStrategy,
     pub(crate) pool_fallback_reason: Option<String>,
+    /// The Vibex session this launch serves. Session-scoped environment values
+    /// — the ones a projected dynamic request header references — are filled
+    /// from it, so a launch that serves no single session carries none.
+    pub(crate) session_id: Option<&'a VibexSessionId>,
 }
 
 /// Applies a model at the process boundary when the Agent cannot select it as
@@ -7843,6 +7847,7 @@ impl AcpRuntimeSwitchBridge {
                 purpose: AcpProcessPurpose::Session,
                 process_strategy_effective: context.process_strategy_effective,
                 pool_fallback_reason: context.pool_fallback_reason,
+                session_id: Some(&intent.session_id),
             })
             .await?;
         self.prepared_processes
@@ -11015,6 +11020,7 @@ impl AcpRuntimeClient {
                     purpose: AcpProcessPurpose::Probe,
                     process_strategy_effective: AcpProcessStrategy::PerSession,
                     pool_fallback_reason: None,
+                    session_id: None,
                 },
                 Some(process_args),
                 materialized_env,
@@ -12068,7 +12074,7 @@ impl AcpRuntimeClient {
                 // Resolve the actual environment exactly once. The resulting values
                 // are passed to the child only; the snapshot keeps reference metadata.
                 let ProcessEnvironmentMaterialization {
-                    env_overlays,
+                    mut env_overlays,
                     projection,
                 } = self.resolve_env_overlays_for_profile_with_projection(
                     &profile,
@@ -12088,6 +12094,20 @@ impl AcpRuntimeClient {
                             .map(|projection| projection.process_args.as_slice()),
                     },
                 )?;
+                // A projected request header may reference the session serving
+                // the process. Only a session-scoped process can carry that
+                // value: a shared one would answer every session with the first
+                // session's id. The value stays child-only — it is deliberately
+                // not part of the spawn snapshot — so two launches of the same
+                // Profile stay one identity while each child still answers with
+                // its own session.
+                for (key, value) in session_scoped_env_overlays(
+                    launch.process_strategy_effective,
+                    launch.session_id,
+                    projection.as_ref(),
+                ) {
+                    upsert_env_overlay(&mut env_overlays, key, value);
+                }
                 (snapshot, env_overlays)
             }
             RuntimeAuthSource::AgentAccount { .. } => {
@@ -12881,6 +12901,7 @@ impl AcpRuntimeClient {
             purpose,
             process_strategy_effective,
             pool_fallback_reason,
+            session_id: _,
         } = launch;
         let agent_id = agent_id.clone();
         let adapter_identity = self.effective_adapter_identity(&agent_id, config)?;
@@ -15112,6 +15133,7 @@ impl AcpRuntimeClient {
                 purpose: AcpProcessPurpose::Session,
                 process_strategy_effective: launch_context.process_strategy_effective,
                 pool_fallback_reason: launch_context.pool_fallback_reason.clone(),
+                session_id: Some(&binding.session_id),
             })
             .await?;
         let selected_model = selected_model_from_binding(binding);
@@ -15164,6 +15186,7 @@ impl AcpRuntimeClient {
                             purpose: AcpProcessPurpose::Session,
                             process_strategy_effective: launch_context.process_strategy_effective,
                             pool_fallback_reason: None,
+                            session_id: Some(&binding.session_id),
                         })
                         .await?;
                     self.acquire_attachment(
@@ -16226,6 +16249,30 @@ fn upsert_env_overlay(overlays: &mut Vec<(String, String)>, key: String, value: 
     }
 }
 
+/// The environment a projected dynamic request header resolves through.
+///
+/// A dynamic header names a value the session owns, so it may only ride a
+/// process that serves exactly that session. A pooled process, or a launch
+/// that serves no session at all, yields nothing: a shared child would answer
+/// every session with whichever id spawned it first.
+fn session_scoped_env_overlays(
+    process_strategy: AcpProcessStrategy,
+    session_id: Option<&VibexSessionId>,
+    projection: Option<&vibex_config_switch::ResolvedAgentProviderProjection>,
+) -> Vec<(String, String)> {
+    if process_strategy != AcpProcessStrategy::PerSession {
+        return Vec::new();
+    }
+    let (Some(session_id), Some(projection)) = (session_id, projection) else {
+        return Vec::new();
+    };
+    projection
+        .session_env_keys
+        .iter()
+        .map(|key| (key.clone(), session_id.to_string()))
+        .collect()
+}
+
 #[cfg(test)]
 fn project_claude_provider_env(
     profile: &ProviderProfile,
@@ -16987,7 +17034,18 @@ fn profile_process_options_revision(profile: &ProviderProfile) -> Option<String>
         .map(|headers| {
             headers
                 .into_iter()
-                .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_string())))
+                .filter_map(|(key, value)| match &value {
+                    Value::String(literal) => Some((key, literal.clone())),
+                    // A dynamic header is hashed by the variable it references,
+                    // under a marker no literal value can produce, so switching
+                    // a header between literal and dynamic always moves the
+                    // fingerprint.
+                    Value::Object(fields) => fields
+                        .get("variable")
+                        .and_then(Value::as_str)
+                        .map(|variable| (key, format!("\u{0}variable:{variable}"))),
+                    _ => None,
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -17429,6 +17487,7 @@ async fn launch_agent_auth_process(
         purpose: AcpProcessPurpose::Authentication,
         process_strategy_effective: AcpProcessStrategy::PerSession,
         pool_fallback_reason: None,
+        session_id: None,
     };
     let (_, materialization) = client.process_launch_materialization(&launch)?;
     let effective_args = materialization.snapshot.args.clone();
@@ -17638,6 +17697,7 @@ async fn probe_runtime_session_configs_with_config(
                 purpose: AcpProcessPurpose::Probe,
                 process_strategy_effective: AcpProcessStrategy::PerSession,
                 pool_fallback_reason: None,
+                session_id: None,
             },
             None,
             materialized_env,
@@ -17780,6 +17840,7 @@ async fn probe_copilot_runtime_session_once(
                 purpose: AcpProcessPurpose::Probe,
                 process_strategy_effective: AcpProcessStrategy::PerSession,
                 pool_fallback_reason: None,
+                session_id: None,
             },
             None,
             materialized_env,
@@ -18262,6 +18323,7 @@ impl AcpClient for AcpRuntimeClient {
                 purpose: AcpProcessPurpose::Session,
                 process_strategy_effective: effective_strategy,
                 pool_fallback_reason: fallback_reason,
+                session_id: Some(&request.session_id),
             })
             .await?;
         let attachment = self
@@ -35675,6 +35737,7 @@ for line in sys.stdin:
                 purpose: AcpProcessPurpose::Session,
                 process_strategy_effective: AcpProcessStrategy::PerSession,
                 pool_fallback_reason: None,
+                session_id: None,
             })
             .await
             .unwrap();
@@ -35763,6 +35826,7 @@ for line in sys.stdin:
                 purpose: AcpProcessPurpose::Session,
                 process_strategy_effective: AcpProcessStrategy::PerProfilePool,
                 pool_fallback_reason: None,
+                session_id: None,
             }),
         )
         .await
@@ -37832,6 +37896,58 @@ for line in sys.stdin:
         assert_eq!(
             model_substitution_notice_text("deepseek-v4.1-flash", "deepseek-flash"),
             "DeepSeek Harness replaced Model \"deepseek-v4.1-flash\" with \"deepseek-flash\": the projected route no longer lists the requested Model"
+        );
+    }
+
+    #[test]
+    fn dynamic_header_environment_only_rides_a_session_scoped_process() {
+        let session_id = VibexSessionId::new();
+        let projection = vibex_config_switch::ResolvedAgentProviderProjection {
+            binding_id: vibex_core::AgentModelProviderBindingId::new(),
+            non_secret_env: BTreeMap::new(),
+            secret_env: Vec::new(),
+            overlay_root: std::path::PathBuf::from("overlay-root"),
+            overlay_files: Vec::new(),
+            process_args: Vec::new(),
+            session_config: Vec::new(),
+            effective_model: Some("model-a".to_string()),
+            switch_behavior: vibex_core::ProviderSwitchBehavior::RestartAndResume,
+            fingerprint: "sha256:dynamic-headers".to_string(),
+            session_env_keys: vec!["VIBEX_SESSION_ID".to_string()],
+        };
+
+        assert_eq!(
+            session_scoped_env_overlays(
+                AcpProcessStrategy::PerSession,
+                Some(&session_id),
+                Some(&projection),
+            ),
+            vec![("VIBEX_SESSION_ID".to_string(), session_id.to_string())]
+        );
+        // A shared process would answer every session with the first id.
+        assert!(
+            session_scoped_env_overlays(
+                AcpProcessStrategy::PerProfilePool,
+                Some(&session_id),
+                Some(&projection),
+            )
+            .is_empty()
+        );
+        // A launch that serves no session has no value to offer.
+        assert!(
+            session_scoped_env_overlays(AcpProcessStrategy::PerSession, None, Some(&projection))
+                .is_empty()
+        );
+        // A projection that references nothing dynamic contributes nothing.
+        let mut static_projection = projection.clone();
+        static_projection.session_env_keys.clear();
+        assert!(
+            session_scoped_env_overlays(
+                AcpProcessStrategy::PerSession,
+                Some(&session_id),
+                Some(&static_projection),
+            )
+            .is_empty()
         );
     }
 }

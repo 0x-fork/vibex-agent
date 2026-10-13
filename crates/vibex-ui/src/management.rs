@@ -301,6 +301,15 @@ impl AgentProviderBindingEditorState {
         self.capability.as_ref()?.fixed_endpoint()
     }
 
+    /// Whether the selected Agent's projection carries user-configured request
+    /// headers. The Provider editor only offers the rows where the Agent has a
+    /// config surface to write them into.
+    pub fn supports_request_headers(&self) -> bool {
+        self.capability
+            .as_ref()
+            .is_some_and(|capability| capability.supports_request_headers())
+    }
+
     pub fn credential_surface(&self) -> ProjectionCredentialSurface {
         use vibex_core::AgentProjectionFormControl as Control;
         if self.shows(Control::ApiKey) {

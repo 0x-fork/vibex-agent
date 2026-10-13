@@ -392,6 +392,31 @@ environment key and the final ACP authentication decision.
 - Manager tests assert the fork cut anchors to the last identified assistant segment at or before the requested sequence, that an anonymous segment yields no cut, and that the fork projection still drops provider correlation ids.
 - The typed projector matrix asserts the private `settings.yaml` and `cordis.patch.yml`, `DSH_HOME`, and Vibex-scoped credential environment boundary.
 
+## Scenario: Provider Request Headers And Session Variables
+
+### 1. Scope / Trigger
+
+- Trigger: the Provider editor's request-header rows (name + value) carry a Profile's headers into the Agent's model requests, and a value may be a built-in dynamic variable rather than a literal. The concrete case is OpenCode Go, whose endpoint rejects a request without a stable per-conversation `x-opencode-session` header; a Vibex Profile expresses that as the built-in `session_id` variable.
+
+### 2. Contracts
+
+- Persist rows in the legacy `headerOverrideJson` Provider option: a JSON object keyed by header name whose value is a string (literal) or `{"variable":"session_id"}` (dynamic). The Profile sync and the editor accept exactly those two shapes and ignore anything else, so a hand-edited option never becomes a header the user never configured. Header names are HTTP field tokens, unique case-insensitively, at most 32 rows; a rejected save names the row and keeps the dialog open.
+- Header values are literal or dynamic — never credentials. Do not map a sensitive-looking value onto the Profile credential the way the pre-header-era sync did; the credential keeps its own `apiKeyEnv` / `apiKey` surface, and a `SecretReference` header is skipped by projections rather than repeated as a header.
+- The built-in variable set is typed in `ModelProviderHeaderVariable`; each entry owns its stable wire id (`session_id`), its environment key (`VIBEX_SESSION_ID`), and a projection spelling per Agent. Adding a variable means adding those three, not a string at a call site.
+- Fill a session variable at launch, not in the overlay file: the projection names the environment keys it references through `session_env_keys`, and the ACP launch writes each key with the Vibex session id of the process it is spawning. Fill them only when the effective process strategy is `PerSession` — a pooled process would answer every session with the first session's id — and only when the launch serves a session. The value is child-only: it is deliberately excluded from the spawn snapshot, so two sessions of one Profile keep one process identity and a profile-refresh comparison never sees a stale snapshot.
+- DeepSeek Harness writes literal headers to both `settings.yaml` and `cordis.patch.yml`. A dynamic header travels only through the Cordis home patch, spelled `!!js process.env.<KEY>`: `settings.yaml` is read as plain YAML by the bundled runtime's own loader, which would send the expression text itself, while the Cordis loader evaluates `!!js` on every launch (verified on the bundled `0.1.5` and `0.2.0` runtimes). Because `serde_yaml` cannot emit a secondary (`!!`) tag, the writer emits the reserved `VIBEX_DYNAMIC_HEADER_ENV_` plain-scalar placeholder and expands it after encoding; a placeholder not followed by an environment key fails the projection instead of reaching the Agent.
+- OpenCode writes headers to `provider.<id>.options.headers`; a dynamic value is spelled `{env:<KEY>}`, the same substitution OpenCode already applies to the projected credential.
+- The header fingerprint is part of the projection fingerprint whenever a Profile declares headers, so adding, removing, or re-spelling one relaunches the Agent instead of leaving a process built from the previous header set.
+- The editor offers one-click common headers (`x-opencode-session` bound to `session_id`, `User-Agent`, `HTTP-Referer`, `X-Title`), imports a JSON object whose values are strings or `{"variable":...}`, and copies the rows back in the same shape. The copy action tolerates unfinished rows; save does not. The section appears only where `AgentProviderProjectionCapability::supports_request_headers` holds — DeepSeek Harness and OpenCode — so no other Agent stores rows its own projection never writes.
+
+### 3. Tests Required
+
+- Core tests assert the header value round-trips as `{"type":"dynamic_variable","value":"session_id"}`, that `dynamic_variable_env_keys` de-duplicates and orders keys, and that profile validation rejects duplicate names and non-token names.
+- DB tests assert the legacy override maps string values to literals and `{"variable":...}` values to dynamic variables while skipping unknown shapes.
+- Projection tests assert a Harness route carries a literal header in both `settings.yaml` and `cordis.patch.yml`, carries a dynamic header as `!!js process.env.VIBEX_SESSION_ID` only in the home patch, and that the plan names `VIBEX_SESSION_ID` in `session_env_keys`.
+- Projection tests assert an OpenCode route spells a dynamic header as `{env:VIBEX_SESSION_ID}` in the inline provider config and that its plan names the same key.
+- Runtime tests assert a session-scoped launch resolves the session environment from the session id while a pooled or session-less launch resolves none, and that the editor's override parser round-trips literals and variables and ignores unknown shapes.
+
 ## Scenario: Declared Model Context And Output Limits
 
 ### 1. Scope / Trigger

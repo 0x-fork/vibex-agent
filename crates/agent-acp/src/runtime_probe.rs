@@ -483,6 +483,7 @@ impl AcpRuntimeClient {
                         purpose: AcpProcessPurpose::Probe,
                         process_strategy_effective: strategy,
                         pool_fallback_reason: fallback,
+                        session_id: None,
                     },
                     Some(process_args),
                     Some(env),
@@ -1538,6 +1539,7 @@ mod tests {
             effective_model: Some("target-model".to_string()),
             switch_behavior: ProviderSwitchBehavior::RestartAndResume,
             fingerprint: "sha256:0123456789abcdef".to_string(),
+            session_env_keys: Vec::new(),
         };
         let session = json!({"models": {"availableModels": [{"modelId": "target-model"}]}});
         let fact =
@@ -1562,6 +1564,7 @@ mod tests {
             effective_model: Some("target-model".to_string()),
             switch_behavior: ProviderSwitchBehavior::RestartAndResume,
             fingerprint: "sha256:0123456789abcdef".to_string(),
+            session_env_keys: Vec::new(),
         };
         let fact = effective_provider_fact(
             &json!({"endpoint": "https://profile.example"}),
@@ -1686,6 +1689,7 @@ mod tests {
             effective_model: Some("target-model".to_string()),
             switch_behavior: ProviderSwitchBehavior::RestartAndResume,
             fingerprint: "sha256:crow".to_string(),
+            session_env_keys: Vec::new(),
         };
         assert_eq!(
             materialized_probe_process_args("crow-cli", &config, Some(&crow_projection)),

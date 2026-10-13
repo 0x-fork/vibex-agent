@@ -12,13 +12,14 @@ use vibex_core::{
     AgentRuntimeResourcePolicy, AgentRuntimeRouteKey, AgentRuntimeVersionIdentity,
     AgentVersionSource, ModelProviderCatalogEntry, ModelProviderCredentialReference,
     ModelProviderEndpoint, ModelProviderEndpointKind, ModelProviderHeaderReference,
-    ModelProviderHeaderValue, ModelProviderProfile, ModelProviderProfileId,
-    ModelProviderProfileStatus, ModelProviderProxyPolicy, ProjectionDescriptorMatch,
-    ProjectionEvidenceState, ProjectionSecretReference, ProjectionVerificationState,
-    ProviderConfiguredModel, ProviderModelWireApi, ProviderProfile, ProviderProfileId,
-    ProviderProfileStatus, ProviderSecretKind, ProviderSecretSetupState, TransportKind, VibexError,
-    VibexResult, WIRE_PROTOCOL_ANTHROPIC_MESSAGES, WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
-    WIRE_PROTOCOL_OPENAI_RESPONSES, acp_agent_catalog_entries, builtin_agent_definitions,
+    ModelProviderHeaderValue, ModelProviderHeaderVariable, ModelProviderProfile,
+    ModelProviderProfileId, ModelProviderProfileStatus, ModelProviderProxyPolicy,
+    ProjectionDescriptorMatch, ProjectionEvidenceState, ProjectionSecretReference,
+    ProjectionVerificationState, ProviderConfiguredModel, ProviderModelWireApi, ProviderProfile,
+    ProviderProfileId, ProviderProfileStatus, ProviderSecretKind, ProviderSecretSetupState,
+    TransportKind, VibexError, VibexResult, WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, WIRE_PROTOCOL_OPENAI_RESPONSES,
+    acp_agent_catalog_entries, builtin_agent_definitions,
 };
 
 use super::{
@@ -1036,7 +1037,7 @@ fn map_legacy_projection_records(
             .or_else(|| Some(legacy.kind.to_string())),
         endpoints: legacy_model_provider_endpoints(legacy),
         proxy_policy: ModelProviderProxyPolicy::InheritSystem,
-        headers: legacy_headers(legacy, &credentials),
+        headers: legacy_headers(legacy),
         credentials,
         configured_models: legacy_model_catalog(legacy),
         default_model_id: legacy.default_model.clone(),
@@ -1668,11 +1669,17 @@ fn legacy_agent_model_id(profile: &ProviderProfile, provider_model_id: &str) -> 
         .unwrap_or_else(|| provider_model_id.to_string())
 }
 
-fn legacy_headers(
-    profile: &ProviderProfile,
-    credentials: &[ModelProviderCredentialReference],
-) -> Vec<ModelProviderHeaderReference> {
-    let Some(raw) = provider_option(profile, "headerOverrideJson") else {
+/// The request headers a legacy Profile override declares.
+///
+/// The override is a JSON object keyed by header name. A string is a literal
+/// value; an object of the form `{"variable":"session_id"}` is a per-session
+/// value the projection leaves for the runtime to fill. Anything else is
+/// ignored rather than guessed at, so a hand-edited option cannot turn into a
+/// header the user never configured.
+const LEGACY_HEADER_OVERRIDE_OPTION_KEY: &str = "headerOverrideJson";
+
+fn legacy_headers(profile: &ProviderProfile) -> Vec<ModelProviderHeaderReference> {
+    let Some(raw) = provider_option(profile, LEGACY_HEADER_OVERRIDE_OPTION_KEY) else {
         return Vec::new();
     };
     let Some(object) = serde_json::from_str::<serde_json::Value>(&raw)
@@ -1684,24 +1691,31 @@ fn legacy_headers(
     object
         .into_iter()
         .filter_map(|(name, value)| {
-            let value = value.as_str()?.to_string();
-            let sensitive = looks_sensitive(&name) || looks_sensitive(&value);
-            let header_value = if sensitive {
-                let credential_id = credentials
-                    .first()
-                    .map(|credential| credential.id.clone())?;
-                ModelProviderHeaderValue::SecretReference(credential_id)
-            } else {
-                ModelProviderHeaderValue::NonSecretLiteral(value)
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let (value, redacted_hint) = match &value {
+                serde_json::Value::String(literal) => (
+                    ModelProviderHeaderValue::NonSecretLiteral(literal.clone()),
+                    "non-secret header",
+                ),
+                serde_json::Value::Object(fields) => {
+                    let variable = fields
+                        .get("variable")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(ModelProviderHeaderVariable::from_id)?;
+                    (
+                        ModelProviderHeaderValue::DynamicVariable(variable),
+                        "session variable",
+                    )
+                }
+                _ => return None,
             };
             Some(ModelProviderHeaderReference {
                 name,
-                value: header_value,
-                redacted_hint: if sensitive {
-                    "Secret reference".to_string()
-                } else {
-                    "non-secret header".to_string()
-                },
+                value,
+                redacted_hint: redacted_hint.to_string(),
             })
         })
         .collect()
@@ -1933,20 +1947,6 @@ fn db_to_bool(value: i64) -> bool {
     value != 0
 }
 
-fn looks_sensitive(value: &str) -> bool {
-    let normalized = value.to_ascii_lowercase();
-    [
-        "key",
-        "token",
-        "secret",
-        "password",
-        "authorization",
-        "cookie",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-}
-
 fn to_sql_decode_error(error: VibexError) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
 }
@@ -1960,7 +1960,8 @@ mod tests {
     };
     use vibex_core::{
         ModelProviderEndpoint, ProviderBindingMetadata, ProviderConfiguredModel, ProviderKind,
-        ProviderModelWireApi, ProviderSecretBackend, ProviderSecretReference, RequestId,
+        ProviderModelWireApi, ProviderOptions, ProviderSecretBackend, ProviderSecretReference,
+        RequestId,
     };
 
     fn schema_through(conn: &mut Connection, version: i64) {
@@ -2338,6 +2339,50 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(restored.configured_models, saved.binding.configured_models);
+    }
+
+    #[test]
+    fn legacy_header_override_parses_literals_and_dynamic_variables() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+        profile.id = ProviderProfileId::new();
+        profile.status = ProviderProfileStatus::Enabled;
+        profile.provider_options = ProviderOptions {
+            schema_version: 1,
+            entries: vec![ProviderBindingMetadata {
+                key: "headerOverrideJson".to_string(),
+                value: serde_json::json!({
+                    "x-opencode-session": {"variable": "session_id"},
+                    "User-Agent": "vibex/1.0",
+                    "ignored": 7,
+                    "unknown-variable": {"variable": "not_a_variable"},
+                })
+                .to_string(),
+            }],
+        };
+        ProviderProfileRepository::insert(&conn, &profile).unwrap();
+
+        let saved = ProviderProjectionCompatibilityRepository::sync_legacy_profile(&conn, &profile)
+            .unwrap();
+        assert_eq!(
+            saved.model_provider.headers,
+            vec![
+                ModelProviderHeaderReference {
+                    name: "User-Agent".to_string(),
+                    value: ModelProviderHeaderValue::NonSecretLiteral("vibex/1.0".to_string()),
+                    redacted_hint: "non-secret header".to_string(),
+                },
+                ModelProviderHeaderReference {
+                    name: "x-opencode-session".to_string(),
+                    value: ModelProviderHeaderValue::DynamicVariable(
+                        ModelProviderHeaderVariable::SessionId,
+                    ),
+                    redacted_hint: "session variable".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]

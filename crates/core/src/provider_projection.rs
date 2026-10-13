@@ -72,6 +72,14 @@ const MAX_DISPLAY_NAME_LEN: usize = 160;
 const MAX_MODEL_COUNT: usize = 512;
 const MAX_ENV_COUNT: usize = 256;
 const MAX_ARGS_COUNT: usize = 256;
+const MAX_HEADER_COUNT: usize = 32;
+const MAX_HEADER_NAME_LEN: usize = 256;
+const MAX_HEADER_LITERAL_LEN: usize = 8192;
+
+/// Whether a byte may appear in an HTTP header field name (RFC 9110 token).
+fn is_header_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,11 +117,59 @@ pub enum ModelProviderProxyPolicy {
     Endpoint(String),
 }
 
+/// A per-session value a Provider request header can carry instead of a
+/// literal.
+///
+/// The value is filled by the runtime that owns the Agent process, at the
+/// moment the request leaves it, so one Provider Profile still describes every
+/// session it serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelProviderHeaderVariable {
+    /// The Vibex session whose turns the Agent process is serving.
+    SessionId,
+}
+
+impl ModelProviderHeaderVariable {
+    pub const ALL: [Self; 1] = [Self::SessionId];
+
+    /// The stable identifier the Provider editor, the persisted override, and
+    /// every projection share.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::SessionId => "session_id",
+        }
+    }
+
+    /// The environment key a projection references the value through. The ACP
+    /// runtime fills it from the session that owns the Agent process.
+    pub const fn env_key(self) -> &'static str {
+        match self {
+            Self::SessionId => "VIBEX_SESSION_ID",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|variable| variable.id() == id)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ModelProviderHeaderValue {
     NonSecretLiteral(String),
     SecretReference(RequestId),
+    /// A value the runtime fills from the session it is serving.
+    DynamicVariable(ModelProviderHeaderVariable),
+}
+
+impl ModelProviderHeaderValue {
+    pub const fn dynamic_variable(&self) -> Option<ModelProviderHeaderVariable> {
+        match self {
+            Self::DynamicVariable(variable) => Some(*variable),
+            Self::NonSecretLiteral(_) | Self::SecretReference(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +178,21 @@ pub struct ModelProviderHeaderReference {
     pub name: String,
     pub value: ModelProviderHeaderValue,
     pub redacted_hint: String,
+}
+
+impl ModelProviderHeaderReference {
+    /// The environment keys a launch must fill for this Profile's dynamic
+    /// headers, in stable order and without duplicates.
+    pub fn dynamic_variable_env_keys(headers: &[Self]) -> Vec<String> {
+        let mut keys = headers
+            .iter()
+            .filter_map(|header| header.value.dynamic_variable())
+            .map(|variable| variable.env_key().to_string())
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
 }
 
 /// Provider-side model metadata. Wire protocol and SDK adapter deliberately
@@ -332,6 +403,42 @@ impl ModelProviderProfile {
             "model_provider_credential_duplicate",
             "model provider credential ids must be unique",
         )?;
+        if self.headers.len() > MAX_HEADER_COUNT {
+            return Err(VibexError::validation(
+                "model_provider_header_limit_exceeded",
+                "model provider profile contains too many request headers",
+            ));
+        }
+        let mut header_names = BTreeSet::new();
+        for header in &self.headers {
+            let name = header.name.trim();
+            if name.is_empty()
+                || name.len() > MAX_HEADER_NAME_LEN
+                || !name.bytes().all(is_header_name_byte)
+            {
+                return Err(VibexError::validation(
+                    "model_provider_header_invalid",
+                    "model provider request header names must be non-empty HTTP field names",
+                )
+                .with_diagnostic("headerName", header.name.as_str()));
+            }
+            if !header_names.insert(name.to_ascii_lowercase()) {
+                return Err(VibexError::validation(
+                    "model_provider_header_duplicate",
+                    "model provider request header names must be unique",
+                )
+                .with_diagnostic("headerName", name));
+            }
+            if let ModelProviderHeaderValue::NonSecretLiteral(value) = &header.value
+                && value.len() > MAX_HEADER_LITERAL_LEN
+            {
+                return Err(VibexError::validation(
+                    "model_provider_header_value_invalid",
+                    "model provider request header value exceeds the supported length",
+                )
+                .with_diagnostic("headerName", name));
+            }
+        }
         if let Some(default_model_id) = self.default_model_id.as_deref()
             && !self
                 .configured_models
@@ -1220,6 +1327,24 @@ impl AgentProviderProjectionCapability {
         }
     }
 
+    /// Whether the projection carries user-configured request headers.
+    ///
+    /// Only the Agents whose projected config owns a header map read them —
+    /// the DeepSeek Harness route and OpenCode's inline provider. Every other
+    /// Agent's projection has no place to write one, so the Provider editor
+    /// hides the rows instead of storing headers the request never carries.
+    pub fn supports_request_headers(&self) -> bool {
+        let owns_headers = |control: &AgentProviderControl| match control {
+            AgentProviderControl::ManagedConfigOverlay { strategy } => matches!(
+                strategy,
+                ConfigOverlayStrategy::DeepseekHarnessSettingsYaml
+                    | ConfigOverlayStrategy::OpenCodeInlineProvider
+            ),
+            _ => false,
+        };
+        owns_headers(&self.provider_control)
+    }
+
     pub fn from_resolution(
         identity: &AgentRuntimeVersionIdentity,
         resolution: &AgentProviderProjectionResolution,
@@ -1427,6 +1552,11 @@ pub struct AgentProviderProjectionPlan {
     pub fingerprint: String,
     pub preview: AgentProviderProjectionPreview,
     pub diagnostics: Vec<ProviderBindingMetadata>,
+    /// Environment keys whose value is the current Vibex session identity,
+    /// referenced by the projected route's dynamic request headers. The launch
+    /// fills them from the session that owns the Agent process and only when
+    /// that process is session-scoped.
+    pub session_env_keys: Vec<String>,
 }
 
 impl fmt::Debug for AgentProviderProjectionPlan {
@@ -1458,6 +1588,7 @@ impl fmt::Debug for AgentProviderProjectionPlan {
             .field("switch_behavior", &self.switch_behavior)
             .field("fingerprint", &self.fingerprint)
             .field("diagnostics", &self.diagnostics)
+            .field("session_env_keys", &self.session_env_keys)
             .finish()
     }
 }
@@ -2034,6 +2165,62 @@ mod tests {
         assert_eq!(
             profile.validate().unwrap_err().code,
             "model_provider_endpoint_protocol_invalid"
+        );
+    }
+
+    #[test]
+    fn provider_header_references_validate_and_round_trip_dynamic_variables() {
+        let mut profile = ModelProviderProfile {
+            id: ModelProviderProfileId::new(),
+            legacy_provider_profile_id: None,
+            display_name: "Header gateway".to_string(),
+            vendor_hint: None,
+            endpoints: Vec::new(),
+            proxy_policy: ModelProviderProxyPolicy::InheritSystem,
+            credentials: Vec::new(),
+            configured_models: Vec::new(),
+            default_model_id: None,
+            headers: vec![
+                ModelProviderHeaderReference {
+                    name: "x-opencode-session".to_string(),
+                    value: ModelProviderHeaderValue::DynamicVariable(
+                        ModelProviderHeaderVariable::SessionId,
+                    ),
+                    redacted_hint: "session variable".to_string(),
+                },
+                ModelProviderHeaderReference {
+                    name: "User-Agent".to_string(),
+                    value: ModelProviderHeaderValue::NonSecretLiteral("vibex/1.0".to_string()),
+                    redacted_hint: "non-secret header".to_string(),
+                },
+            ],
+            status: ModelProviderProfileStatus::Enabled,
+            revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            deleted_at_ms: None,
+        };
+        profile.validate().unwrap();
+        assert_eq!(
+            ModelProviderHeaderReference::dynamic_variable_env_keys(&profile.headers),
+            vec!["VIBEX_SESSION_ID".to_string()]
+        );
+        let encoded = serde_json::to_string(&profile.headers).unwrap();
+        assert!(encoded.contains("\"type\":\"dynamic_variable\""));
+        assert!(encoded.contains("\"value\":\"session_id\""));
+        let decoded: Vec<ModelProviderHeaderReference> = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, profile.headers);
+
+        profile.headers.push(profile.headers[0].clone());
+        assert_eq!(
+            profile.validate().unwrap_err().code,
+            "model_provider_header_duplicate"
+        );
+        profile.headers.pop();
+        profile.headers[0].name = "x opencode session".to_string();
+        assert_eq!(
+            profile.validate().unwrap_err().code,
+            "model_provider_header_invalid"
         );
     }
 
