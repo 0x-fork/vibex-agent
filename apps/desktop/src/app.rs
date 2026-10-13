@@ -1450,17 +1450,13 @@ enum ComposerQueueDispatchBehavior {
 
 /// The queued message the rest of the pre-send queue is waiting on.
 ///
-/// The queue advances one message at a time: after an entry leaves it, no later
-/// entry is dispatched until the turn that entry started is observed to have
-/// completed normally.
+/// The queue advances one message at a time: after an entry leaves it, the
+/// entries behind it wait while that message's turn still occupies its session,
+/// and only then may the next entry leave.
 #[derive(Debug, Clone)]
 struct ComposerQueueDispatchFence {
     session_id: VibexSessionId,
     message_id: u64,
-    /// The session revision the dispatch left behind. A turn is only judged once
-    /// the session has moved past it, so a probe that still describes the turn
-    /// before this one cannot release the queue.
-    session_updated_at_ms: i64,
     /// A command runs no conversational turn of its own, so its submission is
     /// the boundary that releases the queue.
     awaits_turn: bool,
@@ -7245,44 +7241,29 @@ fn composer_queue_behavior_is_explicit(behavior: ComposerQueueDispatchBehavior) 
 /// back.
 ///
 /// The queue is one ordered list and advances one message at a time: after an
-/// entry leaves it, no later entry may be dispatched until that message's turn
-/// has been observed to end normally. `dispatched_at_ms` is the session revision
-/// the dispatch left behind, so an answer that still describes the turn before
-/// this one cannot release the queue.
+/// entry leaves it, the entries behind it wait while that message's turn still
+/// occupies its session — a local submission in flight, a running or parked
+/// Agent, or a session that has not settled yet. The judgment is the session's
+/// own state, never an asynchronous probe: a fence the workbench cannot resolve
+/// would strand every message behind it, including messages of other sessions,
+/// which is exactly what the queue must never do. A settled session
+/// (`Idle`/`Error`), a closed or archived one, and one the workbench no longer
+/// tracks all stop holding the queue.
 fn composer_queue_fence_waits(
     turn_pending: bool,
     session_state: Option<AgentSessionState>,
-    session_updated_at_ms: Option<i64>,
-    dispatched_at_ms: i64,
-    cached_turn_status: Option<Option<bool>>,
 ) -> bool {
     if turn_pending {
         return true;
     }
-    let (Some(state), Some(session_updated_at_ms)) = (session_state, session_updated_at_ms) else {
-        // The queue cannot judge a session the workbench no longer tracks.
-        return false;
-    };
-    if matches!(
-        state,
-        AgentSessionState::Closed | AgentSessionState::Archived
-    ) {
-        // A closed session can no longer produce the completion the queue is
-        // waiting for, so it stops holding the queue.
-        return false;
+    match session_state {
+        Some(AgentSessionState::Idle | AgentSessionState::Error) => false,
+        Some(AgentSessionState::Closed | AgentSessionState::Archived) => false,
+        // Running, `NeedsInput` and Initializing all mean a turn is, or is
+        // about to be, occupying the session.
+        Some(_) => true,
+        None => false,
     }
-    if session_updated_at_ms <= dispatched_at_ms {
-        // The turn the dispatch asked for has not been observed at all yet.
-        return true;
-    }
-    if !matches!(state, AgentSessionState::Idle | AgentSessionState::Error) {
-        return true;
-    }
-    composer_queue_waits_for_continuation(
-        ComposerQueueDispatchBehavior::Automatic,
-        Some(state),
-        cached_turn_status,
-    )
 }
 
 /// How the timeline should record a queued message that is dispatched now.
@@ -26728,24 +26709,28 @@ impl VibexWorkbench {
     /// unobserved session revision. The probe caches the answer and marks the
     /// waiting queue for re-evaluation on the next frame, so a normal completion
     /// still advances the queue without user action.
+    ///
+    /// Returns whether a verdict is on its way. `false` means nothing can judge
+    /// the boundary right now, which is what lets the queue fall back to the
+    /// session's own state instead of waiting forever.
     fn probe_composer_queue_turn_status(
         &mut self,
         session_id: &VibexSessionId,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let Some(session_updated_at_ms) = self
             .registered_session(session_id.as_str())
             .map(|session| session.updated_at_ms)
         else {
-            return;
+            return false;
         };
         if self
             .cached_auto_continue_turn_status(session_id, session_updated_at_ms)
             .is_some()
         {
-            return;
+            return true;
         }
-        self.probe_auto_continue_turn_status(session_id.clone(), session_updated_at_ms, cx);
+        self.probe_auto_continue_turn_status(session_id.clone(), session_updated_at_ms, cx)
     }
 
     /// Dispatches the head of the pre-send queue when it is ready to leave.
@@ -26829,6 +26814,14 @@ impl VibexWorkbench {
         // front of it.
         let fence_blocks =
             !composer_queue_behavior_is_explicit(behavior) && self.composer_queue_fence_blocks();
+        // An unobserved revision is not proof of a normal completion, so the
+        // queue asks for a verdict. When nothing can judge the boundary right
+        // now, the session's own settled state is the best evidence the queue
+        // has: waiting on a verdict that is not coming would strand every
+        // message behind this one.
+        let waits_for_continuation = waits_for_continuation
+            && !(cached_turn_status.is_none()
+                && !self.probe_composer_queue_turn_status(&session_id, cx));
         if !dispatch_enabled
             || self.agent_action_pending
             || fence_blocks
@@ -26842,25 +26835,13 @@ impl VibexWorkbench {
                 .composer_queue_paused_session_ids
                 .contains(session_id.as_str())
         {
-            // An unobserved revision is not proof of a normal completion: probe
-            // it so a later frame can release the queue once the latest turn is
-            // known. The turn the queue handed over last is asked about the same
-            // way.
-            if waits_for_continuation && cached_turn_status.is_none() {
-                self.probe_composer_queue_turn_status(&session_id, cx);
-            }
-            if fence_blocks {
-                self.probe_composer_queue_fence(cx);
-            }
             return false;
         }
-        let session_updated_at_ms = session.map_or(0, |session| session.updated_at_ms);
         let message = self.composer_queue.remove(index);
         let message_id = message.id;
         self.composer_queue_dispatch_fence = Some(ComposerQueueDispatchFence {
             session_id: message.session_id.clone(),
             message_id,
-            session_updated_at_ms,
             awaits_turn: message.command_invocation.is_none(),
         });
         self.publish_sidebar_invalidation();
@@ -26888,12 +26869,10 @@ impl VibexWorkbench {
     /// Whether the pre-send queue is still waiting for the turn of the message it
     /// handed over last.
     ///
-    /// The queue advances one message at a time: after an entry leaves it, no
-    /// later entry may be dispatched until that message's turn has been observed
-    /// to end normally. A session that is still running, still initializing or
-    /// still waiting on its first snapshot keeps the queue waiting; a session
-    /// that was closed or archived can no longer produce the completion the
-    /// queue is waiting for, so it stops holding the queue.
+    /// The queue advances one message at a time: after an entry leaves it, the
+    /// entries behind it wait while that message's turn still occupies its
+    /// session. The fence never waits on an asynchronous verdict, so a session
+    /// that cannot answer a probe still releases the queue once it settles.
     fn composer_queue_fence_blocks(&self) -> bool {
         let Some(fence) = self.composer_queue_dispatch_fence.as_ref() else {
             return false;
@@ -26901,39 +26880,11 @@ impl VibexWorkbench {
         if !fence.awaits_turn {
             return false;
         }
-        let session = self.registered_session(fence.session_id.as_str());
         composer_queue_fence_waits(
             self.session_turn_pending(&fence.session_id),
-            session.map(|session| session.state),
-            session.map(|session| session.updated_at_ms),
-            fence.session_updated_at_ms,
-            session.and_then(|session| {
-                self.cached_auto_continue_turn_status(&fence.session_id, session.updated_at_ms)
-                    .map(|status| status.ended_normally)
-            }),
+            self.registered_session(fence.session_id.as_str())
+                .map(|session| session.state),
         )
-    }
-
-    /// Asks the authority for the turn outcome the queue fence is waiting on.
-    fn probe_composer_queue_fence(&mut self, cx: &mut Context<Self>) {
-        let Some(fence) = self.composer_queue_dispatch_fence.clone() else {
-            return;
-        };
-        if !fence.awaits_turn || self.session_turn_pending(&fence.session_id) {
-            return;
-        }
-        let Some(session) = self.registered_session(fence.session_id.as_str()) else {
-            return;
-        };
-        if session.updated_at_ms <= fence.session_updated_at_ms
-            || !matches!(
-                session.state,
-                AgentSessionState::Idle | AgentSessionState::Error
-            )
-        {
-            return;
-        }
-        self.probe_composer_queue_turn_status(&fence.session_id, cx);
     }
 
     /// Re-evaluates the pre-send queue after a turn outcome became known.
@@ -93397,84 +93348,44 @@ mod tests {
         ));
     }
 
-    /// The queue advances one message at a time: the entry behind the message
-    /// that was just dispatched waits until that message's turn is observed to
-    /// have ended normally.
+    /// The queue advances one message at a time: the entries behind the message
+    /// that was just dispatched wait while its turn still occupies its session.
+    /// The judgment is the session's own state, so a fence can never be
+    /// stranded by a probe that has not answered.
     #[test]
     fn the_pre_send_queue_waits_for_the_turn_it_handed_over() {
         // The submission itself is still in flight.
         assert!(composer_queue_fence_waits(
             true,
-            Some(AgentSessionState::Idle),
-            Some(10),
-            10,
-            None,
-        ));
-        // The session has not moved past the revision the dispatch left, so the
-        // turn it asked for has not been observed at all.
-        assert!(composer_queue_fence_waits(
-            false,
-            Some(AgentSessionState::Idle),
-            Some(10),
-            10,
-            None,
+            Some(AgentSessionState::Idle)
         ));
         // A turn that is still occupying the Agent holds the queue.
         assert!(composer_queue_fence_waits(
             false,
-            Some(AgentSessionState::Running),
-            Some(11),
-            10,
-            None,
+            Some(AgentSessionState::Running)
         ));
         assert!(composer_queue_fence_waits(
             false,
-            Some(AgentSessionState::Initializing),
-            Some(11),
-            10,
-            None,
+            Some(AgentSessionState::NeedsInput)
         ));
-        // An unobserved revision is not proof of a normal completion.
+        // A session whose turn has not settled yet holds it too.
         assert!(composer_queue_fence_waits(
             false,
-            Some(AgentSessionState::Idle),
-            Some(11),
-            10,
-            None,
+            Some(AgentSessionState::Initializing)
         ));
-        // An abnormal stop keeps waiting for a later normal completion...
-        assert!(composer_queue_fence_waits(
-            false,
-            Some(AgentSessionState::Idle),
-            Some(11),
-            10,
-            Some(Some(false)),
-        ));
-        // ...and only a confirmed normal completion releases the queue.
-        assert!(!composer_queue_fence_waits(
-            false,
-            Some(AgentSessionState::Idle),
-            Some(11),
-            10,
-            Some(Some(true)),
-        ));
-        // A probe that found no conversational turn has nothing to wait for.
-        assert!(!composer_queue_fence_waits(
-            false,
-            Some(AgentSessionState::Idle),
-            Some(11),
-            10,
-            Some(None),
-        ));
-        // A session that can no longer produce that completion stops holding
-        // the queue, and so does one the workbench no longer tracks.
-        for state in [AgentSessionState::Closed, AgentSessionState::Archived] {
-            assert!(
-                !composer_queue_fence_waits(false, Some(state), Some(11), 10, None),
-                "{state:?}"
-            );
+        // A settled session releases the queue, whatever its last turn was:
+        // waiting on a verdict would strand the whole queue behind a session
+        // that cannot answer, and a failed stop is still a turn that is over.
+        for state in [
+            AgentSessionState::Idle,
+            AgentSessionState::Error,
+            AgentSessionState::Closed,
+            AgentSessionState::Archived,
+        ] {
+            assert!(!composer_queue_fence_waits(false, Some(state)), "{state:?}");
         }
-        assert!(!composer_queue_fence_waits(false, None, None, 10, None));
+        // A session the workbench no longer tracks cannot hold the queue.
+        assert!(!composer_queue_fence_waits(false, None));
     }
 
     /// An explicit send is the one gesture that may overtake the queue. A due

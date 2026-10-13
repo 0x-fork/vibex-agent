@@ -613,9 +613,9 @@ selection, text, attachments, optional command, and `scheduledAtMs`.
 `next_queue_message_index(queue, is_editing)` names the one entry the dispatcher
 may hand over — the head, unless it is being edited. One workbench timer checks
 every session, including background sessions. `ComposerQueueDispatchFence`
-remembers the entry that just left the queue (its session, message id, the
-session revision the dispatch left behind, and whether it owes a turn), and
-`composer_queue_fence_waits` decides whether that turn still holds the queue.
+remembers the entry that just left the queue (its session, message id, and
+whether it owes a turn), and `composer_queue_fence_waits` decides from that
+session's own state whether the turn still holds the queue.
 
 ### 3. Contracts
 
@@ -641,14 +641,22 @@ session revision the dispatch left behind, and whether it owes a turn), and
   overtaken by the messages behind it, a due schedule cannot jump the entries in
   front of it — including another session's — and a row being edited holds the
   whole queue until the edit ends.
-- After an entry leaves the queue, a dispatch fence holds the next one until the
-  turn that entry started is observed to end normally: the fenced session must
-  move past the revision the dispatch left, must settle to `Idle`/`Error`, and
-  must have a probed normal completion (or no conversational turn) for that
-  revision. An abnormal stop keeps the queue waiting for a later normal
-  completion. A submission that never landed, or a command that runs no
-  conversational turn of its own, releases the fence rather than stranding the
-  messages behind it, and a `Closed`/`Archived` session stops holding the queue.
+- After an entry leaves the queue, a dispatch fence holds the next one while the
+  turn that entry started still occupies its session: the fence blocks on the
+  local turn-pending flag or a `Running`/`NeedsInput`/`Initializing` session
+  state, and releases the moment that session settles (`Idle`/`Error`), closes,
+  is archived, or leaves the workbench. The fence must never wait on an
+  asynchronous completion verdict: because the queue is global, a fence the
+  workbench cannot resolve would strand every message behind it, including other
+  sessions' messages, so a failed or interrupted stop is still a turn that is
+  over. A submission that never landed, and a command that runs no
+  conversational turn of its own, release the fence outright.
+- An automatic send of an ordinary head still waits for that session's latest
+  turn to be confirmed normal (or absent) instead of risking a send after an
+  abnormal stop — but only while a verdict can actually be obtained. When
+  nothing can judge the boundary, the settled session is the best evidence the
+  queue has, and the queue advances rather than stalling behind a verdict that
+  is not coming.
 - Explicit sends are the one gesture allowed to overtake the queue: the row's
   send-now/steer action promotes the message to the head and its behavior may
   leave the fence behind. A head that carries a deadline is always dispatched as
@@ -688,8 +696,8 @@ session revision the dispatch left behind, and whether it owes a turn), and
 | Countdown is outside 1 second–365 days, overflows, or has minutes/seconds outside 0–59 | Keep the picker open with an inline error |
 | Session is running, initializing, closed, archived, or unavailable | Retain the scheduled message without dispatch |
 | A message sits in front of a due schedule | Retain the schedule and send the head first |
-| The message ahead of a schedule has not completed a turn normally | Retain the schedule until a later normal completion is observed |
-| The session that owes the queue a turn stops abnormally | Keep waiting; never auto-send past it |
+| The turn ahead of a schedule is still running or its submission is in flight | Retain the schedule until that session settles |
+| The session that owes the queue a turn stops abnormally | Release the fence once the session settles; a stopped turn is still over |
 | The fenced submission failed, or was a command with no turn of its own | Release the fence so the queue is not stranded |
 | A row is being edited | Hold the queue, head included, until the edit ends |
 | The reader moves a message in front of a schedule and its session is settled | Send it without waiting for the deadline |
@@ -700,9 +708,9 @@ session revision the dispatch left behind, and whether it owes a turn), and
 
 ### 5. Good / Base / Bad Cases
 
-- Good: a due message waits for every entry in front of it — and for the turn
-  each of them started to end normally — then sends once through the existing
-  queue path, even after the user switches sessions.
+- Good: a due message waits for every entry in front of it — and for each turn
+  those entries started to finish — then sends once through the existing queue
+  path, even after the user switches sessions.
 - Good: a message moved in front of a schedule sends as soon as its session is
   settled, without waiting for the deadline that used to be ahead of it.
 - Base: unscheduled messages keep their Auto/Manual behavior; a due schedule
@@ -711,6 +719,8 @@ session revision the dispatch left behind, and whether it owes a turn), and
   resume send a future deadline early.
 - Bad: let a message behind a schedule leave because its own session is idle, or
   let a due schedule overtake another session's queued entry.
+- Bad: hold the whole queue on an unresolved completion probe, so one error
+  session freezes every other session's messages.
 - Bad: show the manager's `<agent> session` placeholder on a row that is only
   waiting for its scheduled send, or keep that name after the send has landed.
 
@@ -722,12 +732,15 @@ reordering/send-now, draft consumption, the row's countdown shape, the name a
 waiting schedule gives its session, and the persisted-entry round trip, plus
 real dialog keyboard/pointer interaction including invalid input, confirmation,
 dismissal, and removing a schedule. `app.rs` covers the fence's admission
-matrix — pending submission, unmoved revision, running turn, unobserved
-revision, abnormal stop, normal completion, no turn, closed session — and the
-per-behavior admission of `AfterCompletion`, `AfterInterrupt`, `Automatic`,
-`ForceNext` and `Scheduled`. `desktop-model` covers the persisted queue's
-normalization, its bounds, and the UI-state encode/decode round trip. A
-source-level test asserts the row keeps the scheduled mark ahead of the generic
+matrix — pending submission, running turn, parked Agent, initializing session,
+settled/closed/archived/untracked session — and the per-behavior admission of
+`AfterCompletion`, `AfterInterrupt`, `Automatic`, `ForceNext` and `Scheduled`.
+`team_tests.rs` drives the real dispatch path: a due head fires while a
+schedule waits behind it, a settled session releases a fence without any probe,
+and moving an ordinary message in front of a schedule sends it. `desktop-model`
+covers the persisted queue's normalization, its bounds, and the UI-state
+encode/decode round trip. A source-level test asserts the row keeps the
+scheduled mark ahead of the generic
 state indicator, reads its name from the queue, and keeps the pause honored
 where the head is dispatched.
 

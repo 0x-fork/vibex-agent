@@ -390,6 +390,126 @@ fn queued_worker_message() -> ComposerQueueMessage {
     }
 }
 
+/// One message for a pre-send-queue test: an ordinary entry unless `at_ms` gives
+/// it a deadline.
+fn head_queue_message(
+    id: u64,
+    session_id: &VibexSessionId,
+    at_ms: Option<i64>,
+) -> ComposerQueueMessage {
+    ComposerQueueMessage {
+        id,
+        session_id: session_id.clone(),
+        desired_runtime: selection("root-model"),
+        text: format!("queued message {id}"),
+        attachments: Vec::new(),
+        command_invocation: None,
+        scheduled_at_ms: at_ms,
+        mentions: Vec::new(),
+    }
+}
+
+/// The queue hands over its head as soon as the session in front of it is
+/// settled — for a due schedule and for a message the reader moved ahead of one
+/// alike — while a turn that still occupies a session holds it back.
+#[gpui::test]
+fn the_pre_send_queue_sends_its_head_when_the_session_is_settled(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    let now = unix_timestamp_ms();
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            let session_id = session(0).id.clone();
+            // The last turn ended normally and no turn is in flight.
+            workbench.cache_auto_continue_turn_status(
+                &session_id,
+                session(0).updated_at_ms,
+                Some(true),
+                cx,
+            );
+            workbench.composer_queue = vec![
+                head_queue_message(1, &session_id, Some(now - 1_000)),
+                head_queue_message(2, &session_id, Some(now + 60_000)),
+            ];
+            // The due head leaves the queue even though a schedule waits behind
+            // it.
+            assert!(workbench.maybe_dispatch_next_composer_queue_message(
+                None,
+                ComposerQueueDispatchBehavior::Automatic,
+                window,
+                cx,
+            ));
+            assert_eq!(workbench.composer_queue.len(), 1);
+            assert_eq!(workbench.composer_queue[0].id, 2);
+        });
+    });
+}
+
+/// The turn a dispatch handed over is what holds the queue: while it occupies
+/// the session nothing behind it leaves, and a settled session releases it
+/// instead of waiting on an asynchronous completion verdict.
+#[gpui::test]
+fn a_settled_session_releases_the_pre_send_queue_fence(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    let now = unix_timestamp_ms();
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            let session_id = session(0).id.clone();
+            workbench.composer_queue = vec![head_queue_message(1, &session_id, Some(now - 1_000))];
+            workbench.composer_queue_dispatch_fence = Some(ComposerQueueDispatchFence {
+                session_id: session_id.clone(),
+                message_id: 99,
+                awaits_turn: true,
+            });
+            workbench.set_session_turn_pending(&session_id, true);
+            assert!(!workbench.maybe_dispatch_next_composer_queue_message(
+                None,
+                ComposerQueueDispatchBehavior::Automatic,
+                window,
+                cx,
+            ));
+            assert_eq!(workbench.composer_queue.len(), 1);
+
+            // The turn is over. The settled session releases the fence, so the
+            // due schedule fires even though nothing probed its outcome.
+            workbench.set_session_turn_pending(&session_id, false);
+            assert!(workbench.maybe_dispatch_next_composer_queue_message(
+                None,
+                ComposerQueueDispatchBehavior::Automatic,
+                window,
+                cx,
+            ));
+            assert!(workbench.composer_queue.is_empty());
+        });
+    });
+}
+
+/// Moving a message in front of a schedule makes it the head, and a session
+/// that is already settled sends it without waiting for the deadline that used
+/// to stand in front of it.
+#[gpui::test]
+fn moving_a_message_in_front_of_a_schedule_sends_it(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    let now = unix_timestamp_ms();
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            let session_id = session(0).id.clone();
+            workbench.cache_auto_continue_turn_status(
+                &session_id,
+                session(0).updated_at_ms,
+                Some(true),
+                cx,
+            );
+            workbench.composer_queue = vec![
+                head_queue_message(1, &session_id, Some(now + 3_600_000)),
+                head_queue_message(2, &session_id, None),
+            ];
+            workbench.move_composer_queue_message_relative(2, 1, false, window, cx);
+            assert_eq!(workbench.composer_queue.len(), 1);
+            assert_eq!(workbench.composer_queue[0].id, 1);
+        });
+    });
+}
+
 #[gpui::test]
 fn team_root_reconciliation_retains_unloaded_members_and_queued_mentions(cx: &mut TestAppContext) {
     let (workbench, cx, _) = fixture(cx, 3);
