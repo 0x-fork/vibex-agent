@@ -26007,6 +26007,10 @@ impl VibexWorkbench {
 
     /// Sends the queued message that is currently lifted into the composer.
     ///
+    /// A deadline the reader picked in the Composer replaces the entry's own;
+    /// without one the entry keeps the schedule it already carried, so editing
+    /// a scheduled message never turns it into an immediate send.
+    ///
     /// Returns `true` when the submission was handled: either the queued
     /// entry was rewritten in place, or an emptied payload released the edit
     /// back to the queue untouched. `false` means the marker has outlived its
@@ -26029,11 +26033,27 @@ impl VibexWorkbench {
             composer_submission_payload(&raw_text, &self.composer_attachments);
         if text.trim().is_empty() && attachments.is_empty() {
             // An emptied payload cancels the edit: the queued message keeps
-            // its original content instead of being destroyed.
+            // its original content and schedule instead of being destroyed.
             self.composer_queue_edit_in_composer = None;
             cx.notify();
             return true;
         }
+        // A deadline the reader picked while the message sat in the composer
+        // wins; otherwise the queued entry keeps the schedule it already
+        // carried, so an edit never silently turns a scheduled send into an
+        // immediate one.
+        let rescheduled_at_ms = match self
+            .composer_message_schedule()
+            .map(|schedule| schedule.deadline(unix_timestamp_ms()))
+            .transpose()
+        {
+            Ok(at_ms) => at_ms,
+            Err(error) => {
+                self.agent_error = Some(error.into());
+                cx.notify();
+                return true;
+            }
+        };
         let Some(message) = self
             .composer_queue
             .iter_mut()
@@ -26050,9 +26070,9 @@ impl VibexWorkbench {
         message.attachments = attachments;
         message.mentions = composer_mentions(composer_input.read(cx).tokens());
         message.command_invocation = None;
-        // The entry is being edited, not rescheduled; a stale schedule would
-        // either fire the rewrite or reject the send once it ran out.
-        message.scheduled_at_ms = None;
+        if let Some(at_ms) = rescheduled_at_ms {
+            message.scheduled_at_ms = Some(at_ms);
+        }
         composer_input.update(cx, |input, cx| input.set_value("", window, cx));
         self.composer_attachments.clear();
         self.composer_command_entry = None;
@@ -26062,6 +26082,8 @@ impl VibexWorkbench {
         self.reset_composer_history();
         self.mark_composer_queue_for_recheck(&session_id);
         self.composer_queue_changed();
+        // A preserved or newly picked deadline still needs its timer armed.
+        self.start_message_schedule_timer(window, cx);
         cx.notify();
         true
     }
@@ -94078,8 +94100,8 @@ mod tests {
 
     /// Lifting a queued message into an empty Composer and sending it rewrites
     /// the same queue entry in place: the message keeps its slot, keeps the
-    /// queue from advancing past it while it is being edited, and never picks
-    /// up a schedule of its own.
+    /// queue from advancing past it while it is being edited, and keeps the
+    /// deadline it already carried.
     #[gpui::test]
     fn composer_queue_message_edits_in_the_composer_keep_its_queue_slot(cx: &mut TestAppContext) {
         struct QueueEditWorkbenchProbe {
@@ -94165,6 +94187,109 @@ mod tests {
                 workbench.composer_drafts.get(session_id.as_str()).is_none(),
                 "the lifted draft must not resurrect or reschedule itself"
             );
+        });
+    }
+
+    /// Editing a scheduled queued message keeps its deadline: the entry keeps
+    /// waiting for the same time, and only a schedule the reader picked in the
+    /// Composer replaces it.
+    #[gpui::test]
+    fn composer_queue_edit_keeps_the_message_deadline(cx: &mut TestAppContext) {
+        struct QueueEditScheduleProbe {
+            workbench: Entity<VibexWorkbench>,
+        }
+
+        impl Render for QueueEditScheduleProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let (probe, cx) = cx.add_window_view(|window, cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            let workbench =
+                cx.new(|cx| VibexWorkbench::with_initial_state(None, ui_state, None, window, cx));
+            QueueEditScheduleProbe { workbench }
+        });
+        let workbench = probe.read_with(cx, |probe, _| probe.workbench.clone());
+        let selection = SessionRuntimeSelection::provider(
+            AgentId::parse("agent-schedule-edit").unwrap(),
+            ProviderProfileId::parse("provider_schedule_edit").unwrap(),
+            "model-schedule-edit",
+        );
+        let session_id = VibexSessionId::parse("session_queue_schedule_edit").unwrap();
+        let original_deadline = unix_timestamp_ms() + 3_600_000;
+
+        workbench.update_in(cx, |workbench: &mut VibexWorkbench, window, cx| {
+            workbench.composer_queue = vec![ComposerQueueMessage {
+                id: 9,
+                session_id: session_id.clone(),
+                desired_runtime: selection.clone(),
+                text: "scheduled draft".into(),
+                attachments: Vec::new(),
+                command_invocation: None,
+                scheduled_at_ms: Some(original_deadline),
+                mentions: Vec::new(),
+            }];
+            workbench.view_session_id = Some(session_id.clone());
+
+            workbench.begin_composer_queue_edit(9, window, cx);
+            let input = workbench.composer_input.clone().expect("composer input");
+            input.update(cx, |input, cx| {
+                input.set_value("edited scheduled body", window, cx)
+            });
+            assert!(
+                workbench.submit_edited_composer_queue_message(
+                    workbench.composer_queue_edit_in_composer.unwrap(),
+                    window,
+                    cx,
+                ),
+                "the send should be handled by the in-place rewrite"
+            );
+            assert_eq!(
+                workbench.composer_queue[0].scheduled_at_ms,
+                Some(original_deadline),
+                "an edit keeps the scheduled deadline the entry already carried"
+            );
+            assert_eq!(workbench.composer_queue[0].text, "edited scheduled body");
+
+            // A deadline picked while the message sits in the composer wins.
+            workbench.begin_composer_queue_edit(9, window, cx);
+            input.update(cx, |input, cx| {
+                input.set_value("rescheduled body", window, cx)
+            });
+            let content = workbench
+                .composer_input
+                .clone()
+                .expect("composer input")
+                .read(cx)
+                .content();
+            workbench.composer_drafts.save(
+                session_id.as_str(),
+                ComposerDraft {
+                    content,
+                    attachments: Vec::new(),
+                    command_entry: None,
+                    attachment_serial: 0,
+                    schedule: Some(MessageSchedule::After(600)),
+                },
+            );
+            let before = unix_timestamp_ms();
+            assert!(workbench.submit_edited_composer_queue_message(
+                workbench.composer_queue_edit_in_composer.unwrap(),
+                window,
+                cx,
+            ));
+            let rescheduled = workbench.composer_queue[0]
+                .scheduled_at_ms
+                .expect("the picked schedule should replace the deadline");
+            assert!(
+                rescheduled >= before + 600_000 && rescheduled <= unix_timestamp_ms() + 600_000,
+                "the composer's countdown should become the new deadline: {rescheduled}"
+            );
+            assert_eq!(workbench.composer_queue[0].text, "rescheduled body");
         });
     }
 
