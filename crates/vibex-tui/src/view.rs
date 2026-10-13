@@ -2191,13 +2191,15 @@ fn render_management_view(
 /// The right gutter: one tick per turn.
 ///
 /// A tick stands for a turn — one the reader opened — in conversation order, and
-/// the turn the viewport starts on wears the heavier one, so the count of the
-/// reader's conversation and their place in it are the same object, and the rail
-/// is a map of the session rather than of the buffer. Nothing else is drawn
-/// there: a scrollbar in the same columns would be counted as turns, which is
-/// exactly the mistake the rail exists to prevent. When there are more turns
-/// than rows the ticks window around the active one, because an unwindowed rail
-/// would fold many turns onto a single row.
+/// every turn the viewport shows is lit, so the count of the reader's
+/// conversation and their place in it are the same object, and the rail is a map
+/// of the session rather than of the buffer. The turn the viewport starts on
+/// wears the heavier tick: the lit window says what the reader can see, and the
+/// heavier one says where in that window they are. Nothing else is drawn there:
+/// a scrollbar in the same columns would be counted as turns, which is exactly
+/// the mistake the rail exists to prevent. When there are more turns than rows
+/// the ticks window around the active one, because an unwindowed rail would fold
+/// many turns onto a single row.
 fn render_gutter(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTheme) {
     let turns = app.transcript.turn_count();
     let tier = app.glyph_tier();
@@ -2207,6 +2209,11 @@ fn render_gutter(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTh
     }
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows);
 
+    // The window of turns on screen, and the turn it starts on. The marker is
+    // the lit window's first tick whenever the viewport starts on a turn; a
+    // window that opens on the runtime's own startup rows lights from the first
+    // turn down and marks none of them.
+    let lit = app.transcript.visible_turns();
     let active = app.transcript.active_turn();
     // Window the ticks when there are more turns than rows, keeping the active
     // turn visible: an unwindowed rail would fold many turns onto one row.
@@ -2225,6 +2232,19 @@ fn render_gutter(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTh
             continue;
         }
         let is_active = active == Some(turn);
+        let is_lit = lit.as_ref().is_some_and(|turns| turns.contains(&turn));
+        let (glyph, color) = if is_active {
+            (
+                crate::glyphs::timeline_tick_active(tier),
+                theme.roles.accent_user,
+            )
+        } else if is_lit {
+            // A turn the reader can see, but not the one the viewport starts
+            // on: the same light, the lighter mark.
+            (crate::glyphs::timeline_tick(tier), theme.roles.accent_user)
+        } else {
+            (crate::glyphs::timeline_tick(tier), theme.roles.gray_dim)
+        };
         app.regions.turns.push((
             Rect {
                 y: area.y + row as u16,
@@ -2233,18 +2253,7 @@ fn render_gutter(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTh
             },
             turn,
         ));
-        lines.push(Line::from(Span::styled(
-            if is_active {
-                crate::glyphs::timeline_tick_active(tier)
-            } else {
-                crate::glyphs::timeline_tick(tier)
-            },
-            Style::default().fg(if is_active {
-                theme.roles.accent_user
-            } else {
-                theme.roles.gray_dim
-            }),
-        )));
+        lines.push(Line::from(Span::styled(glyph, Style::default().fg(color))));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }

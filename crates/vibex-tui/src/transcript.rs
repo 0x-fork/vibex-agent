@@ -21,6 +21,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    ops::Range,
     time::{Duration, Instant},
 };
 
@@ -335,6 +336,12 @@ pub struct Transcript {
     last_selected: Option<usize>,
     /// Display line the viewport started at in the last frame.
     scroll_offset: usize,
+    /// Rows the viewport held in the last frame.
+    ///
+    /// Kept beside [`Transcript::scroll_offset`], and for the same reason: the
+    /// rail asks which turns are on screen, and the answer is the turns between
+    /// the line the viewport starts at and the last line it holds.
+    viewport_rows: usize,
     /// Counters that make the cache behaviour observable in tests and in the
     /// benchmark harness.
     pub stats: TranscriptStats,
@@ -381,6 +388,7 @@ impl Transcript {
             phase: 0,
             last_selected: None,
             scroll_offset: 0,
+            viewport_rows: 0,
             stats: TranscriptStats::default(),
         }
     }
@@ -750,6 +758,33 @@ impl Transcript {
         self.turn_heads()
             .partition_point(|head| *head <= index)
             .checked_sub(1)
+    }
+
+    /// The turns the viewport shows, for the rail's lit window.
+    ///
+    /// The range starts at [`Transcript::active_turn`] — the turn the viewport
+    /// starts on, which the rail marks with its heaviest tick — and ends at the
+    /// turn the last visible row belongs to. Every turn between the two ends is
+    /// on screen as well, because a turn is a contiguous run of blocks: the
+    /// rail lights a window of the conversation, not a single point in it.
+    ///
+    /// A window that opens above the first turn lights from the first turn
+    /// down: the runtime's own startup rows belong to no turn, but a screen that
+    /// reaches the conversation is showing it. A viewport with no rows, or one
+    /// that stops above every turn, shows nothing.
+    pub fn visible_turns(&mut self) -> Option<Range<usize>> {
+        if self.viewport_rows == 0 {
+            return None;
+        }
+        self.ensure_layout();
+        let bottom_line = self.scroll_offset.saturating_add(self.viewport_rows - 1);
+        let bottom = self.block_at_line(bottom_line)?;
+        let last = self
+            .turn_heads()
+            .partition_point(|head| *head <= bottom)
+            .checked_sub(1)?;
+        let first = self.active_turn().unwrap_or(0);
+        Some(first..last + 1)
     }
 
     /// The block that opens the `turn`-th turn, for a click on the rail.
@@ -1373,6 +1408,7 @@ impl Transcript {
         theme: &TuiTheme,
         strings: Strings,
     ) -> Vec<Line<'static>> {
+        self.viewport_rows = height;
         if height == 0 || self.blocks.is_empty() {
             return Vec::new();
         }
@@ -4130,6 +4166,128 @@ mod tests {
         let continued = transcript.line_of_block(6);
         transcript.scroll_offset = continued;
         assert_eq!(transcript.active_turn(), Some(1));
+    }
+
+    #[test]
+    fn the_rail_lights_every_turn_the_viewport_shows() {
+        // The reader's place in a session is a window, not a point: a screen
+        // showing the end of one answer and the start of the next is in both
+        // turns, and a rail that lit one tick under it would say the session
+        // was one turn long. The range starts at the anchor the rail has always
+        // marked, and ends at the turn the last visible row belongs to.
+        let turn = |id: &str, turn: &str| {
+            let mut entry = block(id, TimelineRowKind::UserMessage, "a question");
+            entry.turn_id = Some(turn.to_string());
+            entry
+        };
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        transcript.set_blocks(vec![
+            turn("a", "turn-1"),
+            turn("b", "turn-2"),
+            turn("c", "turn-3"),
+            turn("d", "turn-4"),
+        ]);
+        let palette = theme();
+        // Settle the measurement before the line arithmetic, so the offsets
+        // below are measured heights rather than estimates of them.
+        let _ = transcript.visible_lines(ScrollState::default(), 200, &palette, strings());
+
+        // A viewport that starts at the top and ends inside the third turn
+        // shows all three of them.
+        let end = transcript.line_of_block(2);
+        let lines = transcript.visible_lines(
+            ScrollState {
+                follow: false,
+                ..Default::default()
+            },
+            end + 1,
+            &palette,
+            strings(),
+        );
+        assert_eq!(lines.len(), end + 1, "the fixture did not fill the band");
+        assert_eq!(
+            transcript.visible_turns(),
+            Some(0..3),
+            "a screen of three turns lit something else"
+        );
+
+        // One row inside the first turn shows only that turn: the window ends
+        // where the viewport does.
+        let _ = transcript.visible_lines(
+            ScrollState {
+                follow: false,
+                ..Default::default()
+            },
+            1,
+            &palette,
+            strings(),
+        );
+        assert_eq!(transcript.visible_turns(), Some(0..1));
+    }
+
+    #[test]
+    fn turns_the_viewport_does_not_show_are_not_lit() {
+        let turn = |id: &str, turn: &str| {
+            let mut entry = block(id, TimelineRowKind::UserMessage, "a question");
+            entry.turn_id = Some(turn.to_string());
+            entry
+        };
+        let mut startup = block("startup", TimelineRowKind::SystemNotice, "initializing");
+        startup.turn_id = None;
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        transcript.set_blocks(vec![startup, turn("a", "turn-1"), turn("b", "turn-2")]);
+        let palette = theme();
+        // Settle the measurement before the line arithmetic below.
+        let _ = transcript.visible_lines(ScrollState::default(), 500, &palette, strings());
+
+        // The runtime's own startup row is not a turn, so the top of the
+        // transcript lights nothing at all...
+        let _ = transcript.visible_lines(
+            ScrollState {
+                follow: false,
+                ..Default::default()
+            },
+            1,
+            &palette,
+            strings(),
+        );
+        assert_eq!(transcript.visible_turns(), None);
+
+        // ...and a window that opens above the first turn lights the turns it
+        // reaches: the startup row belongs to no turn, so nothing wears the
+        // marker, but the screen is showing the conversation all the same.
+        let first = transcript.line_of_block(1);
+        let second = transcript.line_of_block(2);
+        assert!(first > 0, "the fixture has no row above the first turn");
+        let _ = transcript.visible_lines(
+            ScrollState {
+                follow: false,
+                ..Default::default()
+            },
+            second,
+            &palette,
+            strings(),
+        );
+        assert_eq!(transcript.visible_turns(), Some(0..1));
+
+        // One row more reaches the second turn, and lights it too.
+        let _ = transcript.visible_lines(
+            ScrollState {
+                follow: false,
+                ..Default::default()
+            },
+            second + 1,
+            &palette,
+            strings(),
+        );
+        assert_eq!(transcript.visible_turns(), Some(0..2));
+        assert_eq!(
+            transcript.active_turn(),
+            None,
+            "a window that opens above the first turn has no anchor to mark"
+        );
     }
 }
 

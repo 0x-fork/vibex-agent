@@ -2850,6 +2850,110 @@ fn the_turn_rail_publishes_a_tick_per_turn() {
     assert!(turn < app.transcript.turn_count());
 }
 
+/// The rail's ticks in the frame just drawn: turn, glyph, ink.
+fn rail_ticks(
+    app: &App,
+    buffer: &ratatui::buffer::Buffer,
+) -> Vec<(usize, String, Option<ratatui::style::Color>)> {
+    app.regions
+        .turns
+        .iter()
+        .map(|(rect, turn)| {
+            let cell = buffer
+                .cell((rect.x, rect.y))
+                .unwrap_or_else(|| panic!("the rail published a tick with no cell"));
+            (*turn, cell.symbol().to_string(), cell.style().fg)
+        })
+        .collect()
+}
+
+#[test]
+fn the_turn_rail_lights_every_turn_on_screen() {
+    // The reader's place in a session is a window, not a point: a screen
+    // showing several turns lights every one of their ticks, so the rail's
+    // light is what the reader can see rather than only where the viewport
+    // starts. The heavier tick still marks the turn the viewport starts on.
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.transcript.set_blocks(
+        (0..6)
+            .map(|turn| opened(&format!("t{turn}"), &format!("turn-{turn}")))
+            .collect(),
+    );
+    let buffer = render_buffer(&mut app, 120, 40);
+    let ticks = rail_ticks(&app, &buffer);
+    assert_eq!(ticks.len(), 6, "the rail did not draw every turn");
+
+    let accent = app.theme.roles.accent_user;
+    let dim = app.theme.roles.gray_dim;
+    let lit: Vec<usize> = ticks
+        .iter()
+        .filter(|(_, _, ink)| *ink == Some(accent))
+        .map(|(turn, _, _)| *turn)
+        .collect();
+    assert_eq!(
+        lit,
+        vec![0, 1, 2, 3, 4, 5],
+        "the rail lit only part of the screen"
+    );
+    let heavy: Vec<usize> = ticks
+        .iter()
+        .filter(|(_, glyph, _)| glyph == "▪")
+        .map(|(turn, _, _)| *turn)
+        .collect();
+    assert_eq!(
+        heavy,
+        vec![0],
+        "the anchor is not the turn the viewport starts on"
+    );
+    assert!(
+        ticks.iter().all(|(_, _, ink)| *ink != Some(dim)),
+        "a turn on screen was left dim"
+    );
+}
+
+#[test]
+fn the_turn_rail_leaves_off_screen_turns_dim() {
+    // A long session lights the turns the viewport holds and no others: the
+    // rail's other ticks are still the map, and a map whose every mark is lit
+    // says nothing about where the reader is.
+    let mut app = app(120, 24);
+    app.navigate_to(Page::Agent);
+    app.transcript.set_blocks(
+        (0..60)
+            .map(|turn| {
+                seeded_block(
+                    &format!("t{turn}"),
+                    vibex_desktop_model::TimelineRowKind::UserMessage,
+                    "a question with enough words to take a row of its own",
+                )
+            })
+            .map(|mut block| {
+                block.turn_id = Some(format!("turn-{}", block.id));
+                block
+            })
+            .collect(),
+    );
+    let buffer = render_buffer(&mut app, 120, 24);
+    let ticks = rail_ticks(&app, &buffer);
+    assert!(ticks.len() > 2, "the rail drew too few ticks to judge");
+
+    let accent = app.theme.roles.accent_user;
+    let dim = app.theme.roles.gray_dim;
+    let lit = ticks
+        .iter()
+        .filter(|(_, _, ink)| *ink == Some(accent))
+        .count();
+    let dark = ticks.iter().filter(|(_, _, ink)| *ink == Some(dim)).count();
+    assert!(lit >= 2, "a screen of turns lit fewer than two ticks");
+    assert!(dark >= 1, "a turn off screen was lit");
+    assert_eq!(
+        ticks.iter().filter(|(_, glyph, _)| glyph == "▪").count(),
+        1,
+        "the rail drew more than one anchor"
+    );
+}
+
 #[test]
 fn a_composer_click_places_the_cursor() {
     let mut app = app(120, 40);

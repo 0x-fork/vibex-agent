@@ -268,7 +268,7 @@ pub fn timeline_tick(tier: GlyphTier) -> &'static str {
     }
 }
 
-/// The heavier tick marking the turn the viewport is on. One column.
+/// The heavier tick marking the turn the viewport starts on. One column.
 pub fn timeline_tick_active(tier: GlyphTier) -> &'static str {
     match tier {
         GlyphTier::Full => "▪",

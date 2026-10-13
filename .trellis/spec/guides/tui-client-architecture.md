@@ -259,10 +259,12 @@ Structure is carried by four devices, in this order of importance:
    identified by what it says — the prompt mark on the reader's own words, the
    bullet on a work item, the colour of the text — not by a stripe beside it.
 2. **The turn rail.** One tick per turn in the gutter, in conversation order: a
-   count of the session as much as a map of it, with the turn the viewport
-   starts on drawn heavier. More turns than rows window the ticks around the
-   active one. A transcript with no turns draws nothing — a scrollbar in those
-   columns is counted as turns, which is the mistake the rail exists to avoid.
+   count of the session as much as a map of it, with every turn the viewport
+   shows lit and the turn the viewport starts on drawn heavier. The lit window
+   is the reader's place, not a cursor position: a screen holding three turns
+   lights three ticks. More turns than rows window the ticks around the active
+   one. A transcript with no turns draws nothing — a scrollbar in those columns
+   is counted as turns, which is the mistake the rail exists to avoid.
 3. **Layered surfaces.** `surface` / `surface_raised` / `surface_highlight` step
    away from `background`, so a plane change is visible without a border.
 4. **A three-step grey scale.** `gray_dim` for punctuation and chrome, `gray`
