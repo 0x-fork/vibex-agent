@@ -804,3 +804,83 @@ fn activity_shimmer_stops_when_settled_or_motion_is_reduced(cx: &mut TestAppCont
         );
     }
 }
+
+/// The gate that keeps a repeating sweep from driving frames a late timeline
+/// cannot deliver on time. Its hysteresis is a pure state machine, so the two
+/// budgets and the streaks between them are checked without a window.
+#[test]
+fn live_label_gate_stops_a_late_timeline_and_restores_it_with_hysteresis() {
+    let refresh = Duration::from_micros(16_667);
+    let on_time = Duration::from_micros(16_000);
+    let late = Duration::from_micros(33_000);
+    // Between the two budgets: neither streak advances.
+    let near_budget = Duration::from_micros(25_000);
+
+    let slipped = LiveLabelGate::ANIMATING.observe(late, refresh);
+    assert!(
+        slipped.animate,
+        "one frame that slipped must not blink the sweep off"
+    );
+    let stopped = slipped.observe(late, refresh);
+    assert!(
+        !stopped.animate,
+        "a second late frame stops asking for the next one"
+    );
+
+    let recovering = stopped.observe(on_time, refresh);
+    assert!(!recovering.animate, "one on-time frame is not recovery yet");
+    let recovered = recovering.observe(on_time, refresh);
+    assert!(
+        recovered.animate,
+        "a held display interval restores the sweep"
+    );
+
+    assert!(
+        LiveLabelGate::ANIMATING
+            .observe(near_budget, refresh)
+            .animate,
+        "a sweep that runs keeps running inside the band"
+    );
+    assert!(
+        !LiveLabelGate {
+            animate: false,
+            late_frames: 0,
+            on_time_frames: 0,
+        }
+        .observe(near_budget, refresh)
+        .animate,
+        "a sweep that stopped stays stopped inside the band"
+    );
+}
+
+/// A frame nobody can afford is the other reason a live label gives up its
+/// sweep, and the group summary stops projecting its members on every frame.
+#[test]
+fn live_labels_keep_their_frame_gate_and_the_summary_reuses_its_projection() {
+    let activity = include_str!("timeline_activity.rs");
+    let label = activity
+        .split_once("fn activity_text(")
+        .and_then(|(_, tail)| tail.split_once("\n}"))
+        .map(|(body, _)| body)
+        .expect("the activity label should remain inspectable");
+    assert!(label.contains("running && live_labels_animate()"));
+
+    let source = include_str!("app.rs");
+    let page = source
+        .split_once("    fn render_agent_workbench_for(")
+        .and_then(|(_, tail)| tail.split_once("\n    fn "))
+        .map(|(body, _)| body)
+        .expect("the workbench should remain inspectable");
+    assert!(page.contains("timeline_activity::observe_live_label_frame(window, cx);"));
+
+    let group = source
+        .split_once("    fn render_process_activity_group(")
+        .and_then(|(_, tail)| tail.split_once("\n    fn render_process_activity_line("))
+        .map(|(body, _)| body)
+        .expect("the group renderer should remain inspectable");
+    assert!(group.contains("let activity = self.activity_projection_cached(row);"));
+    assert!(
+        !group.contains("timeline_activity::project(row, payload)"),
+        "a summary must not project every member row on every frame"
+    );
+}

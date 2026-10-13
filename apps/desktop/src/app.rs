@@ -646,6 +646,10 @@ const AGENT_THINKING_LABEL_MAX_CHARS: usize = 48;
 /// projection it was meant to memoize.
 const TIMELINE_TOOL_PROJECTION_CACHE_LIMIT: usize = 512;
 const TIMELINE_TOOL_PROJECTION_CACHE_BYTES: usize = 8 * 1024 * 1024;
+/// A group summary projects every member row before it paints its one header
+/// line, so this table is sized like the tool-card table beside it.
+const TIMELINE_ACTIVITY_PROJECTION_CACHE_LIMIT: usize = 512;
+const TIMELINE_ACTIVITY_PROJECTION_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const TIMELINE_FILE_DIFF_PREVIEW_CACHE_LIMIT: usize = 256;
 const TIMELINE_FILE_DIFF_PREVIEW_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const TIMELINE_FILE_DIFF_SCROLL_CACHE_LIMIT: usize = 512;
@@ -4475,6 +4479,7 @@ pub struct SessionView {
     markdown_text_states: BTreeMap<String, MarkdownTextState>,
     timeline_reasoning_summaries: BTreeMap<String, (i64, TimelineReasoningSummarySnapshot)>,
     timeline_tool_card_projections: BTreeMap<String, (i64, Rc<ToolCardProjection>)>,
+    timeline_activity_projections: BTreeMap<String, (i64, CachedActivityProjection)>,
     timeline_file_diff_previews: BTreeMap<String, (i64, Rc<AgentFileDiffPreview>)>,
     timeline_file_diff_scrolls: BTreeMap<String, gpui::ScrollHandle>,
     timeline_turn_file_changes: BTreeMap<String, (i64, Rc<TurnFileChangesSummary>)>,
@@ -4608,6 +4613,7 @@ impl SessionView {
             markdown_text_states: BTreeMap::new(),
             timeline_reasoning_summaries: BTreeMap::new(),
             timeline_tool_card_projections: BTreeMap::new(),
+            timeline_activity_projections: BTreeMap::new(),
             timeline_file_diff_previews: BTreeMap::new(),
             timeline_file_diff_scrolls: BTreeMap::new(),
             timeline_turn_file_changes: BTreeMap::new(),
@@ -4719,6 +4725,7 @@ impl SessionView {
         self.markdown_text_states.clear();
         self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
+        self.timeline_activity_projections.clear();
         self.timeline_file_diff_previews.clear();
         self.timeline_file_diff_scrolls.clear();
         self.timeline_turn_file_changes.clear();
@@ -23694,6 +23701,7 @@ impl VibexWorkbench {
         self.markdown_text_states.clear();
         self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
+        self.timeline_activity_projections.clear();
         self.timeline_file_diff_previews.clear();
         self.timeline_file_diff_scrolls.clear();
         self.timeline_turn_file_changes.clear();
@@ -50949,6 +50957,11 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Sample the window's frame cadence before this pass adds to it: a live
+        // label's repeating sweep is only worth its frames while the timeline
+        // is drawing on time. See
+        // [`timeline_activity::observe_live_label_frame`].
+        timeline_activity::observe_live_label_frame(window, cx);
         if include_composer {
             // Elicitation drafts are keyed by request id and shared across the
             // workbench, so only the focused view may prune them. A pane that
@@ -54335,7 +54348,7 @@ impl VibexWorkbench {
             && command_row.turn_id.is_some()
             && command_row.turn_id == permission_row.turn_id
             && self
-                .permission_request_for_row(permission_row)
+                .permission_request_ref_for_row(permission_row)
                 .is_some_and(|request| {
                     request.risk_category == vibex_core::PermissionRiskCategory::Command
                 })
@@ -54345,9 +54358,22 @@ impl VibexWorkbench {
         &self,
         row: &TimelineRow,
     ) -> Option<vibex_core::PermissionRequest> {
+        self.permission_request_ref_for_row(row).cloned()
+    }
+
+    /// The borrowed form of [`Self::permission_request_for_row`], for callers
+    /// that only read the request.
+    ///
+    /// The command/permission pairing check runs once per process row on every
+    /// frame, and a request payload carries its prompt and options, so a clone
+    /// there is per-frame traffic the check never needs.
+    fn permission_request_ref_for_row(
+        &self,
+        row: &TimelineRow,
+    ) -> Option<&vibex_core::PermissionRequest> {
         self.timeline_row_latest_item(row)
             .and_then(|item| match &item.payload {
-                vibex_core::TimelinePayload::PermissionRequest(request) => Some(request.clone()),
+                vibex_core::TimelinePayload::PermissionRequest(request) => Some(request),
                 _ => None,
             })
     }
@@ -55298,6 +55324,39 @@ impl VibexWorkbench {
         )
     }
 
+    /// One row's activity projection, memoized per row revision and locale.
+    ///
+    /// The activity is the summary line of a row: its action, target and path.
+    /// A group header summarizes every member row before it paints, and the
+    /// rows inside an expanded group project on their own way to their cards,
+    /// so both reuse here rather than rebuilding the same strings each frame.
+    fn activity_projection_cached(&mut self, row: &TimelineRow) -> Rc<timeline_activity::Activity> {
+        let locale = locale::current_locale();
+        if let Some((sequence, cached)) = self.timeline_activity_projections.get(&row.id)
+            && *sequence == row.last_sequence
+            && cached.locale == locale
+        {
+            return cached.activity.clone();
+        }
+        let activity = {
+            let payload = self.timeline_row_latest_item(row).map(|item| &item.payload);
+            Rc::new(timeline_activity::project(row, payload))
+        };
+        insert_bounded_timeline_projection(
+            &mut self.timeline_activity_projections,
+            row.id.clone(),
+            row.last_sequence,
+            CachedActivityProjection {
+                locale,
+                activity: activity.clone(),
+            },
+            TIMELINE_ACTIVITY_PROJECTION_CACHE_LIMIT,
+            TIMELINE_ACTIVITY_PROJECTION_CACHE_BYTES,
+            CachedActivityProjection::approximate_bytes,
+        );
+        activity
+    }
+
     /// Tool/command card projection, memoized per row revision and locale.
     ///
     /// Building one clones the payload strings (command output, tool summaries),
@@ -55908,9 +55967,9 @@ impl VibexWorkbench {
                 && self.command_permission_rows_are_linked(command_row, permission_row)
             {
                 let permission_height = self
-                    .permission_request_for_row(permission_row)
+                    .permission_request_ref_for_row(permission_row)
                     .map(|request| {
-                        if permission_request_is_pending(permission_row, &request) {
+                        if permission_request_is_pending(permission_row, request) {
                             92.0
                         } else {
                             48.0
@@ -57220,8 +57279,8 @@ impl VibexWorkbench {
         let turn_id = turn.id.clone();
         let mut summary = timeline_activity::ActivitySummary::default();
         for row in rows {
-            let payload = self.timeline_row_latest_item(row).map(|item| &item.payload);
-            summary.record(&timeline_activity::project(row, payload), &row.id);
+            let activity = self.activity_projection_cached(row);
+            summary.record(&activity, &row.id);
         }
         let header = timeline_activity::summary_header(
             format!("activity-summary:{}", group.id),
@@ -64432,6 +64491,29 @@ struct ToolCardProjection {
     details_pending: bool,
 }
 
+/// One row's [`timeline_activity::Activity`], memoized on its own.
+///
+/// A tool-activity group summarizes every member row before it paints its one
+/// header line, and a projection is not free: it single-lines the tool's
+/// summary through a `Vec`, clones the target and a file path, and parses raw
+/// tool input JSON to recover a target. A row's own card already reuses its
+/// tool-card projection, so the summary reuses this table instead of building
+/// the detail blocks it never shows.
+struct CachedActivityProjection {
+    locale: locale::ResolvedLocale,
+    activity: Rc<timeline_activity::Activity>,
+}
+
+impl CachedActivityProjection {
+    /// The bytes this entry is worth to the bounded table, on the same order as
+    /// the tool-card weight it stands in front of.
+    fn approximate_bytes(&self) -> usize {
+        self.activity.action().len()
+            + self.activity.target().len()
+            + self.activity.path().map_or(0, str::len)
+    }
+}
+
 /// Typed expanded content shared by compact activity rows and enhanced cards.
 /// Arguments and results retain their own copy and presentation semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65377,8 +65459,10 @@ fn render_agent_thinking_indicator(
     // nowrap label with `overflow_hidden`.
     // The sweep repeats for as long as it is mounted, so it is reserved for a
     // turn that is actually in flight. A row whose session is idle keeps the
-    // label and drops the animation.
-    let body: AnyElement = if live {
+    // label and drops the animation, and so does a workbench whose frames are
+    // already over budget: the sweep asks for the next frame on every display
+    // refresh, which only adds requests a late frame cannot answer.
+    let body: AnyElement = if live && timeline_activity::live_labels_animate() {
         ShimmerText::new(label)
             .id(animation_id)
             .text_color(cx.theme().muted_foreground)
@@ -82909,8 +82993,12 @@ mod tests {
         // The sweep repeats for as long as it is mounted, so it only runs for a
         // turn that is actually in flight. A row's `streaming` flag outlives an
         // interrupted turn, and a shimmer left running there kept every pane
-        // holding that session repainting at frame rate.
-        assert!(renderer.contains("let body: AnyElement = if live {"));
+        // holding that session repainting at frame rate. The frame gate adds
+        // the second reason: a sweep that keeps asking for frames a late
+        // timeline cannot deliver on time.
+        assert!(renderer.contains(
+            "let body: AnyElement = if live && timeline_activity::live_labels_animate() {"
+        ));
         let production = source
             .split_once("\n#[cfg(test)]\nmod tests {")
             .map(|(body, _)| body)

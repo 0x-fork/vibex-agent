@@ -28,6 +28,130 @@ pub(super) fn project(row: &TimelineRow, payload: Option<&TimelinePayload>) -> A
     Activity::project(row, payload, current_locale())
 }
 
+/// Longest gap between two timeline frames that still describes a frame budget.
+///
+/// A longer gap means the timeline went quiet in between, so the second render
+/// says nothing about how fast the window is drawing.
+const LIVE_LABEL_IDLE_GAP: Duration = Duration::from_millis(150);
+/// Gaps shorter than this belong to a second view drawing inside one frame.
+const LIVE_LABEL_SAME_FRAME_GAP: Duration = Duration::from_millis(4);
+/// Consecutive late frames before live labels stop asking for the next one.
+const LIVE_LABEL_LATE_STREAK: u32 = 2;
+/// Consecutive on-time frames before they start asking again.
+const LIVE_LABEL_RECOVERED_STREAK: u32 = 2;
+/// A frame may land this far past the display's interval and still count as on
+/// time, in tenths. Missing the display interval once is the first sign the
+/// frame is over budget; a repeating animation would only add a request such a
+/// frame cannot answer.
+const LIVE_LABEL_LATE_SLACK_TENTHS: u64 = 18;
+/// The gap that restores the sweep, in tenths: close enough to the display's
+/// interval that a recovered timeline animates again on the next frame.
+const LIVE_LABEL_RECOVERED_SLACK_TENTHS: u64 = 13;
+
+/// What the live labels' frame gate decided, and the streaks it decides with.
+///
+/// The decision is a pure state machine so its hysteresis is testable without
+/// a window. Idle gaps never reach it: each gap it sees either keeps the sweep,
+/// stops it, or restores it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveLabelGate {
+    animate: bool,
+    late_frames: u32,
+    on_time_frames: u32,
+}
+
+impl LiveLabelGate {
+    const ANIMATING: Self = Self {
+        animate: true,
+        late_frames: 0,
+        on_time_frames: 0,
+    };
+
+    /// The state after one frame `gap`, measured against the display's own
+    /// `refresh` interval.
+    ///
+    /// The two budgets leave a band between them where a sweep that runs keeps
+    /// running and a sweep that stopped stays stopped, so a frame that lands
+    /// near the budget cannot flip the animation every other frame.
+    fn observe(self, gap: Duration, refresh: Duration) -> Self {
+        let refresh = (refresh.as_micros() as u64).max(1);
+        let gap = gap.as_micros() as u64;
+        if gap > refresh * LIVE_LABEL_LATE_SLACK_TENTHS / 10 {
+            let late_frames = self.late_frames.saturating_add(1);
+            Self {
+                animate: self.animate && late_frames < LIVE_LABEL_LATE_STREAK,
+                late_frames,
+                on_time_frames: 0,
+            }
+        } else if gap <= refresh * LIVE_LABEL_RECOVERED_SLACK_TENTHS / 10 {
+            let on_time_frames = self.on_time_frames.saturating_add(1);
+            Self {
+                animate: self.animate || on_time_frames >= LIVE_LABEL_RECOVERED_STREAK,
+                late_frames: 0,
+                on_time_frames,
+            }
+        } else {
+            Self {
+                animate: self.animate,
+                late_frames: 0,
+                on_time_frames: 0,
+            }
+        }
+    }
+}
+
+static LIVE_LABEL_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+static LIVE_LABEL_LAST_FRAME_MICROS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static LIVE_LABEL_GATE: std::sync::Mutex<LiveLabelGate> =
+    std::sync::Mutex::new(LiveLabelGate::ANIMATING);
+
+/// Samples the gap since the previous timeline frame and decides whether live
+/// labels may keep a repeating animation mounted.
+///
+/// The sweep is what makes a running row read as alive, and on a frame with
+/// headroom it costs nothing extra: that frame was going to be drawn anyway.
+/// On a frame that is already late it is the opposite. A repeating
+/// `with_animation` asks the window for a frame on every display refresh for as
+/// long as it is mounted, so a workbench whose frames overrun the budget never
+/// idles — the main thread stays saturated by frames it cannot deliver on time,
+/// which is exactly the state an expanded, busy timeline lands in. This gate
+/// drops live labels back to static text while the timeline misses its display
+/// interval and restores the sweep once it holds it again.
+pub(super) fn observe_live_label_frame(window: &Window, cx: &App) {
+    let now = Instant::now();
+    let epoch = *LIVE_LABEL_EPOCH.get_or_init(|| now);
+    let now_micros = now.saturating_duration_since(epoch).as_micros() as u64;
+    let previous = LIVE_LABEL_LAST_FRAME_MICROS.swap(now_micros, Ordering::Relaxed);
+    let gap = now_micros.saturating_sub(previous);
+    // The first frame has nothing to compare against; a second view drawing
+    // inside one frame is not a frame of its own; and a gap this wide means the
+    // timeline went quiet, which says nothing about the budget.
+    if previous == 0
+        || gap < LIVE_LABEL_SAME_FRAME_GAP.as_micros() as u64
+        || gap > LIVE_LABEL_IDLE_GAP.as_micros() as u64
+    {
+        return;
+    }
+    // Panels on a display that reports no interval keep animating: the gate
+    // exists to protect a budget, and without one there is nothing to protect.
+    let Some(refresh) = window.refresh_interval(cx) else {
+        return;
+    };
+    let mut gate = LIVE_LABEL_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *gate = gate.observe(Duration::from_micros(gap), refresh);
+}
+
+/// Whether a live label may mount its repeating sweep this frame.
+pub(super) fn live_labels_animate() -> bool {
+    LIVE_LABEL_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .animate
+}
+
 /// The same button geometry is used by tool, file and plan disclosures.
 pub(super) fn header(
     id: String,
@@ -189,7 +313,7 @@ pub(super) fn summary_header(
 }
 
 fn activity_text(id: &'static str, text: &str, running: bool) -> AnyElement {
-    if running {
+    if running && live_labels_animate() {
         ShimmerText::new(text.to_string())
             .id(id)
             .duration(TIMELINE_SHIMMER_SWEEP)
