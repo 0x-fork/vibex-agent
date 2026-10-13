@@ -2002,18 +2002,42 @@ fn retained_process_units_render_only_when_their_key_moves(cx: &mut TestAppConte
     draw_live_timeline_frames(&workbench, cx, 6);
     // Strong handles for the length of the test, so that a frame which stops
     // mounting a unit cannot be mistaken for one that did not render it.
-    let units: Vec<Entity<timeline_unit_view::TimelineUnitView>> =
+    let retained: Vec<(String, Entity<timeline_unit_view::TimelineUnitView>)> =
         workbench.read_with(cx, |workbench, _| {
             workbench
                 .timeline_unit_views
-                .values()
-                .filter_map(|view| view.upgrade())
+                .iter()
+                .filter_map(|(id, view)| view.upgrade().map(|view| (id.clone(), view)))
                 .collect()
         });
+    let units: Vec<Entity<timeline_unit_view::TimelineUnitView>> =
+        retained.iter().map(|(_, view)| view.clone()).collect();
     assert!(
         !units.is_empty(),
         "a settled unit should be retained once it has been measured"
     );
+    // A retained unit is mounted at the height the table holds and paints inside
+    // that box. An empty one still reserves its space, so the frame has to be
+    // checked for a real box rather than for the view having rendered.
+    let boxed_unit = retained[0].0.clone();
+    let painted_box = units[0].read_with(cx, |view, _| view.box_height());
+    let reserved = workbench.read_with(cx, |workbench, _| {
+        workbench
+            .timeline_process_unit_heights
+            .get(&boxed_unit)
+            .map(|entry| entry.height)
+    });
+    assert!(
+        painted_box > 0.0,
+        "a retained unit must fill the box its parent reserved, not collapse to nothing"
+    );
+    if let Some(reserved) = reserved {
+        assert!(
+            (painted_box - reserved).abs() <= 1.0,
+            "a retained unit paints at the height the table holds: {painted_box} vs {reserved}"
+        );
+    }
+
     let renders = |cx: &VisualTestContext| {
         units
             .iter()

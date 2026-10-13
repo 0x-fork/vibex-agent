@@ -83,6 +83,11 @@ pub(super) struct TimelineUnitView {
     observed_surfaces: BTreeSet<String>,
     #[cfg(test)]
     render_count: usize,
+    /// The box the last rendered frame gave this view, for tests: a retained unit
+    /// that collapsed to nothing still reserves its space, so a render count
+    /// alone cannot tell an empty frame from a painted one.
+    #[cfg(test)]
+    box_height: Rc<std::cell::Cell<f32>>,
 }
 
 impl TimelineUnitView {
@@ -101,6 +106,8 @@ impl TimelineUnitView {
             observed_surfaces: BTreeSet::new(),
             #[cfg(test)]
             render_count: 0,
+            #[cfg(test)]
+            box_height: Rc::new(std::cell::Cell::new(0.0)),
         }
     }
 
@@ -108,6 +115,12 @@ impl TimelineUnitView {
     #[cfg(test)]
     pub(super) fn render_count(&self) -> usize {
         self.render_count
+    }
+
+    /// The height of the box the last rendered frame gave this view.
+    #[cfg(test)]
+    pub(super) fn box_height(&self) -> f32 {
+        self.box_height.get()
     }
 }
 
@@ -151,8 +164,12 @@ impl Render for TimelineUnitView {
                 });
             });
         });
+        // The wrapper carries the test selector and must fill the box the parent
+        // reserved: the measure element fills *its* parent, so an auto-height
+        // wrapper would make the two depend on each other and collapse the box to
+        // nothing — every unit painting an empty, clipped frame.
         div()
-            .w_full()
+            .size_full()
             .min_w_0()
             .flex_none()
             .debug_selector({
@@ -164,6 +181,8 @@ impl Render for TimelineUnitView {
                 child: element,
                 retained: true,
                 report,
+                #[cfg(test)]
+                box_height: self.box_height.clone(),
             })
             .into_any_element()
     }
@@ -220,6 +239,9 @@ struct TimelineUnitMeasure {
     /// Whether the parent reserved this unit's box, or the flow laid it out.
     retained: bool,
     report: Rc<dyn Fn(f32, &mut App)>,
+    /// Where the box this frame reserved is recorded, for tests.
+    #[cfg(test)]
+    box_height: Rc<std::cell::Cell<f32>>,
 }
 
 impl IntoElement for TimelineUnitMeasure {
@@ -276,6 +298,8 @@ impl Element for TimelineUnitMeasure {
         window: &mut Window,
         cx: &mut App,
     ) {
+        #[cfg(test)]
+        self.box_height.set(f32::from(bounds.size.height));
         if !self.retained {
             // The flow already measured it; report that and prepaint as usual.
             (self.report)(f32::from(bounds.size.height), cx);
@@ -425,6 +449,8 @@ impl VibexWorkbench {
             child: element,
             retained: false,
             report,
+            #[cfg(test)]
+            box_height: Rc::new(std::cell::Cell::new(0.0)),
         }
         .into_any_element()
     }
