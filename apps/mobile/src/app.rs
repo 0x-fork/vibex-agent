@@ -76,13 +76,15 @@ use crate::sidebar::{
 };
 use crate::storage::{
     AppSettings, CredentialStorage, MAX_SESSION_TIMELINE_ITEMS,
-    MobileTimelineDisplaySettingsOverride, StoredHostEntry, StoredSessionTimeline,
+    MobileTimelineDisplaySettingsOverride, StoredComposerQueuedMessage, StoredComposerSession,
+    StoredHostEntry, StoredSessionTimeline,
 };
 use crate::toast::{Hint, Tone};
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{locale, markdown, notifications, power, scanner, theme, toast, update};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader};
+use gpui_component::input::InputEvent;
 use gpui_component::input::TextareaState;
 use gpui_component::input::{Input, InputState, Textarea};
 use gpui_component::progress::ProgressCircle;
@@ -1381,6 +1383,12 @@ pub struct MobileApp {
     new_session_picker: Option<NewSessionPicker>,
     /// Whether the composer's attach menu is up.
     composer_attach_menu_open: bool,
+    /// The composer's un-sent work changed since the last write to disk.
+    composer_state_dirty: bool,
+    /// The debounce timer for that write, replaced per burst of edits.
+    composer_state_flush_task: Option<Task<()>>,
+    /// Observes the composer field, so typing counts as a change worth keeping.
+    _composer_change_subscription: gpui::Subscription,
     runtime_options_target: RuntimeOptionsTarget,
     runtime_draft: Option<SessionRuntimeSelection>,
     runtime_sheet_search: Option<Entity<InputState>>,
@@ -2192,6 +2200,22 @@ impl MobileApp {
         // The selection toolbar is its own view: it floats over the whole
         // window, and the composer only hands it the long press that opens it.
         let selection_menu = cx.new(|cx| SelectionMenu::new(composer_input.clone(), cx));
+        // Typing is a change to the composer's un-sent work, and the phone can
+        // be killed while it is in the background with no other notice.
+        let composer_change_subscription = cx.subscribe_in(
+            &composer_input,
+            window,
+            |this: &mut Self,
+             _: &Entity<TextareaState>,
+             event: &InputEvent,
+             _: &mut Window,
+             cx: &mut Context<Self>| {
+                if matches!(event, InputEvent::Change) {
+                    this.mark_composer_state_dirty(cx);
+                }
+            },
+        );
+        let restored_composer = Self::restore_composer_state(storage.load_composer_state());
         let mut app = Self {
             storage,
             app_settings,
@@ -2210,17 +2234,17 @@ impl MobileApp {
             composer_input,
             selection_menu,
             pending_composer_restore: None,
-            composer_drafts: BTreeMap::new(),
+            composer_drafts: restored_composer.drafts,
             composer_commands: Vec::new(),
             composer_commands_generation: 0,
             composer_armed_command: None,
             composer_armed_mentions: Vec::new(),
             composer_attachments: Vec::new(),
-            composer_attachment_drafts: BTreeMap::new(),
+            composer_attachment_drafts: restored_composer.attachments,
             composer_plan_expanded: None,
             dismissed_composer_plans: BTreeSet::new(),
-            composer_queue: Vec::new(),
-            composer_queue_next_id: 1,
+            composer_queue: restored_composer.queue,
+            composer_queue_next_id: restored_composer.next_queue_id,
             timeline_turns: Arc::new(Vec::new()),
             timeline_markdown_views: RefCell::new(BTreeMap::new()),
             pending_user_message: None,
@@ -2377,6 +2401,9 @@ impl MobileApp {
             runtime_options_open: false,
             new_session_picker: None,
             composer_attach_menu_open: false,
+            composer_state_dirty: false,
+            composer_state_flush_task: None,
+            _composer_change_subscription: composer_change_subscription,
             runtime_options_target: RuntimeOptionsTarget::ActiveSession,
             runtime_draft: None,
             runtime_sheet_search: None,
@@ -2468,6 +2495,12 @@ impl MobileApp {
         match event {
             MobileLifecycleEvent::Backgrounded => {
                 self.app_backgrounded = true;
+                // The process may not come back, so the debounced write is
+                // spent now rather than at the end of its timer.
+                if self.composer_state_dirty {
+                    self.composer_state_flush_task = None;
+                    self.flush_composer_state(cx);
+                }
                 if matches!(
                     self.nearby_pairing_state,
                     NearbyPairingState::Discovering
@@ -2631,6 +2664,7 @@ impl MobileApp {
                     // to, so every picked image rides the message as a whole.
                     inline_text_offset: None,
                 });
+                self.mark_composer_state_dirty(cx);
                 self.hint(
                     Tone::Info,
                     locale::text("Attachment added", "已添加附件", "已新增附件"),
@@ -2681,6 +2715,7 @@ impl MobileApp {
     fn remove_composer_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.composer_attachments.len() {
             self.composer_attachments.remove(index);
+            self.mark_composer_state_dirty(cx);
             cx.notify();
         }
     }
@@ -2881,6 +2916,7 @@ impl MobileApp {
                 self.mode = RootMode::Pairing;
                 self.fail(error);
                 let _ = self.storage.clear();
+                self.clear_composer_state(cx);
                 self.refresh_host_reachability(cx);
                 cx.notify();
             }
@@ -5237,25 +5273,35 @@ impl MobileApp {
             // target's own draft before the first frame of the new conversation.
             let current = self.composer_input.read(cx).value().to_string();
             let current_attachments = std::mem::take(&mut self.composer_attachments);
-            if let Some(previous) = previous_session {
-                self.composer_drafts
-                    .insert(previous.as_str().to_string(), current);
-                self.composer_attachment_drafts
-                    .insert(previous.as_str().to_string(), current_attachments);
+            // With no session open — the reader deleted the one they were in,
+            // say — the field's text belongs to no conversation yet, so it
+            // follows them into the session they open next rather than being
+            // parked where nothing would ever show it again.
+            let parked = previous_session
+                .as_ref()
+                .map(|session| session.as_str().to_string())
+                .unwrap_or_else(|| session_id.as_str().to_string());
+            if current.trim().is_empty() {
+                self.composer_drafts.remove(&parked);
             } else {
-                if !current.trim().is_empty() {
-                    self.composer_drafts
-                        .insert(Self::unsessioned_draft_key(), current);
-                }
-                self.composer_attachment_drafts
-                    .insert(Self::unsessioned_draft_key(), current_attachments);
+                self.composer_drafts.insert(parked.clone(), current);
             }
-            self.composer_drafts.remove(session_id.as_str());
+            if current_attachments.is_empty() {
+                self.composer_attachment_drafts.remove(&parked);
+            } else {
+                self.composer_attachment_drafts
+                    .insert(parked, current_attachments);
+            }
+            // The parked draft is the reader's un-sent work, and a switch is
+            // exactly when it is most likely to be left behind.
+            self.mark_composer_state_dirty(cx);
         }
+        // The target's own draft is what the field shows next, so it is taken
+        // rather than copied: it is live in the field from here on, and the
+        // next park puts it back.
         let draft = self
             .composer_drafts
-            .get(session_id.as_str())
-            .cloned()
+            .remove(session_id.as_str())
             .unwrap_or_default();
         self.composer_attachments = self
             .composer_attachment_drafts
@@ -5398,33 +5444,168 @@ impl MobileApp {
         self.timeline_list.scroll_to_end();
     }
 
+    /// Turns the stored composer record back into the three maps the composer
+    /// actually runs on: drafts, their attachments, and the queues.
+    fn restore_composer_state(
+        restored: BackendResult<Vec<StoredComposerSession>>,
+    ) -> RestoredComposerState {
+        let mut state = RestoredComposerState {
+            next_queue_id: 1,
+            ..RestoredComposerState::default()
+        };
+        // The file is a convenience: a phone that cannot read it still opens its
+        // conversations, so a failure is not the reader's problem.
+        let Ok(sessions) = restored else {
+            return state;
+        };
+        for session in sessions {
+            let key = session.session_id.clone();
+            // A draft and its files are worth keeping even for a key no
+            // conversation answers to, but a queue is only meaningful against a
+            // session that can be opened again.
+            let queued_session = VibexSessionId::parse(key.clone()).ok();
+            if !session.draft.trim().is_empty() {
+                state.drafts.insert(key.clone(), session.draft);
+            }
+            let attachments = session
+                .attachments
+                .iter()
+                .filter_map(restore_composer_attachment)
+                .collect::<Vec<_>>();
+            if !attachments.is_empty() {
+                state.attachments.insert(key, attachments);
+            }
+            let Some(queued_session) = queued_session else {
+                continue;
+            };
+            for queued in session.queued {
+                let id = state.next_queue_id;
+                state.next_queue_id = state.next_queue_id.saturating_add(1);
+                state.queue.push(MobileQueuedMessage {
+                    id,
+                    session_id: queued_session.clone(),
+                    text: queued.text,
+                    attachments: queued
+                        .attachments
+                        .iter()
+                        .filter_map(restore_composer_attachment)
+                        .collect(),
+                    mentions: queued.mentions,
+                    created_at_ms: unix_timestamp_ms(),
+                });
+            }
+        }
+        state
+    }
+
+    /// Parks whatever the open session's field holds, the way switching
+    /// sessions does, so the file describes the live composer too and not only
+    /// the conversations the reader has moved away from.
+    fn park_live_composer(&mut self, cx: &gpui::App) {
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        let key = session_id.as_str().to_string();
+        let current = self.composer_input.read(cx).value().to_string();
+        if current.trim().is_empty() {
+            self.composer_drafts.remove(&key);
+        } else {
+            self.composer_drafts.insert(key.clone(), current);
+        }
+        if self.composer_attachments.is_empty() {
+            self.composer_attachment_drafts.remove(&key);
+        } else {
+            self.composer_attachment_drafts
+                .insert(key, self.composer_attachments.clone());
+        }
+    }
+
+    /// Records that the composer's un-sent work changed, and schedules the
+    /// write that keeps it.
+    ///
+    /// Debounced, because typing produces one change per keystroke and the file
+    /// holds every session's composer. A backgrounded app flushes at once: that
+    /// is the moment the process may not come back.
+    fn mark_composer_state_dirty(&mut self, cx: &mut Context<Self>) {
+        self.composer_state_dirty = true;
+        if self.composer_state_flush_task.is_some() {
+            return;
+        }
+        let entity = cx.weak_entity();
+        self.composer_state_flush_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(400))
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                this.composer_state_flush_task = None;
+                if this.composer_state_dirty {
+                    this.flush_composer_state(cx);
+                }
+            });
+        }));
+    }
+
+    /// Forgets every parked composer, on disk and in memory.
+    ///
+    /// Used when the runtime the drafts belonged to is gone: the session ids
+    /// they are filed under name conversations only that runtime ever had, so
+    /// restoring them would file the reader's work against nothing. What is in
+    /// the field right now is not parked against a session, so it stays.
+    fn clear_composer_state(&mut self, cx: &mut Context<Self>) {
+        // Dropping the task cancels the debounce it was holding.
+        self.composer_state_flush_task = None;
+        self.composer_state_dirty = false;
+        let _ = self.storage.clear_composer_state();
+        self.composer_drafts.clear();
+        self.composer_attachment_drafts.clear();
+        self.composer_queue.clear();
+        cx.notify();
+    }
+
+    /// Writes every session's un-sent work and forgets that there was anything
+    /// left to write.
+    fn flush_composer_state(&mut self, cx: &gpui::App) {
+        self.park_live_composer(cx);
+        let now = unix_timestamp_ms();
+        let mut sessions = BTreeMap::<String, StoredComposerSession>::new();
+        for (key, draft) in &self.composer_drafts {
+            composer_session_entry(&mut sessions, key, now).draft = draft.clone();
+        }
+        for (key, attachments) in &self.composer_attachment_drafts {
+            composer_session_entry(&mut sessions, key, now).attachments = attachments
+                .iter()
+                .filter_map(stored_composer_attachment)
+                .collect();
+        }
+        for message in &self.composer_queue {
+            composer_session_entry(&mut sessions, message.session_id.as_str(), now)
+                .queued
+                .push(StoredComposerQueuedMessage {
+                    text: message.text.clone(),
+                    attachments: message
+                        .attachments
+                        .iter()
+                        .filter_map(stored_composer_attachment)
+                        .collect(),
+                    mentions: message.mentions.clone(),
+                });
+        }
+        let sessions = sessions.into_values().collect::<Vec<_>>();
+        // Best effort: the drafts are a courtesy, and a full or read-only data
+        // dir must not surface an error for them.
+        let _ = self.storage.save_composer_state(&sessions);
+        self.composer_state_dirty = false;
+    }
+
     /// Writes the open session's window, so the next cold start paints the
     /// conversation before the network answers.
     ///
     /// Best effort on purpose: the cache is an optimization, and a full or
     /// read-only data dir must not surface an error for it.
-    /// The key a draft is parked under while no session is selected.
-    fn unsessioned_draft_key() -> String {
-        "\u{0}vibex:no-session".to_string()
-    }
-
-    /// Records the composer's current text against the open session, so a
-    /// refresh of the same session never loses what is half-typed.
-    fn stash_composer_draft(&mut self, cx: &gpui::App) {
-        let key = self
-            .controller
-            .as_ref()
-            .and_then(|controller| controller.state.selected_session_id.as_ref())
-            .map(|session_id| session_id.as_str().to_string())
-            .unwrap_or_else(Self::unsessioned_draft_key);
-        let current = self.composer_input.read(cx).value().to_string();
-        if current.trim().is_empty() {
-            self.composer_drafts.remove(&key);
-        } else {
-            self.composer_drafts.insert(key, current);
-        }
-    }
-
     fn persist_active_session_timeline(&mut self) {
         let Some(host_id) = self.active_host_id.clone() else {
             return;
@@ -7274,6 +7455,7 @@ impl MobileApp {
         // too, and only it could ever have used them.
         let _ = self.storage.clear();
         let _ = self.storage.clear_session_timelines();
+        self.clear_composer_state(cx);
         self.mode = RootMode::Pairing;
         match self.fallback_host_id() {
             Some(next_id) => {
@@ -7676,6 +7858,9 @@ impl MobileApp {
 
     fn remove_queued_message(&mut self, id: u64, cx: &mut Context<Self>) {
         self.composer_queue.retain(|message| message.id != id);
+        // The file holds the queue too, so a prompt the reader deleted must
+        // not be waiting for them after a restart.
+        self.mark_composer_state_dirty(cx);
         cx.notify();
     }
 
@@ -7692,6 +7877,7 @@ impl MobileApp {
         self.composer_input
             .update(cx, |input, cx| input.set_value(message.text, window, cx));
         crate::platform::show_keyboard();
+        self.mark_composer_state_dirty(cx);
         cx.notify();
     }
 
@@ -7705,6 +7891,7 @@ impl MobileApp {
             return;
         };
         let message = self.composer_queue.remove(index);
+        self.mark_composer_state_dirty(cx);
         let running = self
             .controller
             .as_ref()
@@ -7761,6 +7948,9 @@ impl MobileApp {
             return;
         };
         let message = self.composer_queue.remove(index);
+        // The prompt is on its way out, so the file must stop claiming it is
+        // still waiting here.
+        self.mark_composer_state_dirty(cx);
         self.submit_prompt(
             message.text,
             message.attachments,
@@ -22244,6 +22434,64 @@ fn sidebar_item_ref(item: &SidebarOrganizationItem) -> RemoteSidebarItemRef {
     }
 }
 
+/// The three maps the composer runs on, rebuilt from the stored record.
+#[derive(Default)]
+struct RestoredComposerState {
+    drafts: BTreeMap<String, String>,
+    attachments: BTreeMap<String, Vec<MessageAttachment>>,
+    queue: Vec<MobileQueuedMessage>,
+    next_queue_id: u64,
+}
+
+/// The phone's half of an attachment is the data URL the picker produced.
+///
+/// A uri that is not one of those names a path on the machine the desktop runs
+/// on — real for the desktop's own composer, meaningless in a record this
+/// client wrote and would have to hand back.
+fn stored_composer_attachment(
+    attachment: &MessageAttachment,
+) -> Option<crate::storage::StoredComposerAttachment> {
+    let data_url = attachment.uri.clone()?;
+    data_url
+        .starts_with("data:")
+        .then(|| crate::storage::StoredComposerAttachment {
+            label: attachment.label.clone(),
+            mime_type: attachment.mime_type.clone(),
+            data_url,
+        })
+}
+
+fn restore_composer_attachment(
+    attachment: &crate::storage::StoredComposerAttachment,
+) -> Option<MessageAttachment> {
+    attachment
+        .data_url
+        .starts_with("data:")
+        .then(|| MessageAttachment {
+            label: attachment.label.clone(),
+            mime_type: attachment.mime_type.clone(),
+            uri: Some(attachment.data_url.clone()),
+            // A phone has no text editor to anchor an inline attachment to.
+            inline_text_offset: None,
+        })
+}
+
+/// The record one draft key writes into, created on first use so a session that
+/// only holds a queue still gets its own entry.
+fn composer_session_entry<'a>(
+    sessions: &'a mut BTreeMap<String, StoredComposerSession>,
+    key: &str,
+    now: i64,
+) -> &'a mut StoredComposerSession {
+    sessions
+        .entry(key.to_string())
+        .or_insert_with(|| StoredComposerSession {
+            session_id: key.to_string(),
+            saved_at_ms: now,
+            ..StoredComposerSession::default()
+        })
+}
+
 fn workspace_label(root: &str) -> &str {
     root.rsplit(['/', '\\'])
         .find(|segment| !segment.is_empty())
@@ -24200,6 +24448,65 @@ mod tests {
             touch_phase: TouchPhase::Ended,
         });
         cx.run_until_parked();
+    }
+
+    /// A draft, the files waiting on it, and a prompt queued behind a running
+    /// turn are all on disk before the process dies — and a later launch is
+    /// what reads them back, which is the point of writing them at all.
+    #[gpui::test]
+    fn unsent_composer_work_survives_a_restart(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().unwrap();
+        let session_id = VibexSessionId::new();
+        let key = session_id.as_str().to_string();
+
+        let (writing, _cx) = add_rooted_window_view(cx, |window, cx| {
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.composer_drafts
+                .insert(key.clone(), "half a thought".to_string());
+            app.composer_attachment_drafts.insert(
+                key.clone(),
+                vec![MessageAttachment {
+                    label: "notes.txt".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    uri: Some("data:text/plain;base64,aGVsbG8=".to_string()),
+                    inline_text_offset: None,
+                }],
+            );
+            app.composer_queue.push(MobileQueuedMessage {
+                id: 1,
+                session_id: session_id.clone(),
+                text: "and then one more".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                created_at_ms: unix_timestamp_ms(),
+            });
+            app.flush_composer_state(cx);
+            app
+        });
+        writing.read_with(cx, |app, _| {
+            assert!(app.storage.composer_state_path().exists());
+        });
+
+        // The next launch: same data dir, nothing carried over in memory.
+        let (reopened, cx) = add_rooted_window_view(cx, |window, cx| {
+            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
+        });
+        reopened.read_with(cx, |app, _| {
+            assert_eq!(
+                app.composer_drafts.get(&key).map(String::as_str),
+                Some("half a thought")
+            );
+            let attachments = app
+                .composer_attachment_drafts
+                .get(&key)
+                .expect("the files waiting on the draft came back");
+            assert_eq!(attachments.len(), 1);
+            assert_eq!(attachments[0].label, "notes.txt");
+            assert_eq!(app.composer_queue.len(), 1);
+            assert_eq!(app.composer_queue[0].session_id, session_id);
+            assert_eq!(app.composer_queue[0].text, "and then one more");
+        });
     }
 
     #[gpui::test]

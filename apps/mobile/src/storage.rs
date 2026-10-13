@@ -59,6 +59,88 @@ const MAX_CLIENT_IDENTITY_BYTES: u64 = 1024;
 /// Upper bound on stored preference strings; every value written by the
 /// settings UI is one of a fixed enum, so this only guards corruption.
 const MAX_APP_SETTINGS_VALUE_BYTES: usize = 32;
+/// The composer's un-sent work, per session: the draft, the files waiting on
+/// it, and the prompts queued behind a running turn.
+///
+/// The desktop keeps its composer in memory because it is the process that
+/// owns the session; a phone process is killed in the background without
+/// warning, so anything typed and not sent has to survive on disk.
+const COMPOSER_STATE_FILE: &str = "composer-state.json";
+const COMPOSER_STATE_SCHEMA_VERSION: &str = "vibex-native-mobile-composer.v1";
+/// How many sessions' composers are worth keeping. A reader moves between a
+/// handful of conversations, and the oldest is dropped first.
+const MAX_COMPOSER_SESSIONS: usize = 16;
+/// The whole file, which is dominated by base64 attachments.
+const MAX_COMPOSER_STATE_BYTES: u64 = 8 * 1024 * 1024;
+/// The attachments the file may carry in total. Past this the text is kept and
+/// the files are dropped, because the words are what cannot be retyped.
+const MAX_COMPOSER_ATTACHMENT_BYTES: usize = 4 * 1024 * 1024;
+/// One prompt's text. The authority rejects longer prompts anyway; this only
+/// keeps a corrupt or runaway value out of the file.
+const MAX_COMPOSER_TEXT_BYTES: usize = 256 * 1024;
+const MAX_COMPOSER_SESSION_ID_BYTES: usize = 256;
+
+/// One file waiting on a draft, exactly as the picker handed it over.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoredComposerAttachment {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// The `data:<mime>;base64,<payload>` URI the picker produced.
+    pub data_url: String,
+}
+
+/// One prompt held behind a running turn.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoredComposerQueuedMessage {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<StoredComposerAttachment>,
+    /// The `@` references the reader wrote, as the catalogue resolved them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<vibex_core::VibexUseMention>,
+}
+
+/// One session's composer.
+///
+/// The session is named by the composer's own draft key — a session id as text
+/// — rather than a parsed `VibexSessionId`, so one record naming something this
+/// build cannot make sense of is dropped on its own instead of failing the
+/// whole file and taking every other session's work with it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoredComposerSession {
+    pub session_id: String,
+    pub saved_at_ms: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub draft: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<StoredComposerAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued: Vec<StoredComposerQueuedMessage>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredComposerStateFile {
+    schema_version: String,
+    sessions: Vec<StoredComposerSession>,
+}
+
+/// Trims one piece of composer text to what the file will carry, cutting on a
+/// character boundary so the result is still valid text.
+fn clamp_composer_text(text: String) -> String {
+    if text.len() <= MAX_COMPOSER_TEXT_BYTES {
+        return text;
+    }
+    let mut end = MAX_COMPOSER_TEXT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
 
 /// Mobile-owned appearance and language preferences. When a value is `None`
 /// the mobile client follows the platform (system appearance and system
@@ -768,6 +850,134 @@ impl CredentialStorage {
         }
     }
 
+    pub fn composer_state_path(&self) -> PathBuf {
+        self.data_dir.join(COMPOSER_STATE_FILE)
+    }
+
+    /// Reads the composer's un-sent work. A missing, empty, or corrupt file
+    /// reads as "nothing was half-written", which is the safe answer: the
+    /// drafts are a courtesy, not the session itself.
+    pub fn load_composer_state(&self) -> BackendResult<Vec<StoredComposerSession>> {
+        let path = self.composer_state_path();
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => return Err(storage_error("mobile_composer_state_read_failed")),
+        };
+        if metadata.len() == 0 || metadata.len() > MAX_COMPOSER_STATE_BYTES {
+            return self.reject_invalid_composer_state(&path);
+        }
+        let bytes =
+            fs::read(&path).map_err(|_| storage_error("mobile_composer_state_read_failed"))?;
+        let stored: StoredComposerStateFile = match serde_json::from_slice(&bytes) {
+            Ok(stored) => stored,
+            Err(_) => return self.reject_invalid_composer_state(&path),
+        };
+        if stored.schema_version != COMPOSER_STATE_SCHEMA_VERSION {
+            return self.reject_invalid_composer_state(&path);
+        }
+        let mut sessions = stored
+            .sessions
+            .into_iter()
+            .filter(|session| {
+                // The key has to name a session: a record this client could
+                // never open a conversation for is not worth carrying, and
+                // dropping it here keeps a single bad entry from costing every
+                // other session its draft.
+                session.session_id.len() <= MAX_COMPOSER_SESSION_ID_BYTES
+                    && VibexSessionId::parse(session.session_id.clone()).is_ok()
+            })
+            .collect::<Vec<_>>();
+        sessions.truncate(MAX_COMPOSER_SESSIONS);
+        Ok(sessions)
+    }
+
+    /// Writes the composer's un-sent work, newest sessions first and within the
+    /// attachment budget. A record that does not fit keeps its text and loses
+    /// the files hanging on it: the reader's words are the part they cannot
+    /// retype, and an attachment is one tap away from being picked again.
+    pub fn save_composer_state(&self, sessions: &[StoredComposerSession]) -> BackendResult<()> {
+        fs::create_dir_all(&self.data_dir)
+            .map_err(|_| storage_error("mobile_composer_state_write_failed"))?;
+        let mut ordered = sessions.to_vec();
+        ordered.sort_by_key(|session| std::cmp::Reverse(session.saved_at_ms));
+        ordered.truncate(MAX_COMPOSER_SESSIONS);
+        let mut spent = 0usize;
+        let stored = ordered
+            .into_iter()
+            .map(|mut session| {
+                session.draft = clamp_composer_text(session.draft);
+                session.attachments.retain(|attachment| {
+                    let cost = attachment.data_url.len();
+                    if spent.saturating_add(cost) > MAX_COMPOSER_ATTACHMENT_BYTES {
+                        return false;
+                    }
+                    spent += cost;
+                    true
+                });
+                session.queued = session
+                    .queued
+                    .into_iter()
+                    .filter_map(|mut message| {
+                        message.text = clamp_composer_text(message.text);
+                        if message.text.is_empty() && message.attachments.is_empty() {
+                            return None;
+                        }
+                        message.attachments.retain(|attachment| {
+                            let cost = attachment.data_url.len();
+                            if spent.saturating_add(cost) > MAX_COMPOSER_ATTACHMENT_BYTES {
+                                return false;
+                            }
+                            spent += cost;
+                            true
+                        });
+                        Some(message)
+                    })
+                    .collect();
+                session
+            })
+            .filter(|session| {
+                !session.draft.is_empty()
+                    || !session.attachments.is_empty()
+                    || !session.queued.is_empty()
+            })
+            .collect::<Vec<_>>();
+        let encoded = serde_json::to_vec(&StoredComposerStateFile {
+            schema_version: COMPOSER_STATE_SCHEMA_VERSION.to_string(),
+            sessions: stored,
+        })
+        .map_err(|_| storage_error("mobile_composer_state_encode_failed"))?;
+        if encoded.is_empty() || encoded.len() as u64 > MAX_COMPOSER_STATE_BYTES {
+            return Err(storage_error("mobile_composer_state_invalid"));
+        }
+        write_atomic(
+            &self.composer_state_path(),
+            &encoded,
+            "mobile_composer_state_write_failed",
+        )
+    }
+
+    pub fn clear_composer_state(&self) -> BackendResult<()> {
+        match fs::remove_file(self.composer_state_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(storage_error("mobile_composer_state_clear_failed")),
+        }
+    }
+
+    fn reject_invalid_composer_state(
+        &self,
+        path: &Path,
+    ) -> BackendResult<Vec<StoredComposerSession>> {
+        match fs::remove_file(path) {
+            Ok(()) => Err(storage_error("mobile_composer_state_invalid")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(storage_error("mobile_composer_state_invalid"))
+            }
+            Err(_) => Err(storage_error("mobile_composer_state_clear_failed")),
+        }
+    }
+
     pub fn clear(&self) -> BackendResult<()> {
         match fs::remove_file(self.path()) {
             Ok(()) => Ok(()),
@@ -1331,6 +1541,101 @@ mod tests {
         let loaded = storage.load_app_settings().unwrap();
         assert_eq!(loaded.theme, Some(crate::theme::AppearanceMode::Dark));
         assert_eq!(loaded.language, None);
+    }
+
+    #[test]
+    fn composer_state_round_trips_and_clears() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        assert!(storage.load_composer_state().unwrap().is_empty());
+
+        let sessions = vec![StoredComposerSession {
+            session_id: "session_test".to_string(),
+            saved_at_ms: 10,
+            draft: "half a thought".to_string(),
+            attachments: vec![StoredComposerAttachment {
+                label: "shot.png".to_string(),
+                mime_type: Some("image/png".to_string()),
+                data_url: "data:image/png;base64,aGVsbG8=".to_string(),
+            }],
+            queued: vec![StoredComposerQueuedMessage {
+                text: "and another".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+            }],
+        }];
+        storage.save_composer_state(&sessions).unwrap();
+        assert_eq!(storage.load_composer_state().unwrap(), sessions);
+
+        storage.clear_composer_state().unwrap();
+        assert!(storage.load_composer_state().unwrap().is_empty());
+    }
+
+    /// One record naming something that is not a session costs only itself:
+    /// the sessions either side of it keep their drafts.
+    #[test]
+    fn a_composer_record_naming_no_session_is_dropped_on_its_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(
+            storage.composer_state_path(),
+            br#"{
+                "schemaVersion": "vibex-native-mobile-composer.v1",
+                "sessions": [
+                    {"sessionId": "session_kept", "savedAtMs": 2, "draft": "kept"},
+                    {"sessionId": "not-a-session", "savedAtMs": 3, "draft": "dropped"},
+                    {"sessionId": "", "savedAtMs": 4, "draft": "dropped"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = storage.load_composer_state().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].session_id, "session_kept");
+        assert_eq!(loaded[0].draft, "kept");
+    }
+
+    /// The words are what cannot be retyped, so a record past the attachment
+    /// budget keeps its text and loses the files.
+    #[test]
+    fn composer_state_drops_attachments_past_its_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        let payload = "A".repeat(MAX_COMPOSER_ATTACHMENT_BYTES / 2 + 1);
+        let attachment = |label: &str| StoredComposerAttachment {
+            label: label.to_string(),
+            mime_type: None,
+            data_url: format!("data:application/octet-stream;base64,{payload}"),
+        };
+        storage
+            .save_composer_state(&[StoredComposerSession {
+                session_id: "session_test".to_string(),
+                saved_at_ms: 10,
+                draft: "keep me".to_string(),
+                attachments: vec![attachment("first"), attachment("second")],
+                queued: Vec::new(),
+            }])
+            .unwrap();
+
+        let loaded = storage.load_composer_state().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].draft, "keep me");
+        assert_eq!(loaded[0].attachments.len(), 1);
+        assert_eq!(loaded[0].attachments[0].label, "first");
+    }
+
+    #[test]
+    fn unreadable_composer_state_is_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(storage.composer_state_path(), b"not-json").unwrap();
+
+        let error = storage.load_composer_state().unwrap_err();
+        assert_eq!(error.code, "mobile_composer_state_invalid");
+        assert!(!storage.composer_state_path().exists());
     }
 
     #[test]
