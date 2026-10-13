@@ -493,6 +493,36 @@ mod tests {
     }
 
     #[test]
+    fn android_left_edge_swipe_opens_the_drawer_instead_of_leaving_the_app() {
+        // The sessions drawer is dragged open from the left edge, and on a
+        // phone with gesture navigation that edge belongs to the system's back
+        // gesture. A swipe the system claims never reaches GPUI: it arrives as
+        // BACK, and the session page's back stack is empty, so the app left the
+        // foreground instead of opening the drawer. The host has to keep that
+        // edge out of the system gesture for the app's own pan to see it.
+        assert!(
+            ANDROID_ACTIVITY.contains("setSystemGestureExclusionRects"),
+            "the Android host must keep the left edge out of the system back gesture"
+        );
+        assert!(
+            ANDROID_ACTIVITY.contains("new Rect(0, 0, drawerEdgeWidthPx, height)"),
+            "the excluded strip has to sit on the left edge and span the surface"
+        );
+        assert!(
+            ANDROID_ACTIVITY.contains("Build.VERSION_CODES.Q"),
+            "the system gesture exclusion only exists from API 29 on"
+        );
+        // The exclusion is only justified while the drawer is dragged open by a
+        // rightward pan from the main page: an app without that gesture would be
+        // reserving the edge for nothing.
+        let app_source = include_str!("app.rs");
+        assert!(
+            app_source.contains("DrawerDragOrigin::Main if dx > 0.0 => DrawerPanDecision::Drag(DrawerPage::Sessions)"),
+            "the rightward pan from the main page must still drag the sessions drawer open"
+        );
+    }
+
+    #[test]
     fn android_battery_allowlist_guidance_contract_is_complete() {
         let power_source = include_str!("power.rs");
         for (java_method, rust_call) in [

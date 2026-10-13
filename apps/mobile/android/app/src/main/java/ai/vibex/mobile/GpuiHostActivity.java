@@ -12,6 +12,7 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
@@ -56,6 +57,7 @@ import java.io.InputStream;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -107,6 +109,17 @@ public final class GpuiHostActivity extends Activity {
     /** The action a launcher shortcut uses to open a fresh session. */
     private static final String ACTION_NEW_SESSION = "ai.vibex.mobile.NEW_SESSION";
     /**
+     * Width of the strip along the left edge the system's own back gesture may
+     * not claim, in density-independent pixels.
+     *
+     * <p>The sessions drawer is dragged open from that edge, and a swipe the
+     * system claims never reaches GPUI: it arrives as BACK instead, and on the
+     * session page the back stack is empty, so the app left the foreground
+     * rather than opening the drawer. The platform's own gesture inset is used
+     * where it reports one; this is the floor for the devices that do not.
+     */
+    private static final int DRAWER_EDGE_DP = 24;
+    /**
      * The host id every native call carries.
      *
      * <p>{@code gpui-pre-mobile} keeps one GPUI window per host id and builds it
@@ -130,6 +143,11 @@ public final class GpuiHostActivity extends Activity {
 
     private SurfaceView surfaceView;
     private InputProxy input;
+    /** Width of the left-edge strip kept out of the system's back gesture. */
+    private int drawerEdgeWidthPx;
+    /** The strip already handed to the framework, so an unchanged one is not re-sent. */
+    private int appliedDrawerEdgeWidthPx;
+    private int appliedDrawerEdgeHeightPx;
     /** The file a pending camera capture writes into, cleared once it reports. */
     private File captureTarget;
 
@@ -167,6 +185,8 @@ public final class GpuiHostActivity extends Activity {
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
 
         surfaceView = new SurfaceView(this);
+        drawerEdgeWidthPx = Math.round(
+                DRAWER_EDGE_DP * getResources().getDisplayMetrics().density);
         surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override
             public void surfaceCreated(SurfaceHolder holder) {
@@ -187,6 +207,12 @@ public final class GpuiHostActivity extends Activity {
         setContentView(surfaceView);
 
         View decor = getWindow().getDecorView();
+        // The excluded strip spans the whole left edge, so its height follows
+        // the window: every layout re-issues it, and `reportInsets` widens it to
+        // whatever the platform calls its own gesture area.
+        decor.addOnLayoutChangeListener(
+                (view, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) ->
+                        applyDrawerEdgeExclusion());
         ViewCompat.setOnApplyWindowInsetsListener(decor, (view, insets) -> {
             reportInsets(insets);
             return insets;
@@ -516,6 +542,53 @@ public final class GpuiHostActivity extends Activity {
         }
     }
 
+    /**
+     * Keeps the system's own back gesture out of the strip the sessions drawer
+     * is dragged open from.
+     *
+     * <p>{@code setSystemGestureExclusionRects} is the only way to hand an edge
+     * swipe back to the app once gesture navigation owns that edge, and the
+     * system caps what an app may exclude, so this asks for the drawer's own
+     * edge and nothing more. A platform that reports no gesture area still gets
+     * the floor, because the swipe has to reach GPUI either way.
+     */
+    private void excludeDrawerEdgeFromSystemGesture(WindowInsetsCompat insets) {
+        int floor = Math.round(DRAWER_EDGE_DP * getResources().getDisplayMetrics().density);
+        Insets gestures = insets.getInsets(WindowInsetsCompat.Type.systemGestures());
+        drawerEdgeWidthPx = Math.max(gestures.left, floor);
+        applyDrawerEdgeExclusion();
+    }
+
+    /**
+     * Re-issues the excluded left-edge strip for the surface's current size.
+     *
+     * <p>It does nothing below API 29, where the framework has no such knob and
+     * the edge belongs to the app alone. Called again on every layout and inset
+     * change, because the rect spans the window's whole height; an unchanged
+     * strip is not re-sent.
+     */
+    private void applyDrawerEdgeExclusion() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return;
+        }
+        // The rects go on the decor, never on the SurfaceView: the surface's
+        // content belongs to another process, and the framework takes exclusion
+        // rects from the window's own hierarchy. A rect that never reaches the
+        // window is a swipe the system keeps claiming.
+        View decor = getWindow().getDecorView();
+        int height = decor.getHeight();
+        if (drawerEdgeWidthPx <= 0 || height <= 0) {
+            return;
+        }
+        if (drawerEdgeWidthPx == appliedDrawerEdgeWidthPx && height == appliedDrawerEdgeHeightPx) {
+            return;
+        }
+        decor.setSystemGestureExclusionRects(
+                Collections.singletonList(new Rect(0, 0, drawerEdgeWidthPx, height)));
+        appliedDrawerEdgeWidthPx = drawerEdgeWidthPx;
+        appliedDrawerEdgeHeightPx = height;
+    }
+
     private void reportInsets(WindowInsetsCompat insets) {
         Insets bars = insets.getInsets(
                 WindowInsetsCompat.Type.systemBars()
@@ -523,6 +596,7 @@ public final class GpuiHostActivity extends Activity {
         // The GPUI render thread may not have processed surfaceChanged yet.
         // Send edge distances, never a rect derived from this View's new size.
         nativeInsets(bars.left, bars.top, bars.right, bars.bottom);
+        excludeDrawerEdgeFromSystemGesture(insets);
 
         boolean visible = insets.isVisible(WindowInsetsCompat.Type.ime());
         Insets ime = insets.getInsets(WindowInsetsCompat.Type.ime());
