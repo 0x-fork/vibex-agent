@@ -16,8 +16,8 @@
 use std::collections::BTreeSet;
 
 use vibex_core::{
-    AgentId, RuntimeAuthSourceAvailability, RuntimeOptionAvailability, SessionRuntimeOption,
-    SessionRuntimeSelection, SessionRuntimeSelectionStatus,
+    AgentId, RuntimeAuthSource, RuntimeAuthSourceAvailability, RuntimeOptionAvailability,
+    SessionRuntimeOption, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
 };
 
 use crate::app::{App, RunOption, RuntimePickerView};
@@ -581,6 +581,19 @@ pub fn entry_matches(option: &SessionRuntimeOption, query: &str) -> bool {
         || option.agent_label.to_lowercase().contains(query)
         || option.auth_source_label.to_lowercase().contains(query)
         || option.model_label.to_lowercase().contains(query)
+}
+
+/// The account one catalogue entry runs on, as a row names it.
+///
+/// The catalogue carries a label for every account, but an Agent account is a
+/// product concept rather than a name the reader chose, so this client says it
+/// in the reader's language and keeps the runtime's label for the accounts the
+/// reader did name — a Provider Profile.
+pub fn runtime_option_auth_label(strings: &Strings, option: &SessionRuntimeOption) -> String {
+    match &option.selection.auth_source {
+        RuntimeAuthSource::AgentAccount { .. } => strings.runtime_auth_agent_account().to_string(),
+        RuntimeAuthSource::ProviderProfile { .. } => option.auth_source_label.clone(),
+    }
 }
 
 /// The catalogue's entries, grouped by Agent, in the order the runtime

@@ -89,11 +89,12 @@ without fetching a record before creation has completed.
   the summary. Toggling all reasoning chooses a target state once before
   walking groups. Reasoning defaults, explicit overrides, and disclosure motion
   follow [Timeline Presentation](./timeline-presentation.md).
-- Runtime text transitions follow the current `ComposerTarget` on both
-  `Page::NewSession` and `Page::Agent`. Observe workspace text only on New Session,
-  where that animated row is visible. `switch_composer` clears both observed
-  labels and running transitions when the target changes, so opening another
-  editor starts with its own labels.
+- Runtime text transitions — the Agent, the account it runs on and the model —
+  follow the current `ComposerTarget` on both `Page::NewSession` and
+  `Page::Agent`. Observe workspace text only on New Session, where that animated
+  row is visible. `switch_composer` clears every observed label and running
+  transition when the target changes, so opening another editor starts with its
+  own labels.
 - `observe_composer_text` defers observation while an overlay covers the page.
   A runtime change received behind the picker begins on the first frame after
   it closes. With text transitions disabled, observations still record the

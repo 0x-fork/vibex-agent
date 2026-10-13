@@ -44,7 +44,8 @@ use unicode_width::UnicodeWidthChar;
 /// scramble both to say so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Slot {
-    /// The Agent and model the current composer will run.
+    /// The Agent, the account it runs on and the model the current composer
+    /// will run.
     Runtime,
     /// The directory the session will work in.
     Workspace,
@@ -83,9 +84,9 @@ pub struct Scramble {
     /// What each part of the line showed when the transition began.
     ///
     /// Parts rather than one string because a line can be drawn in more than
-    /// one style: the Agent and the model are two spans on the composer's line,
-    /// and they must arrive as themselves rather than as a single flattened
-    /// run.
+    /// one style: the Agent, the account and the model are three spans on the
+    /// composer's line, and they must arrive as themselves rather than as a
+    /// single flattened run.
     from: Vec<String>,
     /// The animation frame the transition began on.
     started: u32,
@@ -109,10 +110,10 @@ impl Scramble {
 
     /// The text one part of the line is drawn as at `phase`.
     ///
-    /// `part` is which piece of the line this is — the Agent, the model — so
-    /// each keeps its own style and its own arrival. A part the transition did
-    /// not know about is treated as empty, which scrambles it whole: a line that
-    /// grew a piece has something to say about it.
+    /// `part` is which piece of the line this is — the Agent, the model, the
+    /// account — so each keeps its own style and its own arrival. A part the
+    /// transition did not know about is treated as empty, which scrambles it
+    /// whole: a line that grew a piece has something to say about it.
     pub fn drawn(&self, part: usize, target: &str, phase: u32) -> String {
         if self.finished(phase) {
             return target.to_string();
@@ -172,11 +173,13 @@ fn noise(index: u64, phase: u64, hidden: char) -> char {
 /// The runtime and workspace labels, as the last frame drew them.
 ///
 /// Held apart rather than as one string because that is how they are drawn: the
-/// Agent and the model are two spans, and the workspace is its own row.
+/// Agent, the account it runs on and the model are three spans, and the
+/// workspace is its own row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Seen {
     agent: String,
     model: String,
+    account: String,
     workspace: String,
 }
 
@@ -201,6 +204,10 @@ impl Transitions {
     /// Note the lines the current composer is about to draw, and begin a
     /// transition for each one that changed since the last look.
     ///
+    /// The Agent, the account and the model are one line's parts and are
+    /// observed together: a reader who changed any of them changed what the
+    /// message will be sent through.
+    ///
     /// `enabled` is the reader's setting. It is checked here rather than at the
     /// draw site so that a page with the effect switched off still *records*
     /// what it drew: switching the effect back on must not scramble the page
@@ -208,6 +215,7 @@ impl Transitions {
     pub fn observe(
         &mut self,
         agent: &str,
+        account: &str,
         model: &str,
         workspace: &str,
         phase: u32,
@@ -216,6 +224,7 @@ impl Transitions {
         let seen = Seen {
             agent: agent.to_string(),
             model: model.to_string(),
+            account: account.to_string(),
             workspace: workspace.to_string(),
         };
         let Some(previous) = self.seen.replace(seen) else {
@@ -225,10 +234,14 @@ impl Transitions {
             self.runs.clear();
             return;
         }
+        // The account is the runtime line's last part although it is drawn
+        // between the other two: the Agent and the model are the pair the
+        // new-session page names on its own, and a part appended to the line
+        // must not renumber the ones a surface already reads.
         self.begin(
             Slot::Runtime,
-            vec![previous.agent, previous.model],
-            &[agent, model],
+            vec![previous.agent, previous.model, previous.account],
+            &[agent, model, account],
             phase,
         );
         self.begin(
@@ -423,12 +436,12 @@ mod tests {
         let mut transitions = Transitions::default();
         // The first look records: a page that has just been opened has nothing
         // to carry.
-        transitions.observe("Codex", "gpt-5", "/home/peatboy", 0, true);
+        transitions.observe("Codex", "Work", "gpt-5", "/home/peatboy", 0, true);
         assert!(!transitions.running(0));
 
         // A new workspace is a transition on the workspace line and not on the
         // Agent's.
-        transitions.observe("Codex", "gpt-5", "/home/peatboy/vibex", 3, true);
+        transitions.observe("Codex", "Work", "gpt-5", "/home/peatboy/vibex", 3, true);
         assert!(transitions.running(3));
         assert_ne!(
             transitions.drawn(Slot::Workspace, 0, "/home/peatboy/vibex", 3),
@@ -436,6 +449,7 @@ mod tests {
         );
         assert_eq!(transitions.drawn(Slot::Runtime, 0, "Codex", 3), "Codex");
         assert_eq!(transitions.drawn(Slot::Runtime, 1, "gpt-5", 3), "gpt-5");
+        assert_eq!(transitions.drawn(Slot::Runtime, 2, "Work", 3), "Work");
 
         // A whole transition later, the lines are what they say they are.
         let settled = 3 + FRAMES;
@@ -447,7 +461,14 @@ mod tests {
 
         // The Agent changed: both of its parts arrive, and the workspace that
         // did not change is left alone.
-        transitions.observe("Claude", "opus", "/home/peatboy/vibex", settled, true);
+        transitions.observe(
+            "Claude",
+            "Work",
+            "opus",
+            "/home/peatboy/vibex",
+            settled,
+            true,
+        );
         assert!(transitions.running(settled));
         assert_ne!(
             transitions.drawn(Slot::Runtime, 0, "Claude", settled),
@@ -461,7 +482,14 @@ mod tests {
         // The next look finds the same text, and that is not the end of the
         // transition: the frame that notes a line is unchanged is the second
         // frame of what it is carrying, not the last one.
-        transitions.observe("Claude", "opus", "/home/peatboy/vibex", settled + 1, true);
+        transitions.observe(
+            "Claude",
+            "Work",
+            "opus",
+            "/home/peatboy/vibex",
+            settled + 1,
+            true,
+        );
         assert!(transitions.running(settled + 1));
         assert_ne!(
             transitions.drawn(Slot::Runtime, 0, "Claude", settled + 1),
@@ -473,7 +501,14 @@ mod tests {
         let done = settled + FRAMES;
         assert!(!transitions.running(done));
         transitions.prune(done);
-        transitions.observe("Claude", "opus", "/home/peatboy/vibex", done + 1, true);
+        transitions.observe(
+            "Claude",
+            "Work",
+            "opus",
+            "/home/peatboy/vibex",
+            done + 1,
+            true,
+        );
         assert!(!transitions.running(done + 1));
         assert_eq!(
             transitions.drawn(Slot::Runtime, 0, "Claude", done + 1),
@@ -482,30 +517,53 @@ mod tests {
     }
 
     #[test]
+    fn an_account_that_changed_alone_still_arrives_as_itself() {
+        // Two Provider Profiles of one Agent on one model differ in nothing but
+        // the account, and that is the whole of what the reader changed: the
+        // line has to carry it rather than swap it under their eyes.
+        let mut transitions = Transitions::default();
+        transitions.observe("Codex", "Work", "gpt-5", "/home/peatboy", 0, true);
+        transitions.observe("Codex", "Personal", "gpt-5", "/home/peatboy", 2, true);
+        assert!(transitions.running(2));
+        assert_eq!(transitions.drawn(Slot::Runtime, 0, "Codex", 2), "Codex");
+        assert_eq!(transitions.drawn(Slot::Runtime, 1, "gpt-5", 2), "gpt-5");
+        assert_ne!(
+            transitions.drawn(Slot::Runtime, 2, "Personal", 2),
+            "Personal"
+        );
+        let settled = 2 + FRAMES;
+        assert!(!transitions.running(settled));
+        assert_eq!(
+            transitions.drawn(Slot::Runtime, 2, "Personal", settled),
+            "Personal"
+        );
+    }
+
+    #[test]
     fn the_effect_switched_off_still_records_what_the_page_drew() {
         // A reader who turns the effect off must not have it fire once, the
         // moment they turn it back on, for a change they never saw.
         let mut transitions = Transitions::default();
-        transitions.observe("Codex", "gpt-5", "/home/peatboy", 0, false);
-        transitions.observe("Claude", "opus", "/home/peatboy/vibex", 4, false);
+        transitions.observe("Codex", "Work", "gpt-5", "/home/peatboy", 0, false);
+        transitions.observe("Claude", "Work", "opus", "/home/peatboy/vibex", 4, false);
         assert!(!transitions.running(4));
 
-        transitions.observe("Claude", "opus", "/home/peatboy/vibex", 8, false);
+        transitions.observe("Claude", "Work", "opus", "/home/peatboy/vibex", 8, false);
         assert!(!transitions.running(8));
         // Turning it on is not itself a change: the lines settle as they are.
-        transitions.observe("Claude", "opus", "/home/peatboy/vibex", 9, true);
+        transitions.observe("Claude", "Work", "opus", "/home/peatboy/vibex", 9, true);
         assert!(!transitions.running(9));
 
         // And the next change is carried.
-        transitions.observe("Claude", "sonnet", "/home/peatboy/vibex", 12, true);
+        transitions.observe("Claude", "Work", "sonnet", "/home/peatboy/vibex", 12, true);
         assert!(transitions.running(12));
     }
 
     #[test]
     fn leaving_the_page_stops_the_transition() {
         let mut transitions = Transitions::default();
-        transitions.observe("Codex", "gpt-5", "/home/peatboy", 0, true);
-        transitions.observe("Claude", "opus", "/home/peatboy", 2, true);
+        transitions.observe("Codex", "Work", "gpt-5", "/home/peatboy", 0, true);
+        transitions.observe("Claude", "Work", "opus", "/home/peatboy", 2, true);
         assert!(transitions.running(2));
 
         // The reader leaves mid-transition: the frames nobody is looking at are
@@ -513,13 +571,13 @@ mod tests {
         // as the text it already is when the page comes back.
         transitions.cancel();
         assert!(!transitions.running(2));
-        transitions.observe("Claude", "opus", "/home/peatboy", 30, true);
+        transitions.observe("Claude", "Work", "opus", "/home/peatboy", 30, true);
         assert!(!transitions.running(30));
         assert_eq!(transitions.drawn(Slot::Runtime, 0, "Claude", 30), "Claude");
 
         // A finished transition is dropped rather than kept for the life of the
         // page, so the client can stop repainting.
-        transitions.observe("Claude", "sonnet", "/home/peatboy", 32, true);
+        transitions.observe("Claude", "Work", "sonnet", "/home/peatboy", 32, true);
         assert!(transitions.running(32));
         transitions.prune(32 + FRAMES);
         assert!(!transitions.running(32 + FRAMES));

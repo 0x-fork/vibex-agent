@@ -613,6 +613,10 @@ strings! {
     },
     runtime_model => { "Model", "模型", "模型" },
     runtime_agent => { "Agent", "Agent", "Agent" },
+    // The Agent's own account, as a picker row names it. The runtime writes an
+    // English name into the catalogue for clients that render no locale; a
+    // reader of this client gets the one below instead.
+    runtime_auth_agent_account => { "Agent account", "Agent 账户", "Agent 帳戶" },
     runtime_probe => { "Probe runtimes", "探测运行时", "探測執行階段" },
     // The switch affordance, shown beside the runtime it moves.
     runtime_switch_hint => { "Ctrl+G change", "Ctrl+G 切换", "Ctrl+G 切換" },

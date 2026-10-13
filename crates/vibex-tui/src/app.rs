@@ -2177,6 +2177,7 @@ impl App {
             return;
         }
         let (agent, model) = self.composer_runtime_labels();
+        let account = self.composer_auth_source_label();
         let workspace = if self.page == Page::NewSession {
             self.new_session_workspace()
         } else {
@@ -2184,6 +2185,7 @@ impl App {
         };
         self.transitions.observe(
             &agent,
+            &account,
             &model,
             &workspace,
             self.animation_phase,
@@ -2196,7 +2198,10 @@ impl App {
     /// Two parts rather than one line because that is how the surfaces under
     /// the page draw them: the Agent and the model are separate spans with
     /// separate emphasis, and the transition carries each of them rather than a
-    /// flattened run that would lose the difference.
+    /// flattened run that would lose the difference. The account the two run on
+    /// is a third part of the same transition ([`Self::drawn_runtime_account`]),
+    /// drawn between them: it is not returned here because the new-session page
+    /// names the pair and leaves the account to the info line under the box.
     pub fn drawn_runtime_parts(&self) -> (String, String) {
         let (agent, model) = self.composer_runtime_labels();
         let phase = self.animation_phase;
@@ -2206,6 +2211,40 @@ impl App {
             self.transitions
                 .drawn(crate::scramble::Slot::Runtime, 1, &model, phase),
         )
+    }
+
+    /// The account the page's runtime runs on, with any transition applied.
+    ///
+    /// Drawn between the Agent and the model on the composer's info line, which
+    /// is the order the picker's own entries name them in. It is empty when
+    /// there is no name to give, and the line then leaves it out rather than
+    /// showing a gap.
+    pub fn drawn_runtime_account(&self) -> String {
+        self.transitions.drawn(
+            crate::scramble::Slot::Runtime,
+            2,
+            &self.composer_auth_source_label(),
+            self.animation_phase,
+        )
+    }
+
+    /// The account the page's runtime runs on, as this client names it.
+    ///
+    /// The info line below the composer names what the message will go through —
+    /// the Agent, the account, the model — and the account is the one part of
+    /// that name this client has a name of its own for: an Agent account is the
+    /// product's own concept rather than a name the reader chose, so it is said
+    /// in the reader's language, while a Provider Profile keeps the name its
+    /// owner gave it. The catalogue holds the runtime's own label, written in
+    /// English for every client at once, which is why the picker's row and this
+    /// line name the same account the same way. A selection the catalogue does
+    /// not hold has no name to give: it records an id, and an id is not
+    /// something the reader has ever seen on that line.
+    pub fn composer_auth_source_label(&self) -> String {
+        self.page_runtime_selection()
+            .and_then(|selection| self.runtime_option_for(&selection))
+            .map(|option| crate::runtime_picker::runtime_option_auth_label(&self.strings, option))
+            .unwrap_or_default()
     }
 
     /// The workspace a session created now would open in, mid-transition.

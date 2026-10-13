@@ -633,7 +633,8 @@ fn a_cjk_draft_with_a_collapsed_space_run_renders() {
 fn the_prompt_names_the_runtime_the_session_is_on() {
     // The Agent and model switcher has to be visible from the composer: the
     // line names the session's own runtime — not the first catalogue entry —
-    // and the key that moves it.
+    // and the key that moves it. The account the entry runs on is part of that
+    // answer: it sits between the Agent and the model, as the picker names it.
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
     app.live = vibex_tui::app::LiveState::Ready;
@@ -736,9 +737,58 @@ fn the_prompt_names_the_runtime_the_session_is_on() {
         "the runtime is not aligned with the editor: column {start}\n{screen}"
     );
     assert!(
-        info_row[start..].starts_with("codex · gpt-5"),
+        info_row[start..].starts_with("codex · bal · gpt-5"),
         "the info line starts with something else: {:?}",
         &info_row[start..]
+    );
+}
+
+#[test]
+fn the_prompt_names_the_account_the_runtime_runs_on() {
+    // Two Provider Profiles can offer one Agent on one model, and the account
+    // is then the whole of what tells the two entries apart: a line that named
+    // the Agent and the model alone would leave the reader to remember which
+    // Provider Profile they picked. It sits between them, the place the picker
+    // names it in on its own rows.
+    let mut app = app(140, 40);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let option = |account: &str| vibex_core::SessionRuntimeOption {
+        selection: vibex_core::SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse("deepseek-harness").expect("agent id"),
+            vibex_core::ProviderProfileId::new(),
+            "deepseek-v4.1-flash",
+        ),
+        agent_label: "DeepSeek Harness".to_string(),
+        auth_source_label: account.to_string(),
+        model_label: "deepseek-v4.1-flash".to_string(),
+        reasoning_efforts: Vec::new(),
+        modes: Vec::new(),
+        features: Vec::new(),
+        availability: vibex_core::RuntimeOptionAvailability::Available,
+    };
+    let catalog = vibex_core::SessionRuntimeOptionCatalog {
+        revision: 1,
+        agents: Vec::new(),
+        auth_sources: Vec::new(),
+        options: vec![option("Work"), option("Personal")],
+    };
+    app.runtime_options = Some(catalog.clone());
+    open_session_on(&mut app, catalog.options[1].selection.clone());
+
+    let lines = render(&mut app, 140, 40);
+    let screen = text(&lines);
+    let info_row = lines
+        .iter()
+        .find(|line| line.contains("deepseek-v4.1-flash"))
+        .unwrap_or_else(|| panic!("the info line is on screen:\n{screen}"));
+    assert!(
+        info_row.contains("DeepSeek Harness · Personal · deepseek-v4.1-flash"),
+        "the info line does not name the account it will run on: {info_row:?}"
+    );
+    assert!(
+        !info_row.contains("Work"),
+        "the info line named a Provider Profile the session is not on: {info_row:?}"
     );
 }
 
@@ -1079,10 +1129,10 @@ fn the_prompt_names_the_run_options_the_session_is_on() {
     let screen = text(&lines);
     let info_row = lines
         .iter()
-        .find(|line| line.contains("codex · gpt-5"))
+        .find(|line| line.contains("codex · bal · gpt-5"))
         .expect("the info line is on screen");
     assert!(
-        info_row.contains("codex · gpt-5 · High · Plan"),
+        info_row.contains("codex · bal · gpt-5 · High · Plan"),
         "the info line does not name the run options in effect: {info_row:?}"
     );
     // A feature stays in the switcher: the line carries the shape of the
@@ -5839,7 +5889,11 @@ fn an_existing_session_carries_its_runtime_change_after_the_picker_closes() {
             .expect("picker closed");
         let arriving = text(&buffer_lines(terminal.backend().buffer(), 120, 40));
         assert_eq!(app.transitions.running(app.animation_phase()), enabled);
-        assert_eq!(arriving.contains("codex · gpt-5"), !enabled, "{arriving}");
+        assert_eq!(
+            arriving.contains("codex · bal · gpt-5"),
+            !enabled,
+            "{arriving}"
+        );
         assert!(arriving.contains("keep this draft"));
 
         for _ in 0..vibex_tui::scramble::FRAMES {
@@ -5850,7 +5904,7 @@ fn an_existing_session_carries_its_runtime_change_after_the_picker_closes() {
             }
         }
         let settled = text(&buffer_lines(terminal.backend().buffer(), 120, 40));
-        assert!(settled.contains("codex · gpt-5"), "{settled}");
+        assert!(settled.contains("codex · bal · gpt-5"), "{settled}");
         assert!(!app.is_animating());
         assert!(!app.advance_transcript_animation());
     }
@@ -5871,7 +5925,7 @@ fn opening_another_composer_does_not_carry_the_previous_runtime_transition() {
     open_session_on(&mut app, catalog.options[0].selection.clone());
     app.open_session(app.selected_session_id().unwrap().clone());
     let opened = text(&render(&mut app, 120, 40));
-    assert!(opened.contains("claude · claude-sonnet"), "{opened}");
+    assert!(opened.contains("claude · bal · claude-sonnet"), "{opened}");
     assert!(!app.transitions.running(app.animation_phase()));
 
     app.agent
@@ -5888,7 +5942,7 @@ fn opening_another_composer_does_not_carry_the_previous_runtime_transition() {
     open_session_on(&mut app, catalog.options[0].selection.clone());
     app.open_session(app.selected_session_id().unwrap().clone());
     let opened = text(&render(&mut app, 120, 40));
-    assert!(opened.contains("claude · claude-sonnet"), "{opened}");
+    assert!(opened.contains("claude · bal · claude-sonnet"), "{opened}");
     assert!(!app.is_animating());
 }
 
@@ -7068,7 +7122,7 @@ fn the_creating_session_view_waits_for_its_session() {
     let screen = text(&render(&mut app, 110, 30));
     assert!(screen.contains("first message"), "{screen}");
     assert!(
-        screen.contains("deepseek · deepseek-v4.1-flash"),
+        screen.contains("deepseek · bai · deepseek-v4.1-flash"),
         "the runtime being used is not named:\n{screen}"
     );
     assert!(

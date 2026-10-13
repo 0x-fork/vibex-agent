@@ -3577,14 +3577,14 @@ fn composer_vocabulary(strings: Strings) -> String {
 /// ```text
 /// ╭─ <session title> ─────────────────────────────╮
 /// │ ❯ the draft so far                             │
-/// ╰─ <agent> · <model> · <mode>          multiline╯
+/// ╰─ <agent> · <account> · <model> · <mode>   multi╯
 /// ```
 ///
 /// The top border carries the session, and the bottom border is an info line —
-/// model, mode and any warning — which is where a terminal UI can show context
-/// without spending a row on it. Both fade toward the canvas when the composer
-/// does not have focus, so "where will my keystrokes go" is answerable at a
-/// glance rather than by reading.
+/// the runtime a message will go through and any warning — which is where a
+/// terminal UI can show context without spending a row on it. Both fade toward
+/// the canvas when the composer does not have focus, so "where will my
+/// keystrokes go" is answerable at a glance rather than by reading.
 fn render_composer(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3851,6 +3851,11 @@ fn render_history_search(
 /// the rule the eye follows into the box, and the runtime a message will go
 /// through belongs beside the box's far corner, not on top of the text it is
 /// about.
+///
+/// The runtime is named in full — the Agent, the account it will run on and the
+/// model — because an entry the reader picked in the picker is one of those
+/// three names, and a line that answered with two of them would leave the
+/// reader to remember which Provider Profile they chose.
 fn render_composer_info(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3863,6 +3868,14 @@ fn render_composer_info(
     }
     let (agent, model) = app.drawn_runtime_parts();
     let mut left = vec![Span::styled(agent, theme.muted())];
+    // The account the message will run on sits between the Agent and the model,
+    // which is the order the picker names an entry in: an Agent reached through
+    // a Provider Profile is a different runtime from the same Agent on its own
+    // account, and the line that says what Enter will do has to say which.
+    let account = app.drawn_runtime_account();
+    if !account.is_empty() {
+        left.push(Span::styled(format!(" · {account}"), theme.muted()));
+    }
     if !model.is_empty() {
         left.push(Span::styled(format!(" · {model}"), theme.base()));
     }
