@@ -4,8 +4,8 @@ use std::time::Duration;
 use gpui::{
     Bounds, ClipboardItem, Context, DispatchPhase, Entity, FontWeight, IntoElement, LongPressEvent,
     MouseButton, MouseUpEvent, ParentElement as _, Pixels, Point, Render, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchPhase, WeakEntity, Window, canvas, div,
-    prelude::*, px, relative, rgb, svg,
+    ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchDragEvent, TouchPhase, WeakEntity,
+    Window, canvas, div, prelude::*, px, relative, rgb, svg,
 };
 use vibex_backend::{
     BackendError, BackendOperation, BackendResult, MutationRequest, TerminalBackend as _,
@@ -54,12 +54,53 @@ const TERMINAL_MAX_COLS: u16 = 240;
 /// the bar, not to the row underneath it.
 const TERMINAL_SELECTION_BAR_HEIGHT: f32 = 40.0;
 const TERMINAL_SELECTION_BAR_BAND: f32 = TERMINAL_SELECTION_BAR_HEIGHT + theme::SPACING_SM * 2.0;
+/// The selection's drag handles: the dot a reader sees, and the radius a touch
+/// has to land inside to take hold of it. The touch radius is deliberately
+/// larger than the dot, so the handle is a comfortable target even though it
+/// has to sit beside the text it is selecting.
+const TERMINAL_HANDLE_SIZE: f32 = 14.0;
+const TERMINAL_HANDLE_TOUCH_RADIUS: f32 = 26.0;
 
 /// The two ends of a touch selection over the terminal grid.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct TerminalSelection {
     anchor: TerminalGridPoint,
     head: TerminalGridPoint,
+}
+
+impl TerminalSelection {
+    /// The selection with its ends in reading order, which is what the two
+    /// drag handles are placed and hit-tested against.
+    fn ends(self) -> (TerminalGridPoint, TerminalGridPoint) {
+        let key = |point: TerminalGridPoint| (point.row, point.column);
+        if key(self.anchor) <= key(self.head) {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+}
+
+/// Which end of the selection a drag is moving.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TerminalSelectionHandle {
+    Start,
+    End,
+}
+
+/// A drag this client is forwarding to an application that asked for mouse
+/// reporting, driven by a sideways pan.
+#[derive(Clone, Copy, Debug)]
+struct TerminalMouseDrag {
+    /// Where the finger went down. A pan reports this same point with every
+    /// step, so it is both the press's cell and the origin the travelled
+    /// distance is measured from.
+    origin: Point<Pixels>,
+    /// Horizontal distance reported since the press, in pixels.
+    travelled: f32,
+    /// The cell of the last report, so a step that stays inside one cell is
+    /// not sent again.
+    last: TerminalGridPoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +259,15 @@ pub struct MobileWorkbench {
     /// The text the current selection holds, kept for Copy so the clipboard
     /// write does not have to reach back into the render model.
     terminal_selection_text: Option<String>,
+    /// The end of the selection a touch is currently dragging, once it landed
+    /// on one of the two handles.
+    terminal_selection_handle: Option<TerminalSelectionHandle>,
+    /// The application drag a sideways pan is driving, if one is in progress.
+    terminal_mouse_drag: Option<TerminalMouseDrag>,
+    /// The origin of the pan whose drag has already been released. A fling
+    /// repeats its own gesture's origin, so this is what tells the momentum
+    /// that follows a release apart from a new drag.
+    terminal_mouse_drag_released: Option<Point<Pixels>>,
     /// In-terminal find. Matches are painted by reusing the emulator's own
     /// selection, exactly as the desktop surface highlights them.
     terminal_search_open: bool,
@@ -294,6 +344,9 @@ impl MobileWorkbench {
             terminal_grid_bounds: None,
             terminal_selection: None,
             terminal_selection_text: None,
+            terminal_selection_handle: None,
+            terminal_mouse_drag: None,
+            terminal_mouse_drag_released: None,
             terminal_search_open: false,
             terminal_search_input: None,
             terminal_search_subscription: None,
@@ -1636,7 +1689,7 @@ impl MobileWorkbench {
         if !render.frame.modes.mouse_reporting {
             return;
         }
-        if let Some(input) = terminal_mouse_click(point, render.frame.modes.sgr_mouse) {
+        if let Some(input) = terminal_mouse_tap(point, render.frame.modes.sgr_mouse) {
             self.send_terminal_value(input, false, cx);
         }
     }
@@ -1667,14 +1720,16 @@ impl MobileWorkbench {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let lines = match event.delta {
-            ScrollDelta::Lines(point) => point.y * 3.0,
-            ScrollDelta::Pixels(point) => f32::from(point.y) / TERMINAL_CELL_HEIGHT,
+        let (lines, columns) = match event.delta {
+            ScrollDelta::Lines(point) => (point.y * 3.0, point.x * 3.0),
+            ScrollDelta::Pixels(point) => (
+                f32::from(point.y) / TERMINAL_CELL_HEIGHT,
+                f32::from(point.x) / TERMINAL_CELL_WIDTH,
+            ),
         };
-        if lines == 0.0 {
+        if lines == 0.0 && columns == 0.0 {
             return;
         }
-        cx.stop_propagation();
         // An application that turned on mouse reporting (vim, less, htop,
         // tmux) owns the wheel: the gesture has to reach the PTY as a wheel
         // event instead of moving this client's own viewport, which the
@@ -1685,6 +1740,20 @@ impl MobileWorkbench {
             .render
             .as_ref()
             .is_some_and(|render| render.frame.modes.mouse_reporting);
+        if mouse_reporting && lines == 0.0 {
+            // A pan locks to one axis, so a gesture with no vertical distance
+            // is a sideways drag. The grid has no use for that axis — it never
+            // scrolls sideways — so it is spent on the application's own drag.
+            // The vertical axis keeps its wheel, because that is what scrolls
+            // a pager or a copy-mode buffer and the phone has no second
+            // gesture to spare.
+            self.drag_terminal_mouse(event, cx);
+            return;
+        }
+        if lines == 0.0 {
+            return;
+        }
+        cx.stop_propagation();
         if mouse_reporting {
             let (row, column) = self
                 .terminal
@@ -1712,6 +1781,103 @@ impl MobileWorkbench {
         render.scroll(lines as i32);
         self.terminal_scrolled_back = render.frame.display_offset != 0;
         cx.notify();
+    }
+
+    /// Forwards a sideways pan to the application as the drag it is: a press on
+    /// the first step, a move whenever the finger reaches another cell, and a
+    /// release when it lifts.
+    ///
+    /// A pan reports the position it started at together with the distance
+    /// moved since the previous step, never the finger's live position, so the
+    /// cell under the finger is the start point plus the distance travelled.
+    fn drag_terminal_mouse(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let ScrollDelta::Pixels(delta) = event.delta else {
+            // Touch pans are always reported in pixels; a line-based delta
+            // comes from a wheel, which has no drag to give.
+            return;
+        };
+        let Some(sgr) = self
+            .terminal
+            .state
+            .render
+            .as_ref()
+            .map(|render| render.frame.modes.sgr_mouse)
+        else {
+            return;
+        };
+        let origin = event.position;
+        if matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            let Some(drag) = self.terminal_mouse_drag.take() else {
+                return;
+            };
+            // The fling that follows a release repeats this same origin, so
+            // remembering it is what keeps momentum from reading as a second
+            // drag. A new gesture starts somewhere else.
+            self.terminal_mouse_drag_released = Some(origin);
+            if let Some(input) = terminal_mouse_report(TerminalMouseReport::Release, drag.last, sgr)
+            {
+                self.send_terminal_value(input, false, cx);
+            }
+            return;
+        }
+        if self.terminal_mouse_drag_released == Some(origin) {
+            // Momentum from the gesture that has already been released.
+            return;
+        }
+        // A drag starts where the finger first went down, and only if that was
+        // over the grid: a press on the key row or on the copy bar is not the
+        // application's.
+        let starting = match self.terminal_mouse_drag {
+            Some(drag) if drag.origin == origin => None,
+            _ => {
+                let Some(bounds) = self.terminal_grid_bounds else {
+                    return;
+                };
+                if !bounds.contains(&origin) {
+                    return;
+                }
+                let Some(point) = self.terminal_cell_at(origin) else {
+                    return;
+                };
+                Some(point)
+            }
+        };
+        if let Some(point) = starting {
+            self.terminal_mouse_drag = Some(TerminalMouseDrag {
+                origin,
+                // The step that starts the drag carries the distance the
+                // finger travelled before the pan was recognized, so the first
+                // move lands where the finger actually is.
+                travelled: f32::from(delta.x),
+                last: point,
+            });
+            self.terminal_mouse_drag_released = None;
+            if let Some(input) = terminal_mouse_report(TerminalMouseReport::Press, point, sgr) {
+                self.send_terminal_value(input, false, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        let Some(drag) = self.terminal_mouse_drag else {
+            return;
+        };
+        let travelled = drag.travelled + f32::from(delta.x);
+        let point = Point::new(origin.x + px(travelled), origin.y);
+        let Some(point) = self.terminal_cell_at(point) else {
+            return;
+        };
+        if point == drag.last {
+            return;
+        }
+        self.terminal_mouse_drag = Some(TerminalMouseDrag {
+            travelled,
+            last: point,
+            ..drag
+        });
+        if let Some(input) = terminal_mouse_report(TerminalMouseReport::Move, point, sgr) {
+            self.send_terminal_value(input, false, cx);
+        }
+        cx.stop_propagation();
     }
 
     fn scroll_terminal_to_bottom(&mut self, cx: &mut Context<Self>) {
@@ -1762,6 +1928,78 @@ impl MobileWorkbench {
         )
     }
 
+    /// The two handles a selection can be adjusted by, so they can be painted
+    /// and hit-tested against the same geometry.
+    fn terminal_selection_handles(&self) -> Option<(Point<Pixels>, Point<Pixels>)> {
+        let bounds = self.terminal_grid_bounds?;
+        let render = self.terminal.state.render.as_ref()?;
+        let (start, end) = self.terminal_selection?.ends();
+        Some(terminal_handle_points(
+            bounds,
+            render.frame.rows,
+            start,
+            end,
+        ))
+    }
+
+    /// Moves the end of the selection a touch took hold of.
+    fn on_terminal_handle_drag(&mut self, event: &TouchDragEvent, cx: &mut Context<Self>) {
+        match event.phase {
+            TouchPhase::Started => {
+                // The bar sits over the top rows while a selection is up, and
+                // a press there is meant for the bar even when it lands on a
+                // handle the bar happens to be covering.
+                if self.terminal_grid_bounds.is_some_and(|bounds| {
+                    event.position.y < bounds.top() + px(TERMINAL_SELECTION_BAR_BAND)
+                }) {
+                    return;
+                }
+                let Some((start_point, end_point)) = self.terminal_selection_handles() else {
+                    return;
+                };
+                let Some(handle) = terminal_handle_at_point(
+                    start_point,
+                    end_point,
+                    event.position,
+                    TERMINAL_HANDLE_TOUCH_RADIUS,
+                ) else {
+                    return;
+                };
+                // Claiming the touch here is what makes the drag a control
+                // drag rather than a pan: nothing else in the grid has to know
+                // a handle was touched, and the surface never sees a tap that
+                // would dismiss the selection.
+                self.terminal_selection_handle = Some(handle);
+                cx.stop_propagation();
+            }
+            TouchPhase::Moved => {
+                let Some(handle) = self.terminal_selection_handle else {
+                    return;
+                };
+                let Some(selection) = self.terminal_selection else {
+                    return;
+                };
+                let Some(point) = self.terminal_cell_at(event.position) else {
+                    return;
+                };
+                let (start, end) = selection.ends();
+                let (anchor, head) = match handle {
+                    TerminalSelectionHandle::Start => (point, end),
+                    TerminalSelectionHandle::End => (start, point),
+                };
+                if (anchor, head) != (selection.anchor, selection.head) {
+                    self.select_terminal_cells(anchor, head, cx);
+                }
+                cx.stop_propagation();
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if self.terminal_selection_handle.take().is_some() {
+                    cx.stop_propagation();
+                }
+            }
+        }
+    }
+
     /// Drops everything that pointed into the previous terminal's grid: the
     /// selection, its text, the find query's matches, and the geometry they
     /// were resolved against.
@@ -1769,6 +2007,9 @@ impl MobileWorkbench {
         self.terminal_grid_bounds = None;
         self.terminal_selection = None;
         self.terminal_selection_text = None;
+        self.terminal_selection_handle = None;
+        self.terminal_mouse_drag = None;
+        self.terminal_mouse_drag_released = None;
         self.terminal_search_matches.clear();
         self.terminal_active_search_match = 0;
     }
@@ -1795,6 +2036,7 @@ impl MobileWorkbench {
 
     /// Drops the touch selection and the highlight it painted.
     fn dismiss_terminal_selection(&mut self, cx: &mut Context<Self>) {
+        self.terminal_selection_handle = None;
         if self.terminal_selection.take().is_none() {
             return;
         }
@@ -4598,6 +4840,40 @@ impl MobileWorkbench {
             .into_any_element()
     }
 
+    /// The two dots a reader drags to adjust a selection, one at each end.
+    ///
+    /// They are painted over the grid but carry no hitbox of their own: the
+    /// surface's touch listener is what claims the drag, so a handle never has
+    /// to become an interactive element (and a tap passing through it still
+    /// behaves like a tap on the grid).
+    fn render_terminal_selection_handles(&self) -> Option<gpui::AnyElement> {
+        let (start, end) = self.terminal_selection_handles()?;
+        let bounds = self.terminal_grid_bounds?;
+        let handle = |point: Point<Pixels>| {
+            div()
+                .absolute()
+                .left(px(f32::from(point.x)
+                    - f32::from(bounds.left())
+                    - TERMINAL_HANDLE_SIZE / 2.0))
+                .top(px(f32::from(point.y)
+                    - f32::from(bounds.top())
+                    - TERMINAL_HANDLE_SIZE / 2.0))
+                .size(px(TERMINAL_HANDLE_SIZE))
+                .rounded_full()
+                .bg(theme::accent())
+                .border_2()
+                .border_color(theme::bg_card())
+        };
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .child(handle(start))
+                .child(handle(end))
+                .into_any_element(),
+        )
+    }
+
     /// The cell grid. The surface reports its bounds on paint so the PTY is
     /// auto-fitted to fill the screen, and the shared render model frame is
     /// rendered cell-by-cell with the desktop palette and cursor treatment.
@@ -4732,6 +5008,31 @@ impl MobileWorkbench {
                                     });
                                 }
                             });
+                            // A touch that lands on one of the selection's
+                            // handles is claimed before the recognizer can
+                            // resolve it as a pan, which is what lets the
+                            // handle be dragged while the grid keeps its
+                            // scroll and long-press gestures everywhere else.
+                            // Only the landing has to be inside the grid: a
+                            // drag that leaves it keeps moving the end it
+                            // took hold of.
+                            window.on_mouse_event({
+                                let entity = weak_entity.clone();
+                                move |event: &TouchDragEvent,
+                                      phase: DispatchPhase,
+                                      _: &mut Window,
+                                      cx: &mut gpui::App| {
+                                    if phase != DispatchPhase::Bubble
+                                        || (event.phase == TouchPhase::Started
+                                            && !bounds.contains(&event.position))
+                                    {
+                                        return;
+                                    }
+                                    let _ = entity.update(cx, |this, cx| {
+                                        this.on_terminal_handle_drag(event, cx)
+                                    });
+                                }
+                            });
                         }
                     },
                 )
@@ -4795,7 +5096,9 @@ impl MobileWorkbench {
                 }))
             })
             .when(self.terminal_selection.is_some(), |surface| {
-                surface.child(self.render_terminal_selection_bar(cx))
+                surface
+                    .children(self.render_terminal_selection_handles())
+                    .child(self.render_terminal_selection_bar(cx))
             })
             .into_any_element()
     }
@@ -5529,6 +5832,65 @@ fn terminal_cell_at_point(
     Some(TerminalGridPoint { row, column })
 }
 
+/// The centre of a cell, using the same geometry `terminal_cell_at_point`
+/// reads back: rows are laid out bottom-aligned above the grid's bottom
+/// padding, and columns start at the grid's left edge.
+fn terminal_cell_center(
+    bounds: Bounds<Pixels>,
+    rows: u16,
+    point: TerminalGridPoint,
+) -> Point<Pixels> {
+    let content_bottom = f32::from(bounds.bottom()) - TERMINAL_VERTICAL_PADDING;
+    let y = content_bottom - (f32::from(rows) - f32::from(point.row) - 0.5) * TERMINAL_CELL_HEIGHT;
+    let x = f32::from(bounds.left()) + (f32::from(point.column) + 0.5) * TERMINAL_CELL_WIDTH;
+    Point::new(px(x), px(y))
+}
+
+/// Where the two drag handles sit: the start of the first selected cell and
+/// the end of the last, both on the selection's own line.
+fn terminal_handle_points(
+    bounds: Bounds<Pixels>,
+    rows: u16,
+    start: TerminalGridPoint,
+    end: TerminalGridPoint,
+) -> (Point<Pixels>, Point<Pixels>) {
+    let start_center = terminal_cell_center(bounds, rows, start);
+    let end_center = terminal_cell_center(bounds, rows, end);
+    (
+        Point::new(
+            start_center.x - px(TERMINAL_CELL_WIDTH / 2.0),
+            start_center.y,
+        ),
+        Point::new(end_center.x + px(TERMINAL_CELL_WIDTH / 2.0), end_center.y),
+    )
+}
+
+/// Which handle a touch landed on, if any. The nearer of the two wins, so the
+/// handles can be picked apart even when a selection is only one cell wide.
+fn terminal_handle_at_point(
+    start: Point<Pixels>,
+    end: Point<Pixels>,
+    position: Point<Pixels>,
+    radius: f32,
+) -> Option<TerminalSelectionHandle> {
+    let distance = |handle: Point<Pixels>| {
+        let dx = f32::from(position.x) - f32::from(handle.x);
+        let dy = f32::from(position.y) - f32::from(handle.y);
+        (dx * dx + dy * dy).sqrt()
+    };
+    let (start_distance, end_distance) = (distance(start), distance(end));
+    if start_distance > radius && end_distance > radius {
+        return None;
+    }
+    // A tie goes to the end handle, which is the one a reader reaches for
+    // after selecting forwards.
+    if start_distance < end_distance {
+        Some(TerminalSelectionHandle::Start)
+    } else {
+        Some(TerminalSelectionHandle::End)
+    }
+}
+
 /// The inclusive column range of the non-blank run `column` belongs to. A
 /// blank cell selects itself, so a long press on empty space still raises the
 /// copy bar instead of doing nothing.
@@ -5628,19 +5990,47 @@ fn empty_terminal_cell(point: TerminalGridPoint) -> TerminalCellSnapshot {
     }
 }
 
-/// The press-and-release one tap sends to an application that asked for mouse
-/// reporting, in the encoding that application negotiated.
+/// One report of a mouse gesture, as an application that asked for mouse
+/// reporting understands it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TerminalMouseReport {
+    Press,
+    Release,
+    /// A step of a drag. The button bit stays set, which is what tells the
+    /// application the finger is still down.
+    Move,
+}
+
+/// One mouse report in the encoding the application negotiated.
 ///
-/// SGR carries the cell in decimal and reports the release with a trailing
-/// `m`; the older X10 form packs button and cell into three bytes that reach
-/// past ASCII. Both mirror the desktop's shared encoder, including the X10
-/// form's 223-column limit, past which there is no way to name the cell.
-fn terminal_mouse_click(point: TerminalGridPoint, sgr: bool) -> Option<TerminalInput> {
+/// SGR carries the cell in decimal and names the kind in the final byte, with
+/// `m` for a release; the older X10 form packs the kind and the cell into
+/// three bytes that reach past ASCII. Both mirror the desktop's shared
+/// encoder, including the X10 form's 223-column limit, past which there is no
+/// way to name the cell at all.
+fn terminal_mouse_report(
+    kind: TerminalMouseReport,
+    point: TerminalGridPoint,
+    sgr: bool,
+) -> Option<TerminalInput> {
+    let code: u8 = match kind {
+        TerminalMouseReport::Press => 0,
+        TerminalMouseReport::Release => 3,
+        // A drag is reported with the button still held: button 0 plus the
+        // motion bit.
+        TerminalMouseReport::Move => 32,
+    };
     let column = u32::from(point.column) + 1;
     let row = u32::from(point.row) + 1;
     if sgr {
-        let sequence = format!("\u{1b}[<0;{column};{row}M\u{1b}[<0;{column};{row}m");
-        return Some(TerminalInput::Text(sequence));
+        let final_byte = if kind == TerminalMouseReport::Release {
+            'm'
+        } else {
+            'M'
+        };
+        return Some(TerminalInput::Text(format!(
+            "\u{1b}[<{code};{column};{row}{final_byte}"
+        )));
     }
     if column > 223 || row > 223 {
         return None;
@@ -5649,10 +6039,30 @@ fn terminal_mouse_click(point: TerminalGridPoint, sgr: bool) -> Option<TerminalI
         0x1b,
         b'[',
         b'M',
-        32,
+        code + 32,
         column as u8 + 32,
         row as u8 + 32,
     ]))
+}
+
+/// The press and the release one tap sends, as the single input the write path
+/// carries so the two can never be reordered against each other.
+fn terminal_mouse_tap(point: TerminalGridPoint, sgr: bool) -> Option<TerminalInput> {
+    let press = terminal_mouse_report(TerminalMouseReport::Press, point, sgr)?;
+    let release = terminal_mouse_report(TerminalMouseReport::Release, point, sgr)?;
+    Some(match (press, release) {
+        (TerminalInput::Text(mut press), TerminalInput::Text(release)) => {
+            press.push_str(&release);
+            TerminalInput::Text(press)
+        }
+        (TerminalInput::Bytes(mut press), TerminalInput::Bytes(release)) => {
+            press.extend(release);
+            TerminalInput::Bytes(press)
+        }
+        // Both reports of one tap are asked for in the same encoding, so this
+        // arm is unreachable; dropping the tap beats sending half of it.
+        _ => return None,
+    })
 }
 
 /// Resolves a terminal cell color against the current theme, mirroring the
@@ -5835,18 +6245,27 @@ mod tests {
         let point = TerminalGridPoint { row: 4, column: 9 };
 
         assert_eq!(
-            terminal_mouse_click(point, true),
+            terminal_mouse_tap(point, true),
             Some(TerminalInput::Text(
-                "\u{1b}[<0;10;5M\u{1b}[<0;10;5m".to_string()
+                "\u{1b}[<0;10;5M\u{1b}[<3;10;5m".to_string()
             ))
         );
+        // The legacy form has no decimal escape, so its press and release are
+        // three bytes each: the button code packed with the cell, both past
+        // ASCII for anything but the first few columns.
         assert_eq!(
-            terminal_mouse_click(point, false),
+            terminal_mouse_tap(point, false),
             Some(TerminalInput::Bytes(vec![
                 0x1b,
                 b'[',
                 b'M',
                 32,
+                10 + 32,
+                5 + 32,
+                0x1b,
+                b'[',
+                b'M',
+                3 + 32,
                 10 + 32,
                 5 + 32,
             ]))
@@ -5857,8 +6276,113 @@ mod tests {
             row: 0,
             column: 223,
         };
-        assert!(terminal_mouse_click(beyond, false).is_none());
-        assert!(terminal_mouse_click(beyond, true).is_some());
+        assert!(terminal_mouse_tap(beyond, false).is_none());
+        assert!(terminal_mouse_tap(beyond, true).is_some());
+    }
+
+    /// A drag reports the button as still held, which is what the motion bit
+    /// in the button code means.
+    #[test]
+    fn a_terminal_drag_step_reports_the_button_as_held() {
+        let point = TerminalGridPoint { row: 0, column: 0 };
+
+        assert_eq!(
+            terminal_mouse_report(TerminalMouseReport::Move, point, true),
+            Some(TerminalInput::Text("\u{1b}[<32;1;1M".to_string()))
+        );
+        assert_eq!(
+            terminal_mouse_report(TerminalMouseReport::Move, point, false),
+            Some(TerminalInput::Bytes(vec![
+                0x1b,
+                b'[',
+                b'M',
+                32 + 32,
+                1 + 32,
+                1 + 32,
+            ]))
+        );
+        assert_eq!(
+            terminal_mouse_report(TerminalMouseReport::Release, point, true),
+            Some(TerminalInput::Text("\u{1b}[<3;1;1m".to_string()))
+        );
+    }
+
+    /// The selection's handles sit on the first and last selected cells, in
+    /// reading order, and a touch takes hold of the nearer one.
+    #[test]
+    fn terminal_handles_follow_the_selection_and_the_nearer_touch() {
+        use gpui::{point, size};
+
+        let bounds = Bounds::new(point(px(6.0), px(100.0)), size(px(80.0), px(200.0)));
+        let start = TerminalGridPoint { row: 9, column: 0 };
+        let end = TerminalGridPoint { row: 8, column: 3 };
+        let (start_point, end_point) = terminal_handle_points(bounds, 10, start, end);
+
+        // The last row is the one above the grid's bottom padding, so its
+        // centre is half a cell up from there.
+        assert_eq!(
+            f32::from(start_point.y),
+            300.0 - TERMINAL_VERTICAL_PADDING - TERMINAL_CELL_HEIGHT / 2.0
+        );
+        assert_eq!(f32::from(start_point.x), 6.0);
+        assert_eq!(f32::from(end_point.x), 6.0 + 4.0 * TERMINAL_CELL_WIDTH);
+
+        let radius = TERMINAL_HANDLE_TOUCH_RADIUS;
+        assert_eq!(
+            terminal_handle_at_point(start_point, end_point, start_point, radius),
+            Some(TerminalSelectionHandle::Start)
+        );
+        assert_eq!(
+            terminal_handle_at_point(start_point, end_point, end_point, radius),
+            Some(TerminalSelectionHandle::End)
+        );
+        // A touch between the two handles is nearer neither, and the end
+        // handle wins the tie. A touch past both is not a handle at all. Both
+        // handles share a line here so the tie is exactly a tie.
+        let (line_start, line_end) = terminal_handle_points(
+            bounds,
+            10,
+            TerminalGridPoint { row: 8, column: 0 },
+            TerminalGridPoint { row: 8, column: 3 },
+        );
+        let between = point(
+            px((f32::from(line_start.x) + f32::from(line_end.x)) / 2.0),
+            line_start.y,
+        );
+        assert_eq!(
+            terminal_handle_at_point(line_start, line_end, between, radius),
+            Some(TerminalSelectionHandle::End)
+        );
+        let far = point(line_end.x + px(radius + 1.0), line_end.y);
+        assert_eq!(
+            terminal_handle_at_point(line_start, line_end, far, radius),
+            None
+        );
+    }
+
+    /// The selection's ends are ordered, so the handles are placed on the
+    /// first and last cell no matter which way the reader selected.
+    #[test]
+    fn terminal_selection_ends_read_in_order() {
+        let first = TerminalGridPoint { row: 1, column: 2 };
+        let last = TerminalGridPoint { row: 1, column: 7 };
+
+        assert_eq!(
+            TerminalSelection {
+                anchor: first,
+                head: last
+            }
+            .ends(),
+            (first, last)
+        );
+        assert_eq!(
+            TerminalSelection {
+                anchor: last,
+                head: first
+            }
+            .ends(),
+            (first, last)
+        );
     }
 
     #[test]
