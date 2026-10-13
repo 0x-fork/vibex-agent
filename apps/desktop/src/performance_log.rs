@@ -37,7 +37,10 @@ pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// `droppedPercent` means what the HUD's `DROP` row means.
 pub const FRAME_BUDGET: Duration = Duration::from_nanos(16_666_667);
 /// Stamped into every line so a later reader can tell formats apart.
-pub const SAMPLE_SCHEMA_VERSION: u32 = 2;
+///
+/// Version 3 added the per-phase draw means (`layoutMillis`, `prepaintMillis`,
+/// `paintMillis`) beside the whole-frame figure version 2 carried.
+pub const SAMPLE_SCHEMA_VERSION: u32 = 3;
 
 /// The build profile a sample came from.
 ///
@@ -108,6 +111,14 @@ pub struct FpsMonitorSample {
     pub p95_millis: f32,
     /// The slowest frame of the interval, in milliseconds.
     pub worst_millis: f32,
+    /// Mean time each phase of the draw took over the interval, in
+    /// milliseconds. `frame_millis` is their sum plus the work between phases,
+    /// so the three attribute a frame that has grown too slow: rendering views
+    /// and requesting their layout, computing layout and prepainting, and
+    /// painting into the scene.
+    pub layout_millis: f32,
+    pub prepaint_millis: f32,
+    pub paint_millis: f32,
     /// Share of the interval's frames that overran [`FRAME_BUDGET`].
     pub dropped_percent: f32,
     /// Mean invalidations coalesced into one frame.
@@ -187,6 +198,9 @@ impl FpsMonitorRecorder {
             worst_millis: summary.worst_millis,
             dropped_percent: summary.dropped_percent,
             invalidations: summary.invalidations,
+            layout_millis: summary.layout_millis,
+            prepaint_millis: summary.prepaint_millis,
+            paint_millis: summary.paint_millis,
             cpu_percent,
             resident_memory_bytes,
             build_profile: BUILD_PROFILE,
@@ -244,6 +258,9 @@ struct IntervalFrames {
     draws: Vec<Duration>,
     invalidations: u64,
     present_times: Vec<Instant>,
+    layout_total: Duration,
+    prepaint_total: Duration,
+    paint_total: Duration,
 }
 
 impl IntervalFrames {
@@ -253,6 +270,9 @@ impl IntervalFrames {
                 FrameEvent::Draw(timing) if timing.window_id == window_id => {
                     self.draws.push(timing.draw_duration());
                     self.invalidations = self.invalidations.saturating_add(timing.invalidations);
+                    self.layout_total += timing.phases.request_layout;
+                    self.prepaint_total += timing.phases.prepaint;
+                    self.paint_total += timing.phases.paint;
                 }
                 FrameEvent::Present(timing) if timing.window_id == window_id => {
                     self.present_times.push(timing.present_end);
@@ -263,12 +283,16 @@ impl IntervalFrames {
     }
 
     fn take_summary(&mut self) -> FrameSummary {
-        let summary = summarize_frames(
+        let mut summary = summarize_frames(
             &self.draws,
             self.invalidations,
             &self.present_times,
             FRAME_BUDGET,
         );
+        let frames = self.draws.len() as u32;
+        summary.layout_millis = mean_millis(self.layout_total, frames);
+        summary.prepaint_millis = mean_millis(self.prepaint_total, frames);
+        summary.paint_millis = mean_millis(self.paint_total, frames);
         self.clear();
         summary
     }
@@ -277,6 +301,9 @@ impl IntervalFrames {
         self.draws.clear();
         self.invalidations = 0;
         self.present_times.clear();
+        self.layout_total = Duration::ZERO;
+        self.prepaint_total = Duration::ZERO;
+        self.paint_total = Duration::ZERO;
     }
 }
 
@@ -291,6 +318,17 @@ struct FrameSummary {
     worst_millis: f32,
     dropped_percent: f32,
     invalidations: f32,
+    layout_millis: f32,
+    prepaint_millis: f32,
+    paint_millis: f32,
+}
+
+/// The mean of one phase's accumulated time over `frames` draws.
+fn mean_millis(total: Duration, frames: u32) -> f32 {
+    if frames == 0 {
+        return 0.;
+    }
+    millis(total / frames)
 }
 
 fn summarize_frames(
@@ -309,6 +347,9 @@ fn summarize_frames(
             worst_millis: 0.,
             dropped_percent: 0.,
             invalidations: 0.,
+            layout_millis: 0.,
+            prepaint_millis: 0.,
+            paint_millis: 0.,
         };
     }
 
@@ -326,6 +367,11 @@ fn summarize_frames(
         worst_millis: millis(worst),
         dropped_percent: over_budget as f32 / draws.len() as f32 * 100.,
         invalidations: invalidations as f32 / draws.len() as f32,
+        // The phases are filled by `IntervalFrames::take_summary`, which has
+        // the accumulated per-phase time this summary does not receive.
+        layout_millis: 0.,
+        prepaint_millis: 0.,
+        paint_millis: 0.,
     }
 }
 
@@ -521,6 +567,9 @@ mod tests {
             worst_millis: 22.0,
             dropped_percent: 1.7,
             invalidations: 1.0,
+            layout_millis: 3.1,
+            prepaint_millis: 4.2,
+            paint_millis: 1.1,
             cpu_percent: Some(142.0),
             resident_memory_bytes: Some(88_080_384),
             build_profile: BUILD_PROFILE,
@@ -534,6 +583,11 @@ mod tests {
         assert_eq!(parsed["recordedAtMs"], 1_700_000_000_000i64);
         assert_eq!(parsed["frameMillis"], 8.4);
         assert_eq!(parsed["droppedPercent"], 1.7);
+        // The three phases split the frame, so a reader can see which one a
+        // slow frame spent its time in.
+        assert_eq!(parsed["layoutMillis"], 3.1);
+        assert_eq!(parsed["prepaintMillis"], 4.2);
+        assert_eq!(parsed["paintMillis"], 1.1);
         assert_eq!(parsed["cpuPercent"], 142.0);
         assert_eq!(parsed["residentMemoryBytes"], 88_080_384u64);
         assert_eq!(parsed["buildProfile"], BUILD_PROFILE);
