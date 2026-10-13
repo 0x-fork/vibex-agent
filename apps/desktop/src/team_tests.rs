@@ -562,7 +562,10 @@ fn team_root_reconciliation_retains_unloaded_members_and_queued_mentions(cx: &mu
                             == SidebarOrganizationItem::Session(session(1).id.to_string())
                     })
             );
-            workbench.optimistically_remove_sessions(&BTreeSet::from([session(1).id.to_string()]));
+            workbench.optimistically_remove_sessions(
+                &BTreeSet::from([session(1).id.to_string()]),
+                SidebarSessionRemoval::Delete,
+            );
             assert!(workbench.composer_queue.is_empty());
             assert_eq!(
                 workbench
@@ -1835,7 +1838,10 @@ fn team_view_removal_and_eviction_discard_only_their_composer_measurements(
                 geometry.input_bounds = Some(bounds);
             });
         }
-        workbench.optimistically_remove_sessions(&BTreeSet::from([session(2).id.to_string()]));
+        workbench.optimistically_remove_sessions(
+            &BTreeSet::from([session(2).id.to_string()]),
+            SidebarSessionRemoval::Delete,
+        );
         assert!(
             !workbench
                 .pending_composer_geometries
@@ -2048,4 +2054,60 @@ async fn team_immediate_delegation_keeps_context_and_retries_the_same_gesture(
         panic!("expected changed task");
     };
     assert_ne!(first.idempotency_key, changed.idempotency_key);
+}
+
+/// An archive hides a session row only while its mutation is in flight.
+///
+/// Archiving is reversible and the restore is authoritative, so the optimistic
+/// removal has to end with the mutation it belongs to: an id left behind keeps
+/// filtering the restored session out of every authoritative list, and the row
+/// never reaches the sidebar.
+#[gpui::test]
+fn restoring_an_archived_session_puts_its_row_back_on_the_sidebar(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 2);
+    workbench.update(cx, |workbench, cx| {
+        let archived = BTreeSet::from([session(1).id.to_string()]);
+        workbench.optimistically_remove_sessions(&archived, SidebarSessionRemoval::Archive);
+        assert!(workbench.session_hidden_from_sidebar(session(1).id.as_str()));
+        assert!(
+            workbench
+                .optimistically_archived_session_ids
+                .contains(session(1).id.as_str())
+        );
+        // A deletion keeps its ids hidden until a load reconciles it; an
+        // archive must not, because the runtime still has the session.
+        assert!(
+            !workbench
+                .optimistically_removed_session_ids
+                .contains(session(1).id.as_str())
+        );
+        // A snapshot that arrives while the archive is in flight cannot put the
+        // row back.
+        workbench.upsert_session_snapshot(session(1));
+        assert!(
+            !workbench
+                .sessions
+                .iter()
+                .any(|root| root.id == session(1).id)
+        );
+
+        // The runtime confirms the archive, and the reader restores it.
+        workbench.settle_optimistic_session_archive(&archived);
+        assert!(!workbench.session_hidden_from_sidebar(session(1).id.as_str()));
+        workbench.upsert_session_snapshot(session(1));
+        assert!(
+            workbench
+                .sessions
+                .iter()
+                .any(|root| root.id == session(1).id)
+        );
+        let groups = workbench.sidebar_workspace_groups("");
+        assert!(
+            groups
+                .iter()
+                .flat_map(|group| group.compact_sessions.iter())
+                .any(|listed| listed.id == session(1).id),
+            "the restored session should be back on the sidebar"
+        );
+    });
 }

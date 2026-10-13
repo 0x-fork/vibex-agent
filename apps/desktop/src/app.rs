@@ -4061,6 +4061,21 @@ fn session_snapshot_sidebar_changed(previous: Option<&AgentSession>, next: &Agen
         || previous.deleted_at_ms != next.deleted_at_ms
 }
 
+/// How a mutation took a session row off the sidebar before the runtime
+/// answered.
+///
+/// The two are not interchangeable. A deletion is terminal: the row stays
+/// hidden, and every authoritative read keeps ignoring it, until the deletion
+/// is reconciled. An archive is reversible, so the row is only hidden while the
+/// archive itself is in flight — once it settles the ordinary session list
+/// omits archived rows by itself, and a restore has to be free to put the row
+/// back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarSessionRemoval {
+    Delete,
+    Archive,
+}
+
 fn session_update_should_repaint(
     active_tab: &str,
     new_session_open: bool,
@@ -8488,7 +8503,19 @@ pub struct VibexWorkbench {
     /// The handle has to outlive the frame that created it: a fresh handle per
     /// paint would drop the keyboard focus the reader just put on the row.
     delegated_row_focus: BTreeMap<String, FocusHandle>,
+    /// Sessions a deletion took off the sidebar before the runtime answered.
+    ///
+    /// A deletion is terminal, so an id stays here until a load reconciles the
+    /// optimistic removal with the authoritative list. It is the only reason a
+    /// session the runtime still reports is allowed to stay invisible.
     optimistically_removed_session_ids: BTreeSet<String>,
+    /// Sessions an archive took off the sidebar before the runtime answered.
+    ///
+    /// An archive is reversible, so an id stays here only while its mutation is
+    /// in flight: once the archive settles the ordinary session list omits the
+    /// row on its own, and keeping the id here would also keep the row out
+    /// after the reader restores it.
+    optimistically_archived_session_ids: BTreeSet<String>,
     pending_session_deletion_ids: BTreeSet<String>,
     /// Sessions with an archive mutation in flight.
     ///
@@ -9987,6 +10014,7 @@ impl VibexWorkbench {
             delegated_collapsed_ids: restored_collapsed_delegated_ids,
             delegated_row_focus: BTreeMap::new(),
             optimistically_removed_session_ids: BTreeSet::new(),
+            optimistically_archived_session_ids: BTreeSet::new(),
             pending_session_deletion_ids: BTreeSet::new(),
             pending_session_archive_ids: BTreeSet::new(),
             pending_session_restore_ids: BTreeSet::new(),
@@ -14137,9 +14165,7 @@ impl VibexWorkbench {
                                 sessions
                                     .into_iter()
                                     .filter(|session| {
-                                        !this
-                                            .optimistically_removed_session_ids
-                                            .contains(session.id.as_str())
+                                        !this.session_hidden_from_sidebar(session.id.as_str())
                                     })
                                     .collect()
                             };
@@ -14180,9 +14206,7 @@ impl VibexWorkbench {
                                 .as_ref()
                                 .filter(|selected| {
                                     sessions.iter().any(|session| &session.id == *selected)
-                                        || (!this
-                                            .optimistically_removed_session_ids
-                                            .contains(selected.as_str())
+                                        || (!this.session_hidden_from_sidebar(selected.as_str())
                                             && (this
                                                 .delegated_sessions
                                                 .contains_key(selected.as_str())
@@ -14674,7 +14698,7 @@ impl VibexWorkbench {
         valid_session_ids.extend(self.composer_drafts.drafts.keys().cloned());
         valid_session_ids.extend(self.pending_agent_turn_session_ids.iter().cloned());
         valid_session_ids.extend(self.auto_continue_session_ids.iter().cloned());
-        valid_session_ids.retain(|id| !self.optimistically_removed_session_ids.contains(id));
+        valid_session_ids.retain(|id| !self.session_hidden_from_sidebar(id));
         let mut seen = BTreeSet::new();
         self.sidebar_state
             .row_order
@@ -14905,9 +14929,7 @@ impl VibexWorkbench {
     }
 
     fn upsert_session_snapshot(&mut self, session: AgentSession) {
-        if self
-            .optimistically_removed_session_ids
-            .contains(session.id.as_str())
+        if self.session_hidden_from_sidebar(session.id.as_str())
             || self
                 .optimistically_removed_project_ids
                 .contains(session.project_id.as_str())
@@ -16021,6 +16043,21 @@ impl VibexWorkbench {
             .iter_mut()
             .find(|session| session.id.as_str() == session_id)
             .or_else(|| self.delegated_sessions.get_mut(session_id))
+    }
+
+    /// Whether a mutation has taken this session off the sidebar locally and
+    /// the runtime has not answered yet.
+    ///
+    /// A hidden session is one the client removed optimistically, so every
+    /// authoritative read and every live snapshot has to keep ignoring it until
+    /// the mutation settles. Archiving counts only while it is in flight:
+    /// afterwards the session list itself omits the row, and a restore must be
+    /// able to put it back.
+    fn session_hidden_from_sidebar(&self, session_id: &str) -> bool {
+        self.optimistically_removed_session_ids.contains(session_id)
+            || self
+                .optimistically_archived_session_ids
+                .contains(session_id)
     }
 
     /// Refreshes bounded metadata pages; histories load only for live panes.
@@ -20013,7 +20050,7 @@ impl VibexWorkbench {
             .collect::<BTreeSet<_>>();
         self.pending_session_deletion_ids
             .extend(session_id_set.iter().cloned());
-        self.optimistically_remove_sessions(&session_id_set);
+        self.optimistically_remove_sessions(&session_id_set, SidebarSessionRemoval::Delete);
         self.queue_agent_ui_state();
         cx.notify();
         let generation = self.session_generation;
@@ -34602,7 +34639,7 @@ impl VibexWorkbench {
         let session_id_set = BTreeSet::from([session_id.as_str().to_string()]);
         self.pending_session_deletion_ids
             .extend(session_id_set.iter().cloned());
-        self.optimistically_remove_sessions(&session_id_set);
+        self.optimistically_remove_sessions(&session_id_set, SidebarSessionRemoval::Delete);
         self.queue_agent_ui_state();
         cx.notify();
         let generation = self.session_generation;
@@ -34704,7 +34741,7 @@ impl VibexWorkbench {
             .collect::<BTreeSet<_>>();
         self.pending_session_deletion_ids
             .extend(session_id_set.iter().cloned());
-        self.optimistically_remove_sessions(&session_id_set);
+        self.optimistically_remove_sessions(&session_id_set, SidebarSessionRemoval::Delete);
         self.queue_agent_ui_state();
         cx.notify();
         let generation = self.session_generation;
@@ -34728,11 +34765,27 @@ impl VibexWorkbench {
         self.finish_optimistic_session_deletion(generation, session_id_set, runner, cx);
     }
 
-    fn optimistically_remove_sessions(&mut self, session_ids: &BTreeSet<String>) {
+    /// Drops rows the mutation just removed, before the runtime answers.
+    ///
+    /// `removal` decides how long the row is allowed to stay hidden: a deletion
+    /// is terminal and keeps the id until a load reconciles it, while an archive
+    /// is a reversible removal that stops hiding the row as soon as the runtime
+    /// confirms it.
+    fn optimistically_remove_sessions(
+        &mut self,
+        session_ids: &BTreeSet<String>,
+        removal: SidebarSessionRemoval,
+    ) {
         self.agent_overview_generation = self.agent_overview_generation.wrapping_add(1);
-        self.optimistically_removed_session_ids
-            .extend(session_ids.iter().cloned());
-        let deleting_selected_session = self
+        match removal {
+            SidebarSessionRemoval::Delete => self
+                .optimistically_removed_session_ids
+                .extend(session_ids.iter().cloned()),
+            SidebarSessionRemoval::Archive => self
+                .optimistically_archived_session_ids
+                .extend(session_ids.iter().cloned()),
+        }
+        let removing_selected_session = self
             .selected_session_id
             .as_ref()
             .is_some_and(|session_id| session_ids.contains(session_id.as_str()));
@@ -34786,7 +34839,7 @@ impl VibexWorkbench {
         {
             self.pending_session_search_jump = None;
         }
-        if deleting_selected_session {
+        if removing_selected_session {
             // The sidebar is updated optimistically, so the active workbench
             // must be invalidated in the same transaction. Otherwise the
             // removed session's timeline remains rendered until the
@@ -35183,7 +35236,7 @@ impl VibexWorkbench {
             .map(|session_id| session_id.as_str().to_string())
             .collect::<BTreeSet<_>>();
         if !session_id_set.is_empty() {
-            self.optimistically_remove_sessions(&session_id_set);
+            self.optimistically_remove_sessions(&session_id_set, SidebarSessionRemoval::Delete);
         }
         let folder_ids = self
             .ui_state
@@ -35403,7 +35456,10 @@ impl VibexWorkbench {
         self.workspaces
             .retain(|(project, _)| project.id.as_str() != project_id);
         if !removed_session_ids.is_empty() {
-            self.optimistically_remove_sessions(&removed_session_ids);
+            self.optimistically_remove_sessions(
+                &removed_session_ids,
+                SidebarSessionRemoval::Delete,
+            );
         }
         for workspace_id in &workspace_ids {
             self.workspace_contexts.remove(workspace_id.as_str());
@@ -35556,7 +35612,7 @@ impl VibexWorkbench {
             .collect::<BTreeSet<_>>();
         self.pending_session_archive_ids
             .extend(session_id_set.iter().cloned());
-        self.optimistically_remove_sessions(&session_id_set);
+        self.optimistically_remove_sessions(&session_id_set, SidebarSessionRemoval::Archive);
         self.queue_agent_ui_state();
         cx.notify();
         let generation = self.session_generation;
@@ -35593,6 +35649,12 @@ impl VibexWorkbench {
                 let _ = entity.update(cx, |this, cx| {
                     this.pending_session_archive_ids
                         .retain(|session_id| !session_ids.contains(session_id));
+                    // The archive has settled, so the row stops being hidden
+                    // locally: the ordinary session list omits an archived
+                    // session on its own, and a restore is free to bring the
+                    // row back. This runs even for a superseded generation —
+                    // a stale load must not leave the id marked forever.
+                    this.settle_optimistic_session_archive(&session_ids);
                     let active = this.session_generation == generation;
                     match outcome {
                         Ok(Ok(())) => {
@@ -35604,12 +35666,10 @@ impl VibexWorkbench {
                         }
                         Ok(Err(error)) if active => {
                             this.agent_error = Some(format!("{}: {}", error.code, error.message));
-                            this.optimistic_session_deletion_reconciliation_pending = true;
                             this.load_agent_overview(cx);
                         }
                         Err(error) if active => {
                             this.agent_error = Some(format!("session mutation failed: {error}"));
-                            this.optimistic_session_deletion_reconciliation_pending = true;
                             this.load_agent_overview(cx);
                         }
                         Ok(Err(_)) | Err(_) => {}
@@ -35619,6 +35679,17 @@ impl VibexWorkbench {
             },
         )
         .detach();
+    }
+
+    /// Stops hiding the rows of an archive the runtime has answered.
+    ///
+    /// An archive removes the row from the sidebar without destroying it, so
+    /// the local removal only lives as long as the mutation it belongs to.
+    /// Leaving the ids behind would keep the session out of every later
+    /// authoritative list — including the one a restore produces.
+    fn settle_optimistic_session_archive(&mut self, session_ids: &BTreeSet<String>) {
+        self.optimistically_archived_session_ids
+            .retain(|session_id| !session_ids.contains(session_id));
     }
 
     /// Puts an archived session back on the sidebar.
@@ -86356,7 +86427,7 @@ mod tests {
             .find("self.sidebar_batch_mode = false;")
             .expect("batch deletion should exit selection mode");
         let optimistic_remove = deletion
-            .find("self.optimistically_remove_sessions(&session_id_set);")
+            .find("self.optimistically_remove_sessions(&session_id_set, SidebarSessionRemoval::Delete);")
             .expect("deletion should remove deleted rows locally");
         let repaint = deletion
             .find("cx.notify();\n        let generation")
@@ -86378,7 +86449,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("optimistic session removal should remain inspectable");
         assert!(optimistic_state.contains("self.sessions\n            .retain"));
-        assert!(optimistic_state.contains("self.optimistically_removed_session_ids"));
+        // The row is hidden by the set that matches the removal: a deletion's
+        // bookkeeping outlives the mutation, an archive's does not.
+        assert!(optimistic_state.contains("optimistically_removed_session_ids"));
+        assert!(optimistic_state.contains("optimistically_archived_session_ids"));
         assert!(optimistic_state.contains(
             "self.session_views
             .retain"
@@ -86623,7 +86697,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("single session deletion should remain inspectable");
         let optimistic_remove = deletion
-            .find("self.optimistically_remove_sessions(&session_id_set);")
+            .find("self.optimistically_remove_sessions(&session_id_set, SidebarSessionRemoval::Delete);")
             .expect("single deletion should remove the row locally");
         let repaint = deletion
             .find("cx.notify();\n        let generation")
@@ -86721,6 +86795,48 @@ mod tests {
         assert!(archive.contains("Some(session_ids) => {"));
         assert!(archive.contains("this.archive_sessions(session_ids, cx)"));
         assert!(archive.contains(".archive_session(archive_id.clone(), cx)"));
+    }
+
+    /// An archive takes a row off the sidebar without destroying it, so the
+    /// optimistic removal may not outlive the mutation that created it: an id
+    /// left behind would keep filtering the restored session out of every
+    /// authoritative list, and the restore would put nothing back.
+    #[test]
+    fn archiving_hides_a_session_row_only_until_the_mutation_settles() {
+        let source = include_str!("app.rs");
+        let archive = source
+            .split_once("    fn begin_session_archive(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn finish_optimistic_session_archive("))
+            .map(|(body, _)| body)
+            .expect("the archive path should remain inspectable");
+        assert!(archive.contains(
+            "self.optimistically_remove_sessions(&session_id_set, SidebarSessionRemoval::Archive);"
+        ));
+        // Archiving is not deleting: the deletion bookkeeping is what keeps a
+        // session invisible after the runtime has already put it back.
+        assert!(!archive.contains("optimistically_removed_session_ids"));
+
+        let completion = source
+            .split_once("    fn finish_optimistic_session_archive(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Stops hiding the rows of an archive"))
+            .map(|(body, _)| body)
+            .expect("archive completion should remain inspectable");
+        assert!(completion.contains("this.settle_optimistic_session_archive(&session_ids);"));
+        assert!(completion.contains("this.load_archived_sessions(cx);"));
+        // A failure reconciles through the ordinary list; clearing the deletion
+        // reconciliation here would also drop concurrent deletions' marks.
+        assert!(completion.contains("this.load_agent_overview(cx);"));
+        assert!(!completion.contains("optimistic_session_deletion_reconciliation_pending"));
+
+        let settle = source
+            .split_once("    fn settle_optimistic_session_archive(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Puts an archived session back on the sidebar.")
+            })
+            .map(|(body, _)| body)
+            .expect("the archive settle should remain inspectable");
+        assert!(settle.contains("self.optimistically_archived_session_ids"));
+        assert!(settle.contains(".retain("));
     }
 
     /// A right click inside a shift/ctrl selection makes every session command

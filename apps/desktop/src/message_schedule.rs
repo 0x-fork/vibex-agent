@@ -890,10 +890,7 @@ impl VibexWorkbench {
                 }
                 this.composer_queue_session_loads
                     .remove(session_id.as_str());
-                if this
-                    .optimistically_removed_session_ids
-                    .contains(session_id.as_str())
-                {
+                if this.session_hidden_from_sidebar(session_id.as_str()) {
                     return;
                 }
                 match outcome {

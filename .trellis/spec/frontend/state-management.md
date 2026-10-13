@@ -1783,6 +1783,14 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   opening their dialog and call the typed manager mutation for that id. They must
   not silently retarget the currently selected session; successful non-selected
   mutations refresh the session list while preserving the active generation.
+- A session row a mutation removed optimistically is hidden by an id set, not by
+  the row being absent from the authoritative list, so the bookkeeping has to
+  end with the mutation wherever the removal is provisional. Deleting is
+  terminal: the id keeps filtering the row out of every authoritative list until
+  a load reconciles the deletion. Archiving is reversible: its id is dropped the
+  moment the archive settles, because the ordinary session list already omits
+  archived rows and a mark left behind would also keep filtering out the restore
+  that follows — the restored row would never reach the sidebar.
 - The global short action lock is owned by the mutation operation, not by the
   selected-session view generation. Every taker — rename/delete (including
   optimistic batch delete), Composer/preview terminal create and teardown, shell
