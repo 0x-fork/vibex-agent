@@ -422,7 +422,6 @@ impl ProfileCandidateRow {
 }
 
 /// Disclosures the Provider editor owns, named so the toggle can find them.
-const PROFILE_MODEL_ADVANCED_DISCLOSURE_ID: &str = "provider-model-advanced";
 const PROFILE_PROTOCOL_DISCLOSURE_ID: &str = "provider-protocol-overrides";
 const PROFILE_HEADERS_DISCLOSURE_ID: &str = "provider-request-headers";
 
@@ -1132,9 +1131,6 @@ pub struct ManagementCenter {
     /// The open Model editor's problem, tagged with the field it belongs to so
     /// the message lands next to the control that produced it.
     profile_model_edit_error: Option<(ProfileModelEditField, String)>,
-    /// The Model editor's advanced values are collapsed until asked for, and
-    /// open themselves when the Model already declares one.
-    profile_model_advanced_open: bool,
     /// Per-protocol endpoint overrides stay behind a disclosure: most Providers
     /// only ever configure the default address.
     profile_protocol_advanced_open: bool,
@@ -1942,7 +1938,6 @@ impl ManagementCenter {
             profile_model_edit_wire_api: None,
             profile_model_edit_reasoning_disabled: false,
             profile_model_edit_error: None,
-            profile_model_advanced_open: false,
             profile_protocol_advanced_open: false,
             profile_headers: Vec::new(),
             profile_headers_open: false,
@@ -4637,7 +4632,6 @@ impl ManagementCenter {
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_reasoning_disabled = false;
         self.profile_model_edit_error = None;
-        self.profile_model_advanced_open = false;
         self.profile_protocol_advanced_open = false;
         self.profile_provider_options = vibex_core::ProviderOptions::empty();
         self.clear_profile_headers(window, cx);
@@ -4719,7 +4713,6 @@ impl ManagementCenter {
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_reasoning_disabled = false;
         self.profile_model_edit_error = None;
-        self.profile_model_advanced_open = false;
         self.profile_provider_options = full_profile
             .map(|profile| profile.provider_options)
             .unwrap_or_else(vibex_core::ProviderOptions::empty);
@@ -4826,7 +4819,6 @@ impl ManagementCenter {
         self.profile_model_selection = None;
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_error = None;
-        self.profile_model_advanced_open = false;
         self.profile_protocol_advanced_open = false;
         self.profile_provider_options = vibex_core::ProviderOptions::empty();
         self.profile_protocol_base_urls.clear();
@@ -5535,9 +5527,6 @@ impl ManagementCenter {
             PROFILE_HEADERS_DISCLOSURE_ID => {
                 self.profile_headers_open = !self.profile_headers_open;
             }
-            PROFILE_MODEL_ADVANCED_DISCLOSURE_ID => {
-                self.profile_model_advanced_open = !self.profile_model_advanced_open;
-            }
             _ => return,
         }
         cx.notify();
@@ -5587,7 +5576,6 @@ impl ManagementCenter {
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_reasoning_disabled = false;
         self.profile_model_edit_error = None;
-        self.profile_model_advanced_open = false;
         for input in [
             &self.profile_model_edit_id,
             &self.profile_model_edit_name,
@@ -5646,11 +5634,6 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value(output_tokens, window, cx));
         self.profile_model_selection = Some(model.id);
         self.profile_model_edit_error = None;
-        // Advanced values the Model already declares are shown instead of
-        // hiding behind a disclosure that looks untouched.
-        self.profile_model_advanced_open = model.capabilities.reasoning_efforts.is_some()
-            || model.capabilities.context_tokens.is_some()
-            || model.capabilities.output_tokens.is_some();
         self.navigation
             .mark_dirty(ManagementSection::Agents, was_dirty);
         cx.notify();
@@ -13717,7 +13700,6 @@ impl ManagementCenter {
         let reasoning_error = field_error(ProfileModelEditField::Reasoning);
         let limits_error = field_error(ProfileModelEditField::Limits);
         let reasoning_disabled = self.profile_model_edit_reasoning_disabled;
-        let advanced_open = self.profile_model_advanced_open;
         let enabled = self
             .profile_configured_models
             .get(index)
@@ -13999,68 +13981,49 @@ impl ManagementCenter {
             );
         }
 
-        editor = editor.child(
-            // The rule above the disclosure separates a rarely used group from
-            // the frequent fields, so the row does not read as one more field.
+        editor = editor.child(profile_editor_section(
+            management_locale_text("Advanced", "高级", "進階"),
+            None,
             v_flex()
                 .w_full()
-                .gap_2()
-                .pt_3()
-                .border_t_1()
-                .border_color(cx.theme().border)
-                .child(
-                    Collapsible::new()
-                        .w_full()
-                        .open(advanced_open)
-                        .child(profile_editor_disclosure(
-                            PROFILE_MODEL_ADVANCED_DISCLOSURE_ID,
-                            management_locale_text("Advanced", "高级", "進階").into(),
-                            advanced_open,
-                            None,
-                            cx,
-                        ))
-                        .content(
-                            v_flex()
-                                .w_full()
-                                .gap_2p5()
-                                .pt_2()
-                                .child(management_token_field(
-                                    management_locale_text(
-                                        "Context window (tokens)",
-                                        "上下文窗口（Token）",
-                                        "上下文視窗（Token）",
-                                    ),
-                                    &self.profile_model_edit_context_tokens,
-                                    limits_error.as_deref(),
-                                    &MANAGEMENT_CONTEXT_TOKEN_PRESETS,
-                                    format!("provider-model-context-preset-{index}"),
-                                    pending,
-                                    cx,
-                                ))
-                                .child(management_token_field(
-                                    management_locale_text(
-                                        "Max output tokens",
-                                        "最大输出 Token",
-                                        "最大輸出 Token",
-                                    ),
-                                    &self.profile_model_edit_output_tokens,
-                                    None,
-                                    &MANAGEMENT_OUTPUT_TOKEN_PRESETS,
-                                    format!("provider-model-output-preset-{index}"),
-                                    pending,
-                                    cx,
-                                ))
-                                .child(management_field_hint(
-                                    management_locale_text(
-                                        "Click a value to declare it and click it again to clear it, or type any other count. Empty keeps the Agent's own default; only Agents that read a declared limit are affected.",
-                                        "点击常用值即可填入，再次点击清除，也可以输入其他数值。留空沿用 Agent 默认；只有会读取该设置的 Agent 受影响。",
-                                        "點擊常用值即可填入，再次點擊清除，也可以輸入其他數值。留空沿用 Agent 預設；只有會讀取該設定的 Agent 受影響。",
-                                    ),
-                                    cx,
-                                )),
-                        ),
-                ),
-        );
+                .gap_2p5()
+                .child(management_token_field(
+                    management_locale_text(
+                        "Context window (tokens)",
+                        "上下文窗口（Token）",
+                        "上下文視窗（Token）",
+                    ),
+                    &self.profile_model_edit_context_tokens,
+                    limits_error.as_deref(),
+                    &MANAGEMENT_CONTEXT_TOKEN_PRESETS,
+                    format!("provider-model-context-preset-{index}"),
+                    pending,
+                    cx,
+                ))
+                .child(management_token_field(
+                    management_locale_text(
+                        "Max output tokens",
+                        "最大输出 Token",
+                        "最大輸出 Token",
+                    ),
+                    &self.profile_model_edit_output_tokens,
+                    None,
+                    &MANAGEMENT_OUTPUT_TOKEN_PRESETS,
+                    format!("provider-model-output-preset-{index}"),
+                    pending,
+                    cx,
+                ))
+                .child(management_field_hint(
+                    management_locale_text(
+                        "Click a value to declare it and click it again to clear it, or type any other count. Empty keeps the Agent's own default; only Agents that read a declared limit are affected.",
+                        "点击常用值即可填入，再次点击清除，也可以输入其他数值。留空沿用 Agent 默认；只有会读取该设置的 Agent 受影响。",
+                        "點擊常用值即可填入，再次點擊清除，也可以輸入其他數值。留空沿用 Agent 預設；只有會讀取該設定的 Agent 受影響。",
+                    ),
+                    cx,
+                ))
+                .into_any_element(),
+            cx,
+        ));
 
         editor.into_any_element()
     }
