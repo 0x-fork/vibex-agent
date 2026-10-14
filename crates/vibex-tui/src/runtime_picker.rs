@@ -65,13 +65,20 @@ pub struct RuntimePickerState {
     /// Kept outside the editing selection so leaving the run options does not
     /// lose the reader's place in them.
     pub option_row: usize,
-    /// The first catalogue row the last frame drew.
+    /// The first line of the catalogue the last frame drew.
     ///
     /// Recorded by the renderer, the way the transcript band records the rows it
     /// drew: the page keys need the window's height, and only the frame that put
-    /// the list on screen knows what it was.
+    /// the list on screen knows what it was. It counts drawn *lines* rather than
+    /// rows, because the list is not all rows: a line of air parts two Agents'
+    /// groups and a rule parts the pinned sections from the Agents, and a window
+    /// is measured in what is on screen.
     pub scroll: usize,
     /// How many catalogue rows that frame had room for.
+    ///
+    /// The rows the window drew, which is not the height it drew them in: the
+    /// air and the rule are lines the reader cannot land on. It is what a page
+    /// key moves by.
     pub page_rows: usize,
 }
 

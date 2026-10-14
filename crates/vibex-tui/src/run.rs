@@ -1416,8 +1416,10 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             }
             // The switcher's rows select and activate exactly as the other
             // lists do, headings included: a heading is the control that folds
-            // its group, and a double click is how the mouse presses it.
-            if let Some(region) = app.regions.runtime_picker
+            // its group, and a double click is how the mouse presses it. A line
+            // of air between two groups answers with no row, so a click on one
+            // is a click on nothing rather than on the row under it.
+            if let Some(region) = app.regions.runtime_picker.as_ref()
                 && let Some(row) = region.row_at(mouse.column, mouse.row)
             {
                 let repeat = app.double_click_at(mouse.column, mouse.row);
@@ -5184,6 +5186,108 @@ mod tests {
         assert_eq!(
             app.new_session_runtime.as_ref().unwrap().agent_id.as_str(),
             "deepseek-harness"
+        );
+    }
+
+    /// A click in the catalogue takes the row the frame drew under the pointer,
+    /// and the lines that are not rows take nothing at all.
+    ///
+    /// The list is not all rows: a rule parts the pinned sections from the
+    /// Agents, and a line of air parts one Agent's group from the next. A hit
+    /// test that counted lines as rows would put the cursor on the Agent above
+    /// the one the reader pointed at, and a click on the air would move it,
+    /// which no list here does.
+    #[test]
+    fn a_click_on_the_catalogue_skips_the_lines_that_are_not_rows() {
+        use crate::action::Intent;
+        use crate::app::RuntimePickerView;
+        use crate::runtime_picker::RuntimePickerRow;
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        // The pinned row is what puts the rule on screen, and two open Agents
+        // are what put air between two groups.
+        let recent = app.runtime_options.as_ref().unwrap().options[0]
+            .selection
+            .clone();
+        app.remember_runtime_selection(&recent);
+        app.perform(Intent::NewSession);
+        app.show_runtime_picker();
+        app.fold_runtime_group(
+            &vibex_core::AgentId::parse("deepseek-harness").unwrap(),
+            false,
+        );
+        conversation_frame(&mut app, 120, 40);
+
+        let region = app
+            .regions
+            .runtime_picker
+            .as_ref()
+            .expect("the picker published its rows")
+            .clone();
+        // The line the last Agent's heading landed on, and the lines the frame
+        // drew no row on. Such a line only counts when the line above it is a
+        // row, so the empty space below the list is not one.
+        let rows = app.runtime_picker_rows();
+        let heading = rows
+            .iter()
+            .rposition(|row| matches!(row, RuntimePickerRow::Agent { .. }))
+            .expect("the catalogue has two Agents");
+        let heading_line = region
+            .rows
+            .iter()
+            .position(|row| *row == Some(heading))
+            .expect("the heading is in the window");
+        let gaps: Vec<usize> = region
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(line, row)| row.is_none() && *line > 0 && region.rows[line - 1].is_some())
+            .map(|(line, _)| line)
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            2,
+            "the rule and the air are not both drawn: {gaps:?}"
+        );
+
+        let selected = |app: &App| match &app.overlay {
+            Some(Overlay::RuntimePicker { selected, .. }) => *selected,
+            other => panic!("the picker is not up: {other:?}"),
+        };
+        let click = |app: &mut App, line: usize| {
+            handle_mouse(
+                app,
+                &worker,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: region.rect.x,
+                    row: region.rect.y + u16::try_from(line).expect("a line in the window"),
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+        };
+
+        click(&mut app, heading_line);
+        assert_eq!(
+            selected(&app),
+            heading,
+            "the click did not take the heading under the pointer"
+        );
+        for line in gaps {
+            click(&mut app, line);
+            assert_eq!(
+                selected(&app),
+                heading,
+                "a click on the line {line} moved the cursor off the row it was on"
+            );
+        }
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::RuntimePicker {
+                view: RuntimePickerView::Choices,
+                selected: heading,
+            }),
+            "a click on a line that is not a row changed the view"
         );
     }
 

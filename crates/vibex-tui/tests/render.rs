@@ -934,7 +934,10 @@ fn pick_entry(app: &mut App, index: usize) {
 #[test]
 fn a_pinned_row_names_the_agent_and_how_it_ran() {
     // A pinned row stands outside every Agent group, so it has to carry what the
-    // heading above it would otherwise say: the Agent the entry belongs to. It
+    // heading above it would otherwise say: the Agent the entry belongs to. On a
+    // terminal that draws no pictures that is the Agent's name, which is the
+    // half of this the mark cannot answer; the other half is
+    // `a_pinned_row_wears_its_agents_mark_where_the_terminal_can_draw_one`. It
     // does *not* carry the run options — three names and a settings summary do
     // not fit one row, and squeezing them in hides the names the reader needs to
     // tell two entries apart. The highlighted row gets the line under the list
@@ -986,6 +989,141 @@ fn a_pinned_row_names_the_agent_and_how_it_ran() {
     assert!(
         !preview.contains("Thinking depth"),
         "the preview repeats the option's name: {preview:?}"
+    );
+}
+
+#[test]
+fn a_pinned_row_wears_its_agents_mark_where_the_terminal_can_draw_one() {
+    // The recent rows are a shortcut read in one glance, and the Agent column is
+    // a column of words that have to be read to tell two of them apart. The
+    // heading already answers "which Agent" with a mark, so a pinned row does
+    // the same and gives the columns back to the account and the model. A
+    // terminal that cannot hold a picture keeps the name.
+    let mut app = app(140, 40);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.terminal_images = vibex_tui::terminal_image::ImageSupport::forced(
+        vibex_tui::terminal_image::ImageProtocol::Kitty,
+    );
+    let catalog = run_option_catalog();
+    let desired = catalog.options[1].selection.clone();
+    app.runtime_options = Some(catalog);
+    open_session_on(&mut app, desired.clone());
+    app.remember_runtime_selection(&desired);
+    app.show_runtime_picker();
+
+    let lines = render(&mut app, 140, 40);
+    let screen = text(&lines);
+    // The pinned row is the one inside the modal that carries the account and
+    // the model: the line under the composer names the Agent in words, which is
+    // exactly what this row no longer does.
+    let row = lines
+        .iter()
+        .find(|line| line.contains('│') && line.contains("bal · gpt-5"))
+        .unwrap_or_else(|| panic!("the recent row is not on screen:\n{screen}"));
+    let row = modal_interior(row);
+    assert!(
+        !row.contains("codex"),
+        "the pinned row still spells out the Agent the mark says: {row:?}"
+    );
+    // The cell the number leaves, then the two the mark covers and the column
+    // that keeps it off the account: a picture sits above the text layer, so the
+    // row reserves those cells rather than drawing in them.
+    let lead = row
+        .split_once("1 ")
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("the pinned row lost its number: {row:?}"));
+    assert!(
+        lead.trim_start().starts_with("bal")
+            && lead.len() - lead.trim_start().len()
+                == usize::from(vibex_tui::agent_logo::AGENT_LOGO_COLS) + 1,
+        "the pinned row did not keep the mark's columns: {row:?}"
+    );
+    // And the mark really is on the terminal, not only reserved: the escapes
+    // that put it there are queued for the run loop after the frame.
+    assert!(
+        app.agent_logos.is_holding(),
+        "the mark was reserved but never handed to the terminal:\n{screen}"
+    );
+    let control = String::from_utf8(app.take_terminal_control()).expect("escapes are text");
+    assert!(
+        control.contains("a=T,f=100"),
+        "a terminal with pixels was handed no mark: {control:?}"
+    );
+}
+
+/// The part of a line that lies between the open modal's two vertical borders.
+///
+/// The page behind the modal keeps drawing, so a line of the screen is not a
+/// line of the modal: the sidebar is beside it, and a tab or two.
+fn modal_interior(line: &str) -> &str {
+    match (line.find('│'), line.rfind('│')) {
+        // A border glyph is multi-byte, so the interior starts past its bytes
+        // rather than past its one column.
+        (Some(start), Some(end)) if end > start => &line[start + '│'.len_utf8()..end],
+        _ => line,
+    }
+}
+
+/// Whether a line inside a modal holds nothing but air.
+fn is_modal_air(line: &str) -> bool {
+    modal_interior(line).trim().is_empty()
+}
+
+#[test]
+fn the_catalogue_parts_the_pinned_sections_from_the_agents() {
+    // One list answers two questions: "what have I used" from the pinned rows,
+    // and "what is there" from the Agents under them. A rule is what parts the
+    // two halves — the air two groups are parted by says a group ended, not that
+    // the shortcuts did — and air is what keeps a column of Agents from reading
+    // as one grey block.
+    let mut app = app(140, 40);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let catalog = run_option_catalog();
+    let desired = catalog.options[1].selection.clone();
+    app.runtime_options = Some(catalog);
+    open_session_on(&mut app, desired.clone());
+    app.remember_runtime_selection(&desired);
+    app.show_runtime_picker();
+    // Both Agents open: the fixture has one group per Agent, and the thing being
+    // read here is the seam between them.
+    app.fold_runtime_group(
+        &vibex_core::AgentId::parse("claude").expect("agent id"),
+        false,
+    );
+
+    let lines = render(&mut app, 140, 40);
+    let screen = text(&lines);
+    let headings: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains('▾') || line.contains('▸'))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(headings.len(), 2, "the fixture has two Agents:\n{screen}");
+
+    // The pinned rows end with a rule, and it is the line the first Agent's
+    // heading follows.
+    let recent = lines
+        .iter()
+        .position(|line| line.contains("Recent"))
+        .unwrap_or_else(|| panic!("the recent section is not on screen:\n{screen}"));
+    let rule = lines[recent..headings[0]]
+        .iter()
+        .position(|line| line.matches('─').count() > 8)
+        .map(|offset| recent + offset)
+        .unwrap_or_else(|| panic!("nothing parts the pinned rows from the Agents:\n{screen}"));
+    assert_eq!(
+        rule + 1,
+        headings[0],
+        "the rule does not close the pinned sections off:\n{screen}"
+    );
+
+    // Two Agents' groups are parted by air, which is not what the halves get.
+    assert!(
+        is_modal_air(&lines[headings[1] - 1]),
+        "two Agents' groups are not parted by air:\n{screen}"
     );
 }
 
@@ -1111,6 +1249,59 @@ fn a_long_catalogue_does_not_bury_the_run_options() {
     assert!(
         !screen.contains("gpt-5-39"),
         "the run-option view drew catalogue rows:\n{screen}"
+    );
+}
+
+#[test]
+fn a_catalogue_longer_than_the_window_keeps_the_cursor_on_screen() {
+    // The window is measured in the lines the frame drew, and the list is not
+    // all rows: an Agent per group brings a line of air with it. A window that
+    // counted rows would scroll past the line the cursor is on and leave the
+    // reader on a blank one.
+    let mut app = app(120, 24);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let options = (0..12)
+        .map(|index| vibex_core::SessionRuntimeOption {
+            selection: vibex_core::SessionRuntimeSelection::provider(
+                vibex_core::AgentId::parse(format!("agent-{index}")).expect("agent id"),
+                vibex_core::ProviderProfileId::new(),
+                format!("m-{index}"),
+            ),
+            agent_label: format!("Brand {index}"),
+            auth_source_label: "bal".to_string(),
+            model_label: format!("m-{index}"),
+            reasoning_efforts: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability: vibex_core::RuntimeOptionAvailability::Available,
+        })
+        .collect::<Vec<_>>();
+    let catalog = vibex_core::SessionRuntimeOptionCatalog {
+        revision: 1,
+        agents: Vec::new(),
+        auth_sources: Vec::new(),
+        options: options.clone(),
+    };
+    app.runtime_options = Some(catalog);
+    open_session_on(&mut app, options[0].selection.clone());
+    app.show_runtime_picker();
+    // The last Agent's group is open, so the last row of the list is an entry
+    // with a heading above it: the window has to hold both.
+    app.fold_runtime_group(
+        &vibex_core::AgentId::parse("agent-11").expect("agent id"),
+        false,
+    );
+
+    app.perform(vibex_tui::action::Intent::ScrollToBottom);
+    let screen = text(&render(&mut app, 120, 24));
+    assert!(
+        screen.contains("m-11"),
+        "the row the cursor moved to is not on screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Brand 1 ·"),
+        "the whole catalogue is on one page, so nothing here is being tested:\n{screen}"
     );
 }
 

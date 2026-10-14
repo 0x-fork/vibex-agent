@@ -1445,13 +1445,16 @@ pub struct RowActionRegion {
 }
 
 /// Where the runtime switcher drew its rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePickerRegion {
+    /// The rows the list was drawn into.
     pub rect: ratatui::layout::Rect,
-    /// The catalogue row drawn on the rect's first line.
-    pub offset: usize,
-    /// How many rows the view has, drawn or not.
-    pub rows: usize,
+    /// The catalogue row each drawn line shows, top to bottom.
+    ///
+    /// A line of air between two Agents' groups, and the rule that parts the
+    /// pinned sections from the Agents, show `None`: neither is a row the reader
+    /// or the pointer can land on.
+    pub rows: Vec<Option<usize>>,
 }
 
 impl RuntimePickerRegion {
@@ -1464,8 +1467,10 @@ impl RuntimePickerRegion {
         {
             return None;
         }
-        let index = self.offset + usize::from(row - self.rect.y);
-        (index < self.rows).then_some(index)
+        self.rows
+            .get(usize::from(row - self.rect.y))
+            .copied()
+            .flatten()
     }
 }
 

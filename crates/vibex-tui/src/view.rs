@@ -1331,12 +1331,14 @@ struct SessionRowControl {
     intent: Intent,
 }
 
-/// One Agent mark a session row wants on the terminal.
+/// One Agent mark a list row wants on the terminal.
 ///
 /// Like a control, a mark is collected while the row is laid out and placed
 /// onto the screen once the window is known, because a row scrolled past must
 /// not leave a picture behind. The identity is what the terminal is asked to
-/// draw; the row has already reserved the cells.
+/// draw; the row has already reserved the cells. The session list and the
+/// runtime switcher both lay rows out this way, which is why the shape carries
+/// no assumption about which list it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionRowMark {
     /// The line of the row the mark sits on, counting from its first.
@@ -8233,39 +8235,98 @@ fn render_runtime_catalogue(
         content.height -= 1;
     }
     let width = usize::from(content.width);
-    let mut lines = Vec::with_capacity(rows.len());
-    // The Agent marks the headings want, by the catalogue row they belong to.
-    // The row is a line of the laid-out list rather than of the window, so the
-    // placement below subtracts the window's scroll offset.
-    let mut wanted_marks: Vec<(usize, String)> = Vec::new();
+    // The list is laid out as *lines* rather than as rows, because two of the
+    // things it draws are not rows: a line of air parts one Agent's group from
+    // the next, and a rule parts the pinned sections from the Agents. Each line
+    // therefore carries the catalogue row it shows — nothing, for the air and
+    // the rule — which is what the window, the page keys and the pointer count
+    // in. The table is built in the same pass, so a line can never be pushed
+    // without saying what it is.
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len() + 2);
+    let mut row_of_line: Vec<Option<usize>> = Vec::with_capacity(rows.len() + 2);
+    let mut line_of_row: Vec<usize> = Vec::with_capacity(rows.len());
+    // Every Agent mark the lines want, in the coordinates of the laid-out list.
+    // Like the session list's, a mark is moved onto the screen once the window is
+    // known, so one on a line the reader has scrolled past is never placed.
+    let mut wanted_marks: Vec<(usize, SessionRowMark)> = Vec::new();
     let mut in_group = false;
+    let mut in_section = false;
     for (index, row) in rows.iter().enumerate() {
         match row {
             RuntimePickerRow::Section(section) => {
+                // Air above a pinned section: two sections are two lists, and
+                // their titles are where one ends and the next begins.
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                    row_of_line.push(None);
+                }
+                line_of_row.push(lines.len());
                 in_group = false;
+                in_section = true;
                 lines.push(Line::from(Span::styled(
                     truncate_to_width(&format!("  {}", section.label(&strings)), width, "…"),
                     theme.dimmed(theme.roles.gray).add_modifier(Modifier::BOLD),
                 )));
+                row_of_line.push(Some(index));
             }
             RuntimePickerRow::Agent { .. } => {
+                // The pinned sections and the Agents are the two halves of this
+                // list, and a rule is what says so: the air between two Agents
+                // says a group ended, not that the shortcuts did. The rule is
+                // drawn between two rows, so it shows no row of its own.
+                if in_section {
+                    in_section = false;
+                    lines.push(runtime_picker_rule(width, app.glyph_tier(), theme));
+                    row_of_line.push(None);
+                } else if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                    row_of_line.push(None);
+                }
+                let at = lines.len();
+                line_of_row.push(at);
                 in_group = true;
                 let (line, identity) =
                     runtime_picker_heading_line(app, row, index == selected, width, theme);
                 if let Some(identity) = identity {
-                    wanted_marks.push((index, identity));
+                    // The heading's own two-cell disclosure is the lead the mark
+                    // sits after.
+                    wanted_marks.push((
+                        at,
+                        SessionRowMark {
+                            line: 0,
+                            column: 2,
+                            identity,
+                        },
+                    ));
                 }
                 lines.push(line);
+                row_of_line.push(Some(index));
             }
-            RuntimePickerRow::Entry { .. } => lines.push(runtime_picker_entry_line(
-                app,
-                &options,
-                row,
-                index == selected,
-                in_group,
-                width,
-                theme,
-            )),
+            RuntimePickerRow::Entry { .. } => {
+                let at = lines.len();
+                line_of_row.push(at);
+                let (line, mark) = runtime_picker_entry_line(
+                    app,
+                    &options,
+                    row,
+                    index == selected,
+                    in_group,
+                    width,
+                    theme,
+                );
+                if let Some((column, identity)) = mark {
+                    wanted_marks.push((
+                        at,
+                        SessionRowMark {
+                            line: 0,
+                            column,
+                            identity,
+                        },
+                    ));
+                }
+                lines.push(line);
+                row_of_line.push(Some(index));
+            }
         }
     }
     // Keep the cursor on screen with the least movement: the window only moves
@@ -8274,28 +8335,42 @@ fn render_runtime_catalogue(
     // and the scroll bar both need to know where the window ended up.
     let selected = selected.min(rows.len().saturating_sub(1));
     let height = usize::from(content.height);
+    let selected_line = line_of_row.get(selected).copied().unwrap_or(0);
     let mut offset = app
         .runtime_picker
         .scroll
-        .min(rows.len().saturating_sub(height.min(rows.len())));
-    if selected < offset {
-        offset = selected;
+        .min(lines.len().saturating_sub(height.min(lines.len())));
+    if selected_line < offset {
+        offset = selected_line;
     }
-    if selected >= offset + height {
-        offset = (selected + 1).saturating_sub(height);
+    if selected_line >= offset + height {
+        offset = (selected_line + 1).saturating_sub(height);
     }
     app.runtime_picker.scroll = offset;
-    app.runtime_picker.page_rows = height.max(1);
+    // A page is what the reader can see, and the air between two groups is not
+    // a row they can land on: the page key counts the rows the window drew.
+    let drawn_rows = row_of_line
+        .iter()
+        .skip(offset)
+        .take(height)
+        .filter(|row| row.is_some())
+        .count();
+    app.runtime_picker.page_rows = drawn_rows.max(1);
     app.regions.runtime_picker = Some(crate::app::RuntimePickerRegion {
         rect: content,
-        offset,
-        rows: rows.len(),
+        rows: row_of_line
+            .iter()
+            .skip(offset)
+            .take(height)
+            .copied()
+            .collect(),
     });
 
     // The scroll bar is one column of the list rather than a widget: a reader
     // who cannot see how long the catalogue is cannot tell a short list from a
     // clipped one.
-    let bar = rows.len() > height && content.width > 4;
+    let total = lines.len();
+    let bar = total > height && content.width > 4;
     let list_area = if bar {
         Rect {
             width: content.width - 1,
@@ -8314,20 +8389,19 @@ fn render_runtime_catalogue(
         )),
         list_area,
     );
-    // The Agent marks land on the heading lines the window actually drew. Like
-    // the session list's, a heading scrolled past or pushed off a narrow list is
-    // not placed at all rather than left standing over the row below.
+    // The Agent marks land on the lines the window actually drew. Like the
+    // session list's, a mark on a line scrolled past, or one a terminal too
+    // narrow to hold it has pushed out of the list, is not placed at all rather
+    // than left standing over the row below.
     let mark_color = crate::theme::color_rgb(theme.roles.foreground);
-    for (index, identity) in &wanted_marks {
-        let Some(screen_line) = index.checked_sub(offset) else {
+    for (line, mark) in &wanted_marks {
+        let Some(screen_line) = line.checked_sub(offset) else {
             continue;
         };
         if screen_line >= height {
             continue;
         }
-        // The heading's own two-cell lead is the disclosure at `list_area.x`,
-        // and the mark covers the next two: `▾ ` then the reserved cells.
-        let column = list_area.x.saturating_add(2);
+        let column = list_area.x.saturating_add(mark.column);
         if column + crate::agent_logo::AGENT_LOGO_COLS > list_area.right() {
             continue;
         }
@@ -8339,10 +8413,10 @@ fn render_runtime_catalogue(
         };
         let _ = app
             .agent_logos
-            .show(&app.terminal_images, identity, mark_color, rect);
+            .show(&app.terminal_images, &mark.identity, mark_color, rect);
     }
     if bar {
-        render_scroll_indicator(frame, content, offset, rows.len(), theme);
+        render_scroll_indicator(frame, content, offset, total, theme);
     }
     if preview {
         let entry = rows.get(selected).and_then(|row| row.entry());
@@ -8361,6 +8435,25 @@ fn render_runtime_catalogue(
             },
         );
     }
+}
+
+/// The rule that parts the pinned sections from the Agents below them.
+///
+/// The two halves of the list answer different questions — "what have I used"
+/// and "what is there" — and the air that parts two Agents' groups cannot say
+/// where one half ends: it says a group ended. A rule from the list's left edge
+/// to its right is what a reader reads as the end of a section, and it is drawn
+/// in the dim step for the reason every other rule here is: punctuation between
+/// sections, not a line of the page.
+fn runtime_picker_rule(
+    width: usize,
+    tier: crate::glyphs::GlyphTier,
+    theme: &TuiTheme,
+) -> Line<'static> {
+    Line::from(Span::styled(
+        crate::glyphs::heading_rule(tier).repeat(width),
+        theme.dimmed(theme.roles.gray_dim),
+    ))
 }
 
 /// One Agent's heading: what it holds, and whether it is the one in use.
@@ -8394,23 +8487,19 @@ fn runtime_picker_heading_line(
     // has one; the heading's own text is what every other case gets, which is
     // the state this pointer is `None` in.
     let mark_width = usize::from(crate::agent_logo::AGENT_LOGO_COLS);
-    let identity = app.agent_identity(agent_id, label);
-    let mark = app.terminal_images.supports_pixels()
-        && vibex_brands::agent_mark(&identity).is_some_and(|mark| {
-            !mark.uses_current_color || crate::theme::color_rgb(theme.roles.foreground).is_some()
-        });
+    let mark = agent_mark_identity(app, agent_id, label, theme);
     let lead = if *folded { "▸ " } else { "▾ " };
     let mut spans = vec![Span::styled(
         lead.to_string(),
         theme.dimmed(theme.roles.gray),
     )];
-    if mark {
+    if mark.is_some() {
         // The cells the mark covers are painted blank so nothing shows through
         // around it: a picture sits above the text layer, not instead of it.
         spans.push(Span::styled(" ".repeat(mark_width), theme.base()));
         spans.push(Span::styled(" ", theme.base()));
     }
-    let indent = if mark { mark_width + 1 } else { 0 };
+    let indent = if mark.is_some() { mark_width + 1 } else { 0 };
     spans.push(Span::styled(
         truncate_to_width(label, width.saturating_sub(2 + indent), "…"),
         theme.base().add_modifier(Modifier::BOLD),
@@ -8428,11 +8517,38 @@ fn runtime_picker_heading_line(
             theme.dimmed(theme.roles.gray_dim),
         ));
     }
-    let identity = mark.then_some(identity);
-    (selected_line(spans, selected, width, theme), identity)
+    (selected_line(spans, selected, width, theme), mark)
+}
+
+/// The Agent mark a catalogue row wants drawn, when there is one to want.
+///
+/// Two conditions, and neither is the row's to answer: the terminal has to be
+/// able to hold a picture, and the Agent has to have a mark. `None` is the
+/// caller's signal to keep the Agent's name, which is always known — a mark that
+/// resolved to four pixels of half block would be a worse answer than the word
+/// it replaced, and a themed mark with no theme colour has nothing to draw in.
+fn agent_mark_identity(
+    app: &App,
+    agent_id: &vibex_core::AgentId,
+    label: &str,
+    theme: &TuiTheme,
+) -> Option<String> {
+    if !app.terminal_images.supports_pixels() {
+        return None;
+    }
+    let identity = app.agent_identity(agent_id, label);
+    vibex_brands::agent_mark(&identity)
+        .filter(|mark| {
+            !mark.uses_current_color || crate::theme::color_rgb(theme.roles.foreground).is_some()
+        })
+        .map(|_| identity)
 }
 
 /// One entry: its account and model, and what it says about itself.
+///
+/// Reports the Agent mark the row reserved cells for, and the column it starts
+/// at: a pinned row says which Agent it came from with the mark rather than with
+/// the name, the way the heading it no longer sits under would have.
 fn runtime_picker_entry_line(
     app: &App,
     options: &[vibex_core::SessionRuntimeOption],
@@ -8441,13 +8557,13 @@ fn runtime_picker_entry_line(
     in_group: bool,
     width: usize,
     theme: &TuiTheme,
-) -> Line<'static> {
+) -> (Line<'static>, Option<(u16, String)>) {
     let strings = app.strings;
     let RuntimePickerRow::Entry { index, quick, .. } = row else {
-        return Line::from("");
+        return (Line::from(""), None);
     };
     let Some(option) = options.get(*index) else {
-        return Line::from("");
+        return (Line::from(""), None);
     };
     let current = app.runtime_option_is_current(option);
     let status = if current {
@@ -8465,18 +8581,35 @@ fn runtime_picker_entry_line(
     };
     let indent = if in_group { 4 } else { 2 };
     // A pinned row names an entry out of its group, so it has to carry what the
-    // heading above it would otherwise say: the Agent it belongs to. Its run
+    // heading above it would otherwise say: the Agent it belongs to — as the
+    // heading says it, which is the mark when the terminal can hold one. Its run
     // options are not drawn here — three names and a settings summary do not fit
     // one row, and the reader who wants them is one `Tab` from the line under
     // the list, which the highlighted row already fills in.
+    let mark = if in_group {
+        None
+    } else {
+        agent_mark_identity(app, &option.selection.agent_id, &option.agent_label, theme)
+    };
+    // The cells the mark covers, plus the column that keeps it off the name
+    // beside it. Counted from the text's own lead, so the two ends of the row
+    // cannot drift apart.
+    let mark_width = if mark.is_some() {
+        usize::from(crate::agent_logo::AGENT_LOGO_COLS) + 1
+    } else {
+        0
+    };
     let status_width = status.as_deref().map(display_width).unwrap_or_default();
     let status_gap = if status_width > 0 { 2 } else { 0 };
-    let available = width.saturating_sub(indent + 2 + status_width + status_gap);
+    let available = width.saturating_sub(indent + 2 + mark_width + status_width + status_gap);
     // The model is what a reader scans for, so it takes the larger share and the
     // account truncates first: "Agent account/…" names the provenance, but
     // two rows of the same model on two accounts are still two rows.
     let auth_label = runtime_option_auth_label(&strings, option);
-    let body = if in_group {
+    let body = if in_group || mark.is_some() {
+        // The Agent has already been said — by the heading above a group's row,
+        // by the mark on a pinned one — so the row spends its columns on the two
+        // names that tell two entries of one Agent apart.
         let (auth_width, model_width) = runtime_columns(available);
         format!(
             "{} · {}",
@@ -8502,11 +8635,20 @@ fn runtime_picker_entry_line(
                 theme.dimmed(theme.roles.gray)
             },
         ),
-        Span::styled(
-            pad_to_width(&body, available),
-            if current { theme.base() } else { theme.muted() },
-        ),
     ];
+    if mark.is_some() {
+        // The cells the mark covers are painted blank so nothing shows through
+        // around it: a picture sits above the text layer, not instead of it.
+        spans.push(Span::styled(
+            " ".repeat(usize::from(crate::agent_logo::AGENT_LOGO_COLS)),
+            theme.base(),
+        ));
+        spans.push(Span::styled(" ", theme.base()));
+    }
+    spans.push(Span::styled(
+        pad_to_width(&body, available),
+        if current { theme.base() } else { theme.muted() },
+    ));
     if let Some(status) = status {
         spans.push(Span::styled(" ".repeat(status_gap), theme.base()));
         spans.push(Span::styled(
@@ -8518,7 +8660,10 @@ fn runtime_picker_entry_line(
             },
         ));
     }
-    selected_line(spans, selected, width, theme)
+    // The mark sits after the row's own lead — the indent and the marker's two
+    // cells — which is where the blank cells above were reserved.
+    let mark = mark.map(|identity| ((indent + 2) as u16, identity));
+    (selected_line(spans, selected, width, theme), mark)
 }
 
 /// The preview of the highlighted entry: how it would run, and where that is
