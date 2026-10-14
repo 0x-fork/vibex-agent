@@ -1884,23 +1884,29 @@ impl Dispatch {
             } => {
                 // The authority owns the command catalogue: `/` merges the
                 // Agent's own commands with Vibex Prompts, `@` resolves
-                // workspace files, and `$` resolves Skills. None of that is
-                // local knowledge, so the composer asks rather than guessing.
-                let session = match ticket.target.as_ref() {
-                    Some(crate::app::ComposerTarget::Session(id)) => {
-                        self.facade.agent().open_session(id.clone()).await.ok()
-                    }
-                    _ => None,
-                };
+                // workspace files and the collaborators work can be handed to,
+                // and `$` resolves Skills. None of that is local knowledge, so
+                // the composer asks rather than guessing.
+                //
+                // Everything the request needs is read off the ticket the
+                // composer minted, so no read here can answer for a page the
+                // reader has already left: the target names the session (or
+                // reserves the absence of one), the ticket's runtime names the
+                // Agent the draft would go through, and its workspace is the one
+                // the page resolved — the `@` file list is a workspace read, and
+                // a request that names none comes back without files rather than
+                // with another workspace's.
                 let request = vibex_core::AgentCommandDiscoverRequest {
                     agent_id: ticket
                         .runtime
                         .as_ref()
-                        .map(|runtime| runtime.agent_id.clone())
-                        .or_else(|| session.as_ref().map(|session| session.agent_id.clone())),
+                        .map(|runtime| runtime.agent_id.clone()),
                     provider_profile_id: None,
-                    session_id: session.as_ref().map(|session| session.id.clone()),
-                    workspace_id: session.as_ref().map(|session| session.workspace_id.clone()),
+                    session_id: match ticket.target.as_ref() {
+                        Some(crate::app::ComposerTarget::Session(id)) => Some(id.clone()),
+                        _ => None,
+                    },
+                    workspace_id: ticket.workspace_id.clone(),
                     trigger: Some(match trigger {
                         crate::composer::CompletionTrigger::Slash => {
                             vibex_core::AgentCommandTrigger::Slash

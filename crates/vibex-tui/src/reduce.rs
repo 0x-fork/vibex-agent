@@ -4563,19 +4563,30 @@ impl App {
         let Some(menu) = self.completion.as_mut() else {
             return;
         };
-        let count = menu.items.len();
-        if count == 0 {
+        // The walk is over the rows on screen, not over the whole answer: a
+        // candidate the query has filtered out is one arrow keys must step over,
+        // or the reader watches the highlight disappear into rows nobody drew.
+        let matches = menu.visible();
+        if matches.is_empty() {
             return;
         }
-        let current = menu.selected as i64;
-        menu.selected = (current + delta).rem_euclid(count as i64) as usize;
+        let position = matches
+            .iter()
+            .position(|index| *index == menu.selected)
+            .unwrap_or(0);
+        let next = (position as i64 + delta).rem_euclid(matches.len() as i64) as usize;
+        menu.selected = matches[next];
     }
 
     fn accept_completion(&mut self) -> Outcome {
         let Some(menu) = self.completion.clone() else {
             return Outcome::quiet();
         };
-        let Some(item) = menu.items.get(menu.selected) else {
+        // Only a row the drawer is offering is a row `Tab` or `Enter` may take:
+        // an answer for a query the reader has since typed past can leave the
+        // selection on a candidate their text no longer matches, and inserting
+        // it would put a command they never chose into the draft.
+        let Some(item) = menu.selected_item() else {
             self.completion = None;
             return Outcome::quiet();
         };
@@ -4589,21 +4600,15 @@ impl App {
     pub fn refresh_completion(&mut self) -> Option<(CompletionTrigger, String)> {
         match self.composer.active_trigger() {
             Some((trigger, start, query)) => {
-                let end = self.composer.cursor();
                 match self.completion.as_mut() {
                     Some(menu) if menu.trigger == trigger && menu.start == start => {
-                        menu.end = end;
-                        let filtered = menu.filtered(&query);
-                        if let Some(first) = filtered.first() {
-                            menu.selected = menu.selected.min(menu.items.len() - 1);
-                            let _ = first;
-                        }
+                        menu.reseat(query.clone());
                     }
                     _ => {
                         self.completion = Some(CompletionMenu {
                             trigger,
                             start,
-                            end,
+                            query: query.clone(),
                             items: Vec::new(),
                             selected: 0,
                             loading: true,

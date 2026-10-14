@@ -1275,9 +1275,16 @@ fn handle_composer_key(
                 return Ok(Some(false));
             }
         }
-        KeyCode::Enter if shift => {
-            app.composer.insert_char('\n');
-            return Ok(Some(false));
+        // The drawer is the thing on screen with the keyboard, so `Enter` takes
+        // the row it offers into the draft — the same answer the desktop gives
+        // the same popup, and what keeps choosing a command from sending one.
+        // It sends only when there is no row to take.
+        KeyCode::Enter => {
+            if app.completion_offers_row() {
+                let outcome = app.perform(Intent::CompletionAccept);
+                dispatch_all(worker, &outcome);
+                return Ok(Some(false));
+            }
         }
         _ => {}
     }
@@ -2773,6 +2780,70 @@ mod tests {
         assert!(!app.composer_takes_keys());
     }
 
+    #[test]
+    fn enter_takes_the_completion_row_instead_of_sending_the_draft() {
+        // Regression: with the drawer open, `Enter` fell through to the binding
+        // table and sent the draft, so the command the reader had just chosen
+        // never reached the box — they watched a half-typed trigger word go out
+        // instead. Taking the row is what the desktop composer answers the same
+        // popup with.
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        app.resize(100, 30);
+        app.perform(crate::action::Intent::NewSession);
+        app.agent.state.selected_session_id = None;
+        app.focus = crate::app::Focus::Composer;
+        assert!(app.composer_takes_keys());
+        assert_eq!(app.composer.text(), "");
+        // The composer is the page's own target, so nothing has to be opened for
+        // the draft to be ready to send.
+        app.composer.set_text("testest /com");
+        app.refresh_completion();
+        {
+            let menu = app.completion.as_mut().expect("a completion menu");
+            menu.items = vec![crate::composer::Completion {
+                insert: "/compact ".to_string(),
+                label: "compact".to_string(),
+                detail: "Compact the conversation".to_string(),
+                group: "Command".to_string(),
+            }];
+            menu.loading = false;
+            menu.reseat(menu.query.clone());
+        }
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            app.composer.text(),
+            "testest /compact ",
+            "the chosen command did not land in the box"
+        );
+        assert!(app.pending_creations.is_empty(), "the draft was sent");
+        assert!(app.completion.is_none());
+
+        // A drawer with nothing to offer is not a reason to swallow `Enter`: the
+        // key falls through to the binding table, which sends the draft.
+        app.composer.set_text("testest /com");
+        app.refresh_completion();
+        let menu = app.completion.as_mut().expect("a completion menu");
+        menu.items.clear();
+        menu.loading = false;
+        assert_eq!(
+            handle_composer_key(
+                &mut app,
+                &worker,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+            .unwrap(),
+            None,
+            "an empty drawer took the key"
+        );
+    }
+
+    #[test]
     #[test]
     fn the_newline_chords_break_the_line_instead_of_sending() {
         // `Shift+Enter` is only a key of its own once the terminal has been
@@ -5123,6 +5194,59 @@ mod tests {
     }
 
     #[test]
+    fn the_completion_drawer_is_painted_on_the_theme_surface() {
+        // Regression: the drawer cleared its area and let the terminal paint it,
+        // so the command list sat on a background of its own — a different
+        // colour from the composer it is pulled out of, and the one surface a
+        // theme cannot choose for itself.
+        let mut app = isolation_app();
+        app.resize(100, 30);
+        app.perform(crate::action::Intent::NewSession);
+        app.focus = crate::app::Focus::Composer;
+        app.composer.set_text("testest /com");
+        app.refresh_completion();
+        {
+            let menu = app.completion.as_mut().expect("a completion menu");
+            menu.items = vec![crate::composer::Completion {
+                insert: "/compact ".to_string(),
+                label: "compact".to_string(),
+                detail: "Compact the conversation".to_string(),
+                group: "Command".to_string(),
+            }];
+            menu.loading = false;
+            menu.reseat(menu.query.clone());
+        }
+        let surface = app.theme.roles.surface_raised;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::view::render(frame, &mut app))
+            .expect("the drawer draws");
+        let buffer = terminal.backend().buffer();
+        let row_text = |row: u16| -> String {
+            (0..buffer.area.width)
+                .map(|column| {
+                    buffer
+                        .cell((column, row))
+                        .map(|cell| cell.symbol())
+                        .unwrap_or(" ")
+                })
+                .collect()
+        };
+        let drawer = (0..buffer.area.height)
+            .find(|row| row_text(*row).contains("compact"))
+            .expect("the drawer is not on screen");
+        for column in [0, buffer.area.width / 2, buffer.area.width - 1] {
+            assert_eq!(
+                buffer.cell((column, drawer)).map(|cell| cell.style().bg),
+                Some(Some(surface)),
+                "column {column} of the drawer is not on the theme's surface"
+            );
+        }
+    }
+
+    #[test]
+    #[test]
     fn workspace_callback_cannot_move_a_newer_draft_or_page() {
         use crate::action::Intent;
         let worker = isolation_worker();
@@ -5167,6 +5291,52 @@ mod tests {
         assert_eq!(app.composer.text(), "newer work");
     }
 
+    #[test]
+    fn a_completion_request_names_the_workspace_the_draft_belongs_to() {
+        // `@` lists the workspace's files, so the request has to say which
+        // workspace — and the composing page has no session to read one from.
+        // The directory that page will create the session in is the answer, and
+        // the workspace records this client has read turn it into an id.
+        let mut app = isolation_app();
+        app.resize(100, 30);
+        app.perform(crate::action::Intent::NewSession);
+        let project_id = vibex_core::ProjectId::new();
+        let workspace_id = vibex_core::WorkspaceId::new();
+        app.workspace_rows = vec![vibex_backend::WorkspaceSummary {
+            project: vibex_core::ProjectRecord {
+                id: project_id.clone(),
+                name: "repo".into(),
+                root_path: "/repo".into(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            workspace: vibex_core::WorkspaceRecord {
+                id: workspace_id.clone(),
+                project_id,
+                root_path: "/repo".into(),
+                mode: vibex_core::WorkspaceMode::CurrentCheckout,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            git_branch: None,
+        }];
+        app.workspace_path = Some("/repo".to_string());
+        assert_eq!(app.composer_workspace_id(), Some(workspace_id.clone()));
+        assert_eq!(
+            app.composer_ticket().workspace_id,
+            Some(workspace_id),
+            "the request the worker builds would name no workspace"
+        );
+
+        // A directory the runtime has no record for names no workspace rather
+        // than the wrong one: a completion request without one answers without
+        // files, which is a list that is empty rather than a list of another
+        // project's.
+        app.workspace_path = Some("/elsewhere".to_string());
+        assert_eq!(app.composer_workspace_id(), None);
+    }
+
+    #[test]
     #[test]
     fn slow_creation_and_send_expiry_never_release_followup_before_send_ack() {
         let worker = isolation_worker();

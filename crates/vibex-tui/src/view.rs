@@ -14,7 +14,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
 use vibex_ui::shell::ShellKind;
 
@@ -3938,7 +3938,10 @@ fn render_history_search(
         width: anchor.width,
         height,
     };
-    frame.render_widget(Clear, area);
+    // Same plane as the completion drawer above: the two are the same chrome,
+    // and `Clear` alone would leave this one on the terminal's own background.
+    let surface = Style::default().bg(theme.roles.surface_raised);
+    frame.render_widget(Block::default().style(surface), area);
     let rule_style = Style::default().fg(theme.roles.gray_dim);
     // Top rule, titled and with the match count right-aligned on it.
     let title = format!(" {} ", strings.composer_history());
@@ -3952,12 +3955,16 @@ fn render_history_search(
         ));
         top.push(Span::styled(count, Style::default().fg(theme.roles.gray)));
     }
-    frame.render_widget(Paragraph::new(Line::from(top)), Rect { height: 1, ..area });
+    frame.render_widget(
+        Paragraph::new(Line::from(top)).style(surface),
+        Rect { height: 1, ..area },
+    );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "─".repeat(usize::from(area.width)),
             rule_style,
-        ))),
+        )))
+        .style(surface),
         Rect {
             y: area.y + area.height - 1,
             height: 1,
@@ -4017,7 +4024,7 @@ fn render_history_search(
             Line::from(spans)
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(Text::from(lines)), body);
+    frame.render_widget(Paragraph::new(Text::from(lines)).style(surface), body);
 }
 
 /// The composer's info line, against the right edge.
@@ -4121,7 +4128,12 @@ fn render_completion(
         width: anchor.width,
         height,
     };
-    frame.render_widget(Clear, area);
+    // The drawer is a surface of its own, on the same plane as the composer it
+    // is pulled out of. `Clear` alone would leave every cell the rows do not
+    // cover painted on the terminal's own background — the one colour a themed
+    // interface cannot choose, and a different one from the box below it.
+    let surface = Style::default().bg(theme.roles.surface_raised);
+    frame.render_widget(Block::default().style(surface), area);
 
     let rule_style = Style::default().fg(theme.roles.gray_dim);
     let title = match menu.trigger {
@@ -4145,13 +4157,17 @@ fn render_completion(
             Span::styled(count, Style::default().fg(theme.roles.gray)),
         ];
     }
-    frame.render_widget(Paragraph::new(Line::from(top)), Rect { height: 1, ..area });
+    frame.render_widget(
+        Paragraph::new(Line::from(top)).style(surface),
+        Rect { height: 1, ..area },
+    );
     // Bottom rule, which is also the composer's top edge.
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "─".repeat(usize::from(area.width)),
             rule_style,
-        ))),
+        )))
+        .style(surface),
         Rect {
             y: area.y + area.height - 1,
             height: 1,
@@ -4178,7 +4194,7 @@ fn render_completion(
             )
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(Text::from(lines)), body);
+    frame.render_widget(Paragraph::new(Text::from(lines)).style(surface), body);
 }
 
 /// One completion row.
@@ -6287,6 +6303,10 @@ pub fn shortcut_rows<'a>(
             .bindings()
             .iter()
             .filter(|binding| binding.label.is_some() && binding.scope.category() == category)
+            // A verb with no subject is not a shortcut the reader can use: the
+            // cheatsheet names what this client can do *now*, so the ownership
+            // rows appear with the sessions that have something to own.
+            .filter(|binding| app.ownership_key_applies(binding.intent))
             .filter(|binding| {
                 needle.is_empty()
                     || binding.chord.display().to_lowercase().contains(&needle)

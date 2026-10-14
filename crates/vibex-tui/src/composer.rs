@@ -59,7 +59,12 @@ pub struct CompletionMenu {
     pub trigger: CompletionTrigger,
     /// Byte range of the trigger word in the buffer.
     pub start: usize,
-    pub end: usize,
+    /// What has been typed after the trigger.
+    ///
+    /// The candidates come from the authority, which matched them against the
+    /// query the request carried; the reader keeps typing while that answer
+    /// travels, so this is what the drawer filters the rows by in the meantime.
+    pub query: String,
     pub items: Vec<Completion>,
     pub selected: usize,
     pub loading: bool,
@@ -69,24 +74,7 @@ pub struct CompletionMenu {
 pub const MAX_VISIBLE_COMPLETIONS: usize = 8;
 
 impl CompletionMenu {
-    /// The rows to draw: the filtered matches, windowed around the selection.
-    ///
-    /// The menu carries no query of its own -- the composer owns the text -- so
-    /// the caller filters and this windows the result, which keeps the drawer
-    /// showing the selected row even after the list has scrolled.
-    pub fn visible(&self) -> Vec<usize> {
-        let all = (0..self.items.len()).collect::<Vec<_>>();
-        if all.len() <= MAX_VISIBLE_COMPLETIONS {
-            return all;
-        }
-        let half = MAX_VISIBLE_COMPLETIONS / 2;
-        let start = self
-            .selected
-            .saturating_sub(half)
-            .min(all.len() - MAX_VISIBLE_COMPLETIONS);
-        all[start..start + MAX_VISIBLE_COMPLETIONS].to_vec()
-    }
-
+    /// The indices of the candidates the query matches.
     pub fn filtered(&self, query: &str) -> Vec<usize> {
         let query = query.to_lowercase();
         self.items
@@ -96,9 +84,62 @@ impl CompletionMenu {
                 query.is_empty()
                     || item.label.to_lowercase().contains(&query)
                     || item.detail.to_lowercase().contains(&query)
+                    // The insertion carries what the label leaves out — a file's
+                    // directory, a command's arguments — and it is what the
+                    // authority matched a query against, so a row it returned
+                    // for a path would otherwise disappear the moment the
+                    // reader typed the rest of that path.
+                    || item.insert.to_lowercase().contains(&query)
             })
             .map(|(index, _)| index)
             .collect()
+    }
+
+    /// The rows to draw: the matches, windowed around the selection.
+    ///
+    /// The menu carries the query the drawer is drawn for, so the window is
+    /// placed in the *filtered* list rather than in the whole one: the selected
+    /// row is always on screen even after the list has scrolled.
+    pub fn visible(&self) -> Vec<usize> {
+        let matches = self.filtered(&self.query);
+        if matches.len() <= MAX_VISIBLE_COMPLETIONS {
+            return matches;
+        }
+        let half = MAX_VISIBLE_COMPLETIONS / 2;
+        let position = matches
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        let start = position
+            .saturating_sub(half)
+            .min(matches.len() - MAX_VISIBLE_COMPLETIONS);
+        matches[start..start + MAX_VISIBLE_COMPLETIONS].to_vec()
+    }
+
+    /// The candidate the drawer is offering, when it is offering one.
+    ///
+    /// The selection is an index into the whole list while the reader only ever
+    /// sees the rows their query matches. An index the query has since filtered
+    /// out therefore has nothing behind it, and `Enter` has to be able to tell
+    /// the difference before it takes a row rather than sends the draft.
+    pub fn selected_item(&self) -> Option<&Completion> {
+        self.filtered(&self.query)
+            .contains(&self.selected)
+            .then(|| self.items.get(self.selected))
+            .flatten()
+    }
+
+    /// Take a new query, keeping the selection on a row it still matches.
+    ///
+    /// The reader's cursor moves the selection across rows that are no longer
+    /// on screen otherwise: the highlighted row would be one the drawer does
+    /// not draw, and `Enter` would insert a command they cannot see.
+    pub fn reseat(&mut self, query: String) {
+        self.query = query;
+        let matches = self.filtered(&self.query);
+        if !matches.contains(&self.selected) {
+            self.selected = matches.first().copied().unwrap_or(0);
+        }
     }
 }
 
@@ -1573,9 +1614,16 @@ impl ComposerBuffer {
 
     /// Detect an unterminated trigger word at the cursor.
     ///
-    /// `and/or` is not a command, and neither is the absolute path in
-    /// `cat /etc/hosts`: a slash command must be the first token on its line.
-    /// `@` and `$` may appear anywhere a word can start.
+    /// A trigger opens a *word*: `and/or` is not a command, and neither is the
+    /// `@` inside an address. Where the word is does not matter — `/` after a
+    /// word on the same line opens the drawer exactly as it does at the start of
+    /// a line, which is the rule the desktop composer applies, so the two
+    /// clients answer the same keystrokes the same way.
+    ///
+    /// What follows the trigger is its query, and a query that repeats the
+    /// trigger is not a trigger at all: a second `/` closes the one before it
+    /// rather than opening another, which is what keeps `/usr/bin` and `//`
+    /// from asking the authority about a command nobody named.
     pub fn active_trigger(&self) -> Option<(CompletionTrigger, usize, String)> {
         let (start, word) = self.word_before_cursor();
         let mut characters = word.chars();
@@ -1588,16 +1636,11 @@ impl ComposerBuffer {
                 return None;
             }
         }
-        if trigger == CompletionTrigger::Slash {
-            let line_start = self.text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
-            if !self.text[line_start..start]
-                .chars()
-                .all(char::is_whitespace)
-            {
-                return None;
-            }
+        let query = characters.as_str();
+        if query.contains(trigger.character()) {
+            return None;
         }
-        Some((trigger, start, characters.collect()))
+        Some((trigger, start, query.to_string()))
     }
 
     /// Replace the active trigger word with `insertion`.
@@ -2075,10 +2118,75 @@ mod tests {
         // A slash inside a word is just a slash.
         let draft = buffer("and/or");
         assert_eq!(draft.active_trigger(), None);
+    }
 
-        // An absolute path is not a command.
+    #[test]
+    fn a_trigger_opens_after_anything_a_word_can_follow() {
+        // Regression: `/` was a command only at the start of a *line*, so a
+        // reader who had already typed on that line got no drawer at all until
+        // they pressed Enter and started a new one. The rule is the start of a
+        // *word*, which is also what the desktop composer applies.
+        for text in ["testest /", "run /compact", "look at @src", "use $skill"] {
+            let draft = buffer(text);
+            assert!(
+                draft.active_trigger().is_some(),
+                "{text:?} opened no drawer"
+            );
+        }
+
+        // A path is not a command: the query would carry the trigger's own
+        // character, and a second `/` closes the first rather than opening a
+        // popup for a directory listing nobody asked for.
         let draft = buffer("cat /etc/hosts");
         assert_eq!(draft.active_trigger(), None);
+        let draft = buffer("open //tmp");
+        assert_eq!(draft.active_trigger(), None);
+
+        // Neither is a second `@` inside a reference.
+        let draft = buffer("@src/@lib");
+        assert_eq!(draft.active_trigger(), None);
+    }
+
+    #[test]
+    fn the_drawer_only_shows_rows_the_query_still_matches() {
+        let menu = CompletionMenu {
+            trigger: CompletionTrigger::At,
+            start: 0,
+            query: "src".to_string(),
+            items: vec![
+                Completion {
+                    insert: "@crates/vibex-tui/src/run.rs ".into(),
+                    label: "@run.rs".into(),
+                    detail: "src/run.rs".into(),
+                    group: "Reference".into(),
+                },
+                Completion {
+                    insert: "@README.md ".into(),
+                    label: "@README.md".into(),
+                    detail: String::new(),
+                    group: "Reference".into(),
+                },
+            ],
+            selected: 0,
+            loading: false,
+        };
+        // The label alone would not match: the directory the reader typed is in
+        // the insertion, which is what the authority matched the query against.
+        assert_eq!(menu.visible(), vec![0]);
+
+        // The selection can only stand on a row the drawer draws; a query that
+        // filters the selected row out moves it to the first row that survives.
+        let mut menu = menu;
+        menu.reseat("read".to_string());
+        assert_eq!(menu.visible(), vec![1]);
+        assert_eq!(menu.selected, 1);
+        assert_eq!(menu.selected_item().map(|item| item.label.as_str()), Some("@README.md"));
+
+        // A query nothing matches leaves the drawer with nothing to offer, so
+        // `Enter` sends the draft rather than inserting an invisible row.
+        menu.reseat("nothing-matches-this".to_string());
+        assert!(menu.visible().is_empty());
+        assert!(menu.selected_item().is_none());
     }
 
     #[test]
@@ -2226,7 +2334,7 @@ mod tests {
         let menu = CompletionMenu {
             trigger: CompletionTrigger::Slash,
             start: 0,
-            end: 1,
+            query: String::new(),
             items: vec![
                 Completion {
                     insert: "/help".into(),

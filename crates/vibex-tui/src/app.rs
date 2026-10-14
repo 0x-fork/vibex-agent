@@ -779,6 +779,13 @@ pub struct ComposerTicket {
     pub target: Option<ComposerTarget>,
     pub navigation_serial: u64,
     pub runtime: Option<Box<vibex_core::SessionRuntimeSelection>>,
+    /// The workspace the page resolves its completion requests against.
+    ///
+    /// See [`App::composer_workspace_id`]: the `@` file list is a workspace
+    /// read, and the request has to carry the workspace the draft belongs to —
+    /// a session's own, or the directory a session written on the composing
+    /// page would open in — rather than whatever the authority would guess.
+    pub workspace_id: Option<vibex_core::WorkspaceId>,
     pub text: String,
     pub cursor: usize,
 }
@@ -4763,9 +4770,52 @@ impl App {
             target: self.composer_target.clone(),
             navigation_serial: self.navigation_serial,
             runtime: self.page_runtime_selection().map(Box::new),
+            workspace_id: self.composer_workspace_id(),
             text: self.composer.text().to_string(),
             cursor: self.composer.cursor(),
         }
+    }
+
+    /// Whether the completion drawer is offering a row a key could take.
+    ///
+    /// A menu can be open with nothing to offer — a request still in flight, or
+    /// a query that matches none of the candidates that came back — and the
+    /// drawer draws nothing then. A key that takes a row has to ask this rather
+    /// than whether a menu exists, or it swallows the keystroke for a popup the
+    /// reader cannot see.
+    pub fn completion_offers_row(&self) -> bool {
+        self.completion
+            .as_ref()
+            .is_some_and(|menu| menu.selected_item().is_some())
+    }
+
+    /// The workspace a completion request for the open composer resolves in.
+    ///
+    /// On a session page it is the session's own workspace. On the page where a
+    /// session is being written there is no session yet, so it is the workspace
+    /// the page is about to create one in — the directory the reader chose, or
+    /// the one the client was started in — matched against the workspace records
+    /// this client has read. A path the runtime has no record for is no
+    /// workspace id: the request then names none, and the authority answers it
+    /// without a file list rather than with another workspace's files.
+    pub fn composer_workspace_id(&self) -> Option<vibex_core::WorkspaceId> {
+        if self.page_shows_session() {
+            return self
+                .selected_session_id()
+                .and_then(|id| self.session_by_id(id))
+                .map(|session| session.workspace_id.clone())
+                .or_else(|| self.active_workspace_id());
+        }
+        let path = self.new_session_workspace();
+        self.workspace_rows
+            .iter()
+            .find(|row| row.workspace.root_path == path)
+            .map(|row| row.workspace.id.clone())
+            .or_else(|| {
+                self.active_session()
+                    .filter(|session| session.workspace_root == path)
+                    .map(|session| session.workspace_id.clone())
+            })
     }
 
     pub fn accepts_composer_ticket(&self, ticket: &ComposerTicket) -> bool {
