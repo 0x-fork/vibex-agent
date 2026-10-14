@@ -794,6 +794,19 @@ builder, so a spinner, an attention glyph and a dot cannot drift apart between
 the two surfaces. The tab's own projection folds in the optimistic local dispatch
 and the requests parked on the user exactly as the row's does.
 
+A delegated child row in the ownership tree is that same lane one level down, and
+its status column draws the row's mark rather than a state label. It resolves the
+state through the row's own projection — `sidebar_session_display_state` over the
+optimistic local dispatch, with the requests parked on the user outranking it —
+from the child session's live snapshot, never from the ownership node's task
+phase. The phase moves when the delegation record moves and not when the session
+does, so a row that read it kept showing `Failed` for a task that had failed and
+was then continued, and "active" for a session the reader had since stopped. The
+node's phase answers only for a child the registry cannot describe yet: a spinner
+while the task gets ready or runs, the failure dot for a failed one, the settled
+dot once it is done, and the attention glyph when the record itself is parked on
+the user.
+
 ## Timeline Cards
 
 Render Agent activity through provider-neutral cards:

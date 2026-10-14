@@ -1182,6 +1182,70 @@ fn delegated_rows_branch_from_the_parent_logo_and_share_its_columns(cx: &mut Tes
     );
 }
 
+/// A child row reports the child session, not the delegation record.
+///
+/// The ownership node's phase moves when the task does and not when the session
+/// does: a task that failed and was then continued keeps `Failed` while its
+/// session works again, and a task still marked active says nothing about a
+/// session the reader has since stopped. The row therefore resolves the state a
+/// session row resolves — from the live snapshot — and keeps the phase only as
+/// the fallback for a child the registry cannot describe yet.
+#[test]
+fn a_delegated_row_follows_the_child_session_over_the_task_phase() {
+    let mut failed_task = node(1, Some(0), 0);
+    failed_task.task_phase = Some(DelegationTaskPhase::Failed);
+
+    let mut working = session(1);
+    working.state = AgentSessionState::Running;
+    assert_eq!(
+        delegation_row_display_state(&failed_task, Some(&working), false, false),
+        AgentSessionState::Running,
+        "a spent failure phase does not outrank a session that is working again"
+    );
+
+    let mut active_task = node(1, Some(0), 0);
+    active_task.task_phase = Some(DelegationTaskPhase::Active);
+    let mut stopped = session(1);
+    stopped.state = AgentSessionState::Idle;
+    assert_eq!(
+        delegation_row_display_state(&active_task, Some(&stopped), false, false),
+        AgentSessionState::Idle,
+        "a task still marked active says nothing about a session that stopped"
+    );
+
+    // The projections a session row folds in hold here too: a local dispatch is
+    // optimistic, and a request parked on the user outranks it.
+    assert_eq!(
+        delegation_row_display_state(&active_task, Some(&stopped), true, false),
+        AgentSessionState::Running
+    );
+    assert_eq!(
+        delegation_row_display_state(&active_task, Some(&stopped), true, true),
+        AgentSessionState::NeedsInput
+    );
+    let mut parked = session(1);
+    parked.state = AgentSessionState::NeedsInput;
+    assert_eq!(
+        delegation_row_display_state(&active_task, Some(&parked), true, false),
+        AgentSessionState::NeedsInput
+    );
+
+    // Without a snapshot the phase still answers, and a node the task parked on
+    // the user says so even before the session reports it.
+    assert_eq!(
+        delegation_row_display_state(&failed_task, None, false, false),
+        AgentSessionState::Error
+    );
+    let mut blocked = node(2, Some(0), 0);
+    blocked.blocked_on = Some(DelegationBlockedOn::Permission {
+        request_id: "request_team".into(),
+    });
+    assert_eq!(
+        delegation_row_display_state(&blocked, None, false, false),
+        AgentSessionState::NeedsInput
+    );
+}
+
 #[gpui::test]
 fn team_presentation_recovers_missing_groups_preserves_manual_layout_and_respects_authority(
     cx: &mut TestAppContext,

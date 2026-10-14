@@ -17146,8 +17146,6 @@ impl VibexWorkbench {
             .selected_session_id
             .as_ref()
             .is_some_and(|selected| selected.as_str() == session_id);
-        let status = delegation_node_status(node);
-        let attention = status.attention || node.blocked_descendants > 0;
         let summary = if collapsed && (node.active_descendants > 0 || node.blocked_descendants > 0)
         {
             Some(format!(
@@ -17160,12 +17158,36 @@ impl VibexWorkbench {
         } else {
             None
         };
+        // The status column draws the same mark a session row draws, resolved
+        // from the same source: the live snapshot the runtime streams for the
+        // child. The ownership node's task phase is only the fallback for a
+        // child the registry has not answered for yet, because the phase
+        // describes the delegation record rather than the session — a task that
+        // failed and was then continued keeps its `Failed` phase while the
+        // session is working again.
+        let display_state = delegation_row_display_state(
+            node,
+            self.registered_session(&session_id),
+            self.pending_agent_turn_session_ids.contains(&session_id),
+            self.pending_user_request_ids.contains_key(&session_id),
+        );
+        let status_mark: AnyElement = if display_state == AgentSessionState::NeedsInput {
+            sidebar_attention_icon(
+                format!("sidebar-delegated-attention-{session_id}"),
+                self.strings().sidebar_needs_input,
+                cx,
+            )
+        } else {
+            session_status_mark_for(
+                format!("sidebar-delegated-activity-{session_id}"),
+                display_state,
+                self.auto_continue_enabled_for(&session_id),
+                cx,
+            )
+        };
         let guides = self.render_delegated_guides(node, depth, cx);
         let hover_group: SharedString = format!("sidebar-delegated-session-{session_id}").into();
         let disclosure = self.delegated_toggle_slot(&session_id, &hover_group, cx);
-        // The same sentence reports the branch on the parent row and the node on
-        // its own row, so a collapsed branch loses no state on the way down.
-        let status_text = summary.clone().unwrap_or_else(|| status.text.to_string());
         let entity = cx.weak_entity();
         let click_session = VibexSessionId::parse(session_id.clone()).ok();
         // A row carries a stable focus handle so the tree can be walked with the
@@ -17338,14 +17360,7 @@ impl VibexWorkbench {
                             .flex_none()
                             .items_center()
                             .justify_end()
-                            .gap(px(6.0))
-                            .text_xs()
-                            .text_color(if attention {
-                                cx.theme().warning
-                            } else {
-                                cx.theme().sidebar_foreground.opacity(0.48)
-                            })
-                            .child(div().min_w_0().truncate().child(status_text)),
+                            .child(status_mark),
                     ),
             );
         row.into_any_element()
@@ -67480,74 +67495,74 @@ fn sidebar_project_uses_detailed_hierarchy(
         })
 }
 
-/// How one node of the ownership tree reads at a glance.
-struct DelegatedNodeStatus {
-    text: &'static str,
-    /// Whether the row should draw attention (a request is waiting for the
-    /// user, or the task failed).
-    attention: bool,
+/// The state a delegated row draws for one node of the ownership tree.
+///
+/// A child session's row answers the same question its parent's row answers —
+/// what is this session doing — so it resolves the same state a session row
+/// does, from the live snapshot the runtime streams for that session. The
+/// node's task phase is only the fallback for a child the registry has not
+/// answered for yet: the phase describes the delegation record, which moves
+/// when the task does and not when the session does. A task that failed and was
+/// then continued keeps its `Failed` phase while the session works again, and a
+/// task still marked active says nothing about a session the user has since
+/// stopped.
+fn delegation_row_display_state(
+    node: &SessionTreeNode,
+    session: Option<&AgentSession>,
+    turn_pending: bool,
+    request_pending: bool,
+) -> AgentSessionState {
+    // An unanswered approval or input request outranks both the optimistic
+    // local dispatch and the still-open provider turn: the Agent is parked on
+    // the user, so the row asks for the answer instead of spinning.
+    if request_pending
+        || session.is_some_and(|session| session.state == AgentSessionState::NeedsInput)
+        || delegation_node_awaits_user(node)
+    {
+        return AgentSessionState::NeedsInput;
+    }
+    session.map_or_else(
+        || delegation_node_state(node),
+        |session| sidebar_session_display_state(session.state, turn_pending),
+    )
 }
 
-/// Maps a task's phase and blocking onto the wording the sidebar shows.
+/// Whether the delegation record itself is parked on the user.
+fn delegation_node_awaits_user(node: &SessionTreeNode) -> bool {
+    matches!(
+        node.blocked_on,
+        Some(
+            vibex_core::DelegationBlockedOn::Permission { .. }
+                | vibex_core::DelegationBlockedOn::Question { .. }
+                | vibex_core::DelegationBlockedOn::PlanApproval { .. }
+        )
+    )
+}
+
+/// The state a task phase stands for, for a child the registry cannot describe.
 ///
-/// The wording is deliberately the same as the delegation card's, so a child
-/// row and its parent's card never describe the same task differently.
-fn delegation_node_status(node: &SessionTreeNode) -> DelegatedNodeStatus {
+/// The mapping keeps the phase's own reading: a task still getting ready
+/// pulses, one being worked on or stopped pulses, a failed one carries the
+/// failure dot, a cancelled one the settled dot, and a task parked on a
+/// resource that is not the user is neither working nor asking.
+fn delegation_node_state(node: &SessionTreeNode) -> AgentSessionState {
     if let Some(blocked) = node.blocked_on.as_ref() {
         return match blocked {
-            vibex_core::DelegationBlockedOn::Permission { .. } => DelegatedNodeStatus {
-                text: locale::text("Waiting for you", "等待你授权", "等待你授權"),
-                attention: true,
-            },
-            vibex_core::DelegationBlockedOn::Question { .. } => DelegatedNodeStatus {
-                text: locale::text("Waiting for you", "等待你回答", "等待你回答"),
-                attention: true,
-            },
-            vibex_core::DelegationBlockedOn::PlanApproval { .. } => DelegatedNodeStatus {
-                text: locale::text("Waiting for you", "等待你确认", "等待你確認"),
-                attention: true,
-            },
             vibex_core::DelegationBlockedOn::Configuration { .. }
-            | vibex_core::DelegationBlockedOn::Resource { .. } => DelegatedNodeStatus {
-                text: locale::text("Waiting", "等待中", "等待中"),
-                attention: false,
-            },
+            | vibex_core::DelegationBlockedOn::Resource { .. } => AgentSessionState::Idle,
+            _ => AgentSessionState::NeedsInput,
         };
     }
     match node.task_phase {
         Some(vibex_core::DelegationTaskPhase::Queued)
-        | Some(vibex_core::DelegationTaskPhase::Starting) => DelegatedNodeStatus {
-            text: locale::text("Preparing", "准备中", "準備中"),
-            attention: false,
-        },
-        Some(vibex_core::DelegationTaskPhase::Active) => DelegatedNodeStatus {
-            text: locale::text("Working", "处理中", "處理中"),
-            attention: false,
-        },
-        Some(vibex_core::DelegationTaskPhase::AwaitingReview) => DelegatedNodeStatus {
-            text: locale::text("Awaiting review", "等待审阅", "等待審閱"),
-            attention: false,
-        },
-        Some(vibex_core::DelegationTaskPhase::Cancelling) => DelegatedNodeStatus {
-            text: locale::text("Stopping", "正在停止", "正在停止"),
-            attention: false,
-        },
-        Some(vibex_core::DelegationTaskPhase::Completed) => DelegatedNodeStatus {
-            text: locale::text("Finished", "已完成", "已完成"),
-            attention: false,
-        },
-        Some(vibex_core::DelegationTaskPhase::Failed) => DelegatedNodeStatus {
-            text: locale::text("Failed", "失败", "失敗"),
-            attention: true,
-        },
-        Some(vibex_core::DelegationTaskPhase::Cancelled) => DelegatedNodeStatus {
-            text: locale::text("Cancelled", "已取消", "已取消"),
-            attention: false,
-        },
-        None => DelegatedNodeStatus {
-            text: locale::text("Idle", "空闲", "空閒"),
-            attention: false,
-        },
+        | Some(vibex_core::DelegationTaskPhase::Starting) => AgentSessionState::Initializing,
+        Some(vibex_core::DelegationTaskPhase::Active)
+        | Some(vibex_core::DelegationTaskPhase::Cancelling) => AgentSessionState::Running,
+        Some(vibex_core::DelegationTaskPhase::Failed) => AgentSessionState::Error,
+        Some(vibex_core::DelegationTaskPhase::Cancelled) => AgentSessionState::Closed,
+        Some(vibex_core::DelegationTaskPhase::AwaitingReview)
+        | Some(vibex_core::DelegationTaskPhase::Completed)
+        | None => AgentSessionState::Idle,
     }
 }
 
@@ -101636,6 +101651,63 @@ mod tests {
             .map(|(body, _)| body)
             .expect("group drop resolution should remain inspectable");
         assert!(resolver.contains("&& !self.sidebar_session_is_delegated_child(session_id)"));
+    }
+
+    /// A delegated row reports its session's state the way a session row does.
+    ///
+    /// The two rows are one lane apart, so the child's status column draws the
+    /// row builder's own mark — spinner, attention glyph, dot — resolved from
+    /// the child's live snapshot through the row's own projection. The
+    /// ownership node's task phase answers only for a child the registry cannot
+    /// describe, and its wording never reaches the column: a label there kept
+    /// naming a failure the session no longer had.
+    #[test]
+    fn delegated_rows_report_their_session_state_with_the_row_mark() {
+        let source = include_str!("app.rs");
+
+        let child_row = source
+            .split_once("    fn render_delegated_session_row(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The ownership tree in the order the sidebar draws it.")
+            })
+            .map(|(body, _)| body)
+            .expect("the child session row should remain inspectable");
+        assert!(child_row.contains("delegation_row_display_state("));
+        assert!(child_row.contains("self.registered_session(&session_id)"));
+        assert!(child_row.contains("self.pending_agent_turn_session_ids.contains(&session_id)"));
+        assert!(child_row.contains("self.pending_user_request_ids.contains_key(&session_id)"));
+        assert!(child_row.contains("if display_state == AgentSessionState::NeedsInput"));
+        assert!(child_row.contains("sidebar_attention_icon("));
+        assert!(child_row.contains("session_status_mark_for("));
+        assert!(child_row.contains("format!(\"sidebar-delegated-activity-{session_id}\")"));
+        assert!(child_row.contains("self.auto_continue_enabled_for(&session_id)"));
+        assert!(!child_row.contains("delegation_node_status("));
+
+        // The mark owns the column: no state wording is painted beside it.
+        let status_column = child_row
+            .split_once(".w(px(SIDEBAR_STATUS_COLUMN_WIDTH))")
+            .map(|(_, column)| column)
+            .expect("the delegated status column should remain inspectable");
+        assert!(status_column.contains(".child(status_mark)"));
+        assert!(!status_column.contains(".truncate()"));
+        assert!(!status_column.contains("status_text"));
+
+        // The fallback reads the node, and the snapshot branch folds in the
+        // session row's own dispatch and parked-request projection.
+        let projection = source
+            .split_once("fn delegation_row_display_state(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// One column of the ownership tree's connector.")
+            })
+            .map(|(body, _)| body)
+            .expect("the delegated row projection should remain inspectable");
+        assert!(projection.contains("sidebar_session_display_state(session.state, turn_pending)"));
+        assert!(projection.contains("delegation_node_awaits_user(node)"));
+        assert!(projection.contains("|| delegation_node_state(node),"));
+        assert!(
+            source
+                .contains("fn delegation_node_state(node: &SessionTreeNode) -> AgentSessionState")
+        );
     }
 
     /// A session group is a row the user can file like any other.
