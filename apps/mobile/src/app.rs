@@ -537,9 +537,6 @@ enum GeneratedImageState {
     /// The bytes are on their way.
     Loading,
     Ready(Arc<Image>),
-    /// A URL the provider hosts. The image element fetches it itself, which is
-    /// the one route on this client that can reach outside the workspace.
-    Remote(String),
     /// The reference named something this client cannot show: a path outside
     /// the workspace, or a format it cannot decode.
     Unavailable,
@@ -16537,12 +16534,46 @@ impl MobileApp {
             return;
         }
         if reference.starts_with("http://") || reference.starts_with("https://") {
-            // The element fetches this one; recording it is what keeps a
-            // repaint from handing the same URL over again.
-            self.generated_images.insert(
-                reference.to_string(),
-                GeneratedImageState::Remote(reference.to_string()),
-            );
+            // A provider hosts this one. The toolkit's own image element has
+            // no HTTP client behind it — its default answers every request
+            // with "No HttpClient available" — so the bytes are fetched here
+            // and handed over as an image.
+            let url = reference.to_string();
+            self.generated_images
+                .insert(url.clone(), GeneratedImageState::Loading);
+            let runner = gpui_tokio::Tokio::spawn(cx, async move {
+                let response = reqwest::get(&url).await?;
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let bytes = response.bytes().await?.to_vec();
+                Ok::<_, reqwest::Error>((bytes, content_type))
+            });
+            let key = reference.to_string();
+            let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+                // The join only reports whether the task itself was lost; a
+                // request that failed is a reference this client cannot show.
+                let outcome = runner.await.ok().and_then(Result::ok);
+                let _ = entity.update(cx, |this, cx| {
+                    let state = match outcome {
+                        Some((bytes, content_type)) => {
+                            match generated_image_format(&key, content_type.as_deref()) {
+                                Some(format) => GeneratedImageState::Ready(Arc::new(
+                                    Image::from_bytes(format, bytes),
+                                )),
+                                None => GeneratedImageState::Unavailable,
+                            }
+                        }
+                        None => GeneratedImageState::Unavailable,
+                    };
+                    this.generated_images.insert(key, state);
+                    cx.notify();
+                });
+            });
+            self.tasks.push(task);
+            cx.notify();
             return;
         }
         let Some((workspace_id, workspace_root)) = self.active_workspace_context() else {
@@ -17676,24 +17707,6 @@ impl MobileApp {
                 .justify_center()
                 .child(
                     img(image.clone())
-                        .max_w_full()
-                        .max_h_full()
-                        .object_fit(ObjectFit::Contain),
-                )
-                .into_any_element(),
-            Some(GeneratedImageState::Remote(url)) => div()
-                .w_full()
-                .h(px(240.0))
-                .rounded(px(theme::RADIUS_CONTROL))
-                .border_1()
-                .border_color(theme::border_subtle())
-                .bg(theme::bg_card())
-                .overflow_hidden()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    img(url.clone())
                         .max_w_full()
                         .max_h_full()
                         .object_fit(ObjectFit::Contain),
@@ -28213,6 +28226,16 @@ fn sidebar_project_icon_color(color: SidebarProjectLogoColor) -> gpui::Hsla {
         SidebarProjectLogoColor::Red => theme::accent_red(),
         SidebarProjectLogoColor::Magenta => rgb(0xe879f9).into(),
     }
+}
+
+/// The decoder for a fetched image, from its content type or its URL.
+fn generated_image_format(url: &str, content_type: Option<&str>) -> Option<ImageFormat> {
+    if let Some(mime) = content_type.and_then(|value| value.split(';').next()) {
+        if let Some(format) = ImageFormat::from_mime_type(mime.trim()) {
+            return Some(format);
+        }
+    }
+    crate::workbench::image_format_for_path(url.split('?').next().unwrap_or(url))
 }
 
 /// How a hand-off to another Agent is doing, as a word and a colour.
