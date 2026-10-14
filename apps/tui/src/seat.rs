@@ -226,36 +226,43 @@ impl Seat {
         let config = home_config(&home)?;
 
         if request.prefer_authority || !credential_path(&home).exists() {
-            // Try to become the authority. The lock is the only honest way to
-            // find out whether this machine already has one.
-            match DesktopHomeLock::acquire(&home, &config.application_id) {
-                Ok(lock) => {
-                    // Release immediately: `DesktopRuntime::start` takes the
-                    // lock itself and would deadlock against our own handle.
-                    drop(lock);
-                    return Self::authority(config, home).await;
-                }
-                Err(error) if error.code == "desktop_runtime_home_locked" => {
-                    if request.prefer_authority {
-                        return Err(SeatError::HomeLocked {
-                            endpoints: local_endpoint_list(HomeFlavour::of(&home)),
-                            home,
-                            detail: "--prefer-authority was requested, so no client endpoint was dialled"
-                                .to_string(),
-                        });
-                    }
-                }
-                Err(error) => {
-                    return Err(SeatError::Environment {
-                        detail: format!("could not probe the runtime home lock: {error}"),
+            match Self::take_authority(&home, &config).await? {
+                Some(seat) => return Ok(seat),
+                None if request.prefer_authority => {
+                    return Err(SeatError::HomeLocked {
+                        endpoints: local_endpoint_list(HomeFlavour::of(&home)),
+                        home,
+                        detail: "`--local` was requested, so no client endpoint was dialled"
+                            .to_string(),
                     });
                 }
+                None => {}
             }
         }
 
         // A runtime owns the home. Reuse a saved credential when there is one.
-        if let Some(seat) = Self::saved_credential(&home).await? {
-            return Ok(seat);
+        //
+        // A credential can outlive the endpoint it was minted for, and both ways
+        // that happens are recoverable here, so a dead one is not reported until
+        // they have been ruled out: a free lock means this client can be the
+        // runtime the credential was for, and a taken lock means the runtime
+        // moved its door and discovery can find it.
+        match Self::saved_credential(&home).await {
+            Ok(Some(seat)) => return Ok(seat),
+            Ok(None) => {}
+            Err(error @ SeatError::Unreachable { .. }) => {
+                if let Some(seat) = Self::take_authority(&home, &config).await? {
+                    return Ok(seat);
+                }
+                return match Self::bootstrap_local(home.clone(), config).await {
+                    Ok(seat) => Ok(seat),
+                    // Discovery is a second opinion about the same runtime, so
+                    // its connection failure is not a second failure to report.
+                    Err(SeatError::Unreachable { .. }) => Err(error),
+                    Err(other) => Err(other),
+                };
+            }
+            Err(error) => return Err(error),
         }
 
         // Otherwise bootstrap a device credential for this machine.
@@ -272,6 +279,31 @@ impl Seat {
                 })
             }
             Err(error) => Err(error),
+        }
+    }
+
+    /// Become the authority, if nothing else owns the home.
+    ///
+    /// `None` means another process holds it, which is an answer rather than a
+    /// retry: the lock is the only honest way to find out whether this machine
+    /// already has a runtime.
+    async fn take_authority(
+        home: &Path,
+        config: &DesktopRuntimeConfig,
+    ) -> Result<Option<Self>, SeatError> {
+        match DesktopHomeLock::acquire(home, &config.application_id) {
+            Ok(lock) => {
+                // Release immediately: `DesktopRuntime::start` takes the lock
+                // itself and would deadlock against our own handle.
+                drop(lock);
+                Self::authority(config.clone(), home.to_path_buf())
+                    .await
+                    .map(Some)
+            }
+            Err(error) if error.code == "desktop_runtime_home_locked" => Ok(None),
+            Err(error) => Err(SeatError::Environment {
+                detail: format!("could not probe the runtime home lock: {error}"),
+            }),
         }
     }
 
@@ -1108,6 +1140,29 @@ mod tests {
              unavailable runtime rather than as a connection problem"
         );
         gateway.stop().await.expect("stop the Gateway");
+    }
+
+    /// Taking the home is offered only when nothing else owns it.
+    ///
+    /// A stale credential must not turn a client into a second authority: the
+    /// lock is the answer, and `None` is how the caller learns to look for the
+    /// runtime's new door instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn taking_the_home_defers_to_an_existing_owner() {
+        let directory = tempfile::tempdir().expect("temp home");
+        let home = directory.path().join("desktop-preview");
+        std::fs::create_dir_all(&home).expect("create the home");
+        let config = home_config(&home).expect("the config resolves");
+
+        let lock = DesktopHomeLock::acquire(&home, &config.application_id).expect("take the home");
+        let taken = Seat::take_authority(&home, &config)
+            .await
+            .expect("probing the lock is not an error");
+        assert!(
+            taken.is_none(),
+            "a home another process owns must never be taken over"
+        );
+        drop(lock);
     }
 
     /// An unreachable endpoint is a seat error, not a seat that fails later.
