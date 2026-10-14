@@ -1362,12 +1362,14 @@ impl App {
     /// Take every control sequence the last frame owes the terminal.
     ///
     /// One door for the run loop to write through, whatever produced the
-    /// bytes: a notification raised by an event, or the picture the chip
-    /// preview placed. Both have to leave after the frame rather than inside
-    /// it, and neither is the frame's own business.
+    /// bytes: a notification raised by an event, or a picture a frame placed —
+    /// the chip preview's, or the pairing page's QR code. All of them have to
+    /// leave after the frame rather than inside it, and none is the frame's own
+    /// business.
     pub fn take_terminal_control(&mut self) -> Vec<u8> {
         let mut control = self.take_terminal_notifications();
         control.extend_from_slice(&self.picture.take_escapes());
+        control.extend_from_slice(&self.pairing_qr.take_escapes());
         control
     }
 

@@ -717,9 +717,14 @@ a row the runtime would refuse is absent rather than disabled:
 | Find a device on this network | the runtime is a desktop shell that can advertise itself | opens a local-network pairing window and approves what answers it |
 | Pair with a code or link | the runtime is headless | shows the link a second desktop pastes into its add-runtime form |
 
-`Enter` opens the highlighted row in place and `Esc` closes it. The QR code is
-drawn only when the terminal can hold a code a camera could read; a smaller
-terminal says so and gives the link instead. A one-time code is shown once, is
+`Enter` opens the highlighted row in place and `Esc` closes it. A terminal that
+speaks an image protocol (kitty, WezTerm, Ghostty, iTerm2) is handed the code as
+a picture and draws it in the panel's rectangle, which is what makes a code this
+long fit a terminal anyone has; anywhere else the code is drawn from half
+blocks, and a terminal too small for that says so and gives the link instead.
+The picture takes the room it needs and the link keeps what is left — one line
+of it at least, since a reader who cannot scan the code is the one who needs it;
+the full link is on the code-or-link row. A one-time code is shown once, is
 never written to logs or configuration, and is dropped when the reader leaves
 the pairing half.
 

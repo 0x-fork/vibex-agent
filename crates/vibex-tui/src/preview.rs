@@ -145,8 +145,12 @@ fn pixel(pixels: &image::RgbImage, column: u16, row: u32) -> [u8; 3] {
 /// caption and this remembers what the terminal is holding — which picture, in
 /// which rectangle — and the escapes the run loop has to write for the two to
 /// agree again.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PlacedPicture {
+    /// The image id the terminal holds this picture under. Two surfaces that
+    /// can be on screen at once need two ids, or one's clear deletes the
+    /// other's picture. See [`crate::terminal_image::PAIRING_IMAGE_ID`].
+    id: u32,
     /// The picture the terminal holds, by the label of the chip it belongs to.
     label: Option<String>,
     /// The cell rectangle it was placed in.
@@ -158,7 +162,28 @@ pub struct PlacedPicture {
     pending: Vec<u8>,
 }
 
+impl Default for PlacedPicture {
+    fn default() -> Self {
+        Self {
+            id: crate::terminal_image::PREVIEW_IMAGE_ID,
+            label: None,
+            rect: None,
+            bytes: None,
+            pending: Vec::new(),
+        }
+    }
+}
+
 impl PlacedPicture {
+    /// A picture under an image id of its own, for a surface that can share a
+    /// frame with the chip preview's.
+    pub fn with_id(id: u32) -> Self {
+        Self {
+            id,
+            ..Self::default()
+        }
+    }
+
     /// Take the escapes the frame queued, leaving none behind.
     pub fn take_escapes(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending)
@@ -167,6 +192,65 @@ impl PlacedPicture {
     /// Whether the terminal is holding a picture this client put there.
     pub fn is_holding(&self) -> bool {
         self.label.is_some()
+    }
+
+    /// Whether the terminal is already holding this picture in this rectangle.
+    pub fn holds(&self, label: &str, rect: Rect) -> bool {
+        self.label.as_deref() == Some(label) && self.rect == Some(rect)
+    }
+
+    /// Put `bytes` at `rect`, under `label`.
+    ///
+    /// The same picture in the same rectangle sends nothing; the same picture
+    /// in another rectangle is a placement, which is a few dozen bytes; and
+    /// anything else is the picture itself, which also replaces whatever the
+    /// terminal was holding under this client's id.
+    pub fn place(
+        &mut self,
+        support: &crate::terminal_image::ImageSupport,
+        label: &str,
+        bytes: Arc<Vec<u8>>,
+        rect: Rect,
+    ) {
+        if !support.supports_pixels() || rect.width == 0 || rect.height == 0 {
+            self.clear(support);
+            return;
+        }
+        let placement = crate::terminal_image::Placement {
+            x: rect.x,
+            y: rect.y,
+            cols: rect.width,
+            rows: rect.height,
+        };
+        if self.label.as_deref() == Some(label)
+            && let Some(escape) = support.place_as(self.id, placement)
+        {
+            self.pending.extend_from_slice(escape.as_bytes());
+            self.rect = Some(rect);
+            self.bytes = Some(bytes);
+            return;
+        }
+        if let Some(escape) = support.transmit_as(self.id, &bytes, placement) {
+            self.pending.extend_from_slice(escape.as_bytes());
+            self.label = Some(label.to_string());
+            self.rect = Some(rect);
+            self.bytes = Some(bytes);
+        }
+    }
+
+    /// Take the picture off the terminal, if it is holding one.
+    pub fn clear(&mut self, support: &crate::terminal_image::ImageSupport) {
+        if let Some(escape) = self
+            .label
+            .is_some()
+            .then(|| support.clear_as(self.id))
+            .flatten()
+        {
+            self.pending.extend_from_slice(escape.as_bytes());
+        }
+        self.label = None;
+        self.rect = None;
+        self.bytes = None;
     }
 }
 
@@ -252,19 +336,7 @@ fn place_picture(
         clear_picture(support, picture);
         return;
     }
-    let placement = crate::terminal_image::Placement {
-        x: rect.x,
-        y: rect.y,
-        cols: rect.width,
-        rows: rect.height,
-    };
-    let holding_this_one = picture.label.as_deref() == Some(label);
-    if holding_this_one && picture.rect == Some(rect) {
-        return;
-    }
-    if holding_this_one && let Some(escape) = support.place(placement) {
-        picture.pending.extend_from_slice(escape.as_bytes());
-        picture.rect = Some(rect);
+    if picture.holds(label, rect) {
         return;
     }
     let Some(bytes) = picture_bytes(support, picture, label, source) else {
@@ -273,21 +345,12 @@ fn place_picture(
         clear_picture(support, picture);
         return;
     };
-    if let Some(escape) = support.transmit(&bytes, placement) {
-        picture.pending.extend_from_slice(escape.as_bytes());
-        picture.label = Some(label.to_string());
-        picture.rect = Some(rect);
-    }
+    picture.place(support, label, bytes, rect);
 }
 
 /// Take the picture off the terminal, if it is holding one.
 fn clear_picture(support: &crate::terminal_image::ImageSupport, picture: &mut PlacedPicture) {
-    if let Some(escape) = picture.label.is_some().then(|| support.clear()).flatten() {
-        picture.pending.extend_from_slice(escape.as_bytes());
-    }
-    picture.label = None;
-    picture.rect = None;
-    picture.bytes = None;
+    picture.clear(support);
 }
 
 /// The bytes to send for one picture, prepared once and kept while it is the

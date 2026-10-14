@@ -4098,6 +4098,81 @@ fn an_open_pairing_row_draws_the_offer_it_minted() {
     );
 }
 
+/// A terminal that draws pictures is handed the code itself, which is the only
+/// way a code this long fits a terminal anyone has.
+#[test]
+fn a_terminal_with_pixels_is_handed_the_code_as_a_picture() {
+    use vibex_tui::action::Intent;
+    use vibex_tui::device_center::{PairMethod, PairingOffer};
+    use vibex_tui::terminal_image::{ImageProtocol, ImageSupport};
+    // The offer a desktop runtime really mints: a link of about a kilobyte,
+    // which the half-block renderer needs a 173-column terminal to hold.
+    let url = format!("vibex://open/direct#/pair/{}", "A".repeat(1_200));
+    let mut app = device_app(120, 40, vibex_core::RemoteServerKind::Desktop);
+    app.terminal_images = ImageSupport::forced(ImageProtocol::Kitty);
+    app.perform(Intent::GotoDevices);
+    app.device_center.toggle(PairMethod::QrCode);
+    app.device_center.pairing.offer = Some(PairingOffer {
+        code: "4821-7390".to_string(),
+        url,
+        permission: vibex_core::RemoteDevicePermissionLevel::FullControl,
+        expires_at_ms: i64::MAX,
+    });
+    let screen = text(&render(&mut app, 120, 40));
+    // The code is a picture the terminal is holding rather than half blocks in
+    // the buffer, and the run loop is handed the escapes that put it there.
+    assert!(
+        app.pairing_qr.is_holding(),
+        "the terminal was not handed the code:\n{screen}"
+    );
+    let control = String::from_utf8(app.take_terminal_control()).expect("escapes are text");
+    assert!(
+        control.contains("a=T,f=100"),
+        "the code was not sent to the terminal: {control:?}"
+    );
+    assert!(
+        !screen.contains('█') && !screen.contains('▀') && !screen.contains('▄'),
+        "the code was drawn as half blocks as well:\n{screen}"
+    );
+    // The rest of the panel is still the offer in words.
+    assert!(screen.contains("4821-7390"), "{screen}");
+    assert!(screen.contains("Shown once"), "{screen}");
+
+    // The frame after it, unchanged, sends nothing: the terminal has the code.
+    let _ = render(&mut app, 120, 40);
+    assert!(
+        app.take_terminal_control().is_empty(),
+        "an unchanged frame sent the code again"
+    );
+
+    // Leaving the pairing half takes the picture down with it.
+    app.perform(Intent::DevicesTabNext);
+    let _ = render(&mut app, 120, 40);
+    assert!(
+        !app.pairing_qr.is_holding(),
+        "the code was left on the terminal"
+    );
+
+    // A terminal with pixels but no room for the picture says so rather than
+    // drawing a code no camera could read.
+    let mut small = device_app(60, 20, vibex_core::RemoteServerKind::Desktop);
+    small.terminal_images = ImageSupport::forced(ImageProtocol::Kitty);
+    small.perform(Intent::GotoDevices);
+    small.device_center.toggle(PairMethod::QrCode);
+    small.device_center.pairing.offer = Some(PairingOffer {
+        code: "4821-7390".to_string(),
+        url: "vibex://open/direct#/pair/AAAA".to_string(),
+        permission: vibex_core::RemoteDevicePermissionLevel::FullControl,
+        expires_at_ms: i64::MAX,
+    });
+    let screen = text(&render(&mut small, 60, 20));
+    assert!(
+        screen.contains("too small for the code"),
+        "a small terminal with pixels did not say why there is no code:\n{screen}"
+    );
+    assert!(!small.pairing_qr.is_holding(), "{screen}");
+}
+
 /// A failed offer is reported on the row that asked for it, in the reader's
 /// language rather than the runtime's.
 #[test]

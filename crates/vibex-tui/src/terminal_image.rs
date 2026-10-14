@@ -182,13 +182,20 @@ pub struct Placement {
     pub rows: u16,
 }
 
-/// The image id every placement uses.
+/// The image id the chip preview's picture uses.
 ///
 /// One id for the one picture the panel shows: transmitting under an id the
 /// terminal already holds replaces it, which is what makes moving the caret
 /// between two chips a replacement rather than a new picture on top of the
 /// old one.
-const PREVIEW_IMAGE_ID: u32 = 1;
+pub const PREVIEW_IMAGE_ID: u32 = 1;
+
+/// The image id the pairing page's QR code uses.
+///
+/// A second id, not the preview's: the two surfaces can trade places in one
+/// frame — a reader leaves a chip with a picture under the caret for the
+/// pairing page — and one picture's clear would otherwise delete the other's.
+pub const PAIRING_IMAGE_ID: u32 = 2;
 
 /// Above the text, not below it.
 ///
@@ -214,13 +221,22 @@ impl ImageSupport {
     /// that is re-placing a picture it has already sent should use
     /// [`ImageSupport::place`] instead: this carries the whole picture.
     pub fn transmit(&self, bytes: &[u8], placement: Placement) -> Option<String> {
+        self.transmit_as(PREVIEW_IMAGE_ID, bytes, placement)
+    }
+
+    /// [`ImageSupport::transmit`] under an image id of the caller's own.
+    ///
+    /// The id is the handle the terminal keeps the picture under, so two
+    /// pictures that can be on screen at once — the chip preview's and the
+    /// pairing page's — need two of them to be able to leave independently.
+    pub fn transmit_as(&self, id: u32, bytes: &[u8], placement: Placement) -> Option<String> {
         if !self.supports_pixels() || placement.cols == 0 || placement.rows == 0 {
             return None;
         }
         let escape = match self.protocol {
             ImageProtocol::Kitty => {
                 let mut escape = cursor_to(placement);
-                escape.push_str(&kitty_transmit(bytes, placement));
+                escape.push_str(&kitty_transmit(id, bytes, placement));
                 escape
             }
             ImageProtocol::Iterm2 => {
@@ -240,11 +256,16 @@ impl ImageSupport {
     /// Only the kitty protocol can do it — an iTerm2 picture *is* the cells it
     /// was written into, so moving one means sending it again.
     pub fn place(&self, placement: Placement) -> Option<String> {
+        self.place_as(PREVIEW_IMAGE_ID, placement)
+    }
+
+    /// [`ImageSupport::place`] for a picture under another image id.
+    pub fn place_as(&self, id: u32, placement: Placement) -> Option<String> {
         if self.protocol != ImageProtocol::Kitty || placement.cols == 0 || placement.rows == 0 {
             return None;
         }
         let mut escape = cursor_to(placement);
-        escape.push_str(&kitty_place(placement));
+        escape.push_str(&kitty_place(id, placement));
         Some(self.wrap(&escape))
     }
 
@@ -254,10 +275,15 @@ impl ImageSupport {
     /// there, so it has to be deleted. An iTerm2 picture lives in the cells it
     /// was written into, and the next frame paints over them anyway.
     pub fn clear(&self) -> Option<String> {
+        self.clear_as(PREVIEW_IMAGE_ID)
+    }
+
+    /// [`ImageSupport::clear`] for a picture under another image id.
+    pub fn clear_as(&self, id: u32) -> Option<String> {
         if self.protocol != ImageProtocol::Kitty {
             return None;
         }
-        Some(self.wrap(&format!("\x1b_Ga=d,d=i,i={PREVIEW_IMAGE_ID},q=2\x1b\\")))
+        Some(self.wrap(&format!("\x1b_Ga=d,d=i,i={id},q=2\x1b\\")))
     }
 
     /// Wrap a sequence for the multiplexer it has to travel through.
@@ -287,9 +313,9 @@ fn cursor_to(placement: Placement) -> String {
 const CURSOR_BACK: &str = "\x1b8";
 
 /// Kitty: transmit a PNG and display it, as one image (`a=T`) the id owns.
-fn kitty_transmit(png: &[u8], placement: Placement) -> String {
+fn kitty_transmit(id: u32, png: &[u8], placement: Placement) -> String {
     let header = format!(
-        "a=T,f=100,t=d,q=2,C=1,z={PICTURE_LAYER},i={PREVIEW_IMAGE_ID},p={PREVIEW_IMAGE_ID},c={},r={}",
+        "a=T,f=100,t=d,q=2,C=1,z={PICTURE_LAYER},i={id},p={id},c={},r={}",
         placement.cols, placement.rows
     );
     let mut escape = kitty_chunked(png, &header);
@@ -298,9 +324,9 @@ fn kitty_transmit(png: &[u8], placement: Placement) -> String {
 }
 
 /// Kitty: put the image the terminal already holds at this placement.
-fn kitty_place(placement: Placement) -> String {
+fn kitty_place(id: u32, placement: Placement) -> String {
     format!(
-        "\x1b_Ga=p,i={PREVIEW_IMAGE_ID},p={PREVIEW_IMAGE_ID},c={},r={},z={PICTURE_LAYER},C=1,q=2\x1b\\{CURSOR_BACK}",
+        "\x1b_Ga=p,i={id},p={id},c={},r={},z={PICTURE_LAYER},C=1,q=2\x1b\\{CURSOR_BACK}",
         placement.cols, placement.rows
     )
 }
@@ -581,6 +607,29 @@ mod tests {
         assert_eq!(
             support.clear().as_deref(),
             Some("\x1b_Ga=d,d=i,i=1,q=2\x1b\\")
+        );
+    }
+
+    #[test]
+    fn a_second_picture_can_travel_under_an_id_of_its_own() {
+        // Two surfaces can be on the terminal in the same frame — a chip
+        // preview's picture and the pairing page's code — so each is sent,
+        // moved and deleted under its own id, and neither names the other's.
+        let support = ImageSupport::forced(ImageProtocol::Kitty);
+        let escape = support
+            .transmit_as(PAIRING_IMAGE_ID, &png(4, 4), placement())
+            .expect("a sequence");
+        assert!(
+            escape.contains("a=T,f=100,t=d,q=2,C=1,z=1,i=2,p=2,c=40,r=12"),
+            "the code did not travel under the second id: {escape:?}"
+        );
+        let moved = support
+            .place_as(PAIRING_IMAGE_ID, placement())
+            .expect("a sequence");
+        assert!(moved.contains("a=p,i=2,p=2,c=40,r=12"), "{moved:?}");
+        assert_eq!(
+            support.clear_as(PAIRING_IMAGE_ID).as_deref(),
+            Some("\x1b_Ga=d,d=i,i=2,q=2\x1b\\")
         );
     }
 

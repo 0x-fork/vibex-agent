@@ -25,7 +25,7 @@ use crate::layout::Bands;
 use crate::locale::Strings;
 use crate::modal::{self, ModalChrome, ModalHint, ModalLayout, ModalSizing};
 use crate::runtime_picker::{RuntimePickerRow, runtime_option_auth_label};
-use crate::text::{display_width, pad_to_width, truncate_to_width};
+use crate::text::{display_width, pad_to_width, take_width, truncate_to_width};
 use crate::theme::TuiTheme;
 
 /// A block whose border glyphs match the terminal's capability.
@@ -510,6 +510,10 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_todo_band(frame, bands.todo, app, &theme, strings);
     }
 
+    // The pairing QR is a picture the terminal holds rather than a frame it
+    // drew, so the page is what says whether it belongs there: the panel places
+    // it, and every frame that does not ask for it takes it down below.
+    app.pairing_qr.begin_frame();
     match app.page {
         // The workbench pages share the scrollback band; they are views over the
         // same session, so they occupy the same part of the screen.
@@ -526,6 +530,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         | Page::Settings
         | Page::Help => render_management_view(frame, bands.scrollback, app, &theme, strings),
     }
+    app.pairing_qr.settle(&app.terminal_images);
 
     // The rail maps the transcript, so it belongs to the pages that show one.
     // A page writing a new session draws its own welcome in the same band, and
@@ -4859,6 +4864,27 @@ fn textwrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// The pairing link, cut into the rows it will be drawn on.
+///
+/// [`textwrap`] breaks at whitespace and a link has none: a URL of a kilobyte
+/// comes back from it as one piece, which the paragraph then wraps into a dozen
+/// rows nobody counted. These rows are counted — the QR picture is placed by
+/// them and the link is given whatever the picture leaves — so the link is
+/// measured rather than word-wrapped.
+fn wrap_link(url: &str, width: usize) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut rest = url;
+    while !rest.is_empty() && width > 0 {
+        let (piece, tail) = take_width(rest, width);
+        if piece.is_empty() {
+            break;
+        }
+        pieces.push(piece);
+        rest = tail;
+    }
+    pieces
+}
+
 /// The devices page: pairing on one half, the trust store on the other.
 ///
 /// Pairing a device and checking that it arrived are one job — the reader opens
@@ -5041,6 +5067,25 @@ fn render_pair_rows(
     );
 }
 
+/// One line, cut to the width the band can draw.
+///
+/// A line that fits is returned whole; one that does not ends in an ellipsis,
+/// which is what keeps a row from becoming two.
+fn truncate_line(line: Line<'static>, width: u16) -> Line<'static> {
+    let width = usize::from(width);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for span in line.spans {
+        if used >= width {
+            break;
+        }
+        let text = truncate_to_width(&span.content, width - used, "…");
+        used += display_width(&text);
+        spans.push(Span::styled(text, span.style));
+    }
+    Line::from(spans)
+}
+
 /// One way to pair: the reader's action, and who can take it.
 fn pair_row_line(
     method: crate::device_center::PairMethod,
@@ -5091,7 +5136,7 @@ fn pair_row_line(
 fn push_pair_panel(
     lines: &mut Vec<Line<'static>>,
     method: crate::device_center::PairMethod,
-    app: &App,
+    app: &mut App,
     area: Rect,
     theme: &TuiTheme,
     strings: Strings,
@@ -5131,7 +5176,7 @@ fn push_pair_panel(
 fn push_offer_panel(
     lines: &mut Vec<Line<'static>>,
     method: crate::device_center::PairMethod,
-    app: &App,
+    app: &mut App,
     area: Rect,
     theme: &TuiTheme,
     strings: Strings,
@@ -5165,41 +5210,62 @@ fn push_offer_panel(
         format!("{indent}{hint}"),
         theme.accent(),
     )));
+    // The link is what the code encodes and what a desktop pastes, so it is
+    // wrapped once here: the picture decides how many of its lines are drawn.
+    let link = wrap_link(&offer.url, text_width);
     if method == PairMethod::QrCode {
-        // The QR is the whole point of this row, so it is drawn first and the
-        // link below it is the fallback. A terminal that cannot hold it says so
-        // rather than drawing a code no camera could read: a code that is cut
-        // off is worse than no code, because it looks scannable.
-        let link_lines = textwrap(&offer.url, text_width).len();
-        // The hint above, the code line, the link and its label, the closing
-        // hint: everything the QR must leave room for.
-        let reserved = 4 + link_lines;
-        let room = usize::from(area.height)
-            .saturating_sub(lines.len())
-            .saturating_sub(reserved);
-        let blocks = qr_blocks(&offer.url, text_width, room, app.glyph_tier());
-        match blocks {
-            Some(blocks) => {
-                for block in blocks {
+        // A terminal that draws pictures is handed the code itself. The
+        // half-block code below needs a terminal some 173 columns wide, which
+        // is not a terminal anyone has, so this is the row's real answer.
+        let drawn = app.terminal_images.supports_pixels()
+            && push_qr_picture(
+                lines,
+                &mut app.pairing_qr,
+                &app.terminal_images,
+                area,
+                &offer.url,
+            );
+        if !drawn {
+            // The QR is the whole point of this row, so it is drawn first and
+            // the link below it is the fallback. A terminal that cannot hold it
+            // says so rather than drawing a code no camera could read: a code
+            // that is cut off is worse than no code, because it looks
+            // scannable.
+            //
+            // The hint above, the code line, the link and its label, the
+            // closing hint: everything the QR must leave room for.
+            let reserved = 4 + link.len();
+            let room = usize::from(area.height)
+                .saturating_sub(lines.len())
+                .saturating_sub(reserved);
+            let blocks = qr_blocks(&offer.url, text_width, room, app.glyph_tier());
+            match blocks {
+                Some(blocks) => {
+                    for block in blocks {
+                        lines.push(Line::from(Span::styled(
+                            format!("{indent}{block}"),
+                            theme.base(),
+                        )));
+                    }
+                }
+                None => {
+                    // Two different reasons, two different answers: a terminal
+                    // whose font has no half blocks cannot draw a code at any
+                    // size, and one that is merely small can be widened. A
+                    // terminal that draws pictures is only ever here because
+                    // the panel had no room for one.
+                    let message = if app.glyph_tier() == crate::glyphs::GlyphTier::Full
+                        || app.terminal_images.supports_pixels()
+                    {
+                        strings.devices_qr_no_room()
+                    } else {
+                        strings.devices_qr_no_glyphs()
+                    };
                     lines.push(Line::from(Span::styled(
-                        format!("{indent}{block}"),
-                        theme.base(),
+                        format!("{indent}{message}"),
+                        theme.warning(),
                     )));
                 }
-            }
-            None => {
-                // Two different reasons, two different answers: a terminal whose
-                // font has no half blocks cannot draw a code at any size, and
-                // one that is merely small can be widened.
-                let message = if app.glyph_tier() == crate::glyphs::GlyphTier::Full {
-                    strings.devices_qr_no_room()
-                } else {
-                    strings.devices_qr_no_glyphs()
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("{indent}{message}"),
-                    theme.warning(),
-                )));
             }
         }
     }
@@ -5227,9 +5293,21 @@ fn push_offer_panel(
         format!("{indent}{}:", strings.devices_link()),
         theme.muted(),
     )));
-    for piece in textwrap(&offer.url, text_width) {
+    // As much of the link as the room left: a picture can take most of the
+    // panel, and one line of the link is the floor — a reader who cannot scan
+    // the code is the one who needs it. What is cut says so, and the full link
+    // is on the row that exists for it.
+    let room = usize::from(area.height).saturating_sub(lines.len() + 1);
+    let shown = link.len().min(room.max(1));
+    for (index, piece) in link.iter().enumerate().take(shown) {
+        let cut = index + 1 == shown && shown < link.len();
+        let text = if cut {
+            truncate_to_width(piece, text_width.saturating_sub(1), "…")
+        } else {
+            piece.clone()
+        };
         lines.push(Line::from(Span::styled(
-            format!("{indent}{piece}"),
+            format!("{indent}{text}"),
             theme.muted(),
         )));
     }
@@ -5237,6 +5315,61 @@ fn push_offer_panel(
         format!("{indent}{}", strings.devices_code_hint()),
         theme.warning(),
     )));
+}
+
+/// The rows a picture of the code is worth drawing in at all.
+///
+/// Below this the picture is a smear a camera cannot read, and saying the
+/// terminal is too small is the honest answer.
+const QR_MIN_ROWS: usize = 8;
+
+/// The code as a picture, when the panel has room for one worth scanning.
+///
+/// `false` means no picture was placed — no room for one, or a link no code can
+/// be built for — and the caller falls back to the half-block code, or to the
+/// sentence that says why there is none.
+///
+/// A cell is about twice as tall as it is wide, so a square code takes two
+/// columns per row; the rows it reserves are left blank, and the picture is
+/// drawn over them by the terminal rather than by this frame.
+fn push_qr_picture(
+    lines: &mut Vec<Line<'static>>,
+    qr: &mut crate::pairing_qr::PairingQr,
+    support: &crate::terminal_image::ImageSupport,
+    area: Rect,
+    url: &str,
+) -> bool {
+    // The hint above, the code line, the link's label, one line of the link at
+    // least, and the closing hint: what the picture has to leave room for.
+    const FIXED: usize = 4;
+    // The picture is placed by the count of the rows above it, so a row that
+    // would wrap has to be cut instead: the panel's own rows are short, and one
+    // that became two would put the code over the text. Only these rows are
+    // cut — the copy under the code still wraps as far as it needs to.
+    for line in lines.iter_mut() {
+        *line = truncate_line(std::mem::replace(line, Line::from("")), area.width);
+    }
+    let room = usize::from(area.height).saturating_sub(lines.len() + FIXED);
+    let widest = usize::from(area.width).saturating_sub(2);
+    let rows = room.min(widest / 2);
+    if rows < QR_MIN_ROWS {
+        return false;
+    }
+    let cols = (rows * 2).min(widest) as u16;
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(cols)) / 2,
+        y: area.y + lines.len() as u16,
+        width: cols,
+        height: rows as u16,
+    };
+    qr.show(support, url, rect);
+    if !qr.is_holding() {
+        return false;
+    }
+    for _ in 0..rows {
+        lines.push(Line::from(""));
+    }
+    true
 }
 
 /// The advertisement, and whoever has answered it so far.

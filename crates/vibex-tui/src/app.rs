@@ -1072,6 +1072,9 @@ pub struct App {
     /// The picture the chip preview put on the terminal, and the escapes the
     /// run loop still has to write for it. See [`crate::preview`].
     pub picture: crate::preview::PlacedPicture,
+    /// The code the pairing page put on the terminal, and the escapes the run
+    /// loop still has to write for it. See [`crate::pairing_qr`].
+    pub pairing_qr: crate::pairing_qr::PairingQr,
     /// A transient message above the composer, dismissed on the next key.
     pub banner: Option<Banner>,
     /// When the running turn started, for the elapsed-time readout.
@@ -1656,6 +1659,7 @@ impl App {
             notify: crate::notify::Notifier::new(options.notify_path.clone()),
             terminal_images: crate::terminal_image::ImageSupport::detect(),
             picture: crate::preview::PlacedPicture::default(),
+            pairing_qr: crate::pairing_qr::PairingQr::default(),
             banner: None,
             turn_started: None,
             turn_readout: crate::turn::TurnReadout::default(),

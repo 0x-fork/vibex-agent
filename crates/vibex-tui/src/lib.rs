@@ -59,6 +59,7 @@ pub mod markdown;
 pub mod modal;
 pub mod notify;
 pub mod onboarding;
+pub mod pairing_qr;
 pub mod preview;
 pub mod queue_prefs;
 pub mod reduce;
