@@ -227,6 +227,9 @@ async fn tui(local: bool) -> Result<(), Box<dyn Error>> {
         connect: None,
         home: Some(config.home_dir.clone()),
         prefer_authority: local,
+        // The headless `tui` entry point is not the interactive client that
+        // watches for a handover offer, so it never takes a home over.
+        take_over: false,
     };
     let seat = vibex_client::seat::Seat::resolve(request).await?;
     let options = vibex_tui::TuiOptions {

@@ -47,6 +47,11 @@ pub const INPUT_BATCH_BUDGET: Duration = Duration::from_millis(4);
 pub enum ExitReason {
     UserQuit,
     ConnectionLost,
+    /// The reader took the host's offer to own the runtime home.
+    ///
+    /// Ending the run is all this crate can do about it: becoming the authority
+    /// means starting the runtime, which is the composition root's job.
+    Handover,
 }
 
 /// Run the interface until the user quits.
@@ -361,6 +366,9 @@ fn event_loop(
 
         if app.should_quit {
             return Ok(ExitReason::UserQuit);
+        }
+        if app.handover_requested {
+            return Ok(ExitReason::Handover);
         }
         if reason == ExitReason::ConnectionLost {
             return Ok(reason);

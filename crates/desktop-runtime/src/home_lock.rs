@@ -94,6 +94,32 @@ impl Drop for DesktopHomeLock {
     }
 }
 
+/// Whether a runtime currently owns this home, without becoming one.
+///
+/// [`DesktopHomeLock::acquire`] publishes metadata into the lock file, so it is
+/// the wrong probe for a caller that asks repeatedly: it would rewrite the
+/// holder's record and, worse, race a runtime that is trying to start. This
+/// holds the lock only for as long as it takes to ask and writes nothing.
+///
+/// A file that cannot be opened at all answers `false`: an unreadable lock is
+/// not evidence that the home is free, and a caller that acts on "free" starts a
+/// second runtime.
+pub fn home_lock_is_free(home: &Path) -> bool {
+    let path = home.join(DESKTOP_RUNTIME_LOCK_FILE);
+    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -110,10 +110,46 @@ pub struct TuiOptions {
     /// composition root knows: a remote seat learns it in the handshake, an
     /// authority seat is whatever flavour the host started.
     pub runtime_kind: vibex_core::RemoteServerKind,
+    /// Set when the host can offer this client the runtime home it is currently
+    /// only a client of.
+    ///
+    /// The library never works this out for itself — whether a home is free is
+    /// the host's question, and this crate must not learn how to answer it. The
+    /// host watches, flips the flag, and the interface offers the key while it
+    /// is set.
+    pub handover: Option<HandoverOffer>,
     pub theme_id: Option<String>,
     pub mode: Option<vibex_ui::GpuiThemeMode>,
     pub locale: Option<Locale>,
     pub capability: ColorCapability,
+}
+
+/// A standing offer to take the runtime home.
+///
+/// Held by the composition root, which sets it while the home has no owner; read
+/// by the interface, which draws the offer and hands the decision back as
+/// [`run::ExitReason::Handover`]. Taking it means restarting the client as the
+/// authority, so the host does it, not this crate.
+#[derive(Debug, Clone, Default)]
+pub struct HandoverOffer {
+    available: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HandoverOffer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Published by the host when the home becomes free, and withdrawn when it
+    /// is taken again — a runtime that comes back is an answer too.
+    pub fn set_available(&self, available: bool) {
+        self.available
+            .store(available, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.available.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl Default for TuiOptions {
@@ -121,6 +157,7 @@ impl Default for TuiOptions {
         Self {
             seat: SeatKind::Remote,
             runtime_kind: vibex_core::RemoteServerKind::Unknown,
+            handover: None,
             theme_id: None,
             mode: None,
             locale: None,
@@ -214,6 +251,7 @@ pub fn run(facade: BackendFacade, options: TuiOptions) -> BackendResult<ExitReas
         AppOptions {
             seat: options.seat,
             runtime_kind: options.runtime_kind,
+            handover: options.handover.clone(),
             capability: ColorCapability {
                 mode: options.capability.mode,
                 glyphs: startup.glyphs,
@@ -244,6 +282,7 @@ mod tests {
         TuiOptions {
             seat: SeatKind::Remote,
             runtime_kind: vibex_core::RemoteServerKind::Unknown,
+            handover: None,
             theme_id: None,
             mode: None,
             locale: None,

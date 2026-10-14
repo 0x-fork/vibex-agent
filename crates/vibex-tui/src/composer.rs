@@ -2180,7 +2180,10 @@ mod tests {
         menu.reseat("read".to_string());
         assert_eq!(menu.visible(), vec![1]);
         assert_eq!(menu.selected, 1);
-        assert_eq!(menu.selected_item().map(|item| item.label.as_str()), Some("@README.md"));
+        assert_eq!(
+            menu.selected_item().map(|item| item.label.as_str()),
+            Some("@README.md")
+        );
 
         // A query nothing matches leaves the drawer with nothing to offer, so
         // `Enter` sends the draft rather than inserting an invisible row.

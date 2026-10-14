@@ -193,6 +193,19 @@ impl App {
                 self.toggle_sidebar_collapsed();
                 Outcome::effects(vec![])
             }
+            Intent::TakeOverHome => {
+                // Only when the host says the home is free. The key exists on
+                // every run, so pressing it while this client is the authority
+                // or while the runtime is answering has to say why it does
+                // nothing rather than ending the run for no reason.
+                if self.handover_offered() {
+                    self.handover_requested = true;
+                } else {
+                    let message = self.strings.toast_offline().to_string();
+                    self.toast(Toast::info(message));
+                }
+                Outcome::effects(vec![])
+            }
             Intent::ReloadKeymap => {
                 match crate::keymap::Keymap::user_path() {
                     Some(path) => {
@@ -6034,6 +6047,66 @@ mod tests {
         );
         app.resize(100, 30);
         app
+    }
+
+    /// The key that takes the host's offer exists on every run, so the offer
+    /// itself is what decides whether it does anything.
+    #[test]
+    fn taking_the_home_answers_only_an_offer_that_stands() {
+        let mut app =
+            app_with_capabilities(vibex_backend::BackendCapabilitySnapshot::desktop_native_v1());
+        assert!(!app.handover_offered());
+        app.perform(Intent::TakeOverHome);
+        assert!(
+            !app.handover_requested,
+            "an unoffered takeover must not end the run"
+        );
+        let refused = app.strings.toast_offline().to_string();
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.clone()),
+            Some(refused)
+        );
+
+        let offer = crate::HandoverOffer::new();
+        offer.set_available(true);
+        app.handover = Some(offer.clone());
+        assert!(app.handover_offered());
+        app.perform(Intent::TakeOverHome);
+        assert!(app.handover_requested, "the offer is the reader's to take");
+
+        // Withdrawn by the host, the key goes quiet again — including for a
+        // reader who already took it once.
+        app.handover_requested = false;
+        offer.set_available(false);
+        assert!(!app.handover_offered());
+    }
+
+    /// The banner is the one line a disconnected reader always sees, so the
+    /// offer has to be there rather than only where a blocked action complains.
+    #[test]
+    fn the_offer_replaces_the_disconnected_banner() {
+        let mut app =
+            app_with_capabilities(vibex_backend::BackendCapabilitySnapshot::desktop_native_v1());
+        app.live = crate::app::LiveState::Offline;
+        app.refresh_banner();
+        let offline = app
+            .banner
+            .as_ref()
+            .map(|banner| banner.text.clone())
+            .expect("a disconnected seat carries a banner");
+        assert_eq!(offline, app.strings.toast_offline());
+
+        let offer = crate::HandoverOffer::new();
+        offer.set_available(true);
+        app.handover = Some(offer);
+        app.refresh_banner();
+        let offered = app
+            .banner
+            .as_ref()
+            .map(|banner| banner.text.clone())
+            .expect("the offer is a banner");
+        assert_eq!(offered, app.strings.handover_offer());
+        assert_ne!(offered, offline);
     }
 
     fn history_item(session_id: &VibexSessionId, sequence: i64) -> vibex_core::TimelineItem {

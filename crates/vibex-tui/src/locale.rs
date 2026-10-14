@@ -1629,6 +1629,11 @@ strings! {
         "断连时不可用",
         "中斷連線時不可用"
     },
+    handover_offer => {
+        "The runtime has stopped · Ctrl+T takes this home over",
+        "运行时已停止 · Ctrl+T 接管这个 home",
+        "執行階段已停止 · Ctrl+T 接管這個 home"
+    },
 
     // ---- degradation ----------------------------------------------------
     no_tty_title => { "Not a terminal", "不是终端", "不是終端機" },

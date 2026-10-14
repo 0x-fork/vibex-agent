@@ -118,6 +118,13 @@ pub struct SeatRequest {
     pub home: Option<PathBuf>,
     /// Force the authority seat even when a remote credential exists.
     pub prefer_authority: bool,
+    /// Take the home if it has become free, and stay a client if it has not.
+    ///
+    /// This is what `Ctrl+T` restarts the client with. It differs from
+    /// `prefer_authority` on purpose: the reader acted on an offer that was
+    /// true a moment ago, so a runtime that has come back since must leave them
+    /// with a working client rather than a refusal.
+    pub take_over: bool,
 }
 
 /// The loopback address a desktop runtime serves clients running on this
@@ -225,7 +232,7 @@ impl Seat {
         let home = resolve_home(request.home.clone())?;
         let config = home_config(&home)?;
 
-        if request.prefer_authority || !credential_path(&home).exists() {
+        if request.prefer_authority || request.take_over || !credential_path(&home).exists() {
             match Self::take_authority(&home, &config).await? {
                 Some(seat) => return Ok(seat),
                 None if request.prefer_authority => {
@@ -236,6 +243,9 @@ impl Seat {
                             .to_string(),
                     });
                 }
+                // A takeover the reader asked for may have been overtaken by a
+                // runtime starting up again; carrying on as a client is the
+                // answer that leaves them with something that works.
                 None => {}
             }
         }

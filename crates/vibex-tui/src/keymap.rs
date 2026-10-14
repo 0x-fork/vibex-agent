@@ -1420,6 +1420,12 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     // ---- shared intents that also need a visible home --------------------
     binding(
         Scope::Global,
+        Chord::ctrl('t'),
+        Intent::TakeOverHome,
+        "Take over",
+    ),
+    binding(
+        Scope::Global,
         Chord::ctrl('b'),
         Intent::ToggleSidebar,
         "Sidebar",

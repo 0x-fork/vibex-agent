@@ -16302,10 +16302,9 @@ fn aligned_backward_page_cut(
     };
     if leading_start.is_some() && leading_start == anchored_start {
         // The whole page lies inside the turn the reader is in.
-        return finish_turn(anchored_start)
-            .map_or(BackwardPageCut::KeepBudget, |index| BackwardPageCut::FinishTurn {
-                index,
-            });
+        return finish_turn(anchored_start).map_or(BackwardPageCut::KeepBudget, |index| {
+            BackwardPageCut::FinishTurn { index }
+        });
     }
     if let Some(index) = finish_turn(leading_start) {
         return BackwardPageCut::FinishTurn { index };
@@ -16353,12 +16352,14 @@ fn align_backward_page_to_turn_start(
     let ceiling = budget
         .unwrap_or(usize::MAX)
         .max(TIMELINE_TURN_ALIGNED_PAGE_MAX_BYTES);
-    Ok(match aligned_backward_page_cut(items, cut, &starts, ceiling) {
-        BackwardPageCut::KeepBudget => cut,
-        BackwardPageCut::FinishTurn { index } | BackwardPageCut::LeaveTurnOut { index } => {
-            index.max(1)
-        }
-    })
+    Ok(
+        match aligned_backward_page_cut(items, cut, &starts, ceiling) {
+            BackwardPageCut::KeepBudget => cut,
+            BackwardPageCut::FinishTurn { index } | BackwardPageCut::LeaveTurnOut { index } => {
+                index.max(1)
+            }
+        },
+    )
 }
 
 /// A merge key for one streamed payload, part of deciding whether two rows
@@ -22737,12 +22738,8 @@ mod tests {
             .expect("turn two ends just below turn three");
         assert_eq!(left_out, BackwardPageCut::LeaveTurnOut { index });
         // With room to pay, the same cut finishes the turn instead.
-        let finished = aligned_backward_page_cut(
-            &scanned,
-            inside_turn_two,
-            &starts_newest_first,
-            usize::MAX,
-        );
+        let finished =
+            aligned_backward_page_cut(&scanned, inside_turn_two, &starts_newest_first, usize::MAX);
         let index = scanned
             .iter()
             .position(|item| item.sequence == starts[1])

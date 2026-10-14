@@ -61,6 +61,7 @@ intents! {
     GotoManagement => { scope: Global, id: "goto_management", label: "Management", help: "Jump to the management index." },
     ToggleSidebar => { scope: Global, id: "toggle_sidebar", label: "Sidebar", help: "Collapse or show the sidebar." },
     ReloadKeymap => { scope: Global, id: "reload_keymap", label: "Reload keys", help: "Re-read ~/.vibex/tui-keys.toml." },
+    TakeOverHome => { scope: Global, id: "take_over_home", label: "Take over", help: "Start the runtime in this terminal instead of waiting for the one that owns this home." },
 
     // ---- list motion shared by every page --------------------------------
     SelectPrevious => { scope: Global, id: "select_previous", label: "Previous", help: "Move the selection up." },

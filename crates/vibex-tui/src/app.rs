@@ -911,6 +911,17 @@ pub struct App {
     pub pending: BTreeMap<String, ()>,
     pub generation: u64,
     pub should_quit: bool,
+    /// Set when the reader takes the host's offer to own the runtime home.
+    ///
+    /// The interface does not take it: it is a client, and becoming the
+    /// authority means restarting as one. The flag is how the event loop is
+    /// told to end the run so the host can do that.
+    pub handover_requested: bool,
+    /// What the host is offering, if anything. `None` on a run that owns its
+    /// own runtime, and on every run whose host does not watch for the offer.
+    pub handover: Option<crate::HandoverOffer>,
+    /// The offer as the last frame drew it, so a change repaints once.
+    handover_seen: bool,
     pub workspace_rows: Vec<vibex_backend::WorkspaceSummary>,
     pub workspace_browse: Option<vibex_core::RemoteWorkspaceDirectoryListing>,
     pub text_view: Option<(String, String)>,
@@ -1690,6 +1701,12 @@ impl App {
             pending: BTreeMap::new(),
             generation: 0,
             should_quit: false,
+            handover_requested: false,
+            handover_seen: options
+                .handover
+                .as_ref()
+                .is_some_and(crate::HandoverOffer::is_available),
+            handover: options.handover,
             workspace_rows: Vec::new(),
             workspace_browse: None,
             text_view: None,
@@ -4783,6 +4800,13 @@ impl App {
         // the tick is what takes it away. So does an armed quit, whose hint is
         // the same kind of thing.
         let mut dirty = self.toast.is_some() || self.quit_armed();
+        // The host extends or withdraws the offer on its own clock, so the
+        // frame that draws it follows the flag rather than an event.
+        let offered = self.handover_offered();
+        if offered != self.handover_seen {
+            self.handover_seen = offered;
+            dirty = true;
+        }
         if let Some(toast) = self.toast.as_mut() {
             toast.ttl = toast.ttl.saturating_sub(1);
             if toast.ttl == 0 {
@@ -5715,7 +5739,7 @@ impl App {
         let Some(block) = self.transcript.block(index) else {
             return;
         };
-        if !block.expanded || block.group.is_hidden() || block.activity.is_none() {
+        if !block.expanded || block.is_hidden() || block.activity.is_none() {
             return;
         }
         let sequence = block.sequence;
@@ -5931,6 +5955,15 @@ impl App {
     /// withdrawn by the same code that raised it.
     pub fn refresh_banner(&mut self) -> bool {
         if !self.live.is_live() {
+            // A disconnected seat that could own the home says so, and says how:
+            // "not available" is the whole truth only while there is nothing the
+            // reader can do about it.
+            if self.handover_offered() {
+                return self.set_banner(
+                    Banner::warning(self.strings.handover_offer())
+                        .with_priority(BannerPriority::Warning),
+                );
+            }
             return self.set_banner(
                 Banner::warning(self.strings.toast_offline())
                     .with_priority(BannerPriority::Warning),
@@ -7386,9 +7419,23 @@ impl App {
         self.transcript.configure(width, &self.theme.clone());
     }
 
+    /// Whether the host is offering this client the runtime home.
+    pub fn handover_offered(&self) -> bool {
+        !self.handover_requested
+            && self
+                .handover
+                .as_ref()
+                .is_some_and(crate::HandoverOffer::is_available)
+    }
+
     /// Locale-aware, capability-aware reason an action is unavailable.
     pub fn unavailable_reason(&self, intent: Intent) -> Option<String> {
         if !self.live.is_live() && intent.mutates() && !intent.works_offline() {
+            // The reader who reaches for something that needs the runtime is
+            // exactly the reader who wants to know the home is free now.
+            if self.handover_offered() {
+                return Some(self.strings.handover_offer().to_string());
+            }
             return Some(self.strings.toast_offline().to_string());
         }
         None
@@ -7497,6 +7544,9 @@ pub struct AppOptions {
     /// edit the file of whoever ran it, and would race every test doing the
     /// same. The composition root names the real file.
     pub notify_path: Option<std::path::PathBuf>,
+    /// The host's standing offer to hand this client the runtime home. The
+    /// interface only draws it; taking it is the host's job.
+    pub handover: Option<crate::HandoverOffer>,
 }
 
 impl Default for AppOptions {
@@ -7512,6 +7562,7 @@ impl AppOptions {
             seat: SeatKind::Remote,
             runtime_kind: vibex_core::RemoteServerKind::Unknown,
             capability: ColorCapability::detect(),
+            handover: None,
             theme_id: None,
             mode: vibex_ui::GpuiThemeMode::Dark,
             locale: Locale::En,

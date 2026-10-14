@@ -82,6 +82,9 @@ fn run_tui(local: bool) {
         connect: None,
         home: None,
         prefer_authority: local,
+        // The desktop hands its home over by restarting itself, not by asking
+        // the seat resolver for it, so this entry point never takes over.
+        take_over: false,
     };
     if let Ok(home) = vibex_client::seat::resolve_home(None) {
         request.home = Some(home);

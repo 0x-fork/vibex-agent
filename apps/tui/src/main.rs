@@ -110,6 +110,7 @@ fn run(arguments: Vec<String>) -> Result<ExitCode, Failure> {
             }
             "--local" => request.prefer_authority = true,
             "--remote" => request.prefer_authority = false,
+            "--take-over" => request.take_over = true,
             "--theme" => {
                 theme = arguments.get(index + 1).cloned();
                 index += 1;
@@ -162,9 +163,19 @@ fn run(arguments: Vec<String>) -> Result<ExitCode, Failure> {
         .block_on(Seat::resolve(request))
         .map_err(Failure::from)?;
 
+    // A client of somebody else's runtime can be offered the home if that
+    // runtime goes away. The offer is watched here rather than inside the
+    // interface: the lock is the host's business, and the interface is a client
+    // that must not learn how to start a runtime.
+    let handover = (seat.kind == SeatKind::Remote).then(vibex_tui::HandoverOffer::new);
+    if let Some(offer) = handover.clone() {
+        watch_home(&seat.home, offer);
+    }
+
     let mut options = TuiOptions {
         seat: seat.kind,
         runtime_kind: seat.runtime_kind,
+        handover,
         ..TuiOptions::default()
     };
     if let Some(theme) = theme {
@@ -174,6 +185,13 @@ fn run(arguments: Vec<String>) -> Result<ExitCode, Failure> {
     let result = vibex_tui::run(seat.facade.clone(), options);
     runtime.block_on(seat.shutdown());
 
+    // The reader asked to own the home. This process is a client of the runtime
+    // it has just left, so it restarts as one that owns it — the same binary,
+    // the same home, one flag more.
+    if matches!(result, Ok(ExitReason::Handover)) {
+        return restart_as_authority(&arguments);
+    }
+
     match result {
         Ok(ExitReason::UserQuit) => Ok(ExitCode::SUCCESS),
         // A lost connection is reported but is not a crash: the next run
@@ -182,6 +200,8 @@ fn run(arguments: Vec<String>) -> Result<ExitCode, Failure> {
             eprintln!("the connection to the runtime ended");
             Ok(ExitCode::SUCCESS)
         }
+        // Answered above, before the runtime was shut down.
+        Ok(ExitReason::Handover) => Ok(ExitCode::SUCCESS),
         Err(error) => Err(Failure::Message(format!(
             "{}: {}",
             error.code, error.message
@@ -193,6 +213,42 @@ fn run(arguments: Vec<String>) -> Result<ExitCode, Failure> {
 enum Command {
     Tui,
     Status,
+}
+
+/// Publish whether the home this client is attached to has lost its runtime.
+///
+/// Polling is the honest shape here: the lock is a file, the runtime that held
+/// it leaves no event behind, and a probe every few seconds costs one `flock`
+/// that writes nothing. The offer is withdrawn as readily as it is made, so a
+/// runtime that comes back takes the key away again.
+fn watch_home(home: &std::path::Path, offer: vibex_tui::HandoverOffer) {
+    let home = home.to_path_buf();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            offer.set_available(vibex_desktop_runtime::home_lock_is_free(&home));
+        }
+    });
+}
+
+/// Restart this client so it resolves its seat again, preferring the home.
+///
+/// `--local` is deliberately not used: the reader answered an offer that was
+/// true when it was drawn, and a runtime that has started again since then must
+/// leave them with a working client rather than a refusal.
+fn restart_as_authority(arguments: &[String]) -> Result<ExitCode, Failure> {
+    let executable = std::env::current_exe()
+        .map_err(|error| Failure::Message(format!("could not find this executable: {error}")))?;
+    let status = std::process::Command::new(executable)
+        .args(arguments)
+        .arg("--take-over")
+        .status()
+        .map_err(|error| Failure::Message(format!("could not restart the client: {error}")))?;
+    Ok(if status.success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 fn usage() -> String {

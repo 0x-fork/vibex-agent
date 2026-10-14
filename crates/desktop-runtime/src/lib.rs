@@ -97,7 +97,7 @@ pub use events::{
     DesktopEventStream, ProviderConfigChangePhase, ProviderConfigChangedEvent,
 };
 pub use fixture::FixtureDesktopRuntime;
-pub use home_lock::{DESKTOP_RUNTIME_LOCK_FILE, DesktopHomeLock};
+pub use home_lock::{DESKTOP_RUNTIME_LOCK_FILE, DesktopHomeLock, home_lock_is_free};
 pub use lan_pairing::{
     LAN_PAIRING_SERVICE_TYPE, LanPairingAdvertiser, MdnsLanPairingAdvertiser,
     MdnsZeroConfigLanPairingAdvertiser, ZeroConfigLanPairingAdvertiser,
