@@ -266,6 +266,20 @@ impl RowMarks {
         self.slots.iter().any(|slot| slot.picture.is_holding())
     }
 
+    /// The marks the terminal is holding, by label.
+    ///
+    /// A picture's identity is not in the escapes — they carry an image id and a
+    /// payload — so this is the only way a caller can ask *which* marks a frame
+    /// wanted rather than how many. It is what the render tests assert the
+    /// desktop's own icons against.
+    pub fn held_labels(&self) -> Vec<String> {
+        self.slots
+            .iter()
+            .filter(|slot| !slot.label.is_empty())
+            .map(|slot| slot.label.clone())
+            .collect()
+    }
+
     /// The image ids currently in use, for tests.
     #[cfg(test)]
     fn ids(&self) -> Vec<u32> {

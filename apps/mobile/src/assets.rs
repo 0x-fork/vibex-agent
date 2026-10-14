@@ -94,6 +94,11 @@ const ICONS: &[&str] = &[
     "icons/package.svg",
     "icons/log-out.svg",
     "icons/ellipsis-vertical.svg",
+    // The horizontal three dots the desktop's own component set draws for
+    // "more". It belongs to this pack because this pack is the repository's
+    // Lucide copy for a client that needs a plain control icon — and the
+    // terminal's row buttons draw the shapes the desktop draws.
+    "icons/ellipsis.svg",
     "icons/chevrons-right-left.svg",
     "icons/chevrons-left-right.svg",
     "icons/pencil.svg",

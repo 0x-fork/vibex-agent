@@ -1076,17 +1076,26 @@ fn render_session_view(
 ) {
     let page = session_page(area);
     let list = app.sidebar_view();
-    // A terminal too short for chrome and a row keeps the rows instead: two
+    // The page's three bands, and the air between them: the header names the
+    // list, the action row is the one button a session list needs, and the rows
+    // are what the reader came for.
+    //
+    // The action row is a button, not a line of the list, so it keeps *two* rows
+    // of air on each side: one row of separation reads as the next line of the
+    // same paragraph, and the button ends up looking like a row of the list that
+    // happens to be drawn differently. The extra row is what makes it a band.
+    const ACTION_AIR: u16 = 2;
+    let list_offset = 1 + ACTION_AIR + 1 + ACTION_AIR;
+    // A terminal too short for chrome and a row keeps the rows instead: three
     // rows of chrome over two rows of list can only show a heading, and a
     // heading the reader cannot open is worth less than the session under it.
-    // Each chrome line keeps a row of air around it, so the page needs four.
-    if page.height < 8 {
+    if page.height < list_offset + 2 {
         render_session_rows(frame, page, &list, app, theme, strings);
         return;
     }
     let list_area = Rect {
-        y: page.y + 4,
-        height: page.height - 4,
+        y: page.y + list_offset,
+        height: page.height - list_offset,
         ..page
     };
     render_session_header(
@@ -1100,7 +1109,7 @@ fn render_session_view(
     render_session_actions(
         frame,
         Rect {
-            y: page.y + 2,
+            y: page.y + 1 + ACTION_AIR,
             height: 1,
             ..page
         },
@@ -1435,14 +1444,20 @@ pub const HEADING_ROW_LEAD: usize = crate::row_marks::MARK_COLS as usize + 1;
 const SESSION_ROW_DISCLOSURE: usize = 1;
 
 /// The buttons a session row offers while the reader is on it, in the order the
-/// desktop's own menu lists the same verbs.
+/// desktop's own action cluster and menu list the same verbs.
 ///
 /// The row the cursor is on and the row under the pointer both wear them, and
 /// every other row gives their columns back to its title. They take the place
 /// of the status column rather than sitting beside it, which is what the
 /// desktop does with its own action cluster: two answers to "what is this" and
 /// "act on this" in one column would be one too many.
-const SESSION_ROW_ACTIONS: [(crate::sidebar_icons::Icon, Intent); 5] = [
+///
+/// The pin leads because the desktop's own cluster leads with it — it is the one
+/// verb there that is about the row's *place* rather than about the session, and
+/// a reader who knows the cluster on the desktop finds it in the same column
+/// here.
+const SESSION_ROW_ACTIONS: [(crate::sidebar_icons::Icon, Intent); 6] = [
+    (crate::sidebar_icons::Icon::Pin, Intent::PinSession),
     (
         crate::sidebar_icons::Icon::Resume,
         Intent::ToggleAutoContinue,
@@ -1787,7 +1802,6 @@ fn row_icon_slot(
     tier: crate::glyphs::GlyphTier,
     color: ratatui::style::Color,
     style: Style,
-    blank: Style,
     line: usize,
     column: u16,
     marks: &mut Vec<SessionRowMark>,
@@ -1795,7 +1809,9 @@ fn row_icon_slot(
     if drawable {
         // The cells the picture covers are painted blank so nothing shows
         // through around it: a picture sits above the text layer, not instead
-        // of it.
+        // of it. They keep the row's own style, because the wash a row wears
+        // behind its mark — the selection band, the light under the pointer —
+        // is painted by the text layer and shows around the icon.
         marks.push(SessionRowMark {
             line,
             column,
@@ -1804,7 +1820,7 @@ fn row_icon_slot(
         });
         return vec![Span::styled(
             " ".repeat(usize::from(crate::row_marks::MARK_COLS)),
-            blank,
+            style,
         )];
     }
     vec![Span::styled(
@@ -1874,7 +1890,6 @@ fn session_heading_line(
         tier,
         icon_color,
         Style::default().fg(icon_color),
-        blank,
         0,
         indent as u16,
         marks,
@@ -1889,22 +1904,28 @@ fn session_heading_line(
         intent: Intent::OpenSelectedSession,
     });
     spans.push(Span::styled(" ", blank));
-    // What the row's right end holds: the buttons the desktop reveals on hover,
-    // and the running count it keeps at the far edge. Both are measured before
-    // the name is cut, so the name gives way rather than the shape of the row.
+    // What the row's right end holds, from the rule to the edge: the running
+    // count the desktop keeps at the far edge, the badge that says how much the
+    // heading holds, and the buttons. All of it is measured before the name is
+    // cut, so the name gives way rather than the shape of the row.
     let buttons = heading_buttons(row);
     let running = heading_running_label(row, app, strings);
-    // The trailing block is the running count and the buttons, with the air the
-    // count keeps off the rule. It is what the name and the rule have to leave
-    // room for.
+    // The badge sits against the buttons rather than beside the name: it is the
+    // number those buttons act on, and the name is what the reader is looking
+    // for — a digit in the middle of it is a digit between the reader and the
+    // word. It is drawn even at zero, because a project the reader has opened
+    // and not yet talked to is a fact the row should state rather than hide.
+    let badge = format!(" {count} ");
+    let badge_width = display_width(&badge);
     let running_block = if running.is_empty() {
         0
     } else {
-        // The count keeps a column of air on each side: against the rule it is
-        // punctuation, and against the buttons it is a different kind of fact.
+        // The running count keeps a column of air on each side: against the rule
+        // it is punctuation, and against the badge it is a different kind of
+        // fact.
         display_width(&running) + 2
     };
-    let right = running_block + icon_cluster_width(buttons.len()) + ROW_CONTROL_AIR;
+    let right = running_block + badge_width + icon_cluster_width(buttons.len()) + ROW_CONTROL_AIR;
     // The name gives way before the shape of the heading does: a heading whose
     // rule ran out is still a heading, but a heading without its name is not.
     let label_width = width
@@ -1914,20 +1935,8 @@ fn session_heading_line(
         .saturating_sub(4)
         .max(1);
     let label = truncate_to_width(&row.label, label_width, "…");
-    // The count is a badge rather than the line's last word, which is where the
-    // desktop puts it: right after the name, in the muted step. It is drawn even
-    // at zero, because a project the reader has opened and not yet talked to is
-    // a fact the row should state rather than hide.
-    let badge = format!(" {count} ");
-    let badge_width = display_width(&badge);
     spans.push(Span::styled(label.clone(), label_style));
-    spans.push(Span::styled(
-        badge,
-        Style::default()
-            .fg(theme.roles.gray)
-            .bg(theme.roles.code_background),
-    ));
-    let used = indent + HEADING_ROW_LEAD + display_width(&label) + badge_width;
+    let used = indent + HEADING_ROW_LEAD + display_width(&label);
     // One column of air, then the rule to the far end of the list in the dim
     // step: a rule is punctuation between sections, not a line of the page.
     // What it does not reach is the trailing block, which the arithmetic above
@@ -1942,15 +1951,26 @@ fn session_heading_line(
     }
     // The trailing mark is the desktop's "N running", which it keeps at the
     // row's far edge and hides under the pointer. A terminal has no hover, so it
-    // is drawn beside the buttons instead of under them.
+    // is drawn beside the badge instead of under the buttons.
+    // Where the trailing block starts, and where each piece of it leaves the
+    // cursor: the buttons publish the rect a click lands on, so a column that
+    // did not follow the count and the badge would be a button the pointer
+    // cannot hit.
     let mut column = width.saturating_sub(right - ROW_CONTROL_AIR);
     if !running.is_empty() {
         spans.push(Span::styled(
             format!(" {running} "),
             Style::default().fg(theme.roles.gray),
         ));
-        column += 1 + display_width(&running) + 1;
+        column += running_block;
     }
+    spans.push(Span::styled(
+        badge,
+        Style::default()
+            .fg(theme.roles.gray)
+            .bg(theme.roles.code_background),
+    ));
+    column += badge_width;
     for (index, (icon, intent)) in buttons.iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled(" ".repeat(ROW_CONTROL_GAP), blank));
@@ -1958,15 +1978,12 @@ fn session_heading_line(
         }
         let lit = hovered_control == Some(*intent);
         let color = if lit {
-            theme.roles.background
+            theme.roles.accent_user
         } else {
             theme.roles.gray_bright
         };
         let style = if lit {
-            Style::default()
-                .fg(theme.roles.background)
-                .bg(theme.roles.accent_user)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(color)
         };
@@ -1976,7 +1993,6 @@ fn session_heading_line(
             tier,
             color,
             style,
-            blank,
             0,
             column as u16,
             marks,
@@ -2008,12 +2024,20 @@ fn heading_buttons(
         .collect()
 }
 
-/// How many of a heading's sessions are running, in the desktop's own words.
+/// How many of a project's sessions are running, in the desktop's own words.
+///
+/// A project's mark, not a folder's: the desktop keeps it on the project row,
+/// and a folder's own sessions are a slice of the project's — the same number
+/// printed twice, one of them about work the folder may not even hold. The
+/// folder's badge beside the buttons already says how much the folder holds.
 fn heading_running_label(
     row: &vibex_desktop_model::AgentSidebarRow,
     app: &App,
     strings: Strings,
 ) -> String {
+    if row.kind != vibex_desktop_model::AgentSidebarRowKind::Project {
+        return String::new();
+    }
     let count = app.sidebar_running_count(&row.project_id, &row.workspace_id);
     if count == 0 {
         return String::new();
@@ -2031,6 +2055,12 @@ fn heading_running_label(
 struct SessionStatusColumn {
     spans: Vec<Span<'static>>,
     width: usize,
+    /// The icons the column drew, and the column each starts in, relative to
+    /// the column's own left edge. Each has reserved two cells and drawn the
+    /// character it falls back to; the row places the desktop's own picture over
+    /// those cells where the terminal can hold one, which is what keeps a pin
+    /// the shape the desktop draws rather than a star this client invented.
+    icons: Vec<(usize, crate::sidebar_icons::Icon, ratatui::style::Color)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2045,8 +2075,13 @@ fn session_status_column(
     use vibex_core::AgentSessionState;
     let tier = app.glyph_tier();
     let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut icons: Vec<(usize, crate::sidebar_icons::Icon, ratatui::style::Color)> = Vec::new();
     let Some(session) = session else {
-        return SessionStatusColumn { spans, width: 0 };
+        return SessionStatusColumn {
+            spans,
+            width: 0,
+            icons,
+        };
     };
     let state = session.state;
     let awaiting = state == AgentSessionState::NeedsInput;
@@ -2065,13 +2100,47 @@ fn session_status_column(
         }
         spans.push(Span::styled(text, Style::default().fg(color)));
     }
+    /// One of the desktop's icons, in the two cells a picture needs.
+    ///
+    /// The cells are reserved blank where the terminal can hold a picture: the
+    /// mark is drawn *over* them, and a character left underneath would show
+    /// through the transparent parts of the icon — a question mark behind the
+    /// circled question mark. Where the terminal cannot, the character is the
+    /// mark, and it is what the reader gets.
+    fn push_icon(
+        spans: &mut Vec<Span<'static>>,
+        icons: &mut Vec<(usize, crate::sidebar_icons::Icon, ratatui::style::Color)>,
+        icon: crate::sidebar_icons::Icon,
+        tier: crate::glyphs::GlyphTier,
+        color: ratatui::style::Color,
+        drawable: bool,
+    ) {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        let column = spans_width(spans);
+        let text = if drawable {
+            " ".repeat(usize::from(crate::row_marks::MARK_COLS))
+        } else {
+            format!(
+                "{:<width$}",
+                icon.glyph(tier),
+                width = usize::from(crate::row_marks::MARK_COLS)
+            )
+        };
+        icons.push((column, icon, color));
+        spans.push(Span::styled(text, Style::default().fg(color)));
+    }
     // The pause leads, the way the desktop's column leads with it: it is the one
     // mark that says the session's own automation is held back.
     if paused {
-        push(
+        push_icon(
             &mut spans,
-            crate::sidebar_icons::Icon::Pause.glyph(tier).to_string(),
+            &mut icons,
+            crate::sidebar_icons::Icon::Pause,
+            tier,
             theme.roles.gray,
+            icon_drawable(app, theme.roles.gray),
         );
     }
     // The state's own mark, in the desktop's own order. A session parked on the
@@ -2080,18 +2149,22 @@ fn session_status_column(
     // row with something unread, a failure, or nothing to report draws none of
     // them, which is what keeps the dots below unambiguous.
     if awaiting {
-        push(
+        push_icon(
             &mut spans,
-            crate::sidebar_icons::Icon::Attention
-                .glyph(tier)
-                .to_string(),
+            &mut icons,
+            crate::sidebar_icons::Icon::Attention,
+            tier,
             theme.roles.warning,
+            icon_drawable(app, theme.roles.warning),
         );
     } else if scheduled.is_some() {
-        push(
+        push_icon(
             &mut spans,
-            crate::sidebar_icons::Icon::Clock.glyph(tier).to_string(),
+            &mut icons,
+            crate::sidebar_icons::Icon::Clock,
+            tier,
             theme.roles.gray,
+            icon_drawable(app, theme.roles.gray),
         );
     } else if !unread && !failed && state != AgentSessionState::Idle {
         // The ring turns only while the Agent is being asked to work, and it is
@@ -2165,14 +2238,21 @@ fn session_status_column(
         );
     }
     if row.pinned {
-        push(
+        push_icon(
             &mut spans,
-            crate::sidebar_icons::Icon::Pin.glyph(tier).to_string(),
+            &mut icons,
+            crate::sidebar_icons::Icon::Pin,
+            tier,
             theme.roles.warning,
+            icon_drawable(app, theme.roles.warning),
         );
     }
     let width = spans_width(&spans);
-    SessionStatusColumn { spans, width }
+    SessionStatusColumn {
+        spans,
+        width,
+        icons,
+    }
 }
 
 /// When a session last said anything, or how long until its message goes, in
@@ -2362,17 +2442,22 @@ fn session_row_lines(
                 spans.push(Span::styled(" ".repeat(ROW_CONTROL_GAP), blank_style));
                 column += ROW_CONTROL_GAP;
             }
+            // At rest the cluster is chrome, the way the desktop's own is: a
+            // row of six coloured marks would shout at a reader who is only
+            // reading the list. Under the pointer the button takes the colour of
+            // the verb it is — delete is the danger colour exactly when it is
+            // about to be pressed — and that colour is also what the picture is
+            // drawn in. The mark is never drawn *in* the wash behind it: a
+            // picture has no ink to fall back on, and a button rastered in the
+            // terminal's own background is a button that disappears.
             let lit = hovered_control == Some(*intent);
             let colour = if lit {
-                theme.roles.background
+                action_colour(*icon, theme, row.pinned)
             } else {
-                action_colour(*icon, theme)
+                resting_action_colour(*icon, theme, row.pinned)
             };
             let style = if lit {
-                Style::default()
-                    .fg(theme.roles.background)
-                    .bg(action_colour(*icon, theme))
-                    .add_modifier(Modifier::BOLD)
+                paint(colour).add_modifier(Modifier::BOLD)
             } else {
                 paint(colour)
             };
@@ -2382,7 +2467,6 @@ fn session_row_lines(
                 tier,
                 colour,
                 style,
-                blank_style,
                 0,
                 column as u16,
                 marks,
@@ -2397,10 +2481,8 @@ fn session_row_lines(
             column += icon_button_width();
         }
     } else if let Some(status) = status {
-        spans.push(Span::styled(
-            " ".repeat(reserved.saturating_sub(status.width)),
-            blank_style,
-        ));
+        let pad = reserved.saturating_sub(status.width);
+        spans.push(Span::styled(" ".repeat(pad), blank_style));
         // The status column keeps the row's band, so a selected row is one
         // object rather than a band with a bare patch at its right end.
         spans.extend(
@@ -2409,6 +2491,21 @@ fn session_row_lines(
                 .iter()
                 .map(|span| Span::styled(span.content.clone(), span.style.patch(blank_style))),
         );
+        // The marks the column drew as characters are the desktop's own icons
+        // wherever the terminal can hold a picture, which is what keeps a pinned
+        // row wearing the pin the desktop draws rather than a star.
+        let base = indent + SESSION_ROW_LEAD + text_width + SESSION_ROW_DISCLOSURE + pad;
+        for (offset, icon, color) in &status.icons {
+            if !icon_drawable(app, *color) {
+                continue;
+            }
+            marks.push(SessionRowMark {
+                line: 0,
+                column: (base + offset) as u16,
+                mark: crate::row_marks::Mark::Chrome(*icon),
+                color: *color,
+            });
+        }
     }
     let mut lines = vec![Line::from(spans)];
     // The second line is what the session last did, and nothing else: the
@@ -2477,17 +2574,38 @@ fn session_row_buttons(width: usize, indent: usize) -> Vec<(crate::sidebar_icons
     buttons
 }
 
-/// The colour one of a session row's buttons wears.
+/// The colour a session row's button takes while the pointer is on it.
 ///
 /// Delete is the danger colour and archive is the attention one, which is the
 /// distinction a reader has to be able to make without reading: everything else
 /// acts on the session, and those two end it or put it away.
-fn action_colour(icon: crate::sidebar_icons::Icon, theme: &TuiTheme) -> ratatui::style::Color {
+fn action_colour(
+    icon: crate::sidebar_icons::Icon,
+    theme: &TuiTheme,
+    pinned: bool,
+) -> ratatui::style::Color {
     match icon {
         crate::sidebar_icons::Icon::Delete => theme.roles.danger,
         crate::sidebar_icons::Icon::Archive => theme.roles.accent_attention,
         crate::sidebar_icons::Icon::Resume => theme.roles.accent_success,
+        crate::sidebar_icons::Icon::Pin if pinned => theme.roles.warning,
         _ => theme.roles.accent_user,
+    }
+}
+
+/// The colour a session row's button wears while the reader is elsewhere.
+///
+/// Chrome, with one exception the desktop makes too: a pinned session's pin
+/// stays in the warning colour, because it is not a verb the reader is about to
+/// run but the state the row is already in.
+fn resting_action_colour(
+    icon: crate::sidebar_icons::Icon,
+    theme: &TuiTheme,
+    pinned: bool,
+) -> ratatui::style::Color {
+    match icon {
+        crate::sidebar_icons::Icon::Pin if pinned => theme.roles.warning,
+        _ => theme.roles.gray_bright,
     }
 }
 
@@ -9766,6 +9884,11 @@ mod tests {
             vibex_backend::DisconnectedBackend::facade(),
             crate::app::AppOptions::default(),
         );
+        // No picture protocol, whatever terminal the runner happens to be in: a
+        // console draws the character, and a test that let the environment
+        // decide would pass or fail on where it was run.
+        app.terminal_images =
+            crate::terminal_image::ImageSupport::forced(crate::terminal_image::ImageProtocol::None);
         let now = vibex_core::unix_timestamp_ms();
         let mut session = a_session("session_status0001", "quiet");
         session.last_message_at_ms = now;
@@ -9828,12 +9951,19 @@ mod tests {
             "a working row does not turn the ring: {running:?}"
         );
         // A session parked on the reader asks, and the question outranks the
-        // clock.
+        // clock. The desktop's own icons reserve the two cells a picture needs,
+        // so the character is followed by the air the row would have drawn the
+        // mark over.
+        let slot = |icon: crate::sidebar_icons::Icon| {
+            format!(
+                "{:<width$}",
+                icon.glyph(GlyphTier::Full),
+                width = usize::from(crate::row_marks::MARK_COLS)
+            )
+        };
         assert_eq!(
             text_of!(AgentSessionState::NeedsInput),
-            crate::sidebar_icons::Icon::Attention
-                .glyph(GlyphTier::Full)
-                .to_string()
+            slot(crate::sidebar_icons::Icon::Attention)
         );
         // A failure is the danger mark, and the row keeps no hour beside it.
         assert_eq!(
@@ -9872,9 +10002,7 @@ mod tests {
         );
         assert_eq!(
             pinned_text,
-            crate::sidebar_icons::Icon::Pin
-                .glyph(GlyphTier::Full)
-                .to_string(),
+            slot(crate::sidebar_icons::Icon::Pin),
             "a pinned row does not end in its pin: {pinned_text:?}"
         );
     }

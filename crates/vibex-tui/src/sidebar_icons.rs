@@ -2,13 +2,17 @@
 //!
 //! The desktop draws these from two places: the brand pack under
 //! `apps/desktop/assets/icons/`, and `gpui-component`'s own Lucide set for the
-//! handful of plain controls (`Plus`, `Ellipsis`, `ChevronDown`). A terminal
-//! cannot read either at run time, so the icons a row needs are bundled here —
-//! the desktop pack for the ones it already carries, and the phone's Lucide
-//! copy for the three the component set owns and this repository has no
-//! embeddable copy of. The asset path travels with each entry so a reviewer can
-//! see which file a glyph stands for, and so the two clients cannot quietly
-//! drift into drawing different pictures for the same verb.
+//! handful of plain controls (`Plus`, `Ellipsis`, `ChevronDown`,
+//! `ChevronRight`). A terminal cannot read either at run time, so the icons a
+//! row needs are bundled here — the desktop pack for the ones it already
+//! carries, and the phone's Lucide copy for the controls the component set
+//! owns and this repository has no embeddable copy of.
+//!
+//! The shapes are the desktop's own, and deliberately so: a reader who knows
+//! the sidebar on one screen has to recognise the buttons on the other. Every
+//! entry therefore carries the asset path it is, and a test asserts the file
+//! says what the entry claims — a control that quietly drifted to a different
+//! picture would be a different button wearing the same verb.
 //!
 //! # Two renderings, one vocabulary
 //!
@@ -126,7 +130,7 @@ impl Icon {
             Self::Attention => "desktop:circle-question-mark.svg",
             Self::Clock => "desktop:clock.svg",
             Self::New => "mobile:plus.svg",
-            Self::More => "mobile:ellipsis-vertical.svg",
+            Self::More => "mobile:ellipsis.svg",
             Self::FolderClosed => "desktop:folder.svg",
             Self::FolderOpen => "mobile:folder-open.svg",
             Self::NewFolder => "desktop:folder-plus.svg",
@@ -150,7 +154,7 @@ impl Icon {
             }
             Self::Clock => include_bytes!("../../../apps/desktop/assets/icons/clock.svg"),
             Self::New => include_bytes!("../../../apps/mobile/assets/icons/plus.svg"),
-            Self::More => include_bytes!("../../../apps/mobile/assets/icons/ellipsis-vertical.svg"),
+            Self::More => include_bytes!("../../../apps/mobile/assets/icons/ellipsis.svg"),
             Self::FolderClosed => include_bytes!("../../../apps/desktop/assets/icons/folder.svg"),
             Self::FolderOpen => include_bytes!("../../../apps/mobile/assets/icons/folder-open.svg"),
             Self::NewFolder => include_bytes!("../../../apps/desktop/assets/icons/folder-plus.svg"),

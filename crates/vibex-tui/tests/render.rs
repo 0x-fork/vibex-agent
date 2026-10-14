@@ -8555,6 +8555,9 @@ fn the_session_list_names_the_agent_and_when_it_last_spoke() {
     // session last spoke, because every other row has news that displaces the
     // hour — a ring, a failure, or a mark.
     let mut quiet = seeded_session("session_list0004", "nothing new here");
+    quiet.project_id = idle.project_id.clone();
+    quiet.workspace_id = idle.workspace_id.clone();
+    quiet.workspace_root = idle.workspace_root.clone();
     quiet.last_message_at_ms = now - 40 * 60 * 1000;
 
     let mut app = app(110, 24);
@@ -8693,6 +8696,7 @@ fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
     // between them, in the desktop's own order.
     let tier = vibex_tui::glyphs::GlyphTier::Full;
     let cluster = [
+        Icon::Pin,
         Icon::Resume,
         Icon::Rename,
         Icon::Fork,
@@ -8743,7 +8747,7 @@ fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
         .collect::<Vec<_>>();
     assert_eq!(
         controls.len(),
-        5,
+        6,
         "the selected row's buttons: {controls:?}"
     );
     assert_eq!(
@@ -8752,6 +8756,7 @@ fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
             .map(|control| control.intent)
             .collect::<Vec<_>>(),
         vec![
+            Intent::PinSession,
             Intent::ToggleAutoContinue,
             Intent::BeginRenameSession,
             Intent::ForkSession,
@@ -9112,6 +9117,7 @@ fn the_session_list_marks_degrade_to_a_legacy_terminal() {
     // cannot hold.
     let tier = vibex_tui::glyphs::GlyphTier::Legacy;
     for (intent, icon) in [
+        (vibex_tui::action::Intent::PinSession, Icon::Pin),
         (vibex_tui::action::Intent::ToggleAutoContinue, Icon::Resume),
         (vibex_tui::action::Intent::BeginRenameSession, Icon::Rename),
         (vibex_tui::action::Intent::ForkSession, Icon::Fork),
@@ -9384,8 +9390,19 @@ fn the_session_list_summarises_itself_and_offers_a_new_session() {
         .find(|(_, intent)| *intent == vibex_tui::action::Intent::NewSession)
         .map(|(rect, _)| *rect)
         .expect("the new-session button is not clickable");
-    // A row of air under the action is what keeps the button off the list.
-    assert!(button.width > 0 && button.y == app.regions.list.unwrap().rect.y - 2);
+    // Two rows of air under the action are what keep the button off the list,
+    // and the row between them is the one the reader's eye uses to tell a button
+    // from a row.
+    let list = app
+        .regions
+        .list
+        .as_ref()
+        .expect("the list published no rect");
+    assert!(
+        button.width > 0 && button.y + 3 == list.rect.y,
+        "the button is not a band above the list: {button:?} {:?}",
+        list.rect
+    );
 }
 
 /// A list longer than the page scrolls by page and by end without moving the
@@ -9515,27 +9532,33 @@ fn the_session_list_is_not_drawn_inside_a_frame() {
             "the list is wearing a frame again ({corner}):\n{screen}"
         );
     }
-    // The page's own chrome is the first thing in the band: the name, a row of
-    // air, the action, another row of air, then the list.
+    // The page's own chrome is the first thing in the band: the name, two rows
+    // of air, the action, two more, then the list. The action is a button rather
+    // than a line of the list, and one row of air would read as the next line of
+    // the same paragraph.
     let lines = screen.lines().collect::<Vec<_>>();
     let named = lines
         .iter()
         .position(|line| line.trim_start().starts_with("Session list"))
         .unwrap_or_else(|| panic!("the page does not name itself:\n{screen}"));
+    for air in [1, 2] {
+        assert!(
+            lines[named + air].trim().is_empty(),
+            "there is no air under the page's name:\n{screen}"
+        );
+    }
     assert!(
-        lines[named + 1].trim().is_empty(),
-        "there is no air under the page's name:\n{screen}"
-    );
-    assert!(
-        lines[named + 2].contains("+ New session"),
+        lines[named + 3].contains("+ New session"),
         "the action is not under the page's name:\n{screen}"
     );
+    for air in [4, 5] {
+        assert!(
+            lines[named + air].trim().is_empty(),
+            "there is no air under the action:\n{screen}"
+        );
+    }
     assert!(
-        lines[named + 3].trim().is_empty(),
-        "there is no air under the action:\n{screen}"
-    );
-    assert!(
-        lines[named + 4].trim_start().starts_with('▾'),
+        lines[named + 6].trim_start().starts_with('▾'),
         "the list does not start under the page's own chrome:\n{screen}"
     );
 }
@@ -9575,13 +9598,20 @@ fn a_group_heading_counts_its_sessions_and_rules_the_section() {
         badge > named,
         "the count is not beside the name it counts: {heading:?}"
     );
-    // And the rule carries the eye from the badge to the far end of the list.
+    // The rule carries the eye from the name to the badge, and the badge sits
+    // against the buttons rather than beside the name: it is the number those
+    // buttons act on, and a digit in the middle of a name is a digit between the
+    // reader and the word.
     let rule = heading
         .find('─')
         .unwrap_or_else(|| panic!("the heading draws no rule: {heading:?}"));
     assert!(
-        rule > badge,
-        "the rule does not run from the count: {heading:?}"
+        rule > named,
+        "the rule does not run from the name: {heading:?}"
+    );
+    assert!(
+        heading.trim_end().ends_with("2 …  +"),
+        "the count is not the last word before the buttons: {heading:?}"
     );
     // A session row is not a heading: it carries the mark and the age instead.
     let row = screen
@@ -10318,4 +10348,131 @@ fn a_folder_rows_action_button_offers_what_a_folder_can_do() {
         "renaming a folder did not ask for a name: {:?}",
         app.overlay
     );
+}
+
+/// A terminal that can hold a picture gets the desktop's own icons: the Agent's
+/// brand mark at the row's left edge, the mark its status column carries, and
+/// every button the row offers — each drawn from the file the desktop draws,
+/// with the cells reserved rather than a character standing in for it.
+#[test]
+fn a_picture_capable_terminal_draws_the_desktops_own_icons() {
+    use vibex_tui::terminal_image::{ImageProtocol, ImageSupport};
+    let now = vibex_core::unix_timestamp_ms();
+    let mut session = seeded_session("session_pixels001", "the one with pictures");
+    session.state = vibex_core::AgentSessionState::NeedsInput;
+    session.last_message_at_ms = now;
+    let mut app = app(100, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![session]))
+        .expect("sessions apply");
+    app.terminal_images = ImageSupport::forced(ImageProtocol::Kitty);
+    let row_of = |app: &mut App| -> String {
+        let screen = text(&render(app, 100, 24));
+        screen
+            .lines()
+            .find(|line| line.contains("the one with pictures"))
+            .unwrap_or_else(|| panic!("no session row:\n{screen}"))
+            .to_string()
+    };
+    /// Whether the frame asked for this icon by name. A picture's identity is
+    /// not in the escapes — they carry an image id and a payload — so the pool
+    /// is what says *which* marks a frame wanted rather than how many.
+    fn drew(app: &App, label: &str) -> bool {
+        app.row_marks.held_labels().iter().any(|held| held == label)
+    }
+
+    // The cursor is on the heading, so the row is at rest and wears the mark its
+    // state carries. The character is what a terminal without pixels would draw;
+    // here the cells are reserved and the picture is placed over them.
+    let resting = row_of(&mut app);
+    assert!(
+        !resting.contains(
+            vibex_tui::sidebar_icons::Icon::Attention.glyph(vibex_tui::glyphs::GlyphTier::Full)
+        ),
+        "the character was drawn under the picture: {resting:?}"
+    );
+    for label in ["chrome:attention", "chrome:more", "chrome:new"] {
+        assert!(
+            drew(&app, label),
+            "the frame did not draw {label}: {:?}",
+            app.row_marks.held_labels()
+        );
+    }
+    assert!(
+        app.row_marks
+            .held_labels()
+            .iter()
+            .any(|held| held.starts_with("agent:")),
+        "the Agent's brand mark was not drawn: {:?}",
+        app.row_marks.held_labels()
+    );
+    assert!(
+        app.row_marks.is_holding() && !app.row_marks.take_escapes().is_empty(),
+        "the row reserved the mark's cells but placed nothing"
+    );
+
+    // The cursor is on the row, so it wears its buttons instead of its status
+    // column — the same six the desktop's own cluster and menu offer.
+    app.set_selection(Scope::Sessions, 1);
+    let selected = row_of(&mut app);
+    for icon in [
+        Icon::Pin,
+        Icon::Resume,
+        Icon::Rename,
+        Icon::Fork,
+        Icon::Archive,
+        Icon::Delete,
+    ] {
+        assert!(
+            !selected.contains(icon.glyph(vibex_tui::glyphs::GlyphTier::Full)),
+            "the {} button drew a character where a picture belongs: {selected:?}",
+            icon.key()
+        );
+        let label = format!("chrome:{}", icon.key());
+        assert!(
+            drew(&app, &label),
+            "the {label} button was not drawn: {:?}",
+            app.row_marks.held_labels()
+        );
+    }
+    // The row's own control rects are still published, so a click on a picture
+    // lands on the button it is.
+    assert_eq!(
+        app.regions
+            .row_actions
+            .iter()
+            .filter(|control| control.row == 1)
+            .count(),
+        6,
+        "the row's buttons are not clickable: {:?}",
+        app.regions.row_actions
+    );
+}
+
+#[test]
+fn scratch_sticky_follow_probe() {
+    for replies in [0usize, 1, 2, 3, 4] {
+        let mut app = app(64, 20);
+        let mut blocks = vec![seeded_block(
+            "prompt-0",
+            vibex_desktop_model::TimelineRowKind::UserMessage,
+            "PINNED one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen",
+        )];
+        for index in 0..replies {
+            blocks.push(seeded_block(
+                &format!("reply-{index}"),
+                vibex_desktop_model::TimelineRowKind::AgentMessage,
+                "an answer long enough to occupy a row or two",
+            ));
+        }
+        app.transcript.set_blocks(blocks);
+        app.navigate_to(Page::Agent);
+        println!("=== replies {replies} ===");
+        let lines = render(&mut app, 64, 20);
+        println!("  follow={} offset={} recorded={} band={}", app.scroll.follow, app.scroll.offset, app.transcript.scroll_offset(), app.transcript_band_rows);
+        for (index, line) in lines.iter().enumerate() {
+            println!("  {index:2} |{line}");
+        }
+    }
 }
