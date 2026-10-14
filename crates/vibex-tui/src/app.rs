@@ -3659,6 +3659,12 @@ impl App {
             if self.page == Page::Devices && !self.device_key_applies(binding.intent) {
                 continue;
             }
+            // The ownership verbs are the same case: a session with nothing
+            // under it has no sub-sessions to open, and a root has no main
+            // session to go back to.
+            if !self.ownership_key_applies(binding.intent) {
+                continue;
+            }
             advertised.push((binding.scope, binding));
         }
         // The page's own keys lead the bar: a reader looking at the
@@ -3672,6 +3678,26 @@ impl App {
                 .unwrap_or(usize::MAX)
         });
         advertised
+    }
+
+    /// Whether one of the ownership verbs has anywhere to go.
+    ///
+    /// A branch is foldable only when some row on the list actually has one;
+    /// the way into the children exists only for a session that owns some; the
+    /// way back exists only for a session that was delegated. The chords stay
+    /// bound — a key that comes and goes with the state is a key the reader
+    /// cannot learn — but a surface that names keys does not name a verb with
+    /// no subject.
+    pub fn ownership_key_applies(&self, intent: Intent) -> bool {
+        match intent {
+            Intent::ToggleChildBranch => self.sidebar_rows().iter().any(|row| row.child_count > 0),
+            Intent::OpenChildSessions => self.selected_session_id().is_some_and(|session_id| {
+                self.children.has_children(session_id.as_str())
+                    || self.children.declared_child_count(session_id.as_str()) > 0
+            }),
+            Intent::GotoParentSession => self.parent_session_id().is_some(),
+            _ => true,
+        }
     }
 
     /// Whether one of the devices page's own verbs has anything to act on.

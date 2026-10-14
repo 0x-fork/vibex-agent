@@ -9312,6 +9312,77 @@ fn a_main_session_offers_the_workers_it_delegated() {
 }
 
 #[test]
+fn an_ownership_verb_is_only_named_when_it_has_a_subject() {
+    use vibex_tui::action::Intent;
+    fn advertises(app: &App, intent: Intent) -> bool {
+        app.advertised_keys()
+            .iter()
+            .any(|(_, binding)| binding.intent == intent)
+    }
+    // Nothing is delegated and nothing owns this session: the key bar, the
+    // help page and the cheatsheet all stay quiet about a key with no subject.
+    let mut app = app(120, 40);
+    app.perform(Intent::GotoSessions);
+    assert!(!advertises(&app, Intent::ToggleChildBranch));
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Main;
+    assert!(!advertises(&app, Intent::OpenChildSessions));
+    assert!(!advertises(&app, Intent::GotoParentSession));
+    let rows = vibex_tui::view::shortcut_rows(&app, "", &std::collections::BTreeSet::new());
+    let labelled = rows
+        .iter()
+        .filter_map(|row| row.binding)
+        .filter_map(|binding| binding.label)
+        .collect::<Vec<_>>();
+    for label in ["Sub-sessions", "Main session"] {
+        assert!(
+            !labelled.contains(&label),
+            "the cheatsheet offered {label} with nothing to act on"
+        );
+    }
+
+    // A session with a worker: the branch is foldable on the list and the way
+    // into it exists on the session's own page.
+    let (mut app, parent_id, worker_id) = sub_session_app(120, 40);
+    app.agent.state.selected_session_id = Some(parent_id.clone());
+    // The list is where a branch folds, and the session's own page is where
+    // the way into it is named.
+    app.perform(Intent::GotoSessions);
+    assert!(advertises(&app, Intent::ToggleChildBranch));
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Main;
+    assert!(advertises(&app, Intent::OpenChildSessions));
+    assert!(
+        !advertises(&app, Intent::GotoParentSession),
+        "a root was offered a way back up"
+    );
+    // The worker's own page offers the way back to the session that owns it.
+    app.agent.state.selected_session_id = Some(worker_id.clone());
+    app.children
+        .set_open_path(&worker_id, vec![tree_node("session_parent001", None, 1)]);
+    assert!(advertises(&app, Intent::GotoParentSession));
+}
+
+#[test]
+fn a_session_that_delegated_nothing_has_no_sub_session_section() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    let session = seeded_session("session_plain001", "an ordinary session");
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(session.id.clone());
+    app.agent.state.active_session.resolve(session);
+    app.navigate_to(Page::Agent);
+    app.perform(Intent::ToggleDock);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        !screen.contains("Sub-sessions"),
+        "the dock drew a sub-session section with nothing under it:\n{screen}"
+    );
+}
+
+#[test]
 fn a_sub_session_page_names_the_way_back_to_its_main_session() {
     let (mut app, parent_id, worker_id) = sub_session_app(120, 40);
     let worker = app.session_by_id(&worker_id).cloned().expect("the worker");

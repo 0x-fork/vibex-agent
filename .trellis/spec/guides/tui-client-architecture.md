@@ -754,9 +754,14 @@ is never a column count.
   chord, published as a click target like the Sessions entry. `Alt+Right` is the
   other direction: it opens the single child, or lands the dock cursor on the
   first of several, or becomes the read that finds out when the branch has not
-  been read yet. The detail card carries the same fact as a `Main` field, so all
-  three surfaces answer "where did this session come from" from one reading of
-  the ownership edges.
+  been read yet. Both chords stay bound for the whole scope — a key that comes
+  and goes with the state is a key the reader cannot learn — but no surface
+  *names* one with no subject: `App::ownership_key_applies` drops `Sub-sessions`
+  from the key bar, the help page and the shortcut cheatsheet on a session that
+  delegated nothing, and `Main session` on a root, the way the devices page
+  already drops its verbs. The detail card carries the same fact as a `Main`
+  field, so all three surfaces answer "where did this session come from" from
+  one reading of the ownership edges.
 * **The list is a window over lines, not a selection over rows.** A workspace can
   hold hundreds of sessions and a row can carry a detail card, so the page lays
   every row out, measures them in lines, and draws the window it is scrolled to

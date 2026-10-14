@@ -6303,6 +6303,10 @@ pub fn shortcut_rows<'a>(
             .bindings()
             .iter()
             .filter(|binding| binding.label.is_some() && binding.scope.category() == category)
+            // A verb with no subject is not a shortcut the reader can use: the
+            // cheatsheet names what this client can do *now*, so the ownership
+            // rows appear with the sessions that have something to own.
+            .filter(|binding| app.ownership_key_applies(binding.intent))
             .filter(|binding| {
                 needle.is_empty()
                     || binding.chord.display().to_lowercase().contains(&needle)
