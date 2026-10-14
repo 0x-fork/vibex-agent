@@ -28230,10 +28230,11 @@ fn sidebar_project_icon_color(color: SidebarProjectLogoColor) -> gpui::Hsla {
 
 /// The decoder for a fetched image, from its content type or its URL.
 fn generated_image_format(url: &str, content_type: Option<&str>) -> Option<ImageFormat> {
-    if let Some(mime) = content_type.and_then(|value| value.split(';').next()) {
-        if let Some(format) = ImageFormat::from_mime_type(mime.trim()) {
-            return Some(format);
-        }
+    if let Some(format) = content_type
+        .and_then(|value| value.split(';').next())
+        .and_then(|mime| ImageFormat::from_mime_type(mime.trim()))
+    {
+        return Some(format);
     }
     crate::workbench::image_format_for_path(url.split('?').next().unwrap_or(url))
 }
