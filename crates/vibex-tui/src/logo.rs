@@ -68,7 +68,8 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::theme::{ColorMode, GlyphMode, TuiTheme};
+use crate::shimmer::{LIT, lights_up, silver};
+use crate::theme::{GlyphMode, TuiTheme};
 
 /// Which character art the landing mark is drawn with.
 ///
@@ -164,35 +165,6 @@ const WASH_WIDTH: f32 = 5.0;
 /// The top row rests at `REST_HEAD` of the way there rather than at the
 /// foreground, which is the headroom the light spends.
 const REST_HEAD: f32 = 0.25;
-
-/// Above this much light a cell is drawn bold in a palette that cannot blend.
-const LIT: f32 = 0.45;
-
-/// The colour a light crossing the mark takes.
-///
-/// The catalogue has no token named for a light, and the one it carries for the
-/// job is `border`: authored as the canvas's opposite in every shipped theme —
-/// `#ffffff` in all ten dark ones, `#000000` in all ten light ones — which is
-/// what light is, and what makes a specular read as a specular rather than as a
-/// slightly lighter grey. On a light page that inverts to ink, which is the
-/// same statement: the strongest thing that can be drawn on the canvas it falls
-/// on. The token is named for hairlines because that is what it was authored
-/// for; its value is what a light needs, and minting a second white here would
-/// put a colour outside the catalogue that every theme would then have to be
-/// checked against.
-fn silver(theme: &TuiTheme) -> Color {
-    theme.roles.border
-}
-
-/// Whether this terminal can be shown a light at all.
-///
-/// With colour switched off there is nothing to spend: a light drawn in one
-/// colour, with no weight to carry it, is a mark that would only flicker
-/// between two identical frames. The wordmark is still the mark; only the
-/// movement is dropped.
-fn lights_up(theme: &TuiTheme) -> bool {
-    !matches!(theme.capability.mode, ColorMode::None)
-}
 
 /// Whether the mark at `phase` draws anything other than its resting self.
 ///
@@ -598,7 +570,7 @@ fn roll(mut value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::ColorCapability;
+    use crate::theme::{ColorCapability, ColorMode};
     use vibex_ui::GpuiThemeMode;
 
     fn theme(mode: ColorMode, glyphs: GlyphMode) -> TuiTheme {

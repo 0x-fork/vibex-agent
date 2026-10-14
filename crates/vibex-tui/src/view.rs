@@ -2932,6 +2932,12 @@ fn render_gutter(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTh
 /// the Braille cell, one step per animation tick, in the theme's primary — or
 /// green when the session continues itself. Idle is not animated at all, so a
 /// glance at the band cannot mistake "nothing is happening" for progress.
+///
+/// The label beside the mark wears the light the desktop's live timeline rows
+/// wear: a soft band crossing the words, one lap every 1200 ms, for as long as
+/// the work is in flight ([`crate::shimmer`]). It is the same statement the
+/// spinner makes, on the surface a reader actually reads — and it is drawn only
+/// on the running arm, because a band waiting on the reader is not work.
 fn render_turn_status(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2953,7 +2959,7 @@ fn render_turn_status(
     // of an answer arriving is the turn, and the band must not go idle under it.
     let live = running || app.transcript_animating();
 
-    let (icon, label, color) = if approvals + questions > 0 {
+    let (icon, label, color, in_flight) = if approvals + questions > 0 {
         (
             crate::glyphs::diamond_filled(tier),
             format!(
@@ -2962,6 +2968,7 @@ fn render_turn_status(
                 strings.elicitation_title()
             ),
             theme.roles.accent_attention,
+            false,
         )
     } else if live {
         (
@@ -2972,6 +2979,7 @@ fn render_turn_status(
             ),
             turn_label(app, strings),
             running_mark_colour(app, theme),
+            true,
         )
     } else {
         // Idle is a fact, not an animation: a plain mark in the dim grey, so a
@@ -2984,6 +2992,7 @@ fn render_turn_status(
             },
             strings.idle().to_string(),
             theme.roles.gray_dim,
+            false,
         )
     };
 
@@ -2992,10 +3001,24 @@ fn render_turn_status(
     // fast it is writing. A band that is not about a running turn — idle, or
     // waiting on the reader — says only what it is; the measurements belong to
     // work that is actually happening.
-    let mut line = vec![
-        Span::styled(format!("{icon} "), Style::default().fg(color)),
-        Span::styled(label, Style::default().fg(theme.roles.gray)),
-    ];
+    //
+    // The label is the light's own width: it is cut to the columns left after
+    // the mark, so a lap always completes over what the reader can see rather
+    // than spending half of itself off the edge.
+    let prefix = format!("{icon} ");
+    let label = truncate_to_width(
+        &label,
+        usize::from(area.width).saturating_sub(display_width(&prefix)),
+        "…",
+    );
+    let mut line = vec![Span::styled(prefix, Style::default().fg(color))];
+    line.extend(crate::shimmer::spans(
+        &label,
+        theme.roles.gray,
+        theme,
+        phase,
+        in_flight && app.settings.motion,
+    ));
     let measure = Style::default().fg(theme.roles.gray_dim);
     let measure_part = |line: &mut Vec<Span<'static>>, text: String| {
         line.push(Span::styled(" · ", measure));

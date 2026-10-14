@@ -16,6 +16,7 @@
 //! terminal_image the picture a terminal draws for itself, when it can
 //! theme     design tokens → terminal colour with truecolor/256/16/none degradation
 //! text      grapheme-correct measurement, wrapping with joiners, bidi order
+//! shimmer   the light that crosses a label while work is in flight
 //! locale    en / zh-CN / zh-TW product copy
 //! attachment an attachment's place in the message, drawn back as a placeholder
 //! keymap    one binding table per scope: dispatch + key bar + help
@@ -75,6 +76,7 @@ pub mod scramble;
 pub mod search;
 pub mod sessions;
 pub mod settings;
+pub mod shimmer;
 pub mod sidebar_icons;
 mod team;
 pub mod terminal;

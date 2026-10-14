@@ -5919,6 +5919,120 @@ fn the_turn_line_reports_what_the_running_turn_has_done() {
     );
 }
 
+/// The ink under `needle` on whichever row of `buffer` draws it.
+///
+/// The turn line is a sentence, so the label is only the head of it: a light
+/// crossing the label has to be read off the columns the words themselves
+/// occupy rather than off the whole row.
+fn label_inks(buffer: &ratatui::buffer::Buffer, needle: &str) -> Vec<ratatui::style::Color> {
+    let row_text = |row: u16| {
+        (0..buffer.area.width)
+            .map(|column| {
+                buffer
+                    .cell((column, row))
+                    .map(|cell| cell.symbol().to_string())
+                    .unwrap_or_default()
+            })
+            .collect::<String>()
+    };
+    for row in 0..buffer.area.height {
+        let text = row_text(row);
+        let Some(byte) = text.find(needle) else {
+            continue;
+        };
+        let start = vibex_tui::text::display_width(&text[..byte]);
+        return (start..start + vibex_tui::text::display_width(needle))
+            .map(|column| {
+                buffer
+                    .cell((column as u16, row))
+                    .and_then(|cell| cell.style().fg)
+                    .expect("the label is drawn without ink")
+            })
+            .collect();
+    }
+    panic!("{needle:?} is not on screen");
+}
+
+/// A session page with one running turn whose answer is still arriving.
+fn running_turn_line() -> App {
+    let session_id = vibex_core::VibexSessionId::new();
+    let correlation = vibex_core::CorrelationId::new();
+    let mut user = seeded_item(
+        &session_id,
+        1,
+        vibex_core::TimelineItemKind::UserMessage,
+        vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+            text: "question".into(),
+            attachments: Vec::new(),
+            ..Default::default()
+        }),
+    );
+    user.correlation_id = Some(correlation.clone());
+    let mut delta = seeded_item(
+        &session_id,
+        2,
+        vibex_core::TimelineItemKind::AgentMessage,
+        vibex_core::TimelinePayload::AgentMessageDelta(vibex_core::AgentMessageDeltaPayload {
+            text_delta: "the answer".into(),
+            chunk_index: 0,
+            phase: Some(vibex_core::AgentMessagePhase::FinalAnswer),
+        }),
+    );
+    delta.correlation_id = Some(correlation);
+    let mut app = app(120, 30);
+    app.navigate_to(Page::Agent);
+    let mut session = seeded_session("session_shimmer01", "the light on its own line");
+    session.id = session_id.clone();
+    session.state = vibex_core::AgentSessionState::Running;
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(session_id.clone());
+    app.agent.state.active_session.resolve(session);
+    app.agent
+        .state
+        .timeline
+        .replace_authoritative(session_id, vec![user, delta]);
+    app.sync_transcript();
+    app
+}
+
+#[test]
+fn the_live_turn_line_carries_a_light_and_gives_it_up_with_motion() {
+    // The desktop's live labels carry a band of light across their words, and
+    // the turn line is that same statement on this surface: the phase a reader
+    // is already reading, with the light the desktop draws over it.
+    let mut app = running_turn_line();
+    let label = app.strings.phase_generating().to_string();
+
+    // The top of a lap is the plain label, and the next frame has lit its head:
+    // the movement is in the ink, and the words stay where they were.
+    let first = label_inks(&render_buffer(&mut app, 120, 30), &label);
+    assert_eq!(first.len(), vibex_tui::text::display_width(&label));
+    assert!(
+        app.advance_transcript_animation(),
+        "the clock stopped over a running turn"
+    );
+    let second = label_inks(&render_buffer(&mut app, 120, 30), &label);
+    assert_ne!(first, second, "the live turn line did not move");
+    let screen = text(&render(&mut app, 120, 30));
+    assert!(screen.contains(&label), "{screen}");
+
+    // Motion off is the reader's answer, and it is the whole band: the turn's
+    // clock keeps running, while the label it crosses holds still.
+    use vibex_tui::settings::SettingRow;
+    let mut still = running_turn_line();
+    assert!(still.apply_setting_value(SettingRow::Motion, "off"));
+    let first = label_inks(&render_buffer(&mut still, 120, 30), &label);
+    assert!(
+        first.iter().all(|ink| *ink == still.theme.roles.gray),
+        "Motion off drew a light: {first:?}"
+    );
+    assert!(still.advance_transcript_animation());
+    let second = label_inks(&render_buffer(&mut still, 120, 30), &label);
+    assert_eq!(first, second, "the light ran with Motion off");
+}
+
 #[test]
 fn scrolling_down_stops_at_the_bottom_of_the_session() {
     use vibex_desktop_model::TimelineRowKind;
