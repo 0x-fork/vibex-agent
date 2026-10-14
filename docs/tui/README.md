@@ -403,6 +403,14 @@ Typing `/`, `@` or `$` opens a drawer above the composer: two full-width rules,
 no corners, the match count on the top rule, and the composer's own arrow as the
 selection marker so the highlighted row lines up with the text being typed.
 
+`/` and `@` open the same panels the desktop popup has, and the header row above
+the rows names them: `/` carries the Agent's commands and the reusable Prompts,
+`@` the workspace files and the Agent delegation list. `←`/`→` — or a click on a
+name — switch panels, and the switch is local: one discovery answer carries every
+list, so moving between them never asks the authority again. At the first or last
+panel the key is not the drawer's, so the caret keeps its usual movement inside
+the query being edited. `$` has a single Skills panel and keeps the plain arrows.
+
 ### Shortcut band
 
 Keys and labels are separated by middots. The row belongs to the pages that are

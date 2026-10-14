@@ -459,6 +459,13 @@ strings! {
     composer_command_menu => { "Commands", "命令", "命令" },
     composer_file_menu => { "Files", "文件", "檔案" },
     composer_skill_menu => { "Skills", "技能", "技能" },
+    // The panels of the `/` and `@` drawers, named as the desktop popup names
+    // them. `Commands` and `Skills` reuse the words above, so the drawer and the
+    // empty composer's vocabulary cannot drift apart.
+    composer_tab_phrases => { "Quick phrases", "快捷短语", "快捷短語" },
+    composer_tab_files => { "Workspace files", "工作区文件", "工作區檔案" },
+    composer_tab_delegation => { "Agent delegation", "Agent 委派", "Agent 委派" },
+    composer_phrases_empty => { "No quick phrases yet", "还没有快捷短语", "還沒有快捷短語" },
     composer_no_matches => { "No matches", "没有匹配项", "沒有符合項目" },
 
     // ---- the panel that explains a collapsed chip -----------------------

@@ -1395,6 +1395,9 @@ pub struct FrameRegions {
     /// takes the cursor, and a second press on a pairing row opens it.
     pub device_tabs: Vec<(ratatui::layout::Rect, crate::device_center::DeviceTab)>,
     pub device_rows: Vec<(ratatui::layout::Rect, usize)>,
+    /// The completion drawer's panel names, while a `/` or `@` drawer is open.
+    /// A name switches the panel the same way `←`/`→` do.
+    pub completion_tabs: Vec<(ratatui::layout::Rect, crate::composer::CompletionTab)>,
     /// The runtime switcher's rows, when it is the modal on screen. Its cursor
     /// indexes a window rather than a rect, so the region carries where the
     /// window started as well as where it was drawn.
@@ -1426,6 +1429,7 @@ impl FrameRegions {
         self.config_buttons.clear();
         self.device_tabs.clear();
         self.device_rows.clear();
+        self.completion_tabs.clear();
         self.runtime_picker = None;
         self.palette = None;
         // A list, a banner row, a composer's box and a modal's close affordance

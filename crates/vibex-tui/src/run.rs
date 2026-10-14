@@ -1104,6 +1104,22 @@ fn dispatch_completions(app: &mut App, worker: &Worker) {
     }
 }
 
+/// The tag a completion row wears for the kind of entry it is.
+///
+/// The same words the desktop popup prints beside the same rows, so the two
+/// clients describe one discovery answer with one vocabulary; `ClientBuiltin`
+/// is the one variant whose name the code and the reader disagree about.
+fn completion_source_label(source_kind: vibex_core::AgentCommandSourceKind) -> &'static str {
+    use vibex_core::AgentCommandSourceKind;
+    match source_kind {
+        AgentCommandSourceKind::Provider => "Provider",
+        AgentCommandSourceKind::Prompt => "Prompt",
+        AgentCommandSourceKind::Skill => "Skill",
+        AgentCommandSourceKind::Reference => "Reference",
+        AgentCommandSourceKind::ClientBuiltin => "Built-in",
+    }
+}
+
 /// Composer editing keys. Returns `Some(true)` to exit the program.
 fn handle_composer_key(
     app: &mut App,
@@ -1197,10 +1213,20 @@ fn handle_composer_key(
             return Ok(Some(false));
         }
         KeyCode::Left if !ctrl => {
+            // An open `/` or `@` drawer owns `←`/`→` for its panels, which is
+            // how the desktop popup answers the same keys. At the first panel
+            // the press is not the drawer's, so the caret keeps moving inside
+            // the query the reader is editing — and the drawer stays open.
+            if app.step_completion_tab(false) {
+                return Ok(Some(false));
+            }
             app.composer.move_left();
             return Ok(Some(false));
         }
         KeyCode::Right if !ctrl => {
+            if app.step_completion_tab(true) {
+                return Ok(Some(false));
+            }
             app.composer.move_right();
             return Ok(Some(false));
         }
@@ -1412,6 +1438,21 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 && let Some(outcome) = app.click_device_control(mouse.column, mouse.row)
             {
                 dispatch_all(worker, &outcome);
+                return true;
+            }
+            // The completion drawer's panel names are controls, like the strips
+            // above: a press on one switches the panel the same way `←`/`→` do.
+            // A modal covers the drawer, so its names answer only when nothing
+            // is drawn over them.
+            if app.overlay.is_none()
+                && let Some((_, tab)) = app
+                    .regions
+                    .completion_tabs
+                    .iter()
+                    .find(|(rect, _)| rect_contains(*rect, mouse.column, mouse.row))
+                    .copied()
+                && app.select_completion_tab(tab)
+            {
                 return true;
             }
             // The switcher's rows select and activate exactly as the other
@@ -2523,38 +2564,55 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             match result {
                 Ok(discovery) => {
                     if let Some(menu) = app.completion.as_mut() {
-                        // The menu has no tabs, so it shows what the popup's
-                        // lists hold in one flat list: `/` commands and Vibex
-                        // Prompts, `@` workspace files and delegation targets.
-                        // The provider's ordering is already "most relevant
-                        // first" inside each list.
-                        let mut entries = discovery
-                            .response
-                            .entries
-                            .iter()
-                            .chain(discovery.quick_phrases.iter())
-                            .chain(discovery.delegation_entries.iter())
-                            .map(|entry| {
-                                // A delegation target is described by the
-                                // account it runs as and the model it runs,
-                                // both written by the runtime; the account is
-                                // the one name this client says for itself.
-                                let detail = entry.description.clone().unwrap_or_default();
-                                crate::composer::Completion {
-                                    insert: entry.insertion_text.clone(),
-                                    label: entry.label.clone(),
-                                    detail: crate::transcript::runtime_attribution_line(
-                                        app.strings,
-                                        &detail,
-                                    ),
-                                    group: format!("{:?}", entry.source_kind),
-                                }
-                            })
-                            .collect::<Vec<_>>();
-                        entries.dedup_by(|left, right| left.insert == right.insert);
-                        menu.items = entries;
+                        // Each panel gets the list the authority resolved for it,
+                        // which arrived whole in this one answer — the same
+                        // division the desktop popup draws. The provider's
+                        // ordering is already "most relevant first" inside each
+                        // list, so nothing is re-sorted here.
+                        let rows = |entries: &[vibex_core::AgentCommandEntry]| {
+                            let mut rows = entries
+                                .iter()
+                                .map(|entry| {
+                                    // A delegation target is described by the
+                                    // account it runs as and the model it runs,
+                                    // both written by the runtime; the account
+                                    // is the one name this client says for
+                                    // itself.
+                                    let detail = entry.description.clone().unwrap_or_default();
+                                    crate::composer::Completion {
+                                        insert: entry.insertion_text.clone(),
+                                        label: entry.label.clone(),
+                                        detail: crate::transcript::runtime_attribution_line(
+                                            app.strings,
+                                            &detail,
+                                        ),
+                                        group: completion_source_label(entry.source_kind)
+                                            .to_string(),
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            rows.dedup_by(|left, right| left.insert == right.insert);
+                            rows
+                        };
+                        match menu.trigger {
+                            crate::composer::CompletionTrigger::Slash => {
+                                menu.lists.commands = rows(&discovery.response.entries);
+                                menu.lists.phrases = rows(&discovery.quick_phrases);
+                            }
+                            crate::composer::CompletionTrigger::At => {
+                                menu.lists.files = rows(&discovery.response.entries);
+                                menu.lists.delegation = rows(&discovery.delegation_entries);
+                            }
+                            crate::composer::CompletionTrigger::Dollar => {
+                                menu.lists.commands = rows(&discovery.response.entries);
+                            }
+                        }
                         menu.loading = false;
-                        menu.selected = menu.selected.min(menu.items.len().saturating_sub(1));
+                        // The reader may have typed past the row the drawer had
+                        // highlighted while this answer travelled.
+                        menu.reseat(menu.query.clone());
+                        let rows = menu.items().len();
+                        menu.selected = menu.selected.min(rows.saturating_sub(1));
                     }
                 }
                 Err(error) => {
@@ -2849,7 +2907,7 @@ mod tests {
         app.refresh_completion();
         {
             let menu = app.completion.as_mut().expect("a completion menu");
-            menu.items = vec![crate::composer::Completion {
+            menu.lists.commands = vec![crate::composer::Completion {
                 insert: "/compact ".to_string(),
                 label: "compact".to_string(),
                 detail: "Compact the conversation".to_string(),
@@ -2877,7 +2935,7 @@ mod tests {
         app.composer.set_text("testest /com");
         app.refresh_completion();
         let menu = app.completion.as_mut().expect("a completion menu");
-        menu.items.clear();
+        menu.lists.commands.clear();
         menu.loading = false;
         assert_eq!(
             handle_composer_key(
@@ -5451,7 +5509,7 @@ mod tests {
         app.refresh_completion();
         {
             let menu = app.completion.as_mut().expect("a completion menu");
-            menu.items = vec![crate::composer::Completion {
+            menu.lists.commands = vec![crate::composer::Completion {
                 insert: "/compact ".to_string(),
                 label: "compact".to_string(),
                 detail: "Compact the conversation".to_string(),
@@ -5487,6 +5545,116 @@ mod tests {
                 "column {column} of the drawer is not on the theme's surface"
             );
         }
+    }
+
+    #[test]
+    fn the_drawer_names_its_panels_and_marks_the_one_showing() {
+        // The panels are the desktop popup's, and a reader who cannot see which
+        // one is lit has no way to know what `←`/`→` would change. The active
+        // name wears the accent fill the other tab strips use, and the trigger's
+        // own sigil closes the row.
+        let mut app = isolation_app();
+        app.resize(100, 30);
+        app.perform(crate::action::Intent::NewSession);
+        app.focus = crate::app::Focus::Composer;
+        app.composer.set_text("testest /");
+        app.refresh_completion();
+        {
+            let menu = app.completion.as_mut().expect("a completion menu");
+            let row = |label: &str| crate::composer::Completion {
+                insert: format!("{label} "),
+                label: label.to_string(),
+                detail: String::new(),
+                group: "Command".to_string(),
+            };
+            menu.lists.commands = vec![row("/compact")];
+            menu.lists.phrases = vec![row("/review")];
+            menu.loading = false;
+            menu.reseat(menu.query.clone());
+        }
+        let accent = app.theme.roles.accent_user;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::view::render(frame, &mut app))
+            .expect("the drawer draws");
+        let buffer = terminal.backend().buffer();
+        let row_text = |row: u16| -> String {
+            (0..buffer.area.width)
+                .map(|column| {
+                    buffer
+                        .cell((column, row))
+                        .map(|cell| cell.symbol())
+                        .unwrap_or(" ")
+                })
+                .collect()
+        };
+        let header = (0..buffer.area.height)
+            .find(|row| {
+                let text = row_text(*row);
+                text.contains("Commands") && text.contains("Quick phrases")
+            })
+            .expect("the panel header is not on screen");
+        let header_text = row_text(header);
+        assert!(header_text.contains('/'), "the trigger sigil is missing");
+        // A terminal that cannot paint the accent keeps `BOLD` as the mark, so
+        // that is what the test reads; where the palette can paint, the fill is
+        // the accent the other tab strips use.
+        let marked = |name: &str| {
+            let column = header_text.find(name).expect("the panel name") as u16;
+            let cell = buffer.cell((column, header)).expect("the panel's own cell");
+            (
+                cell.style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD),
+                cell.style().bg,
+            )
+        };
+        let (bold, fill) = marked("Commands");
+        assert!(bold, "the panel showing wears no mark");
+        if accent != ratatui::style::Color::Reset {
+            assert_eq!(fill, Some(accent), "the panel showing wears no accent fill");
+        }
+        let (bold, _) = marked("Quick phrases");
+        assert!(!bold, "a panel that is not showing wears the active mark");
+
+        // Switching panels moves the mark with the rows.
+        assert!(app.select_completion_tab(crate::composer::CompletionTab::Phrases));
+        terminal
+            .draw(|frame| crate::view::render(frame, &mut app))
+            .expect("the drawer draws");
+        let buffer = terminal.backend().buffer();
+        let row_text = |row: u16| -> String {
+            (0..buffer.area.width)
+                .map(|column| {
+                    buffer
+                        .cell((column, row))
+                        .map(|cell| cell.symbol())
+                        .unwrap_or(" ")
+                })
+                .collect()
+        };
+        let header = (0..buffer.area.height)
+            .find(|row| {
+                let text = row_text(*row);
+                text.contains("Commands") && text.contains("Quick phrases")
+            })
+            .expect("the panel header is not on screen");
+        let header_text = row_text(header);
+        let marked = |name: &str| {
+            let column = header_text.find(name).expect("the panel name") as u16;
+            buffer.cell((column, header)).is_some_and(|cell| {
+                cell.style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            })
+        };
+        assert!(marked("Quick phrases"));
+        assert!(!marked("Commands"));
+        assert!(
+            (0..buffer.area.height).any(|row| row_text(row).contains("/review")),
+            "the panel's own rows are not drawn"
+        );
     }
 
     #[test]
@@ -5759,10 +5927,198 @@ mod tests {
             },
         )
         .unwrap();
-        let items = &app.completion.as_ref().expect("a completion menu").items;
+        let items = &app.completion.as_ref().expect("a completion menu").items();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].detail, "Agent 账户 - you@example.com · gpt-5");
+        // The reference is a workspace file's panel sibling: an `@` answer fills
+        // the files and the delegation panels, not the commands one.
+        assert_eq!(
+            app.completion.as_ref().unwrap().active_tab(),
+            crate::composer::CompletionTab::Files
+        );
     }
+
+    /// One discovery entry, as the authority would hand it over.
+    fn discovered_entry(
+        label: &str,
+        source_kind: vibex_core::AgentCommandSourceKind,
+    ) -> vibex_core::AgentCommandEntry {
+        vibex_core::AgentCommandEntry {
+            id: format!("test:{label}"),
+            trigger: vibex_core::AgentCommandTrigger::Slash,
+            source_kind,
+            label: label.to_string(),
+            description: Some(format!("{label} description")),
+            insertion_text: format!("{label} "),
+            command_name: None,
+            provider_kind: None,
+            prompt_id: None,
+            skill_id: None,
+            reference_path: None,
+            selection_behavior: vibex_core::AgentCommandSelectionBehavior::Insert,
+            execution_behavior: vibex_core::AgentCommandExecutionBehavior::None,
+            destructive: false,
+            metadata: Vec::new(),
+        }
+    }
+
+    /// Answer the open drawer with the two `/` panels, as one discovery does.
+    fn answer_slash_discovery(app: &mut App, worker: &Worker) {
+        use vibex_core::AgentCommandSourceKind;
+        let ticket = app.composer_ticket();
+        let discovery = vibex_core::AgentCommandDiscovery {
+            response: vibex_core::AgentCommandDiscoverResponse {
+                entries: vec![discovered_entry(
+                    "/compact",
+                    AgentCommandSourceKind::Provider,
+                )],
+                diagnostics: Vec::new(),
+            },
+            slash_commands: true,
+            skills: true,
+            quick_phrases: vec![discovered_entry("/review", AgentCommandSourceKind::Prompt)],
+            delegation_entries: Vec::new(),
+        };
+        apply_message(
+            app,
+            worker,
+            AppMessage::Completions {
+                ticket,
+                result: Ok(Box::new(discovery)),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_drawer_opens_the_desktops_panels_and_the_arrow_keys_switch_them() {
+        // The `/` drawer is the desktop popup's: a panel of commands and a panel
+        // of reusable Prompts, both from the one discovery answer, with `←`/`→`
+        // moving between them. The panels used to be flattened into a single
+        // list, so the reader could not reach the Prompts at all once the
+        // commands filled the bound.
+        let worker = isolation_worker();
+        let mut app = test_app(120, 32);
+        app.composer.set_text("/ab");
+        app.refresh_completion();
+        answer_slash_discovery(&mut app, &worker);
+
+        let menu = app.completion.as_ref().expect("a completion menu");
+        assert_eq!(menu.active_tab(), crate::composer::CompletionTab::Commands);
+        assert_eq!(menu.items()[0].label, "/compact");
+
+        // `Right` switches to the phrases panel, which the same answer filled.
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let menu = app.completion.as_ref().expect("a completion menu");
+        assert_eq!(menu.active_tab(), crate::composer::CompletionTab::Phrases);
+        assert_eq!(menu.items()[0].label, "/review");
+        // The key was the drawer's, so the caret never moved: the next character
+        // lands at the end of the draft.
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "/abX");
+
+        // `Left` walks back to the first panel.
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            app.completion.as_ref().unwrap().active_tab(),
+            crate::composer::CompletionTab::Commands
+        );
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "/abXY");
+
+        // At the first panel `Left` is not the drawer's key: the caret keeps its
+        // usual movement, which the next character proves by landing before the
+        // one it stepped over.
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "/abXZY");
+    }
+
+    #[test]
+    fn a_skills_drawer_keeps_its_single_panel_and_its_plain_arrows() {
+        // `$` has one Skills panel, so `←`/`→` stay the caret's keys there and
+        // the drawer draws no header to switch.
+        let worker = isolation_worker();
+        let mut app = test_app(120, 32);
+        app.composer.set_text("$ab");
+        app.refresh_completion();
+        let ticket = app.composer_ticket();
+        let discovery = vibex_core::AgentCommandDiscovery {
+            response: vibex_core::AgentCommandDiscoverResponse {
+                entries: vec![discovered_entry(
+                    "$deploy",
+                    vibex_core::AgentCommandSourceKind::Skill,
+                )],
+                diagnostics: Vec::new(),
+            },
+            slash_commands: true,
+            skills: true,
+            quick_phrases: Vec::new(),
+            delegation_entries: Vec::new(),
+        };
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Completions {
+                ticket,
+                result: Ok(Box::new(discovery)),
+            },
+        )
+        .unwrap();
+        let menu = app.completion.as_ref().expect("a completion menu");
+        assert_eq!(menu.active_tab(), crate::composer::CompletionTab::Commands);
+        assert!(!menu.tabs_available());
+        assert_eq!(menu.items()[0].label, "$deploy");
+
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "$abX");
+        assert_eq!(
+            app.completion.as_ref().unwrap().active_tab(),
+            crate::composer::CompletionTab::Commands
+        );
+    }
+
     #[test]
     fn remembered_default_and_late_catalogue_do_not_block_creation_recovery() {
         use crate::action::Intent;

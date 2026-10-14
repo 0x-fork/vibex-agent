@@ -4584,7 +4584,7 @@ fn render_composer(
     }
 
     if let Some(menu) = app.completion.clone() {
-        render_completion(frame, area, app, theme, &menu);
+        render_completion(frame, area, app, theme, strings, &menu);
     } else if app.composer_mode == ComposerMode::HistorySearch {
         render_history_search(frame, area, app, theme, strings);
     }
@@ -4781,22 +4781,33 @@ fn render_composer_info(
 /// belongs to, and would read as a separate window; two rules read as a drawer
 /// pulled out of the prompt. The count on the top rule says how much is behind
 /// it, which a border title cannot.
+///
+/// A trigger with more than one panel — `/` and `@` — opens with a header row
+/// naming them under that rule, and the drawer stays up while the panel the
+/// reader chose has nothing to offer: a drawer that closed on an empty panel
+/// would take the panels with it, and `←` could never reach the list that does
+/// match.
 fn render_completion(
     frame: &mut Frame<'_>,
     anchor: Rect,
-    app: &App,
+    app: &mut App,
     theme: &TuiTheme,
+    strings: Strings,
     menu: &crate::composer::CompletionMenu,
 ) {
     let indices = menu.visible();
-    if indices.is_empty() {
-        // No "no matches" state: the drawer simply closes, which is what the
-        // reader expects when the query stops matching anything.
+    let tabbed = menu.tabs_available();
+    if indices.is_empty() && !tabbed {
+        // No "no matches" state for a trigger with one panel: the drawer simply
+        // closes, which is what the reader expects when the query stops matching
+        // anything.
         return;
     }
     let tier = app.glyph_tier();
     let rows = indices.len().min(crate::composer::MAX_VISIBLE_COMPLETIONS);
-    let height = rows as u16 + 2;
+    let header = usize::from(tabbed);
+    let body_rows = rows.max(usize::from(tabbed));
+    let height = (header + body_rows + 2) as u16;
     if anchor.y < height {
         return;
     }
@@ -4814,12 +4825,6 @@ fn render_completion(
     frame.render_widget(Block::default().style(surface), area);
 
     let rule_style = Style::default().fg(theme.roles.gray_dim);
-    let title = match menu.trigger {
-        crate::composer::CompletionTrigger::Slash => strings_group(menu, 0),
-        crate::composer::CompletionTrigger::At => "".to_string(),
-        crate::composer::CompletionTrigger::Dollar => "".to_string(),
-    };
-    let _ = title;
 
     // Top rule, with the match count right-aligned on it.
     let mut top = vec![Span::styled(
@@ -4828,7 +4833,7 @@ fn render_completion(
     )];
     let count = format!(" {}/{} ", menu.selected + 1, indices.len());
     let count_width = display_width(&count);
-    if usize::from(area.width) > count_width + 4 {
+    if !indices.is_empty() && usize::from(area.width) > count_width + 4 {
         let cut = usize::from(area.width) - count_width;
         top = vec![
             Span::styled("─".repeat(cut), rule_style),
@@ -4854,25 +4859,120 @@ fn render_completion(
     );
 
     let body = Rect {
-        y: area.y + 1,
-        height: area.height.saturating_sub(2),
+        y: area.y + 1 + header as u16,
+        height: body_rows as u16,
         ..area
     };
+    if tabbed {
+        render_completion_tabs(
+            frame,
+            Rect {
+                y: area.y + 1,
+                height: 1,
+                ..area
+            },
+            app,
+            theme,
+            strings,
+            menu,
+            surface,
+        );
+    }
+    if indices.is_empty() {
+        let message = if menu.loading {
+            strings.loading()
+        } else if menu.active_tab() == crate::composer::CompletionTab::Phrases
+            && menu.query.trim().is_empty()
+        {
+            strings.composer_phrases_empty()
+        } else {
+            strings.composer_no_matches()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  {message}"),
+                Style::default().fg(theme.roles.gray_dim),
+            )))
+            .style(surface),
+            body,
+        );
+        return;
+    }
     let lines = indices
         .iter()
         .take(rows)
-        .map(|index| {
-            completion_row(
-                menu,
-                *index,
-                usize::from(body.width),
-                theme,
-                tier,
-                strings_of(app),
-            )
-        })
+        .map(|index| completion_row(menu, *index, usize::from(body.width), theme, tier))
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(lines)).style(surface), body);
+}
+
+/// The drawer's panel header: one name per panel the trigger opens.
+///
+/// The active name is filled with the accent the way the devices page and the
+/// configuration centre mark their own strips, and the trigger's sigil sits on
+/// the right naming which drawer this is. Each name is published as a click
+/// region, so the pointer runs the same switch `←`/`→` do.
+fn render_completion_tabs(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+    menu: &crate::composer::CompletionMenu,
+    surface: Style,
+) {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0u16;
+    for tab in menu.tabs() {
+        let active = *tab == menu.active_tab();
+        let label = format!(" {} ", completion_tab_label(*tab, strings));
+        let width = display_width(&label) as u16;
+        if used + width > area.width {
+            break;
+        }
+        let style = if active {
+            Style::default()
+                .fg(theme.roles.background)
+                .bg(theme.roles.accent_user)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.roles.gray)
+        };
+        app.regions.completion_tabs.push((
+            Rect {
+                x: area.x + used,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            *tab,
+        ));
+        spans.push(Span::styled(label, style));
+        used += width;
+    }
+    let sigil = format!("{}  ", menu.trigger.character());
+    let sigil_width = display_width(&sigil) as u16;
+    if used + sigil_width < area.width {
+        spans.push(Span::raw(
+            " ".repeat(usize::from(area.width - used - sigil_width)),
+        ));
+        spans.push(Span::styled(
+            sigil,
+            Style::default().fg(theme.roles.gray_dim),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(surface), area);
+}
+
+/// One panel's name, in the reader's language.
+fn completion_tab_label(tab: crate::composer::CompletionTab, strings: Strings) -> &'static str {
+    use crate::composer::CompletionTab;
+    match tab {
+        CompletionTab::Commands => strings.composer_command_menu(),
+        CompletionTab::Phrases => strings.composer_tab_phrases(),
+        CompletionTab::Files => strings.composer_tab_files(),
+        CompletionTab::Delegation => strings.composer_tab_delegation(),
+    }
 }
 
 /// One completion row.
@@ -4886,9 +4986,8 @@ fn completion_row(
     width: usize,
     theme: &TuiTheme,
     tier: crate::glyphs::GlyphTier,
-    strings: Strings,
 ) -> Line<'static> {
-    let Some(item) = menu.items.get(index) else {
+    let Some(item) = menu.items().get(index) else {
         return Line::from("");
     };
     let selected = index == menu.selected;
@@ -4931,16 +5030,7 @@ fn completion_row(
         spans.push(Span::styled("  ", detail_style));
         spans.push(Span::styled(detail, detail_style));
     }
-    let _ = strings;
     Line::from(spans)
-}
-
-fn strings_group(_menu: &crate::composer::CompletionMenu, _index: usize) -> String {
-    String::new()
-}
-
-fn strings_of(_app: &App) -> Strings {
-    Strings::for_locale(crate::locale::Locale::En)
 }
 
 /// The configuration centre: modules, areas, records and the detail pane.
@@ -8686,13 +8776,16 @@ fn render_text_view(
     scroll: usize,
     theme: &TuiTheme,
 ) {
+    // The modal chrome's hints are the only copy this view needs, and the app
+    // already carries the reader's own table.
+    let strings = app.strings;
     let chrome = modal_chrome(
         app,
         title,
         ModalSizing::document(),
         vec![
-            ModalHint::new("↑↓", strings_of(app).hint_scroll()),
-            ModalHint::new("Esc", strings_of(app).close()),
+            ModalHint::new("↑↓", strings.hint_scroll()),
+            ModalHint::new("Esc", strings.close()),
         ],
     );
     let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {

@@ -878,7 +878,8 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     // The completion drawer is walked with the arrow keys while it is open;
     // these two are the explicit chords, and they deliberately stay off
     // `Ctrl+N`/`Ctrl+P` so the global command palette keeps working while the
-    // composer owns the keyboard.
+    // composer owns the keyboard. `←`/`→` switch the drawer's panels and are
+    // read before this table, so they are not bindings of their own.
     binding(
         Scope::Composer,
         Chord::new(KeyCode::Up, KeyModifiers::ALT),

@@ -20,7 +20,7 @@ use crate::app::{
     PendingCreation, PromptField, RunOption, RunOptionKey, RunOptionKind, RuntimePickerView, Toast,
     WorkspacePickerRow,
 };
-use crate::composer::{CompletionMenu, CompletionTrigger};
+use crate::composer::{CompletionLists, CompletionMenu, CompletionTab, CompletionTrigger};
 use crate::keymap::Scope;
 use crate::runtime_picker::{PICKER_PAGE_ROWS, RuntimePickerRow};
 use crate::schedule::ScheduleEditTarget;
@@ -4888,6 +4888,28 @@ impl App {
         menu.selected = matches[next];
     }
 
+    /// `Left`/`Right` on an open `/` or `@` drawer moves between its panels.
+    ///
+    /// Returns whether the press changed the panel. At the edge in that
+    /// direction the key is *not* consumed: the caret keeps its usual movement
+    /// inside the `/query` being edited, which is also what the desktop
+    /// composer answers the same popup with.
+    pub fn step_completion_tab(&mut self, forward: bool) -> bool {
+        self.completion
+            .as_mut()
+            .is_some_and(|menu| menu.step_tab(forward))
+    }
+
+    /// Switch to `tab` from a click on the drawer's header.
+    ///
+    /// A single-panel trigger has no header, so a click on a panel name it does
+    /// not draw changes nothing.
+    pub fn select_completion_tab(&mut self, tab: CompletionTab) -> bool {
+        self.completion
+            .as_mut()
+            .is_some_and(|menu| menu.select_tab(tab))
+    }
+
     fn accept_completion(&mut self) -> Outcome {
         let Some(menu) = self.completion.clone() else {
             return Outcome::quiet();
@@ -4919,7 +4941,14 @@ impl App {
                             trigger,
                             start,
                             query: query.clone(),
-                            items: Vec::new(),
+                            lists: CompletionLists::default(),
+                            // The panels follow the trigger, so the drawer opens
+                            // on the trigger's own first panel whatever the
+                            // previous one was showing.
+                            tab: CompletionTab::tabs(trigger)
+                                .first()
+                                .copied()
+                                .unwrap_or_default(),
                             selected: 0,
                             loading: true,
                         });

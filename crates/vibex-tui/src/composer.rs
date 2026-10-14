@@ -53,6 +53,86 @@ pub struct Completion {
     pub group: String,
 }
 
+/// Which panel of an open completion drawer is showing.
+///
+/// A `/` drawer carries the Agent's commands and the reusable Prompts; an `@`
+/// drawer carries the workspace files and the collaborators a reader may hand
+/// work to. `$` keeps its single Skills panel, which is [`Self::Commands`]'
+/// list, so a trigger without panels still has one — the same shape the desktop
+/// popup has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompletionTab {
+    #[default]
+    Commands,
+    Phrases,
+    Files,
+    Delegation,
+}
+
+impl CompletionTab {
+    /// The panels a trigger opens, in header order.
+    pub const fn tabs(trigger: CompletionTrigger) -> &'static [Self] {
+        match trigger {
+            CompletionTrigger::Slash => &[Self::Commands, Self::Phrases],
+            CompletionTrigger::At => &[Self::Files, Self::Delegation],
+            CompletionTrigger::Dollar => &[Self::Commands],
+        }
+    }
+
+    /// Stable identifier, for a click region or a test that names a panel.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Commands => "commands",
+            Self::Phrases => "phrases",
+            Self::Files => "files",
+            Self::Delegation => "delegation",
+        }
+    }
+
+    /// The panel one `Left` (`forward == false`) or `Right` press moves to.
+    ///
+    /// A trigger's panels clamp instead of wrapping, so a press that cannot
+    /// change the panel answers with the one already showing: the caller reads
+    /// that as "the key was not mine" and lets the caret keep its usual
+    /// movement, exactly as the desktop composer does.
+    pub fn moved(self, tabs: &[Self], forward: bool) -> Self {
+        let Some(index) = tabs.iter().position(|tab| *tab == self) else {
+            return tabs.first().copied().unwrap_or(self);
+        };
+        let next = if forward {
+            tabs.get(index + 1)
+        } else {
+            index.checked_sub(1).and_then(|index| tabs.get(index))
+        };
+        next.copied().unwrap_or(self)
+    }
+}
+
+/// The candidate lists one discovery answer carries, one per panel.
+///
+/// They are kept apart rather than flattened so a switch is local: the answer
+/// already holds every list the trigger opens, which is what keeps `←`/`→` from
+/// returning to the authority, and what lets each panel be drawn on its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompletionLists {
+    pub commands: Vec<Completion>,
+    pub phrases: Vec<Completion>,
+    pub files: Vec<Completion>,
+    pub delegation: Vec<Completion>,
+}
+
+impl CompletionLists {
+    /// The rows one panel holds.
+    pub fn rows(&self, tab: CompletionTab) -> &[Completion] {
+        match tab {
+            CompletionTab::Commands => &self.commands,
+            CompletionTab::Phrases => &self.phrases,
+            CompletionTab::Files => &self.files,
+            CompletionTab::Delegation => &self.delegation,
+        }
+    }
+}
+
 /// The open completion menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionMenu {
@@ -65,7 +145,11 @@ pub struct CompletionMenu {
     /// query the request carried; the reader keeps typing while that answer
     /// travels, so this is what the drawer filters the rows by in the meantime.
     pub query: String,
-    pub items: Vec<Completion>,
+    /// Every list the trigger's panels hold.
+    pub lists: CompletionLists,
+    /// Which panel is showing. Clamped into the trigger's own panels by
+    /// [`Self::active_tab`], so a leftover choice cannot survive a new trigger.
+    pub tab: CompletionTab,
     pub selected: usize,
     pub loading: bool,
 }
@@ -74,10 +158,68 @@ pub struct CompletionMenu {
 pub const MAX_VISIBLE_COMPLETIONS: usize = 8;
 
 impl CompletionMenu {
+    /// The panels this trigger opens, in header order.
+    pub const fn tabs(&self) -> &'static [CompletionTab] {
+        CompletionTab::tabs(self.trigger)
+    }
+
+    /// Whether the drawer has more than one panel to switch between.
+    ///
+    /// `$` opens a single Skills panel and keeps the plain caret movement its
+    /// arrow keys always had; `/` and `@` are the triggers whose panels are
+    /// worth a header row and a pair of keys.
+    pub fn tabs_available(&self) -> bool {
+        self.tabs().len() > 1
+    }
+
+    /// The panel showing, clamped into the trigger's own panels.
+    pub fn active_tab(&self) -> CompletionTab {
+        let tabs = self.tabs();
+        if tabs.contains(&self.tab) {
+            self.tab
+        } else {
+            tabs.first().copied().unwrap_or_default()
+        }
+    }
+
+    /// The rows of the panel showing.
+    pub fn items(&self) -> &[Completion] {
+        self.lists.rows(self.active_tab())
+    }
+
+    /// Switch to the next (`forward`) or previous panel.
+    ///
+    /// Returns whether the press changed anything. At the edge in that
+    /// direction the key is *not* consumed: the caret keeps its usual movement
+    /// inside the `/query` being edited, which is also what keeps the drawer
+    /// open.
+    pub fn step_tab(&mut self, forward: bool) -> bool {
+        if !self.tabs_available() {
+            return false;
+        }
+        let next = self.active_tab().moved(self.tabs(), forward);
+        self.select_tab(next)
+    }
+
+    /// Switch to `tab`, returning whether the panel changed.
+    ///
+    /// The header's click and its keys run the same switch, so a panel reached
+    /// by pointer restarts the selection exactly as one reached by `←`/`→`: the
+    /// panel is a fresh list, and an index kept from the one just left would
+    /// highlight a row the reader never chose.
+    pub fn select_tab(&mut self, tab: CompletionTab) -> bool {
+        if !self.tabs_available() || !self.tabs().contains(&tab) || self.active_tab() == tab {
+            return false;
+        }
+        self.tab = tab;
+        self.selected = self.filtered(&self.query).first().copied().unwrap_or(0);
+        true
+    }
+
     /// The indices of the candidates the query matches.
     pub fn filtered(&self, query: &str) -> Vec<usize> {
         let query = query.to_lowercase();
-        self.items
+        self.items()
             .iter()
             .enumerate()
             .filter(|(_, item)| {
@@ -125,7 +267,7 @@ impl CompletionMenu {
     pub fn selected_item(&self) -> Option<&Completion> {
         self.filtered(&self.query)
             .contains(&self.selected)
-            .then(|| self.items.get(self.selected))
+            .then(|| self.items().get(self.selected))
             .flatten()
     }
 
@@ -136,6 +278,11 @@ impl CompletionMenu {
     /// not draw, and `Enter` would insert a command they cannot see.
     pub fn reseat(&mut self, query: String) {
         self.query = query;
+        self.reseat_selection();
+    }
+
+    /// Point the selection at the first row the query still matches.
+    fn reseat_selection(&mut self) {
         let matches = self.filtered(&self.query);
         if !matches.contains(&self.selected) {
             self.selected = matches.first().copied().unwrap_or(0);
@@ -2153,20 +2300,24 @@ mod tests {
             trigger: CompletionTrigger::At,
             start: 0,
             query: "src".to_string(),
-            items: vec![
-                Completion {
-                    insert: "@crates/vibex-tui/src/run.rs ".into(),
-                    label: "@run.rs".into(),
-                    detail: "src/run.rs".into(),
-                    group: "Reference".into(),
-                },
-                Completion {
-                    insert: "@README.md ".into(),
-                    label: "@README.md".into(),
-                    detail: String::new(),
-                    group: "Reference".into(),
-                },
-            ],
+            lists: CompletionLists {
+                files: vec![
+                    Completion {
+                        insert: "@crates/vibex-tui/src/run.rs ".into(),
+                        label: "@run.rs".into(),
+                        detail: "src/run.rs".into(),
+                        group: "Reference".into(),
+                    },
+                    Completion {
+                        insert: "@README.md ".into(),
+                        label: "@README.md".into(),
+                        detail: String::new(),
+                        group: "Reference".into(),
+                    },
+                ],
+                ..CompletionLists::default()
+            },
+            tab: CompletionTab::Files,
             selected: 0,
             loading: false,
         };
@@ -2198,6 +2349,91 @@ mod tests {
         let (_, start, _) = draft.active_trigger().unwrap();
         draft.replace_trigger_word(start, "/help ");
         assert_eq!(draft.text(), "/help ");
+    }
+
+    #[test]
+    fn panels_follow_the_trigger_and_clamp_at_their_edges() {
+        // The same panels the desktop popup opens, in the same order: `/`
+        // carries the commands and the reusable Prompts, `@` the workspace
+        // files and the collaborators, and `$` keeps its one Skills panel.
+        assert_eq!(
+            CompletionTab::tabs(CompletionTrigger::Slash),
+            &[CompletionTab::Commands, CompletionTab::Phrases]
+        );
+        assert_eq!(
+            CompletionTab::tabs(CompletionTrigger::At),
+            &[CompletionTab::Files, CompletionTab::Delegation]
+        );
+        assert_eq!(
+            CompletionTab::tabs(CompletionTrigger::Dollar),
+            &[CompletionTab::Commands]
+        );
+
+        let slash = CompletionTab::tabs(CompletionTrigger::Slash);
+        assert_eq!(
+            CompletionTab::Commands.moved(slash, true),
+            CompletionTab::Phrases
+        );
+        // At the edge the panel does not move: the key is left for the caret,
+        // so `Left` on the first panel still moves inside the query.
+        assert_eq!(
+            CompletionTab::Commands.moved(slash, false),
+            CompletionTab::Commands
+        );
+        assert_eq!(
+            CompletionTab::Phrases.moved(slash, true),
+            CompletionTab::Phrases
+        );
+    }
+
+    #[test]
+    fn a_menu_keeps_one_list_per_panel_and_switches_between_them() {
+        let row = |label: &str| Completion {
+            insert: format!("{label} "),
+            label: label.to_string(),
+            detail: String::new(),
+            group: "Command".to_string(),
+        };
+        let mut menu = CompletionMenu {
+            trigger: CompletionTrigger::Slash,
+            start: 0,
+            query: String::new(),
+            lists: CompletionLists {
+                commands: vec![row("/compact"), row("/clear")],
+                phrases: vec![row("/review")],
+                ..CompletionLists::default()
+            },
+            tab: CompletionTab::Commands,
+            selected: 1,
+            loading: false,
+        };
+
+        assert!(menu.tabs_available());
+        assert_eq!(menu.active_tab(), CompletionTab::Commands);
+        assert_eq!(menu.items().len(), 2);
+
+        // The switch reads the other list, which travelled in the same answer,
+        // and the selection starts over rather than keeping the first panel's
+        // index.
+        assert!(menu.step_tab(true));
+        assert_eq!(menu.active_tab(), CompletionTab::Phrases);
+        assert_eq!(
+            menu.selected_item().map(|item| item.label.as_str()),
+            Some("/review")
+        );
+
+        // The last panel clamps, so the key is reported as unhandled.
+        assert!(!menu.step_tab(true));
+        assert!(menu.step_tab(false));
+        assert_eq!(menu.active_tab(), CompletionTab::Commands);
+
+        // A trigger with one panel has nothing to switch, whatever the menu
+        // remembers from an earlier one.
+        menu.trigger = CompletionTrigger::Dollar;
+        menu.tab = CompletionTab::Phrases;
+        assert!(!menu.tabs_available());
+        assert_eq!(menu.active_tab(), CompletionTab::Commands);
+        assert!(!menu.step_tab(true));
     }
 
     #[test]
@@ -2338,20 +2574,24 @@ mod tests {
             trigger: CompletionTrigger::Slash,
             start: 0,
             query: String::new(),
-            items: vec![
-                Completion {
-                    insert: "/help".into(),
-                    label: "help".into(),
-                    detail: "Show help".into(),
-                    group: "Commands".into(),
-                },
-                Completion {
-                    insert: "/hooks".into(),
-                    label: "hooks".into(),
-                    detail: "Manage hooks".into(),
-                    group: "Commands".into(),
-                },
-            ],
+            lists: CompletionLists {
+                commands: vec![
+                    Completion {
+                        insert: "/help".into(),
+                        label: "help".into(),
+                        detail: "Show help".into(),
+                        group: "Commands".into(),
+                    },
+                    Completion {
+                        insert: "/hooks".into(),
+                        label: "hooks".into(),
+                        detail: "Manage hooks".into(),
+                        group: "Commands".into(),
+                    },
+                ],
+                ..CompletionLists::default()
+            },
+            tab: CompletionTab::Commands,
             selected: 0,
             loading: false,
         };
