@@ -13651,6 +13651,50 @@ impl MobileApp {
                         );
                     }),
                 );
+                // The desktop keeps this preference per project; the phone
+                // only read it, so a project could be stuck starting every
+                // session in a new worktree with no way to say otherwise here.
+                let location_project_id = row.id().to_string();
+                let starts_in_worktree = self
+                    .sidebar_view
+                    .project_location_preferences
+                    .get(row.id())
+                    .is_some_and(|location| *location == NewSessionLocation::NewWorktree);
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-project-default-location",
+                    if starts_in_worktree {
+                        locale::text(
+                            "Start sessions in the checkout",
+                            "默认在当前检出中开始",
+                            "預設在目前檢出中開始",
+                        )
+                        .to_string()
+                    } else {
+                        locale::text(
+                            "Start sessions in a new worktree",
+                            "默认在新建 Worktree 中开始",
+                            "預設在新建 Worktree 中開始",
+                        )
+                        .to_string()
+                    },
+                    false,
+                    Box::new(move |this, _, cx| {
+                        let next = if starts_in_worktree {
+                            vibex_core::RemoteSidebarNewSessionLocation::CurrentCheckout
+                        } else {
+                            vibex_core::RemoteSidebarNewSessionLocation::NewWorktree
+                        };
+                        this.send_sidebar_mutation(
+                            RemoteSidebarOrganizationMutation::SetProjectNewSessionLocation {
+                                project_id: location_project_id.clone(),
+                                location: next,
+                            },
+                            false,
+                            cx,
+                        );
+                    }),
+                );
                 // Removing a project takes its sessions out of the workbench,
                 // so it asks first — and it is a workbench change, not a disk
                 // one: nothing under the project's path is touched.

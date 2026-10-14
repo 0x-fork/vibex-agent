@@ -4853,6 +4853,15 @@ pub enum RemoteSidebarOrganizationMutation {
     SetHierarchyMode {
         mode: RemoteSidebarHierarchyMode,
     },
+    /// Where a project's new sessions start by default.
+    ///
+    /// The preference is the reader's, not the project's, so it lives with the
+    /// rest of the sidebar arrangement rather than in the repository. A client
+    /// that can only read it is stuck with whatever the desktop last chose.
+    SetProjectNewSessionLocation {
+        project_id: String,
+        location: RemoteSidebarNewSessionLocation,
+    },
     /// Move the hour a queued message waits for, or take it away.
     ///
     /// The message itself belongs to the holder's queue — this changes only
