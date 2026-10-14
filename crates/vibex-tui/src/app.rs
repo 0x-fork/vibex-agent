@@ -1853,6 +1853,35 @@ impl App {
         self.agent.state.active_session.value.as_ref()
     }
 
+    /// Settle the open session's own copy from the ownership tree's metadata.
+    ///
+    /// A delegated session is absent from the root list, so the tree is the
+    /// only read that carries a worker's state: the authority publishes a
+    /// settled turn as a sidebar invalidation, which re-reads the branches this
+    /// client draws, and the metadata that comes back with them is a fresher
+    /// row for the worker on screen. Folding it in is what keeps a worker whose
+    /// turn ended from sitting under the composer as "running" until the reader
+    /// opens it again.
+    ///
+    /// The name this client recorded for a session stands in for the manager's
+    /// placeholder here exactly as it does on the list, because the row is the
+    /// same record and the page must not lose the name the reader typed.
+    ///
+    /// Answers whether the page's copy changed.
+    pub fn sync_open_session_from_tree(&mut self) -> bool {
+        let Some(open) = self
+            .selected_session_id()
+            .map(|session_id| session_id.as_str().to_string())
+        else {
+            return false;
+        };
+        let Some(row) = self.children.session(&open).cloned() else {
+            return false;
+        };
+        let row = self.reconcile_pending_session_title(row);
+        self.agent.reconcile_open_session(row)
+    }
+
     /// Whether the page in front of the reader is a session's own page.
     ///
     /// The composing page deliberately keeps the session it came from

@@ -1887,6 +1887,13 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                     vibex_core::unix_timestamp_ms(),
                     page,
                 );
+                // The answer carries metadata for every node and ancestor it
+                // named, the open worker included. That row is this client's
+                // only authoritative copy of a worker's state — the root list
+                // omits it, and a remote authority announces it as a sidebar
+                // invalidation rather than a session update — so the page's own
+                // copy is settled from it here.
+                app.sync_open_session_from_tree();
             }
             Err(error) => {
                 if error.kind == vibex_backend::BackendErrorKind::Unsupported {
@@ -3112,6 +3119,52 @@ mod tests {
         assert!(
             app.agent.state.sessions.is_loading(),
             "a lag that named the sidebar left the list stale"
+        );
+    }
+
+    #[test]
+    fn a_sidebar_invalidation_settles_the_open_sessions_turn() {
+        // The authority publishes no session update to a remote client, so a
+        // turn it has settled reaches this one as nothing but an invalidated
+        // sidebar. The list read that follows is the only copy of the state
+        // the page gets, and without the fold it kept drawing the turn as
+        // running — spinner, elapsed clock and "Steer" placeholder included —
+        // until the reader re-opened the session by hand.
+        let (worker, _messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+        let mut app = isolation_app();
+        let mut running = isolation_session(vibex_core::VibexSessionId::new(), "codex");
+        running.state = vibex_core::AgentSessionState::Running;
+        app.agent.apply_sessions(Ok(vec![running.clone()])).unwrap();
+        app.agent.state.selected_session_id = Some(running.id.clone());
+        app.agent.state.active_session.resolve(running.clone());
+        app.navigate_to(Page::Agent);
+        assert!(app.turn_reads_running());
+
+        let mut settled = running.clone();
+        settled.state = vibex_core::AgentSessionState::Idle;
+        settled.updated_at_ms = running.updated_at_ms + 1;
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Event(vibex_backend::BackendEvent::ProjectionInvalidated(
+                vibex_backend::BackendProjection::Sidebar,
+            )),
+        )
+        .unwrap();
+        assert!(app.agent.state.sessions.is_loading());
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Sessions(Ok(vec![settled.clone()])),
+        )
+        .unwrap();
+
+        assert_eq!(app.active_session(), Some(&settled));
+        assert!(!app.turn_reads_running());
+        assert!(
+            !app.is_animating(),
+            "the settled page is still repainting for a turn that ended"
         );
     }
 
@@ -5865,5 +5918,60 @@ mod tests {
             "the sub-session key opened something else: {:?}",
             outcome.effects
         );
+    }
+
+    /// A delegated session's state reaches its own page through the tree.
+    ///
+    /// A worker is absent from the root list, and a remote authority announces
+    /// a settled turn as a sidebar invalidation rather than a session event, so
+    /// the branch read that follows is the only authoritative row for the
+    /// worker on screen. Without that fold the page keeps the state its
+    /// snapshot carried, and a worker whose turn ended sits under the composer
+    /// as running until the reader opens it again.
+    #[test]
+    fn the_ownership_tree_settles_the_open_workers_turn() {
+        let (worker, _messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+        let mut app = isolation_app();
+        let main_id = vibex_core::VibexSessionId::parse("session_main00001").unwrap();
+        let sub_id = vibex_core::VibexSessionId::parse("session_sub000001").unwrap();
+        let main = isolation_session(main_id, "codex");
+        let mut running = isolation_session(sub_id.clone(), "codex");
+        running.state = vibex_core::AgentSessionState::Running;
+        app.agent.apply_sessions(Ok(vec![main.clone()])).unwrap();
+        app.agent.state.selected_session_id = Some(sub_id.clone());
+        app.agent.state.active_session.resolve(running.clone());
+
+        let mut settled = running.clone();
+        settled.state = vibex_core::AgentSessionState::Idle;
+        settled.updated_at_ms = 2;
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::SessionTree {
+                parent_session_id: Some(sub_id.clone()),
+                append: false,
+                result: Ok(ownership_page(
+                    Vec::new(),
+                    vec![main.clone(), settled.clone()],
+                )),
+            },
+        )
+        .unwrap();
+        assert_eq!(app.active_session(), Some(&settled));
+
+        // The same branch read again with the state this page has already left
+        // behind is not news, and the row the list would draw is untouched.
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::SessionTree {
+                parent_session_id: Some(sub_id),
+                append: false,
+                result: Ok(ownership_page(Vec::new(), vec![main, running])),
+            },
+        )
+        .unwrap();
+        assert_eq!(app.active_session(), Some(&settled));
     }
 }

@@ -672,6 +672,18 @@ roots preserves the selected worker, timeline, and draft. Mobile and TUI route
 this decision to the session list rather than treating it as a transcript gap;
 an update during a pending list request retains one follow-up refresh.
 
+A remote client is sent no `SessionUpdated` at all: the authority announces a
+session's state change as a sidebar invalidation, so the reads that invalidation
+triggers are its only copy of the state. A root-list read therefore reconciles
+the open session's own copy from the row it answers with
+(`AgentWorkflowController::reconcile_open_session`), under the same
+`updated_at_ms` recency rule a pushed update obeys: the row must be at least as
+new as the copy on screen, and a load still in flight answers for itself. The
+ownership tree's `registry` is the equivalent read for a worker, which the root
+list omits, so the TUI folds its row in when a branch page lands. Without this,
+a settled turn keeps being drawn as running — spinner, elapsed clock and the
+Steer placeholder included — until the reader re-opens the session by hand.
+
 ## Required Session Operations
 
 The provider-neutral service must model these operations even if a provider

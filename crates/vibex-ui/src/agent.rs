@@ -768,12 +768,28 @@ impl AgentWorkflowController {
 
     /// Replaces root navigation rows without changing an explicitly opened
     /// session. Team workers remain valid selections outside this root list.
+    ///
+    /// A row for the *open* session is that session's own state, so the page's
+    /// copy is reconciled against it. This read is authoritative for every
+    /// client, and for a remote client it is the only one that carries a
+    /// session's state: an authority announces a turn it has settled as a
+    /// sidebar invalidation and never as a session update, so a client that
+    /// only stored the rows would keep drawing the turn as running until the
+    /// reader re-opened the session by hand.
     pub fn apply_sessions(
         &mut self,
         result: BackendResult<Vec<AgentSession>>,
     ) -> BackendResult<()> {
         match result {
             Ok(sessions) => {
+                if let Some(row) = self
+                    .state
+                    .selected_session_id
+                    .as_ref()
+                    .and_then(|selected| sessions.iter().find(|session| &session.id == selected))
+                {
+                    self.reconcile_open_session(row.clone());
+                }
                 self.state.sessions.resolve(sessions);
                 Ok(())
             }
@@ -782,6 +798,37 @@ impl AgentWorkflowController {
                 Err(error)
             }
         }
+    }
+
+    /// Fold one authoritative row for the open session into the copy its page
+    /// reads.
+    ///
+    /// A session's state is a property of the session rather than an event, so
+    /// every read of the record is a chance to be current. The rule is the one
+    /// a pushed update obeys: the row has to be at least as new as what the
+    /// page holds, so a read issued before the snapshot now on screen can never
+    /// put an older state — a turn that has already ended, say — back.
+    ///
+    /// Only the selected session is folded in, and only while the page already
+    /// holds a loaded copy: a load in flight answers with its own authoritative
+    /// snapshot, and resolving the page against a read that generation has
+    /// since replaced would show a session the reader has not finished opening.
+    ///
+    /// Answers whether the page's copy changed.
+    pub fn reconcile_open_session(&mut self, session: AgentSession) -> bool {
+        if self.state.selected_session_id.as_ref() != Some(&session.id)
+            || self.state.active_session.phase != AsyncPhase::Ready
+        {
+            return false;
+        }
+        let Some(existing) = self.state.active_session.value.as_ref() else {
+            return false;
+        };
+        if existing == &session || !session_update_is_current(existing, &session) {
+            return false;
+        }
+        self.state.active_session.resolve(session);
+        true
     }
 
     pub fn begin_sessions_refresh(&mut self) {
@@ -3036,6 +3083,44 @@ mod tests {
                 .title,
             "Release plan"
         );
+    }
+
+    #[test]
+    fn a_root_list_read_settles_the_open_sessions_turn() {
+        // A remote client has no session event to hear about a settled turn:
+        // the authority announces it as a sidebar invalidation, and the list
+        // read that follows is the only copy of the state this client gets.
+        let mut running = session();
+        running.state = AgentSessionState::Running;
+        running.updated_at_ms = 10;
+        let backend = Arc::new(MockAgentBackend::new(running.clone(), Vec::new()));
+        let mut controller = AgentWorkflowController::new(backend, capabilities());
+        controller.state.selected_session_id = Some(running.id.clone());
+        controller.state.active_session.resolve(running.clone());
+
+        let mut settled = running.clone();
+        settled.state = AgentSessionState::Idle;
+        settled.updated_at_ms = 11;
+        controller
+            .apply_sessions(Ok(vec![settled.clone()]))
+            .expect("the list read applies");
+        assert_eq!(controller.state.active_session.value, Some(settled.clone()));
+        assert_eq!(controller.state.sessions.value, Some(vec![settled.clone()]));
+
+        // A read issued before the state moved cannot put the running turn
+        // back, and a read that changes nothing is not one either.
+        controller
+            .apply_sessions(Ok(vec![running.clone()]))
+            .expect("the stale read applies");
+        assert_eq!(controller.state.active_session.value, Some(settled));
+        assert!(!controller.reconcile_open_session(running.clone()));
+
+        // A read while the page is still opening is not the page's state: the
+        // snapshot on its way answers for this session.
+        controller.state.active_session.begin();
+        let mut newer = running;
+        newer.updated_at_ms = 12;
+        assert!(!controller.reconcile_open_session(newer));
     }
 
     #[test]

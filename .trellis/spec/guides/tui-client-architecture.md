@@ -101,6 +101,16 @@ Rules:
 * `BackendEvent::Lagged` forces an authoritative refetch — the client never
   advances a cursor across a gap and never auto-resends a prompt after a
   reconnect.
+* **A settled turn reaches a remote client as a re-read, never an event.** The
+  authority publishes a session's state change as a sidebar invalidation, so
+  the reads that invalidation triggers are the only copy of the state a remote
+  client gets. The root list therefore settles the open session's own copy
+  (`reconcile_open_session`, under the recency rule a pushed update obeys), and
+  a branch page settles the worker it names through
+  `App::sync_open_session_from_tree`, because a worker is absent from the root
+  list. A client that stored the rows alone drew a finished turn as running —
+  spinner, elapsed clock and the `Steer` placeholder included — until the
+  reader re-opened the session by hand.
 * **A message carries the session's own runtime selection.** A send's
   `desired_runtime` is authoritative, so filling it with the client's preferred
   catalogue entry moves the session onto another Agent as a side effect of
