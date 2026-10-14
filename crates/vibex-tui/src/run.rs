@@ -1776,12 +1776,17 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             content,
         } => apply_clipboard(app, &ticket, wanted, content),
         AppMessage::Sessions(result) => {
+            // Read before the list is stored: a row the reader named by writing
+            // is recognized as already held, which is what tells a title the
+            // authority supplies from a placeholder that has not been named yet.
+            let result = app.reconcile_session_list(result);
             if let Err(error) = app.agent.apply_sessions(result) {
                 app.toast(Toast::danger(error.message));
             }
             // A session the runtime no longer lists is a session the list can
             // no longer draw, so its last words are not worth keeping.
             app.retain_session_echoes();
+            app.retain_pending_session_titles();
             // Fold the loaded ids into the reader's arrangement: their pins and
             // manual order survive a refresh, and new sessions are appended
             // rather than dropped from the order.
@@ -2475,6 +2480,10 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             {
                 app.confirm_pending_item(&event.item);
             }
+            // The name this client recorded for a session it created stands in
+            // while the authority still reports the manager's placeholder, so an
+            // early update cannot put the default back on a named row.
+            let event = app.reconcile_session_event(event);
             let session_update = matches!(&event, vibex_backend::BackendEvent::SessionUpdated(_));
             let decision = app.agent.apply_event(event);
             match decision {
@@ -2806,6 +2815,14 @@ mod tests {
         }
     }
 
+    /// The same session before anything has named it: what the manager answers
+    /// with for a creation that carried no title.
+    fn unnamed_session(id: vibex_core::VibexSessionId, agent: &str) -> vibex_core::AgentSession {
+        let mut session = isolation_session(id, agent);
+        session.title = format!("{agent} session");
+        session
+    }
+
     fn isolation_create(app: &mut App, text: &str, agent: usize) -> vibex_core::VibexSessionId {
         app.perform(crate::action::Intent::NewSession);
         app.new_session_runtime = Some(
@@ -3116,6 +3133,67 @@ mod tests {
         assert_eq!(app.composer.text(), "Keep this worker draft");
         assert_eq!(app.page, Page::Agent);
         assert_eq!(app.live, LiveState::Ready);
+    }
+
+    #[test]
+    fn a_read_and_an_update_keep_the_name_the_reader_gave_its_new_session() {
+        // The client names the row the moment it asks for the session, because
+        // the authority has no name for it until the message reaches a turn.
+        // Everything the authority says in the meantime is a placeholder, and
+        // none of it may take the reader's own words off the row.
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        let session_id = vibex_core::VibexSessionId::new();
+        app.note_pending_session_title(&session_id, "  Fix   the flake  ");
+
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Sessions(Ok(vec![unnamed_session(session_id.clone(), "codex")])),
+        )
+        .unwrap();
+        assert_eq!(
+            app.session_title(&session_id).as_deref(),
+            Some("Fix the flake")
+        );
+
+        // The management of the session it just persisted arrives under the
+        // same placeholder.
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Event(vibex_backend::BackendEvent::SessionUpdated(
+                unnamed_session(session_id.clone(), "codex"),
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            app.session_title(&session_id).as_deref(),
+            Some("Fix the flake"),
+            "the placeholder took the row back"
+        );
+
+        // The authority's own title — the seed from that message, or one an
+        // Agent supplied — wins, and from then on the row is the authority's.
+        let mut named = unnamed_session(session_id.clone(), "codex");
+        named.title = "Investigate the flake".to_string();
+        apply_message(&mut app, &worker, AppMessage::Sessions(Ok(vec![named]))).unwrap();
+        assert_eq!(
+            app.session_title(&session_id).as_deref(),
+            Some("Investigate the flake")
+        );
+
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Sessions(Ok(vec![unnamed_session(session_id.clone(), "codex")])),
+        )
+        .unwrap();
+        assert_eq!(
+            app.session_title(&session_id).as_deref(),
+            Some("codex session"),
+            "the name the reader's message gave is still standing over the authority's"
+        );
     }
 
     #[test]

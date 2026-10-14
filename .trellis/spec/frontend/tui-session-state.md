@@ -69,6 +69,17 @@ without fetching a record before creation has completed.
 - Creation failure preserves that request's inputs without overwriting newer
   edits or moving a reader who has left it. Explicit retry uses a fresh attempt
   identity because the failed attempt may already have a durable record.
+- A session created here is named by its first message from the moment the
+  creation is asked for, because the manager persists the placeholder
+  `<agent> session` and seeds the reader's message as the title only once that
+  message reaches a turn — which waits on the Agent being materialized. The
+  recorded name is substituted for that placeholder in every snapshot the row is
+  built from (the creation's answer, a list read, an Agent update), and is
+  released by the first snapshot whose title is not the placeholder. Only a
+  snapshot that updates an already-known row releases it, so the row this client
+  projects for a creation it has just acknowledged cannot drop the name before
+  the placeholder arrives to be outlasted. A failed creation forgets the name
+  with the identity it reserved.
 - Asynchronous clipboard, external-editor, completion, and workspace results
   carry the editor/draft or navigation identity that requested them. A result
   for a departed or submitted editor cannot mutate the current buffer, change
@@ -128,6 +139,8 @@ without fetching a record before creation has completed.
 | An existing session's runtime changes behind its picker | Begin the composer transition only after the overlay closes. |
 | A different composer opens during a transition | Clear the previous labels and transition before its first frame. |
 | Text transitions are disabled | Show updated labels immediately and do not replay them when re-enabled. |
+| A placeholder snapshot arrives for a session created here | The row keeps the reader's message until a title that is not the placeholder arrives. |
+| A title the authority supplies lands, then a placeholder snapshot follows | The authority's title stands; the reader's recorded name is not consulted again. |
 
 ## 5. Good / Base / Bad Cases
 
@@ -150,7 +163,9 @@ without fetching a record before creation has completed.
 - `run.rs` callback tests must call the real message application path with
   deliberately reordered success/failure results. Cover stale session loads,
   concurrent and duplicate creations, mismatched IDs, forks, failed recovery,
-  picker targets, and send completion isolation.
+  picker targets, send completion isolation, and the placeholder snapshots that
+  a list read or an Agent update carries for a session the reader named by
+  writing.
 - `tests/render.rs` must draw animation frames only when the scheduler requests
   them. Assert that Classic and Glitch restore their resting buffers, a text
   transition finishes while the mark is resting, and later quiet ticks do not

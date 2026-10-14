@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use vibex_backend::DomainCapabilities;
-use vibex_backend::{BackendCapabilitySnapshot, BackendFacade, BackendOperation};
+use vibex_backend::{BackendCapabilitySnapshot, BackendFacade, BackendOperation, BackendResult};
 use vibex_core::{AgentSession, RemoteDeviceDetail, VibexSessionId};
 use vibex_desktop_model::{SidebarState, TimelineRow};
 use vibex_ui::shell::{CompactNavigation, GlobalDestination, SessionDestination, ShellKind};
@@ -351,6 +351,16 @@ fn session_config_value_label(value: &vibex_core::SessionConfigValue) -> String 
         .clone()
         .filter(|label| !label.trim().is_empty())
         .unwrap_or_else(|| value.value.clone())
+}
+
+/// The title the manager persists for a session that has not been named yet.
+///
+/// A creation carries no title — the reader's message becomes one once it
+/// reaches a turn — so this is what every snapshot says until then. The two
+/// sides have to agree on it exactly, because it is what an optimistic title
+/// recognizes as "nothing has named this session yet" before standing in.
+fn session_fallback_title(agent_id: impl std::fmt::Display) -> String {
+    format!("{agent_id} session")
 }
 
 /// One run option the selected Agent publishes.
@@ -1039,6 +1049,17 @@ pub struct App {
     /// already receives, pruned to the sessions the list still holds, so it
     /// costs the runtime nothing.
     pub session_echoes: BTreeMap<String, String>,
+    /// The name a session created here borrows from the message that opened it.
+    ///
+    /// A creation carries no title, so the manager persists the placeholder
+    /// `<agent> session` and seeds the reader's message as the title only once
+    /// that message reaches a turn — which waits on the Agent being
+    /// materialized. For that whole window every authoritative snapshot would
+    /// put the placeholder on the row, so the row is named from what the reader
+    /// wrote instead. The first snapshot whose title is not the placeholder
+    /// releases the record, so a rename made later, or a title an Agent
+    /// supplies, always wins.
+    pub pending_session_titles: BTreeMap<VibexSessionId, String>,
     /// What the terminal is told when a session needs the reader and the reader
     /// is not looking at it. The bytes are queued here and written by the run
     /// loop after the frame, so no reducer ever touches the terminal.
@@ -1631,6 +1652,7 @@ impl App {
             pending_send_serial: 0,
             unread_sessions: std::collections::BTreeSet::new(),
             session_echoes: BTreeMap::new(),
+            pending_session_titles: BTreeMap::new(),
             notify: crate::notify::Notifier::new(options.notify_path.clone()),
             terminal_images: crate::terminal_image::ImageSupport::detect(),
             picture: crate::preview::PlacedPicture::default(),
@@ -4536,9 +4558,13 @@ impl App {
     }
 
     pub fn record_created_session(&mut self, session: &AgentSession) {
+        // The authority's answer is a placeholder: the creation carried no
+        // title, and the reader's message becomes one only when it reaches a
+        // turn. The row is named from that message in the meantime.
+        let session = self.reconcile_pending_session_title(session.clone());
         let rows = self.agent.state.sessions.value.get_or_insert_with(Vec::new);
         if !rows.iter().any(|row| row.id == session.id) {
-            rows.push(session.clone());
+            rows.push(session);
         }
     }
 
@@ -4573,6 +4599,9 @@ impl App {
         let Some(creation) = self.pending_creations.remove(request_id) else {
             return false;
         };
+        // No session exists for the name to belong to, and the retry reserves
+        // another identity, so this one is kept by nothing.
+        self.forget_pending_session_title(request_id);
         self.abandon_send(request_id, creation.send_id);
         // A scheduled creation put its message in the queue before the session
         // it belongs to existed. The session does not exist, so the message
@@ -5754,7 +5783,7 @@ impl App {
     pub fn pending_scheduled_session_title(&self, session: &AgentSession) -> Option<String> {
         let queued = self.scheduled_message_for(&session.id)?;
         let title = vibex_core::normalize_agent_session_title(&queued.text)?;
-        let fallback = format!("{} session", session.agent_id);
+        let fallback = session_fallback_title(&session.agent_id);
         (session.title == fallback || session.title == title).then_some(title)
     }
 
@@ -5763,6 +5792,113 @@ impl App {
     pub fn session_row_title(&self, session: &AgentSession) -> String {
         self.pending_scheduled_session_title(session)
             .unwrap_or_else(|| session.title.clone())
+    }
+
+    /// Record the name a creation's first message gives its session.
+    ///
+    /// Read by [`Self::reconcile_pending_session_title`] until an authoritative
+    /// title lands. A message that normalizes to nothing — whitespace, or the
+    /// bare command that sends no prose — names nothing, so the placeholder
+    /// stands rather than the row wearing a blank name.
+    pub fn note_pending_session_title(&mut self, session_id: &VibexSessionId, message: &str) {
+        if let Some(title) = vibex_core::normalize_agent_session_title(message) {
+            self.pending_session_titles
+                .insert(session_id.clone(), title);
+        }
+    }
+
+    /// Forget the name recorded for a creation that never became a session.
+    ///
+    /// The identity is the failed attempt's, and the reader's retry reserves a
+    /// fresh one, so nothing would ever look this name up again.
+    pub fn forget_pending_session_title(&mut self, session_id: &VibexSessionId) {
+        self.pending_session_titles.remove(session_id);
+    }
+
+    /// Take an authoritative snapshot, with the name this client recorded for
+    /// the session standing in while the authority still reports the
+    /// placeholder.
+    ///
+    /// This is what keeps the manager's default off a row the reader already
+    /// named by writing: the creation's own response is a placeholder snapshot,
+    /// and so is every list read and Agent update until the message reaches a
+    /// turn. The first title that is *not* the placeholder releases the record —
+    /// and a snapshot that updates a row this client already holds is what
+    /// releases it, because the rows projected for a creation the client has
+    /// only just acknowledged are the first non-placeholder snapshots for their
+    /// ids, and releasing there would drop the name before the placeholder ever
+    /// arrived to be outlasted.
+    pub fn reconcile_pending_session_title(&mut self, session: AgentSession) -> AgentSession {
+        let is_fallback = session.title == session_fallback_title(&session.agent_id);
+        if !is_fallback {
+            if self.session_title(&session.id).is_some() {
+                self.pending_session_titles.remove(&session.id);
+            }
+            return session;
+        }
+        let Some(title) = self.pending_session_titles.get(&session.id).cloned() else {
+            return session;
+        };
+        AgentSession { title, ..session }
+    }
+
+    /// Take the authoritative session list with those recorded names standing
+    /// in, before the controller stores it.
+    pub fn reconcile_session_list(
+        &mut self,
+        result: BackendResult<Vec<AgentSession>>,
+    ) -> BackendResult<Vec<AgentSession>> {
+        result.map(|sessions| {
+            sessions
+                .into_iter()
+                .map(|session| self.reconcile_pending_session_title(session))
+                .collect()
+        })
+    }
+
+    /// Take an event with the session it carries reconciled, so a placeholder
+    /// announcement cannot put the manager's default back on a named row.
+    pub fn reconcile_session_event(
+        &mut self,
+        event: vibex_backend::BackendEvent,
+    ) -> vibex_backend::BackendEvent {
+        match event {
+            vibex_backend::BackendEvent::SessionUpdated(session) => {
+                vibex_backend::BackendEvent::SessionUpdated(
+                    self.reconcile_pending_session_title(session),
+                )
+            }
+            other => other,
+        }
+    }
+
+    /// Drop the names of sessions this client is no longer creating and the
+    /// list no longer holds.
+    ///
+    /// A record is normally released by the first authoritative title, so this
+    /// is only for the ones that left before a title arrived: a session deleted
+    /// while its name was still standing in. A creation that has not been
+    /// acknowledged yet is kept — it is not in the list, and it is exactly the
+    /// row the name is for.
+    pub fn retain_pending_session_titles(&mut self) {
+        let keep = self
+            .agent
+            .state
+            .sessions
+            .value
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|session| session.id.clone())
+            .chain(
+                self.pending_session_titles
+                    .keys()
+                    .filter(|session_id| self.session_is_uncreated(session_id))
+                    .cloned(),
+            )
+            .collect::<BTreeSet<VibexSessionId>>();
+        self.pending_session_titles
+            .retain(|session_id, _| keep.contains(session_id));
     }
 
     /// How long a session's next scheduled send still waits, when it has one.
@@ -8012,6 +8148,131 @@ mod tests {
         session.title = "Migrate the scheduler".to_string();
         assert_eq!(app.pending_scheduled_session_title(&session), None);
         assert_eq!(app.session_row_title(&session), "Migrate the scheduler");
+    }
+
+    /// A session the manager persisted for a creation that carried no title.
+    ///
+    /// This is what every snapshot says until the first message reaches a turn.
+    fn unnamed_session(session_id: &VibexSessionId, agent: &str) -> AgentSession {
+        AgentSession {
+            id: session_id.clone(),
+            title: format!("{agent} session"),
+            project_id: vibex_core::ProjectId::new(),
+            workspace_id: vibex_core::WorkspaceId::new(),
+            workspace_root: "/repo".to_string(),
+            workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+            agent_id: vibex_core::AgentId::parse(agent).expect("agent id"),
+            state: vibex_core::AgentSessionState::Initializing,
+            safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_message_at_ms: 1,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        }
+    }
+
+    /// Apply a session list the way `AppMessage::Sessions` does.
+    fn list_sessions(app: &mut App, sessions: Vec<AgentSession>) {
+        let reconciled = app.reconcile_session_list(Ok(sessions));
+        app.agent
+            .apply_sessions(reconciled)
+            .expect("the list applies");
+    }
+
+    #[test]
+    fn a_session_created_here_is_named_by_its_first_message() {
+        let session_id = VibexSessionId::new();
+        let mut app = scheduled_app(&session_id);
+        app.note_pending_session_title(&session_id, "  Fix   the flake  ");
+
+        // The authority's answer to the creation is the manager's placeholder,
+        // and so is every read until the message reaches a turn: the row wears
+        // what the reader wrote instead.
+        app.record_created_session(&unnamed_session(&session_id, "codex"));
+        assert_eq!(
+            app.session_title(&session_id).as_deref(),
+            Some("Fix the flake")
+        );
+        list_sessions(&mut app, vec![unnamed_session(&session_id, "codex")]);
+        assert_eq!(
+            app.session_title(&session_id).as_deref(),
+            Some("Fix the flake")
+        );
+
+        // The seed from that message, or a title an Agent supplies, is the
+        // authority's own name and wins from then on.
+        let mut named = unnamed_session(&session_id, "codex");
+        named.title = "Investigate the flake".to_string();
+        list_sessions(&mut app, vec![named]);
+        assert_eq!(
+            app.session_title(&session_id).as_deref(),
+            Some("Investigate the flake")
+        );
+
+        // With the title released, a later placeholder snapshot is the
+        // authority's word rather than the reader's old message.
+        list_sessions(&mut app, vec![unnamed_session(&session_id, "codex")]);
+        assert_eq!(
+            app.session_title(&session_id).as_deref(),
+            Some("codex session")
+        );
+    }
+
+    #[test]
+    fn an_early_update_cannot_put_the_placeholder_back_on_a_named_row() {
+        let session_id = VibexSessionId::new();
+        let mut app = scheduled_app(&session_id);
+        app.note_pending_session_title(&session_id, "Fix the flake");
+        app.record_created_session(&unnamed_session(&session_id, "codex"));
+
+        // The manager announces the session it has just persisted — still under
+        // its placeholder — while the row already carries the reader's name.
+        let event = app.reconcile_session_event(vibex_backend::BackendEvent::SessionUpdated(
+            unnamed_session(&session_id, "codex"),
+        ));
+        app.agent.apply_event(event);
+        assert_eq!(
+            app.session_title(&session_id).as_deref(),
+            Some("Fix the flake"),
+            "the placeholder took the row back"
+        );
+    }
+
+    #[test]
+    fn a_message_that_names_nothing_leaves_the_placeholder_standing() {
+        let session_id = VibexSessionId::new();
+        let mut app = scheduled_app(&session_id);
+        app.note_pending_session_title(&session_id, " \n\t ");
+
+        assert!(
+            app.pending_session_titles.is_empty(),
+            "a message with no words in it named a session"
+        );
+        app.record_created_session(&unnamed_session(&session_id, "codex"));
+        assert_eq!(
+            app.session_title(&session_id).as_deref(),
+            Some("codex session")
+        );
+    }
+
+    #[test]
+    fn a_name_is_pruned_with_the_session_it_was_going_to_name() {
+        let session_id = VibexSessionId::new();
+        let mut app = scheduled_app(&session_id);
+
+        // A creation that has not been acknowledged yet is not in the list, and
+        // is exactly the row the name is for.
+        app.new_draft_id = session_id.clone();
+        app.note_pending_session_title(&session_id, "Fix the flake");
+        app.retain_pending_session_titles();
+        assert!(app.pending_session_titles.contains_key(&session_id));
+
+        // The row it named is gone — the session was deleted before any title
+        // arrived — and the name goes with it.
+        app.new_draft_id = VibexSessionId::new();
+        app.retain_pending_session_titles();
+        assert!(app.pending_session_titles.is_empty());
     }
 
     #[test]

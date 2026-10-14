@@ -3532,6 +3532,11 @@ impl App {
                 self.mark_send_dispatched(Some(&request_id), outgoing.text.clone(), projected)
             }
         };
+        // The row is named by the message from the moment the session is asked
+        // for. The authority has no name for it until that message reaches a
+        // turn — which waits on the Agent being materialized — and the
+        // placeholder it reports until then is not what the reader wrote.
+        self.note_pending_session_title(&request_id, &outgoing.text);
         self.pending_creations.insert(
             request_id.clone(),
             PendingCreation {
@@ -8610,6 +8615,31 @@ mod tests {
             app.draft_schedule().is_some(),
             "the retry lost the send time the reader chose"
         );
+    }
+
+    #[test]
+    fn the_first_message_names_the_session_it_creates() {
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        app.runtime_options = Some(run_option_catalog());
+        app.perform(Intent::NewSession);
+        app.composer.insert_str("  Fix   the flake  ");
+
+        app.perform(Intent::SubmitComposer);
+        let request_id = app.selected_session_id().cloned().expect("a session");
+        // One line, as the list draws it: what the reader wrote is the name the
+        // row wears until the authority has one of its own.
+        assert_eq!(
+            app.pending_session_titles
+                .get(&request_id)
+                .map(String::as_str),
+            Some("Fix the flake")
+        );
+
+        // A creation that never became a session takes its name with it: the
+        // retry reserves another identity, and nothing would look this one up.
+        assert!(app.fail_creation(&request_id));
+        assert!(!app.pending_session_titles.contains_key(&request_id));
     }
 
     #[test]
