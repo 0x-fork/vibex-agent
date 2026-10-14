@@ -1931,9 +1931,11 @@ fn session_heading_line(
     let used = indent + HEADING_ROW_LEAD + display_width(&label);
     // One column of air, then the rule to the far end of the list in the dim
     // step: a rule is punctuation between sections, not a line of the page.
-    // What it does not reach is the trailing block, which the arithmetic above
-    // has already promised the room for.
-    let rule_width = width.saturating_sub(used + right);
+    //
+    // It stops a column short of what follows it, which is what the trailing
+    // block's air is: a rule that ran into the buttons would read as the row's
+    // own edge, and the last dash would look like part of the button it touches.
+    let rule_width = width.saturating_sub(used + 1 + right);
     if rule_width > 0 {
         spans.push(Span::styled(" ", blank));
         spans.push(Span::styled(
@@ -1941,6 +1943,7 @@ fn session_heading_line(
             Style::default().fg(theme.roles.gray_dim),
         ));
     }
+    spans.push(Span::styled(" ".repeat(ROW_CONTROL_AIR), blank));
     // The trailing mark is the desktop's "N running", which it keeps at the
     // row's far edge and hides under the pointer. A terminal has no hover, so it
     // is drawn beside the badge instead of under the buttons.

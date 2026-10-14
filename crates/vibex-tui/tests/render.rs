@@ -9670,10 +9670,10 @@ fn the_session_list_is_not_drawn_inside_a_frame() {
     );
 }
 
-/// A heading says what it holds and rules off the section, so a stack of rows
-/// reads as groups rather than as one long list.
+/// A heading names its group and rules off the section, so a stack of rows reads
+/// as groups rather than as one long list.
 #[test]
-fn a_group_heading_counts_its_sessions_and_rules_the_section() {
+fn a_group_heading_names_its_group_and_rules_the_section() {
     let mut first = seeded_session("session_group0001", "first");
     first.last_message_at_ms = vibex_core::unix_timestamp_ms();
     let mut second = seeded_session("session_group0002", "second");
@@ -9692,23 +9692,12 @@ fn a_group_heading_counts_its_sessions_and_rules_the_section() {
         .lines()
         .find(|line| line.trim_start_matches(['│', ' ']).starts_with('▾'))
         .unwrap_or_else(|| panic!("no heading:\n{screen}"));
-    // The count is a badge right after the name, which is where the desktop
-    // draws it: the name says which project, and the badge says how much of it
-    // there is before the eye has read a single row.
+    // The name, then the rule: a heading says which project it is and carries
+    // the eye to its far end. It carries no number — how much a heading holds is
+    // what opening it is for.
     let named = heading
         .find("vibex-card-workspace")
         .unwrap_or_else(|| panic!("the heading does not name the workspace: {heading:?}"));
-    let badge = heading
-        .find(" 2 ")
-        .unwrap_or_else(|| panic!("the heading does not badge its count: {heading:?}"));
-    assert!(
-        badge > named,
-        "the count is not beside the name it counts: {heading:?}"
-    );
-    // The rule carries the eye from the name to the badge, and the badge sits
-    // against the buttons rather than beside the name: it is the number those
-    // buttons act on, and a digit in the middle of a name is a digit between the
-    // reader and the word.
     let rule = heading
         .find('─')
         .unwrap_or_else(|| panic!("the heading draws no rule: {heading:?}"));
@@ -9719,6 +9708,14 @@ fn a_group_heading_counts_its_sessions_and_rules_the_section() {
     assert!(
         !heading[..rule].contains(|character: char| character.is_ascii_digit()),
         "a count is back beside the name: {heading:?}"
+    );
+    // The rule stops a column short of the buttons: one that ran into them would
+    // read as the row's own edge rather than as punctuation.
+    let after_rule = &heading[heading.rfind('─').expect("the rule's last cell") + '─'.len_utf8()..];
+    assert_eq!(
+        after_rule.chars().next(),
+        Some(' '),
+        "the rule runs into what follows it: {heading:?}"
     );
     // The row's own buttons close it, and nothing is drawn between them and the
     // rule.
