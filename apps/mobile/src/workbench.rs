@@ -6,7 +6,7 @@ use gpui::{
     Bounds, ClipboardItem, Context, DispatchPhase, Entity, FontWeight, Image, ImageFormat,
     IntoElement, LongPressEvent, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _, Pixels,
     Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchDragEvent,
-    TouchPhase, WeakEntity, Window, canvas, div, img, prelude::*, px, relative, rgb, svg,
+    TouchPhase, WeakEntity, Window, canvas, div, img, point, prelude::*, px, relative, rgb, svg,
 };
 use vibex_backend::{
     BackendError, BackendOperation, BackendResult, GitBackend as _, MutationRequest,
@@ -280,6 +280,18 @@ pub struct MobileWorkbench {
     /// The rendered Markdown view, kept across frames so a preview does not
     /// rebuild its text layout on every paint. Keyed by path and revision.
     file_markdown_view: Option<(String, Entity<markdown::MarkdownView>)>,
+    /// The editor's own find bar. The kit input already highlights matches and
+    /// reveals the active one with padding, so the phone only has to own the
+    /// field and the two step buttons.
+    file_find_open: bool,
+    file_find_input: Option<Entity<InputState>>,
+    file_find_subscription: Option<gpui::Subscription>,
+    /// The query the editor was last told about, so a keystroke that did not
+    /// change it costs nothing.
+    file_find_query: String,
+    /// The go-to-line prompt, which is a number and a confirm.
+    file_goto_open: bool,
+    file_goto_input: Option<Entity<InputState>>,
     git_diff: Option<GitDiffResponse>,
     /// The scroll handle for the diff sheet, so a freshly opened diff starts at
     /// its first line instead of wherever the tree behind it was scrolled to.
@@ -400,6 +412,12 @@ impl MobileWorkbench {
             file_image: None,
             file_image_loading: None,
             file_markdown_view: None,
+            file_find_open: false,
+            file_find_input: None,
+            file_find_subscription: None,
+            file_find_query: String::new(),
+            file_goto_open: false,
+            file_goto_input: None,
             git_diff: None,
             git_diff_scroll: ScrollHandle::new(),
             git_revert_confirmation: None,
@@ -686,6 +704,132 @@ impl MobileWorkbench {
             });
         });
         self.tasks.push(task);
+    }
+
+    /// Pushes the find query into the editor, which highlights the matches.
+    fn apply_file_find_query(&mut self, cx: &mut Context<Self>) {
+        let query = input_value(&self.file_find_input, cx).to_string();
+        if query == self.file_find_query {
+            return;
+        }
+        self.file_find_query = query.clone();
+        let Some(editor) = self.file_editor_input.clone() else {
+            return;
+        };
+        editor.update(cx, |editor, cx| {
+            if query.trim().is_empty() {
+                editor.close_search(cx);
+            } else {
+                editor.set_search_query(query, true, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    fn open_file_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.file_find_open = true;
+        if let Some(find) = self.file_find_input.clone() {
+            find.update(cx, |find, cx| find.focus(window, cx));
+        }
+        crate::platform::show_keyboard();
+        cx.notify();
+    }
+
+    fn close_file_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.file_find_open = false;
+        self.file_find_query.clear();
+        if let Some(find) = self.file_find_input.clone() {
+            find.update(cx, |find, cx| find.set_value("", window, cx));
+        }
+        if let Some(editor) = self.file_editor_input.clone() {
+            editor.update(cx, |editor, cx| editor.close_search(cx));
+        }
+        cx.notify();
+    }
+
+    /// Steps to the next or previous match.
+    ///
+    /// The editor reveals the match itself, with the padding a reader needs to
+    /// see what surrounds it, so nothing here has to know where it landed.
+    fn step_file_find_match(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(editor) = self.file_editor_input.clone() else {
+            return;
+        };
+        editor.update(cx, |editor, cx| {
+            if forward {
+                editor.next_search_match(cx);
+            } else {
+                editor.previous_search_match(cx);
+            }
+        });
+        cx.notify();
+    }
+
+    fn open_file_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.file_goto_open = true;
+        if let Some(input) = self.file_goto_input.clone() {
+            input.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+                input.focus(window, cx);
+            });
+        }
+        crate::platform::show_keyboard();
+        cx.notify();
+    }
+
+    fn close_file_goto(&mut self, cx: &mut Context<Self>) {
+        if self.file_goto_open {
+            self.file_goto_open = false;
+            cx.notify();
+        }
+    }
+
+    /// Puts the caret on a line the reader named.
+    ///
+    /// The line is selected rather than merely pointed at: a caret between two
+    /// identical lines is hard to find on a phone, and a selection is not.
+    fn confirm_file_goto(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(line_number) = input_value(&self.file_goto_input, cx)
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|line| *line > 0)
+        else {
+            self.show_notice(
+                locale::text("Enter a line number", "请输入行号", "請輸入行號").to_string(),
+                cx,
+            );
+            return;
+        };
+        let Some(editor) = self.file_editor_input.clone() else {
+            return;
+        };
+        let text = editor.read(cx).value().to_string();
+        let Some((start, end)) = file_line_range(&text, line_number) else {
+            self.show_notice(
+                locale::text(
+                    "That line is past the end of the file",
+                    "该行超出了文件末尾",
+                    "該行超出了檔案結尾",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        };
+        // The editor does not reveal a programmatic selection, so the scroll is
+        // set from the line's own height. A wrapped line makes it approximate,
+        // which is why the line itself is what gets selected.
+        let line_height = editor.read(cx).line_height().map(f32::from).unwrap_or(18.0);
+        let offset_y = -((line_number.saturating_sub(2)) as f32) * line_height;
+        editor.update(cx, |editor, cx| {
+            editor.set_selected_range(start..end, cx);
+            editor.set_scroll_offset(point(px(0.0), px(offset_y)), cx);
+            editor.focus(window, cx);
+        });
+        self.file_goto_open = false;
+        crate::platform::hide_keyboard();
+        cx.notify();
     }
 
     fn toggle_file_preview_mode(
@@ -1139,6 +1283,37 @@ impl MobileWorkbench {
                     }
                 },
             ));
+        }
+        if self.file_find_input.is_none() {
+            self.file_find_input = Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Find in file",
+                    "在文件中查找",
+                    "在檔案中尋找",
+                ))
+            }));
+        }
+        if self.file_find_subscription.is_none()
+            && let Some(find) = self.file_find_input.clone()
+        {
+            self.file_find_subscription = Some(cx.subscribe_in(
+                &find,
+                window,
+                |this: &mut Self,
+                 _: &Entity<InputState>,
+                 event: &InputEvent,
+                 _: &mut Window,
+                 cx: &mut Context<Self>| {
+                    if matches!(event, InputEvent::Change) {
+                        this.apply_file_find_query(cx);
+                    }
+                },
+            ));
+        }
+        if self.file_goto_input.is_none() {
+            self.file_goto_input = Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text("Line number", "行号", "行號"))
+            }));
         }
         if self.git_commit_input.is_none() {
             self.git_commit_input = Some(cx.new(|cx| {
@@ -2796,6 +2971,34 @@ impl MobileWorkbench {
                                 .child(status),
                         ),
                     )
+                    // Find and go-to-line are the two things a long file
+                    // needs on a phone, where scrolling to a place by hand is
+                    // the only alternative.
+                    .when(!showing_preview, |header| {
+                        header
+                            .child(
+                                icon_button("file-find", "icons/search.svg", "Find in file")
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            if this.file_find_open {
+                                                this.close_file_find(window, cx);
+                                            } else {
+                                                this.open_file_find(window, cx);
+                                            }
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                icon_button("file-goto-line", "icons/hash.svg", "Go to line")
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.open_file_goto(window, cx)
+                                        }),
+                                    ),
+                            )
+                    })
                     .when(previewable, |header| {
                         header.child(
                             div()
@@ -2834,6 +3037,9 @@ impl MobileWorkbench {
                         )
                     }),
             )
+            .when(self.file_find_open && !showing_preview, |screen| {
+                screen.child(self.render_file_find_bar(cx))
+            })
             .child(body)
             .child(
                 div()
@@ -2875,6 +3081,166 @@ impl MobileWorkbench {
                             button.on_mouse_up(MouseButton::Left, cx.listener(Self::save_file))
                         })
                         .when(!can_write, |button| button.opacity(0.55)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The editor's find bar: the query, how many matches it has, and the two
+    /// steps through them.
+    ///
+    /// The match count comes from the editor's own search session, so the
+    /// number on screen is the number of highlighted matches rather than a
+    /// second count that could disagree with them.
+    fn render_file_find_bar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (matched, current) = self
+            .file_editor_input
+            .as_ref()
+            .map(|editor| {
+                let session = editor.read(cx).search_session();
+                (session.matcher.len(), session.matcher.current_match_index())
+            })
+            .unwrap_or((0, 0));
+        let has_query = !self.file_find_query.trim().is_empty();
+        div()
+            .id("file-find-bar")
+            .debug_selector(|| "file-find-bar".to_string())
+            .flex_shrink_0()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .bg(theme::bg_card())
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .h(px(36.0))
+                    .min_w_0()
+                    .flex_1()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::workbench_panel_bg())
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        svg()
+                            .path("icons/search.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::text_muted()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
+                            .child(input_element(self.file_find_input.as_ref())),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .min_w(px(56.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(theme::font_micro())
+                    .text_color(if has_query && matched == 0 {
+                        theme::accent_red()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .child(if has_query {
+                        format!("{} / {}", current.min(matched), matched)
+                    } else {
+                        String::new()
+                    }),
+            )
+            .child(
+                icon_button(
+                    "file-find-previous",
+                    "icons/chevron-down.svg",
+                    "Previous match",
+                )
+                .when(has_query && matched > 0, |button| {
+                    button.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.step_file_find_match(false, cx)),
+                    )
+                })
+                .when(!has_query || matched == 0, |button| button.opacity(0.4)),
+            )
+            .child(
+                icon_button("file-find-next", "icons/chevron-down.svg", "Next match")
+                    .when(has_query && matched > 0, |button| {
+                        button.on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.step_file_find_match(true, cx)),
+                        )
+                    })
+                    .when(!has_query || matched == 0, |button| button.opacity(0.4)),
+            )
+            .child(
+                icon_button("file-find-close", "icons/x.svg", "Close find").on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.close_file_find(window, cx)),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// The go-to-line prompt: a number, and a way to confirm it.
+    fn render_file_goto_prompt(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.45))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_file_goto(cx)),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "file-goto-prompt".to_string())
+                    .w_full()
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(theme::font_title())
+                            .text_color(theme::text_primary())
+                            .child(locale::text("Go to line", "跳转到行", "跳轉到行")),
+                    )
+                    .child(
+                        div()
+                            .h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::workbench_panel_bg())
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
+                            .child(input_element(self.file_goto_input.as_ref())),
+                    )
+                    .child(
+                        action_button("file-goto-confirm", locale::common("Go"))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::confirm_file_goto)),
                     ),
             )
             .into_any_element()
@@ -3973,6 +4339,9 @@ impl MobileWorkbench {
             })
             .when(self.git_branch_sheet_open, |root| {
                 root.child(self.render_git_branch_sheet(cx))
+            })
+            .when(self.file_goto_open, |root| {
+                root.child(self.render_file_goto_prompt(cx))
             })
             .into_any_element()
     }
@@ -6476,6 +6845,27 @@ fn image_format_for_path(path: &str) -> Option<ImageFormat> {
     }
 }
 
+/// The byte range of one 1-based line, or `None` when the file has no such
+/// line. The trailing newline is left out so the selection ends with the text.
+fn file_line_range(text: &str, line_number: usize) -> Option<(usize, usize)> {
+    if line_number == 0 {
+        return None;
+    }
+    let mut start = 0usize;
+    let mut current = 1usize;
+    for (index, character) in text.char_indices() {
+        if current == line_number && character == '\n' {
+            return Some((start, index));
+        }
+        if character == '\n' {
+            current += 1;
+            start = index + 1;
+        }
+    }
+    // The last line has no newline after it.
+    (current == line_number && start <= text.len()).then_some((start, text.len()))
+}
+
 /// A branch name clipped to what a chip can show.
 fn short_branch_label(branch: &str, max_chars: usize) -> String {
     if branch.chars().count() <= max_chars {
@@ -7392,6 +7782,22 @@ mod tests {
         // A point past the row's own width clamps into it rather than panicking.
         assert_eq!(terminal_word_range(&row, 40), (8, 9));
         assert_eq!(terminal_word_range(&[], 3), (3, 3));
+    }
+
+    #[test]
+    fn a_line_number_resolves_to_the_line_the_reader_counted() {
+        let text = "one\ntwo\nthree";
+        assert_eq!(file_line_range(text, 1), Some((0, 3)));
+        assert_eq!(file_line_range(text, 2), Some((4, 7)));
+        // The last line has no newline to end it.
+        assert_eq!(file_line_range(text, 3), Some((8, 13)));
+        assert_eq!(file_line_range(text, 4), None);
+        assert_eq!(file_line_range(text, 0), None);
+        // An empty file still has a first line to land on.
+        assert_eq!(file_line_range("", 1), Some((0, 0)));
+        assert_eq!(file_line_range("", 2), None);
+        // A blank line between two others is a line, not a gap.
+        assert_eq!(file_line_range("a\n\nb", 2), Some((2, 2)));
     }
 
     #[test]

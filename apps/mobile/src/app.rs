@@ -303,6 +303,8 @@ enum BackScreen {
     SidebarSearch,
     /// The batch (multi-select) sidebar mode.
     SidebarBatchMode,
+    /// One file change from the timeline, open as a full screen.
+    TimelineFileDiff,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -527,6 +529,13 @@ struct PendingMobileUserMessage {
     submitted_at_ms: i64,
     text: String,
     attachments: Vec<MessageAttachment>,
+}
+
+/// One file change from the timeline, opened for reading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MobileTimelineFileDiff {
+    path: String,
+    preview: crate::file_diff::FileDiffPreview,
 }
 
 /// A queued prompt being slid to another place in the queue.
@@ -1316,6 +1325,10 @@ pub struct MobileApp {
     token_usage_generation: u64,
     timeline_metadata_tip: Option<TimelineMetadataTip>,
     attachment_preview: Option<MobileAttachmentPreview>,
+    /// One file change opened from the timeline, with the patch already
+    /// projected: the sheet is a read-out, so nothing is computed while it
+    /// paints.
+    timeline_file_diff: Option<MobileTimelineFileDiff>,
     attachment_preview_loading: Option<String>,
     desktop_timeline_display_settings: AgentTimelineDisplaySettings,
     timeline_display_settings_overrides: BTreeMap<String, MobileTimelineDisplaySettingsOverride>,
@@ -2475,6 +2488,7 @@ impl MobileApp {
             token_usage_generation: 0,
             timeline_metadata_tip: None,
             attachment_preview: None,
+            timeline_file_diff: None,
             attachment_preview_loading: None,
             desktop_timeline_display_settings: AgentTimelineDisplaySettings::default(),
             timeline_display_settings_overrides,
@@ -3224,6 +3238,17 @@ impl MobileApp {
     /// leave a line behind on a screen it no longer describes.
     fn hint(&mut self, tone: Tone, message: impl Into<String>) {
         self.pending_hints.push(Hint::new(tone, message));
+    }
+
+    /// A hint that offers to take back what it reports.
+    fn hint_with_action(
+        &mut self,
+        tone: Tone,
+        message: impl Into<String>,
+        action: toast::HintAction,
+    ) {
+        self.pending_hints
+            .push(Hint::with_action(tone, message, action));
     }
 
     /// Announces a failure the user asked for and did not get.
@@ -7083,6 +7108,130 @@ impl MobileApp {
     /// Asks before a batch delete. The single-session path always confirmed;
     /// "select all" followed by Delete did not, and could take the session the
     /// user was reading with it.
+    /// Takes sessions out of the list without destroying them.
+    ///
+    /// The phone never lists archived sessions, so the hint carries the way
+    /// back: the desktop's archive page is where they live, and a tap on the
+    /// card puts them back before the reader has left the screen.
+    fn archive_sessions(&mut self, ids: Vec<VibexSessionId>, cx: &mut Context<Self>) {
+        if self.operation_busy || ids.is_empty() {
+            return;
+        }
+        if !self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentManageSession)
+        }) {
+            self.hint(
+                Tone::Warning,
+                locale::text(
+                    "Archiving is unavailable on this desktop",
+                    "此桌面端不支持归档会话",
+                    "此桌面版不支援封存工作階段",
+                ),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let count = ids.len();
+        let undo = ids.clone();
+        self.operation_busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            for id in ids {
+                backend.archive_session(MutationRequest::new(id)).await?;
+            }
+            Ok::<_, BackendError>(())
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.operation_busy = false;
+                match outcome {
+                    Ok(()) => {
+                        this.sidebar_state.selected_ids.clear();
+                        this.sidebar_batch_mode = false;
+                        this.refresh_sessions(cx);
+                        this.hint_with_action(
+                            Tone::Success,
+                            if count == 1 {
+                                locale::common("Session archived").to_string()
+                            } else {
+                                format!(
+                                    "{count} {}",
+                                    locale::text(
+                                        "sessions archived",
+                                        "个会话已归档",
+                                        "個工作階段已封存"
+                                    )
+                                )
+                            },
+                            toast::HintAction::UndoArchive(undo),
+                        );
+                    }
+                    Err(error) => this.fail(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Puts back the sessions the last archive removed.
+    fn undo_archive(&mut self, ids: Vec<VibexSessionId>, cx: &mut Context<Self>) {
+        if self.operation_busy || ids.is_empty() {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.operation_busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            for id in ids {
+                backend.unarchive_session(MutationRequest::new(id)).await?;
+            }
+            Ok::<_, BackendError>(())
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.operation_busy = false;
+                match outcome {
+                    Ok(()) => {
+                        this.refresh_sessions(cx);
+                        this.hint(
+                            Tone::Success,
+                            locale::text("Session restored", "会话已恢复", "工作階段已還原"),
+                        );
+                    }
+                    Err(error) => this.fail(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    fn archive_selected_sessions(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids = self
+            .sidebar_state
+            .selected_ids
+            .iter()
+            .filter_map(|id| VibexSessionId::parse(id.clone()).ok())
+            .collect::<Vec<_>>();
+        self.archive_sessions(ids, cx);
+    }
+
     fn delete_selected_sessions(
         &mut self,
         _: &MouseUpEvent,
@@ -7378,6 +7527,7 @@ impl MobileApp {
             BackScreen::WorkbenchDrawer => settled_target == DrawerPage::Workbench.open_offset(),
             BackScreen::SidebarSearch => sidebar_search_open,
             BackScreen::SidebarBatchMode => sidebar_batch_mode,
+            BackScreen::TimelineFileDiff => self.timeline_file_diff.is_some(),
         });
         for overlay in overlay_chain.into_iter().skip(overlay_index) {
             self.push_back_screen(BackScreen::Overlay(overlay));
@@ -7478,6 +7628,9 @@ impl MobileApp {
             BackScreen::SidebarSearch => self.toggle_sidebar_search(&noop_mouse_up(), window, cx),
             BackScreen::SidebarBatchMode => {
                 self.toggle_sidebar_batch_mode(&noop_mouse_up(), window, cx)
+            }
+            BackScreen::TimelineFileDiff => {
+                self.timeline_file_diff = None;
             }
         }
         cx.notify();
@@ -11415,6 +11568,9 @@ impl MobileApp {
                 .when(self.composer_history_open, |root| {
                     root.child(self.render_composer_history_sheet(cx))
                 })
+                .when(self.timeline_file_diff.is_some(), |root| {
+                    root.child(self.render_timeline_file_diff(cx))
+                })
                 .when_some(attachment_preview, |root, preview| {
                     root.child(self.render_attachment_preview(preview, cx))
                 })
@@ -11713,6 +11869,204 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// One file change, as the patch the Agent wrote.
+    ///
+    /// Full screen rather than an expansion inside the turn: a diff needs the
+    /// width, and the turn it came from is one back press away.
+    fn render_timeline_file_diff(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(diff) = self.timeline_file_diff.as_ref() else {
+            return div().into_any_element();
+        };
+        let path = diff.path.clone();
+        let file_name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        let (added, removed) = (diff.preview.added_lines, diff.preview.removed_lines);
+        let omitted = diff.preview.omitted_lines;
+        let rows = diff
+            .preview
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                use crate::file_diff::FileDiffLineKind;
+                let (text, color, background) = match line.kind {
+                    FileDiffLineKind::Added => (
+                        format!("+{}", line.text),
+                        theme::accent_green(),
+                        theme::accent_green().opacity(0.08),
+                    ),
+                    FileDiffLineKind::Removed => (
+                        format!("-{}", line.text),
+                        theme::accent_red(),
+                        theme::accent_red().opacity(0.08),
+                    ),
+                    FileDiffLineKind::Context => (
+                        format!(" {}", line.text),
+                        theme::text_muted(),
+                        gpui::transparent_black(),
+                    ),
+                    FileDiffLineKind::Omitted(count) => (
+                        match count {
+                            Some(count) => format!(
+                                "⋯ {count} {}",
+                                locale::text("lines not shown", "行未显示", "行未顯示")
+                            ),
+                            None => format!(
+                                "⋯ {}",
+                                locale::text(
+                                    "unchanged lines omitted",
+                                    "未改动的行已省略",
+                                    "未改動的行已省略"
+                                )
+                            ),
+                        },
+                        theme::text_muted(),
+                        theme::bg_card_dim(),
+                    ),
+                };
+                div()
+                    .id(("timeline-diff-line", index))
+                    .w_full()
+                    .min_w_0()
+                    .px_2()
+                    .bg(background)
+                    .font_family("IBM Plex Mono")
+                    .text_size(px(12.0))
+                    .line_height(px(17.0))
+                    .text_color(color)
+                    .whitespace_normal()
+                    .child(if text.trim().is_empty() {
+                        " ".to_string()
+                    } else {
+                        text
+                    })
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id("mobile-timeline-file-diff")
+            .debug_selector(|| "mobile-timeline-file-diff".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::bg_primary())
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .h(px(48.0))
+                    .px_1()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("timeline-file-diff-back")
+                            .size(px(theme::TOUCH_TARGET))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.timeline_file_diff = None;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/chevron-left.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(theme::font_body())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_primary())
+                                    .child(file_name),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_muted())
+                                    .child(path.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .pr_2()
+                            .text_size(theme::font_micro())
+                            .when(added > 0, |counts| {
+                                counts.child(
+                                    div()
+                                        .text_color(theme::accent_green())
+                                        .child(format!("+{added}")),
+                                )
+                            })
+                            .when(removed > 0, |counts| {
+                                counts.child(
+                                    div()
+                                        .text_color(theme::accent_red())
+                                        .child(format!("−{removed}")),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("timeline-file-diff-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .py_1()
+                    .children(rows),
+            )
+            .when(omitted > 0, |sheet| {
+                sheet.child(
+                    div()
+                        .flex_shrink_0()
+                        .px_3()
+                        .py_1()
+                        .border_t_1()
+                        .border_color(theme::border_subtle())
+                        .text_size(theme::font_micro())
+                        .text_color(theme::text_muted())
+                        .child(locale::text(
+                            "Open the change on the desktop to read all of it",
+                            "在桌面端打开可查看完整变更",
+                            "在桌面端開啟可檢視完整變更",
+                        )),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_attachment_preview_loading(
         &self,
         label: &str,
@@ -11798,6 +12152,24 @@ impl MobileApp {
         match row.kind {
             SidebarRowKind::Session => {
                 let session_id = row.session_id.clone();
+                // Archive sits with the other row actions rather than behind
+                // the batch bar: it is the ordinary way to clear a session off
+                // the list, and it is the one action here that can be undone.
+                let archive_session_id = row
+                    .session_id
+                    .clone()
+                    .and_then(|id| VibexSessionId::parse(id.as_str()).ok());
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-archive",
+                    locale::common("Archive").to_string(),
+                    false,
+                    Box::new(move |this, _, cx| {
+                        if let Some(session_id) = archive_session_id.clone() {
+                            this.archive_sessions(vec![session_id], cx);
+                        }
+                    }),
+                );
                 for (id, kind, label, destructive) in [
                     (
                         "mobile-row-menu-rename",
@@ -15195,6 +15567,18 @@ impl MobileApp {
             ),
             None => process_title(row),
         };
+        // The change's size is what tells one row from another at a glance; a
+        // row whose operation carries no readable patch simply has none.
+        let counts = self
+            .timeline_row_latest_payload(row)
+            .and_then(|payload| match payload {
+                TimelinePayload::FileOperation(operation) => {
+                    crate::file_diff::line_counts(operation)
+                }
+                _ => None,
+            });
+        let diff_row = row.clone();
+        let diff_path = operation_path.clone();
         let mut element = div()
             .id(format!("timeline-file-row:{title}"))
             .w_full()
@@ -15220,7 +15604,7 @@ impl MobileApp {
                     }),
                 );
         }
-        element
+        element = element
             .child(
                 svg()
                     .path("icons/file-code.svg")
@@ -15239,7 +15623,74 @@ impl MobileApp {
                     .text_color(theme::text_secondary())
                     .child(title),
             )
-            .into_any_element()
+            .when_some(counts, |row, (added, removed)| {
+                row.child(
+                    div()
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_size(theme::font_micro())
+                        .when(added > 0, |counts| {
+                            counts.child(
+                                div()
+                                    .text_color(theme::accent_green())
+                                    .child(format!("+{added}")),
+                            )
+                        })
+                        .when(removed > 0, |counts| {
+                            counts.child(
+                                div()
+                                    .text_color(theme::accent_red())
+                                    .child(format!("−{removed}")),
+                            )
+                        }),
+                )
+            })
+            // The row itself opens the file, which is what a reader wants most
+            // of the time. The change is the second question, so it gets the
+            // second control rather than replacing the first.
+            .when_some(diff_path, |row, path| {
+                row.child(
+                    timeline_action_button(
+                        format!("timeline-file-diff:{}", diff_row.id),
+                        "icons/chevrons-right-left.svg",
+                        locale::text("View changes", "查看变更", "檢視變更"),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.open_timeline_file_diff(&diff_row, path.clone(), cx);
+                        }),
+                    ),
+                )
+            });
+        element.into_any_element()
+    }
+
+    /// Opens one file change as a full screen.
+    fn open_timeline_file_diff(&mut self, row: &TimelineRow, path: String, cx: &mut Context<Self>) {
+        let preview = self
+            .timeline_row_latest_payload(row)
+            .and_then(|payload| match payload {
+                TimelinePayload::FileOperation(operation) => crate::file_diff::project(operation),
+                _ => None,
+            });
+        let Some(preview) = preview else {
+            self.hint(
+                Tone::Info,
+                locale::text(
+                    "This change carries no readable diff",
+                    "这次变更没有可读的差异内容",
+                    "這次變更沒有可讀的差異內容",
+                ),
+            );
+            cx.notify();
+            return;
+        };
+        self.timeline_file_diff = Some(MobileTimelineFileDiff { path, preview });
+        cx.notify();
     }
 
     fn render_approval(
@@ -18633,6 +19084,41 @@ impl MobileApp {
                                 )
                                 .child(
                                     div()
+                                        .id("mobile-sidebar-batch-archive")
+                                        .size(px(32.0))
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .when(
+                                            !self.sidebar_state.selected_ids.is_empty(),
+                                            |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .active(|style| {
+                                                        style.bg(theme::row_pressed_bg())
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(
+                                                            Self::archive_selected_sessions,
+                                                        ),
+                                                    )
+                                            },
+                                        )
+                                        .when(
+                                            self.sidebar_state.selected_ids.is_empty(),
+                                            |button| button.opacity(0.4),
+                                        )
+                                        .child(
+                                            svg()
+                                                .path("icons/package.svg")
+                                                .size(px(16.0))
+                                                .text_color(theme::sidebar_text_secondary()),
+                                        ),
+                                )
+                                .child(
+                                    div()
                                         .id("mobile-sidebar-batch-delete")
                                         .size(px(32.0))
                                         .rounded(px(theme::RADIUS_CONTROL))
@@ -19473,7 +19959,18 @@ impl Render for MobileApp {
         // that reaches the layer never touches a page's layout, which is what
         // keeps a message from outliving the state it described.
         for hint in std::mem::take(&mut self.pending_hints) {
-            toast::push(window, cx, &hint);
+            let on_action: Option<toast::HintHandler> = hint.action.as_ref().map(|action| {
+                let entity = cx.weak_entity();
+                let action = action.clone();
+                let run: toast::HintHandler = Rc::new(move |window, cx| {
+                    let _ = entity.update(cx, |this, cx| match action.clone() {
+                        toast::HintAction::UndoArchive(ids) => this.undo_archive(ids, cx),
+                    });
+                    let _ = window;
+                });
+                run
+            });
+            toast::push(window, cx, &hint, on_action);
         }
         // The toast layer's width and bottom margin follow the live window:
         // rotation changes the first, the keyboard and the system gesture bar
@@ -27923,6 +28420,7 @@ mod tests {
             BackScreen::WorkbenchDrawer => true,
             BackScreen::SidebarSearch => false,
             BackScreen::SidebarBatchMode => false,
+            BackScreen::TimelineFileDiff => false,
         });
         let overlay = Some(MobileOverlay::Settings);
         if let Some(overlay) = overlay

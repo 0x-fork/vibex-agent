@@ -15,6 +15,7 @@ mod attachment;
 mod background_connection;
 mod device;
 mod discovery;
+mod file_diff;
 mod lifecycle;
 mod locale;
 mod markdown;

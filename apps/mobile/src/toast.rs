@@ -13,11 +13,14 @@
 //! autohide and replace-by-id behave identically on both clients. `theme.rs`
 //! moves the layer to the phone's own corner and width.
 
+use std::rc::Rc;
+
 use gpui::{
     App, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
     Window, div,
 };
 use gpui_component::WindowExt as _;
+use gpui_component::button::Button;
 use gpui_component::notification::{Notification, NotificationType};
 
 use crate::theme;
@@ -62,11 +65,35 @@ impl Tone {
     }
 }
 
+/// What a hint's button does.
+///
+/// A hint outlives the state it describes, which makes it the one place an undo
+/// can live: archiving takes a session out of the list, and the card that says
+/// so is the only way back to it on a phone. The variant names the work rather
+/// than carrying a closure, so a hint stays comparable and the app keeps the
+/// dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HintAction {
+    /// Put back the sessions an archive just removed.
+    UndoArchive(Vec<vibex_core::VibexSessionId>),
+}
+
+impl HintAction {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::UndoArchive(_) => crate::locale::common("Undo"),
+        }
+    }
+}
+
 /// One hint waiting for the next frame, or already on screen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hint {
     pub tone: Tone,
     pub message: String,
+    /// A control on the card, when the hint reports something the reader can
+    /// still take back.
+    pub action: Option<HintAction>,
 }
 
 impl Hint {
@@ -74,9 +101,25 @@ impl Hint {
         Self {
             tone,
             message: message.into(),
+            action: None,
+        }
+    }
+
+    /// A hint that offers to take back what it just reported.
+    pub fn with_action(tone: Tone, message: impl Into<String>, action: HintAction) -> Self {
+        Self {
+            tone,
+            message: message.into(),
+            action: Some(action),
         }
     }
 }
+
+/// What a hint's button runs when it is tapped.
+///
+/// A boxed closure rather than a generic: the hint layer is handed one by the
+/// app, which is the only place that knows what the action means.
+pub type HintHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// Distinct marker so the kit keys mobile hints apart from any other
 /// notification family that ever lands on this window.
@@ -89,7 +132,7 @@ struct MobileHint;
 /// keeps a repeating event — a connection that keeps dropping — from filling
 /// the corner with identical cards. Different messages stack, newest at the
 /// bottom, and the layer caps how many are visible.
-pub fn push(window: &mut Window, cx: &mut App, hint: &Hint) {
+pub fn push(window: &mut Window, cx: &mut App, hint: &Hint, on_action: Option<HintHandler>) {
     // A window that never got the kit's root — a bare test window — has no
     // notification layer to push to, and `WindowExt::push_notification` panics
     // on the missing window state instead of doing nothing. Every window the
@@ -103,21 +146,35 @@ pub fn push(window: &mut Window, cx: &mut App, hint: &Hint) {
     // The kit's own close button only appears under a pointer, and a phone has
     // none, so the card itself is the dismiss target: the kit takes the hint
     // down before it runs this handler, which therefore has nothing left to do.
-    let notification = Notification::new()
+    let action = match (hint.action.as_ref(), on_action) {
+        (Some(action), Some(run)) => Some((action.label(), run)),
+        _ => None,
+    };
+    let mut notification = Notification::new()
         .with_type(hint.tone.notification_type())
         .id1::<MobileHint>(hint.message.clone())
-        .on_click(|_, _, _| {})
-        .content(move |_, _, _| {
-            div()
-                .w_full()
-                .min_w_0()
-                .text_size(theme::font_body())
-                .debug_selector({
-                    let key = key.to_string();
-                    move || key.clone()
-                })
-                .child(message.clone())
-                .into_any_element()
+        .on_click(|_, _, _| {});
+    if let Some((label, run)) = action {
+        // An action keeps the card up until it is answered: a hint that
+        // offered an undo and then hid itself would be no undo at all.
+        notification = notification.action(move |_, _, _| {
+            let run = run.clone();
+            Button::new("mobile-hint-action")
+                .label(label)
+                .on_click(move |_, window, cx| run(window, cx))
         });
+    }
+    let notification = notification.content(move |_, _, _| {
+        div()
+            .w_full()
+            .min_w_0()
+            .text_size(theme::font_body())
+            .debug_selector({
+                let key = key.to_string();
+                move || key.clone()
+            })
+            .child(message.clone())
+            .into_any_element()
+    });
     window.push_notification(notification, cx);
 }
