@@ -983,7 +983,7 @@ impl MobileWorkbench {
                 .files
                 .state
                 .tree
-                .set_chain_expanded(&[path.clone()], true)
+                .set_chain_expanded(std::slice::from_ref(&path), true)
             {
                 self.load_file_tree_path(path, cx);
             }

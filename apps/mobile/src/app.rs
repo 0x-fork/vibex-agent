@@ -25673,14 +25673,14 @@ impl MobileApp {
     /// only the version, so there was no way to read what changed without
     /// leaving the app.
     fn render_release_notes(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(notes) = self
+        let has_notes = self
             .update_snapshot
             .as_ref()
-            .and_then(|snapshot| snapshot.current_notes.clone())
-            .filter(|notes| !notes.trim().is_empty())
-        else {
+            .and_then(|snapshot| snapshot.current_notes.as_deref())
+            .is_some_and(|notes| !notes.trim().is_empty());
+        if !has_notes {
             return div().into_any_element();
-        };
+        }
         let open = self.release_notes_open;
         let body = open
             .then(|| {
