@@ -13,6 +13,22 @@
 //! geometry follows. [`ModalSizing::compact`] gives the margins back on a short
 //! or narrow terminal, which is the one case where the box would otherwise eat
 //! the content.
+//!
+//! # The page behind the box
+//!
+//! A popup is drawn over a page that is still there, and a page drawn at full
+//! strength competes with it: the reader's eye lands on the session list behind
+//! the palette because it is just as bright as the palette. So the chrome paints
+//! the backdrop too — every cell outside the popup is shadowed by hand
+//! ([`TuiTheme::backdrop`]) before the box goes down. A terminal has no shadow
+//! to cast and no sheet to lay over the page, but it can do this, and the result
+//! is the same thing a shadow is for: one plane, lit.
+//!
+//! The one thing the scrim cannot reach is a *picture* the terminal holds rather
+//! than a cell the frame drew — a mark on a session row, a pasted screenshot
+//! ([`crate::row_marks`], [`crate::preview`]). It sits outside the grid, with no
+//! colour of its own to darken, so whoever placed it is the only thing that can
+//! take it down.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
@@ -235,6 +251,34 @@ pub struct ModalLayout {
     pub close: Option<Rect>,
 }
 
+/// Shadow whatever the popup is about to cover.
+///
+/// The cells the popup itself will occupy are skipped: the box paints over them
+/// a moment later, and darkening colours that are about to be cleared is work
+/// nobody sees. Every other cell of `area` is taken down a step
+/// ([`TuiTheme::backdrop`]), so the frame that was drawn underneath is still
+/// readable as a page and no longer as bright as what is on top of it.
+///
+/// This is the only place the step is applied, and it is applied to the whole
+/// frame rather than to the bands a caller knows about: a modal does not get to
+/// choose which parts of the page behind it recede, and a band list would drift
+/// the moment a new band is added to the layout.
+fn paint_backdrop(frame: &mut Frame<'_>, area: Rect, popup: Rect, theme: &TuiTheme) {
+    let buffer = frame.buffer_mut();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if popup.contains((x, y).into()) {
+                continue;
+            }
+            let Some(cell) = buffer.cell_mut((x, y)) else {
+                continue;
+            };
+            let receded = theme.backdrop(cell.style());
+            cell.set_style(receded);
+        }
+    }
+}
+
 /// Draw one modal's chrome and return the regions to fill.
 ///
 /// A modal that cannot be drawn at a usable size renders a single explanatory
@@ -261,6 +305,12 @@ pub fn render_modal(
         );
         return None;
     }
+    // Before the box, because the box is what the shadow is cast *for*: the page
+    // behind has already been drawn by the time a modal renders, and this is the
+    // frame's last chance to set it back.
+    paint_backdrop(frame, area, popup, theme);
+    // The popup's own cells still hold the page underneath: the backdrop skips
+    // them precisely because this resets every one of them.
     frame.render_widget(Clear, popup);
 
     let close_rect = chrome.close.then(|| close_rect(popup));
@@ -501,6 +551,59 @@ mod tests {
             hovered,
             Style::default(),
             "the hovered affordance is drawn as if it were not there"
+        );
+    }
+
+    #[test]
+    fn the_page_behind_a_modal_recedes_and_the_box_does_not() {
+        // A page drawn at full strength competes with the popup over it: the
+        // reader's eye lands on the session list behind the palette because
+        // nothing says which plane is lit. The backdrop is what says it, so it
+        // has to reach every cell the box does not cover — and it must not
+        // reach the box, whose border is the one thing that has to stay sharp.
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let theme = theme();
+        let page = Style::default()
+            .fg(theme.roles.foreground)
+            .bg(theme.roles.code_background);
+        let mut layout = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.buffer_mut().set_style(area, page);
+                let chrome = ModalChrome::new("Test", ModalSizing::picker());
+                layout = render_modal(frame, area, &chrome, &theme);
+            })
+            .expect("frame draws");
+        let layout = layout.expect("a 120x40 terminal fits a picker");
+        let buffer = terminal.backend().buffer();
+
+        // The corner is a page cell by construction: the picker keeps its
+        // margins, so nothing about it is anywhere near the popup.
+        let behind = buffer
+            .cell((0, 0))
+            .expect("the terminal has a corner")
+            .style();
+        let shadowed = theme.backdrop(page);
+        assert_eq!(
+            behind.fg, shadowed.fg,
+            "the page behind the popup kept its ink at full strength"
+        );
+        assert_eq!(
+            behind.bg, shadowed.bg,
+            "the page behind the popup kept its fill at full strength"
+        );
+
+        // And the border the reader reads the popup by is untouched.
+        let lit = buffer
+            .cell((layout.area.x, layout.area.y))
+            .expect("the popup has a corner of its own")
+            .style();
+        assert_eq!(lit.fg, Some(theme.roles.focus));
+        assert_ne!(
+            lit.fg, shadowed.fg,
+            "the popup was shadowed along with the page it covers"
         );
     }
 

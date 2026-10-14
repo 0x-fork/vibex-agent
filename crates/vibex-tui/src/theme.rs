@@ -573,6 +573,30 @@ pub fn color_rgb(color: Color) -> Option<u32> {
     }
 }
 
+/// The colour every cell behind a modal is mixed toward.
+///
+/// Black, because a shadow is an absence: a scrim that leaned on a palette
+/// colour would tint the page behind every popup, and on the one theme that
+/// resolves that colour to the foreground it would light the page up instead.
+/// Written long-hand because [`TuiTheme::blend`] mixes channels, and the
+/// palette's own `Black` is a slot with no channels in it.
+const SCRIM: Color = Color::Rgb(0, 0, 0);
+
+/// How much of a colour survives on a cell that has fallen behind a modal.
+///
+/// The step is the desktop's own scrim — black at 0.60 over the page in dark
+/// mode, and at 0.32 in light — because the two clients are one product and a
+/// popup that shadows its page differently on each would be two. Light takes
+/// the shallower step for the reason the desktop takes it: a dark page is bright
+/// ink on a dark plane and has further to recede, while the same strength over a
+/// bright page reads as a blackout rather than as a shadow.
+const fn backdrop_weight(mode: GpuiThemeMode) -> f32 {
+    match mode {
+        GpuiThemeMode::Dark => 0.4,
+        GpuiThemeMode::Light => 0.68,
+    }
+}
+
 /// A resolved theme plus the renderer conveniences built on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiTheme {
@@ -860,6 +884,47 @@ impl TuiTheme {
             .unwrap_or(from)
     }
 
+    /// The style one cell wears once it has fallen behind a modal.
+    ///
+    /// A terminal has no alpha, so a scrim cannot be a sheet laid over the page:
+    /// there is nothing to give a transparency to, and painting an opaque one
+    /// would delete the page rather than recede it. The layer is therefore
+    /// painted *into* the cells it covers — the desktop's own scrim is black
+    /// over what stands behind it, and every cell here takes that black by hand,
+    /// at the strength the appearance calls for ([`backdrop_weight`]). The page
+    /// keeps its shape and gives up its claim on the eye, which is what the
+    /// popup above it is asking for.
+    ///
+    /// Nothing here is a token: a scrim is a *step*, and it has to be the same
+    /// step whatever the cell underneath happened to draw.
+    ///
+    /// Where the colours cannot be taken apart there is nothing to mix. An
+    /// indexed palette hands back a slot rather than a colour, and a cell can
+    /// have no colour of its own at all — a reverse-video selection is the one
+    /// that matters, because it is exactly the cell that would otherwise stay
+    /// bright behind the popup. Those cells, and only those, are given `DIM`
+    /// instead: it is the carrier that survives a palette with no steps in it,
+    /// and adding it where the blend already worked would dim the same cell
+    /// twice.
+    pub fn backdrop(&self, style: Style) -> Style {
+        let mixed =
+            |channel: Color| self.capability.mode.blends() && matches!(channel, Color::Rgb(..));
+        let blended = style.fg.is_some_and(mixed) || style.bg.is_some_and(mixed);
+        let scrim = 1.0 - backdrop_weight(self.mode);
+        let mut receded = style;
+        if let Some(ink) = style.fg {
+            receded.fg = Some(self.blend(ink, SCRIM, scrim));
+        }
+        if let Some(fill) = style.bg {
+            receded.bg = Some(self.blend(fill, SCRIM, scrim));
+        }
+        if blended {
+            receded
+        } else {
+            receded.add_modifier(Modifier::DIM)
+        }
+    }
+
     /// The style for chrome that belongs to an unfocused pane.
     pub fn dimmed(&self, color: Color) -> Style {
         Style::default().fg(self.fade(color, 0.55))
@@ -1109,6 +1174,126 @@ mod tests {
             theme.id,
             theme_catalog::default_theme_id(GpuiThemeMode::Light)
         );
+    }
+
+    #[test]
+    fn a_backdrop_takes_light_from_both_the_ink_and_the_fill() {
+        // A scrim is a step, not a colour: whatever a cell drew, it comes back
+        // darker than it was, and by less than all of the way — a page that
+        // reached black would be a blackout rather than a shadow, and the list
+        // behind the palette would stop being readable as a list.
+        let capability = ColorCapability {
+            mode: ColorMode::TrueColor,
+            glyphs: GlyphMode::Unicode,
+        };
+        let lightness = |color: u32| {
+            [16u32, 8, 0]
+                .into_iter()
+                .map(|shift| (color >> shift) & 0xff)
+                .sum::<u32>()
+        };
+        for mode in GpuiThemeMode::ALL {
+            for definition in theme_catalog::themes_for(mode) {
+                let theme = TuiTheme::from_definition(definition, capability);
+                // The pair every page cell is drawn in: prose over a panel.
+                let page = Style::default()
+                    .fg(theme.roles.gray_bright)
+                    .bg(theme.roles.code_background);
+                let receded = theme.backdrop(page);
+                for (before, after, what) in
+                    [(page.fg, receded.fg, "ink"), (page.bg, receded.bg, "fill")]
+                {
+                    let (Some(before), Some(after)) = (before, after) else {
+                        continue;
+                    };
+                    let (Some(before), Some(after)) = (color_rgb(before), color_rgb(after)) else {
+                        continue;
+                    };
+                    assert!(
+                        lightness(after) < lightness(before),
+                        "{} left the {what} where it was",
+                        definition.id
+                    );
+                    assert!(
+                        after > 0,
+                        "{} walked the {what} all the way into the black",
+                        definition.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_appearance_decides_how_far_the_page_recedes() {
+        // The same two steps the desktop takes: a light page is already read as
+        // ink on paper, so a shadow at the dark appearance's strength would read
+        // as a blackout there.
+        let capability = ColorCapability {
+            mode: ColorMode::TrueColor,
+            glyphs: GlyphMode::Unicode,
+        };
+        // How much of its ink a page gives up, as a fraction.
+        let taken = |mode| {
+            let definition = theme_catalog::themes_for(mode).next().expect("a theme");
+            let theme = TuiTheme::from_definition(definition, capability);
+            let before = color_rgb(theme.roles.foreground).expect("a colour");
+            let after = theme
+                .backdrop(Style::default().fg(theme.roles.foreground))
+                .fg
+                .and_then(color_rgb)
+                .expect("the ink is kept");
+            1.0 - (f64::from(after) / f64::from(before))
+        };
+        assert!(
+            taken(GpuiThemeMode::Dark) > taken(GpuiThemeMode::Light),
+            "the light appearance was shadowed at least as hard as the dark one"
+        );
+    }
+
+    #[test]
+    fn a_cell_with_no_colour_of_its_own_recedes_by_weight_instead() {
+        // The blend needs a colour with channels in it. An indexed palette hands
+        // back a slot instead, and a reverse-video selection has no colour at
+        // all — and the selection is exactly the cell that must not stay bright
+        // behind a popup. Those cells take `DIM`, which is the carrier that
+        // survives a palette with no steps in it.
+        for mode in [ColorMode::Ansi256, ColorMode::Ansi16, ColorMode::None] {
+            let capability = ColorCapability {
+                mode,
+                glyphs: GlyphMode::Unicode,
+            };
+            let theme = TuiTheme::resolve(Some("vibex-dark"), GpuiThemeMode::Dark, capability);
+            for (style, what) in [
+                (
+                    Style::default().add_modifier(Modifier::REVERSED),
+                    "a colourless selection",
+                ),
+                (
+                    Style::default().fg(theme.roles.gray_bright),
+                    "a palette-coloured label",
+                ),
+            ] {
+                let receded = theme.backdrop(style);
+                assert!(
+                    receded.add_modifier.contains(Modifier::DIM),
+                    "{mode:?} left {what} at full strength"
+                );
+                // Nothing was invented for a channel the cell never had.
+                assert_eq!(receded.fg, style.fg);
+                assert_eq!(receded.bg, style.bg);
+            }
+        }
+        // With a channel per colour the blend is the carrier, so `DIM` is not:
+        // adding it there would dim the same cell twice.
+        let capability = ColorCapability {
+            mode: ColorMode::TrueColor,
+            glyphs: GlyphMode::Unicode,
+        };
+        let theme = TuiTheme::resolve(Some("vibex-dark"), GpuiThemeMode::Dark, capability);
+        let receded = theme.backdrop(Style::default().fg(theme.roles.gray_bright));
+        assert!(!receded.add_modifier.contains(Modifier::DIM));
+        assert_ne!(receded.fg, Some(theme.roles.gray_bright));
     }
 
     #[test]
