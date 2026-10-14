@@ -263,6 +263,10 @@ pub struct MobileWorkbench {
     /// The path of the buffer the editor is holding, which is not always the
     /// selected path: a read that returned nothing must not claim the screen.
     file_editor_path: Option<String>,
+    /// A line to put the caret on once the file it belongs to has loaded. A
+    /// content-search result names a line, and opening the file without going
+    /// there leaves the reader to find it again by hand.
+    pending_file_reveal: Option<(String, usize)>,
     /// A file the user asked to open while the editor still had unsaved edits.
     /// Opening it immediately would overwrite the buffer, so the choice is
     /// theirs to make first.
@@ -411,6 +415,7 @@ impl MobileWorkbench {
             terminal_clear_pending: false,
             pending_file_editor_content: None,
             file_editor_path: None,
+            pending_file_reveal: None,
             file_discard_prompt: None,
             file_preview_mode: MobileFilePreviewMode::Source,
             file_image: None,
@@ -628,6 +633,13 @@ impl MobileWorkbench {
     }
 
     fn open_file_now(&mut self, path: String, cx: &mut Context<Self>) {
+        if self
+            .pending_file_reveal
+            .as_ref()
+            .is_some_and(|(pending, _)| pending != &path)
+        {
+            self.pending_file_reveal = None;
+        }
         let ticket = match self.files.begin_open_file(path) {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -917,6 +929,49 @@ impl MobileWorkbench {
             });
         });
         self.tasks.push(task);
+    }
+
+    /// Opens a search result on the line it matched.
+    fn reveal_file_search_result(&mut self, path: String, line: u32, cx: &mut Context<Self>) {
+        let line = line as usize;
+        if line > 0 {
+            self.pending_file_reveal = Some((path.clone(), line));
+        }
+        self.select_file(path, cx);
+    }
+
+    /// Puts the caret on a line that was waiting for its file to load.
+    ///
+    /// Called from the paint that writes the buffer, because the selection can
+    /// only be set on content the editor already holds.
+    fn apply_pending_file_reveal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, line)) = self.pending_file_reveal.clone() else {
+            return;
+        };
+        if self.file_editor_path.as_deref() != Some(path.as_str()) {
+            // The file that was asked for never opened; the request goes with
+            // it rather than landing on whatever is in the buffer instead.
+            if !self.files.state.active_file.is_loading() {
+                self.pending_file_reveal = None;
+            }
+            return;
+        }
+        let Some(input) = self.file_editor_input.clone() else {
+            return;
+        };
+        self.pending_file_reveal = None;
+        let text = input.read(cx).value().to_string();
+        let Some((start, end)) = file_line_range(&text, line) else {
+            return;
+        };
+        let line_height = input.read(cx).line_height().map(f32::from).unwrap_or(18.0);
+        let offset_y = -((line.saturating_sub(2)) as f32) * line_height;
+        input.update(cx, |input, cx| {
+            input.set_selected_range(start..end, cx);
+            input.set_scroll_offset(point(px(0.0), px(offset_y)), cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
     }
 
     /// Picks one half of the search-mode switch.
@@ -1439,6 +1494,15 @@ impl MobileWorkbench {
             }
         }
 
+        if let Some(content) = self.pending_file_editor_content.take()
+            && let Some(input) = self.file_editor_input.clone()
+        {
+            input.update(cx, |input, cx| input.set_value(content, window, cx));
+        }
+        // After the buffer write, and before the clears borrow the fields the
+        // reveal also reads.
+        self.apply_pending_file_reveal(window, cx);
+
         let clears = [
             (&mut self.file_search_clear_pending, &self.file_search_input),
             (&mut self.git_commit_clear_pending, &self.git_commit_input),
@@ -1448,12 +1512,6 @@ impl MobileWorkbench {
             ),
             (&mut self.terminal_clear_pending, &self.terminal_input),
         ];
-        if let Some(content) = self.pending_file_editor_content.take()
-            && let Some(input) = self.file_editor_input.clone()
-        {
-            input.update(cx, |input, cx| input.set_value(content, window, cx));
-        }
-
         for (pending, input) in clears {
             if !*pending {
                 continue;
@@ -3684,7 +3742,11 @@ impl MobileWorkbench {
                                 .on_mouse_up(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
-                                        this.select_file(select_path.clone(), cx)
+                                        this.reveal_file_search_result(
+                                            select_path.clone(),
+                                            line,
+                                            cx,
+                                        )
                                     }),
                                 )
                                 .child(mobile_file_tree_icon(
@@ -6947,7 +7009,7 @@ fn file_preview_kind_for_path(path: &str) -> FilePreviewKind {
 
 /// The decoder an image path needs, or `None` when the extension names a
 /// format this build cannot draw.
-fn image_format_for_path(path: &str) -> Option<ImageFormat> {
+pub(crate) fn image_format_for_path(path: &str) -> Option<ImageFormat> {
     let extension = path
         .rsplit('/')
         .next()

@@ -531,6 +531,20 @@ struct PendingMobileUserMessage {
     attachments: Vec<MessageAttachment>,
 }
 
+/// What is known about one generated picture.
+#[derive(Debug, Clone)]
+enum GeneratedImageState {
+    /// The bytes are on their way.
+    Loading,
+    Ready(Arc<Image>),
+    /// A URL the provider hosts. The image element fetches it itself, which is
+    /// the one route on this client that can reach outside the workspace.
+    Remote(String),
+    /// The reference named something this client cannot show: a path outside
+    /// the workspace, or a format it cannot decode.
+    Unavailable,
+}
+
 /// One file change from the timeline, opened for reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MobileTimelineFileDiff {
@@ -1332,6 +1346,9 @@ pub struct MobileApp {
     /// projected: the sheet is a read-out, so nothing is computed while it
     /// paints.
     timeline_file_diff: Option<MobileTimelineFileDiff>,
+    /// The pictures an image-generation card produced, by the reference the
+    /// runtime wrote. A reference is fetched once, when its card is opened.
+    generated_images: BTreeMap<String, GeneratedImageState>,
     attachment_preview_loading: Option<String>,
     desktop_timeline_display_settings: AgentTimelineDisplaySettings,
     timeline_display_settings_overrides: BTreeMap<String, MobileTimelineDisplaySettingsOverride>,
@@ -2554,6 +2571,7 @@ impl MobileApp {
             timeline_metadata_tip: None,
             attachment_preview: None,
             timeline_file_diff: None,
+            generated_images: BTreeMap::new(),
             attachment_preview_loading: None,
             desktop_timeline_display_settings: AgentTimelineDisplaySettings::default(),
             timeline_display_settings_overrides,
@@ -14651,6 +14669,68 @@ impl MobileApp {
         Some((session.workspace_id.clone(), session.workspace_root.clone()))
     }
 
+    /// Fetches the picture an image-generation card refers to.
+    ///
+    /// The runtime writes a reference, not the pixels: a workspace path for a
+    /// picture the Agent saved, or a URL for one a provider is hosting. The
+    /// path is read through the same file route an attachment preview uses;
+    /// a URL is handed to the image element, which is the one thing on this
+    /// client that can fetch for itself.
+    fn ensure_generated_image(&mut self, reference: &str, cx: &mut Context<Self>) {
+        let reference = reference.trim();
+        if reference.is_empty() || self.generated_images.contains_key(reference) {
+            return;
+        }
+        if reference.starts_with("http://") || reference.starts_with("https://") {
+            // The element fetches this one; recording it is what keeps a
+            // repaint from handing the same URL over again.
+            self.generated_images.insert(
+                reference.to_string(),
+                GeneratedImageState::Remote(reference.to_string()),
+            );
+            return;
+        }
+        let Some((workspace_id, workspace_root)) = self.active_workspace_context() else {
+            self.generated_images
+                .insert(reference.to_string(), GeneratedImageState::Unavailable);
+            return;
+        };
+        let Some(path) = message_attachment_workspace_path(reference, Some(&workspace_root)) else {
+            self.generated_images
+                .insert(reference.to_string(), GeneratedImageState::Unavailable);
+            return;
+        };
+        let Some(format) = crate::workbench::image_format_for_path(&path) else {
+            self.generated_images
+                .insert(reference.to_string(), GeneratedImageState::Unavailable);
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.generated_images
+            .insert(reference.to_string(), GeneratedImageState::Loading);
+        let key = reference.to_string();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.download_file(workspace_id, path).await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                let state = match outcome {
+                    Ok(bytes) => {
+                        GeneratedImageState::Ready(Arc::new(Image::from_bytes(format, bytes)))
+                    }
+                    Err(_) => GeneratedImageState::Unavailable,
+                };
+                this.generated_images.insert(key, state);
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
     fn close_attachment_preview(
         &mut self,
         _: &MouseUpEvent,
@@ -15411,12 +15491,20 @@ impl MobileApp {
                     .items_center()
                     .gap_2()
                     .when(can_expand, |header| {
+                        let reference = image.image_reference.clone();
                         header
                             .cursor_pointer()
                             .active(|style| style.bg(theme::row_pressed_bg()))
                             .on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
+                                    // Opening the card is what asks for the
+                                    // picture: a closed card costs nothing.
+                                    if !this.timeline_row_expanded(&row_id)
+                                        && let Some(reference) = reference.as_deref()
+                                    {
+                                        this.ensure_generated_image(reference, cx);
+                                    }
                                     this.toggle_timeline_row(row_id.clone(), cx)
                                 }),
                             )
@@ -15477,14 +15565,71 @@ impl MobileApp {
                             ))
                         })
                         .when_some(image.image_reference.as_ref(), |details, reference| {
-                            details.child(self.render_timeline_detail(
-                                locale::text("Image reference", "图片引用", "圖片參照"),
-                                reference,
-                            ))
+                            details.child(self.render_generated_image(reference)).child(
+                                self.render_timeline_detail(
+                                    locale::text("Image reference", "图片引用", "圖片參照"),
+                                    reference,
+                                ),
+                            )
                         }),
                 )
             })
             .into_any_element()
+    }
+
+    /// The picture an image-generation card produced, when it can be shown.
+    fn render_generated_image(&self, reference: &str) -> gpui::AnyElement {
+        match self.generated_images.get(reference.trim()) {
+            Some(GeneratedImageState::Ready(image)) => div()
+                .w_full()
+                .h(px(240.0))
+                .rounded(px(theme::RADIUS_CONTROL))
+                .border_1()
+                .border_color(theme::border_subtle())
+                .bg(theme::bg_card())
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    img(image.clone())
+                        .max_w_full()
+                        .max_h_full()
+                        .object_fit(ObjectFit::Contain),
+                )
+                .into_any_element(),
+            Some(GeneratedImageState::Remote(url)) => div()
+                .w_full()
+                .h(px(240.0))
+                .rounded(px(theme::RADIUS_CONTROL))
+                .border_1()
+                .border_color(theme::border_subtle())
+                .bg(theme::bg_card())
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    img(url.clone())
+                        .max_w_full()
+                        .max_h_full()
+                        .object_fit(ObjectFit::Contain),
+                )
+                .into_any_element(),
+            Some(GeneratedImageState::Loading) => div()
+                .w_full()
+                .h(px(64.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(theme::font_caption())
+                .text_color(theme::text_muted())
+                .child(locale::common("Loading"))
+                .into_any_element(),
+            // Nothing is drawn for a reference this client cannot show: the
+            // reference line underneath is what says what it was.
+            Some(GeneratedImageState::Unavailable) | None => div().into_any_element(),
+        }
     }
 
     fn render_permission_request_card(
