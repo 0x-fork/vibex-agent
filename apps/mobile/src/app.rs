@@ -1327,6 +1327,9 @@ pub struct MobileApp {
     /// Plan bars the reader closed. Identity is the session plus the plan
     /// revision, so a new plan from the Agent shows up again on its own.
     dismissed_composer_plans: BTreeSet<(String, i64)>,
+    /// The objective editor's field, and whether it is open.
+    goal_objective_input: Entity<TextareaState>,
+    goal_objective_open: bool,
     /// Whether the goal bar is showing its objective in full. A phone has room
     /// for the phase and one line of objective, and no more.
     composer_goal_expanded: bool,
@@ -2650,6 +2653,14 @@ impl MobileApp {
             composer_history_limit: COMPOSER_HISTORY_PAGE,
             composer_plan_expanded: None,
             dismissed_composer_plans: BTreeSet::new(),
+            goal_objective_input: cx.new(|cx| {
+                TextareaState::new(window, cx).placeholder(locale::text(
+                    "What should the Agent work toward?",
+                    "Agent 应该朝着什么目标工作？",
+                    "Agent 應該朝著什麼目標工作？",
+                ))
+            }),
+            goal_objective_open: false,
             composer_goal_expanded: false,
             composer_queue: restored_composer.queue,
             composer_queue_next_id: restored_composer.next_queue_id,
@@ -8692,6 +8703,10 @@ impl MobileApp {
         if self.sidebar_batch_delete_confirmation {
             self.sidebar_batch_delete_confirmation = false;
             cx.notify();
+            return;
+        }
+        if self.goal_objective_open {
+            self.close_goal_objective(cx);
             return;
         }
         if self.timeline_find_open {
@@ -19647,7 +19662,9 @@ impl MobileApp {
         let (phase_label, phase_color) = goal_phase_label(phase);
         let objective = active.goal.objective.clone();
         let progress = goal_progress_label(&active.goal);
-        let can_edit = self.composer_has_goal_command(cx);
+        // A rewrite needs either the Agent's own goal command or a goal
+        // surface that takes one; without either there is nothing to offer.
+        let can_edit = self.composer_has_goal_command(cx) || self.goal_objective_action().is_some();
         let expanded_body = expanded.then(|| {
             div()
                 .px(px(theme::SPACING_MD))
@@ -19701,6 +19718,7 @@ impl MobileApp {
                                                     } else {
                                                         vibex_core::GoalAction::Pause
                                                     },
+                                                    None,
                                                     cx,
                                                 )
                                             }),
@@ -19735,6 +19753,7 @@ impl MobileApp {
                                             cx.listener(|this, _, _, cx| {
                                                 this.control_session_goal(
                                                     vibex_core::GoalAction::Clear,
+                                                    None,
                                                     cx,
                                                 )
                                             }),
@@ -19866,7 +19885,12 @@ impl MobileApp {
     /// The desktop does this through the local manager; a paired client goes
     /// through the same authority over the wire, which is what makes a goal
     /// controllable from the phone at all.
-    fn control_session_goal(&mut self, action: vibex_core::GoalAction, cx: &mut Context<Self>) {
+    fn control_session_goal(
+        &mut self,
+        action: vibex_core::GoalAction,
+        objective: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         if self.operation_busy {
             return;
         }
@@ -19898,7 +19922,7 @@ impl MobileApp {
         let request = MutationRequest::new(vibex_core::AgentGoalControlRequest {
             session_id,
             action,
-            objective: None,
+            objective,
             expected_revision,
             correlation_id: None,
         });
@@ -19925,20 +19949,182 @@ impl MobileApp {
     }
 
     /// Prefills the composer with the Agent's own goal command.
+    /// Whether the Agent's goal surface accepts a new objective at all.
+    ///
+    /// The vocabulary is the adapter's: one that spells the rewrite `set`,
+    /// another that spells it `edit`, and one that offers neither.
+    fn goal_objective_action(&self) -> Option<vibex_core::GoalAction> {
+        let active = self.current_goal()?;
+        if active.actions.contains(&vibex_core::GoalAction::Set) {
+            Some(vibex_core::GoalAction::Set)
+        } else if active.actions.contains(&vibex_core::GoalAction::Edit) {
+            Some(vibex_core::GoalAction::Edit)
+        } else {
+            None
+        }
+    }
+
+    /// Opens the objective editor, seeded with the goal on screen.
+    ///
+    /// The desktop edits the objective in its goal bar and issues a control;
+    /// the phone used to prefill `/goal <objective>` into the composer and let
+    /// the reader send it, which only worked on Agents that spell that command
+    /// themselves. Where the goal surface takes a rewrite, this calls it; where
+    /// it does not, the command is still the fallback.
     fn begin_composer_goal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(active) = self.current_goal() else {
             return;
         };
-        let draft = format!("/goal {}", active.goal.objective);
-        let selection_end = draft.len();
         self.composer_goal_expanded = false;
-        self.composer_input.update(cx, |input, cx| {
-            input.set_value(draft, window, cx);
+        if self.goal_objective_action().is_none()
+            || !self.backend.as_ref().is_some_and(|backend| {
+                backend
+                    .capability_snapshot()
+                    .agent
+                    .supports(BackendOperation::AgentGoalControl)
+            })
+        {
+            let draft = format!("/goal {}", active.goal.objective);
+            let selection_end = draft.len();
+            self.composer_input.update(cx, |input, cx| {
+                input.set_value(draft, window, cx);
+                input.set_selected_range(0..selection_end, cx);
+                input.focus(window, cx);
+            });
+            crate::platform::show_keyboard();
+            cx.notify();
+            return;
+        }
+        let objective = active.goal.objective.clone();
+        let selection_end = objective.len();
+        self.goal_objective_input.update(cx, |input, cx| {
+            input.set_value(objective, window, cx);
             input.set_selected_range(0..selection_end, cx);
             input.focus(window, cx);
         });
+        self.goal_objective_open = true;
         crate::platform::show_keyboard();
         cx.notify();
+    }
+
+    fn close_goal_objective(&mut self, cx: &mut Context<Self>) {
+        if self.goal_objective_open {
+            self.goal_objective_open = false;
+            cx.notify();
+        }
+    }
+
+    /// Sends the rewritten objective through the goal control.
+    fn confirm_goal_objective(&mut self, cx: &mut Context<Self>) {
+        let Some(action) = self.goal_objective_action() else {
+            return;
+        };
+        let objective = self
+            .goal_objective_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if objective.is_empty() {
+            return;
+        }
+        self.goal_objective_open = false;
+        self.control_session_goal(action, Some(objective), cx);
+    }
+
+    /// The objective editor: one field, and the control it will issue.
+    fn render_goal_objective_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .id("mobile-goal-objective")
+            .debug_selector(|| "mobile-goal-objective".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.45))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_goal_objective(cx)),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_size(theme::font_title())
+                            .text_color(theme::text_primary())
+                            .child(locale::text("Objective", "目标", "目標")),
+                    )
+                    .child(
+                        div()
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::bg_primary())
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .items_center()
+                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
+                            .child(
+                                Textarea::new(&self.goal_objective_input).appearance(false),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_muted())
+                                    .child(locale::text(
+                                        "The Agent keeps working toward this until it is done or cleared.",
+                                        "Agent 会持续朝这个目标工作，直到完成或被清除。",
+                                        "Agent 會持續朝這個目標工作，直到完成或被清除。",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("goal-objective-save")
+                                    .flex_shrink_0()
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .px(px(theme::SPACING_LG))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(theme::primary())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .active(|style| style.opacity(0.85))
+                                    .text_size(theme::font_caption())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::primary_foreground())
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.confirm_goal_objective(cx)
+                                        }),
+                                    )
+                                    .child(locale::common("Save")),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// The collaborator a draft is addressed to, when it is addressed to one.
