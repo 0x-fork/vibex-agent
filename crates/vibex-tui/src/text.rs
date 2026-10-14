@@ -103,6 +103,33 @@ pub fn take_width(text: &str, max: usize) -> (String, &str) {
     (text.to_string(), "")
 }
 
+/// Take the text under a range of display cells, both ends included.
+///
+/// A pointer selects the cell it is on, not the boundary before it, so a copy
+/// read back through [`take_width`] loses the character under the pointer at
+/// the far end of a drag. This answers the selection instead of a prefix: the
+/// cells `from..=to` are what was dragged over, and a grapheme the range only
+/// partly covers is taken whole, because half a cell is not something a
+/// terminal can draw.
+pub fn take_columns(text: &str, from: usize, to: usize) -> String {
+    if from > to {
+        return String::new();
+    }
+    let mut output = String::new();
+    let mut column = 0usize;
+    for grapheme in text.graphemes(true) {
+        if column > to {
+            break;
+        }
+        let width = UnicodeWidthStr::width(grapheme);
+        if column + width > from {
+            output.push_str(grapheme);
+        }
+        column += width;
+    }
+    output
+}
+
 /// Pad to exactly `width` columns.
 pub fn pad_to_width(text: &str, width: usize) -> String {
     let current = display_width(text);
@@ -912,6 +939,27 @@ mod tests {
         let (prefix, rest) = take_width("中文abc", 5);
         assert_eq!(prefix, "中文a");
         assert_eq!(rest, "bc");
+    }
+
+    #[test]
+    fn a_cell_range_takes_both_of_its_ends() {
+        // The first cell of a drag is where the pointer went down and the last
+        // is where it came up; both were pointed at, so both are copied.
+        assert_eq!(take_columns("hello", 0, 4), "hello");
+        assert_eq!(take_columns("hello", 1, 3), "ell");
+        assert_eq!(take_columns("hello", 2, 2), "l");
+        // A range narrower than a wide glyph takes the whole glyph, at either
+        // end: a terminal cannot draw half of one.
+        assert_eq!(take_columns("中文abc", 1, 1), "中");
+        assert_eq!(take_columns("中文abc", 2, 2), "文");
+        assert_eq!(take_columns("中文abc", 3, 3), "文");
+        assert_eq!(take_columns("中文abc", 4, 4), "a");
+        assert_eq!(take_columns("中文abc", 1, 2), "中文");
+        // A range past the end of the text is the text, not a panic.
+        assert_eq!(take_columns("ab", 0, 400), "ab");
+        assert_eq!(take_columns("ab", 40, 400), "");
+        // And a range that runs backwards covers nothing.
+        assert_eq!(take_columns("ab", 1, 0), "");
     }
 
     #[test]

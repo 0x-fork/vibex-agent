@@ -1532,12 +1532,18 @@ pub fn list_row_at(region: &ListRegion, column: u16, row: u16) -> Option<usize> 
 /// counts terminal cells from the left edge of the transcript band. Both are
 /// what the renderer already speaks in, so a selection never has to be
 /// translated back into block or byte coordinates to be painted.
+///
+/// Both ends are cells the reader pointed at, and both are covered: a drag that
+/// comes to rest on a character copies that character. A press that never moves
+/// is not a selection at all — it is how the reader drops a stale highlight —
+/// which is what [`TextSelection::is_empty`] answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextSelection {
     pub anchor: (usize, u16),
     pub head: (usize, u16),
-    /// Whether the button is still held.
-    pub dragging: bool,
+    /// Whether the gesture went anywhere: the pointer moved after the button
+    /// went down, or a double click picked a whole word.
+    pub moved: bool,
 }
 
 impl TextSelection {
@@ -1552,7 +1558,7 @@ impl TextSelection {
 
     /// Whether the selection covers any cell at all.
     pub fn is_empty(&self) -> bool {
-        self.anchor == self.head
+        !self.moved
     }
 }
 
@@ -7088,11 +7094,14 @@ impl App {
     // ---- transcript text selection -------------------------------------
 
     /// Start a selection at one cell of the transcript band.
+    ///
+    /// The press covers nothing yet: until the pointer moves it is a click,
+    /// and a click leaves the clipboard alone.
     pub fn begin_text_selection(&mut self, line: usize, column: u16) {
         self.text_selection = Some(TextSelection {
             anchor: (line, column),
             head: (line, column),
-            dragging: true,
+            moved: false,
         });
     }
 
@@ -7325,15 +7334,15 @@ impl App {
             return false;
         };
         selection.head = (line, column);
+        selection.moved = true;
         true
     }
 
     /// Finish the selection in progress, reporting whether it covers anything.
     pub fn finish_text_selection(&mut self) -> bool {
-        let Some(selection) = self.text_selection.as_mut() else {
+        let Some(selection) = self.text_selection.as_ref() else {
             return false;
         };
-        selection.dragging = false;
         !selection.is_empty()
     }
 
@@ -7341,7 +7350,7 @@ impl App {
     pub fn select_word_at(&mut self, line: usize, column: u16) -> bool {
         let theme = self.theme.clone();
         let strings = self.strings;
-        let Some(text) = self
+        let Some(row) = self
             .transcript
             .plain_lines(line, line + 1, &theme, strings)
             .into_iter()
@@ -7349,13 +7358,23 @@ impl App {
         else {
             return false;
         };
-        let Some((start, end)) = crate::transcript::word_at(&text, column) else {
+        // The pointer counts band cells and the row's first cells are chrome,
+        // so a click is read as a click on the text before the word under it
+        // can be found.
+        let column = usize::from(column).saturating_sub(row.chrome);
+        let Some((start, end)) = u16::try_from(column)
+            .ok()
+            .and_then(|column| crate::transcript::word_at(&row.text, column))
+        else {
             return false;
         };
+        // `word_at` answers where the word stops; a selection ends on the cell
+        // it covers, which is the one before that.
+        let chrome = u16::try_from(row.chrome).unwrap_or(u16::MAX);
         self.text_selection = Some(TextSelection {
-            anchor: (line, start),
-            head: (line, end),
-            dragging: false,
+            anchor: (line, start.saturating_add(chrome)),
+            head: (line, end.saturating_sub(1).saturating_add(chrome)),
+            moved: true,
         });
         true
     }
@@ -7370,12 +7389,17 @@ impl App {
     /// The trailing whitespace of every line is dropped, because a terminal
     /// pads with spaces and nobody wants them on the clipboard; interior
     /// spacing is preserved exactly.
+    ///
+    /// A selection is a range of *cells*, and the first cell of every row is
+    /// chrome — the block's marker, its pad, the padding of the reader's own
+    /// box — which never reaches the clipboard. Both ends of the drag are cells
+    /// the reader pointed at, so both are copied.
     pub fn selected_text(&mut self) -> Option<String> {
         let selection = self.text_selection?;
-        let (start, end) = selection.ordered();
-        if start == end {
+        if selection.is_empty() {
             return None;
         }
+        let (start, end) = selection.ordered();
         let theme = self.theme.clone();
         let strings = self.strings;
         let lines = self
@@ -7387,15 +7411,27 @@ impl App {
         let last = lines.len() - 1;
         let mut output = Vec::with_capacity(lines.len());
         for (index, line) in lines.into_iter().enumerate() {
-            let from = if index == 0 { usize::from(start.1) } else { 0 };
-            let to = if index == last {
-                usize::from(end.1)
+            // The row's text starts `chrome` cells in, so a band column reads
+            // as a column of the text by crossing that much of it. A drag that
+            // starts in the margin means the text from its first cell.
+            let from = if index == 0 {
+                usize::from(start.1).saturating_sub(line.chrome)
             } else {
-                usize::from(u16::MAX)
+                0
             };
-            let (_, rest) = crate::text::take_width(&line, from);
-            let (prefix, _) = crate::text::take_width(rest, to.saturating_sub(from));
-            output.push(prefix.trim_end().to_string());
+            let to = if index == last {
+                usize::from(end.1).checked_sub(line.chrome)
+            } else {
+                Some(usize::MAX)
+            };
+            let text = match to {
+                // The drag came up in the row's chrome: it covers none of the
+                // row's text, and a range that ran backwards would otherwise
+                // still take the first character.
+                None => String::new(),
+                Some(to) => crate::text::take_columns(&line.text, from, to),
+            };
+            output.push(text.trim_end().to_string());
         }
         // Blank rows at either end are furniture the selection passed over —
         // the padding inside the reader's own box, the gap between two blocks —

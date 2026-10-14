@@ -901,6 +901,9 @@ fn selection_style(theme: &TuiTheme) -> Style {
 ///
 /// `first_line` is the display line the first visible row shows, so a selection
 /// made in one frame still highlights correctly after the transcript scrolls.
+/// Both ends are cells the reader pointed at, so the range is closed: the
+/// character under the pointer at the end of a drag lights up with the rest of
+/// what it went over.
 fn paint_selection(
     lines: &mut [Line<'static>],
     selection: &crate::app::TextSelection,
@@ -919,7 +922,7 @@ fn paint_selection(
             0
         };
         let to = if display_line == end.0 {
-            usize::from(end.1)
+            usize::from(end.1) + 1
         } else {
             usize::MAX
         };

@@ -297,6 +297,14 @@ impl Block {
 pub struct RenderedBlock {
     pub lines: Vec<Line<'static>>,
     pub plain: Vec<String>,
+    /// The rows of `plain` drawn as the body of the reader's own box, when
+    /// there are any.
+    ///
+    /// That box spends a cell of padding in front of its text that no other row
+    /// has, and a pointer counts cells from the edge of the band while `plain`
+    /// holds only the text: the range is what reads a pointer column on one of
+    /// those rows as a column of its text.
+    pub boxed_body: Option<std::ops::Range<usize>>,
     pub height: usize,
 }
 
@@ -304,6 +312,18 @@ impl RenderedBlock {
     pub fn text(&self) -> String {
         self.plain.join("\n")
     }
+}
+
+/// One display line read back as text.
+///
+/// [`Transcript::plain_lines`] answers in the same cells the mouse speaks in:
+/// the band's columns, whose first few are chrome on every row rather than
+/// text. `chrome` is how many, so a column under the pointer can be read as a
+/// column of `text` — and never as a column of the marker beside it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlainLine {
+    pub text: String,
+    pub chrome: usize,
 }
 
 /// What changed during the last [`Transcript::set_blocks`].
@@ -1962,7 +1982,8 @@ impl Transcript {
         }
     }
 
-    /// The plain text of a range of display lines.
+    /// The plain text of a range of display lines, with the chrome each line
+    /// carries before its text.
     ///
     /// Unlike [`Transcript::visible_lines`] this is not restricted to the
     /// viewport: a selection can be dragged past the edge of the screen, and
@@ -1974,7 +1995,7 @@ impl Transcript {
         end: usize,
         theme: &TuiTheme,
         strings: Strings,
-    ) -> Vec<String> {
+    ) -> Vec<PlainLine> {
         if end <= start || self.blocks.is_empty() {
             return Vec::new();
         }
@@ -2008,8 +2029,21 @@ impl Transcript {
                         rendered
                     }
                 };
-                for line in rendered.plain.iter().skip(skip).take(take) {
-                    lines.push(line.clone());
+                for (offset, line) in rendered.plain.iter().enumerate().skip(skip).take(take) {
+                    let boxed = rendered
+                        .boxed_body
+                        .as_ref()
+                        .is_some_and(|body| body.contains(&offset));
+                    lines.push(PlainLine {
+                        text: line.clone(),
+                        // A row the reader's own box draws sits its body one
+                        // cell further in than any other row does.
+                        chrome: if boxed {
+                            chrome::PAD_LEFT + BOX_INSET
+                        } else {
+                            chrome::PAD_LEFT
+                        },
+                    });
                 }
             }
             index += 1;
@@ -2910,6 +2944,7 @@ fn render_block_inner(
 ) -> RenderedBlock {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut plain: Vec<String> = Vec::new();
+    let mut boxed_body: Option<std::ops::Range<usize>> = None;
 
     if block.is_hidden() {
         // Folded into the run above; contributes nothing but is still counted
@@ -3171,6 +3206,7 @@ fn render_block_inner(
                 block_row += 1;
             }
         }
+        let body_start = lines.len();
         for (index, (line, text)) in rendered.lines.into_iter().zip(rendered.plain).enumerate() {
             let mut styled = line;
             if !matches!(block.kind, TimelineRowKind::Error) {
@@ -3232,6 +3268,10 @@ fn render_block_inner(
             block_row += 1;
         }
         if band.is_some() {
+            // The body of the box is the one run of rows drawn a cell further
+            // in than every other row: its own padding, which is chrome like
+            // the marker and never part of the text.
+            boxed_body = Some(body_start..lines.len());
             for _ in 0..BOX_PAD_ROWS {
                 lines.push(band_row(
                     block_row,
@@ -3314,6 +3354,7 @@ fn render_block_inner(
         height: lines.len(),
         lines,
         plain,
+        boxed_body,
     }
 }
 

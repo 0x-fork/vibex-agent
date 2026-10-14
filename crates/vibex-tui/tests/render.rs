@@ -2132,42 +2132,84 @@ fn a_scrolled_transcript_pins_the_prompt_it_belongs_to() {
 #[test]
 fn a_dragged_selection_becomes_the_text_on_the_clipboard() {
     let mut app = transcript_app(120, 40);
-    // One frame publishes the band's rectangle, which a real drag needs.
-    let _ = render(&mut app, 120, 40);
+    // The frame publishes the band's rectangle, which a real drag needs.
+    let buffer = render_buffer(&mut app, 120, 40);
+    let band = app.regions.scrollback;
     assert!(
-        app.regions.scrollback.height > 0,
+        band.height > 0,
         "the transcript band must be published for the mouse"
     );
-    // The reader's own message pads its text, so the first line with anything
-    // on it is not necessarily the first line of the transcript.
-    let lines =
-        app.transcript
-            .plain_lines(0, 12, &app.theme.clone(), Strings::for_locale(Locale::En));
-    let row = lines
-        .iter()
-        .position(|line| !line.is_empty())
-        .expect("a line with text on it");
-    let next = row
-        + 1
-        + lines[row + 1..]
-            .iter()
-            .position(|line| !line.is_empty())
-            .expect("a second block under the first");
-    let (prefix, _) = vibex_tui::text::take_width(&lines[row], 4);
 
-    app.begin_text_selection(row, 0);
-    app.extend_text_selection(row, 4);
+    // The answer the drag is made over, found on the screen rather than in the
+    // model: the cells a pointer lands on are the cells a copy has to hold,
+    // and every row spends its first few on chrome the text does not contain.
+    // Reading the copy from the model's own columns is what let that chrome
+    // shift the clipboard two columns to the right.
+    let phrase = "The UPLOAD path";
+    let row = (band.y..band.bottom())
+        .find(|row| band_row(&buffer, band, *row).contains(phrase))
+        .expect("the answer is on screen");
+    let line = app.transcript.scroll_offset() + usize::from(row - band.y);
+    // Both ends of a drag are cells the reader pointed at, and both are copied.
+    let start = column_of(&buffer, row, phrase).expect("the phrase's first cell") - band.x;
+    let end = start + u16::try_from(vibex_tui::text::display_width(phrase)).expect("a width") - 1;
+
+    app.begin_text_selection(line, start);
+    app.extend_text_selection(line, end);
     assert!(app.finish_text_selection(), "the drag covered cells");
-    let copied = app.selected_text().expect("a non-empty selection");
-    assert_eq!(copied, prefix.trim_end());
+    assert_eq!(
+        app.selected_text().as_deref(),
+        Some(phrase),
+        "the copy is not the text the drag covered"
+    );
 
-    // A selection over several lines joins them with newlines and drops the
-    // padding a terminal would otherwise put on the clipboard — the blank rows
-    // inside the reader's own box among them.
-    app.begin_text_selection(row, 0);
-    app.extend_text_selection(next, 6);
+    // The highlight and the clipboard agree: the lit cells are the copied
+    // text, so a reader can trust what they see before they let go.
+    let lit = render_buffer(&mut app, 120, 40);
+    let highlighted: String = (band.x..band.right())
+        .filter(|column| {
+            lit.cell((*column, row))
+                .is_some_and(|cell| cell.style().bg == Some(app.theme.roles.foreground))
+        })
+        .map(|column| {
+            lit.cell((column, row))
+                .expect("a lit cell")
+                .symbol()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(highlighted, phrase, "the highlight does not cover the copy");
+
+    // A double click selects the word under the pointer, which is a cell of
+    // the text and not of the marker beside it.
+    let word = column_of(&buffer, row, "UPLOAD").expect("the word's first cell") - band.x;
+    assert!(app.select_word_at(line, word));
+    assert_eq!(app.selected_text().as_deref(), Some("UPLOAD"));
+
+    // A drag that runs from the reader's own message into the answer below it
+    // joins the lines with newlines and drops the padding a terminal would
+    // otherwise put on the clipboard.
+    let question = "fix the flaky upload test";
+    let question_row = (band.y..row)
+        .find(|row| band_row(&buffer, band, *row).contains(question))
+        .expect("the question is above the answer");
+    let question_line = app.transcript.scroll_offset() + usize::from(question_row - band.y);
+    let question_start =
+        column_of(&buffer, question_row, question).expect("the question's first cell") - band.x;
+    app.begin_text_selection(question_line, question_start);
+    app.extend_text_selection(line, end);
     let copied = app.selected_text().expect("a multi-line selection");
     assert!(copied.contains('\n'), "lines are not joined: {copied:?}");
+    assert_eq!(
+        copied.lines().next(),
+        Some(question),
+        "the first line is not the text the drag started on: {copied:?}"
+    );
+    assert_eq!(
+        copied.lines().last(),
+        Some(phrase),
+        "the last line is not the text the drag ended on: {copied:?}"
+    );
     for line in copied.lines() {
         assert_eq!(line, line.trim_end(), "trailing padding was copied");
     }
@@ -2175,6 +2217,50 @@ fn a_dragged_selection_becomes_the_text_on_the_clipboard() {
     // `Esc` is what dismisses the highlight.
     assert!(app.clear_text_selection());
     assert!(app.selected_text().is_none());
+}
+
+#[test]
+fn a_one_character_word_is_still_a_selection_and_a_click_is_not() {
+    let mut app = transcript_app(120, 40);
+    app.transcript.set_blocks(vec![seeded_block(
+        "block-1",
+        vibex_desktop_model::TimelineRowKind::AgentMessage,
+        "I am here",
+    )]);
+    let buffer = render_buffer(&mut app, 120, 40);
+    let band = app.regions.scrollback;
+    let row = (band.y..band.bottom())
+        .find(|row| band_row(&buffer, band, *row).contains("I am here"))
+        .expect("the message is on screen");
+    let line = app.transcript.scroll_offset() + usize::from(row - band.y);
+    let column = column_of(&buffer, row, "I am here").expect("the message's first cell") - band.x;
+
+    // A press that never moved is how the reader drops a stale highlight: it
+    // covers nothing, so `y` still copies the whole block.
+    app.begin_text_selection(line, column);
+    assert!(!app.finish_text_selection(), "a click was taken for a drag");
+    assert!(app.selected_text().is_none());
+
+    // A word of one character is a word: the double click picks it, and the
+    // selection it leaves covers the cell it names.
+    assert!(app.select_word_at(line, column));
+    assert!(
+        app.finish_text_selection(),
+        "a one-character word was taken for a click"
+    );
+    assert_eq!(app.selected_text().as_deref(), Some("I"));
+}
+
+/// One row of the transcript band, as the cells the reader sees.
+fn band_row(buffer: &ratatui::buffer::Buffer, band: ratatui::layout::Rect, row: u16) -> String {
+    (band.x..band.right())
+        .map(|column| {
+            buffer
+                .cell((column, row))
+                .map(|cell| cell.symbol().to_string())
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 /// The cell column a needle starts at on a rendered row, counted in terminal
