@@ -8607,6 +8607,17 @@ pub struct VibexWorkbench {
     /// optimistic removal with the authoritative list. It is the only reason a
     /// session the runtime still reports is allowed to stay invisible.
     optimistically_removed_session_ids: BTreeSet<String>,
+    /// Sessions the runtime confirmed deleted in this app session.
+    ///
+    /// A deletion is terminal, so the row must never be rebuilt from a snapshot
+    /// that was produced before the runtime committed it — a settling turn
+    /// broadcast, a poll response or a registry page already in flight all
+    /// carry a session the row no longer stands for. Those reads race the
+    /// deletion and are routinely applied after it, so they must stay filtered
+    /// for the rest of the process instead of only until the first
+    /// authoritative reload. `optimistically_removed_session_ids` cannot carry
+    /// that guarantee: it is dropped wholesale when a load reconciles it.
+    deleted_session_ids: BTreeSet<String>,
     /// Sessions an archive took off the sidebar before the runtime answered.
     ///
     /// An archive is reversible, so an id stays here only while its mutation is
@@ -10187,6 +10198,7 @@ impl VibexWorkbench {
             delegated_collapsed_ids: restored_collapsed_delegated_ids,
             delegated_row_focus: BTreeMap::new(),
             optimistically_removed_session_ids: BTreeSet::new(),
+            deleted_session_ids: BTreeSet::new(),
             optimistically_archived_session_ids: BTreeSet::new(),
             pending_session_deletion_ids: BTreeSet::new(),
             pending_session_archive_ids: BTreeSet::new(),
@@ -11456,7 +11468,8 @@ impl VibexWorkbench {
         let missing: Vec<VibexSessionId> = session_ids
             .iter()
             .filter(|session_id| {
-                !self.delegated_sessions.contains_key(session_id.as_str())
+                !self.session_hidden_from_sidebar(session_id.as_str())
+                    && !self.delegated_sessions.contains_key(session_id.as_str())
                     && !self
                         .sessions
                         .iter()
@@ -14331,18 +14344,21 @@ impl VibexWorkbench {
                     }
                     match outcome {
                         Ok(Ok((sessions, workspaces, agents, profiles))) => {
-                            let mut sessions = if reconciles_optimistic_session_deletions {
+                            if reconciles_optimistic_session_deletions {
+                                // The runtime's answer decides the optimistic
+                                // removals: a failed deletion restores its rows
+                                // (the ids stopped being hidden when it
+                                // settled), and a committed one keeps its rows
+                                // hidden through `deleted_session_ids`, which
+                                // this load must not undo.
                                 this.optimistic_session_deletion_reconciliation_pending = false;
                                 this.optimistically_removed_session_ids.clear();
-                                sessions
-                            } else {
-                                sessions
-                                    .into_iter()
-                                    .filter(|session| {
-                                        !this.session_hidden_from_sidebar(session.id.as_str())
-                                    })
-                                    .collect()
-                            };
+                            }
+                            // A hidden session wins over the list: this read
+                            // may have been issued before the deletion it is
+                            // racing landed, and rebuilding the row from it is
+                            // how a just-deleted session reappears.
+                            let mut sessions = this.filter_hidden_sessions(sessions);
                             // A project deleted optimistically (and its
                             // sessions) stays hidden while the authoritative
                             // deletion is still in flight. Once the deletion
@@ -16226,12 +16242,28 @@ impl VibexWorkbench {
     /// authoritative read and every live snapshot has to keep ignoring it until
     /// the mutation settles. Archiving counts only while it is in flight:
     /// afterwards the session list itself omits the row, and a restore must be
-    /// able to put it back.
+    /// able to put it back. A deletion counts from the click (the id is already
+    /// in `pending_session_deletion_ids` before the optimistic removal lands)
+    /// and keeps counting after the runtime answers, because that answer makes
+    /// the deletion permanent.
     fn session_hidden_from_sidebar(&self, session_id: &str) -> bool {
         self.optimistically_removed_session_ids.contains(session_id)
+            || self.pending_session_deletion_ids.contains(session_id)
+            || self.deleted_session_ids.contains(session_id)
             || self
                 .optimistically_archived_session_ids
                 .contains(session_id)
+    }
+
+    /// Drops the rows an authoritative read must not put back on the sidebar.
+    ///
+    /// Every list the runtime answers with goes through here, because a read
+    /// issued before a removal landed still describes the removed row.
+    fn filter_hidden_sessions(&self, sessions: Vec<AgentSession>) -> Vec<AgentSession> {
+        sessions
+            .into_iter()
+            .filter(|session| !self.session_hidden_from_sidebar(session.id.as_str()))
+            .collect()
     }
 
     /// Refreshes bounded metadata pages; histories load only for live panes.
@@ -16621,7 +16653,9 @@ impl VibexWorkbench {
                 .insert(node.session_ref.id.clone(), node);
         }
         for session in result.registry {
-            if self.registered_session(session.id.as_str()).is_none() {
+            if self.registered_session(session.id.as_str()).is_none()
+                && !self.session_hidden_from_sidebar(session.id.as_str())
+            {
                 self.delegated_sessions
                     .insert(session.id.as_str().to_string(), session.clone());
             }
@@ -23391,15 +23425,25 @@ impl VibexWorkbench {
         match event {
             DesktopEvent::Timeline(event) => self.apply_live_timeline_batch(vec![event], cx),
             DesktopEvent::SessionUpdated(session) => {
+                // A snapshot that raced a removal describes a row the sidebar
+                // no longer has: a deletion the runtime has not answered yet,
+                // or one it has already committed. Rebuilding the row from it
+                // is how a deleted session comes back, so the update — and the
+                // delegated registry write its unknown branch performs — stops
+                // here for a session the sidebar is hiding.
+                let hidden = self.session_hidden_from_sidebar(session.id.as_str());
                 let previous_session = self.registered_session(session.id.as_str());
-                let sidebar_changed = session_snapshot_sidebar_changed(previous_session, &session);
-                let selected_projection_changed = self
-                    .selected_session_id
-                    .as_ref()
-                    .is_some_and(|selected| selected == &session.id)
+                let sidebar_changed =
+                    !hidden && session_snapshot_sidebar_changed(previous_session, &session);
+                let selected_projection_changed = !hidden
+                    && self
+                        .selected_session_id
+                        .as_ref()
+                        .is_some_and(|selected| selected == &session.id)
                     && previous_session.is_none_or(|existing| existing.state != session.state);
-                let changed = previous_session.is_none_or(|existing| existing != &session);
-                let unknown = previous_session.is_none();
+                let changed =
+                    !hidden && previous_session.is_none_or(|existing| existing != &session);
+                let unknown = !hidden && previous_session.is_none();
                 // A turn boundary is what auto-continue reacts to, and it belongs
                 // to the session that changed — not only to the selected one.
                 // The render path used to pick up a background session's
@@ -23407,10 +23451,11 @@ impl VibexWorkbench {
                 // repaint decide whether a countdown started. The sync only
                 // reads cached state and probes on a backoff, so an ordinary
                 // field change costs a couple of map lookups.
-                let turn_revision_changed = previous_session.is_none_or(|existing| {
-                    existing.state != session.state
-                        || existing.updated_at_ms != session.updated_at_ms
-                });
+                let turn_revision_changed = !hidden
+                    && previous_session.is_none_or(|existing| {
+                        existing.state != session.state
+                            || existing.updated_at_ms != session.updated_at_ms
+                    });
                 if changed {
                     let session_id = session.id.clone();
                     if unknown {
@@ -35736,8 +35781,10 @@ impl VibexWorkbench {
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let outcome = runner.await;
                 let _ = entity.update(cx, |this, cx| {
-                    this.pending_session_deletion_ids
-                        .retain(|session_id| !session_ids.contains(session_id));
+                    this.settle_optimistic_session_deletion(
+                        &session_ids,
+                        matches!(outcome, Ok(Ok(()))),
+                    );
                     let active = this.session_generation == generation;
                     let should_reconcile = this.pending_session_deletion_ids.is_empty();
                     if should_reconcile {
@@ -35767,6 +35814,29 @@ impl VibexWorkbench {
             },
         )
         .detach();
+    }
+
+    /// Applies the answer to a deletion batch to the optimistic state.
+    ///
+    /// A committed deletion is permanent, so its ids move into
+    /// [`Self::deleted_session_ids`] and stay hidden for the rest of the
+    /// process: reads that were already in flight when the runtime committed
+    /// the deletion still describe the row, and the sidebar must not rebuild it
+    /// from them. A failed deletion is only an optimistic removal, so the ids
+    /// stop being hidden and the authoritative reload puts the rows back.
+    fn settle_optimistic_session_deletion(
+        &mut self,
+        session_ids: &BTreeSet<String>,
+        committed: bool,
+    ) {
+        self.pending_session_deletion_ids
+            .retain(|session_id| !session_ids.contains(session_id));
+        if committed {
+            self.deleted_session_ids.extend(session_ids.iter().cloned());
+        } else {
+            self.optimistically_removed_session_ids
+                .retain(|session_id| !session_ids.contains(session_id));
+        }
     }
 
     /// Moves a session out of the sidebar without destroying it.
@@ -35993,7 +36063,11 @@ impl VibexWorkbench {
                     this.archived_sessions_loading = false;
                     match outcome {
                         Ok(Ok(sessions)) => {
-                            this.archived_sessions = Some(sessions);
+                            // This page is as stale-able as the sidebar list: a
+                            // read issued before a deletion still carries the
+                            // row, and a deleted session must not come back
+                            // through the archived surface either.
+                            this.archived_sessions = Some(this.filter_hidden_sessions(sessions));
                             this.archived_sessions_error = None;
                         }
                         Ok(Err(error)) => {
@@ -87115,17 +87189,33 @@ mod tests {
 
         let completion = source
             .split_once("    fn finish_optimistic_session_deletion(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn conversation_find_matches("))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Applies the answer to a deletion batch")
+            })
             .map(|(body, _)| body)
             .expect("optimistic deletion completion should remain inspectable");
         assert!(completion.contains(".detach();"));
         assert!(
             completion.contains("this.optimistic_session_deletion_reconciliation_pending = true;")
         );
-        assert!(completion.contains("this.pending_session_deletion_ids"));
+        assert!(completion.contains("this.settle_optimistic_session_deletion("));
+        assert!(completion.contains("matches!(outcome, Ok(Ok(())))"));
         assert!(completion.contains("if should_reconcile {"));
         assert!(!completion.contains("this.agent_action_pending = false;"));
         assert!(completion.contains("this.load_agent_overview(cx);"));
+
+        // The answer decides the tombstone: a committed deletion is permanent,
+        // a failed one only ever hid its rows optimistically.
+        let settle = source
+            .split_once("    fn settle_optimistic_session_deletion(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Moves a session out of the sidebar"))
+            .map(|(body, _)| body)
+            .expect("the deletion settle should remain inspectable");
+        assert!(settle.contains("self.pending_session_deletion_ids"));
+        assert!(settle.contains(".retain("));
+        assert!(settle.contains("self.deleted_session_ids"));
+        assert!(settle.contains("self.optimistically_removed_session_ids"));
+        assert!(settle.contains("if committed {"));
     }
 
     fn child_agent_session(session_id: &VibexSessionId, state: AgentSessionState) -> AgentSession {

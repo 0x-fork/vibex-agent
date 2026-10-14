@@ -2112,3 +2112,75 @@ fn restoring_an_archived_session_puts_its_row_back_on_the_sidebar(cx: &mut TestA
         );
     });
 }
+
+/// A deletion the runtime confirmed never puts its row back.
+///
+/// Reads race the deletion: the turn that settled just before it, the poll
+/// response and the registry page already in flight all describe the session as
+/// it was when they were issued. The client applies them after the runtime has
+/// answered, and every one of them used to rebuild the row — which is why a
+/// just-deleted session reappeared on the sidebar and had to be deleted twice.
+/// The reconciliation reload clears the optimistic marks, so the terminal
+/// tombstone is what has to keep the row out afterwards.
+#[gpui::test]
+fn a_committed_deletion_keeps_its_row_off_the_sidebar(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 2);
+    workbench.update(cx, |workbench, _cx| {
+        let deleted = BTreeSet::from([session(1).id.to_string()]);
+        workbench
+            .pending_session_deletion_ids
+            .extend(deleted.iter().cloned());
+        workbench.optimistically_remove_sessions(&deleted, SidebarSessionRemoval::Delete);
+        assert!(workbench.session_hidden_from_sidebar(session(1).id.as_str()));
+
+        // The runtime answers, and the reload that follows adopts its list while
+        // clearing the optimistic marks.
+        workbench.settle_optimistic_session_deletion(&deleted, true);
+        workbench.optimistically_removed_session_ids.clear();
+        assert!(
+            workbench.pending_session_deletion_ids.is_empty(),
+            "the settled deletion must not stay pending"
+        );
+        assert!(workbench.session_hidden_from_sidebar(session(1).id.as_str()));
+
+        // A snapshot and a list read before the deletion still carry the row.
+        workbench.upsert_session_snapshot(session(1));
+        assert_eq!(
+            workbench.filter_hidden_sessions(vec![session(1)]).len(),
+            0,
+            "an authoritative list must not adopt a session the runtime deleted"
+        );
+        assert!(
+            !workbench
+                .sessions
+                .iter()
+                .any(|root| root.id == session(1).id)
+        );
+        let groups = workbench.sidebar_workspace_groups("");
+        assert!(
+            !groups
+                .iter()
+                .flat_map(|group| group.compact_sessions.iter())
+                .any(|listed| listed.id == session(1).id),
+            "a deleted session must not come back to the sidebar"
+        );
+
+        // A deletion the runtime rejected is only an optimistic removal: the
+        // row is restored, and the reader can see that it is still there.
+        let refused = BTreeSet::from([session(0).id.to_string()]);
+        workbench
+            .pending_session_deletion_ids
+            .extend(refused.iter().cloned());
+        workbench.optimistically_remove_sessions(&refused, SidebarSessionRemoval::Delete);
+        workbench.settle_optimistic_session_deletion(&refused, false);
+        assert!(!workbench.session_hidden_from_sidebar(session(0).id.as_str()));
+        workbench.upsert_session_snapshot(session(0));
+        assert!(
+            workbench
+                .sessions
+                .iter()
+                .any(|root| root.id == session(0).id),
+            "a failed deletion has to put its row back"
+        );
+    });
+}
