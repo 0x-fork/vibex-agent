@@ -114,6 +114,10 @@ pub struct GitMutationOperation {
     pub kind: GitSafeMutationKind,
     pub paths: Vec<String>,
     pub commit_message: Option<String>,
+    /// Rewrite the previous commit rather than adding one.
+    pub amend: bool,
+    /// Push the branch once the commit lands.
+    pub push_after: bool,
 }
 
 impl fmt::Debug for GitMutationOperation {
@@ -418,12 +422,42 @@ impl GitWorkflowController {
             confirmed: false,
             touch_target_px: MIN_TOUCH_TARGET_PX,
             hover_required: false,
+            amend: false,
+            push_after: false,
         });
         Ok(self
             .state
             .commit_confirmation
             .as_ref()
             .expect("commit confirmation was inserted"))
+    }
+
+    /// Sets whether the pending commit rewrites the previous one.
+    ///
+    /// Amend is a property of the commit being confirmed, so it is chosen on
+    /// the confirmation rather than passed at submission: the reader can see
+    /// what they are about to do and change it before confirming.
+    pub fn set_commit_amend(&mut self, amend: bool) -> BackendResult<()> {
+        let confirmation = self.state.commit_confirmation.as_mut().ok_or_else(|| {
+            BackendError::conflict(
+                "git_commit_confirmation_missing",
+                "request commit confirmation before choosing to amend",
+            )
+        })?;
+        confirmation.amend = amend;
+        Ok(())
+    }
+
+    /// Sets whether the branch is pushed once the commit lands.
+    pub fn set_commit_push_after(&mut self, push_after: bool) -> BackendResult<()> {
+        let confirmation = self.state.commit_confirmation.as_mut().ok_or_else(|| {
+            BackendError::conflict(
+                "git_commit_confirmation_missing",
+                "request commit confirmation before choosing to push",
+            )
+        })?;
+        confirmation.push_after = push_after;
+        Ok(())
     }
 
     pub fn confirm_commit(&mut self) -> BackendResult<()> {
@@ -478,6 +512,8 @@ impl GitWorkflowController {
             workspace_id: confirmation.workspace_id,
             operation_id,
             kind: GitSafeMutationKind::Commit,
+            amend: confirmation.amend,
+            push_after: confirmation.push_after,
             paths: confirmation.paths,
             commit_message: Some(confirmation.message),
         })
@@ -513,8 +549,8 @@ impl GitWorkflowController {
             workspace_id: operation.workspace_id,
             message,
             paths: operation.paths,
-            amend: false,
-            push_after: false,
+            amend: operation.amend,
+            push_after: operation.push_after,
         })
         .with_idempotency_key(operation.operation_id);
         Box::pin(async move { backend.commit(request).await })
@@ -608,6 +644,8 @@ impl GitWorkflowController {
             kind,
             paths,
             commit_message: None,
+            amend: false,
+            push_after: false,
         })
     }
 

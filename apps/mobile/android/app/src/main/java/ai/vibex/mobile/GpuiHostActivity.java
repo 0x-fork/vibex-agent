@@ -35,6 +35,7 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
@@ -406,6 +407,24 @@ public final class GpuiHostActivity extends Activity {
                         : "The picked file could not be read"));
             }
         }).start();
+    }
+
+    /**
+     * Holds the display awake while the panel is watching work run.
+     *
+     * <p>Android's idle timer is the only thing that turns the screen off while
+     * the app is in front of the user. The flag is a property of the window, so
+     * it survives configuration changes and is cleared when the panel stops
+     * asking for it — a phone left alone in the app still sleeps.
+     */
+    public void gpuiKeepScreenOn(boolean keepOn) {
+        runOnUiThread(() -> {
+            if (keepOn) {
+                getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            } else {
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            }
+        });
     }
 
     /**

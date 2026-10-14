@@ -307,6 +307,10 @@ pub struct MobileWorkbench {
     git_commit_detail: Option<GitCommitDetail>,
     git_commit_detail_loading: bool,
     git_commit_confirmation: bool,
+    /// Rewrite the previous commit instead of adding one.
+    git_commit_amend: bool,
+    /// Push the branch once the commit lands.
+    git_commit_push_after: bool,
     git_history_loading: bool,
     git_history_request_generation: u64,
     /// Every branch the repository has, read on demand for the filter sheet.
@@ -425,6 +429,8 @@ impl MobileWorkbench {
             git_commit_detail: None,
             git_commit_detail_loading: false,
             git_commit_confirmation: false,
+            git_commit_amend: false,
+            git_commit_push_after: false,
             git_history_loading: false,
             git_history_request_generation: 0,
             git_branches: None,
@@ -470,6 +476,11 @@ impl MobileWorkbench {
     }
 
     pub fn set_surface(&mut self, surface: WorkbenchSurface, cx: &mut Context<Self>) {
+        // A surface the reader is leaving takes its edits with it: the Files
+        // tab is not a place work is expected to be parked unsaved.
+        if surface != WorkbenchSurface::Files {
+            self.save_active_file(cx);
+        }
         if self.surface == WorkbenchSurface::Terminal && surface != WorkbenchSurface::Terminal {
             self.stop_terminal_poll();
             // The grid goes with the surface; a selection it was showing has
@@ -490,6 +501,9 @@ impl MobileWorkbench {
         if self.workspace_id == workspace_id {
             return;
         }
+        // Another workspace is another file system: the open buffer has to be
+        // written before the editor is pointed somewhere else.
+        self.save_active_file(cx);
         self.workspace_id = workspace_id.clone();
         self.files.select_workspace(workspace_id.clone());
         self.git.select_workspace(workspace_id);
@@ -598,10 +612,14 @@ impl MobileWorkbench {
     }
 
     fn select_file(&mut self, path: String, cx: &mut Context<Self>) {
-        // Opening a file replaces the editor buffer outright, so a dirty buffer
-        // has to be resolved first (blocker: opening any file silently threw
-        // away unsaved edits).
+        // Opening a file replaces the editor buffer outright, so the buffer
+        // that is leaving is written back first. It used to raise a discard
+        // prompt, which asked the reader to decide something the phone can
+        // answer itself.
+        self.save_active_file(cx);
         if self.file_editor_is_dirty(cx) {
+            // The write did not go through — an offline host, a conflict — so
+            // the choice is the reader's again.
             self.file_discard_prompt = Some(path);
             cx.notify();
             return;
@@ -932,6 +950,18 @@ impl MobileWorkbench {
     }
 
     fn save_file(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.save_active_file(cx);
+    }
+
+    /// Writes the open buffer back to the workspace.
+    ///
+    /// The one path a save takes, whether the reader pressed Save or the screen
+    /// is being left: a phone that keeps unsaved work behind a control the
+    /// reader has to remember is a phone that loses edits.
+    fn save_active_file(&mut self, cx: &mut Context<Self>) {
+        if self.busy || !self.file_editor_is_dirty(cx) {
+            return;
+        }
         let content = textarea_value(&self.file_editor_input, cx).to_string();
         if let Err(error) = self.files.update_active_content(content) {
             self.error = Some(error);
@@ -958,6 +988,7 @@ impl MobileWorkbench {
                 if this.error.is_none() {
                     this.notice = Some(locale::common("File saved on desktop").to_string());
                 }
+                let _ = &this;
                 cx.notify();
             });
         });
@@ -992,19 +1023,11 @@ impl MobileWorkbench {
     /// Returns from the full-screen file view to the file tree. The editor
     /// keeps its loaded content so re-opening the file is instant.
     fn close_file_screen(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.file_editor_is_dirty(cx) {
-            // Leaving the screen keeps the buffer, so the only thing to warn
-            // about is losing sight of it; the file stays open behind the tree.
-            self.show_notice(
-                locale::text(
-                    "Unsaved edits stay in the editor",
-                    "未保存的修改仍保留在编辑器中",
-                    "未儲存的修改仍保留在編輯器中",
-                )
-                .to_string(),
-                cx,
-            );
-        }
+        // Leaving the file is when a phone is most likely to lose an edit: the
+        // Save button is behind a scroll and the back gesture is not. The
+        // buffer is written out here rather than merely kept, and the reader is
+        // told only when the write failed.
+        self.save_active_file(cx);
         self.file_screen_open = false;
         cx.notify();
     }
@@ -1026,6 +1049,7 @@ impl MobileWorkbench {
     /// editor. Used by the timeline, where a file the agent wrote is a link.
     pub fn open_file(&mut self, path: String, cx: &mut Context<Self>) {
         self.surface = WorkbenchSurface::Files;
+        self.save_active_file(cx);
         if self.file_editor_is_dirty(cx) {
             self.file_discard_prompt = Some(path);
             cx.notify();
@@ -1678,6 +1702,8 @@ impl MobileWorkbench {
     }
 
     fn request_git_commit(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.git_commit_amend = false;
+        self.git_commit_push_after = false;
         if !self
             .git
             .capabilities()
@@ -1713,6 +1739,34 @@ impl MobileWorkbench {
     fn cancel_git_commit(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.git.cancel_commit();
         self.git_commit_confirmation = false;
+        self.git_commit_amend = false;
+        self.git_commit_push_after = false;
+        cx.notify();
+    }
+
+    /// Rewrites the previous commit rather than adding one.
+    fn toggle_git_commit_amend(&mut self, cx: &mut Context<Self>) {
+        let amend = !self.git_commit_amend;
+        match self.git.set_commit_amend(amend) {
+            Ok(()) => {
+                self.git_commit_amend = amend;
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Pushes the branch once the commit lands.
+    fn toggle_git_commit_push_after(&mut self, cx: &mut Context<Self>) {
+        let push = !self.git_commit_push_after;
+        match self.git.set_commit_push_after(push) {
+            Ok(()) => {
+                self.git_commit_push_after = push;
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
         cx.notify();
     }
 
@@ -1730,6 +1784,8 @@ impl MobileWorkbench {
             }
         };
         self.git_commit_confirmation = false;
+        self.git_commit_amend = false;
+        self.git_commit_push_after = false;
         self.busy = true;
         let runner = gpui_tokio::Tokio::spawn(cx, self.git.run_commit(operation.clone()));
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
@@ -4071,6 +4127,21 @@ impl MobileWorkbench {
                                 ),
                         )
                     })
+                    // Fetch before pull: the phone has no terminal habit to
+                    // fall back on, and "what is on the remote" is its own
+                    // question that a pull would answer by merging.
+                    .child(
+                        toolbar_icon_button("git-fetch", "icons/refresh.svg", "Fetch")
+                            .when(can_remote && !self.busy, |button| {
+                                button.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.run_git_remote_action(GitRemoteActionKind::Fetch, cx)
+                                    }),
+                                )
+                            })
+                            .when(!can_remote || self.busy, |button| button.opacity(0.55)),
+                    )
                     .child(
                         toolbar_icon_button("git-pull", "icons/download.svg", "Pull")
                             .when(can_remote && !self.busy, |button| {
@@ -5186,39 +5257,88 @@ impl MobileWorkbench {
             .gap(px(theme::SPACING_SM))
             .child(input_shell(self.git_commit_input.as_ref()))
             .when(self.git_commit_confirmation, |panel| {
-                panel.child(
-                    div()
-                        .p(px(theme::SPACING_MD))
-                        .rounded(px(theme::RADIUS_CONTROL))
-                        .bg(theme::accent_yellow().opacity(0.14))
-                        .flex()
-                        .items_center()
-                        .gap(px(theme::SPACING_SM))
-                        .text_size(theme::font_caption())
-                        .text_color(theme::text_secondary())
-                        .child(locale::text(
-                            "Commit staged changes?",
-                            "提交已暂存的更改？",
-                            "提交已暫存的變更？",
-                        ))
-                        .child(div().flex_1())
-                        .child(
-                            chip_action("cancel-commit", locale::common("Cancel"), true)
+                panel
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .child(
+                                chip_action(
+                                    "toggle-commit-amend",
+                                    locale::text(
+                                        "Amend last commit",
+                                        "修正上次提交",
+                                        "修正上次提交",
+                                    ),
+                                    true,
+                                )
+                                .when(self.git_commit_amend, |button| {
+                                    button.border_color(theme::primary())
+                                })
                                 .on_mouse_up(
                                     MouseButton::Left,
-                                    cx.listener(Self::cancel_git_commit),
+                                    cx.listener(|this, _, _, cx| this.toggle_git_commit_amend(cx)),
                                 ),
-                        )
-                        .child(
-                            chip_action("confirm-commit", locale::common("Commit"), can_commit)
-                                .when(can_commit, |button| {
-                                    button.on_mouse_up(
+                            )
+                            .child(
+                                chip_action(
+                                    "toggle-commit-push",
+                                    locale::text("Push after", "提交后推送", "提交後推送"),
+                                    true,
+                                )
+                                .when(self.git_commit_push_after, |button| {
+                                    button.border_color(theme::primary())
+                                })
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.toggle_git_commit_push_after(cx)
+                                    }),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .p(px(theme::SPACING_MD))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::accent_yellow().opacity(0.14))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .text_size(theme::font_caption())
+                            .text_color(theme::text_secondary())
+                            .child(if self.git_commit_amend {
+                                locale::text(
+                                    "Rewrite the last commit?",
+                                    "重写上一次提交？",
+                                    "重寫上一次提交？",
+                                )
+                            } else {
+                                locale::text(
+                                    "Commit staged changes?",
+                                    "提交已暂存的更改？",
+                                    "提交已暫存的變更？",
+                                )
+                            })
+                            .child(div().flex_1())
+                            .child(
+                                chip_action("cancel-commit", locale::common("Cancel"), true)
+                                    .on_mouse_up(
                                         MouseButton::Left,
-                                        cx.listener(Self::confirm_git_commit),
-                                    )
-                                }),
-                        ),
-                )
+                                        cx.listener(Self::cancel_git_commit),
+                                    ),
+                            )
+                            .child(
+                                chip_action("confirm-commit", locale::common("Commit"), can_commit)
+                                    .when(can_commit, |button| {
+                                        button.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(Self::confirm_git_commit),
+                                        )
+                                    }),
+                            ),
+                    )
             })
             .when(!self.git_commit_confirmation, |panel| {
                 panel.child(

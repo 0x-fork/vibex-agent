@@ -156,6 +156,10 @@ pub struct AppSettings {
     /// Collapses every transition in the interface. Mobile is the one surface
     /// where the OS setting is not automatically the app's.
     pub reduce_motion: bool,
+    /// Holds the display awake while a turn is running or the terminal is on
+    /// screen. A phone that sleeps mid-run stops showing the thing the reader
+    /// opened it to watch.
+    pub keep_screen_on: bool,
     /// The notification categories the user wants to hear about. `notifications`
     /// is the master switch; the three below gate the individual events.
     pub notifications: bool,
@@ -176,6 +180,8 @@ struct StoredAppSettings {
     theme_selection: Option<ThemeSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reduce_motion: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keep_screen_on: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     notifications: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -732,6 +738,7 @@ impl CredentialStorage {
             language,
             theme_selection: stored.theme_selection.unwrap_or_default(),
             reduce_motion: stored.reduce_motion.unwrap_or(false),
+            keep_screen_on: stored.keep_screen_on.unwrap_or(false),
             notifications: stored.notifications.unwrap_or(true),
             notify_completed: stored.notify_completed.unwrap_or(true),
             notify_needs_input: stored.notify_needs_input.unwrap_or(true),
@@ -751,6 +758,7 @@ impl CredentialStorage {
             theme_selection: Some(settings.theme_selection.clone())
                 .filter(|selection| selection.light.is_some() || selection.dark.is_some()),
             reduce_motion: Some(settings.reduce_motion),
+            keep_screen_on: Some(settings.keep_screen_on),
             notifications: Some(settings.notifications),
             notify_completed: Some(settings.notify_completed),
             notify_needs_input: Some(settings.notify_needs_input),

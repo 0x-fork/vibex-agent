@@ -33,9 +33,9 @@ use vibex_core::{
     AgentListRequest, AgentSessionState, AgentTimelineDisplaySettings,
     AgentTimelineReasoningDisplayMode, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     ElicitationFieldKind, ElicitationResolutionAction, ForkAgentSessionRequest, GoalPhase,
-    GoalSnapshot, MessageAttachment, OpenWorkspaceRequest, PermissionResolution,
-    PermissionResponseKind, PermissionRiskCategory, PlanStepPayload, PlanStepStatus,
-    RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteServerKind,
+    GoalSnapshot, HumanDelegationRequest, MessageAttachment, OpenWorkspaceRequest,
+    PermissionResolution, PermissionResponseKind, PermissionRiskCategory, PlanStepPayload,
+    PlanStepStatus, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteServerKind,
     RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
     RemoteSidebarOrganizationMutation, RenameAgentSessionRequest, ReplaceUserMessagePayload,
     RequestId, ResolvePermissionRequest, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
@@ -1249,6 +1249,9 @@ pub struct MobileApp {
     /// A launcher shortcut waiting for the next paint, which is the first
     /// moment there is a window to open a page in.
     pending_launch_shortcut: Option<crate::shortcut::LaunchShortcut>,
+    /// What the platform was last told about the display, so the flag is only
+    /// written when it changes.
+    keep_screen_on_applied: bool,
     /// The slash commands the open session's Agent offers. Discovered once per
     /// session and filtered locally, so typing `/p` never waits on the wire.
     composer_commands: Vec<AgentCommandEntry>,
@@ -2463,6 +2466,7 @@ impl MobileApp {
             pending_composer_restore: None,
             pending_shared_text: None,
             pending_launch_shortcut: None,
+            keep_screen_on_applied: false,
             composer_drafts: restored_composer.drafts,
             composer_commands: Vec::new(),
             composer_commands_generation: 0,
@@ -2735,6 +2739,9 @@ impl MobileApp {
         match event {
             MobileLifecycleEvent::Backgrounded => {
                 self.app_backgrounded = true;
+                // A backgrounded app must not hold the display: the flag is
+                // released before anything else happens here.
+                self.sync_keep_screen_on(cx);
                 // The process may not come back, so the debounced write is
                 // spent now rather than at the end of its timer.
                 if self.composer_state_dirty {
@@ -3257,6 +3264,31 @@ impl MobileApp {
     /// host, the route, or the credential that failed — so it travels whole.
     fn fail(&mut self, error: BackendError) {
         self.hint(Tone::Error, error.message);
+    }
+
+    /// Holds the display awake exactly while the setting says so.
+    ///
+    /// The flag is a property of the window, so this is written only when the
+    /// answer changes: a JNI call on every paint would cross the bridge sixty
+    /// times a second to say nothing new.
+    fn sync_keep_screen_on(&mut self, cx: &gpui::App) {
+        let running = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.active_session.value.as_ref())
+            .is_some_and(|session| session.state == AgentSessionState::Running);
+        let terminal_visible = self.workbench.as_ref().is_some_and(|workbench| {
+            let workbench = workbench.read(cx);
+            workbench.surface() == WorkbenchSurface::Terminal && workbench.terminal_is_running()
+        });
+        let wanted = self.app_settings.keep_screen_on
+            && !self.app_backgrounded
+            && self.mode == RootMode::Workspace
+            && (running || terminal_visible);
+        if wanted != self.keep_screen_on_applied {
+            self.keep_screen_on_applied = wanted;
+            power::keep_screen_on(wanted);
+        }
     }
 
     /// Whether an answer still belongs to the connection the phone is on.
@@ -16268,6 +16300,7 @@ impl MobileApp {
         let mention_suggestions = self.composer_mention_suggestions(cx);
         let composer_plan = self.render_composer_plan(cx);
         let composer_goal = self.render_composer_goal(cx);
+        let delegation_target = self.composer_delegation_target(cx);
         let queued = self.composer_queue_for_open_session();
         let runtime_selection = self.controller.as_ref().and_then(|controller| {
             controller
@@ -16306,6 +16339,12 @@ impl MobileApp {
             })
             // What the Agent is working through, then what the reader has
             // written ahead: both sit between the suggestions and the field.
+            // Handing the draft to someone else is a choice about the whole
+            // message, so it sits with the goal and the plan rather than in the
+            // field's own control strip.
+            .when_some(delegation_target, |composer, target| {
+                composer.child(self.render_composer_delegation(&target, cx))
+            })
             // The standing objective sits above the plan it is being worked
             // through: the goal is why, the plan is how.
             .when_some(composer_goal, |composer, goal| composer.child(goal))
@@ -17274,6 +17313,202 @@ impl MobileApp {
             input.focus(window, cx);
         });
         crate::platform::show_keyboard();
+        cx.notify();
+    }
+
+    /// The collaborator a draft is addressed to, when it is addressed to one.
+    ///
+    /// A draft that names an `@Agent` can be sent to that Agent's session
+    /// instead of into this one, which is the desktop's "delegate now". The
+    /// mention is what makes it unambiguous: without one there is no target to
+    /// hand the task to.
+    fn composer_delegation_target(&self, cx: &gpui::App) -> Option<VibexUseMention> {
+        if self.composer_input.read(cx).value().trim().is_empty() {
+            return None;
+        }
+        self.armed_mentions(cx)
+            .into_iter()
+            .find(|mention| mention.kind == vibex_core::VibexUseMentionKind::Agent)
+    }
+
+    /// Offers to hand the draft to the named collaborator.
+    fn render_composer_delegation(
+        &self,
+        target: &VibexUseMention,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let label = target.label.clone().unwrap_or_else(|| {
+            locale::text("this collaborator", "该协作者", "該協作者").to_string()
+        });
+        let busy = self.operation_busy;
+        div()
+            .id("mobile-composer-delegation")
+            .debug_selector(|| "mobile-composer-delegation".to_string())
+            .mb(px(theme::SPACING_SM))
+            .px(px(theme::SPACING_SM))
+            .py(px(theme::SPACING_XS))
+            .rounded(px(theme::RADIUS_CONTROL))
+            .border_1()
+            .border_color(theme::border_default())
+            .bg(theme::bg_card())
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                svg()
+                    .path("icons/user.svg")
+                    .size(px(theme::ICON_SM))
+                    .flex_shrink_0()
+                    .text_color(theme::accent_blue()),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(theme::font_caption())
+                    .text_color(theme::text_secondary())
+                    .child(format!(
+                        "{} {label}",
+                        locale::text("Delegate the draft to", "把草稿委派给", "把草稿委派給")
+                    )),
+            )
+            .child(
+                div()
+                    .id("mobile-composer-delegate")
+                    .flex_shrink_0()
+                    .h(px(32.0))
+                    .px(px(theme::SPACING_MD))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .bg(theme::primary())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(theme::font_caption())
+                    .text_color(theme::primary_foreground())
+                    .when(!busy, |button| {
+                        button
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.72))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.delegate_composer_draft(window, cx)
+                                }),
+                            )
+                    })
+                    .when(busy, |button| button.opacity(0.5))
+                    .child(locale::common("Delegate")),
+            )
+            .into_any_element()
+    }
+
+    /// Hands the draft to the collaborator it names.
+    ///
+    /// The task is the prompt as written, and the mention travels with it so
+    /// the receiving session knows who it was addressed to. The draft is only
+    /// cleared once the authority has accepted it.
+    fn delegate_composer_draft(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation_busy {
+            return;
+        }
+        let Some(target) = self.composer_delegation_target(cx) else {
+            return;
+        };
+        let prompt = self.composer_input.read(cx).value().trim().to_string();
+        if prompt.is_empty() {
+            return;
+        }
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let mentions = self.armed_mentions(cx);
+        let attachments = std::mem::take(&mut self.composer_attachments);
+        let restore_attachments = attachments.clone();
+        let mut request = HumanDelegationRequest::new(session_id.clone(), prompt);
+        request.title = request
+            .task
+            .lines()
+            .next()
+            .map(|line| {
+                line.chars()
+                    .take(vibex_core::VIBEX_USE_TITLE_CHARS)
+                    .collect::<String>()
+            })
+            .filter(|title| !title.trim().is_empty());
+        request.runtime_option_ref = Some(target.reference.clone());
+        request.attachments = attachments;
+        request.context_refs = mentions
+            .iter()
+            .filter_map(|mention| {
+                (mention.kind == vibex_core::VibexUseMentionKind::Session)
+                    .then(|| mention.reference.session_id())
+                    .flatten()
+                    .map(|session_id| vibex_core::TeamContextReference {
+                        session_id,
+                        from_sequence: None,
+                        through_sequence: None,
+                    })
+            })
+            .collect();
+        request.mentions = mentions;
+        self.operation_busy = true;
+        self.composer_armed_mentions.clear();
+        self.composer_armed_command = None;
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move {
+                backend
+                    .delegate_session(MutationRequest::new(request).with_idempotency_key(format!(
+                        "mobile-delegate:{}",
+                        RequestId::new().as_str()
+                    )))
+                    .await
+            });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.operation_busy = false;
+                match outcome {
+                    Ok(_) => {
+                        // The field is cleared on the next paint: this path has
+                        // no window, and a programmatic edit needs one.
+                        this.pending_input_writes
+                            .push((InputField::Composer, String::new()));
+                        if let Some(draft_key) = this
+                            .controller
+                            .as_ref()
+                            .and_then(|controller| controller.state.selected_session_id.as_ref())
+                            .map(|session_id| session_id.as_str().to_string())
+                        {
+                            this.composer_drafts.remove(&draft_key);
+                        }
+                        this.mark_composer_state_dirty(cx);
+                        this.hint(
+                            Tone::Success,
+                            locale::text("Task delegated", "任务已委派", "任務已委派"),
+                        );
+                    }
+                    Err(error) => {
+                        // The draft is still in the field, and its attachments
+                        // go back with it: a delegation that was refused must
+                        // not take either with it.
+                        this.composer_attachments = restore_attachments;
+                        this.fail(error);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
         cx.notify();
     }
 
@@ -19958,6 +20193,9 @@ impl Render for MobileApp {
         // one, so they are handed over here, where every frame has it. A notice
         // that reaches the layer never touches a page's layout, which is what
         // keeps a message from outliving the state it described.
+        // The display flag follows the work on screen; the call is a no-op
+        // while the answer has not changed.
+        self.sync_keep_screen_on(cx);
         for hint in std::mem::take(&mut self.pending_hints) {
             let on_action: Option<toast::HintHandler> = hint.action.as_ref().map(|action| {
                 let entity = cx.weak_entity();
@@ -22550,6 +22788,27 @@ impl MobileApp {
                         this.app_settings.reduce_motion = !this.app_settings.reduce_motion;
                         theme::set_reduce_motion(this.app_settings.reduce_motion);
                         this.persist_app_settings(cx);
+                    }),
+                )],
+            ),
+            settings_group(
+                locale::text("While working", "工作时", "工作時"),
+                vec![settings_switch_row(
+                    "mobile-settings-keep-screen-on",
+                    "icons/sun.svg",
+                    locale::text("Keep the screen on", "保持屏幕常亮", "保持螢幕常亮").to_string(),
+                    locale::text(
+                        "While a turn runs or the terminal is open",
+                        "当回合运行中或终端打开时",
+                        "當回合執行中或終端開啟時",
+                    )
+                    .to_string(),
+                    self.app_settings.keep_screen_on,
+                    true,
+                    cx.listener(|this, _, _, cx| {
+                        this.app_settings.keep_screen_on = !this.app_settings.keep_screen_on;
+                        this.persist_app_settings(cx);
+                        this.sync_keep_screen_on(cx);
                     }),
                 )],
             ),

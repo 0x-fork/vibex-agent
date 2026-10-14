@@ -8,6 +8,24 @@
 
 #[cfg(target_os = "android")]
 mod platform {
+    /// Holds the screen on, or lets it go.
+    ///
+    /// Android's own idle timer is the only thing that turns the display off
+    /// while the app is in front of the user, and this is the flag that tells
+    /// it not to. It is cleared whenever the app stops wanting it, so a phone
+    /// left alone in the app still sleeps.
+    pub fn keep_screen_on(keep_on: bool) {
+        let _ = crate::android_bridge::with_activity(|env, activity| {
+            env.call_method(
+                activity,
+                jni::jni_str!("gpuiKeepScreenOn"),
+                jni::jni_sig!((keep_on: jboolean) -> ()),
+                &[jni::objects::JValue::Bool(u8::from(keep_on))],
+            )?;
+            Ok(())
+        });
+    }
+
     pub fn is_ignoring_battery_optimizations() -> bool {
         crate::android_bridge::with_activity(|env, activity| {
             env.call_method(
@@ -35,7 +53,9 @@ mod platform {
 }
 
 #[cfg(target_os = "android")]
-pub use platform::{is_ignoring_battery_optimizations, request_ignore_battery_optimizations};
+pub use platform::{
+    is_ignoring_battery_optimizations, keep_screen_on, request_ignore_battery_optimizations,
+};
 
 #[cfg(not(target_os = "android"))]
 pub fn is_ignoring_battery_optimizations() -> bool {
@@ -44,6 +64,11 @@ pub fn is_ignoring_battery_optimizations() -> bool {
 
 #[cfg(not(target_os = "android"))]
 pub fn request_ignore_battery_optimizations() {}
+
+/// Android is the platform this ships on first; another host has to hold its
+/// own display awake before the setting does anything.
+#[cfg(not(target_os = "android"))]
+pub fn keep_screen_on(_keep_on: bool) {}
 
 #[cfg(test)]
 mod tests {

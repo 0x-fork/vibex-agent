@@ -249,6 +249,11 @@ pub struct GitCommitConfirmationModel {
     pub confirmed: bool,
     pub touch_target_px: u16,
     pub hover_required: bool,
+    /// Rewrite the previous commit instead of adding one. Both clients offer
+    /// it, so it is a property of the confirmation rather than of a client.
+    pub amend: bool,
+    /// Push the branch once the commit lands.
+    pub push_after: bool,
 }
 
 impl fmt::Debug for GitCommitConfirmationModel {
@@ -261,6 +266,8 @@ impl fmt::Debug for GitCommitConfirmationModel {
             .field("confirmed", &self.confirmed)
             .field("touch_target_px", &self.touch_target_px)
             .field("hover_required", &self.hover_required)
+            .field("amend", &self.amend)
+            .field("push_after", &self.push_after)
             .finish()
     }
 }
@@ -432,6 +439,8 @@ mod tests {
             confirmed: false,
             touch_target_px: MIN_TOUCH_TARGET_PX,
             hover_required: false,
+            amend: false,
+            push_after: false,
         };
         let debug = format!("{approval:?} {commit:?}");
         for secret in [
