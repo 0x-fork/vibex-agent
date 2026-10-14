@@ -9568,33 +9568,30 @@ fn the_session_list_is_not_drawn_inside_a_frame() {
             "the list is wearing a frame again ({corner}):\n{screen}"
         );
     }
-    // The page's own chrome is the first thing in the band: the name, two rows
-    // of air, the action, two more, then the list. The action is a button rather
-    // than a line of the list, and one row of air would read as the next line of
-    // the same paragraph.
+    // The page's own chrome is the first thing in the band: the name, a row of
+    // air, the action, two more, then the list. The button belongs with the
+    // title it serves; the list below it is a different kind of thing.
     let lines = screen.lines().collect::<Vec<_>>();
     let named = lines
         .iter()
         .position(|line| line.trim_start().starts_with("Session list"))
         .unwrap_or_else(|| panic!("the page does not name itself:\n{screen}"));
-    for air in [1, 2] {
-        assert!(
-            lines[named + air].trim().is_empty(),
-            "there is no air under the page's name:\n{screen}"
-        );
-    }
     assert!(
-        lines[named + 3].contains("+ New session"),
+        lines[named + 1].trim().is_empty(),
+        "there is no air under the page's name:\n{screen}"
+    );
+    assert!(
+        lines[named + 2].contains("+ New session"),
         "the action is not under the page's name:\n{screen}"
     );
-    for air in [4, 5] {
+    for air in [3, 4] {
         assert!(
             lines[named + air].trim().is_empty(),
             "there is no air under the action:\n{screen}"
         );
     }
     assert!(
-        lines[named + 6].trim_start().starts_with('▾'),
+        lines[named + 5].trim_start().starts_with('▾'),
         "the list does not start under the page's own chrome:\n{screen}"
     );
 }

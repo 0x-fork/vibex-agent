@@ -1087,12 +1087,14 @@ fn render_session_view(
     // list, the action row is the one button a session list needs, and the rows
     // are what the reader came for.
     //
-    // The action row is a button, not a line of the list, so it keeps *two* rows
-    // of air on each side: one row of separation reads as the next line of the
-    // same paragraph, and the button ends up looking like a row of the list that
-    // happens to be drawn differently. The extra row is what makes it a band.
-    const ACTION_AIR: u16 = 2;
-    let list_offset = 1 + ACTION_AIR + 1 + ACTION_AIR;
+    // The button belongs to the page's own chrome — it is what the title is
+    // there for — so one row of air is what keeps it under the title without
+    // reading as the next line of the same sentence. The list below it is a
+    // different kind of thing, and two rows are what stop the button from
+    // reading as the list's first row.
+    const ACTION_AIR_ABOVE: u16 = 1;
+    const ACTION_AIR_BELOW: u16 = 2;
+    let list_offset = 1 + ACTION_AIR_ABOVE + 1 + ACTION_AIR_BELOW;
     // A terminal too short for chrome and a row keeps the rows instead: three
     // rows of chrome over two rows of list can only show a heading, and a
     // heading the reader cannot open is worth less than the session under it.
@@ -1116,7 +1118,7 @@ fn render_session_view(
     render_session_actions(
         frame,
         Rect {
-            y: page.y + 1 + ACTION_AIR,
+            y: page.y + 1 + ACTION_AIR_ABOVE,
             height: 1,
             ..page
         },
