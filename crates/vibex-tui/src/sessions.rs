@@ -642,10 +642,30 @@ fn push_project_children(
 /// Counted through the children's own counts rather than by looking at the
 /// drawn rows, because a folded heading keeps its sessions out of the row list
 /// while still holding them.
+///
+/// A folder's rows are the one thing that must not be counted here: they are
+/// spliced into the same list, one step in, and the folder's own count already
+/// holds them. Adding them again counted every session in an open folder twice,
+/// which is a heading that overstates what it holds — and the count is a badge
+/// beside the name now, so the overstatement is the first thing read.
 fn subtree_sessions(children: &[AgentSidebarRow], counts: &[usize]) -> usize {
+    // A child names its folder by the folder's own id, while the heading's row
+    // id carries the `folder:` prefix the list addresses rows by. Only that
+    // prefix is stripped: a delegated child names its parent as `session:<id>`,
+    // and those sessions are *not* inside the parent's own count.
+    let folders = children
+        .iter()
+        .filter(|row| row.kind == AgentSidebarRowKind::Folder)
+        .filter_map(|row| row.id.strip_prefix("folder:"))
+        .collect::<BTreeSet<_>>();
     children
         .iter()
         .zip(counts)
+        .filter(|(row, _)| {
+            row.parent_id
+                .as_deref()
+                .is_none_or(|parent| !folders.contains(parent))
+        })
         .map(|(row, count)| {
             if row.kind == AgentSidebarRowKind::Session {
                 1
@@ -1195,6 +1215,93 @@ mod tests {
             .find(|(_, row)| row.label == "vibex")
             .expect("the project heading");
         assert_eq!(list.counts[project_index], 4);
+    }
+
+    /// A heading counts what it holds once, however deep the tree goes: a
+    /// folder's rows are spliced into the same list one step in, and the
+    /// folder's own count already holds them.
+    #[test]
+    fn a_heading_does_not_count_an_open_folders_rows_twice() {
+        let mut organization = SidebarOrganizationState::default();
+        organization.folders.insert(
+            "folder-notes".to_string(),
+            SidebarFolderUiState {
+                name: "notes".to_string(),
+                project_id: Some("project_vibex".to_string()),
+                workspace_id: None,
+                auto_archive_after_days: None,
+            },
+        );
+        organization.placements = vec![
+            SidebarOrganizationPlacement {
+                item: SidebarOrganizationItem::Project("project_vibex".to_string()),
+                parent_folder_id: None,
+            },
+            SidebarOrganizationPlacement {
+                item: SidebarOrganizationItem::Session("session_one00001".to_string()),
+                parent_folder_id: None,
+            },
+            SidebarOrganizationPlacement {
+                item: SidebarOrganizationItem::Folder("folder-notes".to_string()),
+                parent_folder_id: None,
+            },
+            SidebarOrganizationPlacement {
+                item: SidebarOrganizationItem::Session("session_two00001".to_string()),
+                parent_folder_id: Some("folder-notes".to_string()),
+            },
+        ];
+        let view = SidebarOrganizationView {
+            revision: 1,
+            organization,
+            collapsed_project_ids: BTreeSet::new(),
+            collapsed_workspace_ids: BTreeSet::new(),
+            pinned_session_ids: BTreeSet::new(),
+            session_order: vec![
+                "session_one00001".to_string(),
+                "session_two00001".to_string(),
+            ],
+            session_order_anchored_at_ms: i64::MAX,
+            hierarchy_mode: vibex_desktop_model::SidebarHierarchyMode::Compact,
+            project_order: vec!["project_vibex".to_string()],
+            workspace_order: BTreeMap::new(),
+            project_appearances: BTreeMap::new(),
+            worktree_titles: BTreeMap::new(),
+            project_location_preferences: BTreeMap::new(),
+            auto_continue_project_ids: BTreeSet::new(),
+            auto_continue_session_overrides: BTreeMap::new(),
+            auto_continue_session_ids: BTreeSet::new(),
+            auto_continue_paused_session_ids: BTreeSet::new(),
+            unread_session_ids: BTreeSet::new(),
+            scheduled_sends: Vec::new(),
+        };
+        let sessions = vec![
+            session("session_one00001", "vibex", "one", 2),
+            session("session_two00001", "vibex", "two", 1),
+        ];
+        let projects = vec![ProjectEntry {
+            id: "project_vibex".to_string(),
+            label: "vibex".to_string(),
+            created_at_ms: 1,
+            has_workspace: true,
+        }];
+        let list = session_list_rows(&SessionListInput {
+            view: &view,
+            sessions: &sessions,
+            projects: &projects,
+            unread_session_ids: &BTreeSet::new(),
+            children: &crate::children::ChildSessions::default(),
+            query: "",
+        });
+        assert_eq!(
+            labels(&list.rows),
+            vec!["vibex", "one", "notes", "two"],
+            "the open folder's rows are not drawn inside it"
+        );
+        assert_eq!(
+            list.counts[0], 2,
+            "the project counts its open folder's session twice"
+        );
+        assert_eq!(list.counts[2], 1, "the folder's own count is wrong");
     }
 
     #[test]
