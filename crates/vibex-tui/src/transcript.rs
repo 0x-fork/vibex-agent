@@ -1337,34 +1337,33 @@ impl Transcript {
         };
         self.turn_expansion.insert(turn_id.clone(), expanded);
         for index in 0..self.blocks.len() {
-            let Some(fold) = self.blocks[index].fold.as_mut() else {
+            let Some(fold) = self.blocks[index].fold.as_ref() else {
                 continue;
             };
             if fold.turn_id != turn_id {
                 continue;
             }
-            fold.expanded = expanded;
+            // Whether the fold decides this row is on screen at all: a row the
+            // shut section hides was measured at nothing, and the room it takes
+            // when the section opens is not the room it was measured in.
+            let drawn = self.block_is_drawn(index);
+            if let Some(fold) = self.blocks[index].fold.as_mut() {
+                fold.expanded = expanded;
+            }
             self.keys[index] = self.blocks[index].content_key();
-            // The fold draws its own row on two of the turn's blocks — the
-            // title above the work, the rule below it — so the lines they
-            // cached are stale. What they *measure* is not: the answer spends
-            // one row and one row of air whether the title or the rule is drawn
-            // on it, and the work rows only appear and disappear, which the
-            // layout reads from the fold itself. Keeping those heights is what
-            // lets a reader parked in the section keep their place; dropping
-            // them would put the whole turn back on estimates, and the answer's
-            // estimate is nowhere near its height.
-            self.drop_lines(index);
-        }
-        // The one block whose shape the fold changes is the row that opens the
-        // section: open, it spends the title and its air above its own content.
-        if let Some(head) = self.blocks.iter().position(|block| {
-            block
-                .fold
-                .as_ref()
-                .is_some_and(|fold| fold.turn_id == turn_id && fold.is_head)
-        }) {
-            self.invalidate(head);
+            // A row the fold neither shows nor hides keeps what it measured, and
+            // only its lines are stale: the title and the rule are drawn on rows
+            // the turn was already spending, and the answer spends one row and
+            // one row of air whichever of the two it carries. Keeping that
+            // height is what lets a reader parked in the section keep their
+            // place — putting the answer back on its estimate would move them by
+            // the difference, and the estimate is nowhere near the rows markdown
+            // draws.
+            if self.block_is_drawn(index) == drawn {
+                self.drop_lines(index);
+            } else {
+                self.invalidate(index);
+            }
         }
         self.layout_valid = false;
         true
