@@ -24,7 +24,7 @@ use gpui::{
 use vibex_app_update::{UpdateSnapshot, UpdateState};
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendFuture, BackendOperation,
-    BackendProjection, BackendResult, ManagementBackend as _, MutationRequest,
+    BackendProjection, BackendResult, GitBackend as _, ManagementBackend as _, MutationRequest,
     WorkspaceBackend as _, WorkspaceSummary,
 };
 use vibex_core::{
@@ -32,11 +32,11 @@ use vibex_core::{
     AgentCommandExecutionBehavior, AgentCommandSourceKind, AgentCommandTrigger, AgentId,
     AgentListRequest, AgentSessionState, AgentTimelineDisplaySettings,
     AgentTimelineReasoningDisplayMode, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    ElicitationFieldKind, ElicitationResolutionAction, ForkAgentSessionRequest, GoalPhase,
-    GoalSnapshot, HumanDelegationRequest, MessageAttachment, OpenWorkspaceRequest,
-    PermissionResolution, PermissionResponseKind, PermissionRiskCategory, PlanStepPayload,
-    PlanStepStatus, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteServerKind,
-    RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
+    ElicitationFieldKind, ElicitationResolutionAction, ForkAgentSessionRequest,
+    GitWorktreeCreateRequest, GoalPhase, GoalSnapshot, HumanDelegationRequest, MessageAttachment,
+    OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PermissionRiskCategory,
+    PlanStepPayload, PlanStepStatus, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState,
+    RemoteServerKind, RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
     RemoteSidebarOrganizationMutation, RenameAgentSessionRequest, ReplaceUserMessagePayload,
     RequestId, ResolvePermissionRequest, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
     RuntimeAuthSourceSummary, RuntimeModelSelection, RuntimeOptionAvailability,
@@ -1485,6 +1485,12 @@ pub struct MobileApp {
     new_session_runtime: Option<SessionRuntimeSelection>,
     new_session_title_input: Entity<InputState>,
     new_session_prompt_input: Entity<TextareaState>,
+    /// The worktree's name, when the session is starting in a new one. The
+    /// authority slugs it into `vibex/<slug>` for the branch and the directory.
+    new_session_worktree_name_input: Entity<InputState>,
+    /// An absolute path on the desktop host for the new worktree. Empty means
+    /// the authority's own managed location.
+    new_session_worktree_path_input: Entity<InputState>,
     new_project_input: Entity<InputState>,
     new_project_busy: bool,
     new_project_error: Option<String>,
@@ -2698,6 +2704,20 @@ impl MobileApp {
                     "Describe what you want to build…",
                     "描述你想完成的事情…",
                     "描述你想完成的事情…",
+                ))
+            }),
+            new_session_worktree_name_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Worktree name",
+                    "Worktree 名称",
+                    "Worktree 名稱",
+                ))
+            }),
+            new_session_worktree_path_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Path on the desktop (optional)",
+                    "桌面端路径（可选）",
+                    "桌面版路徑（可選）",
                 ))
             }),
             new_project_input: cx.new(|cx| {
@@ -5413,17 +5433,108 @@ impl MobileApp {
         let Some(backend) = self.backend.clone() else {
             return;
         };
-        let request = MutationRequest::new(CreateAgentSessionRequest {
-            session_id: None,
-            defer_runtime_materialization: false,
-            runtime: runtime.clone(),
-            workspace_root,
-            workspace_mode,
-            title: (!title.is_empty()).then_some(title),
-            safety: None,
-        });
+        // A session that starts in a new worktree has to have one created for
+        // it first: the session request only registers a workspace, it does not
+        // make the directory. The name the reader typed is what the worktree's
+        // branch and folder are named from, and an empty one is derived from
+        // the first message so the worktree is never left unnamed.
+        let worktree_name = self
+            .new_session_worktree_name_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let worktree_path = self
+            .new_session_worktree_path_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let creates_worktree = workspace_mode == WorkspaceMode::VibexWorktree;
+        let worktree_request = if creates_worktree {
+            let name = if worktree_name.is_empty() {
+                let fallback = if !title.is_empty() {
+                    title.clone()
+                } else {
+                    prompt.clone()
+                };
+                vibex_core::managed_worktree_name_slug(&fallback)
+            } else {
+                worktree_name
+            };
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                self.fail(BackendError::failed(
+                    "mobile_worktree_name_required",
+                    locale::text(
+                        "Name the worktree, or write the first message it can be named from.",
+                        "请填写 Worktree 名称，或先写第一条消息以便自动命名。",
+                        "請填寫 Worktree 名稱，或先寫第一則訊息以便自動命名。",
+                    ),
+                ));
+                cx.notify();
+                return;
+            }
+            let Some(origin_workspace_id) = self
+                .new_session_workspace_id
+                .as_deref()
+                .and_then(|id| vibex_core::WorkspaceId::parse(id).ok())
+            else {
+                self.fail(BackendError::failed(
+                    "mobile_worktree_origin_required",
+                    locale::text(
+                        "Choose the workspace the worktree is created from.",
+                        "请选择创建 Worktree 的源工作区。",
+                        "請選擇建立 Worktree 的來源工作區。",
+                    ),
+                ));
+                cx.notify();
+                return;
+            };
+            let base_ref = self
+                .new_session_workspace_id
+                .as_deref()
+                .and_then(|id| {
+                    self.workspace_summaries
+                        .iter()
+                        .find(|summary| summary.workspace.id.as_str() == id)
+                })
+                .and_then(|summary| summary.git_branch.clone());
+            Some(GitWorktreeCreateRequest {
+                workspace_id: origin_workspace_id.clone(),
+                branch_name: format!("vibex/{}", vibex_core::managed_worktree_name_slug(&name)),
+                base_ref,
+                name: Some(name),
+                worktree_path: (!worktree_path.is_empty()).then_some(worktree_path),
+                target_workspace_id: Some(origin_workspace_id),
+                target_branch: None,
+            })
+        } else {
+            None
+        };
         self.new_session_busy = true;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            // The worktree first: its workspace is what the session is opened
+            // in, so a session is never left pointing at the checkout the
+            // worktree was branched from.
+            let (workspace_root, workspace_mode) = match worktree_request {
+                Some(request) => {
+                    let created = backend
+                        .git_worktree_create(MutationRequest::new(request))
+                        .await?;
+                    (created.workspace.root_path, created.workspace.mode)
+                }
+                None => (workspace_root, workspace_mode),
+            };
+            let request = MutationRequest::new(CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: false,
+                runtime: runtime.clone(),
+                workspace_root,
+                workspace_mode,
+                title: (!title.is_empty()).then_some(title),
+                safety: None,
+            });
             let session = backend.create_session(request).await?;
             let prompt_result = if prompt.is_empty() && attachments.is_empty() {
                 None
@@ -15651,9 +15762,9 @@ impl MobileApp {
             TimelineRowKind::ImageGeneration => self.render_image_generation_card(row, cx),
             TimelineRowKind::ToolCall
             | TimelineRowKind::WebSearch
-            | TimelineRowKind::TodoUpdate
-            | TimelineRowKind::Collaboration
-            | TimelineRowKind::Retry => self.render_process_activity_line(row, cx),
+            | TimelineRowKind::TodoUpdate => self.render_process_activity_line(row, cx),
+            TimelineRowKind::Collaboration => self.render_collaboration_card(row, cx),
+            TimelineRowKind::Retry => self.render_process_activity_line(row, cx),
             TimelineRowKind::GitNotice
             | TimelineRowKind::SystemNotice
             | TimelineRowKind::PermissionResolution
@@ -16412,6 +16523,120 @@ impl MobileApp {
                         }),
                 )
             })
+            .into_any_element()
+    }
+
+    /// A hand-off to another Agent, as its own card.
+    ///
+    /// The desktop expands this into a live preview of the child session. A
+    /// phone cannot show two transcripts at once, so the card says who the
+    /// work went to and how it is doing, and the Team page — which lists the
+    /// task and its state — is one tap away.
+    fn render_collaboration_card(
+        &self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(TimelinePayload::Collaboration(collaboration)) =
+            self.timeline_row_latest_payload(row)
+        else {
+            return self.render_process_activity_line(row, cx);
+        };
+        let managed = collaboration.delegation_id.is_some();
+        let (status_label, status_color) = collaboration_status(collaboration.status);
+        let label = collaboration
+            .agent_label
+            .clone()
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or_else(|| {
+                locale::text("another Agent", "另一个 Agent", "另一個 Agent").to_string()
+            });
+        let summary = collaboration.summary.clone();
+        div()
+            .id(format!("collaboration-card:{}", row.id))
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            .border_color(theme::border_default())
+            .bg(theme::bg_card_dim())
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(44.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(managed, |header| {
+                        header.cursor_pointer().on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.show_overlay(MobileOverlay::Team, window, cx)
+                            }),
+                        )
+                    })
+                    .child(
+                        svg()
+                            .path("icons/user.svg")
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(theme::accent_blue()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(theme::font_caption())
+                                    .text_color(theme::text_primary())
+                                    .child(format!(
+                                        "{} {label}",
+                                        locale::text("Delegated to", "已委派给", "已委派給")
+                                    )),
+                            )
+                            .when(!summary.trim().is_empty(), |title| {
+                                title.child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_size(theme::font_micro())
+                                        .text_color(theme::text_muted())
+                                        .child(summary),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(theme::font_micro())
+                            .text_color(status_color)
+                            .child(status_label),
+                    )
+                    .when(managed, |header| {
+                        header.child(
+                            svg()
+                                .path("icons/chevron-right.svg")
+                                .size(px(14.0))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted()),
+                        )
+                    }),
+            )
             .into_any_element()
     }
 
@@ -23039,7 +23264,11 @@ impl MobileApp {
         let runtime_summary = runtime_selection_summary(runtime_catalog, runtime_selection);
         let prompt = self.new_session_prompt_input.read(cx).value();
         let new_session_mentions = self.new_session_mention_suggestions(cx);
-        let can_submit = !prompt.trim().is_empty() && !self.new_session_busy;
+        // A first message may be a file on its own, the same way a prompt in
+        // the composer may be: the field being empty is not the same as there
+        // being nothing to send.
+        let can_submit = (!prompt.trim().is_empty() || !self.new_session_attachments.is_empty())
+            && !self.new_session_busy;
         let worktree_supported = self.supports_new_session_worktree();
         let mode = self.normalize_new_session_workspace_mode(self.new_session_workspace_mode);
         let can_create_session = self.backend.as_ref().is_some_and(|backend| {
@@ -23170,6 +23399,79 @@ impl MobileApp {
                                     ),
                             ),
                     )
+                    // ── the new worktree's own fields ────────────────────────
+                    .when(mode == WorkspaceMode::VibexWorktree, |page| {
+                        page.child(
+                            div()
+                                .w_full()
+                                .rounded(px(theme::RADIUS_CARD))
+                                .border_1()
+                                .border_color(theme::border_subtle())
+                                .bg(theme::bg_card())
+                                .p(px(theme::SPACING_MD))
+                                .flex()
+                                .flex_col()
+                                .gap(px(theme::SPACING_SM))
+                                .child(
+                                    div()
+                                        .text_size(theme::font_micro())
+                                        .text_color(theme::text_muted())
+                                        .child(locale::text(
+                                            "NEW WORKTREE",
+                                            "新建 WORKTREE",
+                                            "新建 WORKTREE",
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(theme::TOUCH_TARGET))
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .border_1()
+                                        .border_color(theme::border_default())
+                                        .bg(theme::workbench_panel_bg())
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            resume_keyboard_on_tap,
+                                        )
+                                        .child(
+                                            Input::new(&self.new_session_worktree_name_input)
+                                                .appearance(false),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(theme::TOUCH_TARGET))
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .border_1()
+                                        .border_color(theme::border_default())
+                                        .bg(theme::workbench_panel_bg())
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            resume_keyboard_on_tap,
+                                        )
+                                        .child(
+                                            Input::new(&self.new_session_worktree_path_input)
+                                                .appearance(false),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme::font_micro())
+                                        .text_color(theme::text_muted())
+                                        .child(locale::text(
+                                            "The worktree is created from the selected workspace's branch before the session starts.",
+                                            "会话启动前，会基于所选工作区的分支创建 Worktree。",
+                                            "工作階段啟動前，會基於所選工作區的分支建立 Worktree。",
+                                        )),
+                                ),
+                        )
+                    })
                     // ── title, only when the user wants one ──────────────────
                     .child(
                         div()
@@ -26712,6 +27014,27 @@ fn sidebar_project_icon_color(color: SidebarProjectLogoColor) -> gpui::Hsla {
         SidebarProjectLogoColor::Orange => rgb(0xf97316).into(),
         SidebarProjectLogoColor::Red => theme::accent_red(),
         SidebarProjectLogoColor::Magenta => rgb(0xe879f9).into(),
+    }
+}
+
+/// How a hand-off to another Agent is doing, as a word and a colour.
+fn collaboration_status(status: vibex_core::ToolCallStatus) -> (&'static str, gpui::Hsla) {
+    match status {
+        vibex_core::ToolCallStatus::Started => (
+            locale::text("Started", "已开始", "已開始"),
+            theme::accent_blue(),
+        ),
+        vibex_core::ToolCallStatus::Progress => (
+            locale::text("Running", "进行中", "進行中"),
+            theme::accent_blue(),
+        ),
+        vibex_core::ToolCallStatus::Completed => (
+            locale::text("Done", "已完成", "已完成"),
+            theme::accent_green(),
+        ),
+        vibex_core::ToolCallStatus::Failed => {
+            (locale::text("Failed", "失败", "失敗"), theme::accent_red())
+        }
     }
 }
 
