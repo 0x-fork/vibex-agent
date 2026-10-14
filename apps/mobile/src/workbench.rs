@@ -289,6 +289,11 @@ pub struct MobileWorkbench {
     file_markdown_view: Option<(String, Entity<markdown::MarkdownView>)>,
     /// How the content search is run. The desktop offers the same three
     /// switches; a phone keeps them off until asked for.
+    /// Where this workbench is pointed, as one line: the project, the worktree
+    /// and its branch. The rail follows the open session, so this is a
+    /// read-out rather than a switcher — the desktop is where a worktree is
+    /// chosen.
+    context_label: Option<String>,
     file_search_case_sensitive: bool,
     file_search_whole_word: bool,
     file_search_regex: bool,
@@ -437,6 +442,7 @@ impl MobileWorkbench {
             file_image: None,
             file_image_loading: None,
             file_markdown_view: None,
+            context_label: None,
             file_search_case_sensitive: false,
             file_search_whole_word: false,
             file_search_regex: false,
@@ -522,6 +528,13 @@ impl MobileWorkbench {
             WorkbenchSurface::Terminal => self.refresh_terminals(cx),
         }
         cx.notify();
+    }
+
+    /// Sets the one-line description of what this rail is pointed at.
+    pub fn set_context_label(&mut self, label: Option<String>) {
+        if self.context_label != label {
+            self.context_label = label;
+        }
     }
 
     pub fn set_workspace(&mut self, workspace_id: WorkspaceId, cx: &mut Context<Self>) {
@@ -917,6 +930,65 @@ impl MobileWorkbench {
         } else {
             self.select_file(path, cx);
         }
+    }
+
+    /// Collapses every directory the tree has open.
+    ///
+    /// Always complete, and always local: the paths are the ones the tree is
+    /// already holding open.
+    fn collapse_file_tree(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let expanded = self.files.state.tree.expanded_directory_paths();
+        if expanded.is_empty() {
+            return;
+        }
+        if self.files.state.tree.set_chain_expanded(&expanded, false) {
+            cx.notify();
+        }
+    }
+
+    /// Opens the next level of the tree.
+    ///
+    /// A lazy tree cannot be opened all at once — the children of a directory
+    /// do not exist until the authority lists it — so this expands every
+    /// directory that is on screen and fetches what is under it. Tapping again
+    /// goes a level deeper, which is the honest shape of the operation rather
+    /// than a button that claims to finish a job it cannot.
+    fn expand_file_tree_level(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        const MAX_DIRECTORIES_PER_LEVEL: usize = 25;
+        let directories = self
+            .files
+            .state
+            .tree
+            .all_visible_rows()
+            .iter()
+            .filter(|row| row.kind == FileEntryKind::Directory)
+            .filter(|row| !self.files.state.tree.is_expanded(&row.path))
+            .map(|row| row.path.clone())
+            .take(MAX_DIRECTORIES_PER_LEVEL)
+            .collect::<Vec<_>>();
+        if directories.is_empty() {
+            self.show_notice(
+                locale::text(
+                    "Every folder on screen is already open",
+                    "屏幕上的文件夹都已展开",
+                    "螢幕上的資料夾都已展開",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        }
+        for path in directories {
+            if self
+                .files
+                .state
+                .tree
+                .set_chain_expanded(&[path.clone()], true)
+            {
+                self.load_file_tree_path(path, cx);
+            }
+        }
+        cx.notify();
     }
 
     fn start_file_search(&mut self, cx: &mut Context<Self>) {
@@ -4034,6 +4106,22 @@ impl MobileWorkbench {
                                     }),
                                 )
                             })),
+                    )
+                    .child(
+                        toolbar_icon_button(
+                            "collapse-files",
+                            "icons/chevrons-down-up.svg",
+                            "Collapse folders",
+                        )
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::collapse_file_tree)),
+                    )
+                    .child(
+                        toolbar_icon_button(
+                            "expand-files",
+                            "icons/folder-open.svg",
+                            "Open the next level of folders",
+                        )
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::expand_file_tree_level)),
                     )
                     .child(
                         toolbar_icon_button("refresh-files", "icons/refresh.svg", "Refresh")

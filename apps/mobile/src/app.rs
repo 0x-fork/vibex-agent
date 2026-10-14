@@ -1619,6 +1619,10 @@ pub struct MobileApp {
     /// The stable-channel update state, or `None` until a check publishes one.
     /// The settings About section is the only surface.
     update_snapshot: Option<UpdateSnapshot>,
+    /// Whether the installed release's notes are expanded in About.
+    release_notes_open: bool,
+    /// The rendered notes, kept across frames like every other Markdown view.
+    release_notes_view: Option<(String, Entity<markdown::MarkdownView>)>,
     /// The root window, kept so a platform callback (a notification tap) can
     /// open an overlay without a pointer event.
     window_handle: gpui::AnyWindowHandle,
@@ -2846,6 +2850,8 @@ impl MobileApp {
             pending_notification_action: None,
             update_supported: update::supported(),
             update_available: updates_enabled,
+            release_notes_open: false,
+            release_notes_view: None,
             update_snapshot: if updates_enabled {
                 update::snapshot()
             } else {
@@ -5359,8 +5365,36 @@ impl MobileApp {
         self.tasks.push(task);
     }
 
+    /// One line naming where the rail is pointed: project, worktree, branch.
+    ///
+    /// The desktop's rail shows the same three things in its own header; the
+    /// phone had none of them, so a rail opened on a worktree looked exactly
+    /// like one opened on the checkout.
+    fn workbench_context_label(&self, workspace_id: &vibex_core::WorkspaceId) -> Option<String> {
+        let summary = self
+            .workspace_summaries
+            .iter()
+            .find(|summary| summary.workspace.id == *workspace_id)?;
+        let worktree = self
+            .sidebar_view
+            .worktree_titles
+            .get(workspace_id.as_str())
+            .cloned()
+            .unwrap_or_else(|| workspace_label(&summary.workspace.root_path).to_string());
+        let mut parts = vec![summary.project.name.clone(), worktree];
+        if let Some(branch) = summary
+            .git_branch
+            .as_deref()
+            .filter(|b| !b.trim().is_empty())
+        {
+            parts.push(branch.to_string());
+        }
+        Some(parts.join(" / "))
+    }
+
     fn ensure_workbench(&mut self, workspace_id: vibex_core::WorkspaceId, cx: &mut Context<Self>) {
         self.sidebar_selected_workspace_id = Some(workspace_id.as_str().to_string());
+        let context_label = self.workbench_context_label(&workspace_id);
         let session_id = self
             .controller
             .as_ref()
@@ -5369,6 +5403,7 @@ impl MobileApp {
         if let Some(workbench) = self.workbench.as_ref() {
             workbench.update(cx, |workbench, cx| {
                 workbench.set_workspace(workspace_id, cx);
+                workbench.set_context_label(context_label);
                 if let Some(surface) = pending_surface {
                     workbench.set_surface(surface, cx);
                 }
@@ -5386,6 +5421,7 @@ impl MobileApp {
         if let Some(workbench) = self.workbench.as_ref() {
             workbench.update(cx, |workbench, cx| {
                 workbench.set_close_handler(close);
+                workbench.set_context_label(context_label);
                 if let Some(surface) = pending_surface {
                     workbench.set_surface(surface, cx);
                 }
@@ -25631,8 +25667,76 @@ impl MobileApp {
         rows
     }
 
+    /// The installed release's notes, collapsed behind one row.
+    ///
+    /// The desktop has a Release notes row in the same place; the phone had
+    /// only the version, so there was no way to read what changed without
+    /// leaving the app.
+    fn render_release_notes(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(notes) = self
+            .update_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.current_notes.clone())
+            .filter(|notes| !notes.trim().is_empty())
+        else {
+            return div().into_any_element();
+        };
+        let open = self.release_notes_open;
+        let body = open
+            .then(|| {
+                self.release_notes_view
+                    .as_ref()
+                    .map(|(_, view)| view.clone())
+            })
+            .flatten();
+        div()
+            .flex()
+            .flex_col()
+            .child(settings_nav_row(
+                "mobile-settings-release-notes",
+                "icons/book-open.svg",
+                locale::text("Release notes", "更新日志", "更新日誌").to_string(),
+                if open {
+                    locale::common("Hide").to_string()
+                } else {
+                    locale::common("Show").to_string()
+                },
+                theme::accent_chart3(),
+                cx.listener(|this, _, _, cx| {
+                    this.release_notes_open = !this.release_notes_open;
+                    if this.release_notes_open && this.release_notes_view.is_none() {
+                        let source: Arc<str> = Arc::from(
+                            this.update_snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.current_notes.clone())
+                                .unwrap_or_default()
+                                .as_str(),
+                        );
+                        this.release_notes_view = Some((
+                            String::new(),
+                            cx.new(|cx| markdown::render(source, 0, false, cx)),
+                        ));
+                    }
+                    cx.notify();
+                }),
+            ))
+            .when_some(body, |section, view| {
+                section.child(
+                    div()
+                        .id("mobile-release-notes-body")
+                        .max_h(px(320.0))
+                        .overflow_y_scroll()
+                        .px(px(theme::SPACING_MD))
+                        .pb(px(theme::SPACING_SM))
+                        .child(view),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_settings_about(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let mut rows = vec![self.render_update_section(cx)];
+        rows.push(self.render_release_notes(cx));
         rows.push(settings_group(
             locale::common("About"),
             vec![
