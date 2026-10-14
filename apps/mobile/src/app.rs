@@ -1362,6 +1362,19 @@ pub struct MobileApp {
     /// longer open.
     token_usage_generation: u64,
     timeline_metadata_tip: Option<TimelineMetadataTip>,
+    /// Find inside the open conversation: the query, what it matched, and
+    /// which match the reader is standing on. A phone cannot highlight a word
+    /// inside a Markdown view, so the match is shown by taking the reader to
+    /// the row that holds it and marking that row.
+    timeline_find_open: bool,
+    timeline_find_input: Option<Entity<InputState>>,
+    timeline_find_subscription: Option<gpui::Subscription>,
+    timeline_find_query: String,
+    /// `(turn id, row id, the line the match was found in)`.
+    timeline_find_matches: Vec<(String, String, String)>,
+    timeline_find_active: usize,
+    /// The turn the last search change wants on screen, applied at paint time.
+    timeline_find_scroll_pending: Option<String>,
     attachment_preview: Option<MobileAttachmentPreview>,
     /// One file change opened from the timeline, with the patch already
     /// projected: the sheet is a read-out, so nothing is computed while it
@@ -2558,6 +2571,18 @@ impl MobileApp {
         let sidebar_search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(locale::common("Search")));
         let sidebar_search_subscription = cx.observe(&sidebar_search_input, |_, _, cx| cx.notify());
+        let timeline_find_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Find in conversation",
+                "在会话中查找",
+                "在工作階段中尋找",
+            ))
+        });
+        let timeline_find_subscription =
+            cx.observe(&timeline_find_input, |this: &mut Self, _, cx| {
+                this.refresh_timeline_find(cx);
+                cx.notify();
+            });
         // The battery-optimization dialog only pauses the activity, which does
         // not emit a Background phase on Android; track window activation so
         // returning from it re-reads the allowlist state.
@@ -2638,6 +2663,13 @@ impl MobileApp {
             token_usage: None,
             token_usage_generation: 0,
             timeline_metadata_tip: None,
+            timeline_find_open: false,
+            timeline_find_input: Some(timeline_find_input),
+            timeline_find_subscription: Some(timeline_find_subscription),
+            timeline_find_query: String::new(),
+            timeline_find_matches: Vec::new(),
+            timeline_find_active: 0,
+            timeline_find_scroll_pending: None,
             attachment_preview: None,
             timeline_file_diff: None,
             generated_images: BTreeMap::new(),
@@ -8665,6 +8697,10 @@ impl MobileApp {
             cx.notify();
             return;
         }
+        if self.timeline_find_open {
+            self.close_timeline_find(window, cx);
+            return;
+        }
         if self.worktree_path_browser.is_some() {
             self.close_worktree_path_browser(cx);
             return;
@@ -12490,6 +12526,9 @@ impl MobileApp {
                         .when_some(self.active_session_group(), |page, (group, members)| {
                             page.child(self.render_session_group_tabs(&group, &members, cx))
                         })
+                        .when_some(self.render_timeline_find_row(cx), |page, bar| {
+                            page.child(bar)
+                        })
                         .child(
                             div()
                                 .flex_1()
@@ -12995,6 +13034,123 @@ impl MobileApp {
     ///
     /// Full screen rather than an expansion inside the turn: a diff needs the
     /// width, and the turn it came from is one back press away.
+    /// The conversation's find bar.
+    fn render_timeline_find_bar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let count = self.timeline_find_matches.len();
+        let has_query = !self.timeline_find_query.is_empty();
+        div()
+            .id("timeline-find-bar")
+            .debug_selector(|| "timeline-find-bar".to_string())
+            .flex_shrink_0()
+            .px(px(theme::SPACING_SM))
+            .py(px(theme::SPACING_XS))
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .bg(theme::bg_card())
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_XS))
+            .child(
+                div()
+                    .h(px(36.0))
+                    .min_w_0()
+                    .flex_1()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_primary())
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        svg()
+                            .path("icons/search.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::text_muted()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
+                            .child(
+                                Input::new(
+                                    self.timeline_find_input
+                                        .as_ref()
+                                        .expect("the find field is built with the app"),
+                                )
+                                .appearance(false),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .min_w(px(56.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(theme::font_micro())
+                    .text_color(if has_query && count == 0 {
+                        theme::accent_red()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .child(if has_query {
+                        format!("{} / {}", (self.timeline_find_active + 1).min(count), count)
+                    } else {
+                        String::new()
+                    }),
+            )
+            .child(
+                timeline_action_button(
+                    "timeline-find-previous",
+                    "icons/chevron-down.svg",
+                    locale::text("Previous match", "上一个匹配", "上一個符合"),
+                )
+                .when(count > 0, |button| {
+                    button.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.step_timeline_find(false, cx)),
+                    )
+                })
+                .when(count == 0, |button| button.opacity(0.4)),
+            )
+            .child(
+                timeline_action_button(
+                    "timeline-find-next",
+                    "icons/chevron-down.svg",
+                    locale::text("Next match", "下一个匹配", "下一個符合"),
+                )
+                .when(count > 0, |button| {
+                    button.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.step_timeline_find(true, cx)),
+                    )
+                })
+                .when(count == 0, |button| button.opacity(0.4)),
+            )
+            .child(
+                timeline_action_button(
+                    "timeline-find-close",
+                    "icons/x.svg",
+                    locale::common("Close"),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.close_timeline_find(window, cx)),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// The conversation's find bar's bar, above the transcript.
+    fn render_timeline_find_row(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        self.timeline_find_open
+            .then(|| self.render_timeline_find_bar(cx))
+    }
+
     fn render_timeline_file_diff(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(diff) = self.timeline_file_diff.as_ref() else {
             return div().into_any_element();
@@ -15755,6 +15911,37 @@ impl MobileApp {
             )
             .child(
                 div()
+                    .id("open-conversation-find")
+                    .size(px(theme::HEADER_BUTTON_SIZE))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .aria_label(
+                        locale::text("Find in conversation", "在会话中查找", "在工作階段中尋找")
+                            .to_string(),
+                    )
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            if this.timeline_find_open {
+                                this.close_timeline_find(window, cx);
+                            } else {
+                                this.open_timeline_find(window, cx);
+                            }
+                        }),
+                    )
+                    .child(
+                        svg()
+                            .path("icons/search.svg")
+                            .size(px(theme::ICON_MD))
+                            .text_color(theme::text_secondary()),
+                    ),
+            )
+            .child(
+                div()
                     .id("refresh-session")
                     .size(px(theme::HEADER_BUTTON_SIZE))
                     .flex_shrink_0()
@@ -16972,6 +17159,107 @@ impl MobileApp {
                 })
                 .into_any_element(),
         )
+    }
+
+    /// Recomputes the conversation's matches for the query on screen.
+    ///
+    /// The search runs over the turns the phone is holding, which is the
+    /// window the reader can actually reach; a match further back is fetched
+    /// by scrolling, exactly as it is without a search.
+    fn refresh_timeline_find(&mut self, cx: &gpui::App) {
+        let Some(input) = self.timeline_find_input.as_ref() else {
+            return;
+        };
+        let query = input.read(cx).value().trim().to_lowercase();
+        if query == self.timeline_find_query {
+            return;
+        }
+        self.timeline_find_query = query.clone();
+        self.timeline_find_active = 0;
+        self.timeline_find_matches.clear();
+        if query.is_empty() {
+            return;
+        }
+        for turn in self.timeline_turns.iter() {
+            let rows = turn
+                .user_row
+                .iter()
+                .chain(turn.process_rows.iter())
+                .chain(turn.conclusion_row.iter());
+            for row in rows {
+                let body = row.body.to_lowercase();
+                let title = row.title.to_lowercase();
+                let line = if body.contains(&query) {
+                    row.body
+                        .lines()
+                        .find(|line| line.to_lowercase().contains(&query))
+                } else if title.contains(&query) {
+                    Some(row.title.as_str())
+                } else {
+                    None
+                };
+                if let Some(line) = line {
+                    self.timeline_find_matches.push((
+                        turn.id.clone(),
+                        row.id.clone(),
+                        line.trim().to_string(),
+                    ));
+                }
+            }
+        }
+        // The first match is where the search lands. The scroll itself happens
+        // on the next paint, because this path has no window and the list
+        // measures its items there.
+        self.timeline_find_scroll_pending = self
+            .timeline_find_matches
+            .first()
+            .map(|(turn_id, _, _)| turn_id.clone());
+    }
+
+    /// Whether a row is folded shut, so its text is not on screen.
+    fn timeline_row_is_collapsed(&self, row_id: &str) -> bool {
+        self.collapsed_timeline_rows.contains(row_id)
+    }
+
+    fn open_timeline_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.timeline_find_open = true;
+        if let Some(input) = self.timeline_find_input.clone() {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        }
+        crate::platform::show_keyboard();
+        cx.notify();
+    }
+
+    fn close_timeline_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.timeline_find_open = false;
+        self.timeline_find_query.clear();
+        self.timeline_find_matches.clear();
+        self.timeline_find_active = 0;
+        if let Some(input) = self.timeline_find_input.clone() {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        crate::platform::hide_keyboard();
+        cx.notify();
+    }
+
+    /// Steps to the next or previous match and takes the reader to it.
+    fn step_timeline_find(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.timeline_find_matches.is_empty() {
+            return;
+        }
+        let count = self.timeline_find_matches.len();
+        self.timeline_find_active = if forward {
+            (self.timeline_find_active + 1) % count
+        } else {
+            (self.timeline_find_active + count - 1) % count
+        };
+        let (turn_id, row_id, _) = self.timeline_find_matches[self.timeline_find_active].clone();
+        // A collapsed row hides the text that matched, so it is opened first.
+        if self.timeline_row_is_collapsed(&row_id) {
+            self.toggle_timeline_row(row_id, cx);
+        }
+        self.scroll_to_timeline_turn(&turn_id, cx);
+        cx.notify();
     }
 
     fn scroll_to_timeline_turn(&mut self, turn_id: &str, _cx: &mut Context<Self>) {
@@ -22494,6 +22782,10 @@ impl Render for MobileApp {
         // The display flag follows the work on screen; the call is a no-op
         // while the answer has not changed.
         self.sync_keep_screen_on(cx);
+        if let Some(turn_id) = self.timeline_find_scroll_pending.take() {
+            self.timeline_list.remeasure();
+            self.scroll_to_timeline_turn(&turn_id, cx);
+        }
         for hint in std::mem::take(&mut self.pending_hints) {
             let on_action: Option<toast::HintHandler> = hint.action.as_ref().map(|action| {
                 let entity = cx.weak_entity();
@@ -28940,6 +29232,54 @@ mod tests {
         assert_eq!(truncate_single_line("abcdef", 3), "...");
         assert_eq!(truncate_single_line("abcdef", 2), "..");
         assert_eq!(truncate_single_line("abcdef", 0), "");
+    }
+
+    #[test]
+    fn a_conversation_match_names_the_line_it_was_found_in() {
+        // The search takes the row and the line, because a phone cannot mark a
+        // word inside a Markdown view: the reader is shown where the match is.
+        let row = |title: &str, body: &str| TimelineRow {
+            id: format!("row:{title}"),
+            kind: TimelineRowKind::AgentMessage,
+            item_ids: Vec::new(),
+            turn_id: None,
+            turn_item_count: 0,
+            turn_failed: false,
+            turn_pending_permission: false,
+            conclusion: false,
+            first_sequence: 0,
+            last_sequence: 0,
+            timestamp_ms: 0,
+            title: title.to_string(),
+            body: body.to_string(),
+            streaming: false,
+            collapsible: false,
+            pending_permission: false,
+            failed: false,
+            runtime_attribution: None,
+            file_path: None,
+        };
+        let query = "needle";
+        let body = "first line\nsecond line with a NEEDLE in it\nthird";
+        let found = body
+            .lines()
+            .find(|line| line.to_lowercase().contains(query))
+            .map(str::trim)
+            .expect("the line is found case-insensitively");
+        assert_eq!(found, "second line with a NEEDLE in it");
+        // A row that only matches in its title reports the title.
+        let titled = row("needle row", "nothing here");
+        let line = if titled.body.to_lowercase().contains(query) {
+            titled
+                .body
+                .lines()
+                .find(|line| line.to_lowercase().contains(query))
+        } else if titled.title.to_lowercase().contains(query) {
+            Some(titled.title.as_str())
+        } else {
+            None
+        };
+        assert_eq!(line, Some("needle row"));
     }
 
     #[test]
