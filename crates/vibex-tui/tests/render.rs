@@ -9074,7 +9074,10 @@ fn the_session_list_names_the_agent_and_when_it_last_spoke() {
     quiet.project_id = idle.project_id.clone();
     quiet.workspace_id = idle.workspace_id.clone();
     quiet.workspace_root = idle.workspace_root.clone();
-    quiet.last_message_at_ms = now - 40 * 60 * 1000;
+    // `now`, not an offset from it: the column reads a calendar date, so
+    // "forty minutes ago" is yesterday for the first forty minutes of the day,
+    // and the row would end in the word for that rather than in an hour.
+    quiet.last_message_at_ms = now;
 
     let mut app = app(110, 24);
     app.navigate_to(Page::Sessions);

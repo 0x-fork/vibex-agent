@@ -9980,7 +9980,11 @@ mod tests {
         let strings = Strings::for_locale(Locale::En);
         let now = vibex_core::unix_timestamp_ms();
         const DAY: i64 = 24 * 60 * 60 * 1_000;
-        let today = relative_time_label(now - 90 * 60 * 1_000, now, strings);
+        // `now` itself rather than an offset from it: the label compares
+        // calendar dates, so "ninety minutes ago" is yesterday for the first
+        // hour and a half of the day, and the assertions below would fail at
+        // midnight rather than on a defect.
+        let today = relative_time_label(now, now, strings);
         assert_eq!(today.len(), 5, "today is not a wall clock: {today:?}");
         assert_eq!(&today[2..3], ":", "today is not a wall clock: {today:?}");
         assert_eq!(
