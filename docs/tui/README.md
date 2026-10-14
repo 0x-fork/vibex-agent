@@ -693,8 +693,8 @@ option. Elicitation forms are filled field by field and submitted with `s`.
 
 ### Management
 
-Agents, Providers, MCP servers, Skills and Prompts. Devices have a page of
-their own, below.
+Agents, Providers, MCP servers, Skills and Prompts. Pairing and devices have a
+page of their own, below.
 Every row shows its availability: an operation the authority does not offer, or
 that this device's grant does not permit, is visible and explains itself rather
 than disappearing.
@@ -702,7 +702,7 @@ than disappearing.
 Stored credentials are never displayed. Setting one opens a masked field that
 explains the value is sent to the runtime and cleared locally.
 
-### Devices
+### Pairing and devices
 
 Pairing a device and checking what is already paired are one job, so they share
 one page with two halves and a tab strip: `←`/`→`, or a click, moves between

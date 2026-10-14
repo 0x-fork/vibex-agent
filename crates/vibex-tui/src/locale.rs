@@ -699,7 +699,7 @@ strings! {
     management_mcp => { "MCP servers", "MCP 服务", "MCP 服務" },
     management_skills => { "Skills", "技能", "技能" },
     management_prompts => { "Prompts", "提示词", "提示詞" },
-    management_devices => { "Devices", "设备", "裝置" },
+    management_devices => { "Pairing and devices", "配对与设备", "配對與裝置" },
     management_scheduled => { "Scheduled tasks", "定时任务", "定時任務" },
     management_automation => { "Automation", "自动化", "自動化" },
     management_health => { "Provider health", "Provider 健康", "Provider 健康" },
@@ -1554,7 +1554,7 @@ strings! {
         "重新发现可用的 Agent",
         "重新探索可用的 Agent"
     },
-    palette_cmd_devices => { "Devices", "设备", "裝置" },
+    palette_cmd_devices => { "Pairing and devices", "配对与设备", "配對與裝置" },
     palette_hint_devices => {
         "Pair a phone or a second desktop, and manage the devices already paired",
         "配对手机或第二台桌面端，并管理已配对的设备",

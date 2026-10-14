@@ -199,7 +199,7 @@ intents! {
     ConfigEntryCreate => { scope: Management, id: "config_entry_create", label: "New", help: "Create a record in this area." },
     ConfigEntryDelete => { scope: Management, id: "config_entry_delete", label: "Delete", help: "Delete the highlighted record." },
     ConfigFormSave => { scope: Overlay, id: "config_form_save", label: "Save", help: "Write the form to the runtime." },
-    GotoDevices => { scope: Global, id: "goto_devices", label: "Devices", help: "Paired devices, pairing codes and the audit log." },
+    GotoDevices => { scope: Global, id: "goto_devices", label: "Pairing and devices", help: "Paired devices, pairing codes and the audit log." },
 
     // ---- providers ------------------------------------------------------
 

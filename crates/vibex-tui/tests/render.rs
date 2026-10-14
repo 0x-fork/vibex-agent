@@ -3748,7 +3748,7 @@ fn the_palette_files_its_sections_in_reading_order() {
         .collect::<Vec<_>>();
     assert_eq!(
         pairing,
-        vec!["设备"],
+        vec!["配对与设备"],
         "the pairing section is not the device page: {pairing:?}"
     );
 }

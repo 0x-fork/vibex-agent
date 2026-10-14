@@ -342,7 +342,7 @@ fn the_documentation_exists_for_every_page() {
         "Sessions",
         "Agent",
         "Management",
-        "Devices",
+        "Pairing and devices",
         "Settings",
         "Help",
     ] {
