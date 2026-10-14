@@ -1434,6 +1434,51 @@ fn a_single_turn_draws_one_tick() {
     assert_eq!(ticks, 1, "a single turn is not one tick:\n{}", text(&lines));
 }
 
+#[test]
+fn the_turn_rail_does_not_outlive_the_session_it_maps() {
+    // The composing page draws the new session's welcome in the transcript's
+    // own band, and the session the reader left stays *selected* behind it so
+    // leaving can return there. Its rail is a map of a conversation that is not
+    // on screen: left standing, it put the previous session's turns — and their
+    // click targets — in the corner of a page that has no turns yet.
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.transcript.set_blocks(vec![
+        opened("a", "turn-1"),
+        block("b", "turn-1"),
+        opened("c", "turn-2"),
+    ]);
+    let ticks = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|line| line.trim_end().ends_with('•') || line.trim_end().ends_with('▪'))
+            .count()
+    };
+    let lines = render(&mut app, 120, 40);
+    assert!(
+        ticks(&lines) >= 2,
+        "the session page drew no rail to leave with:\n{}",
+        text(&lines)
+    );
+    assert!(
+        !app.regions.turns.is_empty(),
+        "the rail published no ticks to leave with"
+    );
+
+    app.navigate_to(Page::NewSession);
+    let lines = render(&mut app, 120, 40);
+    assert_eq!(
+        ticks(&lines),
+        0,
+        "the old session's rail outlived it:\n{}",
+        text(&lines)
+    );
+    assert!(
+        app.regions.turns.is_empty(),
+        "the old session's ticks were still clickable on the composing page"
+    );
+}
+
 fn block(id: &str, turn: &str) -> vibex_tui::transcript::Block {
     vibex_tui::transcript::Block {
         id: id.to_string(),

@@ -528,7 +528,11 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     // The rail maps the transcript, so it belongs to the pages that show one.
-    if Bands::is_visible(bands.gutter) && app.page.is_session_page() {
+    // A page writing a new session draws its own welcome in the same band, and
+    // the session the reader left is still selected behind it: its rail is a
+    // map of a conversation that is not on screen, so it leaves with it rather
+    // than standing in the corner of a page that has no turns yet.
+    if Bands::is_visible(bands.gutter) && app.page_shows_transcript() {
         render_gutter(frame, bands.gutter, app, &theme);
     }
     // Cleared like the dock: opening the dock folds this band away, and a stale
@@ -595,14 +599,18 @@ fn composer_preview_area(area: Rect, bands: &Bands) -> Rect {
 
 /// What the frame wants on screen, given the current state.
 fn band_request(app: &App) -> crate::layout::BandRequest {
-    // Everything from the turn line down belongs to the session view. On the
-    // session list the active session's plan and turn state are not what the
-    // reader is looking at, and printing them above the list is how a global
-    // page ends up wearing another page's chrome. The page where a session is
-    // being written is the same case from the other side: it is a page with a
-    // composer, not a session, so the session behind it — which the reader is
-    // leaving — must not put its turn, plan or held queue on it.
-    let session_view = app.page.is_session_page() && app.page_owns_session();
+    // Everything from the turn line down belongs to the session view, and the
+    // rule for what that is lives with the page ([`App::page_shows_transcript`])
+    // rather than here: the rail down the right edge reads the same answer, and
+    // two copies of it are how the composing page ended up wearing the session
+    // behind it. On the session list the active session's plan and turn state
+    // are not what the reader is looking at, and printing them above the list
+    // is how a global page ends up wearing another page's chrome. The page
+    // where a session is being written is the same case from the other side: it
+    // is a page with a composer, not a session, so the session behind it —
+    // which the reader is leaving — must not put its turn, plan or held queue
+    // on it.
+    let session_view = app.page_shows_transcript();
     // A send the runtime has not answered yet counts as running: the reader
     // pressed Enter, and the round trip must not read as "idle, message lost".
     let running = app.turn_reads_running();

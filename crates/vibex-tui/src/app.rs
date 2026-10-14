@@ -1765,6 +1765,20 @@ impl App {
         }
     }
 
+    /// Whether the page in front of the reader draws a session's own view.
+    ///
+    /// Only a session's own page shows the transcript, so this is the one
+    /// question every piece of chrome that *maps* or *reports* that transcript
+    /// asks before drawing: the turn line above the composer, the rail of turns
+    /// down the right edge, the plan and the held queue. The composing page is
+    /// the case it exists for — it is a page with a composer rather than a
+    /// session, and the session behind it stays selected only so leaving can
+    /// return there, so none of that chrome may outlive the page it belongs to
+    /// and stand over a conversation that is not on screen.
+    pub fn page_shows_transcript(&self) -> bool {
+        self.page_owns_session() && self.page.is_session_page()
+    }
+
     /// Whether the page in front of the reader is *showing* a session.
     ///
     /// This is what a runtime choice moves, and what a run option tunes: the
@@ -1776,9 +1790,7 @@ impl App {
     /// showing no session has nothing to move, so the choice is the *next*
     /// session's, and a session's own page moves only itself.
     pub fn page_shows_session(&self) -> bool {
-        self.page_owns_session()
-            && self.page.is_session_page()
-            && self.selected_session_id().is_some()
+        self.page_shows_transcript() && self.selected_session_id().is_some()
     }
 
     /// Open the session view for a session that does not exist yet.
