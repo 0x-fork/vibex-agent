@@ -3188,7 +3188,16 @@ impl App {
             self.toast(Toast::info(message));
             return Outcome::effects(vec![]);
         }
-        if self.is_turn_running() {
+        // A turn can only be stopped through the connection. While it is down
+        // the state on screen is the last one the runtime reported, and a
+        // session that was running when the link dropped still reads as
+        // running — so the interrupt would be dispatched into a dead seat,
+        // never change anything, and spend every future press the same way.
+        // `Ctrl+C` would then have nothing it could ever do, and the reader
+        // would have no way out of a client whose connection is already gone.
+        // The press falls through to the quit question instead, which is the
+        // one thing left that a disconnected client can still carry out.
+        if self.live.is_live() && self.is_turn_running() {
             let Some(session_id) = self.selected_session_id().cloned() else {
                 return Outcome::quiet();
             };
@@ -3212,13 +3221,21 @@ impl App {
         Outcome::effects(vec![])
     }
 
+    /// Whether the page in front of the reader has a turn `Ctrl+C` can stop.
+    ///
+    /// The composing page has no session of its own, so it never does: a turn
+    /// the session behind it is running belongs to that session's own page, and
+    /// a reader who is writing a new one is not asking to stop something the
+    /// page is not showing. Reading the session behind the page here is what
+    /// left the composing page unable to leave while that session was running.
     fn is_turn_running(&self) -> bool {
-        self.active_session().is_some_and(|session| {
-            matches!(
-                session.state,
-                AgentSessionState::Running | AgentSessionState::NeedsInput
-            )
-        })
+        self.page_owns_session()
+            && self.active_session().is_some_and(|session| {
+                matches!(
+                    session.state,
+                    AgentSessionState::Running | AgentSessionState::NeedsInput
+                )
+            })
     }
 
     fn session_can_continue(&self) -> bool {
@@ -5747,6 +5764,27 @@ mod tests {
         }
     }
 
+    /// An app on `page`, over a session in `state`, with the connection in
+    /// `live`.
+    ///
+    /// The session stays the open one even on the composing page, which is the
+    /// state that page is in after a reader steps out of a session to write a
+    /// new one: the page shows no session, and the open one is still there.
+    fn app_over_session(
+        page: Page,
+        state: vibex_core::AgentSessionState,
+        live: crate::app::LiveState,
+    ) -> App {
+        let mut app = capable_app();
+        let mut session = openable_session("session_quit0001");
+        session.state = state;
+        app.agent.state.selected_session_id = Some(session.id.clone());
+        app.agent.state.active_session.resolve(session);
+        app.navigate_to(page);
+        app.live = live;
+        app
+    }
+
     /// Put the open session on a selection, as the runtime reports it.
     fn session_on(app: &mut App, desired: vibex_core::SessionRuntimeSelection) {
         app.live = crate::app::LiveState::Ready;
@@ -6921,6 +6959,78 @@ mod tests {
                 .and_then(|selection| selection.reasoning_effort.as_deref()),
             Some("high")
         );
+    }
+
+    #[test]
+    fn a_running_turn_is_still_interrupted_by_a_live_client() {
+        // The rule the disconnected case bends for: with the connection up,
+        // `Ctrl+C` on the session's own page stops the turn the reader is
+        // watching rather than asking them to leave.
+        let mut app = app_over_session(
+            Page::Agent,
+            AgentSessionState::Running,
+            crate::app::LiveState::Ready,
+        );
+        let outcome = app.perform(Intent::ContextualCancel);
+        assert!(
+            matches!(outcome.effects.as_slice(), [Effect::Interrupt { .. }]),
+            "a live client did not interrupt the turn it is showing: {outcome:?}"
+        );
+        assert!(
+            !app.should_quit,
+            "the interrupt was taken for an instruction"
+        );
+        assert!(!app.quit_armed(), "stopping a turn asked about leaving");
+    }
+
+    #[test]
+    fn a_disconnected_client_can_still_be_left() {
+        // The turn on screen is the last thing the runtime reported, not
+        // something this client can still stop: over a dead link the interrupt
+        // changes nothing. Spending the press on it would leave `Ctrl+C` with
+        // nothing it could ever do — the reader would be trapped in a client
+        // whose connection is already gone, which is the one moment they most
+        // need to leave it.
+        for state in [AgentSessionState::Running, AgentSessionState::NeedsInput] {
+            let mut app = app_over_session(Page::Agent, state, crate::app::LiveState::Offline);
+            let first = app.perform(Intent::ContextualCancel);
+            assert!(
+                first.effects.is_empty(),
+                "an interrupt was dispatched over a dead connection: {first:?}"
+            );
+            assert!(!app.should_quit, "one press was taken for an instruction");
+            assert!(
+                app.quit_armed(),
+                "the disconnected page did not ask anything for a {state:?} session"
+            );
+            app.perform(Intent::ContextualCancel);
+            assert!(
+                app.should_quit,
+                "the second press did not leave a disconnected client"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_c_on_the_composing_page_asks_to_leave_rather_than_interrupting() {
+        // The session behind the page keeps its turn: the composing page has no
+        // turn of its own, so a press there is not an instruction to stop
+        // something the page is not showing. Reading the session behind it made
+        // the page unable to leave while that session was running.
+        let mut app = app_over_session(
+            Page::NewSession,
+            AgentSessionState::Running,
+            crate::app::LiveState::Ready,
+        );
+        let first = app.perform(Intent::ContextualCancel);
+        assert!(
+            first.effects.is_empty(),
+            "the composing page interrupted a turn it does not show: {first:?}"
+        );
+        assert!(!app.should_quit, "one press was taken for an instruction");
+        assert!(app.quit_armed(), "the page did not ask anything");
+        app.perform(Intent::ContextualCancel);
+        assert!(app.should_quit, "the second press did not leave");
     }
 
     #[test]
