@@ -40,6 +40,19 @@ fn app(columns: u16, rows: u16) -> App {
     app
 }
 
+/// The spinner frame drawn on the line that says `text`, if it wears one.
+///
+/// Found by the words rather than by the row's number: the table's rows move
+/// with the module and the filter, and what the test is about is the mark that
+/// stands beside the sentence a write put there.
+fn spinner_before(screen: &str, text: &str) -> Option<&'static str> {
+    let line = screen.lines().find(|line| line.contains(text))?;
+    vibex_tui::glyphs::spinner_frames(vibex_tui::glyphs::GlyphTier::Full)
+        .iter()
+        .copied()
+        .find(|frame| line.contains(frame))
+}
+
 /// Draw one frame and return the text a reader would see.
 fn text(app: &mut App, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
@@ -728,6 +741,69 @@ fn every_agent_verb_says_what_it_is_doing_on_the_row_it_was_pressed_on() {
             "{action:?} left the row looking idle while it worked:\n{screen}"
         );
     }
+}
+
+#[test]
+fn a_write_in_flight_keeps_the_marker_turning_until_it_answers() {
+    // The working row replaces its status mark with a spinner, and that spinner
+    // is drawn from the animation phase. A clock that stopped under the write
+    // left the marker standing on one frame for the whole round trip, which is
+    // the one thing a write marker must not do: it is there to say the press
+    // landed.
+    let mut app = loaded(140, 40);
+    assert!(
+        !app.chrome_animating(),
+        "the idle centre is asking for frames"
+    );
+
+    app.run_config_action_by_key("codex", ConfigAction::CheckUpdate);
+    let verb = app
+        .config_center
+        .pending
+        .get("codex")
+        .expect("the row is waiting")
+        .verb;
+    let working = verb.running(app.strings);
+
+    let mut drawn = Vec::new();
+    for _ in 0..4 {
+        let screen = text(&mut app, 140, 40);
+        drawn.push(
+            spinner_before(&screen, working)
+                .unwrap_or_else(|| panic!("the row says it works with nothing turning:\n{screen}"))
+                .to_string(),
+        );
+        assert!(
+            app.chrome_animating(),
+            "the centre stopped asking for frames under a write"
+        );
+        // Each frame is held for a few ticks, so a frame that moved is a clock
+        // that ran rather than one the renderer happened to sample late.
+        for _ in 0..vibex_tui::glyphs::SPINNER_TICKS_PER_FRAME {
+            assert!(
+                app.advance_transcript_animation(),
+                "the clock stopped under a write"
+            );
+        }
+    }
+    assert!(
+        drawn.iter().any(|frame| *frame != drawn[0]),
+        "the marker never moved: {drawn:?}"
+    );
+
+    // The answer releases the clock with the marker: an answered record is a
+    // quiet page again.
+    app.config_center.finish_pending("codex");
+    let screen = text(&mut app, 140, 40);
+    assert!(
+        spinner_before(&screen, working).is_none(),
+        "the row kept turning after its answer:\n{screen}"
+    );
+    assert!(
+        !app.chrome_animating(),
+        "the answered centre keeps asking for frames"
+    );
+    assert!(!app.advance_transcript_animation());
 }
 
 #[test]

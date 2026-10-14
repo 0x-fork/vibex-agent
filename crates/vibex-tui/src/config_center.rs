@@ -841,6 +841,18 @@ impl ConfigCenter {
         self.pending.contains_key(key)
     }
 
+    /// Whether any write the reader asked for is still in flight.
+    ///
+    /// A record being saved and a form being submitted are one fact to the
+    /// clock: each draws a spinner where it was started, and that spinner's
+    /// frame comes from the animation phase, so the clock has to keep stepping
+    /// while one stands there. A frame held still for the length of a round trip
+    /// reads as a press the client dropped, which is the one thing a write
+    /// marker exists to deny.
+    pub fn writes_in_flight(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// Note a write in flight. Answers false when the record already has one,
     /// which is what keeps a held key from queueing the same call twice.
     pub fn begin_pending(

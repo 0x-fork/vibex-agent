@@ -263,6 +263,18 @@ impl Pairing {
         })
     }
 
+    /// Whether a request the reader made is still on its way.
+    ///
+    /// The open row draws a spinner for as long as this is true, and that
+    /// spinner's frame comes from the animation phase: the clock has to keep
+    /// stepping while the answer is out, or the row stands on one frame and the
+    /// reader concludes the press went nowhere. The state is set only while a
+    /// request is in flight and cleared by the answer — or by the panel closing,
+    /// which is what keeps the clock from running for a surface nobody has open.
+    pub fn is_busy(&self) -> bool {
+        self.busy.is_some()
+    }
+
     /// How many requests are waiting, including the one [`Self::pending`] names.
     pub fn waiting(&self) -> usize {
         self.window

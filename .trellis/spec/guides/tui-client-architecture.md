@@ -404,6 +404,18 @@ Measured contract: with no input and no events the loop produces **zero frames**
 Folding happens *before* wrapping, so a collapsed block never pays for the lines
 it will not show.
 
+**A spinner's clock is the page's, not the turn's.** `App::chrome_animating` and
+`App::is_animating` answer for every mark drawn from `animation_phase` that is on
+screen: the session list's running rows, a record being saved in the
+configuration centre and the request row on the devices page, and the dock's own
+rows for the work a finished turn left behind. Each is asked of the state its
+surface draws from — the ring's states are one definition the row and the clock
+share — so a mark cannot stand on one frame under a clock that thinks it has
+nothing to draw, which is the one reading a spinner must never give. Each is
+false when its surface is not the page in front of the reader: that is what keeps
+the zero frames above honest rather than a client that repaints for a panel
+nobody has open.
+
 **A literal is coloured by what it is, not by the fact that it is code.** One
 colour for every code span is what makes a technical paragraph read as a single
 grey block: `cargo run -p vibex-tui`, `crates/vibex-tui/src/view.rs` and

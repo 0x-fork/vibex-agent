@@ -86,6 +86,24 @@ impl Page {
     pub const fn is_composing_page(self) -> bool {
         matches!(self, Page::Agent | Page::NewSession)
     }
+
+    /// Whether the page is one of the configuration centre's modules.
+    ///
+    /// The centre is one surface with six routes onto it, and its writes are
+    /// the same write whichever route the reader took: the page that draws a
+    /// record's spinner is every one of them. The list is the same one
+    /// [`Self::scope`] folds into `Scope::Management`.
+    pub const fn is_configuration_centre(self) -> bool {
+        matches!(
+            self,
+            Page::Management
+                | Page::Providers
+                | Page::Agents
+                | Page::Mcp
+                | Page::Skills
+                | Page::Prompts
+        )
+    }
 }
 
 /// How many pages the walk back remembers.
@@ -4759,11 +4777,59 @@ impl App {
                 })
     }
 
+    /// Whether the page in front of the reader is waiting on a request of its
+    /// own.
+    ///
+    /// Not every spinner belongs to a turn. Saving a record in the configuration
+    /// centre and asking for a pairing offer are the client's own round trips,
+    /// and each draws a spinner where the press was made — the record's status
+    /// mark and its action bar, the pairing row's own line — for as long as the
+    /// answer is out. A frame that stood on one frame for the whole round trip
+    /// reads as a press the client dropped, which is exactly what a spinner is
+    /// there to deny.
+    ///
+    /// Both are asked of the surface that draws them, and both states are
+    /// cleared by their own answers — the pairing request by the panel closing
+    /// as well — so the clock is never left running for a page nobody has open.
+    /// The write form is not one of these: it says a write is on its way in
+    /// words with nothing turning beside them.
+    fn page_has_a_request_in_flight(&self) -> bool {
+        (self.page.is_configuration_centre() && self.config_center.writes_in_flight())
+            || (self.page == Page::Devices && self.device_center.pairing.is_busy())
+    }
+
+    /// Whether the dock the reader has open is drawing a mark that turns.
+    ///
+    /// The panel outlives the turn that filled it: a plan step the Agent left
+    /// running, or a delegation it never closed, is still drawn as a spinner
+    /// after the turn is over — and a spinner standing on one frame is the one
+    /// thing a panel of work in flight must never do. The rows themselves are
+    /// asked rather than their sources, so the clock and the panel cannot
+    /// disagree about which of them is spinning: the fold, the filter over
+    /// finished work and the newest row per delegation are the panel's own
+    /// reading, and a second copy of it would be a second answer. The walk costs
+    /// what the panel costs, and only while the panel is open.
+    fn dock_turns_a_mark(&self) -> bool {
+        if !self.dock_open || !self.page_shows_transcript() {
+            return false;
+        }
+        self.dock_rows().iter().any(|row| match row {
+            DockRow::Agent { status, .. } => matches!(
+                status,
+                vibex_core::ToolCallStatus::Started | vibex_core::ToolCallStatus::Progress
+            ),
+            DockRow::Plan { status, .. } => *status == vibex_core::PlanStepStatus::Running,
+            _ => false,
+        })
+    }
+
     /// Whether anything on screen is moving without the reader's input.
     ///
     /// The landing mark's light crosses the page; a turn's spinner turns. A page
     /// of sessions turns the ring on every row whose session is still working,
-    /// whether or not that session is the one the page has open. Everything else
+    /// whether or not that session is the one the page has open; a page waiting
+    /// on a request of its own turns the spinner where it was started; and the
+    /// dock turns one for the work a finished turn left behind. Everything else
     /// holds still, which is what keeps an idle session — and the prompt the
     /// client opens on, between passes — at zero frames.
     pub fn chrome_animating(&self) -> bool {
@@ -4771,6 +4837,8 @@ impl App {
             || self.landing_mark_moves()
             || self.transitions.running(self.animation_phase)
             || self.session_list_turns_a_ring()
+            || self.page_has_a_request_in_flight()
+            || self.dock_turns_a_mark()
     }
 
     /// Step the running indicator. Returns whether a repaint is due.
@@ -4878,6 +4946,8 @@ impl App {
             || self.mark_animates()
             || self.transitions.running(self.animation_phase)
             || self.session_list_turns_a_ring()
+            || self.page_has_a_request_in_flight()
+            || self.dock_turns_a_mark()
     }
 
     /// The approvals the page in front of the reader is waiting on.

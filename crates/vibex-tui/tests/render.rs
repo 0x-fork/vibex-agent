@@ -202,6 +202,19 @@ fn running_frames() -> Vec<&'static str> {
         .collect()
 }
 
+/// The spinner frame drawn on the line that says `text`, if it wears one.
+///
+/// Found by the words rather than by the row's number: what these tests are
+/// about is the mark that stands beside a sentence, and where the sentence lands
+/// depends on the page's own arrangement.
+fn spinner_before(screen: &str, text: &str) -> Option<&'static str> {
+    let line = screen.lines().find(|line| line.contains(text))?;
+    vibex_tui::glyphs::spinner_frames(vibex_tui::glyphs::GlyphTier::Full)
+        .iter()
+        .copied()
+        .find(|frame| line.contains(frame))
+}
+
 #[test]
 fn every_supported_size_produces_a_full_frame() {
     // The matrix from the design report: the layout must degrade, not break.
@@ -2639,6 +2652,71 @@ fn the_dock_lists_the_plan_and_the_held_queue() {
 }
 
 #[test]
+fn a_plan_step_left_running_turns_the_dock_marker_after_the_turn() {
+    // The dock outlives the turn that filled it. A step the Agent marked running
+    // is still drawn as a spinner once the turn is over, and that spinner's
+    // frame comes from the animation phase: a clock that stopped for the turn
+    // left the panel standing on one frame, which says the work stopped — the
+    // one thing a panel of work in flight must never say.
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    let session = seeded_session("session_dockspin01", "the dock's own clock");
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(session.id.clone());
+    app.agent.state.active_session.resolve(session.clone());
+    seed_plan(&mut app, &session.id);
+    // The session is idle: the plan step is the only thing on the page that
+    // could move, and the clock is quiet until the panel that draws it is open.
+    assert!(!app.turn_reads_running(), "the turn is still running");
+    assert!(
+        !app.chrome_animating(),
+        "the closed dock is asking for frames"
+    );
+
+    app.perform(Intent::ToggleDock);
+    assert!(app.dock_open, "the dock did not open");
+    let mut drawn = Vec::new();
+    for _ in 0..4 {
+        let screen = text(&render(&mut app, 120, 40));
+        drawn.push(
+            spinner_before(&screen, "write the band")
+                .unwrap_or_else(|| panic!("the running step drew no spinner:\n{screen}"))
+                .to_string(),
+        );
+        assert!(
+            app.chrome_animating(),
+            "the dock stopped asking for frames under a running step"
+        );
+        // Each frame is held for a few ticks, so a frame that moved is a clock
+        // that ran rather than one the renderer happened to sample late.
+        for _ in 0..vibex_tui::glyphs::SPINNER_TICKS_PER_FRAME {
+            assert!(
+                app.advance_transcript_animation(),
+                "the clock stopped under a running plan step"
+            );
+        }
+    }
+    assert!(
+        drawn.iter().any(|frame| *frame != drawn[0]),
+        "the marker never moved: {drawn:?}"
+    );
+
+    // The panel's own state is the question: a dock nobody has open is not a
+    // reason to repaint, whatever its rows say.
+    app.perform(Intent::ToggleDock);
+    assert!(!app.dock_open, "the dock did not close");
+    let _ = text(&render(&mut app, 120, 40));
+    assert!(
+        !app.chrome_animating(),
+        "the closed dock keeps asking for frames"
+    );
+    assert!(!app.advance_transcript_animation());
+}
+
+#[test]
 fn the_dock_cursor_skips_headings_and_takes_a_held_message_back() {
     use vibex_tui::action::Intent;
     let mut app = app(120, 40);
@@ -2669,6 +2747,58 @@ fn the_dock_cursor_skips_headings_and_takes_a_held_message_back() {
     app.perform(Intent::DockActivate);
     assert_eq!(app.composer.text(), "fix the flake");
     assert!(app.queued_messages.is_empty(), "the message was not taken");
+}
+
+#[test]
+fn a_delegation_the_turn_left_open_turns_the_dock_marker() {
+    // The panel's other spinner, and the same clock: a child Agent the turn
+    // never closed is still work in flight to the reader, so its row has to keep
+    // turning whether or not a turn is running behind the page.
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    let session = seeded_session("session_dockagent01", "a delegation left open");
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(session.id.clone());
+    app.agent.state.active_session.resolve(session.clone());
+    app.agent.state.timeline.replace_authoritative(
+        session.id.clone(),
+        vec![seeded_item(
+            &session.id,
+            1,
+            vibex_core::TimelineItemKind::Collaboration,
+            vibex_core::TimelinePayload::Collaboration(vibex_core::CollaborationPayload {
+                action: "delegate".into(),
+                status: vibex_core::ToolCallStatus::Progress,
+                summary: "Review the parser".into(),
+                agent_label: Some("Reviewer".into()),
+                delegation_id: Some(vibex_core::AgentDelegationId::new()),
+                child_session_id: Some(session.id.clone()),
+                raw_extension: None,
+            }),
+        )],
+    );
+    app.sync_transcript();
+    assert!(!app.turn_reads_running(), "the turn is still running");
+    assert!(
+        !app.chrome_animating(),
+        "the closed dock is asking for frames"
+    );
+
+    app.perform(Intent::ToggleDock);
+    assert!(app.dock_open, "the dock did not open");
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        spinner_before(&screen, "Reviewer").is_some(),
+        "the delegation drew no spinner:\n{screen}"
+    );
+    assert!(
+        app.chrome_animating(),
+        "the dock stopped asking for frames under a delegation"
+    );
+    assert!(app.advance_transcript_animation());
 }
 
 #[test]
@@ -4755,6 +4885,67 @@ fn a_terminal_with_pixels_is_handed_the_code_as_a_picture() {
         "a small terminal with pixels did not say why there is no code:\n{screen}"
     );
     assert!(!small.pairing_qr.is_holding(), "{screen}");
+}
+
+/// A request in flight turns the row's spinner, and the clock that steps it has
+/// to answer for the page rather than for a turn.
+#[test]
+fn a_pairing_request_turns_the_row_marker_until_it_answers() {
+    // The open row says a request is on its way with a spinner drawn from the
+    // animation phase. A clock that stopped left it standing on one frame for
+    // the whole round trip, so a press a moment old reads as one the client
+    // never took.
+    use vibex_tui::action::Intent;
+    use vibex_tui::device_center::PairMethod;
+    let mut app = device_app(120, 40, vibex_core::RemoteServerKind::Desktop);
+    app.perform(Intent::GotoDevices);
+    app.device_center.toggle(PairMethod::QrCode);
+    assert!(
+        !app.chrome_animating(),
+        "the idle pairing page is asking for frames"
+    );
+
+    app.device_center.pairing.busy = Some(PairMethod::QrCode);
+    let working = app.strings.devices_pair_working();
+    let mut drawn = Vec::new();
+    for _ in 0..4 {
+        let screen = text(&render(&mut app, 120, 40));
+        drawn.push(
+            spinner_before(&screen, working)
+                .unwrap_or_else(|| panic!("the row waits with nothing turning:\n{screen}"))
+                .to_string(),
+        );
+        assert!(
+            app.chrome_animating(),
+            "the page stopped asking for frames under a request"
+        );
+        // Each frame is held for a few ticks, so a frame that moved is a clock
+        // that ran rather than one the renderer happened to sample late.
+        for _ in 0..vibex_tui::glyphs::SPINNER_TICKS_PER_FRAME {
+            assert!(
+                app.advance_transcript_animation(),
+                "the clock stopped under a request"
+            );
+        }
+    }
+    assert!(
+        drawn.iter().any(|frame| *frame != drawn[0]),
+        "the marker never moved: {drawn:?}"
+    );
+
+    // The answer releases the clock with the marker, and so does closing the
+    // panel: nothing turns for a row that is no longer there.
+    app.device_center.pairing.busy = None;
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        spinner_before(&screen, working).is_none(),
+        "the row kept turning after its answer:\n{screen}"
+    );
+    assert!(
+        !app.chrome_animating(),
+        "the answered page keeps asking for frames"
+    );
+    assert!(!app.advance_transcript_animation());
 }
 
 /// A failed offer is reported on the row that asked for it, in the reader's
