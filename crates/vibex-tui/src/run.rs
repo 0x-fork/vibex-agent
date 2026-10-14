@@ -4044,11 +4044,11 @@ mod tests {
             line(echo_row)
         );
         // The echo opens in the column the title's own text took, which is what
-        // drawing the rail after the indent buys: four columns on from the mark
-        // for the rail, its gap, the state mark and its gap.
+        // drawing the rail after the indent buys: the row's whole lead on from
+        // the mark — the rail, its gap, the Agent's two-cell mark and its gap.
         assert_eq!(
             text_column(echo_row, mark),
-            Some(mark + 4),
+            Some(mark + crate::view::SESSION_ROW_LEAD as u16),
             "the echo does not open under its title:\n{}\n{}",
             line(title_row),
             line(echo_row)

@@ -1,9 +1,10 @@
-//! The Agent brand mark, drawn as a picture the terminal holds.
+//! The marks a row draws as a picture the terminal holds.
 //!
-//! A session row already names the Agent that answers for it, in the muted
-//! sentence beside its title. That name is what a reader scans to tell two
-//! similarly titled sessions apart, and a column of names is a column of words
-//! that have to be read. The mark is the same answer without the reading.
+//! Two things on a session list want a picture: the Agent that answers for a
+//! row, and the icons the row's buttons wear. Both are small, both are looked
+//! up by name, and both are drawn the same way — a PNG placed over the cells
+//! the row reserved — so one pool serves them rather than two that would
+//! duplicate the placement logic and compete for image ids.
 //!
 //! # Why a picture, and not a character
 //!
@@ -14,17 +15,19 @@
 //! to the cells it was given — a two-cell box on an ordinary terminal is a
 //! 16-by-16 icon, not a smear.
 //!
-//! So the mark is drawn when the terminal speaks an image protocol, and when it
-//! does not, the row keeps the Agent's name, which is always known. There is no
+//! So a mark is drawn when the terminal speaks an image protocol, and when it
+//! does not, the caller draws the character the same vocabulary carries
+//! ([`crate::sidebar_icons::Icon::glyph`], or the Agent's name). There is no
 //! half-block approximation in between: a mark that resolved to four pixels
 //! would be a worse answer than the word it replaced.
 //!
 //! # Why the marks themselves live elsewhere
 //!
-//! The identity table and the mark bytes are [`vibex_brands`], shared with the
-//! desktop and the phone. This module is only the terminal's half: which marks
-//! are on screen this frame, where, and the escapes the run loop has to write
-//! after the frame. Nothing here decides what an Agent's mark is.
+//! An Agent's identity table and mark bytes are [`vibex_brands`], shared with
+//! the desktop and the phone. The chrome icons are the desktop asset pack, named
+//! by [`crate::sidebar_icons`]. This module is only the terminal's half: which
+//! marks are on screen this frame, where, and the escapes the run loop has to
+//! write after the frame. Nothing here decides what a mark is.
 //!
 //! # The pool
 //!
@@ -47,6 +50,7 @@ use std::sync::Arc;
 use ratatui::layout::Rect;
 
 use crate::preview::PlacedPicture;
+use crate::sidebar_icons::Icon;
 use crate::terminal_image::ImageSupport;
 
 /// How many cells wide one mark is.
@@ -54,9 +58,9 @@ use crate::terminal_image::ImageSupport;
 /// Two cells is the narrowest box that is still square-ish under the cell
 /// aspect the rest of this client assumes, and one row tall: a mark that covered
 /// the echo line under it would be answering a question the row is not asking.
-pub const AGENT_LOGO_COLS: u16 = 2;
+pub const MARK_COLS: u16 = 2;
 /// How many cell rows one mark covers.
-pub const AGENT_LOGO_ROWS: u16 = 1;
+pub const MARK_ROWS: u16 = 1;
 
 /// The pixel edge a mark is rastered at before the terminal scales it.
 ///
@@ -74,19 +78,57 @@ const FIRST_IMAGE_ID: u32 = 100;
 
 /// How many distinct marks are kept rastered.
 ///
-/// The raster is the expensive half and it depends only on the identity and the
+/// The raster is the expensive half and it depends only on the mark and the
 /// colour, so it outlives the slot that used it. A reader scrolling a list of
 /// Agents re-uses a handful; a bound keeps a long session from holding every
 /// mark it ever saw.
 const MAX_CACHED: usize = 64;
+
+/// What a row wants drawn in a picture slot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Mark {
+    /// An Agent's brand mark, by the identity string [`vibex_brands`] matches.
+    Agent(String),
+    /// One of the session list's own icons.
+    Chrome(Icon),
+}
+
+impl Mark {
+    /// The label the terminal's picture is cached and compared under.
+    ///
+    /// The two families are prefixed apart rather than merged: an Agent whose
+    /// id happened to spell an icon's key would otherwise share its picture.
+    fn label(&self) -> String {
+        match self {
+            Self::Agent(identity) => format!("agent:{identity}"),
+            Self::Chrome(icon) => format!("chrome:{}", icon.key()),
+        }
+    }
+
+    /// The bytes the terminal is handed, or `None` when this mark cannot be
+    /// drawn at all — the caller keeps its own fallback rather than a blank.
+    fn png(&self, color: Option<u32>) -> Option<Vec<u8>> {
+        match self {
+            Self::Agent(identity) => {
+                let mark = vibex_brands::agent_mark(identity)?;
+                vibex_brands::mark_png(mark, MARK_PIXELS, color)
+            }
+            Self::Chrome(icon) => {
+                let svg = std::str::from_utf8(icon.svg()).ok()?;
+                let svg = vibex_brands::themed_svg(svg, color)?;
+                vibex_brands::svg_png(&svg, MARK_PIXELS)
+            }
+        }
+    }
+}
 
 /// One placement the terminal is holding.
 #[derive(Debug)]
 struct Slot {
     /// The mark under that id.
     picture: PlacedPicture,
-    /// The identity the picture is, and the colour it was drawn in: together
-    /// they are the mark a row is asking for.
+    /// The mark the picture is, and the colour it was drawn in: together they
+    /// are what a row is asking for.
     label: String,
     color: Option<u32>,
     /// Whether this frame asked for the slot.
@@ -116,18 +158,18 @@ impl Slot {
 
 /// The marks the terminal is holding for the frame being drawn.
 ///
-/// Frame-shaped: [`AgentLogos::begin_frame`] starts one, each row that wants a
-/// mark calls [`AgentLogos::show`], and [`AgentLogos::settle`] takes down every
-/// mark no row asked for — including all of them on a terminal that cannot hold
-/// a picture, and on every frame of a page that has no rows.
+/// Frame-shaped: [`RowMarks::begin_frame`] starts one, each row that wants a
+/// mark calls [`RowMarks::show`], and [`RowMarks::settle`] takes down every mark
+/// no row asked for — including all of them on a terminal that cannot hold a
+/// picture, and on every frame of a page that has no rows.
 #[derive(Debug, Default)]
-pub struct AgentLogos {
+pub struct RowMarks {
     slots: Vec<Slot>,
-    /// Marks already rastered, by identity and colour, oldest first.
+    /// Marks already rastered, by label and colour, oldest first.
     cache: Vec<(String, Option<u32>, Arc<Vec<u8>>)>,
 }
 
-impl AgentLogos {
+impl RowMarks {
     /// Begin a frame: no row has asked for a mark yet.
     pub fn begin_frame(&mut self) {
         for slot in &mut self.slots {
@@ -135,51 +177,51 @@ impl AgentLogos {
         }
     }
 
-    /// Put `identity`'s mark in `rect`.
+    /// Put `mark` in `rect`.
     ///
-    /// `color` is the packed sRGB a themed mark is drawn in; a colored mark
-    /// ignores it. Returns whether a mark was placed: `false` when the Agent has
-    /// no mark, when the terminal cannot hold a picture, or when the pool is
-    /// full — the caller draws the Agent's name instead, which is not a degraded
-    /// answer but the other one.
+    /// `color` is the packed sRGB a themed mark is drawn in; a mark that
+    /// carries its own colours ignores it. Returns whether a mark was placed:
+    /// `false` when the mark has no picture, when the terminal cannot hold one,
+    /// or when the pool is full — the caller draws the character instead, which
+    /// is not a degraded answer but the other one.
     pub fn show(
         &mut self,
         support: &ImageSupport,
-        identity: &str,
+        mark: &Mark,
         color: Option<u32>,
         rect: Rect,
     ) -> bool {
         if !support.supports_pixels() || rect.width == 0 || rect.height == 0 {
             return false;
         }
-        if vibex_brands::agent_mark(identity).is_none() {
-            return false;
-        }
+        let label = mark.label();
         // The same mark in the same rectangle is already on the terminal: the
         // frame asked for exactly what is there, so it sends nothing.
         if let Some(index) = self
             .slots
             .iter()
-            .position(|slot| slot.holds(identity, color, rect))
+            .position(|slot| slot.holds(&label, color, rect))
         {
             self.slots[index].wanted = true;
             return true;
         }
-        let Some(prepared) = self.cached(identity, color) else {
+        let Some(prepared) = self.cached(&label, mark, color) else {
             return false;
         };
         // A slot holding this mark somewhere else is a move, which is a few
-        // dozen bytes rather than the picture. A slot already asked for by
-        // another row this frame is never taken.
+        // dozen bytes rather than the picture — but only a slot no other row has
+        // asked for this frame. An id holds one rectangle, so a row that took a
+        // slot another row is already drawn in would leave that row blank: two
+        // rows showing one Agent take two slots, and the bytes behind them are
+        // shared through the cache.
         if let Some(index) = self
             .slots
             .iter()
-            .position(|slot| slot.is(identity, color) && !slot.wanted)
-            .or_else(|| self.slots.iter().position(|slot| slot.is(identity, color)))
+            .position(|slot| slot.is(&label, color) && !slot.wanted)
         {
             let slot = &mut self.slots[index];
             slot.wanted = true;
-            slot.picture.place(support, identity, prepared, rect);
+            slot.picture.place(support, &label, prepared, rect);
             return true;
         }
         let Some(slot) = self.take_slot() else {
@@ -187,8 +229,8 @@ impl AgentLogos {
         };
         slot.wanted = true;
         slot.color = color;
-        slot.label = identity.to_string();
-        slot.picture.place(support, identity, prepared, rect);
+        slot.label = label.clone();
+        slot.picture.place(support, &label, prepared, rect);
         true
     }
 
@@ -234,23 +276,22 @@ impl AgentLogos {
             .map(|(index, _)| FIRST_IMAGE_ID + index as u32)
             .collect()
     }
+
     /// The rastered bytes for a mark, rastering and caching them on first use.
     ///
-    /// `None` when the Agent has no mark or the mark cannot be rastered, which
-    /// is the caller's signal to keep the name.
-    fn cached(&mut self, identity: &str, color: Option<u32>) -> Option<Arc<Vec<u8>>> {
+    /// `None` when the mark cannot be drawn, which is the caller's signal to
+    /// keep its character.
+    fn cached(&mut self, label: &str, mark: &Mark, color: Option<u32>) -> Option<Arc<Vec<u8>>> {
         if let Some((_, _, bytes)) = self
             .cache
             .iter()
-            .find(|(label, cached_color, _)| label == identity && *cached_color == color)
+            .find(|(cached_label, cached_color, _)| cached_label == label && *cached_color == color)
         {
             return Some(bytes.clone());
         }
-        let mark = vibex_brands::agent_mark(identity)?;
-        let png = vibex_brands::mark_png(mark, MARK_PIXELS, color)?;
+        let png = mark.png(color)?;
         let bytes = Arc::new(png);
-        self.cache
-            .push((identity.to_string(), color, bytes.clone()));
+        self.cache.push((label.to_string(), color, bytes.clone()));
         if self.cache.len() > MAX_CACHED {
             self.cache.remove(0);
         }
@@ -279,8 +320,12 @@ mod tests {
     const DEEPSEEK: &str = "deepseek-harness DeepSeek Harness";
     const CURSOR: &str = "cursor Cursor";
 
+    fn agent(identity: &str) -> Mark {
+        Mark::Agent(identity.to_string())
+    }
+
     fn rect(x: u16, y: u16) -> Rect {
-        Rect::new(x, y, AGENT_LOGO_COLS, AGENT_LOGO_ROWS)
+        Rect::new(x, y, MARK_COLS, MARK_ROWS)
     }
 
     /// The image ids an escape names, read as whole numbers.
@@ -303,16 +348,16 @@ mod tests {
     #[test]
     fn a_mark_is_sent_once_and_then_moved() {
         let support = ImageSupport::forced(ImageProtocol::Kitty);
-        let mut logos = AgentLogos::default();
+        let mut marks = RowMarks::default();
 
-        logos.begin_frame();
-        assert!(logos.show(&support, DEEPSEEK, None, rect(4, 6)));
-        let sent = String::from_utf8(logos.take_escapes()).expect("escapes are text");
+        marks.begin_frame();
+        assert!(marks.show(&support, &agent(DEEPSEEK), None, rect(4, 6)));
+        let sent = String::from_utf8(marks.take_escapes()).expect("escapes are text");
         assert!(
             sent.contains("a=T,f=100"),
             "the mark was not sent: {sent:?}"
         );
-        let id = logos.ids()[0];
+        let id = marks.ids()[0];
         assert_ne!(
             id, PREVIEW_IMAGE_ID,
             "a mark must not take the preview's id"
@@ -325,18 +370,18 @@ mod tests {
 
         // The same mark in the same rectangle sends nothing: the terminal
         // already holds exactly this.
-        logos.begin_frame();
-        logos.show(&support, DEEPSEEK, None, rect(4, 6));
+        marks.begin_frame();
+        marks.show(&support, &agent(DEEPSEEK), None, rect(4, 6));
         assert!(
-            logos.take_escapes().is_empty(),
+            marks.take_escapes().is_empty(),
             "an unchanged frame sent the mark again"
         );
 
         // The same mark in another rectangle is a *move*, not a transmission:
         // the picture is already on the terminal.
-        logos.begin_frame();
-        logos.show(&support, DEEPSEEK, None, rect(8, 6));
-        let moved = String::from_utf8(logos.take_escapes()).expect("escapes are text");
+        marks.begin_frame();
+        marks.show(&support, &agent(DEEPSEEK), None, rect(8, 6));
+        let moved = String::from_utf8(marks.take_escapes()).expect("escapes are text");
         assert!(moved.contains("a=p"), "the mark was not moved: {moved:?}");
         assert!(
             !moved.contains("a=T,f=100"),
@@ -344,19 +389,44 @@ mod tests {
         );
     }
 
+    /// Two rows showing one Agent wear two marks at once: an id holds one
+    /// rectangle, so the second row takes a slot of its own rather than moving
+    /// the picture off the row above it and leaving that row blank.
+    #[test]
+    fn one_agent_on_two_rows_holds_two_marks() {
+        let support = ImageSupport::forced(ImageProtocol::Kitty);
+        let mut marks = RowMarks::default();
+        marks.begin_frame();
+        assert!(marks.show(&support, &agent(DEEPSEEK), None, rect(4, 6)));
+        assert!(marks.show(&support, &agent(DEEPSEEK), None, rect(4, 9)));
+        let ids = marks.ids();
+        assert_eq!(ids.len(), 2, "the second row took the first row's mark");
+
+        // The frame after it asks for exactly the two rectangles again, so the
+        // terminal is already holding both and nothing is sent.
+        marks.take_escapes();
+        marks.begin_frame();
+        assert!(marks.show(&support, &agent(DEEPSEEK), None, rect(4, 6)));
+        assert!(marks.show(&support, &agent(DEEPSEEK), None, rect(4, 9)));
+        assert!(
+            marks.take_escapes().is_empty(),
+            "an unchanged frame sent a mark again"
+        );
+    }
+
     /// A frame that stops asking takes its mark down, and only under its own id.
     #[test]
     fn a_mark_nobody_wants_is_taken_down() {
         let support = ImageSupport::forced(ImageProtocol::Kitty);
-        let mut logos = AgentLogos::default();
-        logos.begin_frame();
-        logos.show(&support, DEEPSEEK, None, rect(4, 6));
-        let id = logos.ids()[0];
-        logos.take_escapes();
+        let mut marks = RowMarks::default();
+        marks.begin_frame();
+        marks.show(&support, &agent(DEEPSEEK), None, rect(4, 6));
+        let id = marks.ids()[0];
+        marks.take_escapes();
 
-        logos.begin_frame();
-        logos.settle(&support);
-        let cleared = String::from_utf8(logos.take_escapes()).expect("escapes are text");
+        marks.begin_frame();
+        marks.settle(&support);
+        let cleared = String::from_utf8(marks.take_escapes()).expect("escapes are text");
         assert!(
             cleared.contains(&format!("a=d,d=i,i={id}")),
             "the mark was not deleted: {cleared:?}"
@@ -369,7 +439,7 @@ mod tests {
             !named.contains(&PREVIEW_IMAGE_ID) && !named.contains(&PAIRING_IMAGE_ID),
             "taking a mark down named another surface's picture: {cleared:?}"
         );
-        assert!(!logos.is_holding());
+        assert!(!marks.is_holding());
     }
 
     /// Two rows showing two Agents hold two marks at once, and neither is lost
@@ -377,21 +447,21 @@ mod tests {
     #[test]
     fn two_agents_hold_two_marks() {
         let support = ImageSupport::forced(ImageProtocol::Kitty);
-        let mut logos = AgentLogos::default();
-        logos.begin_frame();
-        assert!(logos.show(&support, DEEPSEEK, None, rect(4, 6)));
-        assert!(logos.show(&support, CURSOR, Some(0xffffff), rect(4, 7)));
-        assert_eq!(logos.ids().len(), 2);
-        let ids = logos.ids();
+        let mut marks = RowMarks::default();
+        marks.begin_frame();
+        assert!(marks.show(&support, &agent(DEEPSEEK), None, rect(4, 6)));
+        assert!(marks.show(&support, &agent(CURSOR), Some(0xffffff), rect(4, 7)));
+        assert_eq!(marks.ids().len(), 2);
+        let ids = marks.ids();
         assert_ne!(ids[0], ids[1], "two marks shared one image id");
-        logos.take_escapes();
+        marks.take_escapes();
 
         // Only the second is wanted, so only the second survives.
-        logos.begin_frame();
-        logos.show(&support, CURSOR, Some(0xffffff), rect(4, 7));
-        logos.settle(&support);
-        assert!(logos.is_holding());
-        let cleared = String::from_utf8(logos.take_escapes()).expect("escapes are text");
+        marks.begin_frame();
+        marks.show(&support, &agent(CURSOR), Some(0xffffff), rect(4, 7));
+        marks.settle(&support);
+        assert!(marks.is_holding());
+        let cleared = String::from_utf8(marks.take_escapes()).expect("escapes are text");
         // The deletion names an id, and the wanted mark's id 101 contains the
         // dropped one's 100 as a prefix — so the ids are read as numbers.
         let deleted = image_ids(&cleared);
@@ -410,21 +480,21 @@ mod tests {
     #[test]
     fn no_mark_and_no_pixels_are_both_refusals() {
         let kitty = ImageSupport::forced(ImageProtocol::Kitty);
-        let mut logos = AgentLogos::default();
-        logos.begin_frame();
+        let mut marks = RowMarks::default();
+        marks.begin_frame();
         assert!(
-            !logos.show(&kitty, "custom acp", None, rect(4, 6)),
+            !marks.show(&kitty, &agent("custom acp"), None, rect(4, 6)),
             "an Agent with no mark must be refused"
         );
-        assert!(logos.take_escapes().is_empty());
+        assert!(marks.take_escapes().is_empty());
 
         let none = ImageSupport::forced(ImageProtocol::None);
         assert!(
-            !logos.show(&none, DEEPSEEK, None, rect(4, 6)),
+            !marks.show(&none, &agent(DEEPSEEK), None, rect(4, 6)),
             "a terminal without pixels must be refused"
         );
-        assert!(logos.take_escapes().is_empty());
-        assert!(!logos.is_holding());
+        assert!(marks.take_escapes().is_empty());
+        assert!(!marks.is_holding());
     }
 
     /// A themed mark needs a foreground colour; without one it is refused
@@ -432,10 +502,57 @@ mod tests {
     #[test]
     fn a_themed_mark_without_a_colour_is_refused() {
         let support = ImageSupport::forced(ImageProtocol::Kitty);
-        let mut logos = AgentLogos::default();
-        logos.begin_frame();
-        assert!(!logos.show(&support, CURSOR, None, rect(4, 6)));
+        let mut marks = RowMarks::default();
+        marks.begin_frame();
+        assert!(!marks.show(&support, &agent(CURSOR), None, rect(4, 6)));
         // The same mark with a colour is drawn.
-        assert!(logos.show(&support, CURSOR, Some(0xdcdcdc), rect(4, 6)));
+        assert!(marks.show(&support, &agent(CURSOR), Some(0xdcdcdc), rect(4, 6)));
+    }
+
+    /// A chrome icon is drawn the same way an Agent's mark is, and the two
+    /// families never share a slot: an Agent whose identity spelled an icon's
+    /// key would otherwise take its picture.
+    #[test]
+    fn a_chrome_icon_is_drawn_like_a_brand_mark() {
+        let support = ImageSupport::forced(ImageProtocol::Kitty);
+        let mut marks = RowMarks::default();
+        marks.begin_frame();
+        assert!(marks.show(
+            &support,
+            &Mark::Chrome(Icon::Delete),
+            Some(0xff5555),
+            rect(10, 3)
+        ));
+        let sent = String::from_utf8(marks.take_escapes()).expect("escapes are text");
+        assert!(
+            sent.contains("a=T,f=100"),
+            "the icon was not sent: {sent:?}"
+        );
+
+        // The same icon in another colour is a different picture: the raster
+        // depends on the colour, so the terminal has to be handed it again.
+        marks.begin_frame();
+        assert!(marks.show(
+            &support,
+            &Mark::Chrome(Icon::Delete),
+            Some(0x00ff00),
+            rect(10, 3)
+        ));
+        let resent = String::from_utf8(marks.take_escapes()).expect("escapes are text");
+        assert!(
+            resent.contains("a=T,f=100"),
+            "a recoloured icon was not re-sent: {resent:?}"
+        );
+
+        // An icon is never mistaken for an Agent, even one whose identity
+        // spells the icon's own key.
+        marks.begin_frame();
+        assert!(marks.show(
+            &support,
+            &agent("cursor Delete"),
+            Some(0xff5555),
+            rect(10, 4)
+        ));
+        assert_eq!(marks.ids().len(), 3, "the two families shared a slot");
     }
 }

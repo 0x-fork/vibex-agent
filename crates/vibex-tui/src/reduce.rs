@@ -384,7 +384,15 @@ impl App {
                 }
                 outcome
             }
-            Intent::NewSession => self.begin_new_session(),
+            Intent::NewSession => {
+                // The list shows rows, and its cursor is on one of them: `n`
+                // starts a session in the project the reader is pointing at,
+                // the way `r` and `d` act on the session they are pointing at.
+                // A cursor on a session row, or a reader who is not on the
+                // list at all, leaves the page's own workspace alone.
+                self.aim_new_session_at_selected_heading();
+                self.begin_new_session()
+            }
             Intent::BeginRenameSession => self.begin_rename_session(),
             Intent::ForkSession => {
                 // The row the cursor is on, not the session the client has open
@@ -1102,6 +1110,7 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::ConfigEntryActions => self.open_entry_actions(),
+            Intent::SidebarRowActions => self.open_sidebar_row_actions(),
             Intent::ConfigEntryCreate => self.begin_entry_form(None),
             Intent::ConfigEntryDelete => self.confirm_entry_delete(),
             // The three verbs every record shares. They mean the same thing in
@@ -1185,6 +1194,175 @@ impl App {
             }],
             (module, ConfigSection::Sources) => vec![Effect::DiscoverSources { module }],
         }
+    }
+
+    /// The action button of a project or folder row: everything that heading can
+    /// do, built from the heading itself.
+    ///
+    /// A session row has no menu here: its verbs are the buttons it already
+    /// wears while the reader is on it, and a menu of the same five would be a
+    /// second way to reach one list.
+    fn open_sidebar_row_actions(&mut self) -> Outcome {
+        let index = self.selection_for(Scope::Sessions);
+        let Some(row) = self.sidebar_rows().get(index).cloned() else {
+            return Outcome::quiet();
+        };
+        if row.session_id.is_some() {
+            return Outcome::quiet();
+        }
+        let actions =
+            crate::sessions::SidebarRowAction::for_heading(row.kind, !row.project_id.is_empty());
+        if actions.is_empty() {
+            return Outcome::quiet();
+        }
+        self.overlay = Some(Overlay::SidebarRowActions(
+            crate::sessions::SidebarRowActions {
+                title: row.label.clone(),
+                row_id: row.id.clone(),
+                actions,
+                collapsed: row.collapsed,
+                selected: 0,
+            },
+        ));
+        Outcome::effects(vec![])
+    }
+
+    fn perform_sidebar_row_actions(
+        &mut self,
+        intent: Intent,
+        menu: crate::sessions::SidebarRowActions,
+    ) -> Outcome {
+        let last = menu.actions.len().saturating_sub(1);
+        match intent {
+            Intent::SelectPrevious | Intent::ScrollPageUp => {
+                self.overlay = Some(Overlay::SidebarRowActions(
+                    crate::sessions::SidebarRowActions {
+                        selected: menu.selected.saturating_sub(1),
+                        ..menu
+                    },
+                ));
+                Outcome::effects(vec![])
+            }
+            Intent::SelectNext | Intent::ScrollPageDown => {
+                self.overlay = Some(Overlay::SidebarRowActions(
+                    crate::sessions::SidebarRowActions {
+                        selected: (menu.selected + 1).min(last),
+                        ..menu
+                    },
+                ));
+                Outcome::effects(vec![])
+            }
+            Intent::ConfirmOverlay => {
+                let Some(action) = menu.actions.get(menu.selected).copied() else {
+                    return Outcome::quiet();
+                };
+                self.overlay = None;
+                self.run_sidebar_row_action(&menu.row_id, action)
+            }
+            _ => Outcome::quiet(),
+        }
+    }
+
+    /// Run one heading verb against the heading it was drawn for.
+    ///
+    /// The heading is resolved by its own id rather than by the cursor's index:
+    /// a read that lands while the menu is open must not make the choice act on
+    /// whichever heading took its place.
+    fn run_sidebar_row_action(
+        &mut self,
+        row_id: &str,
+        action: crate::sessions::SidebarRowAction,
+    ) -> Outcome {
+        use crate::sessions::SidebarRowAction;
+        let Some(row) = self.sidebar_rows().into_iter().find(|row| row.id == row_id) else {
+            return Outcome::quiet();
+        };
+        match action {
+            SidebarRowAction::NewSession => {
+                // The composing page is where a session is created, and it
+                // already knows what to do with a directory it is handed: the
+                // heading's button is that page with the project's own checkout
+                // already chosen, not a second way to make a session.
+                if let Some(root) = self.project_workspace_root(&row.project_id, &row.workspace_id)
+                {
+                    self.workspace_path = Some(root);
+                }
+                self.begin_new_session()
+            }
+            SidebarRowAction::NewFolder => self.begin_folder_prompt(&row, false),
+            SidebarRowAction::RenameFolder => self.begin_folder_prompt(&row, true),
+            SidebarRowAction::ToggleCollapse => {
+                // When the authority owns the arrangement, so does the fold: a
+                // collapse the desktop would not see is not a collapse.
+                if let Some(effect) = self.sidebar_collapse_effect(&row) {
+                    return Outcome::effects(vec![effect]);
+                }
+                self.toggle_sidebar_collapsed_for(&row.project_id);
+                Outcome::effects(vec![])
+            }
+            SidebarRowAction::DeleteProject | SidebarRowAction::DeleteFolder => {
+                let project = action == SidebarRowAction::DeleteProject;
+                self.pending_sidebar_action = Some((row.id.clone(), action));
+                self.overlay = Some(Overlay::Confirm {
+                    title: if project {
+                        self.strings.sidebar_action_delete_project()
+                    } else {
+                        self.strings.sidebar_action_delete_folder()
+                    }
+                    .to_string(),
+                    body: format!(
+                        "{}\n\n{}",
+                        row.label,
+                        if project {
+                            self.strings.sidebar_confirm_delete_project()
+                        } else {
+                            self.strings.sidebar_confirm_delete_folder()
+                        }
+                    ),
+                    confirm: Intent::SidebarRowActions,
+                });
+                Outcome::effects(vec![])
+            }
+        }
+    }
+
+    /// Open the prompt that names a folder.
+    ///
+    /// One prompt for both verbs, because the reader's answer is the same kind
+    /// of thing either way — a name — and the two differ only in which folder it
+    /// lands on and whether that folder already exists.
+    fn begin_folder_prompt(
+        &mut self,
+        row: &vibex_desktop_model::AgentSidebarRow,
+        rename: bool,
+    ) -> Outcome {
+        let folder_id = row.id.strip_prefix("folder:").map(str::to_string);
+        if rename && folder_id.is_none() {
+            return Outcome::quiet();
+        }
+        self.pending_folder_prompt = Some(crate::app::FolderPromptTarget {
+            folder_id: if rename { folder_id.clone() } else { None },
+            project_id: (!row.project_id.is_empty()).then(|| row.project_id.clone()),
+            workspace_id: (!row.workspace_id.is_empty()).then(|| row.workspace_id.clone()),
+            // A new folder made from a folder heading goes *inside* it; one made
+            // from a project heading has no parent.
+            parent_folder_id: if rename { None } else { folder_id },
+        });
+        self.overlay = Some(Overlay::Prompt {
+            title: if rename {
+                self.strings.sidebar_action_rename_folder()
+            } else {
+                self.strings.sidebar_action_new_folder()
+            }
+            .to_string(),
+            field: if rename {
+                PromptField::RenameFolderName
+            } else {
+                PromptField::NewFolderName
+            },
+            value: String::new(),
+        });
+        Outcome::effects(vec![])
     }
 
     /// `Enter`: everything the highlighted record can do.
@@ -2780,6 +2958,7 @@ impl App {
             // depends on whether a field is being typed into.
             Overlay::Form { form } => self.perform_form(intent, form),
             Overlay::EntryActions { entry } => self.perform_entry_actions(intent, entry),
+            Overlay::SidebarRowActions(menu) => self.perform_sidebar_row_actions(intent, menu),
             Overlay::Schedule(form) => self.perform_schedule(intent, form),
             Overlay::Palette { query, selected } => self.perform_palette(intent, query, selected),
             // The editor owns its keys directly, including the captured chord;
@@ -3140,6 +3319,38 @@ impl App {
             // answered, and asking it again is what the entry point would do.
             return self.exec_config_action(&key, action);
         }
+        if confirm == Intent::SidebarRowActions {
+            let Some((row_id, action)) = self.pending_sidebar_action.take() else {
+                return Outcome::quiet();
+            };
+            // The same rule as the record above: the menu that offered the verb
+            // has been closed, so what runs is the write rather than the menu.
+            let Some(row) = self.sidebar_rows().into_iter().find(|row| row.id == row_id) else {
+                return Outcome::quiet();
+            };
+            return match action {
+                crate::sessions::SidebarRowAction::DeleteProject => {
+                    Outcome::effects(vec![Effect::DeleteProject {
+                        project_id: row.project_id,
+                    }])
+                }
+                crate::sessions::SidebarRowAction::DeleteFolder => {
+                    let Some(folder_id) = row.id.strip_prefix("folder:").map(str::to_string) else {
+                        return Outcome::quiet();
+                    };
+                    let Some(view) = self.projection.sidebar_organization.as_ref() else {
+                        return Outcome::quiet();
+                    };
+                    Outcome::effects(vec![Effect::MutateSidebarOrganization {
+                        mutation: vibex_core::RemoteSidebarOrganizationMutation::DeleteFolder {
+                            folder_id,
+                        },
+                        expected_revision: Some(view.revision),
+                    }])
+                }
+                _ => Outcome::quiet(),
+            };
+        }
         match confirm {
             Intent::ResetSetting => {
                 let Some(row) = self.selected_setting() else {
@@ -3187,6 +3398,47 @@ impl App {
     fn submit_prompt(&mut self, field: PromptField, value: String, title: String) -> Outcome {
         let trimmed = value.trim().to_string();
         match field {
+            PromptField::NewFolderName | PromptField::RenameFolderName => {
+                // The heading travelled with the prompt, so the name lands on
+                // the folder the reader was looking at rather than on whichever
+                // heading the list has since put under the cursor.
+                let Some(target) = self.pending_folder_prompt.take() else {
+                    return Outcome::quiet();
+                };
+                if trimmed.is_empty() {
+                    self.toast(Toast::warning(
+                        self.strings.sidebar_folder_name_empty().to_string(),
+                    ));
+                    return Outcome::quiet();
+                }
+                let Some(view) = self.projection.sidebar_organization.as_ref() else {
+                    // No authority owns the arrangement, so there is no tree for
+                    // a folder to be filed in: saying so is better than a row
+                    // that appears and is gone on the next read.
+                    self.toast(Toast::warning(
+                        self.strings.sidebar_row_actions().to_string(),
+                    ));
+                    return Outcome::quiet();
+                };
+                let mutation = match target.folder_id {
+                    Some(folder_id) => {
+                        vibex_core::RemoteSidebarOrganizationMutation::RenameFolder {
+                            folder_id,
+                            name: trimmed,
+                        }
+                    }
+                    None => vibex_core::RemoteSidebarOrganizationMutation::CreateFolder {
+                        name: trimmed,
+                        project_id: target.project_id,
+                        workspace_id: target.workspace_id,
+                        parent_folder_id: target.parent_folder_id,
+                    },
+                };
+                Outcome::effects(vec![Effect::MutateSidebarOrganization {
+                    mutation,
+                    expected_revision: Some(view.revision),
+                }])
+            }
             PromptField::RenameSession => {
                 // The prompt was opened on a list row, and the cursor cannot
                 // move while it is up: the row it pointed at is what is renamed.
@@ -3649,6 +3901,30 @@ impl App {
     /// went nowhere. A creation consumes both (`enter_creating_session`), so the
     /// page a reader returns to afterwards names the directory of the session
     /// they are in rather than one chosen for a session that already exists.
+    /// Point the composing page at the directory of the heading the reader is
+    /// on, when the session list is what has the cursor.
+    ///
+    /// A heading is a project or a folder, and both name somewhere to work: the
+    /// page is where a session is created, and this is the one thing it needs
+    /// to open the new session in the right checkout. A cursor on a session
+    /// row says nothing about where the *next* session goes, so the page keeps
+    /// whatever the reader last chose.
+    fn aim_new_session_at_selected_heading(&mut self) {
+        if self.page != Page::Sessions {
+            return;
+        }
+        let index = self.selection_for(Scope::Sessions);
+        let Some(row) = self.sidebar_rows().get(index).cloned() else {
+            return;
+        };
+        if row.session_id.is_some() {
+            return;
+        }
+        if let Some(root) = self.project_workspace_root(&row.project_id, &row.workspace_id) {
+            self.workspace_path = Some(root);
+        }
+    }
+
     fn begin_new_session(&mut self) -> Outcome {
         self.navigate_to(Page::NewSession);
         if !self.new_draft_has_content_or_choices() && !self.failed_creations.is_empty() {
@@ -5486,6 +5762,14 @@ impl App {
             // to draw, and the list is the sidebar of every page.
             "rename_session" | "archive_session" | "unarchive_session" | "delete_session" => {
                 Outcome::effects(self.session_page_effects())
+            }
+            // A project is a heading the workspace listing draws, and every
+            // session filed under it went with it: both reads are what makes the
+            // write visible.
+            "delete_project" => {
+                let mut effects = vec![Effect::ListWorkspaces];
+                effects.extend(self.session_page_effects());
+                Outcome::effects(effects)
             }
             // Records the management surfaces draw. Which read answers one is
             // the area on screen: the same write is a row in whichever

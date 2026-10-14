@@ -517,7 +517,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     // Same for the Agent marks in the session list and the switcher: the frame
     // starts with none wanted, the pages that draw rows ask for the ones they
     // show, and the settle at the end of this function takes down the rest.
-    app.agent_logos.begin_frame();
+    app.row_marks.begin_frame();
     match app.page {
         // The workbench pages share the scrollback band; they are views over the
         // same session, so they occupy the same part of the screen.
@@ -582,7 +582,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     // Last, because the switcher places its own Agent marks from inside the
     // overlay: everything that could ask for one has asked by now, and a mark
     // nobody asked for is a layer the terminal is still holding.
-    app.agent_logos.settle(&app.terminal_images);
+    app.row_marks.settle(&app.terminal_images);
 }
 
 /// The rows a chip preview may use: everything above the composer's own stack.
@@ -840,6 +840,11 @@ fn render_scrollback(
     // The scroll ceiling is measured against the band the reader can actually
     // see, so the frame that drew it is the one that records it.
     app.transcript_band_rows = height;
+    // A fold's title leads with the Agent's brand mark, and the cells that
+    // picture is drawn over are reserved by the row itself — so the transcript
+    // has to know whether the terminal can hold one before it lays the row out.
+    app.transcript
+        .set_pictures(app.terminal_images.supports_pixels());
     let pattern = app
         .search
         .as_ref()
@@ -883,6 +888,31 @@ fn render_scrollback(
                 .style(Style::default().bg(theme.roles.surface_raised)),
             header_area,
         );
+    }
+    // The Agent's mark on a fold's title, placed where the row that reserved
+    // its cells was drawn. A picture has no clip rect, so a mark is placed only
+    // while its row is in the window — and never under a modal that covers the
+    // transcript, where it would float over the dialog as a layer above it.
+    if app.overlay.is_none() {
+        for mark in app.transcript.window_marks() {
+            if mark.column + crate::row_marks::MARK_COLS > content.width {
+                continue;
+            }
+            let rect = Rect {
+                x: content.x.saturating_add(mark.column),
+                y: content
+                    .y
+                    .saturating_add(u16::try_from(mark.row).unwrap_or(u16::MAX)),
+                width: crate::row_marks::MARK_COLS,
+                height: crate::row_marks::MARK_ROWS,
+            };
+            let _ = app.row_marks.show(
+                &app.terminal_images,
+                &crate::row_marks::Mark::Agent(mark.identity.clone()),
+                crate::theme::color_rgb(theme.roles.foreground),
+                rect,
+            );
+        }
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), content);
     if let Some(rows) = search_bar {
@@ -1318,7 +1348,8 @@ fn session_chip(
     }
 }
 
-/// The two controls a session row keeps for itself, and where they are.
+/// A control a list row draws at its own right edge — a session row's action
+/// buttons, a heading's icon slot, a branch's disclosure.
 ///
 /// The row does not know where it will land: the page lays every row out and
 /// then draws a window of them, so a control is placed relative to the row —
@@ -1334,33 +1365,36 @@ struct SessionRowControl {
     intent: Intent,
 }
 
-/// One Agent mark a list row wants on the terminal.
+/// One picture a list row wants on the terminal.
 ///
 /// Like a control, a mark is collected while the row is laid out and placed
 /// onto the screen once the window is known, because a row scrolled past must
-/// not leave a picture behind. The identity is what the terminal is asked to
-/// draw; the row has already reserved the cells. The session list and the
-/// runtime switcher both lay rows out this way, which is why the shape carries
-/// no assumption about which list it came from.
+/// not leave a picture behind. The row has already reserved the cells, so what
+/// travels here is only what to draw and in what colour. The session list and
+/// the runtime switcher both lay rows out this way, which is why the shape
+/// carries no assumption about which list it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionRowMark {
     /// The line of the row the mark sits on, counting from its first.
     line: usize,
     /// The mark's first column, from the row's left edge.
     column: u16,
-    /// The Agent whose mark it is.
-    identity: String,
+    /// What to draw: an Agent's brand mark, or one of the list's own icons.
+    mark: crate::row_marks::Mark,
+    /// The colour a themed mark is drawn in. An Agent's mark ignores it when it
+    /// carries the brand's own colours; a chrome icon is always drawn in it, so
+    /// a delete button is the danger colour and a pin is the warning one.
+    color: ratatui::style::Color,
 }
 
-/// The air a session row keeps between its content and its two controls, and
+/// The air a row keeps between its content and its right-hand controls, and
 /// between the controls themselves.
 ///
 /// A control's target is everything it draws, so a pointer does not have to
-/// land on the character itself, and the two targets never touch: the column
-/// between them belongs to neither. The glyph-and-hint width is the keymap's to
-/// say (`session_row_control_label`); these are the two gaps around it.
-const SESSION_ROW_CONTROL_AIR: usize = 1;
-const SESSION_ROW_CONTROL_GAP: usize = 1;
+/// land on the character itself, and two targets never touch: the column
+/// between them belongs to neither.
+const ROW_CONTROL_AIR: usize = 1;
+const ROW_CONTROL_GAP: usize = 1;
 
 /// How far one level of the tree moves a row's content off the left edge.
 ///
@@ -1368,11 +1402,85 @@ const SESSION_ROW_CONTROL_GAP: usize = 1;
 /// folder's children hang under the folder and a project's rows under the
 /// project: without it a folder's sessions start to the left of their own
 /// heading and the nesting reads backwards.
-const SESSION_ROW_INDENT: usize = 2;
+pub const SESSION_ROW_INDENT: usize = 2;
 
-/// The columns a session row spends before its title: the selection bar and the
-/// state mark, each with the column of air that keeps it off what follows.
-const SESSION_ROW_LEAD: usize = 4;
+/// The columns a row spends before its title: the selection bar with the air
+/// after it, the icon slot every row opens with, and the air after that.
+///
+/// The slot is two cells wide because that is the shape a picture has to be:
+/// two cells is the narrowest box that is still square-ish under the cell
+/// aspect the rest of this client assumes. A row with no picture to draw still
+/// spends the cells, so the titles of a list do not start in a different column
+/// on a different terminal.
+///
+/// Published because it is a contract rather than a detail: it is where a row's
+/// title opens, and a second line that opened anywhere else would break the
+/// rail the two lines share.
+pub const SESSION_ROW_LEAD: usize = 2 + crate::row_marks::MARK_COLS as usize + 1;
+
+/// The columns a heading spends before its name: the icon slot, and the air
+/// after it.
+///
+/// Shorter than a session row's lead by the selection bar, which only a row
+/// that can be opened draws: a heading is folded, not entered, and the columns
+/// the bar would have taken are the name's.
+pub const HEADING_ROW_LEAD: usize = crate::row_marks::MARK_COLS as usize + 1;
+
+/// The cell a session row keeps for the disclosure that opens its delegated
+/// branch.
+///
+/// Reserved on every session row rather than only on the rows that have one, so
+/// the titles of a list end in one column and the disclosure of a branch sits
+/// under the disclosure of the session that owns it.
+const SESSION_ROW_DISCLOSURE: usize = 1;
+
+/// The buttons a session row offers while the reader is on it, in the order the
+/// desktop's own menu lists the same verbs.
+///
+/// The row the cursor is on and the row under the pointer both wear them, and
+/// every other row gives their columns back to its title. They take the place
+/// of the status column rather than sitting beside it, which is what the
+/// desktop does with its own action cluster: two answers to "what is this" and
+/// "act on this" in one column would be one too many.
+const SESSION_ROW_ACTIONS: [(crate::sidebar_icons::Icon, Intent); 5] = [
+    (
+        crate::sidebar_icons::Icon::Resume,
+        Intent::ToggleAutoContinue,
+    ),
+    (
+        crate::sidebar_icons::Icon::Rename,
+        Intent::BeginRenameSession,
+    ),
+    (crate::sidebar_icons::Icon::Fork, Intent::ForkSession),
+    (crate::sidebar_icons::Icon::Archive, Intent::ArchiveSession),
+    (crate::sidebar_icons::Icon::Delete, Intent::DeleteSession),
+];
+
+/// The buttons a project or folder row offers, in the desktop's own order.
+///
+/// The desktop reveals these on hover and puts the fold chevron among them. A
+/// terminal has no hover, so they are drawn always; and the chevron is not
+/// repeated here, because the heading's own leading slot is already the control
+/// that folds it — a second one a few columns away would be the same button
+/// twice.
+const HEADING_ROW_ACTIONS: [(crate::sidebar_icons::Icon, Intent); 2] = [
+    (crate::sidebar_icons::Icon::More, Intent::SidebarRowActions),
+    (crate::sidebar_icons::Icon::New, Intent::NewSession),
+];
+
+/// The columns one icon button occupies: the mark itself, with the gap to the
+/// next button counted separately.
+fn icon_button_width() -> usize {
+    crate::row_marks::MARK_COLS as usize
+}
+
+/// The width of a run of icon buttons, gaps included.
+fn icon_cluster_width(count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    count * icon_button_width() + (count - 1) * ROW_CONTROL_GAP
+}
 
 /// The list itself: a heading per group, and under each a row per session.
 fn render_session_rows(
@@ -1392,36 +1500,27 @@ fn render_session_rows(
     let hovered_action = app.hovered_row_action;
     let sessions = app.agent.state.sessions.value.clone().unwrap_or_default();
     let now_ms = vibex_core::unix_timestamp_ms();
-    // When the session last said anything, right-aligned: the reader scanning
-    // the list is looking for what changed, and a wall of identical rows says
-    // nothing about that. The column is measured from what will be drawn, so a
-    // list of sessions from today spends no width on days.
-    //
-    // A session with a scheduled send reads the other way round: the question
-    // its row answers is "how long until it goes", not "when did it last
-    // speak", and a wall clock beside a waiting message would only be a second
-    // timestamp to decode. The absolute deadline stays in the row's own
-    // schedule mark, where there is room to say both.
-    let time_labels = rows
+    // What each row's right end says while the reader is not on it: the hour it
+    // last spoke, the state it is in, and the marks that qualify either. It is
+    // built for every row before anything is drawn, because the widest answer
+    // is what every row reserves — a title that grew when a session started
+    // running would rewrite the list under the reader's hand, and the columns
+    // of the list would stop lining up.
+    let statuses =
+        rows.iter()
+            .map(|row| {
+                let session = row.session_id.as_ref().and_then(|session_id| {
+                    sessions.iter().find(|session| &session.id == session_id)
+                });
+                session_status_column(row, session, app, theme, strings, now_ms)
+            })
+            .collect::<Vec<_>>();
+    let status_column = statuses
         .iter()
-        .map(|row| {
-            let session_id = row.session_id.as_ref()?;
-            let session = sessions.iter().find(|session| &session.id == session_id)?;
-            Some(
-                app.session_schedule_countdown(&session.id, now_ms)
-                    .unwrap_or_else(|| {
-                        relative_time_label(session.last_message_at_ms, now_ms, strings)
-                    }),
-            )
-        })
-        .collect::<Vec<_>>();
-    let time_column = time_labels
-        .iter()
-        .flatten()
-        .map(|label| display_width(label))
+        .map(|column| column.width)
         .max()
         .unwrap_or(0)
-        .min(usize::from(area.width) / 4);
+        .min(usize::from(area.width) / 3);
     // Every row is laid out, and the page draws a window of the result. The
     // list is taller than any terminal — a workspace can hold hundreds of
     // sessions and a row can carry a detail card — so the window is measured in
@@ -1435,7 +1534,7 @@ fn render_session_rows(
     // They are moved onto the screen once the window is known, so a button on a
     // row the reader has scrolled past is never published as a click target.
     let mut controls: Vec<(usize, usize, SessionRowControl)> = Vec::new();
-    // Every Agent mark the rows want, in the coordinates of the laid-out list.
+    // Every picture the rows want, in the coordinates of the laid-out list.
     // Like the controls, they are moved onto the screen once the window is
     // known, so a mark on a row the reader has scrolled past is never placed.
     let mut wanted_marks: Vec<(usize, SessionRowMark)> = Vec::new();
@@ -1451,8 +1550,8 @@ fn render_session_rows(
             hovered_action
                 .filter(|(hovered_row, _)| *hovered_row == index)
                 .map(|(_, intent)| intent),
-            time_labels.get(index).and_then(Option::as_ref),
-            time_column,
+            statuses.get(index),
+            status_column,
             usize::from(area.width),
             &sessions,
             app,
@@ -1497,9 +1596,9 @@ fn render_session_rows(
         .unwrap_or(0);
     app.session_scroll = offset;
     // The controls land where the rows they belong to were drawn. One on a line
-    // the window has scrolled past — or one a terminal too narrow to hold the
-    // pair has pushed out of the band — is not published at all: a click there
-    // would otherwise act on a control nobody can see.
+    // the window has scrolled past — or one a terminal too narrow to hold it has
+    // pushed out of the band — is not published at all: a click there would
+    // otherwise act on a control nobody can see.
     for (line, row, control) in controls {
         let fits =
             usize::from(control.column) + usize::from(control.width) <= usize::from(area.width);
@@ -1526,39 +1625,40 @@ fn render_session_rows(
         .take(window)
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(visible)), area);
-    // The Agent marks land where the rows they belong to were drawn. A mark on
-    // a line the window has scrolled past, or one a terminal too narrow to hold
-    // it has pushed out of the band, is not placed at all: a picture has no
-    // clip rect, so one left standing over the row below would be worse than
-    // the name it replaced.
+    // The pictures land where the rows they belong to were drawn. One on a line
+    // the window has scrolled past, or one a terminal too narrow to hold it has
+    // pushed out of the band, is not placed at all: a picture has no clip rect,
+    // so one left standing over the row below would be worse than the character
+    // it replaced.
     //
     // A modal is open over the list, nothing is placed either. A picture is a
     // layer above the text, so a mark drawn under a dialog would float over it —
     // the one failure mode a clip rect would have prevented and a character cell
     // does not need.
     //
-    // `app.agent_logos` is settled at the end of the frame, so a mark nobody
+    // `app.row_marks` is settled at the end of the frame, so a mark nobody
     // wants any more is taken down rather than left over the list.
-    let mark_color = crate::theme::color_rgb(theme.roles.foreground);
-    let mark_rect = |column: u16, line: usize| Rect {
-        x: area.x.saturating_add(column),
-        y: area.y.saturating_add((line - offset) as u16),
-        width: crate::agent_logo::AGENT_LOGO_COLS,
-        height: crate::agent_logo::AGENT_LOGO_ROWS,
-    };
     if app.overlay.is_none() {
         for (line, mark) in &wanted_marks {
-            let fits = mark.column + crate::agent_logo::AGENT_LOGO_COLS <= area.width;
+            let fits = mark.column + crate::row_marks::MARK_COLS <= area.width;
             let drawn = line
                 .checked_sub(offset)
                 .is_some_and(|screen_line| screen_line < window);
             if !fits || !drawn {
                 continue;
             }
-            let rect = mark_rect(mark.column, *line);
-            let _ = app
-                .agent_logos
-                .show(&app.terminal_images, &mark.identity, mark_color, rect);
+            let rect = Rect {
+                x: area.x.saturating_add(mark.column),
+                y: area.y.saturating_add((line - offset) as u16),
+                width: crate::row_marks::MARK_COLS,
+                height: crate::row_marks::MARK_ROWS,
+            };
+            let _ = app.row_marks.show(
+                &app.terminal_images,
+                &mark.mark,
+                crate::theme::color_rgb(mark.color),
+                rect,
+            );
         }
     }
     // The rows are not all one line tall, so the mouse needs to know which row
@@ -1596,8 +1696,8 @@ fn session_list_item(
     selected: bool,
     hovered: bool,
     hovered_control: Option<Intent>,
-    time: Option<&String>,
-    time_column: usize,
+    status: Option<&SessionStatusColumn>,
+    status_column: usize,
     width: usize,
     sessions: &[vibex_core::AgentSession],
     app: &App,
@@ -1612,7 +1712,19 @@ fn session_list_item(
         .and_then(|session_id| sessions.iter().find(|session| &session.id == session_id));
     if row.kind != vibex_desktop_model::AgentSidebarRowKind::Session {
         return vec![
-            session_heading_line(row, count, selected, hovered, width, app, theme),
+            session_heading_line(
+                row,
+                count,
+                selected,
+                hovered,
+                hovered_control,
+                width,
+                app,
+                theme,
+                strings,
+                controls,
+                marks,
+            ),
             Line::from(""),
         ];
     }
@@ -1622,8 +1734,8 @@ fn session_list_item(
         selected,
         hovered,
         hovered_control,
-        time,
-        time_column,
+        status,
+        status_column,
         width,
         app,
         theme,
@@ -1642,23 +1754,93 @@ fn session_list_item(
     lines
 }
 
+/// The column a row's icon slot opens at, from the row's left edge.
+///
+/// The slot is the second thing a row draws: the selection bar owns the first
+/// column and the space after it, and the air past the slot is what keeps the
+/// title off the mark.
+fn row_icon_column(indent: usize) -> u16 {
+    (indent + 2) as u16
+}
+
+/// Whether a chrome icon can be drawn as a picture here.
+///
+/// The terminal has to hold a picture at all, and it has to have a colour to
+/// draw the icon in: every icon in the vocabulary is drawn in the row's own
+/// colour, so a palette tier that resolves no RGB has none. Either failure
+/// falls back to the character, which is the answer this branch exists to give.
+fn icon_drawable(app: &App, color: ratatui::style::Color) -> bool {
+    app.terminal_images.supports_pixels() && crate::theme::color_rgb(color).is_some()
+}
+
+/// The two-cell icon slot a row opens with: a picture where the terminal can
+/// hold one, and the character the same vocabulary carries where it cannot.
+///
+/// Both renderings are the same two columns wide, so a row does not reflow when
+/// the terminal's capabilities change. A picture is returned as a mark for the
+/// page to place rather than drawn here, because only the page knows which line
+/// the row finally landed on.
+#[allow(clippy::too_many_arguments)]
+fn row_icon_slot(
+    icon: crate::sidebar_icons::Icon,
+    drawable: bool,
+    tier: crate::glyphs::GlyphTier,
+    color: ratatui::style::Color,
+    style: Style,
+    blank: Style,
+    line: usize,
+    column: u16,
+    marks: &mut Vec<SessionRowMark>,
+) -> Vec<Span<'static>> {
+    if drawable {
+        // The cells the picture covers are painted blank so nothing shows
+        // through around it: a picture sits above the text layer, not instead
+        // of it.
+        marks.push(SessionRowMark {
+            line,
+            column,
+            mark: crate::row_marks::Mark::Chrome(icon),
+            color,
+        });
+        return vec![Span::styled(
+            " ".repeat(usize::from(crate::row_marks::MARK_COLS)),
+            blank,
+        )];
+    }
+    vec![Span::styled(
+        format!(
+            "{:<width$}",
+            icon.glyph(tier),
+            width = usize::from(crate::row_marks::MARK_COLS)
+        ),
+        style,
+    )]
+}
+
 /// A group's heading: what it is called, how much it holds, and a rule to the
 /// edge of the list.
 ///
 /// The rule is what turns a stack of rows into sections: without it a project
 /// name is one more line of text, and the reader has to read it to find the
-/// next one.
+/// next one. The badge after the name is the count the desktop draws there, and
+/// the trailing mark is the "N running" it keeps at the row's far edge.
+#[allow(clippy::too_many_arguments)]
 fn session_heading_line(
     row: &vibex_desktop_model::AgentSidebarRow,
     count: usize,
     selected: bool,
     hovered: bool,
+    hovered_control: Option<Intent>,
     width: usize,
     app: &App,
     theme: &TuiTheme,
+    strings: Strings,
+    controls: &mut Vec<SessionRowControl>,
+    marks: &mut Vec<SessionRowMark>,
 ) -> Line<'static> {
+    use vibex_desktop_model::AgentSidebarRowKind;
     let tier = app.glyph_tier();
-    let disclosure = crate::glyphs::disclosure(!row.collapsed, tier);
+    let folder = row.kind == AgentSidebarRowKind::Folder;
     let label_style = if selected {
         Style::default().fg(theme.roles.accent_user)
     } else if hovered {
@@ -1667,57 +1849,360 @@ fn session_heading_line(
         Style::default().fg(theme.roles.gray_bright)
     }
     .add_modifier(Modifier::BOLD);
-    // The count is the line's last word, past the rule: it is what the heading
-    // is *for*, and the end of the row is where the eye lands after the rule
-    // has carried it there.
-    let count_style = Style::default().fg(theme.roles.gray);
+    let blank = Style::default();
     let indent = usize::from(row.depth) * SESSION_ROW_INDENT;
-    let count_label = if count > 0 {
-        count.to_string()
-    } else {
-        String::new()
+    // The heading's icon slot is also the control that folds it, so a reader who
+    // clicks the mark gets what the mark says. A folder wears the folder the
+    // desktop draws — open or shut — and a project wears the disclosure alone,
+    // because the terminal draws no project logo at all.
+    let open = !row.collapsed;
+    let icon = match (folder, open) {
+        (true, true) => crate::sidebar_icons::Icon::FolderOpen,
+        (true, false) => crate::sidebar_icons::Icon::FolderClosed,
+        (false, true) => crate::sidebar_icons::Icon::Expand,
+        (false, false) => crate::sidebar_icons::Icon::Collapse,
     };
-    let tail = if count_label.is_empty() {
+    let icon_color = if selected {
+        theme.roles.accent_user
+    } else {
+        theme.roles.gray_bright
+    };
+    let mut spans = vec![Span::raw(" ".repeat(indent))];
+    spans.extend(row_icon_slot(
+        icon,
+        folder && icon_drawable(app, icon_color),
+        tier,
+        icon_color,
+        Style::default().fg(icon_color),
+        blank,
+        0,
+        indent as u16,
+        marks,
+    ));
+    // The slot is the heading's own fold control: a heading is folded rather
+    // than entered, so the click that lands on the mark is the click that folds
+    // what the mark says.
+    controls.push(SessionRowControl {
+        line: 0,
+        column: indent as u16,
+        width: crate::row_marks::MARK_COLS,
+        intent: Intent::OpenSelectedSession,
+    });
+    spans.push(Span::styled(" ", blank));
+    // What the row's right end holds: the buttons the desktop reveals on hover,
+    // and the running count it keeps at the far edge. Both are measured before
+    // the name is cut, so the name gives way rather than the shape of the row.
+    let buttons = heading_buttons(row);
+    let running = heading_running_label(row, app, strings);
+    // The trailing block is the running count and the buttons, with the air the
+    // count keeps off the rule. It is what the name and the rule have to leave
+    // room for.
+    let running_block = if running.is_empty() {
         0
     } else {
-        display_width(&count_label) + 1
+        // The count keeps a column of air on each side: against the rule it is
+        // punctuation, and against the buttons it is a different kind of fact.
+        display_width(&running) + 2
     };
+    let right = running_block + icon_cluster_width(buttons.len()) + ROW_CONTROL_AIR;
     // The name gives way before the shape of the heading does: a heading whose
     // rule ran out is still a heading, but a heading without its name is not.
     let label_width = width
         .saturating_sub(indent)
-        .saturating_sub(2)
-        .saturating_sub(tail)
-        .saturating_sub(2)
+        .saturating_sub(HEADING_ROW_LEAD)
+        .saturating_sub(right)
+        .saturating_sub(4)
         .max(1);
     let label = truncate_to_width(&row.label, label_width, "…");
-    let used = indent + 2 + display_width(&label) + tail;
-    let mut spans = vec![
-        Span::raw(" ".repeat(indent)),
-        Span::styled(format!("{disclosure} "), label_style),
-        Span::styled(label, label_style),
-    ];
+    // The count is a badge rather than the line's last word, which is where the
+    // desktop puts it: right after the name, in the muted step. It is drawn even
+    // at zero, because a project the reader has opened and not yet talked to is
+    // a fact the row should state rather than hide.
+    let badge = format!(" {count} ");
+    let badge_width = display_width(&badge);
+    spans.push(Span::styled(label.clone(), label_style));
+    spans.push(Span::styled(
+        badge,
+        Style::default()
+            .fg(theme.roles.gray)
+            .bg(theme.roles.code_background),
+    ));
+    let used = indent + HEADING_ROW_LEAD + display_width(&label) + badge_width;
     // One column of air, then the rule to the far end of the list in the dim
     // step: a rule is punctuation between sections, not a line of the page.
-    let rule_width = width.saturating_sub(used + 1);
+    // What it does not reach is the trailing block, which the arithmetic above
+    // has already promised the room for.
+    let rule_width = width.saturating_sub(used + right);
     if rule_width > 0 {
-        spans.push(Span::styled(" ", Style::default()));
+        spans.push(Span::styled(" ", blank));
         spans.push(Span::styled(
             crate::glyphs::heading_rule(tier).repeat(rule_width),
             Style::default().fg(theme.roles.gray_dim),
         ));
     }
-    if !count_label.is_empty() {
-        spans.push(Span::styled(format!(" {count_label}"), count_style));
+    // The trailing mark is the desktop's "N running", which it keeps at the
+    // row's far edge and hides under the pointer. A terminal has no hover, so it
+    // is drawn beside the buttons instead of under them.
+    let mut column = width.saturating_sub(right - ROW_CONTROL_AIR);
+    if !running.is_empty() {
+        spans.push(Span::styled(
+            format!(" {running} "),
+            Style::default().fg(theme.roles.gray),
+        ));
+        column += 1 + display_width(&running) + 1;
+    }
+    for (index, (icon, intent)) in buttons.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" ".repeat(ROW_CONTROL_GAP), blank));
+            column += ROW_CONTROL_GAP;
+        }
+        let lit = hovered_control == Some(*intent);
+        let color = if lit {
+            theme.roles.background
+        } else {
+            theme.roles.gray_bright
+        };
+        let style = if lit {
+            Style::default()
+                .fg(theme.roles.background)
+                .bg(theme.roles.accent_user)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(color)
+        };
+        let mut slot = row_icon_slot(
+            *icon,
+            icon_drawable(app, color),
+            tier,
+            color,
+            style,
+            blank,
+            0,
+            column as u16,
+            marks,
+        );
+        spans.append(&mut slot);
+        controls.push(SessionRowControl {
+            line: 0,
+            column: column as u16,
+            width: crate::row_marks::MARK_COLS,
+            intent: *intent,
+        });
+        column += icon_button_width();
     }
     Line::from(spans)
 }
 
-/// A session's row: the title line and, under it, what the session last did.
+/// The buttons a heading offers: the two the desktop reveals on hover, minus the
+/// new-session button on a folder no project owns — because only such a folder
+/// can hold a session.
+fn heading_buttons(
+    row: &vibex_desktop_model::AgentSidebarRow,
+) -> Vec<(crate::sidebar_icons::Icon, Intent)> {
+    let folder_without_scope =
+        row.kind == vibex_desktop_model::AgentSidebarRowKind::Folder && row.project_id.is_empty();
+    HEADING_ROW_ACTIONS
+        .iter()
+        .filter(|(icon, _)| !(folder_without_scope && *icon == crate::sidebar_icons::Icon::New))
+        .copied()
+        .collect()
+}
+
+/// How many of a heading's sessions are running, in the desktop's own words.
+fn heading_running_label(
+    row: &vibex_desktop_model::AgentSidebarRow,
+    app: &App,
+    strings: Strings,
+) -> String {
+    let count = app.sidebar_running_count(&row.project_id, &row.workspace_id);
+    if count == 0 {
+        return String::new();
+    }
+    format!("{count} {}", strings.sidebar_running())
+}
+
+/// What a session row's right end says while the reader is not on it.
 ///
-/// The title line spends its right end on the row's two controls while the
-/// reader is on the row: the cursor's row and the row under the pointer both
-/// carry them, and every other row gives their columns back to its title.
+/// Built for every row before anything is drawn, because the widest answer is
+/// what every row reserves. The order is the desktop's status column's, mark for
+/// mark: the pause, then the state's own mark, then the hour or the word for a
+/// state that has no hour, then the marks that qualify the row — something new,
+/// a failure, and the pin that owns the trailing slot.
+struct SessionStatusColumn {
+    spans: Vec<Span<'static>>,
+    width: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn session_status_column(
+    row: &vibex_desktop_model::AgentSidebarRow,
+    session: Option<&vibex_core::AgentSession>,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+    now_ms: i64,
+) -> SessionStatusColumn {
+    use vibex_core::AgentSessionState;
+    let tier = app.glyph_tier();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let Some(session) = session else {
+        return SessionStatusColumn { spans, width: 0 };
+    };
+    let state = session.state;
+    let awaiting = state == AgentSessionState::NeedsInput;
+    // Only a *running* turn suppresses the hour. A session still starting up
+    // keeps the ring — the Agent has been asked and has not answered — and says
+    // `INIT` beside it, which is the desktop's own reading: the ring is the
+    // state's mark and the word is the row's.
+    let generating = state == AgentSessionState::Running;
+    let failed = state == AgentSessionState::Error;
+    let scheduled = app.next_scheduled_message_at(&session.id);
+    let unread = app.session_is_unread(&session.id);
+    let paused = app.auto_continue.is_paused(&session.id);
+    fn push(spans: &mut Vec<Span<'static>>, text: String, color: ratatui::style::Color) {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(text, Style::default().fg(color)));
+    }
+    // The pause leads, the way the desktop's column leads with it: it is the one
+    // mark that says the session's own automation is held back.
+    if paused {
+        push(
+            &mut spans,
+            crate::sidebar_icons::Icon::Pause.glyph(tier).to_string(),
+            theme.roles.gray,
+        );
+    }
+    // The state's own mark, in the desktop's own order. A session parked on the
+    // reader answers them, so it outranks everything; then the clock of a
+    // message waiting for its hour; then the mark the state itself carries. A
+    // row with something unread, a failure, or nothing to report draws none of
+    // them, which is what keeps the dots below unambiguous.
+    if awaiting {
+        push(
+            &mut spans,
+            crate::sidebar_icons::Icon::Attention
+                .glyph(tier)
+                .to_string(),
+            theme.roles.warning,
+        );
+    } else if scheduled.is_some() {
+        push(
+            &mut spans,
+            crate::sidebar_icons::Icon::Clock.glyph(tier).to_string(),
+            theme.roles.gray,
+        );
+    } else if !unread && !failed && state != AgentSessionState::Idle {
+        // The ring turns only while the Agent is being asked to work, and it is
+        // the one mark that moves: a session continuing itself wears it in the
+        // success colour, which is how the desktop says auto-continue without a
+        // word. A session that is over — archived, or closed — wears the quiet
+        // dot instead, which is the mark the desktop gives it.
+        match state {
+            AgentSessionState::Running | AgentSessionState::Initializing => {
+                let frames = crate::glyphs::activity_ring_frames(tier);
+                let phase = app.animation_phase / crate::glyphs::ACTIVITY_RING_TICKS_PER_FRAME;
+                let frame = crate::glyphs::frame_at(frames, phase, 1).to_string();
+                let color = if app.auto_continue.is_enabled(&session.id) {
+                    theme.roles.accent_success
+                } else {
+                    theme.roles.accent_running
+                };
+                push(&mut spans, frame, color);
+            }
+            AgentSessionState::Archived | AgentSessionState::Closed => {
+                push(
+                    &mut spans,
+                    crate::glyphs::state_marker("idle", tier).to_string(),
+                    theme.roles.gray_dim,
+                );
+            }
+            _ => {}
+        }
+    }
+    // The countdown is this client's own: the desktop's ring can say *that* a
+    // session will continue itself, and a cell can say when.
+    if let Some(seconds) = app.auto_continue.countdown_seconds(&session.id) {
+        push(
+            &mut spans,
+            format!("↻{seconds}"),
+            theme.roles.accent_attention,
+        );
+    }
+    // The hour, or the word for a state that has no hour worth reading. The
+    // desktop gates the whole pair on the row being neither pinned, nor parked
+    // on the reader, nor working: each of those has a mark of its own to the
+    // right, and a time beside it would be a second answer to the same question.
+    let chip = match state {
+        AgentSessionState::Initializing => Some(strings.sidebar_state_initializing()),
+        AgentSessionState::Archived => Some(strings.sidebar_state_archived()),
+        _ => None,
+    };
+    if !row.pinned && !awaiting && !generating {
+        if let Some(chip) = chip {
+            push(&mut spans, chip.to_string(), theme.roles.gray);
+        } else if !unread && !failed && !paused {
+            push(
+                &mut spans,
+                session_time_label(session, scheduled, strings, now_ms),
+                theme.roles.gray,
+            );
+        }
+    }
+    if unread {
+        push(
+            &mut spans,
+            crate::glyphs::unread_marker(tier).to_string(),
+            theme.roles.accent_user,
+        );
+    }
+    if failed {
+        push(
+            &mut spans,
+            crate::glyphs::state_marker("failed", tier).to_string(),
+            theme.roles.danger,
+        );
+    }
+    if row.pinned {
+        push(
+            &mut spans,
+            crate::sidebar_icons::Icon::Pin.glyph(tier).to_string(),
+            theme.roles.warning,
+        );
+    }
+    let width = spans_width(&spans);
+    SessionStatusColumn { spans, width }
+}
+
+/// When a session last said anything, or how long until its message goes, in
+/// the desktop's own words.
+///
+/// The desktop reads a row's hour as a wall clock — `14:32` today, the word for
+/// yesterday, a count of days, then weeks, and a date once it is older than a
+/// month — so the list separates "this morning" from "last week" by the clock
+/// the reader already knows rather than by an age they have to subtract. A
+/// session with a message waiting reads as the time left to wait instead, which
+/// is the one question that row is asking.
+fn session_time_label(
+    session: &vibex_core::AgentSession,
+    scheduled_at_ms: Option<i64>,
+    strings: Strings,
+    now_ms: i64,
+) -> String {
+    if let Some(at_ms) = scheduled_at_ms {
+        return crate::schedule::format_schedule_countdown(at_ms.saturating_sub(now_ms));
+    }
+    relative_time_label(session.last_message_at_ms, now_ms, strings)
+}
+
+/// A session's row: the Agent's mark, its title, what it last did, and the
+/// column at its right end.
+///
+/// The left edge belongs to the Agent that answers for the row — the same mark
+/// the desktop puts there — and the right end belongs to the hour, or to the
+/// buttons while the reader is on the row. It is the desktop's layout, cell for
+/// cell: a terminal has no room to invent a third arrangement.
 #[allow(clippy::too_many_arguments)]
 fn session_row_lines(
     row: &vibex_desktop_model::AgentSidebarRow,
@@ -1725,8 +2210,8 @@ fn session_row_lines(
     selected: bool,
     hovered: bool,
     hovered_control: Option<Intent>,
-    time: Option<&String>,
-    time_column: usize,
+    status: Option<&SessionStatusColumn>,
+    status_column: usize,
     width: usize,
     app: &App,
     theme: &TuiTheme,
@@ -1742,7 +2227,11 @@ fn session_row_lines(
         Some(band) => Style::default().fg(colour).bg(band),
         None => Style::default().fg(colour),
     };
-    let title_style = paint(theme.roles.foreground);
+    let title_style = if selected {
+        paint(theme.roles.foreground).add_modifier(Modifier::BOLD)
+    } else {
+        paint(theme.roles.foreground)
+    };
     let dim_style = paint(if selected {
         theme.roles.text_secondary
     } else {
@@ -1752,111 +2241,65 @@ fn session_row_lines(
         Some(band) => Style::default().bg(band),
         None => Style::default(),
     };
-    let bar_style = Style::default()
-        .fg(theme.roles.accent_user)
-        .add_modifier(Modifier::BOLD);
-    let bar_style = match band {
-        Some(band) => bar_style.bg(band),
-        None => bar_style,
-    };
+    let bar_style = paint(theme.roles.accent_user).add_modifier(Modifier::BOLD);
     let bar = if row.delegated {
-        // A child row spends the selection bar's column on the mark that says
-        // it hangs under the session above it; the selection is the row's band.
+        // A child row spends the selection bar's column on the mark that says it
+        // hangs under the session above it; the selection is the row's band.
         crate::glyphs::child_marker(tier)
     } else if selected {
         crate::glyphs::accent_bar(tier)
     } else {
         " "
     };
-    let state_mark = session.map(|session| {
-        (
-            session_state_mark(session.state, tier),
-            state_marker_colour(session.state, theme),
-        )
-    });
-    let icon_style = match (band, state_mark) {
-        (Some(band), Some((_, colour))) => Style::default().fg(colour).bg(band),
-        (None, Some((_, colour))) => Style::default().fg(colour),
-        _ => title_style,
-    };
-    let icon = state_mark.map(|(mark, _)| mark).unwrap_or(" ");
-    let badges = session_row_badges(row, session, selected, app, theme);
-    let badge_width = spans_width(&badges);
-    let badge_block = if badges.is_empty() {
-        0
-    } else {
-        badge_width + 2
-    };
-    // What the row draws at its right end when it is not being acted on: the
-    // age, right-aligned in the room the controls would take, so the two can
-    // trade places without the row's edge moving.
-    let time_block = time.filter(|_| time_column > 0).map(|time| {
-        format!(
-            " {}{time}",
-            " ".repeat(time_column.saturating_sub(display_width(time)))
-        )
-    });
-    let time_block_width = time_block.as_deref().map(display_width).unwrap_or(0);
-    // A row whose right end is counting down is waiting on something the reader
-    // set, so it is drawn as the clock it is rather than as the muted age of a
-    // session that has gone quiet.
-    let time_style =
-        if session.is_some_and(|session| app.next_scheduled_message_at(&session.id).is_some()) {
-            paint(theme.roles.accent_attention)
-        } else {
-            dim_style
-        };
-    // The row's own controls are drawn only while the row is the reader's: the
-    // selected row, or the one the pointer is on. They take the age's place at
-    // the right edge, and the age is not drawn under them: two answers to
-    // "when" and "act on this" in one column would be one too many.
-    let active = selected || hovered;
-    // The right end of the row keeps room for whichever of the two is wider,
-    // *on every row* and not only on the row being acted on: a title that grew
-    // when the pointer landed on it would rewrite the list under the reader's
-    // hand, and the columns of the list would stop lining up.
-    let control_block = SESSION_ROW_CONTROL_AIR
-        + session_row_control_width(app, Intent::BeginRenameSession)
-        + SESSION_ROW_CONTROL_GAP
-        + session_row_control_width(app, Intent::DeleteSession);
-    let reserved = time_block_width.max(control_block);
-    let control_labels = if active {
-        session_row_control_label(app, Intent::BeginRenameSession)
-            .zip(session_row_control_label(app, Intent::DeleteSession))
-    } else {
-        None
-    };
     let indent = usize::from(row.depth) * SESSION_ROW_INDENT;
-    // A session that delegated work carries a disclosure before its title, the
-    // way a heading does: it is the one mark that says the rows under it are
-    // this session's, and it is a control whether or not the row is selected.
-    let disclosure = (row.child_count > 0).then(|| crate::glyphs::disclosure(!row.collapsed, tier));
-    let disclosure_width = usize::from(disclosure.is_some());
-    let text_width = width
-        .saturating_sub(indent)
-        .saturating_sub(SESSION_ROW_LEAD)
-        .saturating_sub(disclosure_width)
-        .saturating_sub(reserved)
-        .saturating_sub(badge_block);
+    // The Agent's mark, in the slot every row opens with. A terminal that cannot
+    // hold a picture, or an Agent with no brand mark, leaves the cells blank and
+    // names the Agent after the title instead — the answer this branch exists to
+    // give, and never a half-drawn one.
+    let identity = session.map(|session| app.session_agent_identity(session));
+    let mark_color = theme.roles.foreground;
+    let drawable = app.terminal_images.supports_pixels()
+        && crate::theme::color_rgb(mark_color).is_some()
+        && identity
+            .as_deref()
+            .is_some_and(|identity| vibex_brands::agent_mark(identity).is_some());
     let mut spans = vec![
         Span::styled(" ".repeat(indent), blank_style),
         Span::styled(format!("{bar} "), bar_style),
-        Span::styled(format!("{icon} "), icon_style),
     ];
-    if let Some(disclosure) = disclosure {
-        let disclosure_style = paint(if row.collapsed {
-            theme.roles.gray
-        } else {
-            theme.roles.accent_user
-        });
-        spans.push(Span::styled(disclosure.to_string(), disclosure_style));
-        controls.push(SessionRowControl {
+    if drawable && let Some(identity) = identity.as_deref() {
+        marks.push(SessionRowMark {
             line: 0,
-            column: (indent + SESSION_ROW_LEAD) as u16,
-            width: 1,
-            intent: Intent::ToggleChildBranch,
+            column: row_icon_column(indent),
+            mark: crate::row_marks::Mark::Agent(identity.to_string()),
+            color: mark_color,
         });
     }
+    spans.push(Span::styled(
+        " ".repeat(usize::from(crate::row_marks::MARK_COLS)),
+        blank_style,
+    ));
+    spans.push(Span::styled(" ", blank_style));
+    // The buttons the row offers while the reader is on it, and the room they
+    // need at the row's right end whether or not they are drawn. The trailing
+    // button is the last to go when the terminal is too narrow to hold the five,
+    // so delete is never the one that disappears.
+    let buttons = session_row_buttons(width, indent);
+    let action_block = if buttons.is_empty() {
+        0
+    } else {
+        icon_cluster_width(buttons.len()) + ROW_CONTROL_AIR
+    };
+    let reserved = status_column.max(action_block);
+    // A session that delegated work carries a disclosure after its title, the
+    // way a heading does: it is the one mark that says the rows under it are
+    // this session's, and it is a control whether or not the row is selected. It
+    // keeps its cell on every row, so the titles of a list end together.
+    let text_width = width
+        .saturating_sub(indent)
+        .saturating_sub(SESSION_ROW_LEAD)
+        .saturating_sub(SESSION_ROW_DISCLOSURE)
+        .saturating_sub(reserved);
     // The name a session that exists only to wait for its scheduled message
     // comes from that message until the send actually leaves the queue, so the
     // manager's default `<agent> session` title never labels the wait.
@@ -1866,46 +2309,10 @@ fn session_row_lines(
     let title = truncate_to_width(&label, text_width, "…");
     let mut text_used = display_width(&title);
     spans.push(Span::styled(title, title_style));
-    // Who is answering, when the title has left room for it: which Agent a
-    // session runs on is how a reader tells two similarly named rows apart.
-    //
-    // A terminal that can hold a picture is handed the Agent's brand mark
-    // instead of its name — the same answer without the reading — and every
-    // other terminal keeps the name, which is always known. The mark is two
-    // cells wide against the name's however-many, so the room it needs is the
-    // one thing that differs between the two branches.
-    let identity = session.map(|session| app.session_agent_identity(session));
-    let mark_width = u16::from(crate::agent_logo::AGENT_LOGO_COLS);
-    // The mark is only worth spending the cells on when it can actually be
-    // drawn: the terminal has to hold a picture, the Agent has to have a mark,
-    // and a *themed* mark needs a foreground colour to be drawn in — a terminal
-    // in a palette tier that resolves no RGB has none. Every one of those
-    // failures falls back to the name, which is the answer this branch exists to
-    // give, so the reserved cells are never left blank.
-    let mark = identity.as_deref().filter(|identity| {
-        app.terminal_images.supports_pixels()
-            && vibex_brands::agent_mark(identity).is_some_and(|mark| {
-                !mark.uses_current_color
-                    || crate::theme::color_rgb(theme.roles.foreground).is_some()
-            })
-            && text_used + 3 + usize::from(mark_width) <= text_width
-    });
-    if let Some(identity) = mark {
-        let column = indent + SESSION_ROW_LEAD + disclosure_width + text_used + 3;
-        spans.push(Span::styled(" · ", dim_style));
-        // The cells the mark covers are painted blank so nothing shows through
-        // around it: a picture sits above the text layer, not instead of it.
-        spans.push(Span::styled(
-            " ".repeat(usize::from(mark_width)),
-            blank_style,
-        ));
-        text_used += 3 + usize::from(mark_width);
-        marks.push(SessionRowMark {
-            line: 0,
-            column: column as u16,
-            identity: identity.to_string(),
-        });
-    } else {
+    // Who is answering, when the title has left room for it and the row has no
+    // mark to say it with. Which Agent a session runs on is how a reader tells
+    // two similarly named rows apart.
+    if !drawable {
         let subtitle = session
             .map(|session| app.session_agent_label(session))
             .unwrap_or_default();
@@ -1920,81 +2327,98 @@ fn session_row_lines(
         " ".repeat(text_width.saturating_sub(text_used)),
         blank_style,
     ));
-    if !badges.is_empty() {
-        spans.push(Span::styled("  ", blank_style));
-        spans.extend(badges);
+    let disclosure_column = indent + SESSION_ROW_LEAD + text_width;
+    if row.child_count > 0 {
+        let colour = if row.collapsed {
+            theme.roles.gray
+        } else {
+            theme.roles.accent_user
+        };
+        spans.push(Span::styled(
+            crate::glyphs::disclosure(!row.collapsed, tier).to_string(),
+            paint(colour),
+        ));
+        controls.push(SessionRowControl {
+            line: 0,
+            column: disclosure_column as u16,
+            width: 1,
+            intent: Intent::ToggleChildBranch,
+        });
+    } else {
+        spans.push(Span::styled(" ", blank_style));
     }
-    if let Some((rename, delete)) = control_labels {
-        // The pair ends at the edge the age would have ended at, so a row being
-        // acted on does not move its right end. Each control is one span, so the
-        // whole target lights when the pointer is on it rather than only the
-        // character under it, and the column between the two belongs to neither.
-        let control_start =
-            indent + SESSION_ROW_LEAD + text_width + badge_block + (reserved - control_block);
-        let resting = || paint(theme.roles.gray_bright);
-        let lit = |accent: ratatui::style::Color| {
-            Style::default()
-                .fg(theme.roles.background)
-                .bg(accent)
-                .add_modifier(Modifier::BOLD)
-        };
-        let rename_style = if hovered_control == Some(Intent::BeginRenameSession) {
-            lit(theme.roles.accent_user)
-        } else {
-            resting()
-        };
-        let delete_style = if hovered_control == Some(Intent::DeleteSession) {
-            lit(theme.roles.danger)
-        } else {
-            resting()
-        };
-        // The pad is what right-aligns the pair in the room the age would have
-        // used; the air is the gap the pointer can rest in without choosing.
+    // The row's own buttons, while the row is the reader's: the selected row, or
+    // the one the pointer is on. They take the status column's place at the
+    // right edge, and the hour is not drawn under them: two answers to "when"
+    // and "act on this" in one column would be one too many.
+    let active = selected || hovered;
+    if active && !buttons.is_empty() {
+        let start = disclosure_column + SESSION_ROW_DISCLOSURE;
+        let pad = reserved.saturating_sub(action_block) + ROW_CONTROL_AIR;
+        spans.push(Span::styled(" ".repeat(pad), blank_style));
+        let mut column = start + pad;
+        for (index, (icon, intent)) in buttons.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(" ".repeat(ROW_CONTROL_GAP), blank_style));
+                column += ROW_CONTROL_GAP;
+            }
+            let lit = hovered_control == Some(*intent);
+            let colour = if lit {
+                theme.roles.background
+            } else {
+                action_colour(*icon, theme)
+            };
+            let style = if lit {
+                Style::default()
+                    .fg(theme.roles.background)
+                    .bg(action_colour(*icon, theme))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                paint(colour)
+            };
+            let mut slot = row_icon_slot(
+                *icon,
+                icon_drawable(app, colour),
+                tier,
+                colour,
+                style,
+                blank_style,
+                0,
+                column as u16,
+                marks,
+            );
+            spans.append(&mut slot);
+            controls.push(SessionRowControl {
+                line: 0,
+                column: column as u16,
+                width: crate::row_marks::MARK_COLS,
+                intent: *intent,
+            });
+            column += icon_button_width();
+        }
+    } else if let Some(status) = status {
         spans.push(Span::styled(
-            " ".repeat(reserved - control_block + SESSION_ROW_CONTROL_AIR),
+            " ".repeat(reserved.saturating_sub(status.width)),
             blank_style,
         ));
-        let rename_width = display_width(&rename);
-        spans.push(Span::styled(rename, rename_style));
-        spans.push(Span::styled(
-            " ".repeat(SESSION_ROW_CONTROL_GAP),
-            blank_style,
-        ));
-        let delete_width = display_width(&delete);
-        spans.push(Span::styled(delete, delete_style));
-        controls.push(SessionRowControl {
-            line: 0,
-            column: (control_start + SESSION_ROW_CONTROL_AIR) as u16,
-            width: rename_width as u16,
-            intent: Intent::BeginRenameSession,
-        });
-        controls.push(SessionRowControl {
-            line: 0,
-            column: (control_start
-                + SESSION_ROW_CONTROL_AIR
-                + rename_width
-                + SESSION_ROW_CONTROL_GAP) as u16,
-            width: delete_width as u16,
-            intent: Intent::DeleteSession,
-        });
-    } else if let Some(time) = time_block {
-        // The age is right-aligned in the room the controls would have used, so
-        // it keeps the edge of the row whatever the row is doing.
-        spans.push(Span::styled(
-            " ".repeat(reserved - time_block_width),
-            blank_style,
-        ));
-        spans.push(Span::styled(time, time_style));
+        // The status column keeps the row's band, so a selected row is one
+        // object rather than a band with a bare patch at its right end.
+        spans.extend(
+            status
+                .spans
+                .iter()
+                .map(|span| Span::styled(span.content.clone(), span.style.patch(blank_style))),
+        );
     }
     let mut lines = vec![Line::from(spans)];
     // The second line is what the session last did, and nothing else: the
-    // workspace is the heading the row already sits under, so a row with
-    // nothing to report stays one line rather than repeating its directory.
+    // workspace is the heading the row already sits under, so a row with nothing
+    // to report stays one line rather than repeating its directory.
     if let Some(session) = session {
         let pending = session.state == vibex_core::AgentSessionState::NeedsInput;
-        // What the line says, and whether it is news the reader has to act on:
-        // a session blocked on them says so even when this client has not seen
-        // it say anything yet.
+        // What the line says, and whether it is news the reader has to act on: a
+        // session blocked on them says so even when this client has not seen it
+        // say anything yet.
         let (text, actionable) = match app.session_echo(&session.id) {
             Some(echo) if pending => (format!("{}: {echo}", strings.pending()), true),
             Some(echo) => (echo.to_string(), false),
@@ -2002,22 +2426,20 @@ fn session_row_lines(
             None => (String::new(), false),
         };
         if !text.is_empty() {
-            let budget = width.saturating_sub(indent + 4 + disclosure_width);
+            let budget = width.saturating_sub(indent + SESSION_ROW_LEAD);
             let style = if actionable {
                 paint(theme.roles.warning)
             } else {
                 dim_style
             };
-            // The mark under the title stands in the column the title's own
-            // mark took: the indent comes first, exactly as it does above, and
-            // the text then opens under the title it belongs to. Drawn before
-            // the indent, a nested row's rail broke in two at every level. A
-            // disclosure shifts the title by its own column, so the line under
-            // it follows.
+            // The mark under the title stands in the column the title's own mark
+            // took: the indent comes first, exactly as it does above, and the
+            // text then opens under the title it belongs to. Drawn before the
+            // indent, a nested row's rail broke in two at every level.
             let lead = format!(
                 "{}{bar}{}",
                 " ".repeat(indent),
-                " ".repeat(3 + disclosure_width)
+                " ".repeat(SESSION_ROW_LEAD - 1)
             );
             let text = truncate_to_width(&text, budget, "…");
             // What the echo does not reach keeps the band: the row is one
@@ -2034,111 +2456,38 @@ fn session_row_lines(
     lines
 }
 
-/// What a row's control says: the chord that runs it, in the spelling the key
-/// bar and the help page use.
+/// The buttons a session row offers, dropping the leading ones a narrow
+/// terminal cannot hold.
 ///
-/// A terminal has no tooltip to hover, so the key *is* the label — a mark that
-/// does not name the key would only be a puzzle the reader has to solve in the
-/// help page. An intent nobody has bound has nothing to name, so it gets no
-/// control at all rather than an empty target.
-fn session_row_control_label(app: &App, intent: Intent) -> Option<String> {
-    app.keymap
-        .chord_for_in(Scope::Sessions, intent)
-        .map(|chord| chord.display())
+/// The title keeps two thirds of the row whatever else is drawn, so the cluster
+/// is cut from the front: the verbs a reader is most likely to want on a narrow
+/// screen are the ones nearest the title's end, and delete — the one that cannot
+/// be undone — is the last to go.
+fn session_row_buttons(width: usize, indent: usize) -> Vec<(crate::sidebar_icons::Icon, Intent)> {
+    let available = width
+        .saturating_sub(indent)
+        .saturating_sub(SESSION_ROW_LEAD)
+        .saturating_sub(SESSION_ROW_DISCLOSURE)
+        .min(width / 3)
+        .saturating_sub(ROW_CONTROL_AIR);
+    let mut buttons = SESSION_ROW_ACTIONS.to_vec();
+    while !buttons.is_empty() && icon_cluster_width(buttons.len()) > available {
+        buttons.remove(0);
+    }
+    buttons
 }
 
-/// The same control's width, without building what it draws: the row measures
-/// its controls on every row, including the rows that do not draw them.
-fn session_row_control_width(app: &App, intent: Intent) -> usize {
-    session_row_control_label(app, intent)
-        .map(|label| display_width(&label))
-        .unwrap_or(0)
-}
-
-/// The marks a session row carries: whether it is waiting on a scheduled send,
-/// whether it is pinned, whether it is unread, and whether it is going to
-/// continue itself.
-fn session_row_badges(
-    row: &vibex_desktop_model::AgentSidebarRow,
-    session: Option<&vibex_core::AgentSession>,
-    selected: bool,
-    app: &App,
-    theme: &TuiTheme,
-) -> Vec<Span<'static>> {
-    let tier = app.glyph_tier();
-    let resting = |colour: ratatui::style::Color| Style::default().fg(colour);
-    let mut spans = Vec::new();
-    // The clock leads the marks: a session waiting on a scheduled send is
-    // waiting on something the reader set. The Desktop draws the same mark in
-    // the same place, in place of the state it would otherwise show, and leaves
-    // the counting to the row's time column — saying the number twice in one
-    // row would be one answer too many.
-    if let Some(session) = session
-        && app.next_scheduled_message_at(&session.id).is_some()
-    {
-        spans.push(Span::styled(
-            format!("{} ", crate::glyphs::schedule_marker(tier)),
-            resting(if selected {
-                theme.roles.text_secondary
-            } else {
-                theme.roles.accent_attention
-            }),
-        ));
-    }
-    if row.pinned {
-        spans.push(Span::styled(
-            format!("{} ", crate::glyphs::pin_marker(tier)),
-            resting(theme.roles.gray_bright),
-        ));
-    }
-    if session.is_some_and(|session| app.session_is_unread(&session.id)) {
-        spans.push(Span::styled(
-            format!("{} ", crate::glyphs::unread_marker(tier)),
-            resting(if selected {
-                theme.roles.text_secondary
-            } else {
-                theme.roles.accent_attention
-            }),
-        ));
-    }
-    if let Some(session) = session
-        && let Some(label) = auto_continue_label(app, &session.id)
-    {
-        let counting = app.auto_continue.countdown_seconds(&session.id).is_some();
-        spans.push(Span::styled(
-            format!("{label} "),
-            resting(if selected {
-                theme.roles.text_secondary
-            } else if counting {
-                theme.roles.accent_attention
-            } else {
-                theme.roles.accent_success
-            }),
-        ));
-    }
-    spans
-}
-
-/// The mark beside a session in the list: a shape per state family, so a
-/// monochrome terminal can tell a failed session from a running one.
-fn session_state_mark(
-    state: vibex_core::AgentSessionState,
-    tier: crate::glyphs::GlyphTier,
-) -> &'static str {
-    match state {
-        vibex_core::AgentSessionState::Running => crate::glyphs::state_marker("running", tier),
-        vibex_core::AgentSessionState::NeedsInput => crate::glyphs::state_marker("waiting", tier),
-        vibex_core::AgentSessionState::Error => crate::glyphs::state_marker("failed", tier),
-        vibex_core::AgentSessionState::Archived => crate::glyphs::state_marker("archived", tier),
-        vibex_core::AgentSessionState::Initializing => crate::glyphs::diamond_dotted(tier),
-        // A legacy console has one `o`, and the unread mark is already wearing
-        // it: an idle session keeps the dot its row used before rather than
-        // saying "something new" with the same shape.
-        vibex_core::AgentSessionState::Idle => match tier {
-            crate::glyphs::GlyphTier::Full => crate::glyphs::diamond_hollow(tier),
-            crate::glyphs::GlyphTier::Legacy => crate::glyphs::state_marker("idle", tier),
-        },
-        _ => crate::glyphs::diamond_hollow(tier),
+/// The colour one of a session row's buttons wears.
+///
+/// Delete is the danger colour and archive is the attention one, which is the
+/// distinction a reader has to be able to make without reading: everything else
+/// acts on the session, and those two end it or put it away.
+fn action_colour(icon: crate::sidebar_icons::Icon, theme: &TuiTheme) -> ratatui::style::Color {
+    match icon {
+        crate::sidebar_icons::Icon::Delete => theme.roles.danger,
+        crate::sidebar_icons::Icon::Archive => theme.roles.accent_attention,
+        crate::sidebar_icons::Icon::Resume => theme.roles.accent_success,
+        _ => theme.roles.accent_user,
     }
 }
 
@@ -2173,18 +2522,37 @@ fn trim_spans(spans: Vec<Span<'static>>, budget: usize) -> Vec<Span<'static>> {
     kept
 }
 
-/// The auto-continue mark for one row: `↻` when the session will continue
-/// itself, `↻3` while it counts down, and nothing when it will not.
-fn auto_continue_label(app: &App, session_id: &vibex_core::VibexSessionId) -> Option<String> {
-    if let Some(seconds) = app.auto_continue.countdown_seconds(session_id) {
-        return Some(format!("↻{seconds}"));
+/// The mark beside a session in a list that is not the session list: a shape
+/// per state family, so a monochrome terminal can tell a failed session from a
+/// running one.
+///
+/// The session list itself no longer uses this: its rows carry the desktop's
+/// own status column, where the state is a ring, a question mark, a clock or a
+/// dot. The dock that lists a session's delegated workers is a menu rather than
+/// a mirror of the desktop, and keeps the one-character shapes it was built
+/// with.
+fn session_state_mark(
+    state: vibex_core::AgentSessionState,
+    tier: crate::glyphs::GlyphTier,
+) -> &'static str {
+    match state {
+        vibex_core::AgentSessionState::Running => crate::glyphs::state_marker("running", tier),
+        vibex_core::AgentSessionState::NeedsInput => crate::glyphs::state_marker("waiting", tier),
+        vibex_core::AgentSessionState::Error => crate::glyphs::state_marker("failed", tier),
+        vibex_core::AgentSessionState::Archived => crate::glyphs::state_marker("archived", tier),
+        vibex_core::AgentSessionState::Initializing => crate::glyphs::diamond_dotted(tier),
+        // A legacy console has one `o`, and the unread mark is already wearing
+        // it: an idle session keeps the dot its row used before rather than
+        // saying "something new" with the same shape.
+        vibex_core::AgentSessionState::Idle => match tier {
+            crate::glyphs::GlyphTier::Full => crate::glyphs::diamond_hollow(tier),
+            crate::glyphs::GlyphTier::Legacy => crate::glyphs::state_marker("idle", tier),
+        },
+        _ => crate::glyphs::diamond_hollow(tier),
     }
-    app.auto_continue
-        .is_enabled(session_id)
-        .then(|| "↻".to_string())
 }
 
-/// The colour of a state's mark.
+/// The colour of a state's mark, for the lists that draw one per state.
 fn state_marker_colour(
     state: vibex_core::AgentSessionState,
     theme: &TuiTheme,
@@ -2197,25 +2565,40 @@ fn state_marker_colour(
     }
 }
 
-/// How long ago a session last said anything, the way a list of them reads.
+/// When a session last said anything, the way the desktop's list reads it.
 ///
-/// Deliberately coarse: the list separates "just now" from "a while ago", and a
-/// timestamp to the second would be a column of noise. Negative ages are clamped
-/// rather than printed, because a clock that moved backwards is not news.
+/// Deliberately a clock rather than an age: today is the reader's own wall
+/// clock, yesterday is the word for it, and only past that does the label count
+/// — days, then weeks, then a date. A reader scanning the column is asking
+/// "when", and `14:32` answers it without the arithmetic step `3h` asks for. The
+/// comparison is by calendar date rather than by elapsed hours, which is what
+/// makes `23:50` read as yesterday at `00:10`.
+///
+/// A timestamp the clock cannot resolve, or one in the future, reads as today:
+/// a clock that moved backwards is not news, and a blank column would be worse
+/// than the hour the runtime reported.
 fn relative_time_label(at_ms: i64, now_ms: i64, strings: Strings) -> String {
-    let elapsed_seconds = ((now_ms - at_ms) / 1_000).max(0);
-    if elapsed_seconds < 60 {
-        return strings.time_just_now().to_string();
+    let local = |ms: i64| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+            .map(|timestamp| timestamp.with_timezone(&chrono::Local).naive_local())
+    };
+    let (Some(then), Some(now)) = (local(at_ms), local(now_ms)) else {
+        return String::new();
+    };
+    let days = now.date().signed_duration_since(then.date()).num_days();
+    if days <= 0 {
+        return then.format("%H:%M").to_string();
     }
-    let minutes = elapsed_seconds / 60;
-    if minutes < 60 {
-        return format!("{minutes}{}", strings.time_minutes());
+    if days == 1 {
+        return strings.sidebar_yesterday().to_string();
     }
-    let hours = minutes / 60;
-    if hours < 24 {
-        return format!("{hours}{}", strings.time_hours());
+    if days < 7 {
+        return format!("{days}{}", strings.time_days_ago());
     }
-    format!("{}{}", hours / 24, strings.time_days())
+    if days < 30 {
+        return format!("{}{}", days / 7, strings.time_weeks_ago());
+    }
+    then.format("%m/%d").to_string()
 }
 
 fn session_state_label(state: vibex_core::AgentSessionState, strings: Strings) -> &'static str {
@@ -3063,6 +3446,31 @@ fn render_status_band(
         compact_path(&location, usize::from(area.width) / 3),
         Style::default().fg(theme.roles.path),
     ));
+    // A button on a session row is a picture, and a picture cannot say what it
+    // does. The band is the one place a terminal has room for the sentence a
+    // tooltip would carry, so the pointer resting on a button puts the verb and
+    // the key that would have run it here, and the location comes back when the
+    // pointer leaves. The key is what the row's controls used to spell out, and
+    // it is the half a reader cannot guess from the icon.
+    if let Some((_, intent)) = app.hovered_row_action {
+        let mut hint = vec![Span::styled(
+            intent.default_label().to_string(),
+            Style::default()
+                .fg(theme.roles.foreground)
+                .add_modifier(Modifier::BOLD),
+        )];
+        if let Some(chord) = app.keymap.chord_for_in(Scope::Sessions, intent) {
+            hint.push(Span::styled(
+                format!(" {}", chord.display()),
+                Style::default().fg(theme.roles.accent_user),
+            ));
+        }
+        hint.push(Span::styled(
+            format!("  {}", strings.sessions_title()),
+            Style::default().fg(theme.roles.gray_dim),
+        ));
+        left = hint;
+    }
 
     // ---- right: the question, while there is one -------------------------
     // The reader's first `Ctrl+C` takes the band rather than joining the end of
@@ -7261,6 +7669,66 @@ fn render_entry_actions(
     frame.render_widget(Paragraph::new(lines), layout.content);
 }
 
+/// The action menu for one project or folder.
+///
+/// Built from the heading rather than from a fixed list, so a verb a heading
+/// cannot perform is never offered — the same reason the desktop builds its own
+/// menu from the row. A destructive verb is drawn in the danger colour, because
+/// the menu is the last moment the reader can see what they are choosing.
+fn render_sidebar_row_actions(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    menu: &crate::sessions::SidebarRowActions,
+    theme: &TuiTheme,
+) {
+    let strings = app.strings;
+    let chrome = modal_chrome(
+        app,
+        &menu.title,
+        ModalSizing::new(40, 56, 36, 4, 2, 1, 0),
+        vec![
+            ModalHint::new("↑↓", strings.hint_nav()),
+            ModalHint::new("Enter", strings.hint_run()),
+            ModalHint::new("Esc", strings.close()),
+        ],
+    );
+    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
+        return;
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (index, action) in menu.actions.iter().enumerate() {
+        let selected = index == menu.selected;
+        // The fold verb is the one whose label depends on the row rather than
+        // on the verb: the reader is being offered the state they are not in.
+        let label = if action.is_fold() && menu.collapsed {
+            strings.sidebar_action_expand()
+        } else {
+            action.label(strings)
+        };
+        let style = if selected {
+            Style::default()
+                .fg(theme.roles.foreground)
+                .bg(theme.roles.surface_highlight)
+                .add_modifier(Modifier::BOLD)
+        } else if action.is_destructive() {
+            Style::default().fg(theme.roles.danger)
+        } else {
+            Style::default().fg(theme.roles.text_secondary)
+        };
+        let marker = if selected { "▸" } else { " " };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{marker} {:<width$}",
+                label,
+                width = usize::from(layout.content.width).saturating_sub(2)
+            ),
+            style,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), layout.content);
+}
+
 fn render_overlay(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -7278,6 +7746,9 @@ fn render_overlay(
         }
         Overlay::EntryActions { entry } => {
             render_entry_actions(frame, area, app, entry, theme);
+        }
+        Overlay::SidebarRowActions(menu) => {
+            render_sidebar_row_actions(frame, area, app, menu, theme);
         }
         Overlay::Palette { query, selected } => {
             let matches = app.palette_entries(query);
@@ -8232,10 +8703,12 @@ fn render_runtime_catalogue(
     }
     // The preview line is the inspector this surface has: what the highlighted
     // entry was last run with, one `Tab` away from being changed. It is only
-    // drawn when there is room for a list above it.
+    // drawn when there is room for a list above it, and it keeps a line of air
+    // under it: the line describes the list, and the keys below are the modal's
+    // rather than its own, so the two must not read as one block.
     let preview = content.height >= 6;
     if preview {
-        content.height -= 1;
+        content.height -= 2;
     }
     let width = usize::from(content.width);
     // The list is laid out as *lines* rather than as rows, because two of the
@@ -8266,8 +8739,12 @@ fn render_runtime_catalogue(
                 line_of_row.push(lines.len());
                 in_group = false;
                 in_section = true;
+                // Flush with the list's left edge, where the rule under it and
+                // the Agents' disclosures are: the title names the section rather
+                // than sitting in one of its rows, and the rows keep the indent
+                // their own markers give them.
                 lines.push(Line::from(Span::styled(
-                    truncate_to_width(&format!("  {}", section.label(&strings)), width, "…"),
+                    truncate_to_width(section.label(&strings), width, "…"),
                     theme.dimmed(theme.roles.gray).add_modifier(Modifier::BOLD),
                 )));
                 row_of_line.push(Some(index));
@@ -8298,7 +8775,8 @@ fn render_runtime_catalogue(
                         SessionRowMark {
                             line: 0,
                             column: 2,
-                            identity,
+                            mark: crate::row_marks::Mark::Agent(identity),
+                            color: theme.roles.foreground,
                         },
                     ));
                 }
@@ -8323,7 +8801,8 @@ fn render_runtime_catalogue(
                         SessionRowMark {
                             line: 0,
                             column,
-                            identity,
+                            mark: crate::row_marks::Mark::Agent(identity),
+                            color: theme.roles.foreground,
                         },
                     ));
                 }
@@ -8396,7 +8875,6 @@ fn render_runtime_catalogue(
     // session list's, a mark on a line scrolled past, or one a terminal too
     // narrow to hold it has pushed out of the list, is not placed at all rather
     // than left standing over the row below.
-    let mark_color = crate::theme::color_rgb(theme.roles.foreground);
     for (line, mark) in &wanted_marks {
         let Some(screen_line) = line.checked_sub(offset) else {
             continue;
@@ -8405,18 +8883,21 @@ fn render_runtime_catalogue(
             continue;
         }
         let column = list_area.x.saturating_add(mark.column);
-        if column + crate::agent_logo::AGENT_LOGO_COLS > list_area.right() {
+        if column + crate::row_marks::MARK_COLS > list_area.right() {
             continue;
         }
         let rect = Rect {
             x: column,
             y: list_area.y.saturating_add(screen_line as u16),
-            width: crate::agent_logo::AGENT_LOGO_COLS,
-            height: crate::agent_logo::AGENT_LOGO_ROWS,
+            width: crate::row_marks::MARK_COLS,
+            height: crate::row_marks::MARK_ROWS,
         };
-        let _ = app
-            .agent_logos
-            .show(&app.terminal_images, &mark.identity, mark_color, rect);
+        let _ = app.row_marks.show(
+            &app.terminal_images,
+            &mark.mark,
+            crate::theme::color_rgb(mark.color),
+            rect,
+        );
     }
     if bar {
         render_scroll_indicator(frame, content, offset, total, theme);
@@ -8489,7 +8970,7 @@ fn runtime_picker_heading_line(
     // A mark is only drawn when the terminal can hold a picture and the Agent
     // has one; the heading's own text is what every other case gets, which is
     // the state this pointer is `None` in.
-    let mark_width = usize::from(crate::agent_logo::AGENT_LOGO_COLS);
+    let mark_width = usize::from(crate::row_marks::MARK_COLS);
     let mark = agent_mark_identity(app, agent_id, label, theme);
     let lead = if *folded { "▸ " } else { "▾ " };
     let mut spans = vec![Span::styled(
@@ -8598,7 +9079,7 @@ fn runtime_picker_entry_line(
     // beside it. Counted from the text's own lead, so the two ends of the row
     // cannot drift apart.
     let mark_width = if mark.is_some() {
-        usize::from(crate::agent_logo::AGENT_LOGO_COLS) + 1
+        usize::from(crate::row_marks::MARK_COLS) + 1
     } else {
         0
     };
@@ -8643,7 +9124,7 @@ fn runtime_picker_entry_line(
         // The cells the mark covers are painted blank so nothing shows through
         // around it: a picture sits above the text layer, not instead of it.
         spans.push(Span::styled(
-            " ".repeat(usize::from(crate::agent_logo::AGENT_LOGO_COLS)),
+            " ".repeat(usize::from(crate::row_marks::MARK_COLS)),
             theme.base(),
         ));
         spans.push(Span::styled(" ", theme.base()));
@@ -8671,7 +9152,8 @@ fn runtime_picker_entry_line(
 
 /// The preview of the highlighted entry: how it would run, and where that is
 /// changed. Drawn under the list rather than in it, so it cannot be mistaken for
-/// a row.
+/// a row, and centred: it answers for the row the cursor is on, and the middle
+/// of the width under the list is where a caption of the list sits.
 fn runtime_picker_preview(
     app: &App,
     option: Option<&vibex_core::SessionRuntimeOption>,
@@ -8694,15 +9176,18 @@ fn runtime_picker_preview(
     let body = app
         .run_option_values(&selection)
         .unwrap_or_else(|| strings.runtime_default().to_string());
-    let text = format!(
-        "{}: {body} · {}",
-        strings.runtime_run_options(),
-        strings.runtime_summary_hint()
+    // The values name themselves, and the words that introduced them cost the
+    // row the room the last value needs on a narrow terminal.
+    let text = truncate_to_width(
+        &format!("{body} · {}", strings.runtime_summary_hint()),
+        width,
+        "…",
     );
-    Line::from(Span::styled(
-        truncate_to_width(&text, width, "…"),
-        theme.dimmed(theme.roles.gray),
-    ))
+    let air = width.saturating_sub(display_width(&text)) / 2;
+    Line::from(vec![
+        Span::raw(" ".repeat(air)),
+        Span::styled(text, theme.dimmed(theme.roles.gray)),
+    ])
 }
 
 /// The run options of the entry the picker is on, each row showing what is in
@@ -8718,28 +9203,91 @@ fn render_runtime_options(
     let strings = app.strings;
     // The caption names the entry the rows belong to: the reader may have picked
     // it a moment ago, and the page's own selection catches up a round trip
-    // later.
+    // later. It carries the same facts the catalogue's own rows carry — whose
+    // account serves the entry, and which model it is — with the Agent as the
+    // mark those rows wear: "DeepSeek Harness · bai · model" is one name too
+    // many under a mark that already says the first, and the account is the fact
+    // the catalogue cannot leave out and this line was.
     let (agent, model) = app.picker_runtime_labels();
+    let option = app
+        .picker_selection()
+        .and_then(|selection| app.runtime_option_for(&selection))
+        .cloned();
+    let auth = option
+        .as_ref()
+        .map(|option| runtime_option_auth_label(&strings, option))
+        .unwrap_or_default();
+    let mark = option.as_ref().and_then(|option| {
+        agent_mark_identity(app, &option.selection.agent_id, &option.agent_label, theme)
+    });
     let mut content = content;
-    if content.height > 1 {
-        let caption = if model.is_empty() {
+    // Two rows: the caption, and the air under it. What the rows below are *of*
+    // has to be read before them, and a caption that touches them reads as their
+    // first row.
+    if content.height > 2 {
+        let facts = [auth, model]
+            .into_iter()
+            .filter(|fact| !fact.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let caption = if mark.is_some() || agent.is_empty() {
+            facts
+        } else if facts.is_empty() {
             agent
         } else {
-            format!("{agent} · {model}")
+            format!("{agent} · {facts}")
         };
+        let mut spans = Vec::new();
+        let mut lead = 0usize;
+        if mark.is_some() {
+            // The cells the mark covers are painted blank so nothing shows
+            // through around it: a picture sits above the text layer, not
+            // instead of it. One column of air parts it from the caption.
+            spans.push(Span::styled(
+                " ".repeat(usize::from(crate::row_marks::MARK_COLS)),
+                theme.base(),
+            ));
+            spans.push(Span::styled(" ", theme.base()));
+            lead = usize::from(crate::row_marks::MARK_COLS) + 1;
+        }
+        spans.push(Span::styled(
+            truncate_to_width(
+                &caption,
+                usize::from(content.width).saturating_sub(lead),
+                "…",
+            ),
+            theme.dimmed(theme.roles.gray),
+        ));
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncate_to_width(&caption, usize::from(content.width), "…"),
-                theme.dimmed(theme.roles.gray),
-            ))),
+            Paragraph::new(Line::from(spans)),
             Rect {
                 height: 1,
                 ..content
             },
         );
+        // The mark goes where the Agent's name would have started, which is what
+        // "instead of the text" means for a picture: the same place, drawn, not
+        // written.
+        if let Some(identity) = mark {
+            let rect = Rect {
+                x: content.x,
+                y: content.y,
+                width: crate::row_marks::MARK_COLS,
+                height: crate::row_marks::MARK_ROWS,
+            };
+            let color = crate::theme::color_rgb(theme.roles.foreground);
+            let _ = app.row_marks.show(
+                &app.terminal_images,
+                &crate::row_marks::Mark::Agent(identity),
+                color,
+                rect,
+            );
+        }
+        // The air under the caption: it is what the rows below are *of*, and the
+        // two must not read as one list.
         content = Rect {
-            y: content.y + 1,
-            height: content.height - 1,
+            y: content.y + 2,
+            height: content.height - 2,
             ..content
         };
     }
@@ -8898,10 +9446,31 @@ pub fn locked_seat_help(strings: Strings) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::glyphs::GlyphTier;
     use crate::locale::Locale;
 
     fn strings() -> Strings {
         Strings::for_locale(crate::locale::Locale::En)
+    }
+
+    /// One session, for the row builders that need something to describe.
+    fn a_session(id: &str, title: &str) -> vibex_core::AgentSession {
+        vibex_core::AgentSession {
+            id: vibex_core::VibexSessionId::parse(id).expect("valid session id"),
+            title: title.to_string(),
+            project_id: vibex_core::ProjectId::parse("project_view0001").expect("valid project id"),
+            workspace_id: vibex_core::WorkspaceId::new(),
+            workspace_root: "/repo/view".to_string(),
+            workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+            agent_id: vibex_core::AgentId::parse("claude").expect("valid agent id"),
+            state: vibex_core::AgentSessionState::Idle,
+            safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            last_message_at_ms: 0,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        }
     }
 
     #[test]
@@ -9086,5 +9655,177 @@ mod tests {
                 "at {columns} columns the helper and the band disagree"
             );
         }
+    }
+
+    /// The session list reads a row's hour the way the desktop's sidebar does.
+    ///
+    /// Deliberately a clock rather than an age: the column answers "when", and
+    /// a reader who has to subtract an age to get there has been given an
+    /// arithmetic problem instead of an answer. Past a month even the day stops
+    /// mattering and the date is what the row says.
+    #[test]
+    fn the_list_reads_a_session_hour_the_way_the_desktop_does() {
+        let strings = Strings::for_locale(Locale::En);
+        let now = vibex_core::unix_timestamp_ms();
+        const DAY: i64 = 24 * 60 * 60 * 1_000;
+        let today = relative_time_label(now - 90 * 60 * 1_000, now, strings);
+        assert_eq!(today.len(), 5, "today is not a wall clock: {today:?}");
+        assert_eq!(&today[2..3], ":", "today is not a wall clock: {today:?}");
+        assert_eq!(
+            relative_time_label(now - DAY, now, strings),
+            strings.sidebar_yesterday(),
+            "yesterday is not named"
+        );
+        assert_eq!(
+            relative_time_label(now - 3 * DAY, now, strings),
+            format!("3{}", strings.time_days_ago())
+        );
+        assert_eq!(
+            relative_time_label(now - 10 * DAY, now, strings),
+            format!("1{}", strings.time_weeks_ago())
+        );
+        let old = relative_time_label(now - 40 * DAY, now, strings);
+        assert_eq!(old.len(), 5, "an old session is not a date: {old:?}");
+        assert_eq!(&old[2..3], "/", "an old session is not a date: {old:?}");
+        // A clock that moved backwards is not news, and a blank column would be
+        // worse than the hour the runtime reported.
+        assert_eq!(
+            relative_time_label(now + DAY, now, strings),
+            relative_time_label(now, now, strings),
+            "a future timestamp is not read as today"
+        );
+    }
+
+    /// The trailing column of a session row is the desktop's, mark for mark:
+    /// the ring of a session still working, the question mark of one parked on
+    /// the reader, the clock of one waiting on a send, the dot of one with
+    /// something new, and the hour for everything quiet.
+    #[test]
+    fn a_session_row_says_its_state_in_the_desktop_s_own_marks() {
+        use vibex_core::AgentSessionState;
+        let strings = Strings::for_locale(Locale::En);
+        let theme = TuiTheme::resolve(
+            Some("vibex-dark"),
+            vibex_ui::GpuiThemeMode::Dark,
+            crate::theme::ColorCapability {
+                mode: crate::theme::ColorMode::TrueColor,
+                glyphs: crate::theme::GlyphMode::Unicode,
+            },
+        );
+        let mut app = App::new(
+            vibex_backend::DisconnectedBackend::facade(),
+            crate::app::AppOptions::default(),
+        );
+        let now = vibex_core::unix_timestamp_ms();
+        let mut session = a_session("session_status0001", "quiet");
+        session.last_message_at_ms = now;
+        /// The row the column is built for.
+        fn a_row(
+            session: &vibex_core::AgentSession,
+            state: AgentSessionState,
+        ) -> vibex_desktop_model::AgentSidebarRow {
+            vibex_desktop_model::AgentSidebarRow {
+                id: format!("session:{}", session.id.as_str()),
+                kind: vibex_desktop_model::AgentSidebarRowKind::Session,
+                project_id: session.project_id.as_str().to_string(),
+                workspace_id: session.workspace_id.as_str().to_string(),
+                session_id: Some(session.id.clone()),
+                label: session.title.clone(),
+                depth: 1,
+                pinned: false,
+                selected: false,
+                collapsed: false,
+                state: Some(state),
+                delegated: false,
+                child_count: 0,
+                parent_id: None,
+            }
+        }
+        /// The status column one state draws, as text.
+        fn status_text(
+            app: &App,
+            theme: &TuiTheme,
+            strings: Strings,
+            session: &vibex_core::AgentSession,
+            state: AgentSessionState,
+            pinned: bool,
+            now: i64,
+        ) -> String {
+            let mut described = session.clone();
+            described.state = state;
+            let mut row = a_row(session, state);
+            row.pinned = pinned;
+            let column = session_status_column(&row, Some(&described), app, theme, strings, now);
+            column
+                .spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        }
+        macro_rules! text_of {
+            ($state:expr) => {
+                status_text(&app, &theme, strings, &session, $state, false, now)
+            };
+        }
+        // A quiet session says when it last spoke, and nothing else.
+        let idle = text_of!(AgentSessionState::Idle);
+        assert_eq!(idle.len(), 5, "a quiet row is not its hour: {idle:?}");
+        // A working one turns the ring instead, because the hour of a session
+        // in the middle of a turn is not the question its row is asking.
+        let running = text_of!(AgentSessionState::Running);
+        assert!(
+            crate::glyphs::activity_ring_frames(GlyphTier::Full).contains(&running.as_str()),
+            "a working row does not turn the ring: {running:?}"
+        );
+        // A session parked on the reader asks, and the question outranks the
+        // clock.
+        assert_eq!(
+            text_of!(AgentSessionState::NeedsInput),
+            crate::sidebar_icons::Icon::Attention
+                .glyph(GlyphTier::Full)
+                .to_string()
+        );
+        // A failure is the danger mark, and the row keeps no hour beside it.
+        assert_eq!(
+            text_of!(AgentSessionState::Error),
+            crate::glyphs::state_marker("failed", GlyphTier::Full).to_string()
+        );
+        // A session still starting up wears the ring and says `INIT` beside it:
+        // the Agent has been asked and has not answered, and the word is what
+        // separates that from a turn that is genuinely under way.
+        assert_eq!(
+            text_of!(AgentSessionState::Initializing),
+            format!(
+                "{} {}",
+                crate::glyphs::activity_ring_frames(GlyphTier::Full)[0],
+                strings.sidebar_state_initializing()
+            ),
+            "a starting session does not say so"
+        );
+        // Something new is a dot beside whatever the row already said, and the
+        // pin owns the column's trailing slot.
+        app.unread_sessions.insert(session.id.as_str().to_string());
+        let unread = text_of!(AgentSessionState::Idle);
+        assert!(
+            unread.ends_with(crate::glyphs::unread_marker(GlyphTier::Full)),
+            "an unread row is not dotted: {unread:?}"
+        );
+        app.unread_sessions.clear();
+        let pinned_text = status_text(
+            &app,
+            &theme,
+            strings,
+            &session,
+            AgentSessionState::Idle,
+            true,
+            now,
+        );
+        assert_eq!(
+            pinned_text,
+            crate::sidebar_icons::Icon::Pin
+                .glyph(GlyphTier::Full)
+                .to_string(),
+            "a pinned row does not end in its pin: {pinned_text:?}"
+        );
     }
 }

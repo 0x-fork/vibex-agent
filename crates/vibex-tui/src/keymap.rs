@@ -506,6 +506,15 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::NewSession,
         "New session",
     ),
+    // A heading's own verbs live behind one key, the way the desktop keeps them
+    // behind its action button: a project and a folder each have four or five,
+    // and none of them means anything on a session row.
+    binding(
+        Scope::Sessions,
+        Chord::plain(KeyCode::Char('m')),
+        Intent::SidebarRowActions,
+        "Heading actions",
+    ),
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char('/')),

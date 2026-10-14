@@ -20,6 +20,107 @@ use vibex_desktop_model::{
     sidebar_project_items_for_workspace, sidebar_root_items, sort_sidebar_sessions,
 };
 
+use crate::locale::Strings;
+
+/// One thing a project's or a folder's action button offers.
+///
+/// The desktop builds the same list from the row it was opened on: a project
+/// can start a session, hold a new folder, fold, or be deleted; a folder can do
+/// those and be renamed as well. What a row can do is therefore a property of
+/// the row, which is why the menu is built from the row rather than kept as one
+/// list with the impossible entries disabled — a reader should not have to read
+/// past a verb that was never going to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarRowAction {
+    /// Start a session that opens in the row's own directory.
+    NewSession,
+    /// Make a folder inside this heading.
+    NewFolder,
+    /// Rename a folder.
+    RenameFolder,
+    /// Fold the heading shut, or open it again.
+    ToggleCollapse,
+    /// Delete a project and everything filed under it.
+    DeleteProject,
+    /// Delete a folder, keeping the sessions it held.
+    DeleteFolder,
+}
+
+impl SidebarRowAction {
+    /// What the menu row says.
+    pub const fn label(self, strings: Strings) -> &'static str {
+        match self {
+            Self::NewSession => strings.sidebar_action_new_session(),
+            Self::NewFolder => strings.sidebar_action_new_folder(),
+            Self::RenameFolder => strings.sidebar_action_rename_folder(),
+            Self::ToggleCollapse => strings.sidebar_action_collapse(),
+            Self::DeleteProject => strings.sidebar_action_delete_project(),
+            Self::DeleteFolder => strings.sidebar_action_delete_folder(),
+        }
+    }
+
+    /// Whether the action is a label that has to say "open" rather than "fold".
+    pub const fn is_fold(self) -> bool {
+        matches!(self, Self::ToggleCollapse)
+    }
+
+    /// Whether the action cannot be undone, so it is drawn as a warning and
+    /// asks before it runs.
+    pub const fn is_destructive(self) -> bool {
+        matches!(self, Self::DeleteProject | Self::DeleteFolder)
+    }
+
+    /// The actions a heading offers, in the order the desktop's own menu lists
+    /// them.
+    ///
+    /// A folder no project owns cannot hold a session, so it is not offered one
+    /// — the same rule the desktop's folder row follows when it hides its own
+    /// new-session button.
+    pub fn for_heading(
+        kind: vibex_desktop_model::AgentSidebarRowKind,
+        project_scoped: bool,
+    ) -> Vec<Self> {
+        use vibex_desktop_model::AgentSidebarRowKind;
+        match kind {
+            AgentSidebarRowKind::Project => vec![
+                Self::NewSession,
+                Self::NewFolder,
+                Self::ToggleCollapse,
+                Self::DeleteProject,
+            ],
+            AgentSidebarRowKind::Folder => {
+                let mut actions = Vec::new();
+                if project_scoped {
+                    actions.push(Self::NewSession);
+                }
+                actions.extend([
+                    Self::NewFolder,
+                    Self::RenameFolder,
+                    Self::ToggleCollapse,
+                    Self::DeleteFolder,
+                ]);
+                actions
+            }
+            AgentSidebarRowKind::Session => Vec::new(),
+        }
+    }
+}
+
+/// The columns of a heading's action menu, and where the reader is in it.
+///
+/// The heading travels with the menu by id rather than by position: a list
+/// refresh that lands while the menu is open must not make the choice act on
+/// whichever heading took the cursor's place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarRowActions {
+    pub title: String,
+    pub row_id: String,
+    pub actions: Vec<SidebarRowAction>,
+    /// Whether the heading is folded shut, so the fold verb says "expand".
+    pub collapsed: bool,
+    pub selected: usize,
+}
+
 /// A project as the list draws it: the name the sidebar shows and the age the
 /// ordering falls back to when the reader has not arranged projects by hand.
 #[derive(Debug, Clone, PartialEq, Eq)]

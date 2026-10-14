@@ -86,6 +86,7 @@ intents! {
     ToggleShowArchived => { scope: Sessions, id: "session_show_archived", label: "Archived", help: "Include archived sessions in the list." },
     ToggleSessionCard => { scope: Sessions, id: "session_card_toggle", label: "Details", help: "Open or close the selected session's detail card." },
     CollapseSessionCards => { scope: Sessions, id: "session_card_collapse", label: "Close cards", help: "Close every open session detail card." },
+    SidebarRowActions => { scope: Sessions, id: "sidebar_row_actions", label: "Actions", help: "Open everything the highlighted project or folder can do." },
     ToggleChildBranch => { scope: Sessions, id: "session_children_toggle", label: "Sub-sessions", help: "Fold or unfold the selected session's delegated sub-sessions." },
     CopySessionRow => { scope: Sessions, id: "session_copy", label: "Copy", help: "Copy the selected session's details to the clipboard." },
     PinSession => { scope: Sessions, id: "session_pin", label: "Pin", help: "Keep the selected session above the rest of the list." },

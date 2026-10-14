@@ -148,10 +148,45 @@ strings! {
     session_chip_idle => { "idle", "空闲", "閒置" },
     session_chip_failed => { "failed", "失败", "失敗" },
     queue_released => { "Held message sent", "排队消息已发出", "排隊訊息已發出" },
+    // The session list reads a row's hour the way the desktop's sidebar does: a
+    // wall clock today, then a count of days, then weeks. The suffix carries its
+    // own leading space, because the number is formatted in front of it and
+    // Chinese needs no space where English does.
     time_just_now => { "now", "刚刚", "剛剛" },
     time_minutes => { "m", "分钟", "分鐘" },
     time_hours => { "h", "小时", "小時" },
     time_days => { "d", "天", "天" },
+    time_days_ago => { " days ago", " 天前", " 天前" },
+    time_weeks_ago => { " weeks ago", " 周前", " 週前" },
+    sidebar_yesterday => { "Yesterday", "昨天", "昨天" },
+    // The word beside a project's running count, which the desktop keeps at the
+    // row's far edge.
+    sidebar_running => { "running", "运行中", "執行中" },
+    // The words the desktop puts in a session row's status column when the state
+    // has no hour worth reading.
+    sidebar_state_initializing => { "INIT", "初始化", "初始化" },
+    sidebar_state_archived => { "ARCHIVED", "已归档", "已封存" },
+    // What a project's or a folder's action button opens.
+    sidebar_row_actions => { "Actions", "操作", "操作" },
+    sidebar_action_new_session => { "New session", "新建会话", "建立會話" },
+    sidebar_action_new_folder => { "New folder", "新建文件夹", "新增資料夾" },
+    sidebar_action_rename_folder => { "Rename folder", "重命名文件夹", "重新命名資料夾" },
+    sidebar_action_collapse => { "Collapse", "折叠", "摺疊" },
+    sidebar_action_expand => { "Expand", "展开", "展開" },
+    sidebar_action_delete_project => { "Delete project", "删除项目", "刪除專案" },
+    sidebar_action_delete_folder => { "Delete folder", "删除文件夹", "刪除資料夾" },
+    sidebar_folder_name_placeholder => { "Folder name", "文件夹名称", "資料夾名稱" },
+    sidebar_folder_name_empty => { "Enter a folder name.", "请输入文件夹名称。", "請輸入資料夾名稱。" },
+    sidebar_confirm_delete_project => {
+        "Delete this project and every session in it?",
+        "删除该项目及其中的所有会话？",
+        "刪除該專案及其中的所有工作階段？"
+    },
+    sidebar_confirm_delete_folder => {
+        "Delete this folder? Its sessions are kept.",
+        "删除该文件夹？其中的会话会保留。",
+        "刪除該資料夾？其中的工作階段會保留。"
+    },
     session_untitled => { "untitled session", "未命名会话", "未命名工作階段" },
     // The one line a terminal notification carries. It names what happened,
     // never what was said: the notification layer prepends the Agent's name so

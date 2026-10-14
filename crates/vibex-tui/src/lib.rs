@@ -21,6 +21,8 @@
 //! keymap    one binding table per scope: dispatch + key bar + help
 //! layout    the screen as a vertical stack of full-width bands
 //! glyphs    the chrome glyph vocabulary, with per-terminal fallbacks
+//! sidebar_icons the session list's icon vocabulary: SVG for a picture, a character otherwise
+//! row_marks the pictures a row holds, pooled by image id
 //! modal     the one chrome every popup is drawn through
 //! notify    what the terminal is told when a session needs the reader
 //! onboarding what to do first, in order, until it is done
@@ -42,7 +44,6 @@
 //! ```
 
 pub mod action;
-pub mod agent_logo;
 pub mod app;
 pub mod attachment;
 pub mod auto_continue;
@@ -65,6 +66,7 @@ pub mod pairing_qr;
 pub mod preview;
 pub mod queue_prefs;
 pub mod reduce;
+pub mod row_marks;
 pub mod run;
 pub mod runtime_picker;
 pub mod runtime_prefs;
@@ -73,6 +75,7 @@ pub mod scramble;
 pub mod search;
 pub mod sessions;
 pub mod settings;
+pub mod sidebar_icons;
 mod team;
 pub mod terminal;
 pub mod terminal_clipboard;

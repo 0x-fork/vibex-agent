@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use vibex_backend::DomainCapabilities;
 use vibex_backend::{BackendCapabilitySnapshot, BackendFacade, BackendOperation, BackendResult};
-use vibex_core::{AgentSession, RemoteDeviceDetail, VibexSessionId};
+use vibex_core::{AgentSession, AgentSessionState, RemoteDeviceDetail, VibexSessionId};
 use vibex_desktop_model::{SidebarState, TimelineRow};
 use vibex_ui::shell::{CompactNavigation, GlobalDestination, SessionDestination, ShellKind};
 use vibex_ui::{AgentWorkflowController, ManagementWorkflowController};
@@ -269,6 +269,13 @@ pub enum Overlay {
         body: String,
         scroll: usize,
     },
+    /// The actions one project or folder offers, chosen from a list.
+    ///
+    /// A heading's verbs are a property of the heading — a project can be
+    /// deleted and a folder can be renamed, and a folder no project owns cannot
+    /// hold a session at all — so the menu is built from the row rather than
+    /// kept as one list with the impossible entries disabled.
+    SidebarRowActions(crate::sessions::SidebarRowActions),
 }
 
 /// The elicitation form the reader is filling in: the question, and where the
@@ -326,6 +333,26 @@ pub enum PromptField {
     ImagePath,
     /// A run option the Agent publishes as free text rather than as a list.
     RunOptionValue,
+    /// The name of a folder a heading is about to hold.
+    NewFolderName,
+    /// The new name of a folder the reader made.
+    RenameFolderName,
+}
+
+/// Where a folder a prompt is naming belongs.
+///
+/// The heading travels with the prompt rather than being read back from the
+/// cursor when the name is submitted: a list refresh that lands while the reader
+/// is typing must not file the folder under whichever heading took the cursor's
+/// place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderPromptTarget {
+    /// The folder being renamed, or `None` when one is being made.
+    pub folder_id: Option<String>,
+    pub project_id: Option<String>,
+    pub workspace_id: Option<String>,
+    /// The folder the new folder goes inside, when the heading is itself one.
+    pub parent_folder_id: Option<String>,
 }
 
 /// Which run option a row of the switcher, or a value list, is about.
@@ -900,6 +927,14 @@ pub struct App {
     /// the cursor's index, so an answer that arrives after a refresh still
     /// names the record the question was asked about.
     pub pending_config_action: Option<(String, crate::config_center::ConfigAction)>,
+    /// The heading a menu action was chosen for, waiting for the question that
+    /// guards it. It is carried as the row's own id and the verb rather than as
+    /// the cursor's index, for the same reason the record above is: a list that
+    /// refreshed while the question was up must not answer it against a
+    /// different heading.
+    pub pending_sidebar_action: Option<(String, crate::sessions::SidebarRowAction)>,
+    /// Where a folder the reader is naming belongs, while the prompt is up.
+    pub pending_folder_prompt: Option<FolderPromptTarget>,
     pub selection: BTreeMap<Scope, usize>,
     pub filter: String,
     pub filtering: bool,
@@ -1151,12 +1186,12 @@ pub struct App {
     /// The code the pairing page put on the terminal, and the escapes the run
     /// loop still has to write for it. See [`crate::pairing_qr`].
     pub pairing_qr: crate::pairing_qr::PairingQr,
-    /// The Agent brand marks the session list put on the terminal, and the
-    /// escapes the run loop still has to write for them. See
-    /// [`crate::agent_logo`]: a terminal that speaks an image protocol draws a
-    /// real mark where one will not, and every other terminal keeps the Agent's
-    /// name.
-    pub agent_logos: crate::agent_logo::AgentLogos,
+    /// The pictures the session list put on the terminal — an Agent's brand
+    /// mark, and the icon a row's button wears — and the escapes the run loop
+    /// still has to write for them. See [`crate::row_marks`]: a terminal that
+    /// speaks an image protocol draws the real mark, and every other terminal
+    /// draws the character the same vocabulary carries.
+    pub row_marks: crate::row_marks::RowMarks,
     /// A transient message above the composer, dismissed on the next key.
     pub banner: Option<Banner>,
     /// When the running turn started, for the elapsed-time readout.
@@ -1702,6 +1737,8 @@ impl App {
             config_center: crate::config_center::ConfigCenter::default(),
             device_center: crate::device_center::DeviceCenter::default(),
             pending_config_action: None,
+            pending_sidebar_action: None,
+            pending_folder_prompt: None,
             selection: BTreeMap::new(),
             filter: String::new(),
             filtering: false,
@@ -1780,7 +1817,7 @@ impl App {
             terminal_images: crate::terminal_image::ImageSupport::detect(),
             picture: crate::preview::PlacedPicture::default(),
             pairing_qr: crate::pairing_qr::PairingQr::default(),
-            agent_logos: crate::agent_logo::AgentLogos::default(),
+            row_marks: crate::row_marks::RowMarks::default(),
             banner: None,
             turn_started: None,
             turn_readout: crate::turn::TurnReadout::default(),
@@ -5492,6 +5529,15 @@ impl App {
         // no answer block at all never folds: hiding the work under a divider
         // with nothing below it would lose the only record of the turn.
         let mut conclusion: HashMap<String, usize> = HashMap::new();
+        // The turn's first process row: while the section is open it draws the
+        // title above the work, the way the desktop's own header does. It is
+        // the row the reader meets first, so it is the one that names the turn
+        // — the answer's divider names it only while the work is hidden.
+        let mut head: HashMap<String, usize> = HashMap::new();
+        // The Agent each turn ran on, as the string its brand mark is matched
+        // against. Read once per turn from the attribution the projection
+        // wrote, so every row of the turn draws the same mark.
+        let mut identity: HashMap<String, Option<String>> = HashMap::new();
         for turn in &turns {
             if !turn.complete && !turn.superseded {
                 // A still-running turn keeps its work visible: the rows
@@ -6909,6 +6955,66 @@ impl App {
             || self.authority_unread_sessions.contains(session_id.as_str())
     }
 
+    /// How many sessions a heading holds that are working right now.
+    ///
+    /// Counted from the sessions the client holds rather than from the rows it
+    /// drew, so a folded heading still reports the work going on inside it —
+    /// the same rule the page's own tally follows. It deliberately ignores the
+    /// list's filter, because the mark is a fact about the project rather than
+    /// about the view of it: the desktop's own running count does the same.
+    ///
+    /// An empty `project_id` is a heading nothing is filed under — a folder no
+    /// project owns — and has no sessions to count.
+    pub fn sidebar_running_count(&self, project_id: &str, workspace_id: &str) -> usize {
+        if project_id.is_empty() {
+            return 0;
+        }
+        let sessions = self
+            .agent
+            .state
+            .sessions
+            .value
+            .as_deref()
+            .unwrap_or_default();
+        sessions
+            .iter()
+            .filter(|session| {
+                session.deleted_at_ms.is_none()
+                    && matches!(
+                        session.state,
+                        AgentSessionState::Running | AgentSessionState::Initializing
+                    )
+                    && session.project_id.as_str() == project_id
+                    && (workspace_id.is_empty() || session.workspace_id.as_str() == workspace_id)
+            })
+            .count()
+    }
+
+    /// The directory a session started from a heading's own button would open
+    /// in: the project's checkout where the runtime has published one.
+    ///
+    /// The composing page already knows what to do with a workspace it is
+    /// handed — it names it, and a session created from the page opens there —
+    /// so a heading's "new session" is that page with the directory already
+    /// chosen, rather than a second way to create a session.
+    pub fn project_workspace_root(&self, project_id: &str, workspace_id: &str) -> Option<String> {
+        if project_id.is_empty() {
+            return None;
+        }
+        self.workspace_rows
+            .iter()
+            .find(|summary| {
+                summary.project.id.as_str() == project_id
+                    && (workspace_id.is_empty() || summary.workspace.id.as_str() == workspace_id)
+            })
+            .or_else(|| {
+                self.workspace_rows
+                    .iter()
+                    .find(|summary| summary.project.id.as_str() == project_id)
+            })
+            .map(|summary| summary.workspace.root_path.clone())
+    }
+
     /// The title of a session by id, when the client has listed it.
     pub fn session_title(&self, session_id: &VibexSessionId) -> Option<String> {
         self.agent
@@ -8125,6 +8231,14 @@ pub enum Effect {
     DeleteSession {
         session_id: VibexSessionId,
     },
+    /// Delete a project and everything filed under it.
+    ///
+    /// The runtime owns the record, so the write goes through the workspace
+    /// backend rather than through the sidebar arrangement: a project is not an
+    /// item of the tree, it is the thing the tree hangs from.
+    DeleteProject {
+        project_id: String,
+    },
     ForkSession {
         request_id: VibexSessionId,
         session_id: VibexSessionId,
@@ -8346,6 +8460,7 @@ impl Effect {
             Effect::ArchiveSession { .. } => "archive_session",
             Effect::UnarchiveSession { .. } => "unarchive_session",
             Effect::DeleteSession { .. } => "delete_session",
+            Effect::DeleteProject { .. } => "delete_project",
             Effect::ForkSession { .. } => "fork_session",
             Effect::ReadClipboard { .. } => "read_clipboard",
             Effect::SendMessage { .. } => "send_message",

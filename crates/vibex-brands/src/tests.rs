@@ -105,3 +105,33 @@ fn a_mark_rasters_to_a_square_png() {
 fn a_themed_mark_without_a_colour_is_no_picture() {
     assert_eq!(mark_png(mark!("agents/cursor.svg", true), 32, None), None);
 }
+
+/// A client with icons of its own gets the same rasterizer: the bytes it
+/// carries are turned into a square PNG in the colour it asks for, without the
+/// brand table being involved at all.
+#[cfg(feature = "raster")]
+#[test]
+fn any_svg_becomes_a_square_png() {
+    let svg = themed_svg(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 4h16v16H4z" fill="currentColor"/></svg>"#,
+        Some(0x33_99ff),
+    )
+    .expect("a colour to draw in");
+    let png = svg_png(&svg, 40).expect("a well-formed SVG should render");
+    let decoded = image::load_from_memory(&png).expect("the bytes are a PNG");
+    assert_eq!((decoded.width(), decoded.height()), (40, 40));
+    // The colour asked for is the colour drawn, which is the whole reason the
+    // keyword is rewritten before the parse.
+    let pixel = decoded.to_rgba8().get_pixel(20, 20).0;
+    assert_eq!(&pixel[..3], &[0x33, 0x99, 0xff]);
+}
+
+/// SVG text that is not drawable is `None` rather than a panic, so a caller
+/// falls back to a glyph instead of taking the frame down.
+#[cfg(feature = "raster")]
+#[test]
+fn undrawable_svg_is_refused() {
+    assert_eq!(svg_png("not an svg at all", 32), None);
+    assert_eq!(svg_png("", 32), None);
+    assert_eq!(svg_png("<svg/>", 0), None);
+}

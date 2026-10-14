@@ -1162,6 +1162,28 @@ impl Dispatch {
                     Err(error) => self.failure("delete_session", error),
                 }
             }
+            Effect::DeleteProject { project_id } => {
+                // The id comes from a row the runtime published, so a project
+                // whose id does not parse is one this client invented rather
+                // than one the runtime can be asked about. It is refused here
+                // instead of travelling as a request the runtime would have to
+                // reject.
+                let Some(project_id) = vibex_core::ProjectId::parse(&project_id).ok() else {
+                    self.failure(
+                        "delete_project",
+                        vibex_backend::BackendError::unsupported(
+                            "invalid_project_id",
+                            "the project id is not one the runtime published",
+                        ),
+                    );
+                    return;
+                };
+                let request = MutationRequest::new(project_id);
+                match self.facade.workspace().delete_project(request).await {
+                    Ok(()) => self.ok("delete_project"),
+                    Err(error) => self.failure("delete_project", error),
+                }
+            }
             Effect::ForkSession {
                 request_id,
                 session_id,

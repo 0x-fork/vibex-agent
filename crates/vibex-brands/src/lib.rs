@@ -131,9 +131,22 @@ pub fn marks() -> impl Iterator<Item = (&'static str, &'static [u8])> {
 /// draw — a caller falls back to the Agent's name, which is always known.
 #[cfg(feature = "raster")]
 pub fn mark_png(mark: Mark, size: u32, current_color: Option<u32>) -> Option<Vec<u8>> {
+    let svg = mark_svg(mark, current_color)?;
+    svg_png(&svg, size)
+}
+
+/// A square PNG of any SVG text, for a client that carries its own icons.
+///
+/// [`mark_png`] answers "what does this Agent look like"; this answers "what
+/// does this picture look like", for a caller whose marks are not brands — the
+/// terminal's own chrome, whose icons are the desktop pack's. Rasterization is
+/// the same in both cases, so it lives here once rather than being copied into
+/// every client that has a picture to draw.
+#[cfg(feature = "raster")]
+pub fn svg_png(svg: &str, size: u32) -> Option<Vec<u8>> {
     use image::ImageEncoder;
 
-    let pixels = mark_rgba(mark, size, current_color)?;
+    let pixels = svg_rgba(svg, size)?;
     let mut png = Vec::new();
     image::codecs::png::PngEncoder::new(&mut png)
         .write_image(&pixels, size, size, image::ExtendedColorType::Rgba8)
@@ -148,14 +161,23 @@ pub fn mark_png(mark: Mark, size: u32, current_color: Option<u32>) -> Option<Vec
 /// just encoded.
 #[cfg(feature = "raster")]
 pub fn mark_rgba(mark: Mark, size: u32, current_color: Option<u32>) -> Option<Vec<u8>> {
+    let svg = mark_svg(mark, current_color)?;
+    svg_rgba(&svg, size)
+}
+
+/// Any SVG text rendered to straight RGBA pixels, `size` by `size`.
+///
+/// The mark is fitted into the square and centred, so a picture that is not
+/// square keeps its proportions rather than being stretched into the box.
+#[cfg(feature = "raster")]
+pub fn svg_rgba(svg: &str, size: u32) -> Option<Vec<u8>> {
     use resvg::usvg;
 
     if size == 0 {
         return None;
     }
-    let bytes = mark_svg(mark, current_color)?;
     let options = usvg::Options::default();
-    let tree = usvg::Tree::from_data(bytes.as_bytes(), &options).ok()?;
+    let tree = usvg::Tree::from_data(svg.as_bytes(), &options).ok()?;
     let source = tree.size();
     let (source_width, source_height) = (source.width(), source.height());
     if !source_width.is_finite() || !source_height.is_finite() {
@@ -164,8 +186,8 @@ pub fn mark_rgba(mark: Mark, size: u32, current_color: Option<u32>) -> Option<Ve
     if source_width <= 0.0 || source_height <= 0.0 {
         return None;
     }
-    // Fit and centre: the smaller ratio keeps the whole mark inside the square,
-    // and the leftover goes to one side each so the mark sits in the middle of
+    // Fit and centre: the smaller ratio keeps the whole picture inside the
+    // square, and the leftover goes to one side each so it sits in the middle of
     // the cell the terminal gives it.
     let target = size as f32;
     let scale = (target / source_width).min(target / source_height);
@@ -191,9 +213,20 @@ pub fn mark_svg(mark: Mark, current_color: Option<u32>) -> Option<String> {
     if !mark.uses_current_color {
         return Some(source.to_string());
     }
+    themed_svg(source, current_color)
+}
+
+/// SVG text with `currentColor` resolved to `current_color`.
+///
+/// usvg resolves `currentColor` while parsing and leaves no way to set it
+/// afterwards, so a themed picture is rewritten before it is parsed. `None`
+/// when there is no colour to resolve to, which is the caller's signal to draw
+/// something else rather than a black blob.
+#[cfg(feature = "raster")]
+pub fn themed_svg(svg: &str, current_color: Option<u32>) -> Option<String> {
     let color = current_color?;
     let hex = format!("#{:06x}", color & 0x00ff_ffff);
-    Some(source.replace("currentColor", &hex))
+    Some(svg.replace("currentColor", &hex))
 }
 
 include!("mark_table.rs");

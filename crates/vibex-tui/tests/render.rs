@@ -11,6 +11,7 @@ use ratatui::backend::TestBackend;
 use vibex_backend::DisconnectedBackend;
 use vibex_tui::app::{App, AppOptions, Page};
 use vibex_tui::keymap::Scope;
+use vibex_tui::sidebar_icons::Icon;
 use vibex_tui::theme::{ColorCapability, ColorMode, GlyphMode};
 use vibex_tui::{Locale, SeatKind, Strings};
 
@@ -977,18 +978,34 @@ fn a_pinned_row_names_the_agent_and_how_it_ran() {
     );
     // The line under the list answers for the row the cursor is on, with the
     // values themselves: the option's name is the run-option view's vocabulary,
-    // and repeating it here doubles the line to say "High" twice over.
-    let preview = screen
-        .lines()
-        .find(|line| line.contains("Run options:"))
+    // and repeating it here doubles the line to say "High" twice over. It is
+    // centred — it is a caption of the list, not a row of it — and the air under
+    // it keeps it off the keys, which are the modal's rather than its own.
+    let lines: Vec<&str> = screen.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.contains("Tab edits"))
         .unwrap_or_else(|| panic!("the preview line is not on screen:\n{screen}"));
+    let preview = modal_interior(lines[at]);
+    let text = preview.trim();
     assert!(
-        preview.contains("Run options: High"),
+        text.starts_with("High ·"),
         "the preview does not name the value in effect: {preview:?}"
     );
     assert!(
-        !preview.contains("Thinking depth"),
-        "the preview repeats the option's name: {preview:?}"
+        !preview.contains("Thinking depth") && !preview.contains("Run options"),
+        "the preview repeats the words the row above it already says: {preview:?}"
+    );
+    // Both ends count the modal's own padding, so equal air is centred air.
+    let left = preview.len() - preview.trim_start().len();
+    let right = preview.len() - left - text.len();
+    assert!(
+        left.abs_diff(right) <= 1,
+        "the preview is not centred under the list: {preview:?}"
+    );
+    assert!(
+        is_modal_air(lines[at + 1]),
+        "the preview is not parted from the keys below it:\n{screen}"
     );
 }
 
@@ -1036,13 +1053,13 @@ fn a_pinned_row_wears_its_agents_mark_where_the_terminal_can_draw_one() {
     assert!(
         lead.trim_start().starts_with("bal")
             && lead.len() - lead.trim_start().len()
-                == usize::from(vibex_tui::agent_logo::AGENT_LOGO_COLS) + 1,
+                == usize::from(vibex_tui::row_marks::MARK_COLS) + 1,
         "the pinned row did not keep the mark's columns: {row:?}"
     );
     // And the mark really is on the terminal, not only reserved: the escapes
     // that put it there are queued for the run loop after the frame.
     assert!(
-        app.agent_logos.is_holding(),
+        app.row_marks.is_holding(),
         "the mark was reserved but never handed to the terminal:\n{screen}"
     );
     let control = String::from_utf8(app.take_terminal_control()).expect("escapes are text");
@@ -1124,6 +1141,66 @@ fn the_catalogue_parts_the_pinned_sections_from_the_agents() {
     assert!(
         is_modal_air(&lines[headings[1] - 1]),
         "two Agents' groups are not parted by air:\n{screen}"
+    );
+    // The title sits at the list's left edge, where the rule under the sections
+    // starts: it names the section rather than standing in one of its rows, and
+    // a title indented past the rule reads as a row of its own.
+    let title = lines[recent]
+        .find("Recent")
+        .expect("the title is on its line");
+    let rule_column = lines[rule].find('─').expect("the rule is on its line");
+    assert_eq!(
+        title, rule_column,
+        "the section title is not flush with the list:\n{screen}"
+    );
+}
+
+#[test]
+fn the_run_options_caption_wears_the_agents_mark_too() {
+    // The caption names the entry the rows under it belong to, with the same
+    // facts the catalogue's own rows carry: the Agent as the mark it wears, then
+    // the account and the model as names. The air under it keeps it from reading
+    // as the first run-option row — it says what those rows are *of*.
+    let mut app = app(140, 40);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.terminal_images = vibex_tui::terminal_image::ImageSupport::forced(
+        vibex_tui::terminal_image::ImageProtocol::Kitty,
+    );
+    let catalog = run_option_catalog();
+    let desired = catalog.options[1].selection.clone();
+    app.runtime_options = Some(catalog);
+    open_session_on(&mut app, desired);
+    app.show_runtime_picker();
+    app.perform(vibex_tui::action::Intent::OverlayNextField);
+
+    let lines = render(&mut app, 140, 40);
+    let screen = text(&lines);
+    let at = lines
+        .iter()
+        .position(|line| line.contains('│') && line.contains("· gpt-5"))
+        .unwrap_or_else(|| panic!("the caption is not on screen:\n{screen}"));
+    let caption = modal_interior(&lines[at]);
+    assert!(
+        !caption.contains("codex"),
+        "the caption still spells out the Agent the mark says: {caption:?}"
+    );
+    assert_eq!(
+        caption.trim(),
+        "bal · gpt-5",
+        "the caption does not name the account and the model the entry runs on"
+    );
+    assert!(
+        app.row_marks.is_holding(),
+        "the caption's mark was reserved but never handed to the terminal:\n{screen}"
+    );
+    assert!(
+        is_modal_air(&lines[at + 1]),
+        "the caption is not parted from the rows below it:\n{screen}"
+    );
+    assert!(
+        lines[at + 2].contains("Thinking depth"),
+        "the air under the caption pushed the run options off the view:\n{screen}"
     );
 }
 
@@ -2712,7 +2789,7 @@ fn the_session_state_column_lines_up_on_every_row() {
     };
     // Identify these rows by their fixture titles. Relative ages change with
     // the clock and must not decide whether the alignment assertion runs.
-    let columns = (0..40)
+    let rows = (0..40)
         .filter(|row| {
             // Continuation cells of a wide glyph are blank in TestBackend.
             let text = row_text(*row).replace(' ', "");
@@ -2720,16 +2797,57 @@ fn the_session_state_column_lines_up_on_every_row() {
                 .iter()
                 .any(|title| text.contains(title))
         })
-        .filter_map(|row| column_of(&buffer, row, "◇"))
         .collect::<Vec<_>>();
     assert!(
-        columns.len() >= 3,
-        "not every session row was drawn:\n{columns:?}"
+        rows.len() >= 3,
+        "not every session row was drawn:\n{rows:?}"
     );
+    // What the row says about itself is one trailing column: a quiet session's
+    // hour and a working one's ring end in the same cell, so the column reads
+    // down the page however wide the titles are.
+    let edges = rows
+        .iter()
+        .filter_map(|row| {
+            (0..120).rev().find(|column| {
+                buffer
+                    .cell((*column, *row))
+                    .is_some_and(|cell| !cell.symbol().trim().is_empty())
+            })
+        })
+        .collect::<Vec<_>>();
     assert!(
-        columns.windows(2).all(|pair| pair[0] == pair[1]),
-        "the state column is ragged: {columns:?}"
+        edges.windows(2).all(|pair| pair[0] == pair[1]),
+        "the status column is ragged: {edges:?}"
     );
+    // And that edge is the list's: the heading's own buttons are reserved the
+    // same width, so they end there too — within the one cell a two-cell button
+    // leaves blank on a terminal that draws a character instead of a picture.
+    let heading_row = (0..40)
+        .find(|row| row_text(*row).contains("vibex-card-workspace"))
+        .expect("the heading is on screen");
+    let heading_edge = (0..120).rev().find(|column| {
+        buffer
+            .cell((*column, heading_row))
+            .is_some_and(|cell| !cell.symbol().trim().is_empty())
+    });
+    let edge = edges.first().copied().expect("the rows' edge");
+    assert!(
+        heading_edge.is_some_and(|heading| edge.saturating_sub(heading) <= 1),
+        "the heading does not end where its rows do: {heading_edge:?} {edges:?}"
+    );
+    // Nothing in the list reaches past that column: the trailing edge is the
+    // list's, and a row that overran it would be a row the terminal clipped.
+    for row in rows.iter().copied().chain(std::iter::once(heading_row)) {
+        let past = (edge + 1..120).find(|column| {
+            buffer
+                .cell((*column, row))
+                .is_some_and(|cell| !cell.symbol().trim().is_empty())
+        });
+        assert_eq!(
+            past, None,
+            "a row drew past the list's trailing edge on line {row}"
+        );
+    }
     // And the whole row stays inside the frame.
     for row in 0..40 {
         let last = (0..120).rev().find(|column| {
@@ -5173,11 +5291,15 @@ fn a_tool_heavy_turn_stays_a_short_run_of_rows() {
     assert!(app.transcript.toggle_block(control));
     let screen = text(&render(&mut app, 110, 40));
     assert!(screen.contains("session resumed from disk"), "{screen}");
-    // Expanded, the same row is the separator between the work and the answer:
-    // the duration stays centred between rules that reach both margins.
+    // Expanded, the section is bracketed: the duration is the title above the
+    // work, marked open, and the rule below carries the mark that closes it.
     assert!(
-        screen.contains("─ Worked for 1s ─"),
-        "the open fold draws a rule through its label:\n{screen}"
+        screen.contains("▾  Worked for 1s"),
+        "the open fold does not name the turn above its work:\n{screen}"
+    );
+    assert!(
+        screen.contains('▴'),
+        "the open fold has no rule to close it:\n{screen}"
     );
     // Mixed runs report each semantic category, including the changed file.
     assert!(
@@ -5199,6 +5321,76 @@ fn a_tool_heavy_turn_stays_a_short_run_of_rows() {
         app.transcript.total_height() <= 16,
         "the turn costs {} rows",
         app.transcript.total_height()
+    );
+}
+
+#[test]
+fn a_settled_turns_fold_names_the_agent_that_worked() {
+    // The desktop puts the Agent's brand beside the turn's "worked for"
+    // header. The terminal draws the same mark as a picture over the cells the
+    // title reserved, so both clients answer "who worked" with the same face.
+    let session_id = vibex_core::VibexSessionId::new();
+    let mut app = app(110, 40);
+    app.navigate_to(Page::Agent);
+    app.agent.state.selected_session_id = Some(session_id.clone());
+    let mut items = vec![
+        seeded_item(
+            &session_id,
+            1,
+            vibex_core::TimelineItemKind::UserMessage,
+            vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                text: "Check the runner".into(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+        ),
+        seeded_item(
+            &session_id,
+            2,
+            vibex_core::TimelineItemKind::ToolCall,
+            vibex_core::TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+                tool_call_id: "call-0".into(),
+                tool_name: "read_file".into(),
+                status: vibex_core::ToolCallStatus::Completed,
+                summary: String::new(),
+                input_summary: Some("crates/runner/src/lib.rs".into()),
+                output_summary: Some("412 lines".into()),
+                raw_extension: None,
+            }),
+        ),
+        seeded_item(
+            &session_id,
+            3,
+            vibex_core::TimelineItemKind::AgentMessage,
+            vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: "The runner is fine.".into(),
+                is_final: true,
+            }),
+        ),
+    ];
+    for item in &mut items {
+        item.execution_attribution = Some(vibex_core::TurnExecutionAttributionView {
+            agent_label: "codex".into(),
+            auth_source_label: "Agent account".into(),
+            auth_source: None,
+            model_label: "gpt-5".into(),
+        });
+    }
+    app.agent
+        .state
+        .timeline
+        .replace_authoritative(session_id, items);
+    app.sync_transcript();
+    // The mark is a picture, so it is asked for by a terminal that can hold
+    // one — the same rule the session list's own marks follow.
+    app.terminal_images = vibex_tui::terminal_image::ImageSupport::forced(
+        vibex_tui::terminal_image::ImageProtocol::Kitty,
+    );
+    let screen = text(&render(&mut app, 110, 40));
+    assert!(screen.contains("Worked for"), "{screen}");
+    assert!(
+        app.row_marks.is_holding(),
+        "the fold's title carries no Agent mark:\n{screen}"
     );
 }
 
@@ -8274,6 +8466,11 @@ fn the_turn_band_walks_the_sidebar_ring_in_its_own_colour() {
 /// said anything. Order and folders come from the arrangement the desktop
 /// publishes (see the arrangement test below); this one covers the row's own
 /// contents, which are the same either way.
+///
+/// The status column is the desktop's, mark for mark: the ring of a session
+/// still working, the failure mark of one that stopped badly, the dot of one
+/// with something new, and the hour at the row's trailing edge for everything
+/// quiet.
 #[test]
 fn the_session_list_names_the_agent_and_when_it_last_spoke() {
     let now = vibex_core::unix_timestamp_ms();
@@ -8285,11 +8482,21 @@ fn the_session_list_names_the_agent_and_when_it_last_spoke() {
     let mut failed = seeded_session("session_list0003", "the one that failed");
     failed.state = vibex_core::AgentSessionState::Error;
     failed.last_message_at_ms = now - 20 * 1000;
+    // A fourth row nothing has happened to: it is the one that says when a
+    // session last spoke, because every other row has news that displaces the
+    // hour — a ring, a failure, or a mark.
+    let mut quiet = seeded_session("session_list0004", "nothing new here");
+    quiet.last_message_at_ms = now - 40 * 60 * 1000;
 
     let mut app = app(110, 24);
     app.navigate_to(Page::Sessions);
     app.agent
-        .apply_sessions(Ok(vec![running.clone(), idle.clone(), failed.clone()]))
+        .apply_sessions(Ok(vec![
+            running.clone(),
+            idle.clone(),
+            failed.clone(),
+            quiet.clone(),
+        ]))
         .expect("sessions apply");
     // One Agent for all of them: the catalogue is where its name lives.
     app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {
@@ -8303,24 +8510,47 @@ fn the_session_list_names_the_agent_and_when_it_last_spoke() {
     });
     app.unread_sessions.insert(idle.id.as_str().to_string());
     let screen = text(&render(&mut app, 110, 24));
+    let row_of = |needle: &str| {
+        screen
+            .lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no row for {needle:?}:\n{screen}"))
+    };
 
-    // The Agent's name follows the title, and the time it last spoke trails
-    // the row.
+    // The Agent's name follows the title, because this terminal holds no
+    // pictures: the mark column is reserved either way, and the name is the
+    // answer for a terminal that cannot draw the brand.
     assert!(
         screen.contains("fix the flaky test · Claude Code"),
         "the row does not name the Agent answering it:\n{screen}"
     );
-    assert!(screen.contains("3m"), "no relative time:\n{screen}");
-    assert!(screen.contains("5h"), "{screen}");
-    assert!(screen.contains("now"), "{screen}");
-    // The unread mark belongs to the session that has something new, and to no
-    // other row.
-    let unread_row = screen
-        .lines()
-        .find(|line| line.contains("what is this project?"))
-        .expect("the unread session's row");
+    // The hour is the reader's own wall clock, the way the desktop reads it.
+    let clock = |line: &str| {
+        let tail = line.trim_end();
+        let at = tail.len().saturating_sub(5);
+        tail.get(at..).map(str::to_string)
+    };
+    let is_clock = |label: Option<String>| {
+        label.is_some_and(|label| {
+            let bytes = label.as_bytes();
+            bytes.len() == 5
+                && bytes[2] == b':'
+                && bytes[..2].iter().all(u8::is_ascii_digit)
+                && bytes[3..].iter().all(u8::is_ascii_digit)
+        })
+    };
     assert!(
-        unread_row.contains('●'),
+        is_clock(clock(row_of("nothing new here"))),
+        "the quiet row does not end in its hour:\n{screen}"
+    );
+
+    // The unread mark belongs to the session that has something new, and to no
+    // other row — and it takes the hour's place, the way the desktop's own dot
+    // does: a row answers "what is this" or "when", and news is the louder of
+    // the two.
+    let unread_row = row_of("what is this project?");
+    assert!(
+        unread_row.trim_end().ends_with('●'),
         "the unread session is not marked: {unread_row:?}"
     );
     assert_eq!(
@@ -8328,25 +8558,28 @@ fn the_session_list_names_the_agent_and_when_it_last_spoke() {
         1,
         "more than one row claims something new:\n{screen}"
     );
-    // States are told apart by shape as well as by colour — and by shape
-    // *only*: the word is gone from the row, which is what gives the titles
-    // their width back. An idle session is a hollow diamond: alive, and not
-    // working.
-    for mark in ['▶', '✗', '◇'] {
-        assert!(
-            screen.contains(mark),
-            "missing the {mark:?} mark:\n{screen}"
-        );
-    }
+    // States are told apart by shape as well as by colour, in the trailing
+    // column: a session still working turns the ring, one that stopped badly
+    // wears the failure mark, and a failure is the row's last word because it
+    // has no hour worth reading.
+    let running_row = row_of("fix the flaky test");
+    let failed_row = row_of("the one that failed");
+    assert!(
+        vibex_tui::glyphs::activity_ring_frames(vibex_tui::glyphs::GlyphTier::Full)
+            .iter()
+            .any(|frame| running_row.ends_with(frame)),
+        "the working session does not turn the ring: {running_row:?}"
+    );
+    assert!(
+        failed_row.trim_end().ends_with('✗'),
+        "the failed session is not marked: {failed_row:?}"
+    );
     for (title, word) in [
         ("fix the flaky test", "Running"),
         ("the one that failed", "Failed"),
         ("what is this project?", "Idle"),
     ] {
-        let row = screen
-            .lines()
-            .find(|line| line.contains(title))
-            .unwrap_or_else(|| panic!("no row for {title:?}:\n{screen}"));
+        let row = row_of(title);
         assert!(
             !row.contains(word),
             "the state word is back on the row: {row:?}"
@@ -8354,13 +8587,15 @@ fn the_session_list_names_the_agent_and_when_it_last_spoke() {
     }
 }
 
-/// A session row carries the two controls that act on it — rename and delete —
-/// while the reader is on it: the row the cursor is on, and the row under the
-/// pointer. Every other row gives their columns back to its title, and each
-/// control publishes the rect a click would land on, against its own row.
+/// A session row carries the five buttons the desktop's own menu lists — auto
+/// continue, rename, fork, archive and delete — while the reader is on it: the
+/// row the cursor is on, and the row under the pointer. Every other row gives
+/// their columns back to its status column, and each button publishes the rect a
+/// click would land on, against its own row.
 #[test]
 fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
     use vibex_tui::action::Intent;
+    use vibex_tui::sidebar_icons::Icon;
     let now = vibex_core::unix_timestamp_ms();
     let mut first = seeded_session("session_ruler0001", "fix the flaky test");
     first.last_message_at_ms = now;
@@ -8385,62 +8620,100 @@ fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
             .position(|line| line.contains(needle))
             .unwrap_or_else(|| panic!("no row for {needle:?}:\n{screen}"))
     };
+    // The cluster as it is drawn: every icon two cells wide, one column of air
+    // between them, in the desktop's own order.
+    let tier = vibex_tui::glyphs::GlyphTier::Full;
+    let cluster = [
+        Icon::Resume,
+        Icon::Rename,
+        Icon::Fork,
+        Icon::Archive,
+        Icon::Delete,
+    ]
+    .iter()
+    .map(|icon| format!("{:<2}", icon.glyph(tier)))
+    .collect::<Vec<_>>()
+    .join(" ")
+    .trim_end()
+    .to_string();
     let selected = screen.lines().nth(row_of("fix the flaky test")).unwrap();
     assert!(
-        selected.trim_end().ends_with("R D"),
-        "the row the cursor is on carries no controls: {selected:?}"
+        selected.trim_end().ends_with(&cluster),
+        "the row the cursor is on does not carry its buttons: {selected:?}"
     );
-    // The controls take the age's place: a row does not answer "when" and "act
-    // on this" in the same column.
+    // The buttons take the status column's place: a row does not answer "when"
+    // and "act on this" in the same column.
     assert!(
-        !selected.contains("now"),
-        "the age is still drawn under the controls: {selected:?}"
+        !selected.contains("now") && !selected.contains(':'),
+        "the hour is still drawn under the buttons: {selected:?}"
     );
     let other = screen.lines().nth(row_of("the other one")).unwrap();
     assert!(
-        other.trim_end().ends_with("now"),
-        "a row nobody is on does not end in its age: {other:?}"
+        !other.trim_end().ends_with(&cluster),
+        "a row nobody is on wears the buttons too: {other:?}"
+    );
+    assert!(
+        other
+            .trim_end()
+            .chars()
+            .rev()
+            .take(5)
+            .collect::<String>()
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == ':'),
+        "a row nobody is on does not end in its hour: {other:?}"
     );
 
-    // The pair is a click target, and each half names the row it belongs to.
-    let controls = app.regions.row_actions.clone();
+    // Every button is a click target, and each one names the row it belongs to.
+    let controls = app
+        .regions
+        .row_actions
+        .iter()
+        .filter(|control| control.row == 1)
+        .cloned()
+        .collect::<Vec<_>>();
     assert_eq!(
         controls.len(),
-        2,
-        "the selected row's controls: {controls:?}"
+        5,
+        "the selected row's buttons: {controls:?}"
     );
-    assert!(controls.iter().all(|control| control.row == 1));
+    assert_eq!(
+        controls
+            .iter()
+            .map(|control| control.intent)
+            .collect::<Vec<_>>(),
+        vec![
+            Intent::ToggleAutoContinue,
+            Intent::BeginRenameSession,
+            Intent::ForkSession,
+            Intent::ArchiveSession,
+            Intent::DeleteSession,
+        ],
+        "the row offers the wrong verbs, or in the wrong order"
+    );
     for control in &controls {
         assert_eq!(
             control.rect.y,
             row_of("fix the flaky test") as u16,
-            "a control was published on another line: {control:?}"
+            "a button was published on another line: {control:?}"
+        );
+        assert_eq!(
+            usize::from(control.rect.width),
+            usize::from(vibex_tui::row_marks::MARK_COLS),
+            "a button is not the width of its picture: {control:?}"
         );
     }
     let rename = controls
         .iter()
         .find(|control| control.intent == Intent::BeginRenameSession)
-        .expect("the rename control is not clickable");
+        .expect("the rename button is not clickable");
     let delete = controls
         .iter()
         .find(|control| control.intent == Intent::DeleteSession)
-        .expect("the delete control is not clickable");
+        .expect("the delete button is not clickable");
     assert!(
         rename.rect.right() <= delete.rect.x && delete.rect.right() <= 100,
-        "the pair does not fit the row: {rename:?} {delete:?}"
-    );
-    // The age keeps the right edge on the rows nobody is on, and the controls
-    // end where it does: a row being acted on does not move its right end.
-    let age_edge = |line: &str| {
-        let at = line
-            .find("now")
-            .unwrap_or_else(|| panic!("no age on the row: {line:?}"));
-        vibex_tui::text::display_width(&line[..at]) + 3
-    };
-    assert_eq!(
-        usize::from(delete.rect.right()),
-        age_edge(other),
-        "the controls do not end where the age does: {delete:?} {other:?}"
+        "the cluster does not fit the row: {rename:?} {delete:?}"
     );
 
     // The pointer's row answers the same way, without moving the cursor: the
@@ -8449,15 +8722,15 @@ fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
     let screen = text(&render(&mut app, 100, 24));
     let hovered = screen.lines().nth(row_of("the other one")).unwrap();
     assert!(
-        hovered.trim_end().ends_with("R D"),
-        "the row under the pointer carries no controls: {hovered:?}"
+        hovered.trim_end().ends_with(&cluster),
+        "the row under the pointer carries no buttons: {hovered:?}"
     );
     assert!(
         app.regions
             .row_actions
             .iter()
             .any(|control| control.row == 2),
-        "the hovered row's controls are not clickable: {:?}",
+        "the hovered row's buttons are not clickable: {:?}",
         app.regions.row_actions
     );
     assert_eq!(
@@ -8466,7 +8739,7 @@ fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
         "the pointer moved the cursor"
     );
 
-    // A control answers the pointer before the click does: the one under it
+    // A button answers the pointer before the click does: the one under it
     // lights, and the one beside it does not.
     let resting = render_buffer(&mut app, 100, 24);
     app.hovered_row_action = Some((2, Intent::DeleteSession));
@@ -8491,21 +8764,21 @@ fn a_session_row_offers_its_controls_while_the_reader_is_on_it() {
     assert_eq!(
         changed(delete),
         usize::from(delete.width),
-        "the control under the pointer did not light"
+        "the button under the pointer did not light"
     );
     assert_eq!(
         changed(control(&app, Intent::BeginRenameSession)),
         0,
-        "the hover spilled onto the control beside it"
+        "the hover spilled onto the button beside it"
     );
 }
 
-/// A control names the chord that runs it, in the spelling the key bar and the
-/// help page use. A single cell is worth a hint; a chord that would take more
-/// than one is left out rather than allowed to widen the row, because the row
-/// is a list of titles and not a key reference.
+/// A button is a picture, and a picture cannot say what it does. The band above
+/// the list is the one place a terminal has room for the sentence a tooltip
+/// would carry, so the pointer resting on a button names the verb and the key
+/// that would have run it — the half a reader cannot guess from the icon.
 #[test]
-fn a_session_rows_controls_spell_the_chord_that_runs_them() {
+fn a_session_rows_buttons_name_themselves_while_the_pointer_is_on_them() {
     use vibex_tui::action::Intent;
     use vibex_tui::keymap::{Chord, Scope};
     let now = vibex_core::unix_timestamp_ms();
@@ -8517,44 +8790,56 @@ fn a_session_rows_controls_spell_the_chord_that_runs_them() {
         .apply_sessions(Ok(vec![session]))
         .expect("sessions apply");
     app.set_selection(Scope::Sessions, 1);
-    fn row(app: &mut App) -> String {
+    let band = |app: &mut App| -> String {
         let screen = text(&render(app, 100, 24));
         screen
             .lines()
-            .find(|line| line.contains("name the key"))
-            .expect("the session row")
+            .find(|line| !line.trim().is_empty())
+            .expect("the status band")
             .to_string()
-    }
-    let drawn = row(&mut app);
+    };
+    // At rest the band names where the reader is, not what a button does.
+    let resting = band(&mut app);
     assert!(
-        drawn.trim_end().ends_with("R D") && !drawn.contains('╱'),
-        "the row does not name the chords that run its controls: {drawn:?}"
+        !resting.contains("Rename"),
+        "the band names a verb nobody pointed at: {resting:?}"
     );
 
-    // A rebound key is spelled the way the key bar spells it.
+    app.hovered_row_action = Some((1, Intent::BeginRenameSession));
+    let hovering = band(&mut app);
+    assert!(
+        hovering.contains("Rename R"),
+        "the band does not name the button under the pointer: {hovering:?}"
+    );
+
+    // The key it names is the binding's own, so a rebound verb reads the way
+    // the key bar spells it.
     app.keymap
         .rebind(Intent::BeginRenameSession, "q".parse::<Chord>().unwrap());
-    let drawn = row(&mut app);
+    let rebound = band(&mut app);
     assert!(
-        drawn.trim_end().ends_with("Q D"),
-        "the control did not follow the binding: {drawn:?}"
+        rebound.contains("Rename Q") && !rebound.contains("Rename R"),
+        "the band did not follow the binding: {rebound:?}"
     );
 
-    // A chord that takes more than one cell is spelled out rather than
-    // truncated: the control is the key, whatever the key is.
+    // A verb nobody has bound names itself and nothing else.
     app.keymap.rebind(
         Intent::BeginRenameSession,
         "ctrl+x".parse::<Chord>().unwrap(),
     );
-    let drawn = row(&mut app);
+    let chorded = band(&mut app);
     assert!(
-        drawn.trim_end().ends_with("Ctrl+X D"),
-        "the control does not spell the whole chord: {drawn:?}"
+        chorded.contains("Rename Ctrl+X"),
+        "the band does not spell the whole chord: {chorded:?}"
     );
 }
 
 /// The columns of the list line up, measured in cells rather than bytes: the
 /// rows carry box drawing and geometric glyphs, and the eye scans columns.
+///
+/// The layout is the desktop's: the Agent's mark opens the row, the title
+/// follows it in one column for every row of a depth, and everything the row
+/// says about its state is right-aligned in the trailing column.
 #[test]
 fn the_session_list_columns_line_up() {
     let now = vibex_core::unix_timestamp_ms();
@@ -8581,25 +8866,48 @@ fn the_session_list_columns_line_up() {
             .find(|line| line.contains(needle))
             .unwrap_or_else(|| panic!("no row for {needle:?}:\n{screen}"))
     };
-    // The mark, the title and the age are columns: two rows of different title
-    // lengths put each of them at the same place.
-    assert_eq!(
-        column_of(row_of("short"), "▶"),
-        column_of(row_of("a much longer title"), "✗"),
-        "the state column drifts with the length of a title:\n{screen}"
-    );
+    // The title is a column: two rows of different lengths put it in the same
+    // place, which is what makes the list scannable.
     assert_eq!(
         column_of(row_of("short"), "short"),
         column_of(row_of("a much longer title"), "a much longer"),
-        "the title column follows the group depth:\n{screen}"
+        "the title column follows the length of the row before it:\n{screen}"
     );
-    let time_edge = |line: &str, needle: &str| {
-        column_of(line, needle).map(|at| at + vibex_tui::text::display_width(needle))
-    };
+    // The title opens past the row's whole lead — the rail, its gap, the
+    // Agent's two-cell mark and its gap — and that lead is a fixed number of
+    // columns, so the titles of a list start in one place whatever the terminal
+    // can draw.
+    let heading = screen
+        .lines()
+        .find(|line| line.contains("vibex-card-workspace"))
+        .unwrap_or_else(|| panic!("no heading:\n{screen}"));
+    let heading_name = column_of(heading, "vibex-card-workspace").expect("the heading's name");
+    // The session hangs one level in from the heading, and its own lead is
+    // longer than a heading's by the selection bar it can wear.
+    let expected =
+        heading_name + vibex_tui::view::SESSION_ROW_INDENT + vibex_tui::view::SESSION_ROW_LEAD
+            - vibex_tui::view::HEADING_ROW_LEAD;
     assert_eq!(
-        time_edge(row_of("short"), "3m"),
-        time_edge(row_of("a much longer title"), "5h"),
-        "the age is not right-aligned:\n{screen}"
+        column_of(row_of("short"), "short"),
+        Some(expected),
+        "the title does not open past the Agent's mark:\n{screen}"
+    );
+    // The state's own mark is in the trailing column, and the column ends at the
+    // same edge on every row: a row that ended where its sentence happened to
+    // would make the list ragged.
+    let edge = |line: &str| vibex_tui::text::display_width(line.trim_end());
+    assert_eq!(
+        edge(row_of("short")),
+        edge(row_of("a much longer title")),
+        "the status column does not end at one edge:\n{screen}"
+    );
+    // A failure is the danger mark, at the row's own right edge — and it is the
+    // row's last cell, because a failed session has no hour worth reading.
+    let failed = row_of("a much longer title");
+    assert_eq!(
+        column_of(failed, "✗").map(|at| at + 1),
+        Some(edge(failed)),
+        "the failure mark is not the row's last word:\n{screen}"
     );
 }
 
@@ -8682,6 +8990,12 @@ fn the_session_list_marks_degrade_to_a_legacy_terminal() {
             ..Default::default()
         },
     );
+    // No picture protocol, whatever terminal the runner happens to be in: a
+    // legacy console draws the character, and a test that let the environment
+    // decide would pass or fail on where it was run.
+    app.terminal_images = vibex_tui::terminal_image::ImageSupport::forced(
+        vibex_tui::terminal_image::ImageProtocol::None,
+    );
     app.resize(110, 24);
     app.navigate_to(Page::Sessions);
     let mut failed = seeded_session("session_list0101", "the one that failed");
@@ -8724,13 +9038,32 @@ fn the_session_list_marks_degrade_to_a_legacy_terminal() {
             )
         })
         .collect::<Vec<_>>();
-    assert!(
-        drawn.contains(&(
-            vibex_tui::action::Intent::BeginRenameSession,
-            "R".to_string()
-        )) && drawn.contains(&(vibex_tui::action::Intent::DeleteSession, "D".to_string())),
-        "the controls do not degrade to the legacy tier: {drawn:?}"
-    );
+    // Every button wears the character its icon falls back to, in the tier this
+    // terminal is in — the picture it would rather draw is one a legacy console
+    // cannot hold.
+    let tier = vibex_tui::glyphs::GlyphTier::Legacy;
+    for (intent, icon) in [
+        (vibex_tui::action::Intent::ToggleAutoContinue, Icon::Resume),
+        (vibex_tui::action::Intent::BeginRenameSession, Icon::Rename),
+        (vibex_tui::action::Intent::ForkSession, Icon::Fork),
+        (vibex_tui::action::Intent::ArchiveSession, Icon::Archive),
+        (vibex_tui::action::Intent::DeleteSession, Icon::Delete),
+    ] {
+        assert!(
+            drawn.contains(&(intent, icon.glyph(tier).to_string())),
+            "the {intent:?} button does not degrade to the legacy tier: {drawn:?}"
+        );
+    }
+    // And the heading's own buttons fall back the same way.
+    for (intent, icon) in [
+        (vibex_tui::action::Intent::SidebarRowActions, Icon::More),
+        (vibex_tui::action::Intent::NewSession, Icon::New),
+    ] {
+        assert!(
+            drawn.contains(&(intent, icon.glyph(tier).to_string())),
+            "the {intent:?} heading button does not degrade to the legacy tier: {drawn:?}"
+        );
+    }
 }
 
 /// The list a reader arranged on the desktop is the list this client draws:
@@ -8915,7 +9248,12 @@ fn the_session_list_marks_state_and_auto_continue_without_words() {
         .lines()
         .find(|line| line.contains("still working"))
         .unwrap_or_else(|| panic!("no row for the running session:\n{screen}"));
-    assert!(row.contains('▶'), "the running mark is missing: {row:?}");
+    assert!(
+        vibex_tui::glyphs::activity_ring_frames(vibex_tui::glyphs::GlyphTier::Full)
+            .iter()
+            .any(|frame| row.contains(frame)),
+        "the running mark is missing: {row:?}"
+    );
     assert!(
         !row.contains("Running"),
         "the state word is back on the row: {row:?}"
@@ -9155,23 +9493,26 @@ fn a_group_heading_counts_its_sessions_and_rules_the_section() {
         .lines()
         .find(|line| line.trim_start_matches(['│', ' ']).starts_with('▾'))
         .unwrap_or_else(|| panic!("no heading:\n{screen}"));
-    // The count is the last word on the line, past the rule: the rule carries
-    // the eye to it.
-    let (before, count) = heading
-        .rsplit_once(' ')
-        .unwrap_or_else(|| panic!("the heading has one word: {heading:?}"));
-    assert_eq!(
-        count.trim(),
-        "2",
-        "the count does not close the line: {heading:?}"
-    );
+    // The count is a badge right after the name, which is where the desktop
+    // draws it: the name says which project, and the badge says how much of it
+    // there is before the eye has read a single row.
+    let named = heading
+        .find("vibex-card-workspace")
+        .unwrap_or_else(|| panic!("the heading does not name the workspace: {heading:?}"));
+    let badge = heading
+        .find(" 2 ")
+        .unwrap_or_else(|| panic!("the heading does not badge its count: {heading:?}"));
     assert!(
-        before.trim_end().ends_with('─'),
-        "the count is not past the rule: {heading:?}"
+        badge > named,
+        "the count is not beside the name it counts: {heading:?}"
     );
+    // And the rule carries the eye from the badge to the far end of the list.
+    let rule = heading
+        .find('─')
+        .unwrap_or_else(|| panic!("the heading draws no rule: {heading:?}"));
     assert!(
-        before.contains("vibex-card-workspace"),
-        "the heading does not name the workspace: {heading:?}"
+        rule > badge,
+        "the rule does not run from the count: {heading:?}"
     );
     // A session row is not a heading: it carries the mark and the age instead.
     let row = screen
@@ -9723,5 +10064,189 @@ fn a_sub_session_page_names_the_way_back_to_its_main_session() {
         app.parent_session_id().as_ref(),
         Some(&parent_id),
         "the page cannot answer which session owns this one"
+    );
+}
+
+/// A project row's action button offers the verbs a project has, and only those:
+/// a project can be folded, added to, or deleted, and it cannot be renamed
+/// because the runtime has no such write. The menu is built from the heading
+/// rather than kept as one list with the impossible entries disabled, so the
+/// reader never reads past a verb that was never going to run.
+#[test]
+fn a_project_rows_action_button_offers_what_a_project_can_do() {
+    use vibex_tui::action::Intent;
+    use vibex_tui::app::Effect;
+    let now = vibex_core::unix_timestamp_ms();
+    let mut first = seeded_session("session_menu0001", "first");
+    first.last_message_at_ms = now;
+    let mut second = seeded_session("session_menu0002", "second");
+    second.project_id = first.project_id.clone();
+    second.workspace_id = first.workspace_id.clone();
+    second.workspace_root = first.workspace_root.clone();
+    second.last_message_at_ms = now;
+
+    let mut app = app(110, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![first, second]))
+        .expect("sessions apply");
+    // Row 0 is the project heading; the two sessions hang under it.
+    app.set_selection(Scope::Sessions, 0);
+    render(&mut app, 110, 24);
+    let button = app
+        .regions
+        .row_actions
+        .iter()
+        .find(|control| control.intent == Intent::SidebarRowActions)
+        .copied()
+        .unwrap_or_else(|| {
+            panic!(
+                "the heading has no action button: {:?}",
+                app.regions.row_actions
+            )
+        });
+    assert_eq!(button.row, 0, "the button is not on the heading's row");
+
+    // The key and the button are one verb: both open the same menu.
+    let outcome = app.perform(Intent::SidebarRowActions);
+    assert!(outcome.effects.is_empty(), "opening a menu wrote something");
+    let screen = text(&render(&mut app, 110, 24));
+    for label in ["New session", "New folder", "Collapse", "Delete project"] {
+        assert!(
+            screen.contains(label),
+            "the menu omits {label:?}:\n{screen}"
+        );
+    }
+    assert!(
+        !screen.contains("Rename folder"),
+        "a project was offered a rename the runtime cannot do:\n{screen}"
+    );
+
+    // Closing it does nothing at all.
+    app.perform(Intent::CloseOverlay);
+    assert!(app.overlay.is_none(), "the menu stayed open");
+
+    // A destructive verb is a question before it is a write, and the question
+    // names the heading it is about.
+    app.perform(Intent::SidebarRowActions);
+    app.perform(Intent::SelectNext);
+    app.perform(Intent::SelectNext);
+    app.perform(Intent::SelectNext);
+    let outcome = app.perform(Intent::ConfirmOverlay);
+    assert!(outcome.effects.is_empty(), "the delete ran unasked");
+    let screen = text(&render(&mut app, 110, 24));
+    assert!(
+        screen.contains("Delete this project"),
+        "the question does not say what it is about:\n{screen}"
+    );
+    let outcome = app.perform(Intent::ConfirmOverlay);
+    match outcome.effects.as_slice() {
+        [Effect::DeleteProject { project_id }] => {
+            assert!(!project_id.is_empty(), "the write names no project");
+        }
+        other => panic!("the answer produced {other:?}"),
+    }
+}
+
+/// A folder's menu is its own: it can be renamed and deleted, which a project
+/// cannot, and a folder no project owns is not offered a session it could not
+/// hold.
+#[test]
+fn a_folder_rows_action_button_offers_what_a_folder_can_do() {
+    use vibex_tui::action::Intent;
+    let mut app = app(110, 24);
+    app.navigate_to(Page::Sessions);
+    let session = seeded_session("session_menu0101", "in the folder");
+    let project_id = session.project_id.as_str().to_string();
+    app.agent
+        .apply_sessions(Ok(vec![session]))
+        .expect("sessions apply");
+    // The authority's own arrangement: one project, one folder inside it, and
+    // the session filed in the folder.
+    let snapshot = vibex_core::RemoteSidebarOrganizationSnapshot {
+        revision: 3,
+        folders: vec![vibex_core::RemoteSidebarFolder {
+            id: "folder-notes".to_string(),
+            name: "notes".to_string(),
+            project_id: Some(project_id.clone()),
+            workspace_id: None,
+            auto_archive_after_days: None,
+        }],
+        groups: Vec::new(),
+        placements: vec![
+            vibex_core::RemoteSidebarPlacement {
+                item: vibex_core::RemoteSidebarItemRef {
+                    kind: vibex_core::RemoteSidebarItemKind::Project,
+                    id: project_id.clone(),
+                },
+                parent_folder_id: None,
+            },
+            vibex_core::RemoteSidebarPlacement {
+                item: vibex_core::RemoteSidebarItemRef {
+                    kind: vibex_core::RemoteSidebarItemKind::Folder,
+                    id: "folder-notes".to_string(),
+                },
+                parent_folder_id: None,
+            },
+            vibex_core::RemoteSidebarPlacement {
+                item: vibex_core::RemoteSidebarItemRef {
+                    kind: vibex_core::RemoteSidebarItemKind::Session,
+                    id: "session_menu0101".to_string(),
+                },
+                parent_folder_id: Some("folder-notes".to_string()),
+            },
+        ],
+        collapsed_folder_ids: Vec::new(),
+        collapsed_group_ids: Vec::new(),
+        collapsed_project_ids: Vec::new(),
+        collapsed_workspace_ids: Vec::new(),
+        pinned_session_ids: Vec::new(),
+        session_order: vec!["session_menu0101".to_string()],
+        session_order_anchored_at_ms: i64::MAX,
+        hierarchy_mode: vibex_core::RemoteSidebarHierarchyMode::Compact,
+        project_order: Vec::new(),
+        workspace_order: std::collections::BTreeMap::new(),
+        project_appearances: std::collections::BTreeMap::new(),
+        worktree_titles: std::collections::BTreeMap::new(),
+        project_new_session_locations: std::collections::BTreeMap::new(),
+        auto_continue_project_ids: Vec::new(),
+        auto_continue_session_overrides: std::collections::BTreeMap::new(),
+        auto_continue_session_ids: Vec::new(),
+        auto_continue_paused_session_ids: Vec::new(),
+        unread_session_ids: Vec::new(),
+        scheduled_sends: Vec::new(),
+    };
+    assert!(app.apply_sidebar_organization(&snapshot));
+    let folder = app
+        .sidebar_rows()
+        .iter()
+        .position(|row| row.kind == vibex_desktop_model::AgentSidebarRowKind::Folder)
+        .expect("the arrangement drew no folder");
+    app.set_selection(Scope::Sessions, folder);
+    app.perform(Intent::SidebarRowActions);
+    let screen = text(&render(&mut app, 110, 24));
+    for label in [
+        "New session",
+        "New folder",
+        "Rename folder",
+        "Collapse",
+        "Delete folder",
+    ] {
+        assert!(
+            screen.contains(label),
+            "the menu omits {label:?}:\n{screen}"
+        );
+    }
+    // Renaming a folder asks for the name before it writes anything.
+    app.perform(Intent::CloseOverlay);
+    app.perform(Intent::SidebarRowActions);
+    app.perform(Intent::SelectNext);
+    app.perform(Intent::SelectNext);
+    let outcome = app.perform(Intent::ConfirmOverlay);
+    assert!(outcome.effects.is_empty(), "the rename wrote a blank name");
+    assert!(
+        matches!(app.overlay, Some(vibex_tui::app::Overlay::Prompt { .. })),
+        "renaming a folder did not ask for a name: {:?}",
+        app.overlay
     );
 }
