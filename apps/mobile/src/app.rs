@@ -1492,6 +1492,14 @@ pub struct MobileApp {
     new_session_picker: Option<NewSessionPicker>,
     /// Whether the composer's attach menu is up.
     composer_attach_menu_open: bool,
+    /// Which field the attach menu is filling. The new-session page has its own
+    /// first message, and a picture picked there belongs to it rather than to
+    /// the composer of whatever session happens to be open behind the page.
+    attach_menu_target: AttachmentTarget,
+    /// Attachments on the new-session page's first message.
+    new_session_attachments: Vec<MessageAttachment>,
+    /// The `@` references the new-session first message names.
+    new_session_armed_mentions: Vec<VibexUseMention>,
     /// The composer's un-sent work changed since the last write to disk.
     composer_state_dirty: bool,
     /// The debounce timer for that write, replaced per burst of edits.
@@ -1625,6 +1633,59 @@ fn mention_prefix(text: &str) -> Option<&str> {
     let token = text.split_whitespace().last()?;
     let remainder = token.strip_prefix('@')?;
     (!remainder.contains('@')).then_some(remainder)
+}
+
+/// Which field an attachment picked from the system belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachmentTarget {
+    /// The open session's composer.
+    Composer,
+    /// The new-session page's first message.
+    NewSession,
+}
+
+/// Which of the composer's three trigger lists a panel is showing.
+///
+/// The gesture is the same for all of them, and so is the panel; only what a
+/// chosen row does differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerSuggestionKind {
+    Command,
+    Mention,
+    Skill,
+    /// The same `@` list, drawn for the new-session page's first message. It
+    /// has its own identity because both fields can be on screen at once, and
+    /// two elements may not share an id.
+    NewSessionMention,
+}
+
+impl ComposerSuggestionKind {
+    fn element_id(self) -> &'static str {
+        match self {
+            Self::Command => "mobile-composer-commands",
+            Self::Mention => "mobile-composer-mentions",
+            Self::Skill => "mobile-composer-skills",
+            Self::NewSessionMention => "mobile-new-session-mentions",
+        }
+    }
+
+    /// Whether a chosen row is an `@` reference, wherever it was typed.
+    fn is_mention(self) -> bool {
+        matches!(self, Self::Mention | Self::NewSessionMention)
+    }
+}
+
+/// The partial `$` skill a draft is currently typing, if any.
+///
+/// Same shape as `@`: only a token still being typed opens the panel, because
+/// once the reader has moved past it with a space they are writing the prompt.
+fn skill_prefix(text: &str) -> Option<&str> {
+    if text.is_empty() || text.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let token = text.split_whitespace().last()?;
+    let remainder = token.strip_prefix('$')?;
+    (!remainder.contains('$')).then_some(remainder)
 }
 
 /// The `@` reference behind one suggestion entry, when it has one.
@@ -2644,6 +2705,9 @@ impl MobileApp {
             runtime_options_open: false,
             new_session_picker: None,
             composer_attach_menu_open: false,
+            attach_menu_target: AttachmentTarget::Composer,
+            new_session_attachments: Vec::new(),
+            new_session_armed_mentions: Vec::new(),
             composer_state_dirty: false,
             composer_state_flush_task: None,
             _composer_change_subscription: composer_change_subscription,
@@ -2920,7 +2984,12 @@ impl MobileApp {
     ) {
         match event {
             crate::attachment::AttachmentPickEvent::Picked(picked) => {
-                if self.composer_attachments.len() >= MOBILE_MAX_COMPOSER_ATTACHMENTS {
+                let target = self.attach_menu_target;
+                let attached = match target {
+                    AttachmentTarget::Composer => &mut self.composer_attachments,
+                    AttachmentTarget::NewSession => &mut self.new_session_attachments,
+                };
+                if attached.len() >= MOBILE_MAX_COMPOSER_ATTACHMENTS {
                     self.hint(
                         Tone::Warning,
                         locale::text(
@@ -2932,7 +3001,7 @@ impl MobileApp {
                     cx.notify();
                     return;
                 }
-                self.composer_attachments.push(MessageAttachment {
+                attached.push(MessageAttachment {
                     label: picked.label,
                     mime_type: picked.mime_type,
                     uri: Some(picked.data_url),
@@ -2940,7 +3009,9 @@ impl MobileApp {
                     // to, so every picked image rides the message as a whole.
                     inline_text_offset: None,
                 });
-                self.mark_composer_state_dirty(cx);
+                if target == AttachmentTarget::Composer {
+                    self.mark_composer_state_dirty(cx);
+                }
                 self.hint(
                     Tone::Info,
                     locale::text("Attachment added", "已添加附件", "已新增附件"),
@@ -2975,6 +3046,19 @@ impl MobileApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.attach_menu_target = AttachmentTarget::Composer;
+        self.composer_attach_menu_open = true;
+        cx.notify();
+    }
+
+    /// Opens the same menu for the new-session page's first message.
+    fn open_new_session_attach_menu(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.attach_menu_target = AttachmentTarget::NewSession;
         self.composer_attach_menu_open = true;
         cx.notify();
     }
@@ -5255,6 +5339,17 @@ impl MobileApp {
             .value()
             .trim()
             .to_string();
+        let attachments = self.new_session_attachments.clone();
+        let restore_attachments = attachments.clone();
+        let mentions = std::mem::take(&mut self.new_session_armed_mentions)
+            .into_iter()
+            .filter(|mention| {
+                mention
+                    .label
+                    .as_deref()
+                    .is_none_or(|label| prompt.contains(label.trim_start_matches('@')))
+            })
+            .collect::<Vec<_>>();
         let workspace_mode =
             self.normalize_new_session_workspace_mode(self.new_session_workspace_mode);
         let Some(backend) = self.backend.clone() else {
@@ -5272,18 +5367,18 @@ impl MobileApp {
         self.new_session_busy = true;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let session = backend.create_session(request).await?;
-            let prompt_result = if prompt.is_empty() {
+            let prompt_result = if prompt.is_empty() && attachments.is_empty() {
                 None
             } else {
                 Some(
                     backend
                         .send_message(MutationRequest::new(SendAgentMessageRequest {
-                            mentions: Vec::new(),
+                            mentions,
                             session_id: session.id.clone(),
                             message_idempotency_key: RequestId::new().into_string(),
                             desired_runtime: runtime.clone(),
                             text: prompt,
-                            attachments: Vec::new(),
+                            attachments,
                             reasoning_effort: runtime.reasoning_effort.clone(),
                             correlation_id: None,
                             delivery: UserMessageDelivery::Prompt,
@@ -5304,6 +5399,8 @@ impl MobileApp {
                     Ok((session, prompt_result)) => {
                         this.new_session_open = false;
                         this.new_session_runtime = None;
+                        this.new_session_attachments.clear();
+                        this.new_session_armed_mentions.clear();
                         this.dismiss_overlay(None, cx);
                         this.refresh_sessions(cx);
                         let session_id = session.id.clone();
@@ -5312,7 +5409,13 @@ impl MobileApp {
                             this.fail(error);
                         }
                     }
-                    Err(error) => this.fail(error),
+                    Err(error) => {
+                        // A session that was never created keeps its first
+                        // message: the page stays open, with the files and
+                        // references the reader attached to it.
+                        this.new_session_attachments = restore_attachments;
+                        this.fail(error);
+                    }
                 }
                 cx.notify();
             });
@@ -6105,6 +6208,128 @@ impl MobileApp {
             .take(8)
             .cloned()
             .collect()
+    }
+
+    /// The suggestion panel's contents for a `$` being typed.
+    ///
+    /// Skills are the Agent's own repertoire rather than this client's, so the
+    /// list is whatever the runtime advertised with the dollar trigger — the
+    /// phone adds no vocabulary of its own.
+    fn composer_skill_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
+        let draft = self.composer_input.read(cx).value().to_string();
+        let Some(prefix) = skill_prefix(&draft) else {
+            return Vec::new();
+        };
+        let needle = prefix.to_lowercase();
+        self.composer_commands
+            .iter()
+            .filter(|entry| entry.trigger == AgentCommandTrigger::Dollar)
+            .filter(|entry| {
+                let name = entry
+                    .command_name
+                    .clone()
+                    .unwrap_or_else(|| entry.label.clone())
+                    .trim_start_matches('$')
+                    .to_lowercase();
+                needle.is_empty()
+                    || name.contains(&needle)
+                    || entry.label.to_lowercase().contains(&needle)
+            })
+            .take(8)
+            .cloned()
+            .collect()
+    }
+
+    /// The suggestion panel's contents for an `@` typed in the new-session
+    /// page's first message.
+    fn new_session_mention_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
+        let draft = self.new_session_prompt_input.read(cx).value().to_string();
+        let Some(prefix) = mention_prefix(&draft) else {
+            return Vec::new();
+        };
+        let needle = prefix.to_lowercase();
+        let mut mentions: Vec<AgentCommandEntry> = Vec::new();
+        for entry in self
+            .composer_commands
+            .iter()
+            .filter(|entry| entry.trigger == AgentCommandTrigger::Mention)
+        {
+            if composer_entry_mention(entry).is_none() {
+                continue;
+            }
+            let label = entry.label.trim_start_matches('@').to_lowercase();
+            let name = entry
+                .command_name
+                .clone()
+                .unwrap_or_else(|| entry.label.clone())
+                .to_lowercase();
+            if !needle.is_empty() && !label.contains(&needle) && !name.contains(&needle) {
+                continue;
+            }
+            if mentions
+                .iter()
+                .any(|existing| existing.label == entry.label)
+            {
+                continue;
+            }
+            mentions.push(entry.clone());
+            if mentions.len() >= 8 {
+                break;
+            }
+        }
+        mentions
+    }
+
+    /// Applies one `@` reference to the new-session first message.
+    fn choose_new_session_mention(
+        &mut self,
+        entry: AgentCommandEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mention) = composer_entry_mention(&entry) else {
+            return;
+        };
+        let draft = self.new_session_prompt_input.read(cx).value().to_string();
+        let trimmed = draft.trim_end();
+        let kept = trimmed
+            .rfind('@')
+            .map(|index| &trimmed[..index])
+            .unwrap_or_default()
+            .to_string();
+        let next = format!("{kept}{}", entry.insertion_text);
+        self.new_session_prompt_input
+            .update(cx, |input, cx| input.set_value(next, window, cx));
+        if !self
+            .new_session_armed_mentions
+            .iter()
+            .any(|existing| existing.reference == mention.reference)
+        {
+            self.new_session_armed_mentions.push(mention);
+        }
+        crate::platform::show_keyboard();
+        cx.notify();
+    }
+
+    /// Applies a chosen skill: the typed `$` token becomes the skill's own
+    /// invocation, which is what the Agent reads on the way in.
+    fn choose_composer_skill(
+        &mut self,
+        entry: AgentCommandEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = entry
+            .command_name
+            .clone()
+            .unwrap_or_else(|| entry.label.clone());
+        let name = name.trim_start_matches('$').to_string();
+        self.composer_armed_command = None;
+        self.composer_input.update(cx, |input, cx| {
+            input.set_value(format!("${name} "), window, cx)
+        });
+        crate::platform::show_keyboard();
+        cx.notify();
     }
 
     /// Applies one suggestion: an executable command arms the draft and waits
@@ -7697,6 +7922,10 @@ impl MobileApp {
             self.new_session_project_id = None;
             self.new_session_workspace_id = None;
             self.new_session_picker = None;
+            // The first message's files and references belong to the page that
+            // was just closed, not to the next one.
+            self.new_session_attachments.clear();
+            self.new_session_armed_mentions.clear();
         }
         self.overlay = None;
         self.overlay_returns_to_drawer = false;
@@ -16298,6 +16527,7 @@ impl MobileApp {
         let usage_reported = self.token_usage.is_some();
         let command_suggestions = self.composer_command_suggestions(cx);
         let mention_suggestions = self.composer_mention_suggestions(cx);
+        let skill_suggestions = self.composer_skill_suggestions(cx);
         let composer_plan = self.render_composer_plan(cx);
         let composer_goal = self.render_composer_goal(cx);
         let delegation_target = self.composer_delegation_target(cx);
@@ -16336,6 +16566,9 @@ impl MobileApp {
             })
             .when(!mention_suggestions.is_empty(), |composer| {
                 composer.child(self.render_composer_mention_panel(&mention_suggestions, cx))
+            })
+            .when(!skill_suggestions.is_empty(), |composer| {
+                composer.child(self.render_composer_skill_panel(&skill_suggestions, cx))
             })
             // What the Agent is working through, then what the reader has
             // written ahead: both sit between the suggestions and the field.
@@ -16730,7 +16963,7 @@ impl MobileApp {
         entries: &[AgentCommandEntry],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        self.render_composer_suggestion_panel(entries, false, cx)
+        self.render_composer_suggestion_panel(entries, ComposerSuggestionKind::Command, cx)
     }
 
     /// The `@` suggestion list: same shape as the command list, because it is
@@ -16740,31 +16973,31 @@ impl MobileApp {
         entries: &[AgentCommandEntry],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        self.render_composer_suggestion_panel(entries, true, cx)
+        self.render_composer_suggestion_panel(entries, ComposerSuggestionKind::Mention, cx)
     }
 
-    /// The `/` and `@` suggestion list. Choosing a command either arms the
-    /// draft with something executable or inserts reusable text; choosing a
-    /// mention inserts the reference's label and remembers the reference.
+    /// The `$` skill list, the third character with the same gesture behind it.
+    fn render_composer_skill_panel(
+        &self,
+        entries: &[AgentCommandEntry],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        self.render_composer_suggestion_panel(entries, ComposerSuggestionKind::Skill, cx)
+    }
+
+    /// The `/`, `@`, and `$` suggestion list. Choosing a command either arms
+    /// the draft with something executable or inserts reusable text; choosing a
+    /// mention inserts the reference's label and remembers the reference; a
+    /// skill inserts its own `$name` invocation.
     fn render_composer_suggestion_panel(
         &self,
         entries: &[AgentCommandEntry],
-        mention: bool,
+        kind: ComposerSuggestionKind,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         div()
-            .id(if mention {
-                "mobile-composer-mentions"
-            } else {
-                "mobile-composer-commands"
-            })
-            .debug_selector(move || {
-                if mention {
-                    "mobile-composer-mentions".to_string()
-                } else {
-                    "mobile-composer-commands".to_string()
-                }
-            })
+            .id(kind.element_id())
+            .debug_selector(move || kind.element_id().to_string())
             .mb(px(theme::SPACING_SM))
             .max_h(px(200.0))
             .rounded(px(theme::RADIUS_CARD))
@@ -16781,7 +17014,9 @@ impl MobileApp {
                     .restrict_scroll_to_axis()
                     .children(entries.iter().map(|entry| {
                         let entry = entry.clone();
-                        let executable = !mention && is_executable_command_source(&entry);
+                        let mention = kind.is_mention();
+                        let executable = kind == ComposerSuggestionKind::Command
+                            && is_executable_command_source(&entry);
                         let destructive = entry.destructive;
                         let label = entry.label.clone();
                         // A collaborator's row is described by the account it
@@ -16794,10 +17029,13 @@ impl MobileApp {
                             .command_name
                             .clone()
                             .unwrap_or_else(|| entry.label.clone());
-                        let leading = if mention {
-                            entry.label.clone()
-                        } else {
-                            format!("/{name}")
+                        let leading = match kind {
+                            ComposerSuggestionKind::Mention
+                            | ComposerSuggestionKind::NewSessionMention => entry.label.clone(),
+                            ComposerSuggestionKind::Skill => {
+                                format!("${}", name.trim_start_matches('$'))
+                            }
+                            ComposerSuggestionKind::Command => format!("/{name}"),
                         };
                         div()
                             .id(format!("composer-suggestion:{}", entry.id))
@@ -16813,10 +17051,17 @@ impl MobileApp {
                             .active(|style| style.bg(theme::row_pressed_bg()))
                             .on_mouse_up(
                                 MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
-                                    if mention {
+                                cx.listener(move |this, _, window, cx| match kind {
+                                    ComposerSuggestionKind::Mention => {
                                         this.choose_composer_mention(entry.clone(), window, cx)
-                                    } else {
+                                    }
+                                    ComposerSuggestionKind::NewSessionMention => {
+                                        this.choose_new_session_mention(entry.clone(), window, cx)
+                                    }
+                                    ComposerSuggestionKind::Skill => {
+                                        this.choose_composer_skill(entry.clone(), window, cx)
+                                    }
+                                    ComposerSuggestionKind::Command => {
                                         this.choose_composer_command(entry.clone(), window, cx)
                                     }
                                 }),
@@ -21124,6 +21369,88 @@ impl MobileApp {
             .into_any_element()
     }
 
+    /// The files already attached to the new session's first message.
+    fn render_new_session_attachments(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .id("mobile-new-session-attachments")
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .gap(px(theme::SPACING_XS))
+            .children(
+                self.new_session_attachments
+                    .iter()
+                    .enumerate()
+                    .map(|(index, attachment)| {
+                        let label = if attachment.label.trim().is_empty() {
+                            locale::common("Attachment").to_string()
+                        } else {
+                            attachment.label.clone()
+                        };
+                        div()
+                            .id(("mobile-new-session-attachment", index))
+                            .min_h(px(28.0))
+                            .pl(px(theme::SPACING_SM))
+                            .pr(px(theme::SPACING_XS))
+                            .rounded(px(theme::RADIUS_PILL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::bg_card_dim())
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                svg()
+                                    .path(if message_attachment_is_image(attachment) {
+                                        "icons/image.svg"
+                                    } else {
+                                        "icons/file-text.svg"
+                                    })
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            )
+                            .child(
+                                div()
+                                    .max_w(px(160.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_secondary())
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .id(("mobile-new-session-attachment-remove", index))
+                                    .size(px(24.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .cursor_pointer()
+                                    .aria_label(locale::common("Remove").to_string())
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            if index < this.new_session_attachments.len() {
+                                                this.new_session_attachments.remove(index);
+                                            }
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/x.svg")
+                                            .size(px(12.0))
+                                            .text_color(theme::text_muted()),
+                                    ),
+                            )
+                    }),
+            )
+            .into_any_element()
+    }
+
     /// The composer's attach menu: one image, or any other file.
     fn render_composer_attach_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entries = [
@@ -21629,6 +21956,7 @@ impl MobileApp {
         });
         let runtime_summary = runtime_selection_summary(runtime_catalog, runtime_selection);
         let prompt = self.new_session_prompt_input.read(cx).value();
+        let new_session_mentions = self.new_session_mention_suggestions(cx);
         let can_submit = !prompt.trim().is_empty() && !self.new_session_busy;
         let worktree_supported = self.supports_new_session_worktree();
         let mode = self.normalize_new_session_workspace_mode(self.new_session_workspace_mode);
@@ -21696,6 +22024,67 @@ impl MobileApp {
                                     .child(
                                         Textarea::new(&self.new_session_prompt_input)
                                             .appearance(false),
+                                    ),
+                            )
+                            .when(!new_session_mentions.is_empty(), |card| {
+                                card.child(self.render_composer_suggestion_panel(
+                                    &new_session_mentions,
+                                    ComposerSuggestionKind::NewSessionMention,
+                                    cx,
+                                ))
+                            })
+                            // The first message carries what a prompt carries:
+                            // a picture the Agent should look at, or a file it
+                            // should read, before the session has even started.
+                            .when(!self.new_session_attachments.is_empty(), |card| {
+                                card.child(self.render_new_session_attachments(cx))
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(theme::SPACING_SM))
+                                    .child(
+                                        div()
+                                            .id("mobile-new-session-attach")
+                                            .aria_label(
+                                                locale::text(
+                                                    "Attach a file",
+                                                    "添加附件",
+                                                    "新增附件",
+                                                )
+                                                .to_string(),
+                                            )
+                                            .h(px(32.0))
+                                            .px(px(theme::SPACING_MD))
+                                            .rounded(px(theme::RADIUS_CONTROL))
+                                            .border_1()
+                                            .border_color(theme::border_default())
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .cursor_pointer()
+                                            .active(|style| style.bg(theme::row_pressed_bg()))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(Self::open_new_session_attach_menu),
+                                            )
+                                            .child(
+                                                svg()
+                                                    .path("icons/file-plus.svg")
+                                                    .size(px(theme::ICON_SM))
+                                                    .text_color(theme::text_secondary()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(theme::font_micro())
+                                                    .text_color(theme::text_secondary())
+                                                    .child(locale::text(
+                                                        "Attach",
+                                                        "附件",
+                                                        "附件",
+                                                    )),
+                                            ),
                                     ),
                             ),
                     )
@@ -26264,6 +26653,34 @@ mod tests {
         assert_eq!(truncate_single_line("abcdef", 3), "...");
         assert_eq!(truncate_single_line("abcdef", 2), "..");
         assert_eq!(truncate_single_line("abcdef", 0), "");
+    }
+
+    #[test]
+    fn a_dollar_prefix_is_read_only_while_the_skill_is_being_typed() {
+        assert_eq!(skill_prefix("$rust"), Some("rust"));
+        assert_eq!(skill_prefix("write this $ru"), Some("ru"));
+        assert_eq!(skill_prefix("$"), Some(""));
+        // A finished token is part of the prompt, not a skill being named.
+        assert_eq!(skill_prefix("$rust "), None);
+        assert_eq!(skill_prefix("no skill here"), None);
+        // A second dollar means the token is not a name any more.
+        assert_eq!(skill_prefix("$a$b"), None);
+    }
+
+    #[test]
+    fn each_suggestion_list_has_its_own_element_id() {
+        // Two panels may be laid out in one frame — the composer's and the
+        // new-session page's — and GPUI elements may not share an id.
+        let ids = [
+            ComposerSuggestionKind::Command.element_id(),
+            ComposerSuggestionKind::Mention.element_id(),
+            ComposerSuggestionKind::Skill.element_id(),
+            ComposerSuggestionKind::NewSessionMention.element_id(),
+        ];
+        let unique = ids.iter().collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), ids.len());
+        assert!(ComposerSuggestionKind::NewSessionMention.is_mention());
+        assert!(!ComposerSuggestionKind::Skill.is_mention());
     }
 
     #[test]
