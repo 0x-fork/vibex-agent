@@ -108,28 +108,6 @@ pub fn show_keyboard() {
     }
 }
 
-/// Hands the app back to the system, the way the platform's own back gesture
-/// does at the top of an app.
-///
-/// Android never delivers `KEYCODE_BACK` to the Activity while GPUI is
-/// running — the host forwards every hardware key and consumes it — so "there
-/// is nothing left to close" has to be turned into the platform behaviour
-/// here. iOS has no back key and does nothing.
-pub fn leave_app() {
-    #[cfg(target_os = "android")]
-    {
-        crate::android_bridge::with_activity(|env, activity| {
-            env.call_method(
-                activity,
-                jni::jni_str!("gpuiBackgroundApp"),
-                jni::jni_sig!(() -> ()),
-                &[],
-            )?;
-            Ok(())
-        });
-    }
-}
-
 /// Dismisses the software keyboard without changing GPUI focus.
 pub fn hide_keyboard() {
     #[cfg(any(target_os = "android", target_os = "ios"))]

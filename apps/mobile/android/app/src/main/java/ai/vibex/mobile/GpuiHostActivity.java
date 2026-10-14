@@ -113,10 +113,11 @@ public final class GpuiHostActivity extends Activity {
      * not claim, in density-independent pixels.
      *
      * <p>The sessions drawer is dragged open from that edge, and a swipe the
-     * system claims never reaches GPUI: it arrives as BACK instead, and on the
-     * session page the back stack is empty, so the app left the foreground
-     * rather than opening the drawer. The platform's own gesture inset is used
-     * where it reports one; this is the floor for the devices that do not.
+     * system claims never reaches GPUI: it arrives as BACK instead, so the
+     * drawer stays shut and the swipe does nothing. The app never leaves the
+     * foreground for it, but the gesture still has to be handed back to GPUI to
+     * open the drawer at all. The platform's own gesture inset is used where it
+     * reports one; this is the floor for the devices that do not.
      */
     private static final int DRAWER_EDGE_DP = 24;
     /**
@@ -639,23 +640,13 @@ public final class GpuiHostActivity extends Activity {
                     event.getKeyCode(),
                     action == KeyEvent.ACTION_DOWN ? 0 : 1,
                     event.getMetaState());
-            // Every key is consumed so GPUI sees it, BACK included. When the
-            // app has nothing left to close it calls gpuiBackgroundApp()
-            // instead of relying on the framework's own back handling, which
-            // this branch would otherwise swallow.
+            // Every key is consumed so GPUI sees it, BACK included. Nothing
+            // here turns BACK into leaving the app: the back gesture is the
+            // same rightward edge swipe the sessions drawer opens with, so the
+            // Rust handler keeps the app in the foreground when it runs out of
+            // screens to close.
         }
         return true;
-    }
-
-    /**
-     * Moves the task to the background.
-     *
-     * Called by the Rust shell when the back key/gesture reaches the root with
-     * no screen left to close. Without it the Activity consumed BACK forever
-     * and the app could not be left with the back gesture at all.
-     */
-    public void gpuiBackgroundApp() {
-        runOnUiThread(() -> moveTaskToBack(true));
     }
 
     // ── software keyboard ────────────────────────────────────────────────────

@@ -1150,7 +1150,7 @@ fn apply_app_settings(settings: &AppSettings, window: &mut Window, cx: &mut App)
 
 // Pops the topmost screen from the app's back-navigation stack. Bound to the
 // Android "back" keystroke so the system back key/gesture walks up the page
-// stack instead of backgrounding the app.
+// stack instead of leaving the app.
 gpui::actions!(mobile_app, [NavigateBack]);
 
 pub fn bind_keys(cx: &mut App) {
@@ -1158,8 +1158,8 @@ pub fn bind_keys(cx: &mut App) {
         // gpui-pre-mobile reports Android's back key/gesture as "escape" (see
         // `gpui_mobile::android::keyboard`); the "back" alias stays bound so the
         // same action still works anywhere that emits it. It pops the topmost
-        // screen, and at the root it backgrounds the app itself
-        // (`crate::platform::leave_app`).
+        // screen, and at the root it does nothing: the same rightward edge swipe
+        // opens the sessions drawer, so it can arrive here as BACK.
         KeyBinding::new("escape", NavigateBack, None),
         KeyBinding::new("back", NavigateBack, None),
     ]);
@@ -7385,9 +7385,9 @@ impl MobileApp {
     }
 
     /// The Android back key/gesture: close the topmost screen and keep the app
-    /// in the foreground. An empty stack hands the app to the system through
-    /// [`crate::platform::leave_app`] — the host Activity consumes every key, so
-    /// nothing else would.
+    /// in the foreground. An empty stack leaves the page exactly as it is — the
+    /// root has no back behaviour, because the system's back gesture is the same
+    /// rightward swipe the sessions drawer is dragged open with.
     fn handle_navigate_back(
         &mut self,
         _: &NavigateBack,
@@ -7452,10 +7452,12 @@ impl MobileApp {
         }
         self.sync_back_stack_with_ui();
         let Some(screen) = self.back_stack.pop() else {
-            // The stack is empty: the platform's own back behaviour is the only
-            // thing left, so hand the app back to the system. The Activity
-            // consumes every key and never does this itself.
-            crate::platform::leave_app();
+            // Nothing is left to close, so the page stays exactly as it is. The
+            // app must not hand itself back to the system here: the platform's
+            // back gesture is a rightward swipe from the left edge, which is the
+            // same gesture the sessions drawer is dragged open with, so leaving
+            // the app would turn a swipe meant for the drawer into an exit. The
+            // phone's own home gesture is how the app is left.
             return;
         };
         crate::platform::hide_keyboard();
@@ -26556,6 +26558,38 @@ mod tests {
             app.read_with(cx, |app, _| (app.back_stack.clone(), app.drawer_open));
         assert!(stack.is_empty(), "back stack after back key: {stack:?}");
         assert!(!drawer_open, "sessions drawer must close on back");
+    }
+
+    /// Back at the root has nothing left to close, and that is all it does. The
+    /// system's own back gesture is the same rightward edge swipe the sessions
+    /// drawer is dragged open with, so a root back that left the app would exit
+    /// the app on a swipe meant for the drawer.
+    #[gpui::test]
+    fn back_keystroke_at_the_root_keeps_the_app_in_the_foreground(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.back_stack.is_empty(), "the session page is the root");
+            assert!(!app.drawer_open, "the sessions drawer starts closed");
+        });
+
+        cx.simulate_keystrokes("back");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.mode, RootMode::Workspace);
+            assert!(app.overlay.is_none());
+            assert!(app.back_stack.is_empty());
+            assert!(!app.drawer_open, "a root back must not move the drawer");
+        });
     }
 
     #[gpui::test]

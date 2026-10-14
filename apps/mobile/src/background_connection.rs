@@ -474,9 +474,9 @@ mod tests {
     #[test]
     fn android_back_key_is_mapped_for_in_app_navigation() {
         // gpui-pre-mobile maps KEYCODE_BACK to the "escape" keystroke, and the
-        // app binds it to NavigateBack so the system back gesture pops the page
-        // stack instead of backgrounding the activity. The legacy "back" alias
-        // stays bound for hosts that still emit it.
+        // app binds it to NavigateBack so the system back key/gesture pops the
+        // page stack. The legacy "back" alias stays bound for hosts that still
+        // emit it.
         let app_source = include_str!("app.rs");
         assert!(
             app_source.contains("KeyBinding::new(\"escape\", NavigateBack, None)"),
@@ -497,9 +497,8 @@ mod tests {
         // The sessions drawer is dragged open from the left edge, and on a
         // phone with gesture navigation that edge belongs to the system's back
         // gesture. A swipe the system claims never reaches GPUI: it arrives as
-        // BACK, and the session page's back stack is empty, so the app left the
-        // foreground instead of opening the drawer. The host has to keep that
-        // edge out of the system gesture for the app's own pan to see it.
+        // BACK instead, so the host has to keep that edge out of the system
+        // gesture for the app's own pan to see it.
         assert!(
             ANDROID_ACTIVITY.contains("setSystemGestureExclusionRects"),
             "the Android host must keep the left edge out of the system back gesture"
@@ -511,6 +510,26 @@ mod tests {
         assert!(
             ANDROID_ACTIVITY.contains("Build.VERSION_CODES.Q"),
             "the system gesture exclusion only exists from API 29 on"
+        );
+        // A swipe the system claims anyway arrives as BACK, and the root page
+        // has nothing to close, so back navigation must stop there. Nothing may
+        // turn that event into the app leaving the foreground: that is exactly
+        // the rightward swipe the drawer was supposed to answer.
+        assert!(
+            !ANDROID_ACTIVITY.contains("gpuiBackgroundApp"),
+            "the Android host must expose no way to background the app from Rust"
+        );
+        assert!(
+            !ANDROID_ACTIVITY.contains("moveTaskToBack"),
+            "the Android host must not move the task to the background"
+        );
+        assert!(
+            !include_str!("platform.rs").contains("fn leave_app"),
+            "the platform layer must expose no way to leave the app"
+        );
+        assert!(
+            !include_str!("app.rs").contains("leave_app"),
+            "back navigation must never leave the app"
         );
         // The exclusion is only justified while the drawer is dragged open by a
         // rightward pan from the main page: an app without that gesture would be
