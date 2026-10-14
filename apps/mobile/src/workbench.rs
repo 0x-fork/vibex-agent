@@ -41,6 +41,9 @@ use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaSta
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(600);
 /// Cell metrics copied from the desktop terminal surface so both clients
 /// render the same grid geometry at the base 13px mono font size.
+/// How much of a long diff is shown at once, and how much more each "show
+/// more" adds.
+const GIT_DIFF_PAGE_LINES: usize = 800;
 const TERMINAL_FONT_SIZE: f32 = 13.0;
 const TERMINAL_CELL_WIDTH: f32 = 8.0;
 const TERMINAL_CELL_HEIGHT: f32 = 18.0;
@@ -305,6 +308,9 @@ pub struct MobileWorkbench {
     /// The scroll handle for the diff sheet, so a freshly opened diff starts at
     /// its first line instead of wherever the tree behind it was scrolled to.
     git_diff_scroll: ScrollHandle,
+    /// How many lines of the open diff are shown. A long patch is read a page
+    /// at a time rather than cut off, which is what the hard limit used to do.
+    git_diff_limit: usize,
     /// Paths awaiting confirmation before a rollback. The desktop confirms this
     /// too; the phone used to discard local edits on a single tap.
     git_revert_confirmation: Option<Vec<String>>,
@@ -442,6 +448,7 @@ impl MobileWorkbench {
             file_goto_input: None,
             git_diff: None,
             git_diff_scroll: ScrollHandle::new(),
+            git_diff_limit: GIT_DIFF_PAGE_LINES,
             git_revert_confirmation: None,
             git_status_error: None,
             git_commit_detail: None,
@@ -1747,6 +1754,7 @@ impl MobileWorkbench {
     }
 
     fn open_git_diff(&mut self, path: String, staged: bool, cx: &mut Context<Self>) {
+        self.git_diff_limit = GIT_DIFF_PAGE_LINES;
         let ticket = match self.git.begin_diff_load(path, staged) {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -5594,13 +5602,13 @@ impl MobileWorkbench {
     /// with the old/new line numbers the desktop shows. Long lines wrap with a
     /// hanging indent so a continuation cannot be mistaken for a new line.
     fn render_git_diff(&self, diff: GitDiffResponse, cx: &mut Context<Self>) -> gpui::AnyElement {
-        const MAX_DIFF_LINES: usize = 800;
+        let limit = self.git_diff_limit.max(GIT_DIFF_PAGE_LINES);
         let mut old_line = 0u32;
         let mut new_line = 0u32;
         let lines = diff
             .diff
             .lines()
-            .take(MAX_DIFF_LINES)
+            .take(limit)
             .map(|raw| {
                 let raw = raw.to_string();
                 let (kind, number) = if raw.starts_with("@@") {
@@ -5619,7 +5627,8 @@ impl MobileWorkbench {
                 (kind, number, raw)
             })
             .collect::<Vec<_>>();
-        let truncated = diff.diff.lines().count() > MAX_DIFF_LINES;
+        let total_lines = diff.diff.lines().count();
+        let remaining = total_lines.saturating_sub(limit);
         let path = diff.path.clone();
         div()
             .id("mobile-git-diff-sheet")
@@ -5748,21 +5757,44 @@ impl MobileWorkbench {
                             )
                     })),
             )
-            .when(truncated, |sheet| {
+            // A long patch is paged rather than cut off: the rest of it is one
+            // tap away instead of being a trip to the desktop.
+            .when(remaining > 0, |sheet| {
                 sheet.child(
                     div()
+                        .id("git-diff-more")
                         .flex_shrink_0()
+                        .min_h(px(theme::TOUCH_TARGET))
                         .px(px(theme::SPACING_MD))
-                        .py(px(theme::SPACING_SM))
                         .border_t_1()
                         .border_color(theme::border_subtle())
-                        .text_size(theme::font_micro())
-                        .text_color(theme::text_muted())
-                        .child(locale::text(
-                            "Diff truncated on the phone. Open it on the desktop for the rest.",
-                            "移动端已截断差异，完整内容请在桌面端查看。",
-                            "行動端已截斷差異，完整內容請在桌面版檢視。",
-                        )),
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .active(|style| style.bg(theme::row_pressed_bg()))
+                        .text_size(theme::font_caption())
+                        .text_color(theme::primary())
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.git_diff_limit =
+                                    this.git_diff_limit.saturating_add(GIT_DIFF_PAGE_LINES);
+                                cx.notify();
+                            }),
+                        )
+                        .child(locale::text("Show more lines", "显示更多行", "顯示更多行"))
+                        .child(
+                            div()
+                                .text_size(theme::font_micro())
+                                .text_color(theme::text_muted())
+                                .child(format!(
+                                    "{} {}",
+                                    remaining,
+                                    locale::text("left", "行未显示", "行未顯示")
+                                )),
+                        ),
                 )
             })
             .into_any_element()

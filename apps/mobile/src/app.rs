@@ -1487,6 +1487,12 @@ pub struct MobileApp {
     new_session_runtime: Option<SessionRuntimeSelection>,
     new_session_title_input: Entity<InputState>,
     new_session_prompt_input: Entity<TextareaState>,
+    /// The directory browser's open state, and the listing it is showing.
+    ///
+    /// A path on the desktop host cannot be typed on a phone keyboard, and the
+    /// authority is the only thing that can list its own directories, so the
+    /// choice is made from what it reports.
+    worktree_path_browser: Option<MobileDirectoryBrowser>,
     /// The worktree's name, when the session is starting in a new one. The
     /// authority slugs it into `vibex/<slug>` for the branch and the directory.
     new_session_worktree_name_input: Entity<InputState>,
@@ -1520,6 +1526,21 @@ pub struct MobileApp {
     project_remove_confirmation: Option<String>,
     /// The group whose membership is being edited.
     group_members_editor: Option<MobileGroupMembersEditor>,
+    /// The sessions a parent owns, by parent id, once that parent is expanded.
+    /// Children are not in the ordinary session list, so this is the only place
+    /// the sidebar can learn they exist.
+    delegated_children: BTreeMap<String, Vec<vibex_core::SessionTreeNode>>,
+    /// Session ids the tree reports as having children, whether or not they
+    /// have been fetched yet.
+    delegated_parents: BTreeSet<String>,
+    /// Every node the tree has named, by session id. The group tabs summarise
+    /// their members from these: a member's own node is what says whether its
+    /// task is running, waiting, or done.
+    delegated_nodes: BTreeMap<String, vibex_core::SessionTreeNode>,
+    /// The parents whose children are on screen.
+    delegated_expanded: BTreeSet<String>,
+    /// The parents whose children are being fetched.
+    delegated_loading: BTreeSet<String>,
     /// Top edge and right edge of the row list in window space, recorded during
     /// paint so a touch pan can be resolved to a row without hit-test plumbing.
     sidebar_list_frame: Rc<Cell<(f32, f32)>>,
@@ -1627,7 +1648,10 @@ impl Focusable for MobileApp {
 const MOBILE_MAX_COMPOSER_ATTACHMENTS: usize = 8;
 
 /// One member of the open session's group, as the tab strip draws it.
-type SessionGroupTabs = (String, Vec<(VibexSessionId, String, AgentSessionState)>);
+type MobileSessionGroupTabs = (
+    vibex_desktop_model::SessionGroupUiState,
+    Vec<(VibexSessionId, String, AgentSessionState)>,
+);
 
 /// Splits a composer draft into a slash command name and its arguments.
 ///
@@ -1681,6 +1705,16 @@ fn mention_prefix(text: &str) -> Option<&str> {
     let token = text.split_whitespace().last()?;
     let remainder = token.strip_prefix('@')?;
     (!remainder.contains('@')).then_some(remainder)
+}
+
+/// One directory the authority listed, and where the browser is in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MobileDirectoryBrowser {
+    path: String,
+    parent: Option<String>,
+    roots: Vec<String>,
+    entries: Vec<(String, String)>,
+    loading: bool,
 }
 
 /// Which field an attachment picked from the system belongs to.
@@ -2708,6 +2742,7 @@ impl MobileApp {
                     "描述你想完成的事情…",
                 ))
             }),
+            worktree_path_browser: None,
             new_session_worktree_name_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(locale::text(
                     "Worktree name",
@@ -2756,6 +2791,11 @@ impl MobileApp {
             sidebar_batch_delete_confirmation: false,
             project_remove_confirmation: None,
             group_members_editor: None,
+            delegated_children: BTreeMap::new(),
+            delegated_parents: BTreeSet::new(),
+            delegated_nodes: BTreeMap::new(),
+            delegated_expanded: BTreeSet::new(),
+            delegated_loading: BTreeSet::new(),
             sidebar_list_frame: Rc::new(Cell::new((0.0, 0.0))),
             composer_queue_frame: Rc::new(Cell::new((0.0, 0.0))),
             attachment_preview_frame: Rc::new(Cell::new((0.0, 0.0))),
@@ -3413,6 +3453,111 @@ impl MobileApp {
     /// host, the route, or the credential that failed — so it travels whole.
     fn fail(&mut self, error: BackendError) {
         self.hint(Tone::Error, error.message);
+    }
+
+    /// Opens the authority's directory browser for the worktree path.
+    fn open_worktree_path_browser(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .workspace
+                .supports(BackendOperation::WorkspaceBrowseDirectories)
+        }) {
+            self.hint(
+                Tone::Warning,
+                locale::text(
+                    "This desktop cannot browse its directories",
+                    "此桌面端不支持浏览目录",
+                    "此桌面版不支援瀏覽目錄",
+                ),
+            );
+            cx.notify();
+            return;
+        }
+        // Opening on the path already typed, when there is one, so the browser
+        // continues where the reader was rather than starting over.
+        let start = self
+            .new_session_worktree_path_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        self.load_worktree_directory((!start.is_empty()).then_some(start), cx);
+    }
+
+    /// Lists one directory, or the first browse root when none is named.
+    fn load_worktree_directory(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.worktree_path_browser = Some(MobileDirectoryBrowser {
+            path: path.clone().unwrap_or_default(),
+            parent: None,
+            roots: self
+                .worktree_path_browser
+                .as_ref()
+                .map(|browser| browser.roots.clone())
+                .unwrap_or_default(),
+            entries: Vec::new(),
+            loading: true,
+        });
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.browse_authority_directories(path).await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(listing) => {
+                        this.worktree_path_browser = Some(MobileDirectoryBrowser {
+                            path: listing.path,
+                            parent: listing.parent,
+                            roots: listing.roots,
+                            entries: listing
+                                .entries
+                                .into_iter()
+                                .map(|entry| (entry.name, entry.path))
+                                .collect(),
+                            loading: false,
+                        });
+                    }
+                    Err(error) => {
+                        this.worktree_path_browser = None;
+                        this.fail(error);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    fn close_worktree_path_browser(&mut self, cx: &mut Context<Self>) {
+        if self.worktree_path_browser.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Takes the directory the browser is standing in.
+    fn choose_worktree_directory(
+        &mut self,
+        _: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(browser) = self.worktree_path_browser.take() else {
+            return;
+        };
+        let path = browser.path.clone();
+        self.new_session_worktree_path_input
+            .update(cx, |input, cx| input.set_value(path, window, cx));
+        cx.notify();
     }
 
     /// Steps the text size through its three settings.
@@ -4452,7 +4597,120 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// Reads the ownership forest, so a parent session can show its children.
+    ///
+    /// The ordinary session list deliberately omits owned children: they are
+    /// not peers of the sessions the reader started. The tree is where they
+    /// are named, and only the roots are read here — a branch is fetched when
+    /// its parent is expanded.
+    fn refresh_session_tree(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone().filter(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentSessionAccess)
+        }) else {
+            return;
+        };
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .session_tree(vibex_core::SessionTreeRequest {
+                    parent_session_id: None,
+                    cursor: None,
+                    limit: Some(200),
+                    include_archived: false,
+                })
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                if let Ok(page) = outcome {
+                    this.record_delegated_nodes(&page.nodes);
+                    this.delegated_parents = page
+                        .nodes
+                        .iter()
+                        .filter(|node| node.child_count > 0)
+                        .filter_map(|node| node.session_ref.session_id())
+                        .map(|id| id.as_str().to_string())
+                        .collect();
+                    // A parent that is no longer in the forest drops whatever
+                    // branch was cached for it.
+                    let known = this.delegated_parents.clone();
+                    this.delegated_children
+                        .retain(|parent, _| known.contains(parent));
+                    this.delegated_expanded
+                        .retain(|parent| known.contains(parent));
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+    }
+
+    /// Remembers the nodes a tree page named, for the summaries that read them.
+    fn record_delegated_nodes(&mut self, nodes: &[vibex_core::SessionTreeNode]) {
+        for node in nodes {
+            if let Some(id) = node.session_ref.session_id() {
+                self.delegated_nodes
+                    .insert(id.as_str().to_string(), node.clone());
+            }
+        }
+    }
+
+    /// Shows or hides one parent's children, fetching them the first time.
+    fn toggle_delegated_children(&mut self, session_id: String, cx: &mut Context<Self>) {
+        if self.delegated_expanded.remove(&session_id) {
+            cx.notify();
+            return;
+        }
+        self.delegated_expanded.insert(session_id.clone());
+        if self.delegated_children.contains_key(&session_id)
+            || self.delegated_loading.contains(&session_id)
+        {
+            cx.notify();
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Ok(parent) = VibexSessionId::parse(session_id.as_str()) else {
+            return;
+        };
+        self.delegated_loading.insert(session_id.clone());
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .session_tree(vibex_core::SessionTreeRequest {
+                    parent_session_id: Some(parent),
+                    cursor: None,
+                    limit: Some(100),
+                    include_archived: false,
+                })
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.delegated_loading.remove(&session_id);
+                match outcome {
+                    Ok(page) => {
+                        this.record_delegated_nodes(&page.nodes);
+                        this.delegated_children.insert(session_id, page.nodes);
+                    }
+                    Err(error) => {
+                        this.delegated_expanded.remove(&session_id);
+                        this.fail(error);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
     fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
+        self.refresh_session_tree(cx);
         if self.session_sync_busy {
             self.session_sync_queued = true;
             return;
@@ -6267,7 +6525,7 @@ impl MobileApp {
     ///
     /// The phone shows one member at a time — there is no split view here — so
     /// the group becomes a tab strip on the session page instead of a layout.
-    fn active_session_group(&self) -> Option<SessionGroupTabs> {
+    fn active_session_group(&self) -> Option<MobileSessionGroupTabs> {
         let session_id = self
             .controller
             .as_ref()
@@ -6289,7 +6547,7 @@ impl MobileApp {
                     .map(|session| (session.id.clone(), session.title.clone(), session.state))
             })
             .collect::<Vec<_>>();
-        (members.len() >= 2).then(|| (group.name.clone(), members))
+        (members.len() >= 2).then(|| (group.clone(), members))
     }
 
     /// Loads the `/` commands and `@` references the open session's Agent
@@ -6932,6 +7190,71 @@ impl MobileApp {
     }
 
     fn mobile_sidebar_rows(&self, query: &str) -> Vec<SidebarRow> {
+        let rows = self.base_sidebar_rows(query);
+        self.with_delegated_children(rows)
+    }
+
+    /// Puts each expanded parent's children directly under it.
+    ///
+    /// The child rows are copies of the session row shape with a deeper indent
+    /// and the child flag set, so every path that treats rows as organizational
+    /// items can skip them by that flag alone.
+    fn with_delegated_children(&self, rows: Vec<SidebarRow>) -> Vec<SidebarRow> {
+        if self.delegated_expanded.is_empty() {
+            return rows;
+        }
+        let mut expanded = Vec::with_capacity(rows.len());
+        for row in rows {
+            let parent_id = row
+                .session_id
+                .as_ref()
+                .map(|id| id.as_str().to_string())
+                .filter(|id| self.delegated_expanded.contains(id));
+            let children = parent_id
+                .as_ref()
+                .and_then(|id| self.delegated_children.get(id))
+                .cloned()
+                .unwrap_or_default();
+            let base_indent = row.indent;
+            let project_id = row.project_id.clone();
+            let workspace_id = row.workspace_id.clone();
+            expanded.push(row);
+            for child in children {
+                let Some(child_id) = child.session_ref.session_id() else {
+                    continue;
+                };
+                expanded.push(SidebarRow {
+                    item: SidebarOrganizationItem::Session(child_id.as_str().to_string()),
+                    kind: SidebarRowKind::Session,
+                    depth: 0,
+                    indent: base_indent + theme::SIDEBAR_ICON_TITLE_GAP,
+                    label: child.title.clone(),
+                    project_id: project_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    detail: child
+                        .agent_label
+                        .clone()
+                        .or_else(|| child.agent_id.as_ref().map(|id| id.as_str().to_string())),
+                    child_count: child.child_count,
+                    collapsed: false,
+                    pinned: false,
+                    selected: self
+                        .controller
+                        .as_ref()
+                        .and_then(|controller| controller.state.selected_session_id.as_ref())
+                        .is_some_and(|selected| selected == &child_id),
+                    state: None,
+                    session_id: Some(child_id),
+                    unread: false,
+                    auto_continue: false,
+                    delegated_child: true,
+                });
+            }
+        }
+        expanded
+    }
+
+    fn base_sidebar_rows(&self, query: &str) -> Vec<SidebarRow> {
         let projects = self.sidebar_projects();
         let workspaces = self.sidebar_workspaces();
         sidebar_rows(SidebarRowInput {
@@ -7050,7 +7373,7 @@ impl MobileApp {
         let Some(row) = rows.get(index).cloned() else {
             return;
         };
-        if row.kind == SidebarRowKind::EmptyWorkspace {
+        if row.kind == SidebarRowKind::EmptyWorkspace || row.delegated_child {
             return;
         }
         let can_organize = self.backend.as_ref().is_some_and(|backend| {
@@ -8304,6 +8627,10 @@ impl MobileApp {
         if self.sidebar_batch_delete_confirmation {
             self.sidebar_batch_delete_confirmation = false;
             cx.notify();
+            return;
+        }
+        if self.worktree_path_browser.is_some() {
+            self.close_worktree_path_browser(cx);
             return;
         }
         if self.group_members_editor.is_some() {
@@ -12124,8 +12451,8 @@ impl MobileApp {
                         .flex()
                         .flex_col()
                         .child(self.render_header(&title, state, cx))
-                        .when_some(self.active_session_group(), |page, (name, members)| {
-                            page.child(self.render_session_group_tabs(&name, &members, cx))
+                        .when_some(self.active_session_group(), |page, (group, members)| {
+                            page.child(self.render_session_group_tabs(&group, &members, cx))
                         })
                         .child(
                             div()
@@ -12909,6 +13236,40 @@ impl MobileApp {
         };
 
         match row.kind {
+            SidebarRowKind::Session if row.delegated_child => {
+                // A child has no place in the organization, so the only thing
+                // its menu can do is open it or hand it the same actions a
+                // session has.
+                let session_id = row.session_id.clone();
+                for (id, kind, label, destructive) in [
+                    (
+                        "mobile-row-menu-child-rename",
+                        SessionActionKind::Rename,
+                        locale::common("Rename"),
+                        false,
+                    ),
+                    (
+                        "mobile-row-menu-child-delete",
+                        SessionActionKind::Delete,
+                        locale::common("Delete"),
+                        true,
+                    ),
+                ] {
+                    let session_id = session_id.clone();
+                    let title = row.label.clone();
+                    sheet = entry(
+                        sheet,
+                        id,
+                        label.to_string(),
+                        destructive,
+                        Box::new(move |this, _, cx| {
+                            if let Some(session_id) = session_id.clone() {
+                                this.begin_session_action(kind, session_id, title.clone(), cx);
+                            }
+                        }),
+                    );
+                }
+            }
             SidebarRowKind::Session => {
                 let session_id = row.session_id.clone();
                 // Archive sits with the other row actions rather than behind
@@ -13551,6 +13912,277 @@ impl MobileApp {
                     ),
             )
             .into_any_element()
+    }
+
+    /// The authority's directories, so a path can be chosen instead of typed.
+    fn render_worktree_path_browser(
+        &self,
+        browser: &MobileDirectoryBrowser,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let parent = browser.parent.clone();
+        let current = browser.path.clone();
+        let roots = browser.roots.clone();
+        div()
+            .id("mobile-worktree-path-browser")
+            .debug_selector(|| "mobile-worktree-path-browser".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.45))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_worktree_path_browser(cx)),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .max_h(gpui::relative(0.75))
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(theme::border_subtle())
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("worktree-path-up")
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .when_some(parent.clone(), |button, up| {
+                                        button
+                                            .cursor_pointer()
+                                            .active(|style| style.bg(theme::row_pressed_bg()))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.load_worktree_directory(
+                                                        Some(up.clone()),
+                                                        cx,
+                                                    )
+                                                }),
+                                            )
+                                    })
+                                    .when(parent.is_none(), |button| button.opacity(0.4))
+                                    .child(
+                                        svg()
+                                            .path("icons/chevron-left.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_secondary()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .font_family("IBM Plex Mono")
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_secondary())
+                                    .child(if current.is_empty() {
+                                        locale::common("Loading").to_string()
+                                    } else {
+                                        current.clone()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("worktree-path-choose")
+                                    .flex_shrink_0()
+                                    .h(px(32.0))
+                                    .px_3()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(theme::primary())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(theme::font_caption())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::primary_foreground())
+                                    .when(!current.is_empty(), |button| {
+                                        button
+                                            .cursor_pointer()
+                                            .active(|style| style.opacity(0.85))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(Self::choose_worktree_directory),
+                                            )
+                                    })
+                                    .when(current.is_empty(), |button| button.opacity(0.5))
+                                    .child(locale::common("Use this folder")),
+                            ),
+                    )
+                    .when(!roots.is_empty(), |sheet| {
+                        sheet.child(
+                            div()
+                                .id("worktree-path-roots")
+                                .flex_shrink_0()
+                                .px_2()
+                                .py_1()
+                                .border_b_1()
+                                .border_color(theme::border_subtle())
+                                .overflow_x_scroll()
+                                .restrict_scroll_to_axis()
+                                .flex()
+                                .items_center()
+                                .gap(px(theme::SPACING_XS))
+                                .children(roots.into_iter().map(|root| {
+                                    let label = root.clone();
+                                    let target = root.clone();
+                                    div()
+                                        .id(format!("worktree-path-root:{root}"))
+                                        .flex_shrink_0()
+                                        .h(px(28.0))
+                                        .px_2()
+                                        .rounded(px(theme::RADIUS_PILL))
+                                        .border_1()
+                                        .border_color(theme::border_default())
+                                        .flex()
+                                        .items_center()
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .text_size(theme::font_micro())
+                                        .text_color(theme::text_secondary())
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.load_worktree_directory(
+                                                    Some(target.clone()),
+                                                    cx,
+                                                )
+                                            }),
+                                        )
+                                        .child(label)
+                                })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("worktree-path-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .p_2()
+                            .when(browser.loading, |list| {
+                                list.child(
+                                    div()
+                                        .p_3()
+                                        .text_size(theme::font_body())
+                                        .text_color(theme::text_muted())
+                                        .child(locale::common("Loading")),
+                                )
+                            })
+                            .when(!browser.loading && browser.entries.is_empty(), |list| {
+                                list.child(
+                                    div()
+                                        .p_3()
+                                        .text_size(theme::font_body())
+                                        .text_color(theme::text_muted())
+                                        .child(locale::text(
+                                            "No folders here",
+                                            "这里没有子目录",
+                                            "這裡沒有子目錄",
+                                        )),
+                                )
+                            })
+                            .children(browser.entries.iter().map(|(name, path)| {
+                                let label = name.clone();
+                                let target = path.clone();
+                                div()
+                                    .id(format!("worktree-path-entry:{path}"))
+                                    .w_full()
+                                    .min_h(px(theme::TOUCH_TARGET))
+                                    .px_3()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.load_worktree_directory(Some(target.clone()), cx)
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/folder.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .flex_shrink_0()
+                                            .text_color(theme::accent_blue()),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_size(theme::font_body())
+                                            .text_color(theme::text_primary())
+                                            .child(label),
+                                    )
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// What a group's members are doing, as the desktop's group label says it.
+    fn group_team_status(&self, group: &vibex_desktop_model::SessionGroupUiState) -> String {
+        let sessions = self.sessions();
+        let mut status = vibex_desktop_model::SessionGroupTeamStatus::default();
+        for id in &group.member_session_ids {
+            status.record(
+                self.delegated_nodes.get(id.as_str()),
+                sessions
+                    .iter()
+                    .find(|session| session.id.as_str() == id)
+                    .map(|session| session.state)
+                    .unwrap_or(AgentSessionState::Idle),
+            );
+        }
+        [
+            (status.running, locale::text("running", "运行中", "執行中")),
+            (
+                status.waiting,
+                locale::text("waiting", "等待用户", "等待使用者"),
+            ),
+            (status.review, locale::text("in review", "待审阅", "待審閱")),
+            (
+                status.results_ready,
+                locale::text("results ready", "待回收", "待回收"),
+            ),
+            (status.failed, locale::text("failed", "失败", "失敗")),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, label)| format!("{count} {label}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
     }
 
     /// The membership list for one group: the scope's sessions, ticked.
@@ -15190,10 +15822,12 @@ impl MobileApp {
     /// grouping survives, the split layout does not.
     fn render_session_group_tabs(
         &self,
-        name: &str,
+        group: &vibex_desktop_model::SessionGroupUiState,
         members: &[(VibexSessionId, String, AgentSessionState)],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let name = group.name.as_str();
+        let summary = self.group_team_status(group);
         let selected = self
             .controller
             .as_ref()
@@ -15227,7 +15861,18 @@ impl MobileApp {
                             .text_size(theme::font_micro())
                             .text_color(theme::text_muted())
                             .child(name.to_string()),
-                    ),
+                    )
+                    // What the group's members are doing, where the desktop's
+                    // group label says it: a phone has no panes to read it off.
+                    .when(!summary.is_empty(), |header| {
+                        header.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(theme::font_micro())
+                                .text_color(theme::text_muted())
+                                .child(summary),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -20011,10 +20656,16 @@ impl MobileApp {
             return div().into_any_element();
         };
         let sessions = self.sessions();
-        let Some(session) = sessions.iter().find(|session| session.id == session_id) else {
+        let session = sessions.iter().find(|session| session.id == session_id);
+        // A delegated child is not in the ordinary list — the tree is where it
+        // is named — so its row is drawn from what the row itself carries.
+        if session.is_none() && !row.delegated_child {
             return div().into_any_element();
-        };
-        let session_state = row.state.unwrap_or(session.state);
+        }
+        let session_state = row
+            .state
+            .or_else(|| session.map(|session| session.state))
+            .unwrap_or(AgentSessionState::Idle);
         let generating = matches!(
             session_state,
             AgentSessionState::Running | AgentSessionState::Initializing
@@ -20030,6 +20681,7 @@ impl MobileApp {
             && session_state != AgentSessionState::Idle;
         let open_session_id = session_id.clone();
         let batch_session_id = session_id.clone();
+        let delegated_child = row.delegated_child;
         let (row_offset, row_right_margin) = if inside_workspace_card {
             (
                 -theme::SIDEBAR_ICON_SLOT_OVERHANG,
@@ -20058,7 +20710,9 @@ impl MobileApp {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
-                    if this.sidebar_batch_mode {
+                    // A delegated child is not an item of the organization:
+                    // it is opened, never selected or filed.
+                    if this.sidebar_batch_mode && !delegated_child {
                         this.toggle_sidebar_row_selection(batch_session_id.to_string(), cx);
                     } else {
                         this.open_session(open_session_id.clone(), cx);
@@ -20110,10 +20764,56 @@ impl MobileApp {
                                 }),
                         )
                     })
+                    // A session that owns others offers them here: the ordinary
+                    // list omits owned children, so this is where they are.
+                    .when(
+                        !self.sidebar_batch_mode
+                            && self.delegated_parents.contains(session_id.as_str()),
+                        |title| {
+                            let toggle_id = session_id.as_str().to_string();
+                            let expanded = self.delegated_expanded.contains(session_id.as_str());
+                            title.child(
+                                div()
+                                    .id(format!("mobile-session-children-{}", row.id()))
+                                    .size(px(20.0))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .cursor_pointer()
+                                    .aria_label(
+                                        locale::text("Sub-sessions", "子会话", "子工作階段")
+                                            .to_string(),
+                                    )
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_delegated_children(toggle_id.clone(), cx);
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path(if expanded {
+                                                "icons/chevron-down.svg"
+                                            } else {
+                                                "icons/chevron-right.svg"
+                                            })
+                                            .size(px(12.0))
+                                            .text_color(theme::sidebar_foreground(0.58)),
+                                    ),
+                            )
+                        },
+                    )
                     .when(!self.sidebar_batch_mode, |title| {
                         title.child(
                             svg()
-                                .path(agent_icon_path(&session.agent_id.to_string()))
+                                .path(agent_icon_path(&session.map_or_else(
+                                    || "unknown".to_string(),
+                                    |session| session.agent_id.to_string(),
+                                )))
                                 .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
                                 .flex_shrink_0()
                                 .text_color(theme::sidebar_foreground(if is_selected {
@@ -20169,7 +20869,10 @@ impl MobileApp {
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .whitespace_nowrap()
-                                    .child(session_sidebar_time_label(session.last_message_at_ms)),
+                                    .when_some(
+                                        session.map(|session| session.last_message_at_ms),
+                                        |time, last| time.child(session_sidebar_time_label(last)),
+                                    ),
                             )
                         },
                     )
@@ -23452,21 +24155,67 @@ impl MobileApp {
                                 )
                                 .child(
                                     div()
-                                        .h(px(theme::TOUCH_TARGET))
-                                        .rounded(px(theme::RADIUS_CONTROL))
-                                        .border_1()
-                                        .border_color(theme::border_default())
-                                        .bg(theme::workbench_panel_bg())
-                                        .px_2()
                                         .flex()
                                         .items_center()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            resume_keyboard_on_tap,
+                                        .gap(px(theme::SPACING_XS))
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .h(px(theme::TOUCH_TARGET))
+                                                .rounded(px(theme::RADIUS_CONTROL))
+                                                .border_1()
+                                                .border_color(theme::border_default())
+                                                .bg(theme::workbench_panel_bg())
+                                                .px_2()
+                                                .flex()
+                                                .items_center()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    resume_keyboard_on_tap,
+                                                )
+                                                .child(
+                                                    Input::new(
+                                                        &self.new_session_worktree_path_input,
+                                                    )
+                                                    .appearance(false),
+                                                ),
                                         )
                                         .child(
-                                            Input::new(&self.new_session_worktree_path_input)
-                                                .appearance(false),
+                                            div()
+                                                .id("browse-worktree-path")
+                                                .size(px(theme::TOUCH_TARGET))
+                                                .flex_shrink_0()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(theme::RADIUS_CONTROL))
+                                                .border_1()
+                                                .border_color(theme::border_default())
+                                                .cursor_pointer()
+                                                .aria_label(
+                                                    locale::text(
+                                                        "Browse the desktop's folders",
+                                                        "浏览桌面端文件夹",
+                                                        "瀏覽桌面版資料夾",
+                                                    )
+                                                    .to_string(),
+                                                )
+                                                .active(|style| {
+                                                    style.bg(theme::row_pressed_bg())
+                                                })
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        Self::open_worktree_path_browser,
+                                                    ),
+                                                )
+                                                .child(
+                                                    svg()
+                                                        .path("icons/folder-open.svg")
+                                                        .size(px(theme::ICON_SM))
+                                                        .text_color(theme::text_secondary()),
+                                                ),
                                         ),
                                 )
                                 .child(
