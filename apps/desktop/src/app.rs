@@ -666,6 +666,15 @@ const TIMELINE_PROCESS_RUN_FLOW_LIMIT: usize = 16;
 /// A short group costs less to build outright than to place row by row, the
 /// same trade [`TIMELINE_PROCESS_RUN_FLOW_LIMIT`] makes one level up.
 const TIMELINE_GROUP_ROW_WINDOW_MIN_ROWS: usize = 24;
+/// Slack the row window keeps above and below the viewport.
+///
+/// [`TIMELINE_PROCESS_RUN_OVERSCAN_PX`] is sized for units whose heights differ
+/// by hundreds of pixels, where a fixed slack still cannot promise a full
+/// screen of work. A group's rows are uniform and short, so the same 640px buys
+/// about eighteen rows of work on either side — enough that a seventy-row group
+/// fits inside the window whole, and the window then saves nothing. This is the
+/// same budget measured in rows instead: four or five of them.
+const TIMELINE_GROUP_ROW_OVERSCAN_PX: f32 = 160.0;
 /// The gap the response column puts between two process units.
 const TIMELINE_PROCESS_UNIT_GAP: f32 = 12.0;
 const TIMELINE_TURN_FILE_CHANGES_CACHE_LIMIT: usize = 256;
@@ -2594,6 +2603,24 @@ fn timeline_group_body_windowing() -> bool {
             std::env::var("VIBEX_TIMELINE_GROUP_WINDOW").as_deref(),
             Ok("0") | Ok("false") | Ok("off")
         )
+    })
+}
+
+/// How much slack the row window keeps above and below the viewport.
+///
+/// SPIKE knob: `VIBEX_TIMELINE_GROUP_OVERSCAN=<px>` sweeps the value in one
+/// build, so the band can be measured against the work it saves. Zero is the
+/// floor — a full-screen scroll between frames then shows an empty band — and
+/// the unit run's own slack is the ceiling.
+fn timeline_group_row_overscan() -> Pixels {
+    static OVERSCAN: std::sync::OnceLock<Pixels> = std::sync::OnceLock::new();
+    *OVERSCAN.get_or_init(|| {
+        std::env::var("VIBEX_TIMELINE_GROUP_OVERSCAN")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite())
+            .map(|value| px(value.clamp(0.0, TIMELINE_PROCESS_RUN_OVERSCAN_PX)))
+            .unwrap_or(px(TIMELINE_GROUP_ROW_OVERSCAN_PX))
     })
 }
 
@@ -57667,7 +57694,13 @@ impl VibexWorkbench {
             });
         });
 
-        timeline_group_body::timeline_group_body(origins, total_height, build_row, record)
+        timeline_group_body::timeline_group_body(
+            origins,
+            total_height,
+            timeline_group_row_overscan(),
+            build_row,
+            record,
+        )
     }
 
     /// The turn projection a body built during prepaint belongs to.
@@ -66918,7 +66951,13 @@ impl TimelineProcessRun {
         if bounds.size.width <= px(0.0) {
             return 0..0;
         }
-        timeline_process_visible_units(&self.origins, self.total_height, bounds, viewport)
+        timeline_process_visible_units(
+            &self.origins,
+            self.total_height,
+            bounds,
+            viewport,
+            px(TIMELINE_PROCESS_RUN_OVERSCAN_PX),
+        )
     }
 }
 
@@ -67053,13 +67092,14 @@ fn timeline_process_visible_units(
     total_height: Pixels,
     bounds: Bounds<Pixels>,
     viewport: Bounds<Pixels>,
+    overscan: Pixels,
 ) -> Range<usize> {
     let unit_count = origins.len();
     if unit_count == 0 {
         return 0..0;
     }
-    let visible_top = viewport.top() - px(TIMELINE_PROCESS_RUN_OVERSCAN_PX);
-    let visible_bottom = viewport.bottom() + px(TIMELINE_PROCESS_RUN_OVERSCAN_PX);
+    let visible_top = viewport.top() - overscan;
+    let visible_bottom = viewport.bottom() + overscan;
     let local_top = visible_top - bounds.top();
     let first = if local_top < px(0.0) {
         0
@@ -104819,7 +104859,9 @@ mod tests {
             origin: point(px(0.0), px(0.0)),
             size: size(px(800.0), total_height),
         };
-        let visible = timeline_process_visible_units(&origins, total_height, at_top, viewport);
+        let run_overscan = px(TIMELINE_PROCESS_RUN_OVERSCAN_PX);
+        let visible =
+            timeline_process_visible_units(&origins, total_height, at_top, viewport, run_overscan);
         assert_eq!(visible.start, 0);
         // The band is the viewport plus one overscan on each edge, not the run:
         // 600 + 2 * 640 reaches into the twelfth unit.
@@ -104834,7 +104876,13 @@ mod tests {
             origin: point(px(0.0), px(-5_600.0)),
             size: at_top.size,
         };
-        let visible = timeline_process_visible_units(&origins, total_height, scrolled, viewport);
+        let visible = timeline_process_visible_units(
+            &origins,
+            total_height,
+            scrolled,
+            viewport,
+            run_overscan,
+        );
         assert!(visible.start >= 44 && visible.start <= 46, "{visible:?}");
         // Away from the ends the band is the viewport plus both overscans —
         // 1880px, or eighteen units of 112px — and never the whole run.
@@ -104849,14 +104897,20 @@ mod tests {
             origin: point(px(0.0), px(40_000.0)),
             size: at_top.size,
         };
-        assert!(timeline_process_visible_units(&origins, total_height, below, viewport).is_empty());
+        assert!(
+            timeline_process_visible_units(&origins, total_height, below, viewport, run_overscan)
+                .is_empty()
+        );
         let above = Bounds {
             origin: point(px(0.0), px(-40_000.0)),
             size: at_top.size,
         };
-        assert!(timeline_process_visible_units(&origins, total_height, above, viewport).is_empty());
+        assert!(
+            timeline_process_visible_units(&origins, total_height, above, viewport, run_overscan)
+                .is_empty()
+        );
         assert_eq!(
-            timeline_process_visible_units(&[], px(0.0), at_top, viewport),
+            timeline_process_visible_units(&[], px(0.0), at_top, viewport, run_overscan),
             0..0
         );
     }

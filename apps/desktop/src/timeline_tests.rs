@@ -2119,8 +2119,12 @@ fn an_expanded_group_body_builds_only_the_rows_the_viewport_shows(cx: &mut TestA
         !built.is_empty(),
         "the settled body must build the rows the viewport shows"
     );
+    // The band is the 400px viewport plus the row window's own slack on each
+    // edge — about twenty 36px rows. The bound leaves room for the rows to
+    // measure shorter or taller, and still fails if the window falls back to
+    // the unit run's 640px overscan, which alone would reach eighteen rows.
     assert!(
-        built.len() < group_rows / 2,
+        built.len() <= 32,
         "the windowed body built {} of {group_rows} rows: {built:?}",
         built.len()
     );

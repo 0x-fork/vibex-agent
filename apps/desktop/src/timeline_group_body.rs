@@ -27,7 +27,10 @@
 //! * keep bottom-follow and the captured scroll anchor steady while a streamed
 //!   row grows;
 //! * place rows from the body's own measured width rather than the last width
-//!   the surface reported.
+//!   the surface reported;
+//! * pick its own overscan from how the reader is scrolling. It keeps a shallow
+//!   one today ([`super::TIMELINE_GROUP_ROW_OVERSCAN_PX`]) because the unit
+//!   run's slack, measured in pixels, covered most of a group whole.
 
 use std::rc::Rc;
 
@@ -54,6 +57,8 @@ struct TimelineGroupBody {
     origins: Rc<Vec<Pixels>>,
     /// The height the rows occupy in the flow.
     total_height: Pixels,
+    /// Slack the window keeps above and below the viewport, in pixels.
+    overscan: Pixels,
     /// Builds row `index` on demand.
     build_row: TimelineGroupRowBuilder,
     /// Records the heights this body measured.
@@ -64,12 +69,14 @@ impl TimelineGroupBody {
     fn new(
         origins: Rc<Vec<Pixels>>,
         total_height: Pixels,
+        overscan: Pixels,
         build_row: TimelineGroupRowBuilder,
         record: TimelineGroupRowRecorder,
     ) -> Self {
         Self {
             origins,
             total_height,
+            overscan,
             build_row,
             record,
         }
@@ -154,6 +161,7 @@ impl Element for TimelineGroupBody {
             self.total_height,
             bounds,
             viewport,
+            self.overscan,
         );
         let mut measurements = Vec::new();
         let mut previous_end = None;
@@ -202,8 +210,9 @@ impl Element for TimelineGroupBody {
 pub(super) fn timeline_group_body(
     origins: Rc<Vec<Pixels>>,
     total_height: Pixels,
+    overscan: Pixels,
     build_row: TimelineGroupRowBuilder,
     record: TimelineGroupRowRecorder,
 ) -> AnyElement {
-    TimelineGroupBody::new(origins, total_height, build_row, record).into_any_element()
+    TimelineGroupBody::new(origins, total_height, overscan, build_row, record).into_any_element()
 }
