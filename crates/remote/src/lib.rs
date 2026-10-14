@@ -4470,6 +4470,27 @@ async fn dispatch_agent_request(
             )?;
             serde_json::to_value(result?).map_err(remote_payload_encode_error)
         }
+        RemoteAgentRequest::ControlGoal(request) => {
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = manager.control_goal(request.request).await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                "goal",
+                "Goal control from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            serde_json::to_value(result?).map_err(remote_payload_encode_error)
+        }
         RemoteAgentRequest::DelegateSession(request) => {
             let auth = authorize_agent_action(
                 &manager,

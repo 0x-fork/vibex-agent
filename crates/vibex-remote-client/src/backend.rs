@@ -932,6 +932,32 @@ impl AgentBackend for WebRemoteBackend {
         })
     }
 
+    fn control_goal(
+        &self,
+        request: MutationRequest<vibex_core::AgentGoalControlRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentGoalControlResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::ControlGoal(vibex_core::RemoteTeamMutationRequest {
+                auth: this.auth(),
+                request: request.payload,
+                idempotency_key: key.clone(),
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            decode::<vibex_core::AgentGoalControlResult>(value)
+        })
+    }
+
     fn delegate_session(
         &self,
         request: MutationRequest<vibex_core::HumanDelegationRequest>,
@@ -6916,6 +6942,10 @@ fn remote_capabilities_for_grant(
                 ),
                 (
                     AgentSendMessageWithMentions,
+                    has_team && permits(RemoteActionClass::MutateAgentSession),
+                ),
+                (
+                    AgentGoalControl,
                     has_team && permits(RemoteActionClass::MutateAgentSession),
                 ),
                 (

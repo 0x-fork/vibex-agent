@@ -24,6 +24,8 @@ pub enum BackendOperation {
     AgentResolveApproval,
     AgentRespondElicitation,
     AgentManageSession,
+    /// Pausing, resuming, or clearing the goal a session is working toward.
+    AgentGoalControl,
     AgentForkSession,
     AgentSwitchRuntime,
     AgentAuthRead,

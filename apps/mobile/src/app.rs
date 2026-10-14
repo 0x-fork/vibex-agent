@@ -19643,6 +19643,7 @@ impl MobileApp {
         let active = self.current_goal()?;
         let expanded = self.composer_goal_expanded;
         let phase = active.goal.phase;
+        let paused = phase == GoalPhase::Paused;
         let (phase_label, phase_color) = goal_phase_label(phase);
         let objective = active.goal.objective.clone();
         let progress = goal_progress_label(&active.goal);
@@ -19667,6 +19668,81 @@ impl MobileApp {
                         .text_color(theme::text_muted())
                         .child(progress)
                 }))
+                .child(
+                    div()
+                        .mt(px(theme::SPACING_XS))
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::SPACING_XS))
+                        .child(
+                            div()
+                                .id("composer-goal-pause")
+                                .flex_shrink_0()
+                                .h(px(32.0))
+                                .px(px(theme::SPACING_MD))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(theme::border_default())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(theme::font_caption())
+                                .text_color(theme::text_secondary())
+                                .when(!self.operation_busy, |button| {
+                                    button
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.control_session_goal(
+                                                    if paused {
+                                                        vibex_core::GoalAction::Resume
+                                                    } else {
+                                                        vibex_core::GoalAction::Pause
+                                                    },
+                                                    cx,
+                                                )
+                                            }),
+                                        )
+                                })
+                                .child(if paused {
+                                    locale::text("Resume", "恢复", "恢復")
+                                } else {
+                                    locale::text("Pause", "暂停", "暫停")
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("composer-goal-clear")
+                                .flex_shrink_0()
+                                .h(px(32.0))
+                                .px(px(theme::SPACING_MD))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(theme::border_default())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(theme::font_caption())
+                                .text_color(theme::accent_red())
+                                .when(!self.operation_busy, |button| {
+                                    button
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.control_session_goal(
+                                                    vibex_core::GoalAction::Clear,
+                                                    cx,
+                                                )
+                                            }),
+                                        )
+                                })
+                                .child(locale::text("Clear", "清除", "清除")),
+                        ),
+                )
                 .when(can_edit, |body| {
                     body.child(
                         div()
@@ -19783,6 +19859,69 @@ impl MobileApp {
                 .or(Some(command.label.as_str()))
                 .is_some_and(|name| name.trim_start_matches('/').eq_ignore_ascii_case("goal"))
         })
+    }
+
+    /// Pauses, resumes, or clears the session's goal.
+    ///
+    /// The desktop does this through the local manager; a paired client goes
+    /// through the same authority over the wire, which is what makes a goal
+    /// controllable from the phone at all.
+    fn control_session_goal(&mut self, action: vibex_core::GoalAction, cx: &mut Context<Self>) {
+        if self.operation_busy {
+            return;
+        }
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        let Some(backend) = self.backend.clone().filter(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentGoalControl)
+        }) else {
+            self.hint(
+                Tone::Warning,
+                locale::text(
+                    "This desktop cannot control a goal",
+                    "此桌面端不支持控制目标",
+                    "此桌面版不支援控制目標",
+                ),
+            );
+            cx.notify();
+            return;
+        };
+        let expected_revision = self.current_goal().and_then(|active| active.goal.revision);
+        let request = MutationRequest::new(vibex_core::AgentGoalControlRequest {
+            session_id,
+            action,
+            objective: None,
+            expected_revision,
+            correlation_id: None,
+        });
+        self.operation_busy = true;
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { backend.control_goal(request).await });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.operation_busy = false;
+                match outcome {
+                    Ok(_) => {
+                        // The control appends timeline items, so the window is
+                        // re-read rather than patched.
+                        this.reload_selected_session(cx);
+                    }
+                    Err(error) => this.fail(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
     }
 
     /// Prefills the composer with the Agent's own goal command.
