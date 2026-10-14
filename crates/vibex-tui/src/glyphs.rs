@@ -249,6 +249,35 @@ pub fn elision(tier: GlyphTier) -> &'static str {
     }
 }
 
+/// The single-choice marker of one form option. Three columns.
+pub fn radio(chosen: bool, tier: GlyphTier) -> &'static str {
+    match (chosen, tier) {
+        (true, GlyphTier::Full) => "(•)",
+        (true, GlyphTier::Legacy) => "(*)",
+        (false, _) => "( )",
+    }
+}
+
+/// The multi-choice marker of one form option. Three columns.
+///
+/// A tick is the client's "this is on" glyph everywhere else, and it degrades to
+/// a letter the same way it does there.
+pub fn checkbox(checked: bool, tier: GlyphTier) -> &'static str {
+    match (checked, tier) {
+        (true, GlyphTier::Full) => "[✓]",
+        (true, GlyphTier::Legacy) => "[v]",
+        (false, _) => "[ ]",
+    }
+}
+
+/// The caret at the end of a one-line field being typed into. One column.
+pub fn caret(tier: GlyphTier) -> &'static str {
+    match tier {
+        GlyphTier::Full => "▏",
+        GlyphTier::Legacy => "_",
+    }
+}
+
 /// The upper half block a picture is drawn with, two pixels to a cell.
 ///
 /// A console without it gets a solid mark and one colour per cell: a coarse

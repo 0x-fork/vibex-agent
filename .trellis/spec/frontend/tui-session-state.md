@@ -4,7 +4,8 @@
 
 Read this contract when changing TUI new-session composition, session navigation,
 runtime selection, asynchronous creation/fork/send results, optimistic
-transcripts, composer text transitions, or animation repaint scheduling.
+transcripts, composer text transitions, the elicitation or approval card, or
+animation repaint scheduling.
 The runtime owns durable sessions; the TUI owns editor buffers and
 the association between a user's action and its result.
 
@@ -119,6 +120,25 @@ without fetching a record before creation has completed.
   chrome text transitions. `advance_disclosures` returns true on its final tick
   so the resting frame replaces the last clipped frame; subsequent idle calls
   return false. Disabling Motion settles all active disclosures at once.
+- A blocking request — an approval, or an elicitation from a tool such as
+  `ask_user_question` — opens its card once, when it first appears on the page
+  the reader owns. The desktop draws the same card inline in the timeline, so it
+  is visible without a gesture; the terminal transcript is a block list with no
+  controls in it, so the card is a modal that offers itself. A request already
+  offered, or put down with `Esc`, is not offered again: `Enter` on its pending
+  transcript row is the way back, and the status band keeps counting it.
+- The card waits while the Composer holds the keyboard. A reader mid-message
+  keeps their keystrokes; the card opens when they leave the draft. Answers
+  cannot be typed into by a reader who was writing something else.
+- The elicitation form pins the request it opened on and drafts answers per
+  request. A second question arriving while the reader is filling the first in
+  cannot swap the fields under their cursor, and what was typed for one request
+  is never sent with another. A request resolved elsewhere takes its card with
+  it rather than leaving the reader typing into a question nobody waits on.
+- Submitting closes the card only when the answers pass
+  `ElicitationRequest::validate_resolution`. A required field left blank keeps
+  the form open and reports why; the Agent stays blocked on a question the
+  reader can still see.
 
 ## 4. Validation & Error Matrix
 
@@ -141,6 +161,11 @@ without fetching a record before creation has completed.
 | Text transitions are disabled | Show updated labels immediately and do not replay them when re-enabled. |
 | A placeholder snapshot arrives for a session created here | The row keeps the reader's message until a title that is not the placeholder arrives. |
 | A title the authority supplies lands, then a placeholder snapshot follows | The authority's title stands; the reader's recorded name is not consulted again. |
+| A question arrives while the reader is typing a message | Keep the composer's keyboard; open the card once they leave the draft. |
+| A second question arrives while the form is open | The open form keeps its request and its answers; the next one opens after this is answered. |
+| A required field is blank when the form is submitted | Keep the form open and report it; send no resolution. |
+| The reader presses `Esc` on a card | Put it down and do not reopen it on a later frame; the band and the row keep counting it. |
+| A request is resolved from another client while its form is open | The form closes with it; nothing typed there is sent to a later request. |
 
 ## 5. Good / Base / Bad Cases
 
@@ -171,6 +196,14 @@ without fetching a record before creation has completed.
   transition finishes while the mark is resting, and later quiet ticks do not
   repaint. Cover existing-session runtime switches with the picker open/closed,
   the disabled setting, and transitions cleared when changing composer targets.
+- `tests/elicitation.rs` drives the card through public intents and effects and
+  asserts on the drawn frame. Cover: a pending request opening itself, `Esc`
+  keeping it down, `Enter` on its transcript row bringing it back, the Composer
+  keeping the keyboard, walking fields and options, choosing an option by arrow
+  and by digit, ticking a multi-select, flipping a boolean, typing and rubbing
+  out an answer, a blank required field keeping the form open, `Ctrl+D`
+  declining with no answers, a second question taking the first one's place,
+  and an approval opening the same way.
 - PTY scenarios own temporary interface, runtime-preference, and keymap files.
   Pinning `LC_ALL` alone is insufficient because remembered locale settings
   outrank environment detection.

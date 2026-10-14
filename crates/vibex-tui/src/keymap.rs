@@ -1485,6 +1485,11 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::ApprovalDeny,
         "Deny",
     ),
+    // The elicitation form types into its answer fields, so `d` is a letter
+    // there while one is open for typing. Refusing the question is a chord no
+    // field can swallow, which is what keeps Decline reachable from every
+    // field rather than only from the ones that are lists.
+    alias(Scope::Overlay, Chord::ctrl('d'), Intent::ApprovalDeny),
     binding(
         Scope::Overlay,
         Chord::ctrl('a'),

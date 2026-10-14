@@ -7371,7 +7371,7 @@ fn render_overlay(
             );
         }
         Overlay::Approval { selected } => render_approval(frame, area, app, *selected, theme),
-        Overlay::Elicitation { field } => render_elicitation(frame, area, app, *field, theme),
+        Overlay::Elicitation { .. } => render_elicitation(frame, area, app, theme),
         Overlay::RuntimePicker { view, selected } => {
             render_runtime_picker(frame, area, app, *view, *selected, theme);
         }
@@ -7656,83 +7656,252 @@ fn render_approval(
     );
 }
 
-fn render_elicitation(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &mut App,
-    field: usize,
-    theme: &TuiTheme,
-) {
+/// The elicitation form: the Agent's question, drawn as controls.
+///
+/// The desktop draws the same card inline in the timeline — a heading, one
+/// control per field, and a Submit/Decline pair — and the terminal keeps that
+/// shape, because a question is answered the same way in both clients. What
+/// differs is the pointer: the arrows are the mouse here, so a field's options
+/// are rows of the list the cursor walks rather than buttons beside it.
+fn render_elicitation(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTheme) {
+    use vibex_core::ElicitationFieldKind;
     let strings = app.strings;
-    let elicitations = app.elicitations();
-    let Some(surface) = elicitations.first() else {
+    let Some(form) = app.elicitation_form() else {
         return;
     };
-    let request = surface.request.clone();
-    let chrome = modal_chrome(
-        app,
-        strings.elicitation_title(),
-        ModalSizing::card(),
-        vec![
-            ModalHint::new("Tab", strings.hint_next()),
-            ModalHint::new("Shift+Tab", strings.hint_previous()),
-            ModalHint::new("Enter", strings.elicitation_submit()),
-            ModalHint::new("Esc", strings.close()),
-        ],
-    );
+    let request = form.request;
+    let title = request
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| strings.elicitation_title());
+    // The footer is a legend, so it names what the keys do *in this field*: a
+    // text answer types what the reader presses — `Space` included — while a
+    // list of options spends the space on the option under the cursor.
+    let typing = app.elicitation_field_takes_text_keys();
+    let mut hints = vec![
+        ModalHint::new("↑↓", strings.hint_select()),
+        ModalHint::new("Tab", strings.hint_next()),
+    ];
+    if !typing {
+        hints.push(ModalHint::new("Space", strings.hint_toggle()));
+    }
+    hints.push(ModalHint::new("Enter", strings.elicitation_submit()));
+    hints.push(ModalHint::new("Ctrl+D", strings.elicitation_decline()));
+    hints.push(ModalHint::new("Esc", strings.close()));
+    let chrome = modal_chrome(app, title, ModalSizing::card(), hints);
     let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
         return;
     };
+    let empty = crate::reduce::ElicitationDraft::default();
+    let draft = app.elicitation_draft(request.id.as_str()).unwrap_or(&empty);
+    let tier = app.glyph_tier();
 
-    let mut lines = Vec::new();
-    if let Some(title) = request.title.as_ref().filter(|title| !title.is_empty()) {
-        lines.push(Line::from(Span::styled(title.clone(), theme.strong())));
-        lines.push(Line::from(""));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // The rows each field owns, so the field being answered can be brought into
+    // view on a form taller than the terminal.
+    let mut fields: Vec<(usize, usize)> = Vec::with_capacity(request.fields.len());
+    let message = request.message.trim();
+    if !message.is_empty() {
+        lines.push(Line::from(Span::styled(message.to_string(), theme.base())));
     }
+    if let Some(description) = request
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|description| !description.is_empty() && *description != message)
+    {
+        lines.push(Line::from(Span::styled(
+            description.to_string(),
+            theme.muted(),
+        )));
+    }
+    lines.push(Line::from(""));
+
     for (index, definition) in request.fields.iter().enumerate() {
-        let active = index == field;
-        let marker = if active { "▸ " } else { "  " };
+        let start = lines.len();
+        let active = index == form.field;
         let required = if definition.required {
             format!(" *{}", strings.elicitation_required())
         } else {
             String::new()
         };
-        let style = if active {
-            theme.accent()
-        } else {
-            theme.muted()
-        };
         lines.push(Line::from(vec![
-            Span::styled(format!("{marker}{}", definition.title), style),
+            Span::styled(
+                if active {
+                    crate::glyphs::prompt_arrow(tier).to_string()
+                } else {
+                    "  ".to_string()
+                },
+                Style::default().fg(theme.roles.accent_attention),
+            ),
+            Span::styled(
+                definition.title.clone(),
+                if active {
+                    theme.accent()
+                } else {
+                    theme.muted()
+                },
+            ),
             Span::styled(required, theme.warning()),
         ]));
-        let answer = summarize_answer(&request, definition, &app.elicitation_draft);
-        let answer_style = if answer.is_empty() {
-            theme.muted()
-        } else {
-            theme.base()
-        };
-        lines.push(Line::from(vec![
-            Span::styled("    ", theme.muted()),
-            Span::styled(
-                if answer.is_empty() {
+        if let Some(description) = definition
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+        {
+            lines.push(Line::from(Span::styled(
+                format!("  {description}"),
+                theme.dimmed(theme.roles.gray_dim),
+            )));
+        }
+        match &definition.kind {
+            ElicitationFieldKind::Text { options, .. } if !options.is_empty() => {
+                for (option_index, option) in options.iter().enumerate() {
+                    let chosen = draft.text(&definition.id) == Some(option.value.as_str());
+                    let cursor = active && option_index == form.choice;
+                    lines.push(choice_line(
+                        crate::glyphs::radio(chosen, tier),
+                        &option.title,
+                        cursor,
+                        theme,
+                    ));
+                    if let Some(description) = option
+                        .description
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|description| !description.is_empty())
+                    {
+                        lines.push(Line::from(Span::styled(
+                            format!("      {description}"),
+                            theme.dimmed(theme.roles.gray_dim),
+                        )));
+                    }
+                }
+            }
+            ElicitationFieldKind::MultiSelect { options, .. } => {
+                let selected = draft.multi(&definition.id);
+                for (option_index, option) in options.iter().enumerate() {
+                    let checked = selected.contains(&option.value);
+                    let cursor = active && option_index == form.choice;
+                    lines.push(choice_line(
+                        crate::glyphs::checkbox(checked, tier),
+                        &option.title,
+                        cursor,
+                        theme,
+                    ));
+                    if let Some(description) = option
+                        .description
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|description| !description.is_empty())
+                    {
+                        lines.push(Line::from(Span::styled(
+                            format!("      {description}"),
+                            theme.dimmed(theme.roles.gray_dim),
+                        )));
+                    }
+                }
+            }
+            ElicitationFieldKind::Boolean { default } => {
+                let checked = draft.boolean(&definition.id).or(*default).unwrap_or(false);
+                let label = if checked {
+                    strings.elicitation_yes()
+                } else {
+                    strings.elicitation_no()
+                };
+                lines.push(choice_line(
+                    crate::glyphs::checkbox(checked, tier),
+                    label,
+                    active,
+                    theme,
+                ));
+            }
+            ElicitationFieldKind::Text { .. }
+            | ElicitationFieldKind::Number { .. }
+            | ElicitationFieldKind::Integer { .. } => {
+                // A terminal field is one line edited at its end, so the value
+                // and the caret that follows it are the whole control. An empty
+                // one says what it takes rather than being a blank row.
+                let value = draft.text(&definition.id).unwrap_or_default();
+                let style = if active {
+                    theme.selected()
+                } else {
+                    theme.base()
+                };
+                let shown = if value.is_empty() {
                     format!("({})", field_kind_label(definition, strings))
                 } else {
-                    answer
-                },
-                answer_style,
-            ),
-        ]));
+                    value.to_string()
+                };
+                let mut spans = vec![Span::styled(format!("  {shown}"), style)];
+                if active {
+                    spans.push(Span::styled(
+                        crate::glyphs::caret(tier).to_string(),
+                        theme.accent(),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+            ElicitationFieldKind::Unsupported { schema_type } => {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}: {schema_type}", strings.elicitation_unsupported()),
+                    theme.warning(),
+                )));
+            }
+        }
+        fields.push((start, lines.len()));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("[{}]", strings.elicitation_submit()),
-        theme.accent().add_modifier(Modifier::BOLD),
-    )));
+
+    // Keep the field being answered on screen. The rule is stateless — the
+    // form scrolls so the cursor's last row is visible and shows the top of the
+    // form when it already is — which is enough for a card whose tallest
+    // question still fits, and never hides where the reader is.
+    let width = usize::from(layout.content.width).max(1);
+    let rows_of = |line: &Line<'static>| {
+        crate::text::wrap_text(&line.to_string(), width)
+            .len()
+            .max(1)
+    };
+    let (field_start, field_end) = fields.get(form.field).copied().unwrap_or((0, lines.len()));
+    let first_row = lines[..field_start].iter().map(rows_of).sum::<usize>();
+    let last_row = first_row
+        + lines[field_start..field_end]
+            .iter()
+            .map(rows_of)
+            .sum::<usize>()
+            .saturating_sub(1);
+    let height = usize::from(layout.content.height).max(1);
+    let scroll = last_row
+        .saturating_add(1)
+        .saturating_sub(height)
+        .min(u16::MAX as usize) as u16;
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }),
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: true })
+            .scroll((scroll, 0)),
         layout.content,
     );
+}
+
+/// One option row of a form: the marker, the label, and whether the cursor is
+/// on it.
+///
+/// The cursor is drawn as reverse video over the whole row — marker included —
+/// so it reads as one control rather than a label that happens to be lit, and
+/// it survives a terminal with no colour.
+fn choice_line(marker: &str, label: &str, cursor: bool, theme: &TuiTheme) -> Line<'static> {
+    let style = if cursor {
+        theme.selected()
+    } else {
+        theme.base()
+    };
+    Line::from(vec![
+        Span::styled(format!("  {marker} "), style),
+        Span::styled(label.to_string(), style),
+    ])
 }
 
 fn field_kind_label(definition: &vibex_core::ElicitationField, strings: Strings) -> &'static str {
@@ -7744,32 +7913,6 @@ fn field_kind_label(definition: &vibex_core::ElicitationField, strings: Strings)
         ElicitationFieldKind::Boolean { .. } => strings.elicitation_field_boolean(),
         ElicitationFieldKind::MultiSelect { .. } => strings.elicitation_field_multi(),
         _ => strings.elicitation_unsupported(),
-    }
-}
-
-fn summarize_answer(
-    request: &vibex_core::ElicitationRequest,
-    definition: &vibex_core::ElicitationField,
-    draft: &crate::reduce::ElicitationDraft,
-) -> String {
-    let index = request
-        .fields
-        .iter()
-        .position(|field| field.id == definition.id)
-        .unwrap_or(0);
-    match draft.answer_for(&definition.id, index, definition, index) {
-        Some(vibex_core::ElicitationAnswerValue::String(value)) => value,
-        Some(vibex_core::ElicitationAnswerValue::Integer(value)) => value.to_string(),
-        Some(vibex_core::ElicitationAnswerValue::Number(value)) => value,
-        Some(vibex_core::ElicitationAnswerValue::Boolean(value)) => {
-            if value {
-                "yes".to_string()
-            } else {
-                "no".to_string()
-            }
-        }
-        Some(vibex_core::ElicitationAnswerValue::StringArray(values)) => values.join(", "),
-        None => String::new(),
     }
 }
 

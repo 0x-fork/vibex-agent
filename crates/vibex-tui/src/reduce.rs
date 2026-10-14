@@ -672,6 +672,18 @@ impl App {
                 }
             }
             Intent::OpenBlockDetails => {
+                // The one block whose details are not a read: a question the
+                // Agent is blocked on opens the card that answers it, which is
+                // also how a reader who put the form down with `Esc` asks for
+                // it back.
+                if self.selected_block_is_a_pending_question(true) {
+                    self.open_elicitation();
+                } else if self.selected_block_is_a_pending_question(false) {
+                    self.open_approval();
+                }
+                if self.overlay.is_some() {
+                    return Outcome::effects(vec![]);
+                }
                 let index = self.selection_for(Scope::Agent);
                 match block_detail_text(&mut self.transcript, index) {
                     Some((title, body)) => {
@@ -2835,31 +2847,23 @@ impl App {
                 }
                 _ => Outcome::quiet(),
             },
-            Overlay::Elicitation { field } => match intent {
-                Intent::ElicitationSubmit | Intent::ConfirmOverlay => {
-                    self.overlay = None;
-                    self.submit_elicitation(field)
-                }
+            Overlay::Elicitation { .. } => match intent {
+                // `Enter` and `s` both submit: the first is what every modal in
+                // this client answers to, the second is what the desktop's
+                // Submit button is called here.
+                Intent::ElicitationSubmit | Intent::ConfirmOverlay => self.submit_elicitation(),
+                // The approval card's "deny" is the form's "decline": one verb
+                // for refusing the Agent's request, whichever card asks.
+                Intent::ApprovalDeny => self.decline_elicitation(),
                 Intent::ElicitationFieldNext | Intent::OverlayNextField => {
-                    let count = self.current_elicitation_fields();
-                    if count == 0 {
-                        return Outcome::quiet();
-                    }
-                    self.overlay = Some(Overlay::Elicitation {
-                        field: (field + 1) % count,
-                    });
-                    Outcome::effects(vec![])
+                    self.step_elicitation_field(1)
                 }
                 Intent::ElicitationFieldPrevious | Intent::OverlayPreviousField => {
-                    let count = self.current_elicitation_fields();
-                    if count == 0 {
-                        return Outcome::quiet();
-                    }
-                    self.overlay = Some(Overlay::Elicitation {
-                        field: field.saturating_sub(1),
-                    });
-                    Outcome::effects(vec![])
+                    self.step_elicitation_field(-1)
                 }
+                Intent::SelectNext => self.step_elicitation_cursor(1),
+                Intent::SelectPrevious => self.step_elicitation_cursor(-1),
+                Intent::OverlayToggleValue => self.toggle_elicitation_choice(),
                 _ => Outcome::quiet(),
             },
             Overlay::RuntimePicker { view, selected } => {
@@ -3906,14 +3910,432 @@ impl App {
 
     fn open_approval(&mut self) {
         if self.overlay.is_none() && !self.approvals().is_empty() {
+            self.offered_questions
+                .insert(format!("permission:{}", self.approvals()[0].request_id));
             self.overlay = Some(Overlay::Approval { selected: 0 });
         }
     }
 
+    /// Open the form on the question that has waited longest.
     fn open_elicitation(&mut self) {
-        if self.overlay.is_none() && !self.elicitations().is_empty() {
-            self.overlay = Some(Overlay::Elicitation { field: 0 });
+        if self.overlay.is_some() {
+            return;
         }
+        let Some(surface) = self.elicitations().into_iter().next() else {
+            return;
+        };
+        self.show_elicitation(surface.request.id.as_str());
+    }
+
+    /// Open the form on one request, and remember that it has been offered.
+    fn show_elicitation(&mut self, request_id: &str) {
+        self.offered_questions
+            .insert(format!("elicitation:{request_id}"));
+        self.overlay = Some(Overlay::Elicitation {
+            request: request_id.to_string(),
+            field: 0,
+            choice: 0,
+        });
+    }
+
+    /// Put the Agent's blocking question in front of the reader, once.
+    ///
+    /// The desktop draws the approval card and the elicitation form inline in
+    /// the timeline, so both are visible without a gesture. The transcript here
+    /// is a block list with no controls in it, so the same card is a modal that
+    /// opens itself the first time a request appears on the page the reader
+    /// owns. A question already offered — or put down with `Esc` — is left
+    /// alone; `Enter` on its transcript row asks for it again.
+    ///
+    /// A reader mid-sentence keeps the keyboard: the desktop's card does not
+    /// take their focus either, and a modal that opened over a half-written
+    /// message would turn the next words they type into an answer. The card
+    /// waits for them to leave the composer, and the band goes on counting.
+    ///
+    /// Returns whether the frame changed.
+    pub fn sync_pending_question(&mut self) -> bool {
+        // A request answered from another client takes its card with it. The
+        // form cannot answer a question nobody is waiting on, and a modal with
+        // nothing left to draw would swallow every key in front of it.
+        match &self.overlay {
+            Some(Overlay::Elicitation { .. }) if self.elicitation_form().is_none() => {
+                self.overlay = None;
+                return true;
+            }
+            Some(Overlay::Approval { .. }) if self.approvals().is_empty() => {
+                self.overlay = None;
+                return true;
+            }
+            _ => {}
+        }
+        if self.overlay.is_some() || !self.page_owns_session() || self.focus == Focus::Composer {
+            return false;
+        }
+        // Both projections are read once: they walk the timeline, and this runs
+        // on the loop's own clock rather than on an event.
+        let elicitations = self.elicitations();
+        let approvals = self.approvals();
+        // Whatever has been answered or withdrawn is forgotten, so a request id
+        // the runtime reuses — or a card that comes back from the dead — is
+        // offered again rather than silently swallowed.
+        let live = elicitations
+            .iter()
+            .map(|surface| format!("elicitation:{}", surface.request.id))
+            .chain(
+                approvals
+                    .iter()
+                    .map(|approval| format!("permission:{}", approval.request_id)),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+        self.offered_questions.retain(|key| live.contains(key));
+        // A question the reader has already seen — or put down with `Esc` — is
+        // not offered again; asking for it is the transcript row's job. The
+        // first *fresh* one is the card that opens, which is how a second
+        // question takes the place of one whose answer is still in flight.
+        let fresh_elicitation = elicitations
+            .iter()
+            .map(|surface| surface.request.id.to_string())
+            .find(|id| {
+                !self
+                    .offered_questions
+                    .contains(&format!("elicitation:{id}"))
+            });
+        let fresh_approval = approvals
+            .first()
+            .map(|approval| format!("permission:{}", approval.request_id))
+            .filter(|key| !self.offered_questions.contains(key));
+        let before = self.overlay.clone();
+        if let Some(request) = fresh_elicitation {
+            self.show_elicitation(&request);
+        } else if fresh_approval.is_some() {
+            self.open_approval();
+        }
+        self.overlay != before
+    }
+
+    /// Whether the transcript cursor is on a question the Agent is blocked on.
+    ///
+    /// The transcript draws one row for a pending request, and that row is the
+    /// only place the reader can see the question without the card being open.
+    /// The kind matters: the row that answers an approval is not the one that
+    /// answers a question, and a reader who put the cursor on one is asking for
+    /// that one.
+    fn selected_block_is_a_pending_question(&self, elicitation: bool) -> bool {
+        use vibex_desktop_model::TimelineRowKind;
+        let index = self.selection_for(Scope::Agent);
+        self.transcript.block(index).is_some_and(|block| {
+            block.pending_permission
+                && if elicitation {
+                    block.kind == TimelineRowKind::ElicitationRequest
+                } else {
+                    block.kind == TimelineRowKind::PermissionRequest
+                }
+        })
+    }
+
+    /// The question the open form is filling in, while it is still pending.
+    fn elicitation_form_request(&self) -> Option<vibex_core::ElicitationRequest> {
+        self.elicitation_form().map(|form| form.request)
+    }
+
+    /// The draft the open form is writing into.
+    fn elicitation_form_draft(&self, request_id: &str) -> crate::reduce::ElicitationDraft {
+        self.elicitation_drafts
+            .get(request_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// How many options the field at `field` offers.
+    ///
+    /// A boolean is a switch rather than a list — `Space` flips it — so it
+    /// counts as no choices, which is what lets the arrows walk past it.
+    fn elicitation_choice_count(request: &vibex_core::ElicitationRequest, field: usize) -> usize {
+        use vibex_core::ElicitationFieldKind;
+        match request.fields.get(field).map(|field| &field.kind) {
+            Some(ElicitationFieldKind::Text { options, .. }) => options.len(),
+            Some(ElicitationFieldKind::MultiSelect { options, .. }) => options.len(),
+            _ => 0,
+        }
+    }
+
+    /// The option values a field offers, in the order the Agent sent them.
+    fn elicitation_choice_values(
+        request: &vibex_core::ElicitationRequest,
+        field: usize,
+    ) -> Vec<String> {
+        use vibex_core::ElicitationFieldKind;
+        match request.fields.get(field).map(|field| &field.kind) {
+            Some(ElicitationFieldKind::Text { options, .. })
+            | Some(ElicitationFieldKind::MultiSelect { options, .. }) => {
+                options.iter().map(|option| option.value.clone()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Where the cursor lands when the reader walks into a field.
+    ///
+    /// A single-select opens on the option already chosen and a multi-select on
+    /// the first one already ticked, so `Space` on arrival changes what the
+    /// reader was looking at rather than something further down the list.
+    fn elicitation_entry_choice(
+        request: &vibex_core::ElicitationRequest,
+        field: usize,
+        draft: &crate::reduce::ElicitationDraft,
+    ) -> usize {
+        let values = Self::elicitation_choice_values(request, field);
+        let Some(definition) = request.fields.get(field) else {
+            return 0;
+        };
+        let chosen = match &definition.kind {
+            vibex_core::ElicitationFieldKind::MultiSelect { .. } => {
+                draft.multi(&definition.id).into_iter().next()
+            }
+            _ => draft.text(&definition.id).map(str::to_string),
+        };
+        chosen
+            .and_then(|value| values.iter().position(|option| *option == value))
+            .unwrap_or(0)
+    }
+
+    /// Whether the active field is typed into rather than chosen from.
+    fn elicitation_field_takes_text(
+        request: &vibex_core::ElicitationRequest,
+        field: usize,
+    ) -> bool {
+        use vibex_core::ElicitationFieldKind;
+        match request.fields.get(field).map(|field| &field.kind) {
+            // A text field constrained to options is a list, not a prompt: the
+            // request's own validation refuses an answer outside them.
+            Some(ElicitationFieldKind::Text { options, .. }) => options.is_empty(),
+            Some(ElicitationFieldKind::Number { .. } | ElicitationFieldKind::Integer { .. }) => {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the active field offers anything to move a cursor over.
+    fn elicitation_field_is_a_choice(
+        request: &vibex_core::ElicitationRequest,
+        field: usize,
+    ) -> bool {
+        Self::elicitation_choice_count(request, field) > 0
+    }
+
+    /// The open form's question, cursor and draft, resolved together.
+    ///
+    /// One lookup rather than three, so a form whose request was answered
+    /// elsewhere cannot be read as "field 2 of some other question".
+    fn elicitation_cursor(
+        &self,
+    ) -> Option<(
+        String,
+        vibex_core::ElicitationRequest,
+        usize,
+        usize,
+        crate::reduce::ElicitationDraft,
+    )> {
+        let form = self.elicitation_form()?;
+        let id = form.request.id.to_string();
+        let draft = self.elicitation_form_draft(&id);
+        Some((id, form.request, form.field, form.choice, draft))
+    }
+
+    /// Move the form's cursor by `delta`, walking into and out of a field's
+    /// options rather than stopping at its edge.
+    ///
+    /// One gesture over the whole form: the arrows move down the list of
+    /// controls, and a field that opens into a list of options takes them
+    /// first. `Tab` and `←`/`→` are the other way round — they move between
+    /// fields and leave the option cursor where it lands.
+    fn step_elicitation_cursor(&mut self, delta: i64) -> Outcome {
+        let Some((id, request, field, choice, draft)) = self.elicitation_cursor() else {
+            return Outcome::quiet();
+        };
+        let count = request.fields.len();
+        if count == 0 {
+            return Outcome::quiet();
+        }
+        let choices = Self::elicitation_choice_count(&request, field);
+        if delta > 0 && choice + 1 < choices {
+            return self.set_elicitation_cursor(id, field, choice + 1);
+        }
+        if delta < 0 && choice > 0 {
+            return self.set_elicitation_cursor(id, field, choice - 1);
+        }
+        let next = if delta > 0 {
+            (field + 1) % count
+        } else {
+            (field + count - 1) % count
+        };
+        let choice = Self::elicitation_entry_choice(&request, next, &draft);
+        self.set_elicitation_cursor(id, next, choice)
+    }
+
+    /// Move between fields, leaving the option cursor where it lands.
+    fn step_elicitation_field(&mut self, delta: i64) -> Outcome {
+        let Some((id, request, field, _, draft)) = self.elicitation_cursor() else {
+            return Outcome::quiet();
+        };
+        let count = request.fields.len();
+        if count == 0 {
+            return Outcome::quiet();
+        }
+        let next = if delta > 0 {
+            (field + 1) % count
+        } else {
+            (field + count - 1) % count
+        };
+        let choice = Self::elicitation_entry_choice(&request, next, &draft);
+        self.set_elicitation_cursor(id, next, choice)
+    }
+
+    fn set_elicitation_cursor(&mut self, request: String, field: usize, choice: usize) -> Outcome {
+        self.overlay = Some(Overlay::Elicitation {
+            request,
+            field,
+            choice,
+        });
+        Outcome::effects(vec![])
+    }
+
+    /// Take the cursor's option: choose it outright, or tick it in a list.
+    fn toggle_elicitation_choice(&mut self) -> Outcome {
+        use vibex_core::ElicitationFieldKind;
+        let Some((id, request, field, choice, _)) = self.elicitation_cursor() else {
+            return Outcome::quiet();
+        };
+        let Some(definition) = request.fields.get(field) else {
+            return Outcome::quiet();
+        };
+        let draft = self.elicitation_drafts.entry(id).or_default();
+        match &definition.kind {
+            ElicitationFieldKind::Text { options, .. } => {
+                let Some(option) = options.get(choice) else {
+                    return Outcome::quiet();
+                };
+                draft.set_text(definition.id.clone(), option.value.clone());
+            }
+            ElicitationFieldKind::MultiSelect { options, .. } => {
+                let Some(option) = options.get(choice) else {
+                    return Outcome::quiet();
+                };
+                draft.toggle_multi(definition.id.clone(), option.value.clone());
+            }
+            ElicitationFieldKind::Boolean { .. } => {
+                let current = draft.boolean(&definition.id).unwrap_or(false);
+                draft.set_boolean(definition.id.clone(), !current);
+            }
+            _ => return Outcome::quiet(),
+        }
+        Outcome::effects(vec![])
+    }
+
+    /// Type into the active field.
+    ///
+    /// A terminal form field is edited at its end, exactly like the
+    /// configuration form and the schedule editor: the value is one line, and
+    /// the caret is wherever the last character put it.
+    pub fn elicitation_type_char(&mut self, character: char) {
+        let Some((id, request, field, _, _)) = self.elicitation_cursor() else {
+            return;
+        };
+        if !Self::elicitation_field_takes_text(&request, field) {
+            return;
+        }
+        let Some(definition) = request.fields.get(field) else {
+            return;
+        };
+        let draft = self.elicitation_drafts.entry(id).or_default();
+        let mut value = draft.text(&definition.id).unwrap_or_default().to_string();
+        value.push(character);
+        draft.set_text(definition.id.clone(), value);
+    }
+
+    pub fn elicitation_backspace(&mut self) {
+        let Some((id, request, field, _, _)) = self.elicitation_cursor() else {
+            return;
+        };
+        if !Self::elicitation_field_takes_text(&request, field) {
+            return;
+        }
+        let Some(definition) = request.fields.get(field) else {
+            return;
+        };
+        let draft = self.elicitation_drafts.entry(id).or_default();
+        let mut value = draft.text(&definition.id).unwrap_or_default().to_string();
+        value.pop();
+        draft.set_text(definition.id.clone(), value);
+    }
+
+    /// Give the active field up, the way `Delete` clears every other one-line
+    /// field in this client.
+    pub fn elicitation_clear_field(&mut self) {
+        let Some((id, request, field, _, _)) = self.elicitation_cursor() else {
+            return;
+        };
+        let Some(definition) = request.fields.get(field) else {
+            return;
+        };
+        let draft = self.elicitation_drafts.entry(id).or_default();
+        draft.set_text(definition.id.clone(), String::new());
+    }
+
+    /// Whether a printable character belongs to the active field rather than to
+    /// the binding table. The run loop asks before the table sees the key, so a
+    /// question and a shortcut cannot both answer the same letter.
+    pub fn elicitation_field_takes_keys(&self) -> bool {
+        self.elicitation_form().is_some_and(|form| {
+            Self::elicitation_field_takes_text(&form.request, form.field)
+                || Self::elicitation_field_is_a_choice(&form.request, form.field)
+        })
+    }
+
+    /// Whether the cursor's field offers options, so a digit picks one instead
+    /// of being typed.
+    pub fn elicitation_field_choices(&self) -> usize {
+        self.elicitation_form()
+            .map(|form| Self::elicitation_choice_count(&form.request, form.field))
+            .unwrap_or(0)
+    }
+
+    /// Whether the cursor's field is typed into.
+    pub fn elicitation_field_takes_text_keys(&self) -> bool {
+        self.elicitation_form()
+            .is_some_and(|form| Self::elicitation_field_takes_text(&form.request, form.field))
+    }
+
+    /// What one printable key means to the open elicitation form.
+    ///
+    /// The rule is the reducer's, not the run loop's, so it can be tested
+    /// without a terminal: a character is an answer while the cursor is in a
+    /// field that takes one, an option while the cursor is on a list of them,
+    /// and the binding table's business otherwise — which is what lets `j` walk
+    /// a list and `d` refuse the question from every field that is not typing.
+    pub fn elicitation_key(&self, character: char) -> ElicitationKey {
+        if self.elicitation_field_takes_text_keys() {
+            return ElicitationKey::Text;
+        }
+        let choices = self.elicitation_field_choices();
+        if choices == 0 {
+            return ElicitationKey::Elsewhere;
+        }
+        match character.to_digit(10) {
+            Some(digit) if digit >= 1 && (digit as usize) <= choices => {
+                ElicitationKey::Option(digit as usize - 1)
+            }
+            _ => ElicitationKey::Elsewhere,
+        }
+    }
+
+    /// Choose the option at `index` in the cursor's field.
+    pub fn select_elicitation_option(&mut self, index: usize) -> Outcome {
+        if let Some(Overlay::Elicitation { choice, .. }) = self.overlay.as_mut() {
+            *choice = index;
+        }
+        self.toggle_elicitation_choice()
     }
 
     fn resolve_approval(&mut self, requested: PermissionResponseKind, index: usize) -> Outcome {
@@ -3947,33 +4369,52 @@ impl App {
         }])
     }
 
-    fn current_elicitation_fields(&self) -> usize {
-        self.elicitations()
-            .first()
-            .map(|surface| surface.request.fields.len())
-            .unwrap_or(0)
-    }
-
-    fn submit_elicitation(&mut self, field: usize) -> Outcome {
-        let elicitations = self.elicitations();
-        let Some(surface) = elicitations.first() else {
+    /// Answer the question the form is on, with what has been filled in.
+    ///
+    /// The card only closes once the answers pass the request's own validation:
+    /// a required field the reader skipped is a reason to stay where they are,
+    /// not to drop the form and leave the Agent waiting on nothing.
+    fn submit_elicitation(&mut self) -> Outcome {
+        let Some(request) = self.elicitation_form_request() else {
             return Outcome::quiet();
         };
+        let draft = self.elicitation_form_draft(request.id.as_str());
+        self.resolve_elicitation_request(request, ElicitationResolutionAction::Accept, &draft)
+    }
+
+    /// Refuse the question the form is on.
+    fn decline_elicitation(&mut self) -> Outcome {
+        let Some(request) = self.elicitation_form_request() else {
+            return Outcome::quiet();
+        };
+        self.resolve_elicitation_request(
+            request,
+            ElicitationResolutionAction::Decline,
+            &crate::reduce::ElicitationDraft::default(),
+        )
+    }
+
+    fn resolve_elicitation_request(
+        &mut self,
+        request: vibex_core::ElicitationRequest,
+        action: ElicitationResolutionAction,
+        draft: &crate::reduce::ElicitationDraft,
+    ) -> Outcome {
         let Some(session_id) = self.selected_session_id().cloned() else {
             return Outcome::quiet();
         };
-        let request = surface.request.clone();
-        let draft = self.elicitation_draft.clone();
         let mut answers = std::collections::BTreeMap::new();
-        for (index, definition) in request.fields.iter().enumerate() {
-            if let Some(answer) = draft.answer_for(&definition.id, index, definition, field) {
-                answers.insert(definition.id.clone(), answer);
+        if action == ElicitationResolutionAction::Accept {
+            for definition in &request.fields {
+                if let Some(answer) = draft.answer_for(&definition.id, definition) {
+                    answers.insert(definition.id.clone(), answer);
+                }
             }
         }
         let resolution = ElicitationResolution {
             request_id: request.id.clone(),
             session_id: session_id.clone(),
-            action: ElicitationResolutionAction::Accept,
+            action,
             answers,
             responder_device_id: None,
             resolved_at_ms: vibex_core::unix_timestamp_ms(),
@@ -3983,6 +4424,7 @@ impl App {
             return Outcome::quiet();
         }
         self.mark_pending(format!("elicitation:{}", request.id.as_str()));
+        self.overlay = None;
         Outcome::effects(vec![Effect::ResolveElicitation {
             session_id,
             request_id: request.id.clone(),
@@ -5346,18 +5788,34 @@ pub mod payloads {
     }
 }
 
+/// What one printable key means to the open elicitation form.
+///
+/// The form is the one surface where a letter is sometimes an answer and
+/// sometimes a shortcut, so the decision is named rather than left to the key
+/// handler: [`App::elicitation_key`] makes it, the run loop only carries it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElicitationKey {
+    /// The character is part of the answer being typed.
+    Text,
+    /// The character picks the option at this index.
+    Option(usize),
+    /// The form has nothing to do with it; the binding table decides.
+    Elsewhere,
+}
+
 /// A locally-held draft of an elicitation form.
 ///
 /// The answers live here rather than in the shared controller because the
 /// controller models the *request*, not the in-progress edit; keeping the draft
 /// next to the reducer is what lets the whole form be tested without a
-/// terminal.
+/// terminal. Every keystroke is committed as it is typed — a terminal field is
+/// one line edited at its end — so there is no separate live buffer that a
+/// missed commit could strand the reader's words in.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ElicitationDraft {
     text: std::collections::BTreeMap<String, String>,
     boolean: std::collections::BTreeMap<String, bool>,
     multi: std::collections::BTreeMap<String, Vec<String>>,
-    active_text: String,
 }
 
 impl ElicitationDraft {
@@ -5395,36 +5853,33 @@ impl ElicitationDraft {
         self.text.clear();
         self.boolean.clear();
         self.multi.clear();
-        self.active_text.clear();
     }
 
     /// Answer for one field, using the draft where the user typed something and
     /// the field's default otherwise.
+    ///
+    /// An empty string is not an answer: a required field left blank must fail
+    /// the request's own validation rather than be sent as one, and an optional
+    /// one left blank must be left out of the map entirely.
     pub fn answer_for(
         &self,
         field_id: &str,
-        index: usize,
         definition: &vibex_core::ElicitationField,
-        active: usize,
     ) -> Option<ElicitationAnswerValue> {
         use vibex_core::ElicitationFieldKind;
         match &definition.kind {
             ElicitationFieldKind::Text { default, .. } => {
                 let value = self
                     .text(field_id)
+                    .filter(|value| !value.is_empty())
                     .map(str::to_string)
-                    .or_else(|| {
-                        // The field being edited reads from the live editor.
-                        (index == active)
-                            .then(|| self.active_text.clone())
-                            .filter(|value| !value.is_empty())
-                    })
                     .or_else(|| default.clone())?;
                 Some(ElicitationAnswerValue::String(value))
             }
             ElicitationFieldKind::Number { default, .. } => {
                 let value = self
                     .text(field_id)
+                    .filter(|value| !value.is_empty())
                     .map(str::to_string)
                     .or_else(|| default.clone())?;
                 Some(ElicitationAnswerValue::Number(value))
@@ -5432,6 +5887,7 @@ impl ElicitationDraft {
             ElicitationFieldKind::Integer { default, .. } => {
                 let value = self
                     .text(field_id)
+                    .filter(|value| !value.is_empty())
                     .and_then(|value| value.parse::<i64>().ok())
                     .or(*default)?;
                 Some(ElicitationAnswerValue::Integer(value))
@@ -5446,21 +5902,6 @@ impl ElicitationDraft {
             }
             _ => None,
         }
-    }
-
-    /// Bind the live text editor to `field_id`.
-    pub fn begin_text(&mut self, field_id: &str) {
-        self.active_text = self.text.get(field_id).cloned().unwrap_or_default();
-    }
-
-    pub fn active_text_mut(&mut self) -> &mut String {
-        &mut self.active_text
-    }
-
-    /// Flush the live editor back into the stored answer.
-    pub fn commit_text(&mut self, field_id: &str) {
-        let value = std::mem::take(&mut self.active_text);
-        self.text.insert(field_id.to_string(), value);
     }
 }
 
@@ -7836,18 +8277,22 @@ mod tests {
         let mut draft = ElicitationDraft::default();
         draft.set_text("name", "typed");
         assert_eq!(
-            draft.answer_for("name", 0, &field, 0),
+            draft.answer_for("name", &field),
             Some(ElicitationAnswerValue::String("typed".into()))
         );
         draft.clear();
         assert_eq!(
-            draft.answer_for("name", 0, &field, 0),
+            draft.answer_for("name", &field),
             Some(ElicitationAnswerValue::String("default".into()))
         );
     }
 
     #[test]
-    fn elicitation_draft_reads_the_live_editor_for_the_active_field() {
+    fn elicitation_draft_leaves_a_blank_field_out_of_the_answers() {
+        // A field the reader never touched is not an answer: an optional one
+        // must be absent from the map rather than sent as an empty string, and
+        // a required one must fail the request's own validation instead of
+        // being answered with nothing.
         let field = vibex_core::ElicitationField {
             id: "q".into(),
             title: "Q".into(),
@@ -7863,19 +8308,15 @@ mod tests {
             },
         };
         let mut draft = ElicitationDraft::default();
-        draft.begin_text("q");
-        draft.active_text_mut().push_str("hello");
+        assert_eq!(draft.answer_for("q", &field), None);
+        draft.set_text("q", "hello");
         assert_eq!(
-            draft.answer_for("q", 0, &field, 0),
+            draft.answer_for("q", &field),
             Some(ElicitationAnswerValue::String("hello".into()))
         );
-        // Not the active field, and nothing committed: no answer.
-        assert_eq!(draft.answer_for("q", 1, &field, 0), None);
-        draft.commit_text("q");
-        assert_eq!(
-            draft.answer_for("q", 1, &field, 0),
-            Some(ElicitationAnswerValue::String("hello".into()))
-        );
+        // Typed and then rubbed out: blank again, not an empty answer.
+        draft.set_text("q", "");
+        assert_eq!(draft.answer_for("q", &field), None);
     }
 
     #[test]
@@ -7964,12 +8405,12 @@ mod tests {
         };
         let mut draft = ElicitationDraft::default();
         assert_eq!(
-            draft.answer_for("flag", 0, &field, 0),
+            draft.answer_for("flag", &field),
             Some(ElicitationAnswerValue::Boolean(true))
         );
         draft.set_boolean("flag", false);
         assert_eq!(
-            draft.answer_for("flag", 0, &field, 0),
+            draft.answer_for("flag", &field),
             Some(ElicitationAnswerValue::Boolean(false))
         );
     }

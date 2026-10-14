@@ -691,9 +691,28 @@ the edges, and copies on release. A double click takes the whole word, so
 `src/net/upload.rs` arrives in one piece. `Esc` dismisses the highlight; `y`
 copies the selection again if the clipboard was clobbered.
 
-Pending approvals appear as a card: `a` allows, `d` denies, `Ctrl+A` allows for
-the rest of the session, and a digit answers with that specific advertised
-option. Elicitation forms are filled field by field and submitted with `s`.
+A request the Agent is blocked on — an approval, or a question from a tool like
+`ask_user_question` — is a card that opens itself the moment it arrives, the way
+the desktop draws the same card inline in the timeline. `Esc` puts it down for
+now: it stays counted in the status band and on its transcript row, and `Enter`
+on that row asks for it again. The card does not open over a draft being typed;
+it waits until the reader leaves the Composer.
+
+An approval card answers with `a` to allow, `d` to deny, `Ctrl+A` to allow for
+the rest of the session, and a digit for one of the options the request
+advertised.
+
+An elicitation form draws one control per question. `↑`/`↓` walk the whole form
+— through a question's options and on into the next question — while `Tab`,
+`Shift+Tab` and `←`/`→` move between questions only. On a list of options,
+`Space` takes the option under the cursor and a digit takes one outright; a
+multi-select ticks each one it is given. A field that takes an answer is typed
+into directly — `Backspace` rubs out the last character and `Delete` clears the
+field — which is why `d` is a letter there rather than "decline": refusing the
+question is `Ctrl+D`, a chord no answer field can swallow. `Enter` submits, and
+the card only closes once the answers pass the request's own validation, so a
+required question left blank says so instead of leaving the Agent waiting on
+nothing.
 
 ### Management
 

@@ -82,6 +82,11 @@ fn event_loop(
     let mut last_frame = Instant::now() - FRAME_INTERVAL;
     let mut last_tick = Instant::now();
     let mut reason = ExitReason::UserQuit;
+    // Whether the Agent's blocking question is worth looking for again. It is
+    // derived from the timeline, so the loop asks only after input or a worker
+    // result could have changed what is pending — an idle client does not walk
+    // its whole projection sixty times a second.
+    let mut questions_due = true;
     // The clipboard question the terminal has not answered yet, if any. While
     // one is in flight nothing else may read the input queue.
     let mut clipboard_read: Option<TerminalClipboardRead> = None;
@@ -136,6 +141,9 @@ fn event_loop(
                             return Ok(ExitReason::UserQuit);
                         }
                         dirty = true;
+                        // A key can be what leaves the Composer, which is what
+                        // lets a waiting card open.
+                        questions_due = true;
                     }
                     Event::Mouse(mouse) => {
                         if handle_mouse(app, worker, mouse) {
@@ -184,6 +192,9 @@ fn event_loop(
             match messages.try_recv() {
                 Ok(message) => {
                     handled += 1;
+                    // A message is how a request arrives and how one is
+                    // answered elsewhere.
+                    questions_due = true;
                     match message {
                         // The host the client runs on has nothing on its
                         // clipboard. The reader's clipboard may still be the one
@@ -248,6 +259,20 @@ fn event_loop(
         // means a message that is no longer true withdraws itself.
         if app.refresh_banner() {
             dirty = true;
+        }
+
+        // ---- the Agent's blocking question --------------------------------
+        // A question opens its own card the first time it appears, the way the
+        // desktop's card is simply there in the timeline: the transcript has no
+        // room for controls, so a reader who never looked at the count in the
+        // band would otherwise have no way to answer the Agent at all. Asked
+        // only after input or a message, because the answer is derived from the
+        // timeline and an idle client must not walk it every pass.
+        if questions_due {
+            questions_due = false;
+            if app.sync_pending_question() {
+                dirty = true;
+            }
         }
 
         // ---- the send queue ----------------------------------------------
@@ -852,6 +877,44 @@ fn handle_key(
                 let outcome = app.perform(crate::action::Intent::ApprovalApprove);
                 dispatch_all(worker, &outcome);
                 return Ok(false);
+            }
+        }
+        // The elicitation form is a set of controls, and two of its keys are
+        // also text: a character the cursor's field types, and a digit that
+        // chooses an option when the field offers them. Both are answered
+        // before the binding table — the same rule the configuration form and
+        // the schedule editor live by — so a question mark in an answer is a
+        // question mark and `1` on a list of options is the first one.
+        if let Some(Overlay::Elicitation { .. }) = app.overlay {
+            let typing = app.elicitation_field_takes_text_keys();
+            match key.code {
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    match app.elicitation_key(character) {
+                        crate::reduce::ElicitationKey::Text => {
+                            app.elicitation_type_char(character);
+                            return Ok(false);
+                        }
+                        crate::reduce::ElicitationKey::Option(index) => {
+                            let outcome = app.select_elicitation_option(index);
+                            dispatch_all(worker, &outcome);
+                            return Ok(false);
+                        }
+                        crate::reduce::ElicitationKey::Elsewhere => {}
+                    }
+                }
+                KeyCode::Backspace if typing => {
+                    app.elicitation_backspace();
+                    return Ok(false);
+                }
+                KeyCode::Delete if typing => {
+                    app.elicitation_clear_field();
+                    return Ok(false);
+                }
+                _ => {}
             }
         }
         // The directory picker is a place a reader walks: `←` climbs out of the

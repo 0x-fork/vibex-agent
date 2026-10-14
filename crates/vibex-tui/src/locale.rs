@@ -606,6 +606,9 @@ strings! {
     // ---- elicitation ----------------------------------------------------
     elicitation_title => { "The Agent needs input", "Agent 需要输入", "Agent 需要輸入" },
     elicitation_submit => { "Submit", "提交", "提交" },
+    elicitation_decline => { "Decline", "拒绝", "拒絕" },
+    elicitation_yes => { "Yes", "是", "是" },
+    elicitation_no => { "No", "否", "否" },
     elicitation_unsupported => {
         "This field cannot be answered in the terminal",
         "终端无法回答此字段",

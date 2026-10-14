@@ -202,7 +202,17 @@ pub enum Overlay {
     /// The pending approval card.
     Approval { selected: usize },
     /// The pending elicitation form.
-    Elicitation { field: usize },
+    ///
+    /// The request is pinned rather than re-read as "whichever question is
+    /// first": a second question arriving while the reader is filling this one
+    /// in must not swap the fields under their cursor, and the answers must go
+    /// back to the request they were typed for. `choice` is the option the
+    /// cursor is on inside the active field.
+    Elicitation {
+        request: String,
+        field: usize,
+        choice: usize,
+    },
     /// The runtime and model picker.
     ///
     /// `view` is which half of it is on screen and `selected` indexes the rows
@@ -259,6 +269,20 @@ pub enum Overlay {
         body: String,
         scroll: usize,
     },
+}
+
+/// The elicitation form the reader is filling in: the question, and where the
+/// cursor is inside it.
+///
+/// Borrowed out of the open overlay rather than kept beside it, so the form and
+/// the cursor cannot disagree about which question is on screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElicitationForm {
+    pub request: vibex_core::ElicitationRequest,
+    /// Index of the field being answered.
+    pub field: usize,
+    /// Index of the option the cursor is on inside that field.
+    pub choice: usize,
 }
 
 /// One row the workspace picker draws, top to bottom.
@@ -964,8 +988,21 @@ pub struct App {
     /// A text option's value belongs to a key the prompt overlay cannot carry,
     /// so the key waits here for the one submission the prompt can make.
     pub run_option_prompt: Option<RunOptionKey>,
-    /// In-progress elicitation answers.
-    pub elicitation_draft: crate::reduce::ElicitationDraft,
+    /// In-progress elicitation answers, keyed by the request they answer.
+    ///
+    /// One draft per request rather than one for the form: an Agent can raise
+    /// more than one question, and what was typed for one must never be sent
+    /// with another.
+    pub elicitation_drafts: std::collections::BTreeMap<String, crate::reduce::ElicitationDraft>,
+    /// The Agent's blocking questions this client has already put in front of
+    /// the reader, keyed `elicitation:<id>` or `permission:<id>`.
+    ///
+    /// The desktop draws both cards inline, so a question is visible the moment
+    /// it arrives; the terminal has no room for controls in the transcript, so
+    /// the same card is a modal here and opens itself. Recording what has been
+    /// offered is what makes `Esc` mean "later" — a card that reopened on the
+    /// next frame would make the key useless.
+    pub offered_questions: std::collections::BTreeSet<String>,
     /// Session ids whose detail card is open in the session list.
     ///
     /// Keyed by id rather than row index so a refresh, a rename or a filter
@@ -1662,7 +1699,8 @@ impl App {
             pending_forks: BTreeMap::new(),
             new_session_runtime: None,
             run_option_prompt: None,
-            elicitation_draft: crate::reduce::ElicitationDraft::default(),
+            elicitation_drafts: std::collections::BTreeMap::new(),
+            offered_questions: std::collections::BTreeSet::new(),
             session_cards: std::collections::BTreeSet::new(),
             search: None,
             hover: None,
@@ -3051,6 +3089,36 @@ impl App {
         self.agent.state.elicitation_surfaces(self.shell)
     }
 
+    /// The question the open form is filling in, with the cursor's place in it.
+    ///
+    /// The overlay pins a request id, so this is where "the form" is resolved
+    /// against what is still pending: a request answered from another client
+    /// takes the form with it rather than leaving the reader typing into a
+    /// question nobody is waiting on.
+    pub fn elicitation_form(&self) -> Option<ElicitationForm> {
+        let Some(Overlay::Elicitation {
+            request,
+            field,
+            choice,
+        }) = self.overlay.as_ref()
+        else {
+            return None;
+        };
+        self.elicitations()
+            .into_iter()
+            .find(|surface| surface.request.id.as_str() == request)
+            .map(|surface| ElicitationForm {
+                request: surface.request,
+                field: *field,
+                choice: *choice,
+            })
+    }
+
+    /// The draft the form for `request_id` is writing into.
+    pub fn elicitation_draft(&self, request_id: &str) -> Option<&crate::reduce::ElicitationDraft> {
+        self.elicitation_drafts.get(request_id)
+    }
+
     pub fn pending_permission_count(&self) -> usize {
         self.approvals().len()
     }
@@ -3611,6 +3679,19 @@ impl App {
                 ..
             }) => true,
             Some(Overlay::Form { form }) => form.editing.is_some(),
+            // The elicitation form types into an answer field and spends a
+            // digit on a list of options. Which of the two it is depends on the
+            // field the cursor is on, so the bar asks the form rather than the
+            // overlay: a letter that is an answer in one field is a shortcut in
+            // the next.
+            Some(Overlay::Elicitation { .. }) => {
+                self.elicitation_field_takes_text_keys()
+                    || (self.elicitation_field_choices() > 0
+                        && matches!(
+                            chord.code,
+                            KeyCode::Char(character) if character.is_ascii_digit()
+                        ))
+            }
             Some(_) => false,
             None => self.composer_takes_keys(),
         }
