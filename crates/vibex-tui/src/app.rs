@@ -2383,6 +2383,25 @@ impl App {
         }
     }
 
+    /// The reads an authority's sidebar invalidation makes stale.
+    ///
+    /// The rows the list draws are sessions under project headings, and the
+    /// arrangement says what order they take, so "the sidebar changed" is a
+    /// claim about all three. A remote authority announces a session it has
+    /// just created this way and through no other event, so a client that
+    /// re-read only the arrangement would redraw the same rows and keep the new
+    /// session off the list until the reader happened to leave the page and
+    /// come back to it.
+    pub(crate) fn sidebar_projection_effects(&mut self) -> Vec<Effect> {
+        let mut effects = self.refresh_session_list().into_iter().collect::<Vec<_>>();
+        // Project rows are named by the runtime's project records, and a
+        // session in a workspace this client has never seen adds a heading of
+        // its own.
+        effects.push(Effect::ListWorkspaces);
+        effects.push(Effect::LoadSidebarOrganization);
+        effects
+    }
+
     /// Sidebar rows for the current filter, with the reader's grouping applied.
     pub fn sidebar_rows(&self) -> Vec<vibex_desktop_model::AgentSidebarRow> {
         self.sidebar_view().rows
@@ -7595,6 +7614,54 @@ mod tests {
                 .sidebar
                 .collapsed_ids
                 .contains("project_collapsed")
+        );
+    }
+
+    #[test]
+    fn a_sidebar_invalidation_re_reads_the_sessions_it_arranges() {
+        // The list is sessions under project headings, and a remote authority
+        // announces a session it just created as nothing but a sidebar
+        // invalidation. A client that re-read the arrangement alone would draw
+        // the same rows again, so the sessions and the projects travel with it.
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = arrangement_app(&directory.path().join("tui-sidebar.json"));
+        let effects = app.sidebar_projection_effects();
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ListSessions { .. })),
+            "the sessions themselves were not re-read"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ListWorkspaces)),
+            "a heading for a session's project was not re-read"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadSidebarOrganization)),
+            "the arrangement was not re-read"
+        );
+
+        // The read already on the wire is not duplicated: the invalidation
+        // queues one more behind it, and the answer to the first is what
+        // releases it.
+        let effects = app.sidebar_projection_effects();
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ListSessions { .. })),
+            "a second read was issued while the first was still in flight"
+        );
+        app.agent.apply_sessions(Ok(Vec::new())).unwrap();
+        assert!(
+            matches!(
+                app.pending_session_list_refresh(),
+                Some(Effect::ListSessions { .. })
+            ),
+            "the coalesced invalidation was dropped instead of re-read"
         );
     }
 

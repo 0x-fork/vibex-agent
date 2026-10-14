@@ -2432,16 +2432,31 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             {
                 worker.dispatch(effect);
             }
-            // A sidebar invalidated on the authority means the tree this client
+            // A sidebar invalidated on the authority means the list this client
             // is drawing is out of date: the reader rearranged it somewhere
-            // else, or another client did.
-            if matches!(
+            // else, or another client created a session in it. A remote
+            // authority announces a new session this way and through no other
+            // event, so the sessions and their project headings are re-read
+            // along with the arrangement — re-reading the arrangement alone
+            // would redraw the same rows without the new one.
+            //
+            // A fan-out that lagged past the sidebar is the same news from the
+            // other direction: the invalidation itself was the event that got
+            // dropped, and the same reads answer both.
+            let sidebar_invalidated = matches!(
                 &event,
                 vibex_backend::BackendEvent::ProjectionInvalidated(
                     vibex_backend::BackendProjection::Sidebar
                 )
-            ) {
-                worker.dispatch(crate::app::Effect::LoadSidebarOrganization);
+            ) || matches!(
+                &event,
+                vibex_backend::BackendEvent::Lagged { refetch, .. }
+                    if refetch.projection == Some(vibex_backend::BackendProjection::Sidebar)
+            );
+            if sidebar_invalidated {
+                for effect in app.sidebar_projection_effects() {
+                    worker.dispatch(effect);
+                }
             }
             // The unread mark and the last thing a session did are both the
             // client's own readings of the events it already receives: the
@@ -2872,6 +2887,106 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn a_remote_sidebar_invalidation_re_reads_the_session_list() {
+        // A remote authority publishes no session-update event: a session the
+        // desktop has just created reaches this client as an invalidated
+        // sidebar and nothing else. Re-reading the arrangement alone leaves the
+        // new row out of the list, so the invalidation has to re-read the
+        // sessions too.
+        let (worker, mut messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+        let mut app = isolation_app();
+        app.agent
+            .apply_sessions(Ok(vec![isolation_session(
+                vibex_core::VibexSessionId::new(),
+                "codex",
+            )]))
+            .unwrap();
+        assert!(!app.agent.state.sessions.is_loading());
+
+        // A projection this client draws no session rows from is not a session
+        // read: a management invalidation must not cost one.
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Event(vibex_backend::BackendEvent::ProjectionInvalidated(
+                vibex_backend::BackendProjection::Management,
+            )),
+        )
+        .unwrap();
+        assert!(!app.agent.state.sessions.is_loading());
+
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Event(vibex_backend::BackendEvent::ProjectionInvalidated(
+                vibex_backend::BackendProjection::Sidebar,
+            )),
+        )
+        .unwrap();
+        assert!(
+            app.agent.state.sessions.is_loading(),
+            "the invalidated sidebar did not re-read the sessions it arranges"
+        );
+        // The reads the worker was asked for are the ones the invalidation
+        // promised, so the wiring, not just the reducer, is what is asserted.
+        let observer = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let reads = observer.block_on(async {
+            let mut reads = Vec::new();
+            while reads.len() < 3 {
+                match tokio::time::timeout(Duration::from_secs(5), messages.recv()).await {
+                    Ok(Some(AppMessage::Sessions(_))) => reads.push("sessions"),
+                    Ok(Some(AppMessage::Workspaces(_))) => reads.push("workspaces"),
+                    Ok(Some(AppMessage::SidebarOrganization(_))) => reads.push("arrangement"),
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            reads
+        });
+        for read in ["sessions", "workspaces", "arrangement"] {
+            assert!(reads.contains(&read), "the invalidation never read {read}");
+        }
+
+        // A fan-out that lagged past the sidebar dropped the invalidation
+        // itself, and the refetch it asks for names the same projection.
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Sessions(Ok(vec![isolation_session(
+                vibex_core::VibexSessionId::new(),
+                "codex",
+            )])),
+        )
+        .unwrap();
+        assert!(!app.agent.state.sessions.is_loading());
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Event(vibex_backend::BackendEvent::Lagged {
+                stream: vibex_backend::BackendEventStream::Fanout,
+                skipped: 4,
+                refetch: vibex_backend::BackendRefetch {
+                    session_id: None,
+                    timeline: false,
+                    runtime: false,
+                    runtime_selection: false,
+                    projection: Some(vibex_backend::BackendProjection::Sidebar),
+                },
+                observed_live: false,
+            }),
+        )
+        .unwrap();
+        assert!(
+            app.agent.state.sessions.is_loading(),
+            "a lag that named the sidebar left the list stale"
+        );
     }
 
     #[test]
