@@ -113,6 +113,33 @@ Transcript::advance_disclosures(&mut self, Instant) -> bool
 - Reasoning content keeps its natural height, bottom-aligned within the
   six-line cap. Answers and commentary use body foreground; reasoning stays
   muted. A turn without process rows has no empty process header.
+- A settled, answered turn folds its process section. The fold is only offered
+  when the transcript actually draws work for the turn and the turn produced a
+  non-empty answer (`complete || superseded` plus a `conclusion_row` body):
+  a running turn keeps its work visible because the arriving rows are the
+  point, and a settled turn with no answer keeps them because the work is the
+  only record. A turn with no drawn process row has nothing to fold and gets no
+  divider — a bare question and answer must not pay a rule for work the reader
+  never saw. This matches the desktop's `timeline_turn_process_expanded`
+  (`explicit.unwrap_or(conclusion.is_none() && (!complete || superseded))`),
+  with the added guard that the drawable process run is non-empty.
+- The TUI fold control is the divider row itself, drawn as the first row of the
+  conclusion block: a disclosure glyph plus `Worked for <duration>`, centred
+  between `glyphs::heading_rule` rules that reach both margins while open and
+  collapse to just the labelled title while shut. The duration comes from the
+  turn's own `started_at_ms`/`ended_at_ms` (a running turn measures to now), so
+  it survives a reload and agrees with the desktop and mobile labels. The
+  divider rides on the conclusion block rather than being a synthetic block, so
+  it adds nothing to layout, search, or copy.
+- TUI turn folds keep explicit choices by turn id in the transcript's own map,
+  exactly as reasoning expansion does: the projection supplies the default on
+  every rebuild and the map overrides it. It is applied to every block of the
+  turn in one pass, which is what makes the fold a property of the turn rather
+  than a coincidence of neighbouring blocks agreeing. Entries leave with the
+  turn that owns them, so the map cannot grow with the session. `e` on the
+  control and a click on the divider row both toggle it; `F2` expands folds as
+  well as bodies; a search hit inside a shut fold opens it before revealing
+  the row.
 
 TUI settings use `InterfacePreferences` in `tui-interface.json`; all three fields
 are optional, and absent or unknown choices resolve to the shipped default:
@@ -138,6 +165,10 @@ are optional, and absent or unknown choices resolve to the shipped default:
 | Search matches a hidden tool detail | Reveal and select that child, without opening sibling details |
 | A tool follows streaming reasoning | Stop the old window; remove the non-final bottom indicator |
 | Live reasoning is explicitly collapsed | Keep it closed across deltas and the next bottom indicator in that turn |
+| Turn settles with a non-empty answer and drawn process | Fold the process behind the `Worked for` divider; keep the answer and the control visible |
+| Turn running, or settled with no answer, or no drawn process | Keep every row visible and draw no divider |
+| Reader opens/closes a turn fold | The explicit choice survives rebuilds and streaming deltas for that turn |
+| Search matches a row inside a shut fold | Open the fold, then reveal the matched row |
 | Older preference file omits reasoning settings | Latest at bottom, default expansion off, Window |
 | Disclosure is reversed or Motion is disabled | Continue from displayed progress or settle immediately |
 | Failed or pending operation | Keep its failure/approval affordance visible |

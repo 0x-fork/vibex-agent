@@ -1211,7 +1211,7 @@ fn handle_composer_key(
                     .transcript
                     .blocks()
                     .iter()
-                    .rposition(|block| !block.group.is_hidden())
+                    .rposition(|block| !block.is_hidden())
                     .unwrap_or(0);
                 app.set_selection(crate::keymap::Scope::Agent, index);
                 app.scroll.follow = false;
@@ -1533,11 +1533,38 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             let Some((line, column)) = mouse_cell(app, mouse.column, mouse.row) else {
                 return false;
             };
+            // The divider at the top of a turn's answer folds the process
+            // section above it. It is a control before it is a row: pressing it
+            // toggles the work, and a drag that happens to start on it still
+            // selects text, so the gesture only claims its own line. The
+            // pointer resolves the row it landed on rather than asking which
+            // affordance `e` would have chosen.
+            if let Some(index) = app.transcript.block_at_line(line)
+                && app.transcript.fold_control_line(index) == Some(line)
+            {
+                app.clear_text_selection();
+                app.focus = Focus::Main;
+                app.set_selection(crate::keymap::Scope::Agent, index);
+                app.scroll.follow = false;
+                app.scroll.offset = app.transcript.scroll_offset();
+                let opened = app.transcript.toggle_fold_at(index);
+                let effects = if opened {
+                    // The act of opening can reveal an activity whose payload
+                    // the summary page withheld, so the read is asked for here
+                    // the way it is for a group that was just opened.
+                    app.note_all_block_details();
+                    app.take_timeline_detail_effects()
+                } else {
+                    Vec::new()
+                };
+                dispatch_all(worker, &Outcome::effects(effects));
+                return true;
+            }
             if let Some(index) = app.transcript.block_at_line(line)
                 && app.transcript.line_of_block(index) == line
                 && app.transcript.block(index).is_some_and(|block| {
                     block.collapsible
-                        && !block.group.is_hidden()
+                        && !block.is_hidden()
                         && crate::transcript::is_dense_row(block.kind)
                 })
             {

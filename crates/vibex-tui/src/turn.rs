@@ -116,6 +116,43 @@ pub fn generated_tokens(turn: &TimelineConversationTurn) -> Option<u64> {
     (characters > 0).then_some((characters as u64).saturating_add(3) / 4)
 }
 
+/// How long a settled turn took, written the way the desktop writes it.
+///
+/// The projection timestamps the turn, not the client, so a duration survives a
+/// reload and matches what the desktop shows for the same turn. A running turn
+/// is measured to now; a turn whose span is missing or inverted falls back to a
+/// single second rather than reporting nothing, because the fold still needs a
+/// number to label itself with.
+pub fn worked_duration(turn: &TimelineConversationTurn) -> Duration {
+    let end_ms = if turn.complete || turn.superseded {
+        turn.ended_at_ms
+            .unwrap_or_else(vibex_core::unix_timestamp_ms)
+    } else {
+        vibex_core::unix_timestamp_ms()
+    };
+    let duration_ms = end_ms.saturating_sub(turn.started_at_ms).max(1_000);
+    Duration::from_millis(duration_ms as u64)
+}
+
+/// A duration as the compact label the desktop uses: "12s", "3m 5s", "2h 4m".
+///
+/// Seconds are dropped once there is an hour to show and included while the
+/// turn is short, which is the same trade the desktop makes: the reader wants
+/// precision for a turn they just watched and shape for one they did not.
+pub fn format_worked_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs().max(1);
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 /// The rate two observations of a turn add up to.
 ///
 /// Only forward movement has a rate: a turn that produced nothing, or one whose
@@ -360,5 +397,37 @@ mod tests {
         assert_eq!(readout.phase(), None);
         assert_eq!(readout.tool_calls(), 0);
         assert_eq!(readout.tokens_per_second(), None);
+    }
+
+    #[test]
+    fn a_worked_duration_reads_like_the_desktop() {
+        // Seconds while the turn is short, minutes once it is not, and no
+        // seconds at all once there is an hour to spend the width on.
+        assert_eq!(format_worked_duration(Duration::from_secs(1)), "1s");
+        assert_eq!(format_worked_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(format_worked_duration(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_worked_duration(Duration::from_secs(185)), "3m 5s");
+        assert_eq!(format_worked_duration(Duration::from_secs(3_600)), "1h 0m");
+        assert_eq!(
+            format_worked_duration(Duration::from_secs(3_600 + 4 * 60)),
+            "1h 4m"
+        );
+        // A zero or inverted span is still a duration the reader waited, so the
+        // label never comes out empty.
+        assert_eq!(format_worked_duration(Duration::ZERO), "1s");
+    }
+
+    #[test]
+    fn a_settled_turn_is_measured_from_its_own_span() {
+        let mut settled = turn("turn-1");
+        settled.complete = true;
+        settled.started_at_ms = 1_000;
+        settled.ended_at_ms = Some(12_500);
+        assert_eq!(worked_duration(&settled), Duration::from_millis(11_500));
+
+        // A settled turn the runtime never stamped still reports a second
+        // rather than nothing: the fold needs a label either way.
+        settled.ended_at_ms = None;
+        assert!(worked_duration(&settled) >= Duration::from_secs(1));
     }
 }

@@ -466,6 +466,7 @@ strings! {
     },
     transcript_expand_all => { "Expand all", "展开全部", "展開全部" },
     transcript_collapse_all => { "Collapse all", "折叠全部", "折疊全部" },
+    transcript_worked_for => { "Worked for", "工作了", "工作了" },
     transcript_follow => { "Following", "已跟随", "已跟隨" },
     transcript_paused => { "Scroll paused", "滚动已暂停", "滾動已暫停" },
     transcript_empty => {

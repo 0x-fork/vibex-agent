@@ -475,5 +475,6 @@ fn entry(id: &str, kind: TimelineRowKind, title: &str, body: &str, failed: bool)
         runtime_attribution: None,
         conclusion: false,
         group: vibex_tui::transcript::GroupRole::Solo,
+        fold: None,
     }
 }

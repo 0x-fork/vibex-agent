@@ -1522,6 +1522,7 @@ fn block(id: &str, turn: &str) -> vibex_tui::transcript::Block {
         runtime_attribution: None,
         conclusion: false,
         group: vibex_tui::transcript::GroupRole::Solo,
+        fold: None,
         activity: None,
         details: Vec::new(),
         group_summary: None,
@@ -1745,6 +1746,7 @@ fn seeded_block(
         runtime_attribution: None,
         conclusion: false,
         group: vibex_tui::transcript::GroupRole::Solo,
+        fold: None,
         activity: None,
         details: Vec::new(),
         group_summary: None,
@@ -4861,10 +4863,44 @@ fn a_tool_heavy_turn_stays_a_short_run_of_rows() {
         screen.contains("❯ Fix the flaky test in the runner"),
         "{screen}"
     );
-    assert!(screen.contains("session resumed from disk"), "{screen}");
     assert!(
         screen.contains("Done: the test now uses the fake clock."),
         "{screen}"
+    );
+    // The turn is settled and answered, so its process folds behind the divider
+    // and only the answer's own rule is on screen.
+    assert!(
+        screen.contains("Worked for 1s"),
+        "the folded turn carries its duration:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Read 3 files"),
+        "a settled turn folds its process:\n{screen}"
+    );
+    assert!(
+        !screen.contains("session resumed from disk"),
+        "a folded turn hides its process narration too:\n{screen}"
+    );
+    // Open the fold: the work the turn did comes back, grouped.
+    let control = app
+        .transcript
+        .blocks()
+        .iter()
+        .position(|block| {
+            block
+                .fold
+                .as_ref()
+                .is_some_and(vibex_tui::transcript::TurnFold::is_control)
+        })
+        .expect("a settled, answered turn owns a fold control");
+    assert!(app.transcript.toggle_block(control));
+    let screen = text(&render(&mut app, 110, 40));
+    assert!(screen.contains("session resumed from disk"), "{screen}");
+    // Expanded, the same row is the separator between the work and the answer:
+    // the duration stays centred between rules that reach both margins.
+    assert!(
+        screen.contains("─ Worked for 1s ─"),
+        "the open fold draws a rule through its label:\n{screen}"
     );
     // Mixed runs report each semantic category, including the changed file.
     assert!(
@@ -9074,6 +9110,7 @@ fn reasoning_toggle_opens_and_closes_every_member_of_a_group() {
         runtime_attribution: None,
         conclusion: false,
         group: vibex_tui::transcript::GroupRole::Solo,
+        fold: None,
         activity: None,
         details: Vec::new(),
         group_summary: None,

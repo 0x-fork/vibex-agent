@@ -609,6 +609,16 @@ impl App {
                     self.toast(Toast::info(
                         self.strings.toast_action_unavailable().to_string(),
                     ));
+                } else if self
+                    .transcript
+                    .block(index)
+                    .and_then(|block| block.fold.as_ref())
+                    .is_some_and(crate::transcript::TurnFold::is_control)
+                {
+                    // Opening a turn's fold can reveal activities the summary
+                    // page withheld, and it opens them all at once rather than
+                    // the one the reader pointed at.
+                    self.note_all_block_details();
                 } else {
                     // An activity opens onto output a summary page withheld,
                     // so the expand is what asks for the read.
@@ -3466,7 +3476,7 @@ impl App {
             while self
                 .transcript
                 .block(next)
-                .is_some_and(|block| block.group.is_hidden())
+                .is_some_and(|block| block.is_hidden())
             {
                 let candidate = next as i64 + delta.signum();
                 if candidate < 0 || candidate >= count as i64 {

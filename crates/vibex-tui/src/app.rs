@@ -30,7 +30,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use crate::keymap::{Binding, Chord, Keymap, Scope};
 use crate::locale::{Locale, Strings};
 use crate::theme::{ColorCapability, TuiTheme};
-use crate::transcript::{Block, ScrollState, Transcript};
+use crate::transcript::{Block, ScrollState, Transcript, TurnFold};
 use crate::view::SeatKind;
 
 /// Which page the user is looking at.
@@ -5327,7 +5327,7 @@ impl App {
         // payload from a complete one, and a page that just landed arrived
         // summarized.
         let mut summarized = BTreeSet::new();
-        let blocks: Vec<Block> = rows
+        let mut blocks: Vec<Block> = rows
             .iter()
             .filter(|row| row_is_rendered(row))
             .map(|row| {
@@ -5364,6 +5364,7 @@ impl App {
                 block
             })
             .collect();
+        self.project_turn_folds(&mut blocks);
         // A prepend is the only change that moves the content under the
         // viewport, and it is recognisable from the head alone: the block that
         // used to start the transcript now sits further down. An append, a
@@ -5394,7 +5395,7 @@ impl App {
                 .transcript
                 .blocks()
                 .iter()
-                .filter(|block| block.expanded && !block.group.is_hidden())
+                .filter(|block| block.expanded && !block.is_hidden())
                 .map(|block| block.sequence)
                 .filter(|sequence| summarized.contains(sequence))
                 .collect::<Vec<_>>();
@@ -5425,6 +5426,117 @@ impl App {
         // The transcript is the turn's own output, so it is also where the line
         // above the composer learns that the turn moved.
         self.sync_turn_readout();
+    }
+
+    /// Annotate each block with the fold its turn settled on.
+    ///
+    /// The desktop's rule, and the TUI's: a turn folds its process section once
+    /// it has settled *and* produced an answer. A turn still running keeps its
+    /// work visible — the rows arriving are the point — and a settled turn with
+    /// no answer keeps them too, because there is nothing to fold towards and
+    /// the work is the only record of what happened. A superseded turn is the
+    /// case worth naming: it never completes, but the work it did is what the
+    /// message that replaced it is answering, so it folds as settled.
+    ///
+    /// The reader's own choice is not consulted here: it lives in the
+    /// transcript's expansion map and is applied on every `set_blocks`, which
+    /// is what keeps an explicit expansion from being undone by the next
+    /// streaming delta.
+    fn project_turn_folds(&self, blocks: &mut [Block]) {
+        use vibex_desktop_model::TimelineRowKind;
+        let turns = self
+            .agent
+            .state
+            .conversation_turns_with_reasoning_mode(self.settings.reasoning_display_mode);
+        let mut labels: HashMap<&str, String> = HashMap::new();
+        // The answer is the row the projection stamped as the turn's
+        // conclusion. A turn whose answer row is not marked — an older
+        // projection, a row the runtime replaced — falls back to the row the
+        // turn names, and then to its last Agent message. Marking it here is
+        // what gives the fold a block to draw its divider on, and a turn with
+        // no answer block at all never folds: hiding the work under a divider
+        // with nothing below it would lose the only record of the turn.
+        let mut conclusion: HashMap<String, usize> = HashMap::new();
+        for turn in &turns {
+            if !turn.complete && !turn.superseded {
+                // A still-running turn keeps its work visible: the rows
+                // arriving are the point. A superseded turn never completes,
+                // but the work it did is what the message replacing it
+                // answers, so it folds as settled.
+                continue;
+            }
+            let answered = turn
+                .conclusion_row
+                .as_ref()
+                .is_some_and(|row| !row.body.trim().is_empty());
+            if !answered {
+                // A settled turn with no answer keeps its work too: there is
+                // nothing to fold towards, and the work is the only record of
+                // what happened.
+                continue;
+            }
+            let in_turn = |block: &Block| block.turn_id.as_deref() == Some(turn.id.as_str());
+            let named = turn.conclusion_row.as_ref().map(|row| row.id.as_str());
+            let index = blocks
+                .iter()
+                .position(|block| in_turn(block) && Some(block.id.as_str()) == named)
+                .or_else(|| {
+                    blocks
+                        .iter()
+                        .rposition(|block| in_turn(block) && block.conclusion)
+                })
+                .or_else(|| {
+                    blocks.iter().rposition(|block| {
+                        in_turn(block) && block.kind == TimelineRowKind::AgentMessage
+                    })
+                });
+            // A turn with no drawn work has nothing to fold — a bare question
+            // and answer must not pay a divider for process the reader never
+            // saw — and a turn with nothing but its answer has no divider to
+            // justify either.
+            let has_process = index.is_some_and(|index| {
+                blocks.iter().enumerate().any(|(other, block)| {
+                    other != index
+                        && in_turn(block)
+                        && !matches!(block.kind, TimelineRowKind::UserMessage)
+                })
+            });
+            if let Some(index) = index.filter(|_| has_process) {
+                blocks[index].conclusion = true;
+                conclusion.insert(turn.id.clone(), index);
+                labels.insert(
+                    turn.id.as_str(),
+                    crate::turn::format_worked_duration(crate::turn::worked_duration(turn)),
+                );
+            }
+        }
+        if labels.is_empty() {
+            return;
+        }
+        // Every drawn row of a folding turn except the user's own message
+        // carries the fold. The answer's copy is the control; the rest hide
+        // while it is shut.
+        for (index, block) in blocks.iter_mut().enumerate() {
+            let Some(turn_id) = block.turn_id.clone() else {
+                continue;
+            };
+            let Some(label) = labels.get(turn_id.as_str()).cloned() else {
+                continue;
+            };
+            if block.kind == TimelineRowKind::UserMessage {
+                continue;
+            }
+            let is_conclusion = conclusion.get(&turn_id) == Some(&index);
+            // The projection asks for a settled turn's work to be hidden; a
+            // reader who opens it says so in the transcript's expansion map,
+            // which `set_blocks` re-applies on every rebuild.
+            block.fold = Some(TurnFold {
+                turn_id,
+                label,
+                expanded: false,
+                is_conclusion,
+            });
+        }
     }
 
     /// Use the desktop's turn projection for reasoning placement and liveness.
@@ -7516,6 +7628,7 @@ pub fn block_from_row(row: &TimelineRow) -> Block {
         runtime_attribution: row.runtime_attribution.clone(),
         conclusion: row.conclusion,
         group: crate::transcript::GroupRole::Solo,
+        fold: None,
         activity: None,
         details: Vec::new(),
         group_summary: None,

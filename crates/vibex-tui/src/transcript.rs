@@ -170,6 +170,45 @@ fn prepends_existing_blocks(existing: &[Block], incoming: &[Block]) -> bool {
         .is_some_and(|index| index > 0)
 }
 
+/// A folded turn: the process work behind the divider, and the answer below it.
+///
+/// A turn is a unit of work even though the transcript is a flat list of
+/// blocks. Once the turn is done and the Agent has answered, the rows that
+/// produced the answer fold away behind a divider that carries the turn's
+/// duration — the desktop's "worked for" header, drawn between the work and the
+/// answer instead of above it. The facts ride on the blocks themselves, so the
+/// fold costs the layout, the search index and the copy path nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TurnFold {
+    /// The projected turn this block belongs to.
+    pub turn_id: String,
+    /// The turn's duration, already formatted: "3m 5s".
+    ///
+    /// The word that frames it is product copy and stays in the locale table,
+    /// so only the number travels with the projection.
+    pub label: String,
+    /// Whether the process section is open. The projection asks for it shut; a
+    /// reader who opens it says so in the transcript's own expansion map, which
+    /// is re-applied on every rebuild.
+    pub expanded: bool,
+    /// This block is the turn's answer, and owns the divider control.
+    pub is_conclusion: bool,
+}
+
+impl TurnFold {
+    /// Whether the block is hidden because its turn's process section is shut.
+    ///
+    /// The answer is never hidden: it is the reason the section is folded.
+    pub fn is_folded(&self) -> bool {
+        !self.expanded && !self.is_conclusion
+    }
+
+    /// Whether this block draws the divider that folds the section.
+    pub fn is_control(&self) -> bool {
+        self.is_conclusion
+    }
+}
+
 /// One transcript block, projected from the authoritative `TimelineRow`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
@@ -197,6 +236,10 @@ pub struct Block {
     pub conclusion: bool,
     /// How this block participates in a dense run of work items.
     pub group: GroupRole,
+    /// The turn fold this block belongs to. `None` for a block outside any
+    /// settled turn — bookkeeping the runtime wrote between turns, or work the
+    /// Agent is still doing.
+    pub fold: Option<TurnFold>,
     /// Desktop-derived activity identity, separate from its expandable output.
     pub activity: Option<Activity>,
     /// Raw bounded fields; decoding happens only when this block is rendered.
@@ -222,6 +265,7 @@ impl Block {
         self.collapsible.hash(&mut hasher);
         self.file_path.hash(&mut hasher);
         self.group.hash(&mut hasher);
+        self.fold.hash(&mut hasher);
         self.activity.hash(&mut hasher);
         self.details.hash(&mut hasher);
         self.group_summary.hash(&mut hasher);
@@ -236,6 +280,15 @@ impl Block {
     /// Whether the block shows its whole body.
     pub fn is_open(&self) -> bool {
         self.expanded || !self.collapsible
+    }
+
+    /// Whether the block draws no rows at all.
+    ///
+    /// Two things hide a block: being a folded member of a dense run, and
+    /// being folded away with the rest of its turn's process section. Both are
+    /// separate from the block's own expansion, which only shortens its body.
+    pub fn is_hidden(&self) -> bool {
+        self.group.is_hidden() || self.fold.as_ref().is_some_and(TurnFold::is_folded)
     }
 }
 
@@ -304,6 +357,13 @@ pub struct Transcript {
     reasoning_expanded_by_default: bool,
     reasoning_expansion_mode: ReasoningExpansionMode,
     reasoning_expansion: HashMap<String, bool>,
+    /// The reader's explicit choice to open or fold a turn's process section.
+    ///
+    /// Keyed by the projected turn, not by a block: the process rows are many
+    /// and the header that stands for them is synthetic, so the choice has to
+    /// outlive both. A turn with no entry takes the projection's default, which
+    /// is what makes a turn fold itself the moment it settles.
+    turn_expansion: HashMap<String, bool>,
     motion_enabled: bool,
     disclosures: HashMap<String, Disclosure>,
     /// Derived indices, kept outside the content key so a prepend can reuse rows.
@@ -373,6 +433,7 @@ impl Transcript {
             reasoning_expanded_by_default: false,
             reasoning_expansion_mode: ReasoningExpansionMode::Window,
             reasoning_expansion: HashMap::new(),
+            turn_expansion: HashMap::new(),
             motion_enabled: false,
             disclosures: HashMap::new(),
             parents: Vec::new(),
@@ -431,6 +492,18 @@ impl Transcript {
 
     pub fn visible_block(&self, index: usize) -> Option<usize> {
         let block = self.blocks.get(index)?;
+        // A block folded away with its turn's process section has no parent
+        // block to point at: the row that stands for the hidden section is the
+        // conclusion, which is where the fold control lives.
+        if block.fold.as_ref().is_some_and(TurnFold::is_folded) {
+            let turn_id = block.fold.as_ref().map(|fold| fold.turn_id.as_str())?;
+            return self.blocks.iter().position(|candidate| {
+                candidate
+                    .fold
+                    .as_ref()
+                    .is_some_and(|fold| fold.turn_id == turn_id && fold.is_control())
+            });
+        }
         if block.group.is_hidden() {
             self.parents[index]
         } else {
@@ -443,6 +516,20 @@ impl Transcript {
     pub fn reveal_block(&mut self, index: usize) {
         if index >= self.blocks.len() {
             return;
+        }
+        // A match inside a folded process section has to open the fold first,
+        // or the transcript would scroll to a row that is not drawn and land on
+        // the answer instead. The fold control is on the conclusion, which is
+        // the visible row that stands for the hidden section.
+        if self.blocks[index]
+            .fold
+            .as_ref()
+            .is_some_and(TurnFold::is_folded)
+        {
+            let control = self.visible_block(index);
+            if let Some(control) = control {
+                self.toggle_turn_fold(control);
+            }
         }
         if let Some(parent) = self.parents[index] {
             if !self.blocks[parent].expanded {
@@ -508,6 +595,25 @@ impl Transcript {
             }
             block.group = GroupRole::Solo;
             block.group_summary = None;
+        }
+        // A reader's explicit choice about a turn's process section outlives a
+        // rebuild exactly as a reasoning expansion does; the projection supplies
+        // the default the choice overrides. Choices leave with the turn that
+        // owns them, so the map cannot grow with the session.
+        if !self.turn_expansion.is_empty() {
+            let turns = blocks
+                .iter()
+                .filter_map(|block| block.fold.as_ref().map(|fold| fold.turn_id.as_str()))
+                .collect::<HashSet<_>>();
+            self.turn_expansion
+                .retain(|turn_id, _| turns.contains(turn_id.as_str()));
+        }
+        for block in &mut blocks {
+            if let Some(fold) = block.fold.as_mut()
+                && let Some(&expanded) = self.turn_expansion.get(&fold.turn_id)
+            {
+                fold.expanded = expanded;
+            }
         }
         // Explicit choices outlive a temporarily absent bottom indicator, but
         // leave with the turn/session that owns them.
@@ -683,6 +789,10 @@ impl Transcript {
                 runtime_attribution: None,
                 conclusion: false,
                 group: GroupRole::Head { members },
+                // The head stands for the run, so it carries the run's turn
+                // fold: a head left unfolded would stay on screen after the
+                // rest of its turn's process folded away.
+                fold: first.fold.clone(),
                 activity: None,
                 details: Vec::new(),
                 group_summary: None,
@@ -919,6 +1029,16 @@ impl Transcript {
     }
 
     fn block_is_drawn(&self, index: usize) -> bool {
+        // A block folded away with its turn's process section draws nothing,
+        // however far any group disclosure has animated: the fold is a state of
+        // the turn, not a partially open run.
+        if self.blocks[index]
+            .fold
+            .as_ref()
+            .is_some_and(TurnFold::is_folded)
+        {
+            return false;
+        }
         !self.blocks[index].group.is_hidden()
             || self.parents[index].is_some_and(|parent| self.disclosure_progress(parent) > 0.0)
     }
@@ -981,9 +1101,7 @@ impl Transcript {
     /// A folded member is not one: the run's head stands for it, so the head is
     /// what "the end of the session" means.
     fn last_visible_block(&self) -> Option<usize> {
-        self.blocks
-            .iter()
-            .rposition(|block| !block.group.is_hidden())
+        self.blocks.iter().rposition(|block| !block.is_hidden())
     }
 
     /// Drop every measurement and rendered row.
@@ -1012,11 +1130,32 @@ impl Transcript {
     }
 
     /// Toggle one block's expansion.
+    ///
+    /// A conclusion that draws a fold divider and has no body of its own hands
+    /// `e` to the divider: the divider is the row the reader sees first, and
+    /// the work it hides is what they came to open. A conclusion that is itself
+    /// collapsible — an error whose message is worth reading in full — keeps
+    /// `e` for its body, because its header advertises the expansion the key's
+    /// own help names; the divider below is still a click target. Either way
+    /// `e` runs the affordance the block's own rows advertise, so the key and
+    /// the hint beside it cannot disagree.
     pub fn toggle_block(&mut self, index: usize) -> bool {
+        let fold_control = self
+            .blocks
+            .get(index)
+            .and_then(|block| block.fold.as_ref())
+            .is_some_and(TurnFold::is_control);
+        let own_body = self
+            .blocks
+            .get(index)
+            .is_some_and(|block| block.collapsible);
+        if fold_control && !own_body {
+            return self.toggle_turn_fold(index);
+        }
         let Some(block) = self.blocks.get(index) else {
             return false;
         };
-        if !block.collapsible || block.group.is_hidden() {
+        if !block.collapsible || block.is_hidden() {
             return false;
         }
         let expanded = !block.expanded;
@@ -1035,6 +1174,61 @@ impl Transcript {
                 self.invalidate(member);
             }
         }
+        true
+    }
+
+    /// Flip the process section of the turn whose divider is at `index`.
+    ///
+    /// The pointer resolves the row it landed on rather than re-deriving which
+    /// affordance `e` would have chosen, so a click on the divider always means
+    /// the divider.
+    pub fn toggle_fold_at(&mut self, index: usize) -> bool {
+        self.toggle_turn_fold(index)
+    }
+
+    /// Flip the process section of the turn whose fold control is at `index`.
+    ///
+    /// The reader's choice is recorded against the turn, not the block, so it
+    /// survives the rebuild that follows the next streaming delta — and it is
+    /// applied to every block of the turn in one pass, which is what makes the
+    /// fold a property of the turn rather than a coincidence of neighbouring
+    /// blocks agreeing.
+    fn toggle_turn_fold(&mut self, index: usize) -> bool {
+        let Some(expanded) = self
+            .blocks
+            .get(index)
+            .and_then(|block| block.fold.as_ref())
+            .map(|fold| !fold.expanded)
+        else {
+            return false;
+        };
+        self.set_turn_fold(index, expanded)
+    }
+
+    /// Set the process section of the turn whose fold control is at `index`.
+    fn set_turn_fold(&mut self, index: usize, expanded: bool) -> bool {
+        let Some(turn_id) = self
+            .blocks
+            .get(index)
+            .and_then(|block| block.fold.as_ref())
+            .filter(|fold| fold.is_control())
+            .map(|fold| fold.turn_id.clone())
+        else {
+            return false;
+        };
+        self.turn_expansion.insert(turn_id.clone(), expanded);
+        for index in 0..self.blocks.len() {
+            let Some(fold) = self.blocks[index].fold.as_mut() else {
+                continue;
+            };
+            if fold.turn_id != turn_id {
+                continue;
+            }
+            fold.expanded = expanded;
+            self.keys[index] = self.blocks[index].content_key();
+            self.invalidate(index);
+        }
+        self.layout_valid = false;
         true
     }
 
@@ -1057,8 +1251,21 @@ impl Transcript {
     }
 
     /// Expand or collapse every collapsible block at once.
+    ///
+    /// A turn's process section folds for the reader the same way a block's
+    /// body does, so "expand all" opens it too: one key that reveals everything
+    /// is the point of the key, and a reader who pressed it to find a hidden
+    /// tool row would otherwise have to hunt for each turn's divider by hand.
     pub fn toggle_all(&mut self, expanded: bool) {
         for index in 0..self.blocks.len() {
+            if self.blocks[index]
+                .fold
+                .as_ref()
+                .is_some_and(TurnFold::is_control)
+            {
+                self.set_turn_fold(index, expanded);
+                continue;
+            }
             if !self.blocks[index].collapsible {
                 continue;
             }
@@ -1088,11 +1295,23 @@ impl Transcript {
     }
 
     /// Whether every collapsible block is currently open.
+    ///
+    /// A shut turn fold counts as closed: "expand all" is offered while
+    /// anything on screen is still hidden, and pressing it must open the fold
+    /// as well as the bodies inside it.
     pub fn all_expanded(&self) -> bool {
         self.blocks
             .iter()
-            .filter(|block| block.collapsible)
-            .all(|block| block.expanded)
+            .filter(|block| {
+                block.collapsible || block.fold.as_ref().is_some_and(TurnFold::is_control)
+            })
+            .all(|block| {
+                if block.fold.as_ref().is_some_and(TurnFold::is_control) {
+                    block.fold.as_ref().is_some_and(|fold| fold.expanded)
+                } else {
+                    block.expanded
+                }
+            })
     }
 
     fn invalidate(&mut self, index: usize) {
@@ -1187,11 +1406,12 @@ impl Transcript {
         };
         // The header is truncated to one row, and a message has none at all —
         // its first line *is* the message.
-        let headerless = matches!(
-            block.kind,
-            TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage
-        ) && !block.body.is_empty();
+        let headerless = is_headerless(block);
         let header = usize::from(!headerless);
+        // The divider is one row of its own, added by the renderer before the
+        // body. An estimate that forgot it would lay the tail out one row short
+        // of what is drawn, and the scroll would not reach the bottom.
+        let divider = usize::from(block.fold.as_ref().is_some_and(TurnFold::is_control));
         let body_lines = if block.group.is_head() {
             0
         } else if open && !block.details.is_empty() {
@@ -1233,7 +1453,7 @@ impl Transcript {
         let status = usize::from(block.failed && !dense && block.kind != TimelineRowKind::Error)
             + usize::from(block.pending_permission)
             + usize::from(block.runtime_attribution.is_some() && block.expanded);
-        (header + body_lines + status + gap).max(1)
+        (header + divider + body_lines + status + gap).max(1)
     }
 
     /// Measure one block precisely and cache the height.
@@ -1394,6 +1614,22 @@ impl Transcript {
     pub fn line_of_block(&mut self, index: usize) -> usize {
         self.ensure_layout();
         self.offsets.get(index).copied().unwrap_or(0)
+    }
+
+    /// The display line the fold control of `index` occupies, if it owns one.
+    ///
+    /// The control is the divider row, which the renderer draws after any
+    /// header the block has and before its body. Deriving it here keeps the
+    /// renderer the single authority on where the control landed: the pointer
+    /// handler asks for the row rather than re-deriving the layout, so the two
+    /// cannot disagree about what was pressed.
+    pub fn fold_control_line(&mut self, index: usize) -> Option<usize> {
+        let block = self.blocks.get(index)?;
+        if !block.fold.as_ref().is_some_and(TurnFold::is_control) {
+            return None;
+        }
+        let header = usize::from(!is_headerless(block));
+        Some(self.line_of_block(index) + header)
     }
 
     /// Materialise the blocks covering `[scroll.offset, scroll.offset + height)`.
@@ -1666,7 +1902,7 @@ impl Transcript {
                 if covered >= height {
                     break;
                 }
-                if !self.blocks[index].group.is_hidden() {
+                if !self.blocks[index].is_hidden() {
                     covered += self.measure(index, theme, strings) as usize;
                 }
             }
@@ -2239,6 +2475,19 @@ fn group_indent(block: &Block) -> usize {
     }
 }
 
+/// Whether a block draws its body without a header row above it.
+///
+/// A message *is* its text: a "You" or "Agent" row above every one of them
+/// spends a row of the transcript saying what the rail colour already says. The
+/// renderer and the height estimate both need this, and a disagreement about it
+/// is a row of drift between what is drawn and what is scrolled to.
+fn is_headerless(block: &Block) -> bool {
+    matches!(
+        block.kind,
+        TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage
+    ) && !block.body.is_empty()
+}
+
 fn detail_indent(block: &Block) -> usize {
     if !block.group.is_head() && (is_tool_item(block.kind) || block.activity.is_some()) {
         chrome::NEST
@@ -2662,9 +2911,10 @@ fn render_block_inner(
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut plain: Vec<String> = Vec::new();
 
-    if block.group.is_hidden() {
+    if block.is_hidden() {
         // Folded into the run above; contributes nothing but is still counted
-        // by the head's summary.
+        // by the head's summary. A block folded away with its turn's process
+        // section contributes nothing at all.
         return RenderedBlock::default();
     }
 
@@ -2878,6 +3128,16 @@ fn render_block_inner(
         plain.push(header_plain);
     }
 
+    // The turn's fold control and the rule that closes its process section, on
+    // the first row of the answer: everything above is work, everything below
+    // is what the work was for. It is drawn before the body so a long answer
+    // never buries the gesture that hides the work it came from.
+    if let Some(fold) = block.fold.as_ref().filter(|fold| fold.is_control()) {
+        let (rule_line, rule_plain) = divider_line(fold, content_width, theme, selected, strings);
+        lines.push(rule_line);
+        plain.push(rule_plain);
+    }
+
     if let Some(rendered) = rendered {
         let body_background = body_band(block, theme);
         let style = body_style(block, theme);
@@ -3075,6 +3335,76 @@ fn row_line(marker: Span<'static>, spans: Vec<Span<'static>>) -> Line<'static> {
     Line::from(out)
 }
 
+/// The rule that closes a turn's process section, with the work's duration in
+/// the middle and the control that folds it at the left.
+///
+/// One row carries both jobs because they are one decision: the rule is where
+/// the work stops and the answer begins, and pressing the mark beside it is how
+/// the reader moves that boundary. Closed, there is no work above it to separate
+/// from, so only the mark and the label are drawn and the row reads as the
+/// turn's title — the desktop's "worked for" header. Open, the process sits
+/// above and the rules run out to both edges, so the row reads as the separator
+/// it has become. The label is centred by giving both rules the widths that
+/// leave it so, which keeps the row exact at every terminal width.
+fn divider_line(
+    fold: &TurnFold,
+    content_width: usize,
+    theme: &TuiTheme,
+    selected: bool,
+    strings: Strings,
+) -> (Line<'static>, String) {
+    let tier = crate::glyphs::GlyphTier::of(theme);
+    let glyph = crate::glyphs::disclosure(fold.expanded, tier);
+    // Two cells frame the label — one space on either side — and one cell
+    // separates the disclosure mark from the left rule. At a width too narrow
+    // for the whole label the mark and the start of the text are what matter,
+    // so the label gives way rather than the row overflowing the band.
+    let mark_width = display_width(glyph) + 1;
+    let budget = content_width.saturating_sub(mark_width + 2);
+    let label = truncate_to_width(
+        &format!("{} {}", strings.transcript_worked_for(), fold.label),
+        budget,
+        "…",
+    );
+    let framed = display_width(&label) + 2;
+    let rules = content_width.saturating_sub(framed + mark_width);
+    // Closed, the row is a title and the rules would be furniture around a
+    // single word; open, they are the only thing separating the work from the
+    // answer, so both edges get one.
+    let (left, right) = if fold.expanded {
+        (rules / 2, rules - rules / 2)
+    } else {
+        (0, 0)
+    };
+    let rule = crate::glyphs::heading_rule(tier);
+    let mut spans = vec![
+        Span::styled(glyph.to_string(), theme.muted()),
+        Span::raw(" "),
+    ];
+    if left > 0 {
+        spans.push(Span::styled(
+            rule.repeat(left),
+            theme.dimmed(theme.roles.gray_dim),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(" {label} "),
+        theme.dimmed(theme.roles.gray),
+    ));
+    if right > 0 {
+        spans.push(Span::styled(
+            rule.repeat(right),
+            theme.dimmed(theme.roles.gray_dim),
+        ));
+    }
+    let text = format!("{glyph} {}{label}{}", rule.repeat(left), rule.repeat(right));
+    let mut line = row_line(Span::raw(" "), spans);
+    if selected {
+        line = line.style(Style::default().bg(theme.roles.surface_highlight));
+    }
+    (line, text)
+}
+
 /// The marker cell of one row of a block, `row` counting from the header.
 ///
 /// When the block is a live thought window the cell is one step of the rail that
@@ -3266,6 +3596,7 @@ mod tests {
             runtime_attribution: None,
             conclusion: false,
             group: GroupRole::Solo,
+            fold: None,
             activity: None,
             details: Vec::new(),
             group_summary: None,
@@ -4611,6 +4942,7 @@ mod density_tests {
             runtime_attribution: None,
             conclusion: false,
             group: GroupRole::Solo,
+            fold: None,
             activity: None,
             details: Vec::new(),
             group_summary: None,
@@ -4867,6 +5199,137 @@ mod density_tests {
         assert!(
             text.iter().any(|line| line.contains("codex")),
             "the new runtime is not named: {text:?}"
+        );
+    }
+
+    /// A turn with one work row folded away and the answer that owns the
+    /// control, as the projection would hand it over.
+    fn folded_turn(expanded: bool) -> Vec<Block> {
+        let mut work = item("t1", TimelineRowKind::ToolCall, "the tool's output", false);
+        work.fold = Some(TurnFold {
+            turn_id: "turn-1".into(),
+            label: "12s".into(),
+            expanded,
+            is_conclusion: false,
+        });
+        let mut answer = item("t2", TimelineRowKind::AgentMessage, "the answer", false);
+        // The projection never makes an Agent message collapsible: an answer
+        // *is* its text. The fixture has to agree, or `e` on the answer would
+        // take the body branch the production block leaves to the divider.
+        answer.collapsible = false;
+        answer.fold = Some(TurnFold {
+            turn_id: "turn-1".into(),
+            label: "12s".into(),
+            expanded,
+            is_conclusion: true,
+        });
+        vec![work, answer]
+    }
+
+    #[test]
+    fn a_folded_turn_draws_only_its_answer_and_divider() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        transcript.set_blocks(folded_turn(false));
+        let lines = transcript.visible_lines(ScrollState::default(), 20, &theme(), strings());
+        let text = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            !text.iter().any(|line| line.contains("the tool's output")),
+            "the folded work is still drawn: {text:?}"
+        );
+        assert!(
+            text.iter().any(|line| line.contains("the answer")),
+            "the answer goes with the fold: {text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.contains("Worked for 12s") && line.contains('▸')),
+            "a shut fold is a title with a closed mark: {text:?}"
+        );
+    }
+
+    #[test]
+    fn opening_a_fold_draws_the_work_and_a_rule() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        transcript.set_blocks(folded_turn(true));
+        let lines = transcript.visible_lines(ScrollState::default(), 20, &theme(), strings());
+        let text = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            text.iter().any(|line| line.contains("the tool's output")),
+            "the open fold hides the work it stands for: {text:?}"
+        );
+        // Expanded, the label is a separator: ruled to both edges and marked
+        // open.
+        let rule = text
+            .iter()
+            .find(|line| line.contains("Worked for 12s"))
+            .expect("the divider is drawn");
+        assert!(rule.contains("─ Worked for 12s ─"), "{rule:?}");
+        assert!(rule.contains('▾'), "{rule:?}");
+    }
+
+    #[test]
+    fn a_fold_choice_survives_a_rebuild() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        transcript.set_blocks(folded_turn(false));
+        let control = transcript
+            .blocks()
+            .iter()
+            .position(|block| block.fold.as_ref().is_some_and(TurnFold::is_control))
+            .expect("the answer owns the control");
+        assert!(transcript.toggle_block(control));
+        assert!(
+            transcript.blocks()[0]
+                .fold
+                .as_ref()
+                .is_some_and(|f| f.expanded)
+        );
+
+        // The projection hands the fold back shut on the next delta; the
+        // reader's choice is re-applied rather than discarded.
+        transcript.set_blocks(folded_turn(false));
+        assert!(
+            transcript.blocks()[0]
+                .fold
+                .as_ref()
+                .is_some_and(|f| f.expanded),
+            "an explicit expansion was undone by a rebuild"
+        );
+
+        // A fold nothing refers to any more takes its choice with it.
+        transcript.set_blocks(vec![item(
+            "solo",
+            TimelineRowKind::AgentMessage,
+            "hi",
+            false,
+        )]);
+        assert!(transcript.turn_expansion.is_empty());
+    }
+
+    #[test]
+    fn a_folded_block_is_skipped_by_the_cursor_and_search() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        transcript.set_blocks(folded_turn(false));
+        // The hidden work resolves to the control that stands for it, so the
+        // cursor never lands on a row that is not drawn.
+        assert_eq!(transcript.visible_block(0), Some(1));
+        // And a search hit inside the fold opens it before revealing itself.
+        transcript.reveal_block(0);
+        assert!(
+            transcript.blocks()[0]
+                .fold
+                .as_ref()
+                .is_some_and(|f| f.expanded),
+            "revealing a hidden row left the fold shut"
         );
     }
 }
