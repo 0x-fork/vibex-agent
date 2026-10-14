@@ -1458,12 +1458,19 @@ impl AgentManager {
 
         if materialization == InitialRuntimeMaterialization::Deferred {
             let conn = self.open_migrated()?;
-            return SessionRepository::get(&conn, &session.id)?.ok_or_else(|| {
+            let created = SessionRepository::get(&conn, &session.id)?.ok_or_else(|| {
                 VibexError::storage(
                     "session_missing_after_deferred_create",
                     "deferred session could not be reloaded",
                 )
-            });
+            })?;
+            // A creation is a row no client's session list has yet, and the
+            // caller's answer reaches nobody else. The snapshot is how the
+            // authority announces it: the sidebar invalidation published beside
+            // it makes a remote client re-read the list, and an in-process
+            // client answers a session it cannot place the same way.
+            self.publish_root_session_update(&conn, created.clone());
+            return Ok(created);
         }
 
         let mut conn = self.open_migrated()?;
@@ -1474,13 +1481,14 @@ impl AgentManager {
             "Agent session is ready",
             SystemNoticeLevel::Info,
         )?;
-
-        SessionRepository::get(&conn, &session.id)?.ok_or_else(|| {
+        let created = SessionRepository::get(&conn, &session.id)?.ok_or_else(|| {
             VibexError::storage(
                 "session_missing_after_create",
                 "created session could not be reloaded",
             )
-        })
+        })?;
+        self.publish_root_session_update(&conn, created.clone());
+        Ok(created)
     }
 
     pub async fn fork_session(
@@ -5514,7 +5522,10 @@ impl AgentManager {
 
     fn publish_root_session_update(&self, _conn: &DbConnection, session: AgentSession) {
         // Child updates refresh open worker views and tree metadata. Client
-        // session-list queries keep their authoritative roots-only projection.
+        // session-list queries keep their authoritative roots-only projection,
+        // so a client that cannot place a snapshot answers it by re-reading
+        // that list — which is what a creation needs: the row exists now and
+        // no other event names it.
         let _ = self.session_events.send(session);
     }
 
@@ -9184,6 +9195,51 @@ mod tests {
         );
 
         drop(conn);
+        drop(manager);
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn a_committed_creation_broadcasts_the_session_row() {
+        // A creation adds a row no client's session list has yet, and the reply
+        // only reaches the caller. The snapshot is what the sidebar
+        // invalidation published beside it fans out from, so a TUI creating a
+        // session is how the Desktop sharing the runtime learns the row exists.
+        // The deferred shape is the one the TUI asks for: the identity is
+        // reserved and the row is durable before the Agent is materialized.
+        let db_path = temp_db_path("session-creation-broadcast");
+        let workspace_root = temp_workspace_path("session-creation-broadcast");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let manager = crate::test_support::TestRuntimeHarness::new(
+            &db_path,
+            AgentId::parse("codex").unwrap(),
+            Arc::new(CompletingTurnProvider),
+        );
+        let selection = manager
+            .resolve_initial_runtime_selection(None, ProviderKind::Codex, None, None)
+            .unwrap();
+        let mut updates = manager.subscribe_session_updates();
+        let reserved_id = VibexSessionId::new();
+
+        let session = manager
+            .create_session(CreateAgentSessionRequest {
+                session_id: Some(reserved_id.clone()),
+                defer_runtime_materialization: true,
+                runtime: selection,
+                workspace_root: workspace_root.to_string_lossy().to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                title: Some("Creation broadcast".to_string()),
+                safety: Some(AgentSessionSafety::workspace_write_ask_on_risk()),
+            })
+            .await
+            .unwrap();
+
+        let published = std::iter::from_fn(|| updates.try_recv().ok())
+            .find(|update| update.id == reserved_id)
+            .expect("a committed creation must be announced to every subscribed client");
+        assert_eq!(published, session);
+
         drop(manager);
         cleanup_db(&db_path);
         let _ = fs::remove_dir_all(workspace_root);
