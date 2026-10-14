@@ -24,7 +24,7 @@ use gpui::{
 use vibex_app_update::{UpdateSnapshot, UpdateState};
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendFuture, BackendOperation,
-    BackendProjection, BackendResult, ManagementBackend as _, MutationRequest,
+    BackendProjection, BackendResult, GitBackend as _, ManagementBackend as _, MutationRequest,
     WorkspaceBackend as _, WorkspaceSummary,
 };
 use vibex_core::{
@@ -32,11 +32,11 @@ use vibex_core::{
     AgentCommandExecutionBehavior, AgentCommandSourceKind, AgentCommandTrigger, AgentId,
     AgentListRequest, AgentSessionState, AgentTimelineDisplaySettings,
     AgentTimelineReasoningDisplayMode, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    ElicitationFieldKind, ElicitationResolutionAction, ForkAgentSessionRequest, GoalPhase,
-    GoalSnapshot, HumanDelegationRequest, MessageAttachment, OpenWorkspaceRequest,
-    PermissionResolution, PermissionResponseKind, PermissionRiskCategory, PlanStepPayload,
-    PlanStepStatus, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteServerKind,
-    RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
+    ElicitationFieldKind, ElicitationResolutionAction, ForkAgentSessionRequest,
+    GitWorktreeCreateRequest, GoalPhase, GoalSnapshot, HumanDelegationRequest, MessageAttachment,
+    OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PermissionRiskCategory,
+    PlanStepPayload, PlanStepStatus, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState,
+    RemoteServerKind, RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
     RemoteSidebarOrganizationMutation, RenameAgentSessionRequest, ReplaceUserMessagePayload,
     RequestId, ResolvePermissionRequest, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
     RuntimeAuthSourceSummary, RuntimeModelSelection, RuntimeOptionAvailability,
@@ -531,6 +531,17 @@ struct PendingMobileUserMessage {
     attachments: Vec<MessageAttachment>,
 }
 
+/// What is known about one generated picture.
+#[derive(Debug, Clone)]
+enum GeneratedImageState {
+    /// The bytes are on their way.
+    Loading,
+    Ready(Arc<Image>),
+    /// The reference named something this client cannot show: a path outside
+    /// the workspace, or a format it cannot decode.
+    Unavailable,
+}
+
 /// One file change from the timeline, opened for reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MobileTimelineFileDiff {
@@ -666,6 +677,24 @@ enum SidebarNamePrompt {
     RenameFolder {
         folder_id: String,
     },
+    RenameGroup {
+        group_id: String,
+    },
+    CreateGroup {
+        project_id: String,
+        workspace_id: String,
+        member_session_ids: Vec<String>,
+    },
+}
+
+/// The membership editor for one session group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MobileGroupMembersEditor {
+    group_id: String,
+    project_id: String,
+    workspace_id: String,
+    /// The sessions ticked so far, in the order they were ticked.
+    selected: Vec<String>,
 }
 
 /// A row being moved with the finger after the long-press delay has elapsed.
@@ -714,6 +743,8 @@ enum InputField {
     PairingCode,
     NewSessionTitle,
     NewSessionPrompt,
+    NewSessionWorktreeName,
+    NewSessionWorktreePath,
     SidebarName,
     SessionAction,
     /// The runtime rename sheet's field.
@@ -1149,6 +1180,7 @@ fn apply_app_settings(settings: &AppSettings, window: &mut Window, cx: &mut App)
     theme::set_system_dark(system_appearance_is_dark(cx));
     locale::set_preference(settings.language.unwrap_or_default());
     theme::set_reduce_motion(settings.reduce_motion);
+    theme::set_font_scale_percent(settings.font_scale_percent);
     theme::set_theme_selection(&settings.theme_selection);
     // The kit's own components (inputs, sheets, notification layer) read the
     // theme global, and it was only ever applied at startup: changing the
@@ -1295,6 +1327,9 @@ pub struct MobileApp {
     /// Plan bars the reader closed. Identity is the session plus the plan
     /// revision, so a new plan from the Agent shows up again on its own.
     dismissed_composer_plans: BTreeSet<(String, i64)>,
+    /// The objective editor's field, and whether it is open.
+    goal_objective_input: Entity<TextareaState>,
+    goal_objective_open: bool,
     /// Whether the goal bar is showing its objective in full. A phone has room
     /// for the phase and one line of objective, and no more.
     composer_goal_expanded: bool,
@@ -1327,11 +1362,27 @@ pub struct MobileApp {
     /// longer open.
     token_usage_generation: u64,
     timeline_metadata_tip: Option<TimelineMetadataTip>,
+    /// Find inside the open conversation: the query, what it matched, and
+    /// which match the reader is standing on. A phone cannot highlight a word
+    /// inside a Markdown view, so the match is shown by taking the reader to
+    /// the row that holds it and marking that row.
+    timeline_find_open: bool,
+    timeline_find_input: Option<Entity<InputState>>,
+    timeline_find_subscription: Option<gpui::Subscription>,
+    timeline_find_query: String,
+    /// `(turn id, row id, the line the match was found in)`.
+    timeline_find_matches: Vec<(String, String, String)>,
+    timeline_find_active: usize,
+    /// The turn the last search change wants on screen, applied at paint time.
+    timeline_find_scroll_pending: Option<String>,
     attachment_preview: Option<MobileAttachmentPreview>,
     /// One file change opened from the timeline, with the patch already
     /// projected: the sheet is a read-out, so nothing is computed while it
     /// paints.
     timeline_file_diff: Option<MobileTimelineFileDiff>,
+    /// The pictures an image-generation card produced, by the reference the
+    /// runtime wrote. A reference is fetched once, when its card is opened.
+    generated_images: BTreeMap<String, GeneratedImageState>,
     attachment_preview_loading: Option<String>,
     desktop_timeline_display_settings: AgentTimelineDisplaySettings,
     timeline_display_settings_overrides: BTreeMap<String, MobileTimelineDisplaySettingsOverride>,
@@ -1449,6 +1500,18 @@ pub struct MobileApp {
     new_session_runtime: Option<SessionRuntimeSelection>,
     new_session_title_input: Entity<InputState>,
     new_session_prompt_input: Entity<TextareaState>,
+    /// The directory browser's open state, and the listing it is showing.
+    ///
+    /// A path on the desktop host cannot be typed on a phone keyboard, and the
+    /// authority is the only thing that can list its own directories, so the
+    /// choice is made from what it reports.
+    worktree_path_browser: Option<MobileDirectoryBrowser>,
+    /// The worktree's name, when the session is starting in a new one. The
+    /// authority slugs it into `vibex/<slug>` for the branch and the directory.
+    new_session_worktree_name_input: Entity<InputState>,
+    /// An absolute path on the desktop host for the new worktree. Empty means
+    /// the authority's own managed location.
+    new_session_worktree_path_input: Entity<InputState>,
     new_project_input: Entity<InputState>,
     new_project_busy: bool,
     new_project_error: Option<String>,
@@ -1472,6 +1535,25 @@ pub struct MobileApp {
     sidebar_batch_mode: bool,
     /// Whether the batch-delete confirmation sheet is up.
     sidebar_batch_delete_confirmation: bool,
+    /// The project whose removal is being confirmed.
+    project_remove_confirmation: Option<String>,
+    /// The group whose membership is being edited.
+    group_members_editor: Option<MobileGroupMembersEditor>,
+    /// The sessions a parent owns, by parent id, once that parent is expanded.
+    /// Children are not in the ordinary session list, so this is the only place
+    /// the sidebar can learn they exist.
+    delegated_children: BTreeMap<String, Vec<vibex_core::SessionTreeNode>>,
+    /// Session ids the tree reports as having children, whether or not they
+    /// have been fetched yet.
+    delegated_parents: BTreeSet<String>,
+    /// Every node the tree has named, by session id. The group tabs summarise
+    /// their members from these: a member's own node is what says whether its
+    /// task is running, waiting, or done.
+    delegated_nodes: BTreeMap<String, vibex_core::SessionTreeNode>,
+    /// The parents whose children are on screen.
+    delegated_expanded: BTreeSet<String>,
+    /// The parents whose children are being fetched.
+    delegated_loading: BTreeSet<String>,
     /// Top edge and right edge of the row list in window space, recorded during
     /// paint so a touch pan can be resolved to a row without hit-test plumbing.
     sidebar_list_frame: Rc<Cell<(f32, f32)>>,
@@ -1550,6 +1632,10 @@ pub struct MobileApp {
     /// The stable-channel update state, or `None` until a check publishes one.
     /// The settings About section is the only surface.
     update_snapshot: Option<UpdateSnapshot>,
+    /// Whether the installed release's notes are expanded in About.
+    release_notes_open: bool,
+    /// The rendered notes, kept across frames like every other Markdown view.
+    release_notes_view: Option<(String, Entity<markdown::MarkdownView>)>,
     /// The root window, kept so a platform callback (a notification tap) can
     /// open an overlay without a pointer event.
     window_handle: gpui::AnyWindowHandle,
@@ -1579,7 +1665,10 @@ impl Focusable for MobileApp {
 const MOBILE_MAX_COMPOSER_ATTACHMENTS: usize = 8;
 
 /// One member of the open session's group, as the tab strip draws it.
-type SessionGroupTabs = (String, Vec<(VibexSessionId, String, AgentSessionState)>);
+type MobileSessionGroupTabs = (
+    vibex_desktop_model::SessionGroupUiState,
+    Vec<(VibexSessionId, String, AgentSessionState)>,
+);
 
 /// Splits a composer draft into a slash command name and its arguments.
 ///
@@ -1633,6 +1722,16 @@ fn mention_prefix(text: &str) -> Option<&str> {
     let token = text.split_whitespace().last()?;
     let remainder = token.strip_prefix('@')?;
     (!remainder.contains('@')).then_some(remainder)
+}
+
+/// One directory the authority listed, and where the browser is in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MobileDirectoryBrowser {
+    path: String,
+    parent: Option<String>,
+    roots: Vec<String>,
+    entries: Vec<(String, String)>,
+    loading: bool,
 }
 
 /// Which field an attachment picked from the system belongs to.
@@ -2472,6 +2571,18 @@ impl MobileApp {
         let sidebar_search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(locale::common("Search")));
         let sidebar_search_subscription = cx.observe(&sidebar_search_input, |_, _, cx| cx.notify());
+        let timeline_find_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Find in conversation",
+                "在会话中查找",
+                "在工作階段中尋找",
+            ))
+        });
+        let timeline_find_subscription =
+            cx.observe(&timeline_find_input, |this: &mut Self, _, cx| {
+                this.refresh_timeline_find(cx);
+                cx.notify();
+            });
         // The battery-optimization dialog only pauses the activity, which does
         // not emit a Background phase on Android; track window activation so
         // returning from it re-reads the allowlist state.
@@ -2542,6 +2653,14 @@ impl MobileApp {
             composer_history_limit: COMPOSER_HISTORY_PAGE,
             composer_plan_expanded: None,
             dismissed_composer_plans: BTreeSet::new(),
+            goal_objective_input: cx.new(|cx| {
+                TextareaState::new(window, cx).placeholder(locale::text(
+                    "What should the Agent work toward?",
+                    "Agent 应该朝着什么目标工作？",
+                    "Agent 應該朝著什麼目標工作？",
+                ))
+            }),
+            goal_objective_open: false,
             composer_goal_expanded: false,
             composer_queue: restored_composer.queue,
             composer_queue_next_id: restored_composer.next_queue_id,
@@ -2552,8 +2671,16 @@ impl MobileApp {
             token_usage: None,
             token_usage_generation: 0,
             timeline_metadata_tip: None,
+            timeline_find_open: false,
+            timeline_find_input: Some(timeline_find_input),
+            timeline_find_subscription: Some(timeline_find_subscription),
+            timeline_find_query: String::new(),
+            timeline_find_matches: Vec::new(),
+            timeline_find_active: 0,
+            timeline_find_scroll_pending: None,
             attachment_preview: None,
             timeline_file_diff: None,
+            generated_images: BTreeMap::new(),
             attachment_preview_loading: None,
             desktop_timeline_display_settings: AgentTimelineDisplaySettings::default(),
             timeline_display_settings_overrides,
@@ -2659,6 +2786,21 @@ impl MobileApp {
                     "描述你想完成的事情…",
                 ))
             }),
+            worktree_path_browser: None,
+            new_session_worktree_name_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Worktree name",
+                    "Worktree 名称",
+                    "Worktree 名稱",
+                ))
+            }),
+            new_session_worktree_path_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Path on the desktop (optional)",
+                    "桌面端路径（可选）",
+                    "桌面版路徑（可選）",
+                ))
+            }),
             new_project_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(locale::text(
                     "Project path",
@@ -2691,6 +2833,13 @@ impl MobileApp {
             sidebar_drag: None,
             sidebar_batch_mode: false,
             sidebar_batch_delete_confirmation: false,
+            project_remove_confirmation: None,
+            group_members_editor: None,
+            delegated_children: BTreeMap::new(),
+            delegated_parents: BTreeSet::new(),
+            delegated_nodes: BTreeMap::new(),
+            delegated_expanded: BTreeSet::new(),
+            delegated_loading: BTreeSet::new(),
             sidebar_list_frame: Rc::new(Cell::new((0.0, 0.0))),
             composer_queue_frame: Rc::new(Cell::new((0.0, 0.0))),
             attachment_preview_frame: Rc::new(Cell::new((0.0, 0.0))),
@@ -2741,6 +2890,8 @@ impl MobileApp {
             pending_notification_action: None,
             update_supported: update::supported(),
             update_available: updates_enabled,
+            release_notes_open: false,
+            release_notes_view: None,
             update_snapshot: if updates_enabled {
                 update::snapshot()
             } else {
@@ -3348,6 +3499,126 @@ impl MobileApp {
     /// host, the route, or the credential that failed — so it travels whole.
     fn fail(&mut self, error: BackendError) {
         self.hint(Tone::Error, error.message);
+    }
+
+    /// Opens the authority's directory browser for the worktree path.
+    fn open_worktree_path_browser(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .workspace
+                .supports(BackendOperation::WorkspaceBrowseDirectories)
+        }) {
+            self.hint(
+                Tone::Warning,
+                locale::text(
+                    "This desktop cannot browse its directories",
+                    "此桌面端不支持浏览目录",
+                    "此桌面版不支援瀏覽目錄",
+                ),
+            );
+            cx.notify();
+            return;
+        }
+        // Opening on the path already typed, when there is one, so the browser
+        // continues where the reader was rather than starting over.
+        let start = self
+            .new_session_worktree_path_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        self.load_worktree_directory((!start.is_empty()).then_some(start), cx);
+    }
+
+    /// Lists one directory, or the first browse root when none is named.
+    fn load_worktree_directory(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.worktree_path_browser = Some(MobileDirectoryBrowser {
+            path: path.clone().unwrap_or_default(),
+            parent: None,
+            roots: self
+                .worktree_path_browser
+                .as_ref()
+                .map(|browser| browser.roots.clone())
+                .unwrap_or_default(),
+            entries: Vec::new(),
+            loading: true,
+        });
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.browse_authority_directories(path).await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(listing) => {
+                        this.worktree_path_browser = Some(MobileDirectoryBrowser {
+                            path: listing.path,
+                            parent: listing.parent,
+                            roots: listing.roots,
+                            entries: listing
+                                .entries
+                                .into_iter()
+                                .map(|entry| (entry.name, entry.path))
+                                .collect(),
+                            loading: false,
+                        });
+                    }
+                    Err(error) => {
+                        this.worktree_path_browser = None;
+                        this.fail(error);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    fn close_worktree_path_browser(&mut self, cx: &mut Context<Self>) {
+        if self.worktree_path_browser.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Takes the directory the browser is standing in.
+    fn choose_worktree_directory(
+        &mut self,
+        _: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(browser) = self.worktree_path_browser.take() else {
+            return;
+        };
+        let path = browser.path.clone();
+        self.new_session_worktree_path_input
+            .update(cx, |input, cx| input.set_value(path, window, cx));
+        cx.notify();
+    }
+
+    /// Steps the text size through its three settings.
+    fn cycle_text_size(&mut self, cx: &mut Context<Self>) {
+        let steps = theme::FONT_SCALE_STEPS;
+        let current = self.app_settings.font_scale_percent;
+        let next = steps
+            .iter()
+            .position(|step| *step == current)
+            .map(|index| steps[(index + 1) % steps.len()])
+            .unwrap_or(100);
+        self.app_settings.font_scale_percent = next;
+        theme::set_font_scale_percent(next);
+        self.persist_app_settings(cx);
+        cx.notify();
     }
 
     /// Holds the display awake exactly while the setting says so.
@@ -4372,7 +4643,120 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// Reads the ownership forest, so a parent session can show its children.
+    ///
+    /// The ordinary session list deliberately omits owned children: they are
+    /// not peers of the sessions the reader started. The tree is where they
+    /// are named, and only the roots are read here — a branch is fetched when
+    /// its parent is expanded.
+    fn refresh_session_tree(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone().filter(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentSessionAccess)
+        }) else {
+            return;
+        };
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .session_tree(vibex_core::SessionTreeRequest {
+                    parent_session_id: None,
+                    cursor: None,
+                    limit: Some(200),
+                    include_archived: false,
+                })
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                if let Ok(page) = outcome {
+                    this.record_delegated_nodes(&page.nodes);
+                    this.delegated_parents = page
+                        .nodes
+                        .iter()
+                        .filter(|node| node.child_count > 0)
+                        .filter_map(|node| node.session_ref.session_id())
+                        .map(|id| id.as_str().to_string())
+                        .collect();
+                    // A parent that is no longer in the forest drops whatever
+                    // branch was cached for it.
+                    let known = this.delegated_parents.clone();
+                    this.delegated_children
+                        .retain(|parent, _| known.contains(parent));
+                    this.delegated_expanded
+                        .retain(|parent| known.contains(parent));
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+    }
+
+    /// Remembers the nodes a tree page named, for the summaries that read them.
+    fn record_delegated_nodes(&mut self, nodes: &[vibex_core::SessionTreeNode]) {
+        for node in nodes {
+            if let Some(id) = node.session_ref.session_id() {
+                self.delegated_nodes
+                    .insert(id.as_str().to_string(), node.clone());
+            }
+        }
+    }
+
+    /// Shows or hides one parent's children, fetching them the first time.
+    fn toggle_delegated_children(&mut self, session_id: String, cx: &mut Context<Self>) {
+        if self.delegated_expanded.remove(&session_id) {
+            cx.notify();
+            return;
+        }
+        self.delegated_expanded.insert(session_id.clone());
+        if self.delegated_children.contains_key(&session_id)
+            || self.delegated_loading.contains(&session_id)
+        {
+            cx.notify();
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Ok(parent) = VibexSessionId::parse(session_id.as_str()) else {
+            return;
+        };
+        self.delegated_loading.insert(session_id.clone());
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .session_tree(vibex_core::SessionTreeRequest {
+                    parent_session_id: Some(parent),
+                    cursor: None,
+                    limit: Some(100),
+                    include_archived: false,
+                })
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.delegated_loading.remove(&session_id);
+                match outcome {
+                    Ok(page) => {
+                        this.record_delegated_nodes(&page.nodes);
+                        this.delegated_children.insert(session_id, page.nodes);
+                    }
+                    Err(error) => {
+                        this.delegated_expanded.remove(&session_id);
+                        this.fail(error);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
     fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
+        self.refresh_session_tree(cx);
         if self.session_sync_busy {
             self.session_sync_queued = true;
             return;
@@ -5021,8 +5405,36 @@ impl MobileApp {
         self.tasks.push(task);
     }
 
+    /// One line naming where the rail is pointed: project, worktree, branch.
+    ///
+    /// The desktop's rail shows the same three things in its own header; the
+    /// phone had none of them, so a rail opened on a worktree looked exactly
+    /// like one opened on the checkout.
+    fn workbench_context_label(&self, workspace_id: &vibex_core::WorkspaceId) -> Option<String> {
+        let summary = self
+            .workspace_summaries
+            .iter()
+            .find(|summary| summary.workspace.id == *workspace_id)?;
+        let worktree = self
+            .sidebar_view
+            .worktree_titles
+            .get(workspace_id.as_str())
+            .cloned()
+            .unwrap_or_else(|| workspace_label(&summary.workspace.root_path).to_string());
+        let mut parts = vec![summary.project.name.clone(), worktree];
+        if let Some(branch) = summary
+            .git_branch
+            .as_deref()
+            .filter(|b| !b.trim().is_empty())
+        {
+            parts.push(branch.to_string());
+        }
+        Some(parts.join(" / "))
+    }
+
     fn ensure_workbench(&mut self, workspace_id: vibex_core::WorkspaceId, cx: &mut Context<Self>) {
         self.sidebar_selected_workspace_id = Some(workspace_id.as_str().to_string());
+        let context_label = self.workbench_context_label(&workspace_id);
         let session_id = self
             .controller
             .as_ref()
@@ -5031,6 +5443,7 @@ impl MobileApp {
         if let Some(workbench) = self.workbench.as_ref() {
             workbench.update(cx, |workbench, cx| {
                 workbench.set_workspace(workspace_id, cx);
+                workbench.set_context_label(context_label);
                 if let Some(surface) = pending_surface {
                     workbench.set_surface(surface, cx);
                 }
@@ -5048,6 +5461,7 @@ impl MobileApp {
         if let Some(workbench) = self.workbench.as_ref() {
             workbench.update(cx, |workbench, cx| {
                 workbench.set_close_handler(close);
+                workbench.set_context_label(context_label);
                 if let Some(surface) = pending_surface {
                     workbench.set_surface(surface, cx);
                 }
@@ -5355,17 +5769,108 @@ impl MobileApp {
         let Some(backend) = self.backend.clone() else {
             return;
         };
-        let request = MutationRequest::new(CreateAgentSessionRequest {
-            session_id: None,
-            defer_runtime_materialization: false,
-            runtime: runtime.clone(),
-            workspace_root,
-            workspace_mode,
-            title: (!title.is_empty()).then_some(title),
-            safety: None,
-        });
+        // A session that starts in a new worktree has to have one created for
+        // it first: the session request only registers a workspace, it does not
+        // make the directory. The name the reader typed is what the worktree's
+        // branch and folder are named from, and an empty one is derived from
+        // the first message so the worktree is never left unnamed.
+        let worktree_name = self
+            .new_session_worktree_name_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let worktree_path = self
+            .new_session_worktree_path_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let creates_worktree = workspace_mode == WorkspaceMode::VibexWorktree;
+        let worktree_request = if creates_worktree {
+            let name = if worktree_name.is_empty() {
+                let fallback = if !title.is_empty() {
+                    title.clone()
+                } else {
+                    prompt.clone()
+                };
+                vibex_core::managed_worktree_name_slug(&fallback)
+            } else {
+                worktree_name
+            };
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                self.fail(BackendError::failed(
+                    "mobile_worktree_name_required",
+                    locale::text(
+                        "Name the worktree, or write the first message it can be named from.",
+                        "请填写 Worktree 名称，或先写第一条消息以便自动命名。",
+                        "請填寫 Worktree 名稱，或先寫第一則訊息以便自動命名。",
+                    ),
+                ));
+                cx.notify();
+                return;
+            }
+            let Some(origin_workspace_id) = self
+                .new_session_workspace_id
+                .as_deref()
+                .and_then(|id| vibex_core::WorkspaceId::parse(id).ok())
+            else {
+                self.fail(BackendError::failed(
+                    "mobile_worktree_origin_required",
+                    locale::text(
+                        "Choose the workspace the worktree is created from.",
+                        "请选择创建 Worktree 的源工作区。",
+                        "請選擇建立 Worktree 的來源工作區。",
+                    ),
+                ));
+                cx.notify();
+                return;
+            };
+            let base_ref = self
+                .new_session_workspace_id
+                .as_deref()
+                .and_then(|id| {
+                    self.workspace_summaries
+                        .iter()
+                        .find(|summary| summary.workspace.id.as_str() == id)
+                })
+                .and_then(|summary| summary.git_branch.clone());
+            Some(GitWorktreeCreateRequest {
+                workspace_id: origin_workspace_id.clone(),
+                branch_name: format!("vibex/{}", vibex_core::managed_worktree_name_slug(&name)),
+                base_ref,
+                name: Some(name),
+                worktree_path: (!worktree_path.is_empty()).then_some(worktree_path),
+                target_workspace_id: Some(origin_workspace_id),
+                target_branch: None,
+            })
+        } else {
+            None
+        };
         self.new_session_busy = true;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            // The worktree first: its workspace is what the session is opened
+            // in, so a session is never left pointing at the checkout the
+            // worktree was branched from.
+            let (workspace_root, workspace_mode) = match worktree_request {
+                Some(request) => {
+                    let created = backend
+                        .git_worktree_create(MutationRequest::new(request))
+                        .await?;
+                    (created.workspace.root_path, created.workspace.mode)
+                }
+                None => (workspace_root, workspace_mode),
+            };
+            let request = MutationRequest::new(CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: false,
+                runtime: runtime.clone(),
+                workspace_root,
+                workspace_mode,
+                title: (!title.is_empty()).then_some(title),
+                safety: None,
+            });
             let session = backend.create_session(request).await?;
             let prompt_result = if prompt.is_empty() && attachments.is_empty() {
                 None
@@ -6096,7 +6601,7 @@ impl MobileApp {
     ///
     /// The phone shows one member at a time — there is no split view here — so
     /// the group becomes a tab strip on the session page instead of a layout.
-    fn active_session_group(&self) -> Option<SessionGroupTabs> {
+    fn active_session_group(&self) -> Option<MobileSessionGroupTabs> {
         let session_id = self
             .controller
             .as_ref()
@@ -6118,7 +6623,7 @@ impl MobileApp {
                     .map(|session| (session.id.clone(), session.title.clone(), session.state))
             })
             .collect::<Vec<_>>();
-        (members.len() >= 2).then(|| (group.name.clone(), members))
+        (members.len() >= 2).then(|| (group.clone(), members))
     }
 
     /// Loads the `/` commands and `@` references the open session's Agent
@@ -6761,6 +7266,71 @@ impl MobileApp {
     }
 
     fn mobile_sidebar_rows(&self, query: &str) -> Vec<SidebarRow> {
+        let rows = self.base_sidebar_rows(query);
+        self.with_delegated_children(rows)
+    }
+
+    /// Puts each expanded parent's children directly under it.
+    ///
+    /// The child rows are copies of the session row shape with a deeper indent
+    /// and the child flag set, so every path that treats rows as organizational
+    /// items can skip them by that flag alone.
+    fn with_delegated_children(&self, rows: Vec<SidebarRow>) -> Vec<SidebarRow> {
+        if self.delegated_expanded.is_empty() {
+            return rows;
+        }
+        let mut expanded = Vec::with_capacity(rows.len());
+        for row in rows {
+            let parent_id = row
+                .session_id
+                .as_ref()
+                .map(|id| id.as_str().to_string())
+                .filter(|id| self.delegated_expanded.contains(id));
+            let children = parent_id
+                .as_ref()
+                .and_then(|id| self.delegated_children.get(id))
+                .cloned()
+                .unwrap_or_default();
+            let base_indent = row.indent;
+            let project_id = row.project_id.clone();
+            let workspace_id = row.workspace_id.clone();
+            expanded.push(row);
+            for child in children {
+                let Some(child_id) = child.session_ref.session_id() else {
+                    continue;
+                };
+                expanded.push(SidebarRow {
+                    item: SidebarOrganizationItem::Session(child_id.as_str().to_string()),
+                    kind: SidebarRowKind::Session,
+                    depth: 0,
+                    indent: base_indent + theme::SIDEBAR_ICON_TITLE_GAP,
+                    label: child.title.clone(),
+                    project_id: project_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    detail: child
+                        .agent_label
+                        .clone()
+                        .or_else(|| child.agent_id.as_ref().map(|id| id.as_str().to_string())),
+                    child_count: child.child_count,
+                    collapsed: false,
+                    pinned: false,
+                    selected: self
+                        .controller
+                        .as_ref()
+                        .and_then(|controller| controller.state.selected_session_id.as_ref())
+                        .is_some_and(|selected| selected == &child_id),
+                    state: None,
+                    session_id: Some(child_id),
+                    unread: false,
+                    auto_continue: false,
+                    delegated_child: true,
+                });
+            }
+        }
+        expanded
+    }
+
+    fn base_sidebar_rows(&self, query: &str) -> Vec<SidebarRow> {
         let projects = self.sidebar_projects();
         let workspaces = self.sidebar_workspaces();
         sidebar_rows(SidebarRowInput {
@@ -6879,7 +7449,7 @@ impl MobileApp {
         let Some(row) = rows.get(index).cloned() else {
             return;
         };
-        if row.kind == SidebarRowKind::EmptyWorkspace {
+        if row.kind == SidebarRowKind::EmptyWorkspace || row.delegated_child {
             return;
         }
         let can_organize = self.backend.as_ref().is_some_and(|backend| {
@@ -7150,12 +7720,21 @@ impl MobileApp {
 
     fn open_folder_name_prompt(&mut self, prompt: SidebarNamePrompt, cx: &mut Context<Self>) {
         let initial = match &prompt {
-            SidebarNamePrompt::CreateFolder { .. } => String::new(),
+            SidebarNamePrompt::CreateFolder { .. } | SidebarNamePrompt::CreateGroup { .. } => {
+                String::new()
+            }
             SidebarNamePrompt::RenameFolder { folder_id } => self
                 .sidebar_view
                 .organization
                 .folder(folder_id)
                 .map(|folder| folder.name.clone())
+                .unwrap_or_default(),
+            SidebarNamePrompt::RenameGroup { group_id } => self
+                .sidebar_view
+                .organization
+                .groups
+                .get(group_id)
+                .map(|group| group.name.clone())
                 .unwrap_or_default(),
         };
         self.pending_input_writes
@@ -7186,6 +7765,20 @@ impl MobileApp {
             SidebarNamePrompt::RenameFolder { folder_id } => {
                 RemoteSidebarOrganizationMutation::RenameFolder { folder_id, name }
             }
+            SidebarNamePrompt::RenameGroup { group_id } => {
+                RemoteSidebarOrganizationMutation::RenameGroup { group_id, name }
+            }
+            SidebarNamePrompt::CreateGroup {
+                project_id,
+                workspace_id,
+                member_session_ids,
+            } => RemoteSidebarOrganizationMutation::CreateGroup {
+                name,
+                project_id,
+                workspace_id,
+                member_session_ids,
+                parent_folder_id: None,
+            },
         };
         self.sidebar_name_prompt = None;
         self.send_sidebar_mutation(mutation, false, cx);
@@ -7487,6 +8080,289 @@ impl MobileApp {
             .filter_map(|id| VibexSessionId::parse(id.clone()).ok())
             .collect::<Vec<_>>();
         self.archive_sessions(ids, cx);
+    }
+
+    /// Pins or unpins every selected session.
+    ///
+    /// The direction is read from the selection rather than guessed: pinning a
+    /// list that is already pinned would look like nothing happened.
+    fn pin_selected_sessions(&mut self, cx: &mut Context<Self>) {
+        if self.operation_busy || self.sidebar_state.selected_ids.is_empty() {
+            return;
+        }
+        let rows = self.mobile_sidebar_rows("");
+        let selected = &self.sidebar_state.selected_ids;
+        let ids = rows
+            .iter()
+            .filter(|row| {
+                row.kind == SidebarRowKind::Session
+                    && row
+                        .session_id
+                        .as_ref()
+                        .is_some_and(|id| selected.contains(id.as_str()))
+            })
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        let pin = !ids.iter().all(|row| row.pinned);
+        for row in ids {
+            let Some(session_id) = row.session_id.as_ref() else {
+                continue;
+            };
+            self.send_sidebar_mutation(
+                RemoteSidebarOrganizationMutation::SetSessionPinned {
+                    session_id: session_id.as_str().to_string(),
+                    pinned: pin,
+                },
+                false,
+                cx,
+            );
+        }
+    }
+
+    /// Forks every selected session at its tip.
+    ///
+    /// One request per session, in order: a phone has no use for ten new
+    /// sessions arriving at once, and the first failure stops the run with the
+    /// count that got through.
+    fn fork_selected_sessions(&mut self, cx: &mut Context<Self>) {
+        if self.fork_session_busy || self.sidebar_state.selected_ids.is_empty() {
+            return;
+        }
+        let Some(backend) = self.backend.clone().filter(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentForkSession)
+        }) else {
+            self.fail(BackendError::unsupported(
+                "agent_session_fork_unavailable",
+                locale::text(
+                    "Session forking is unavailable on this desktop.",
+                    "此桌面端不支持分叉会话。",
+                    "此桌面版不支援分支工作階段。",
+                ),
+            ));
+            cx.notify();
+            return;
+        };
+        let ids = self
+            .sidebar_state
+            .selected_ids
+            .iter()
+            .filter_map(|id| VibexSessionId::parse(id.as_str()).ok())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        self.fork_session_busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let mut forked = 0usize;
+            for id in ids {
+                backend
+                    .fork_session(MutationRequest::new(ForkAgentSessionRequest {
+                        source_session_id: id,
+                        through_sequence: ForkAgentSessionRequest::AT_TIP,
+                        expected_source_end_sequence: None,
+                    }))
+                    .await?;
+                forked += 1;
+            }
+            Ok::<_, BackendError>(forked)
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.fork_session_busy = false;
+                match outcome {
+                    Ok(forked) => {
+                        this.sidebar_state.selected_ids.clear();
+                        this.sidebar_batch_mode = false;
+                        this.refresh_sessions(cx);
+                        this.hint(
+                            Tone::Success,
+                            format!(
+                                "{forked} {}",
+                                locale::text("sessions forked", "个会话已分叉", "個工作階段已分支")
+                            ),
+                        );
+                    }
+                    Err(error) => this.fail(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Offers to file the current selection as a new session group.
+    ///
+    /// A group is scoped to one worktree, and every member has to belong to
+    /// it, so a selection that spans scopes cannot become one. The button is
+    /// dimmed rather than failing after the name is typed.
+    fn begin_group_create_from_selection(&mut self, cx: &mut Context<Self>) {
+        let Some((project_id, workspace_id, members)) = self.selected_session_scope() else {
+            self.hint(
+                Tone::Warning,
+                locale::text(
+                    "Select sessions from one worktree to group them",
+                    "请选择同一 Worktree 下的会话进行分组",
+                    "請選擇同一 Worktree 下的工作階段進行分組",
+                ),
+            );
+            cx.notify();
+            return;
+        };
+        self.open_folder_name_prompt(
+            SidebarNamePrompt::CreateGroup {
+                project_id,
+                workspace_id,
+                member_session_ids: members,
+            },
+            cx,
+        );
+    }
+
+    /// The project, worktree, and session ids of the current selection, when
+    /// the selection is one scope.
+    fn selected_session_scope(&self) -> Option<(String, String, Vec<String>)> {
+        let selected = &self.sidebar_state.selected_ids;
+        if selected.len() < 2 {
+            return None;
+        }
+        let sessions = self.sessions();
+        let mut scope: Option<(String, String)> = None;
+        let mut members = Vec::new();
+        for session in sessions {
+            if !selected.contains(session.id.as_str()) {
+                continue;
+            }
+            let key = (
+                session.project_id.as_str().to_string(),
+                session.workspace_id.as_str().to_string(),
+            );
+            match &scope {
+                Some(existing) if existing != &key => return None,
+                Some(_) => {}
+                None => scope = Some(key),
+            }
+            members.push(session.id.as_str().to_string());
+        }
+        let (project_id, workspace_id) = scope?;
+        (members.len() >= 2).then_some((project_id, workspace_id, members))
+    }
+
+    /// Opens the membership editor for one group.
+    fn begin_group_members_edit(&mut self, group_id: String, cx: &mut Context<Self>) {
+        let Some(group) = self.sidebar_view.organization.groups.get(&group_id) else {
+            return;
+        };
+        self.group_members_editor = Some(MobileGroupMembersEditor {
+            group_id,
+            project_id: group.project_id.clone(),
+            workspace_id: group.workspace_id.clone(),
+            selected: group.member_session_ids.clone(),
+        });
+        cx.notify();
+    }
+
+    fn toggle_group_member(&mut self, session_id: String, cx: &mut Context<Self>) {
+        let Some(editor) = self.group_members_editor.as_mut() else {
+            return;
+        };
+        if let Some(index) = editor.selected.iter().position(|id| id == &session_id) {
+            editor.selected.remove(index);
+        } else {
+            editor.selected.push(session_id);
+        }
+        cx.notify();
+    }
+
+    /// Saves the edited membership. An empty list dissolves the group, which
+    /// is what the authority does with one, so the reader is told first.
+    fn confirm_group_members(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.group_members_editor.take() else {
+            return;
+        };
+        if editor.selected.is_empty() {
+            self.send_sidebar_mutation(
+                RemoteSidebarOrganizationMutation::DeleteGroup {
+                    group_id: editor.group_id,
+                },
+                false,
+                cx,
+            );
+            return;
+        }
+        self.send_sidebar_mutation(
+            RemoteSidebarOrganizationMutation::SetGroupMembers {
+                group_id: editor.group_id,
+                session_ids: editor.selected,
+            },
+            false,
+            cx,
+        );
+    }
+
+    /// Takes a project out of the workbench.
+    ///
+    /// The authority removes the project record; nothing on disk is deleted,
+    /// which is why the confirmation says so rather than warning about files.
+    fn remove_project(&mut self, project_id: String, cx: &mut Context<Self>) {
+        self.project_remove_confirmation = None;
+        if self.operation_busy {
+            return;
+        }
+        let Ok(project_id) = vibex_core::ProjectId::parse(project_id) else {
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if !backend
+            .capability_snapshot()
+            .workspace
+            .supports(BackendOperation::WorkspaceDelete)
+        {
+            self.hint(
+                Tone::Warning,
+                locale::text(
+                    "This desktop cannot remove projects",
+                    "此桌面端不支持移除项目",
+                    "此桌面版不支援移除專案",
+                ),
+            );
+            cx.notify();
+            return;
+        }
+        self.operation_busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .delete_project(MutationRequest::new(project_id))
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.operation_busy = false;
+                match outcome {
+                    Ok(()) => {
+                        this.refresh_sessions(cx);
+                        this.refresh_workspaces(cx);
+                        this.hint(
+                            Tone::Success,
+                            locale::text("Project removed", "项目已移除", "專案已移除"),
+                        );
+                    }
+                    Err(error) => this.fail(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
     }
 
     fn delete_selected_sessions(
@@ -7829,6 +8705,28 @@ impl MobileApp {
             cx.notify();
             return;
         }
+        if self.goal_objective_open {
+            self.close_goal_objective(cx);
+            return;
+        }
+        if self.timeline_find_open {
+            self.close_timeline_find(window, cx);
+            return;
+        }
+        if self.worktree_path_browser.is_some() {
+            self.close_worktree_path_browser(cx);
+            return;
+        }
+        if self.group_members_editor.is_some() {
+            self.group_members_editor = None;
+            cx.notify();
+            return;
+        }
+        if self.project_remove_confirmation.is_some() {
+            self.project_remove_confirmation = None;
+            cx.notify();
+            return;
+        }
         // The attach menu is the topmost thing on the composer, so back closes
         // it before it reaches the screen behind it.
         if self.composer_attach_menu_open {
@@ -7923,9 +8821,14 @@ impl MobileApp {
             self.new_session_workspace_id = None;
             self.new_session_picker = None;
             // The first message's files and references belong to the page that
-            // was just closed, not to the next one.
+            // was just closed, not to the next one, and so do the worktree's
+            // name and path: the next session is a different piece of work.
             self.new_session_attachments.clear();
             self.new_session_armed_mentions.clear();
+            self.pending_input_writes
+                .push((InputField::NewSessionWorktreeName, String::new()));
+            self.pending_input_writes
+                .push((InputField::NewSessionWorktreePath, String::new()));
         }
         self.overlay = None;
         self.overlay_returns_to_drawer = false;
@@ -11632,8 +12535,11 @@ impl MobileApp {
                         .flex()
                         .flex_col()
                         .child(self.render_header(&title, state, cx))
-                        .when_some(self.active_session_group(), |page, (name, members)| {
-                            page.child(self.render_session_group_tabs(&name, &members, cx))
+                        .when_some(self.active_session_group(), |page, (group, members)| {
+                            page.child(self.render_session_group_tabs(&group, &members, cx))
+                        })
+                        .when_some(self.render_timeline_find_row(cx), |page, bar| {
+                            page.child(bar)
                         })
                         .child(
                             div()
@@ -11829,6 +12735,12 @@ impl MobileApp {
                 .when(self.composer_history_open, |root| {
                     root.child(self.render_composer_history_sheet(cx))
                 })
+                .when_some(
+                    self.project_remove_confirmation.clone(),
+                    |root, project_id| {
+                        root.child(self.render_project_remove_confirmation(&project_id, cx))
+                    },
+                )
                 .when(self.timeline_file_diff.is_some(), |root| {
                     root.child(self.render_timeline_file_diff(cx))
                 })
@@ -12134,6 +13046,123 @@ impl MobileApp {
     ///
     /// Full screen rather than an expansion inside the turn: a diff needs the
     /// width, and the turn it came from is one back press away.
+    /// The conversation's find bar.
+    fn render_timeline_find_bar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let count = self.timeline_find_matches.len();
+        let has_query = !self.timeline_find_query.is_empty();
+        div()
+            .id("timeline-find-bar")
+            .debug_selector(|| "timeline-find-bar".to_string())
+            .flex_shrink_0()
+            .px(px(theme::SPACING_SM))
+            .py(px(theme::SPACING_XS))
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .bg(theme::bg_card())
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_XS))
+            .child(
+                div()
+                    .h(px(36.0))
+                    .min_w_0()
+                    .flex_1()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_primary())
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        svg()
+                            .path("icons/search.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::text_muted()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
+                            .child(
+                                Input::new(
+                                    self.timeline_find_input
+                                        .as_ref()
+                                        .expect("the find field is built with the app"),
+                                )
+                                .appearance(false),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .min_w(px(56.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(theme::font_micro())
+                    .text_color(if has_query && count == 0 {
+                        theme::accent_red()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .child(if has_query {
+                        format!("{} / {}", (self.timeline_find_active + 1).min(count), count)
+                    } else {
+                        String::new()
+                    }),
+            )
+            .child(
+                timeline_action_button(
+                    "timeline-find-previous",
+                    "icons/chevron-down.svg",
+                    locale::text("Previous match", "上一个匹配", "上一個符合"),
+                )
+                .when(count > 0, |button| {
+                    button.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.step_timeline_find(false, cx)),
+                    )
+                })
+                .when(count == 0, |button| button.opacity(0.4)),
+            )
+            .child(
+                timeline_action_button(
+                    "timeline-find-next",
+                    "icons/chevron-down.svg",
+                    locale::text("Next match", "下一个匹配", "下一個符合"),
+                )
+                .when(count > 0, |button| {
+                    button.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.step_timeline_find(true, cx)),
+                    )
+                })
+                .when(count == 0, |button| button.opacity(0.4)),
+            )
+            .child(
+                timeline_action_button(
+                    "timeline-find-close",
+                    "icons/x.svg",
+                    locale::common("Close"),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.close_timeline_find(window, cx)),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// The conversation's find bar's bar, above the transcript.
+    fn render_timeline_find_row(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        self.timeline_find_open
+            .then(|| self.render_timeline_find_bar(cx))
+    }
+
     fn render_timeline_file_diff(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(diff) = self.timeline_file_diff.as_ref() else {
             return div().into_any_element();
@@ -12191,7 +13220,7 @@ impl MobileApp {
                     .px_2()
                     .bg(background)
                     .font_family("IBM Plex Mono")
-                    .text_size(px(12.0))
+                    .text_size(theme::code_font_size())
                     .line_height(px(17.0))
                     .text_color(color)
                     .whitespace_normal()
@@ -12411,6 +13440,40 @@ impl MobileApp {
         };
 
         match row.kind {
+            SidebarRowKind::Session if row.delegated_child => {
+                // A child has no place in the organization, so the only thing
+                // its menu can do is open it or hand it the same actions a
+                // session has.
+                let session_id = row.session_id.clone();
+                for (id, kind, label, destructive) in [
+                    (
+                        "mobile-row-menu-child-rename",
+                        SessionActionKind::Rename,
+                        locale::common("Rename"),
+                        false,
+                    ),
+                    (
+                        "mobile-row-menu-child-delete",
+                        SessionActionKind::Delete,
+                        locale::common("Delete"),
+                        true,
+                    ),
+                ] {
+                    let session_id = session_id.clone();
+                    let title = row.label.clone();
+                    sheet = entry(
+                        sheet,
+                        id,
+                        label.to_string(),
+                        destructive,
+                        Box::new(move |this, _, cx| {
+                            if let Some(session_id) = session_id.clone() {
+                                this.begin_session_action(kind, session_id, title.clone(), cx);
+                            }
+                        }),
+                    );
+                }
+            }
             SidebarRowKind::Session => {
                 let session_id = row.session_id.clone();
                 // Archive sits with the other row actions rather than behind
@@ -12459,6 +13522,20 @@ impl MobileApp {
                         }),
                     );
                 }
+                let fork_session_id = row.session_id.clone();
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-fork",
+                    locale::text("Fork session", "分叉会话", "分支會話").to_string(),
+                    false,
+                    Box::new(move |this, _, cx| {
+                        if let Some(session_id) = fork_session_id.clone() {
+                            // At the tip: a row stands for a whole conversation,
+                            // and the desktop's sidebar forks it the same way.
+                            this.fork_session(session_id, ForkAgentSessionRequest::AT_TIP, cx);
+                        }
+                    }),
+                );
                 let pin_session_id = row.id().to_string();
                 let pinned = row.pinned;
                 let auto_continue_session_id = row.id().to_string();
@@ -12560,6 +13637,7 @@ impl MobileApp {
             SidebarRowKind::Project => {
                 let project_id = row.id().to_string();
                 let folder_project_id = row.id().to_string();
+                let remove_project_id = row.id().to_string();
                 sheet = entry(
                     sheet,
                     "mobile-row-menu-project-new-session",
@@ -12583,6 +13661,63 @@ impl MobileApp {
                             },
                             cx,
                         );
+                    }),
+                );
+                // The desktop keeps this preference per project; the phone
+                // only read it, so a project could be stuck starting every
+                // session in a new worktree with no way to say otherwise here.
+                let location_project_id = row.id().to_string();
+                let starts_in_worktree = self
+                    .sidebar_view
+                    .project_location_preferences
+                    .get(row.id())
+                    .is_some_and(|location| *location == NewSessionLocation::NewWorktree);
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-project-default-location",
+                    if starts_in_worktree {
+                        locale::text(
+                            "Start sessions in the checkout",
+                            "默认在当前检出中开始",
+                            "預設在目前檢出中開始",
+                        )
+                        .to_string()
+                    } else {
+                        locale::text(
+                            "Start sessions in a new worktree",
+                            "默认在新建 Worktree 中开始",
+                            "預設在新建 Worktree 中開始",
+                        )
+                        .to_string()
+                    },
+                    false,
+                    Box::new(move |this, _, cx| {
+                        let next = if starts_in_worktree {
+                            vibex_core::RemoteSidebarNewSessionLocation::CurrentCheckout
+                        } else {
+                            vibex_core::RemoteSidebarNewSessionLocation::NewWorktree
+                        };
+                        this.send_sidebar_mutation(
+                            RemoteSidebarOrganizationMutation::SetProjectNewSessionLocation {
+                                project_id: location_project_id.clone(),
+                                location: next,
+                            },
+                            false,
+                            cx,
+                        );
+                    }),
+                );
+                // Removing a project takes its sessions out of the workbench,
+                // so it asks first — and it is a workbench change, not a disk
+                // one: nothing under the project's path is touched.
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-project-remove",
+                    locale::text("Remove project", "移除项目", "移除專案").to_string(),
+                    true,
+                    Box::new(move |this, _, cx| {
+                        this.project_remove_confirmation = Some(remove_project_id.clone());
+                        cx.notify();
                     }),
                 );
             }
@@ -12641,7 +13776,99 @@ impl MobileApp {
                     );
                 }
             }
-            SidebarRowKind::Group => return div().into_any_element(),
+            SidebarRowKind::Group => {
+                let rename_group_id = row.id().to_string();
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-group-rename",
+                    locale::common("Rename").to_string(),
+                    false,
+                    Box::new(move |this, _, cx| {
+                        this.open_folder_name_prompt(
+                            SidebarNamePrompt::RenameGroup {
+                                group_id: rename_group_id.clone(),
+                            },
+                            cx,
+                        );
+                    }),
+                );
+                let pin_group_id = row.id().to_string();
+                let pinned = row.pinned;
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-group-pin",
+                    if pinned {
+                        locale::text("Unpin", "取消置顶", "取消置頂").to_string()
+                    } else {
+                        locale::text("Pin", "置顶", "置頂").to_string()
+                    },
+                    false,
+                    Box::new(move |this, _, cx| {
+                        this.send_sidebar_mutation(
+                            RemoteSidebarOrganizationMutation::SetGroupPinned {
+                                group_id: pin_group_id.clone(),
+                                pinned: !pinned,
+                            },
+                            false,
+                            cx,
+                        );
+                    }),
+                );
+                let auto_group_id = row.id().to_string();
+                let auto_continue = row.auto_continue;
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-group-auto-continue",
+                    if auto_continue {
+                        locale::text("Disable auto continue", "关闭自动继续", "關閉自動繼續")
+                            .to_string()
+                    } else {
+                        locale::text("Auto continue", "自动继续", "自動繼續").to_string()
+                    },
+                    false,
+                    Box::new(move |this, _, cx| {
+                        this.send_sidebar_mutation(
+                            RemoteSidebarOrganizationMutation::SetGroupAutoContinue {
+                                group_id: auto_group_id.clone(),
+                                enabled: !auto_continue,
+                            },
+                            false,
+                            cx,
+                        );
+                    }),
+                );
+                let edit_group_id = row.id().to_string();
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-group-members",
+                    locale::text("Edit members", "编辑成员", "編輯成員").to_string(),
+                    false,
+                    Box::new(move |this, _, cx| {
+                        // The multi-select list is where membership is decided:
+                        // a group is a selection, so editing it is a selection
+                        // too.
+                        this.begin_group_members_edit(edit_group_id.clone(), cx);
+                    }),
+                );
+                // Dissolving keeps the sessions: only the group row goes, which
+                // is what the desktop's own delete does.
+                let delete_group_id = row.id().to_string();
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-group-delete",
+                    locale::text("Dissolve group", "解散分组", "解散群組").to_string(),
+                    true,
+                    Box::new(move |this, _, cx| {
+                        this.send_sidebar_mutation(
+                            RemoteSidebarOrganizationMutation::DeleteGroup {
+                                group_id: delete_group_id.clone(),
+                            },
+                            false,
+                            cx,
+                        );
+                    }),
+                );
+            }
             SidebarRowKind::EmptyWorkspace => return div().into_any_element(),
         }
 
@@ -12710,6 +13937,12 @@ impl MobileApp {
             }
             SidebarNamePrompt::RenameFolder { .. } => {
                 locale::text("Rename folder", "重命名文件夹", "重新命名資料夾")
+            }
+            SidebarNamePrompt::RenameGroup { .. } => {
+                locale::text("Rename group", "重命名分组", "重新命名群組")
+            }
+            SidebarNamePrompt::CreateGroup { .. } => {
+                locale::text("New group", "新建分组", "新增群組")
             }
         };
         div()
@@ -12923,6 +14156,614 @@ impl MobileApp {
                                         cx.listener(Self::confirm_batch_delete),
                                     )
                                     .child(locale::common("Delete")),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The authority's directories, so a path can be chosen instead of typed.
+    fn render_worktree_path_browser(
+        &self,
+        browser: &MobileDirectoryBrowser,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let parent = browser.parent.clone();
+        let current = browser.path.clone();
+        let roots = browser.roots.clone();
+        div()
+            .id("mobile-worktree-path-browser")
+            .debug_selector(|| "mobile-worktree-path-browser".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.45))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_worktree_path_browser(cx)),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .max_h(gpui::relative(0.75))
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(theme::border_subtle())
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("worktree-path-up")
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .when_some(parent.clone(), |button, up| {
+                                        button
+                                            .cursor_pointer()
+                                            .active(|style| style.bg(theme::row_pressed_bg()))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.load_worktree_directory(
+                                                        Some(up.clone()),
+                                                        cx,
+                                                    )
+                                                }),
+                                            )
+                                    })
+                                    .when(parent.is_none(), |button| button.opacity(0.4))
+                                    .child(
+                                        svg()
+                                            .path("icons/chevron-left.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_secondary()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .font_family("IBM Plex Mono")
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_secondary())
+                                    .child(if current.is_empty() {
+                                        locale::common("Loading").to_string()
+                                    } else {
+                                        current.clone()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("worktree-path-choose")
+                                    .flex_shrink_0()
+                                    .h(px(32.0))
+                                    .px_3()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(theme::primary())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(theme::font_caption())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::primary_foreground())
+                                    .when(!current.is_empty(), |button| {
+                                        button
+                                            .cursor_pointer()
+                                            .active(|style| style.opacity(0.85))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(Self::choose_worktree_directory),
+                                            )
+                                    })
+                                    .when(current.is_empty(), |button| button.opacity(0.5))
+                                    .child(locale::common("Use this folder")),
+                            ),
+                    )
+                    .when(!roots.is_empty(), |sheet| {
+                        sheet.child(
+                            div()
+                                .id("worktree-path-roots")
+                                .flex_shrink_0()
+                                .px_2()
+                                .py_1()
+                                .border_b_1()
+                                .border_color(theme::border_subtle())
+                                .overflow_x_scroll()
+                                .restrict_scroll_to_axis()
+                                .flex()
+                                .items_center()
+                                .gap(px(theme::SPACING_XS))
+                                .children(roots.into_iter().map(|root| {
+                                    let label = root.clone();
+                                    let target = root.clone();
+                                    div()
+                                        .id(format!("worktree-path-root:{root}"))
+                                        .flex_shrink_0()
+                                        .h(px(28.0))
+                                        .px_2()
+                                        .rounded(px(theme::RADIUS_PILL))
+                                        .border_1()
+                                        .border_color(theme::border_default())
+                                        .flex()
+                                        .items_center()
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .text_size(theme::font_micro())
+                                        .text_color(theme::text_secondary())
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.load_worktree_directory(
+                                                    Some(target.clone()),
+                                                    cx,
+                                                )
+                                            }),
+                                        )
+                                        .child(label)
+                                })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("worktree-path-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .p_2()
+                            .when(browser.loading, |list| {
+                                list.child(
+                                    div()
+                                        .p_3()
+                                        .text_size(theme::font_body())
+                                        .text_color(theme::text_muted())
+                                        .child(locale::common("Loading")),
+                                )
+                            })
+                            .when(!browser.loading && browser.entries.is_empty(), |list| {
+                                list.child(
+                                    div()
+                                        .p_3()
+                                        .text_size(theme::font_body())
+                                        .text_color(theme::text_muted())
+                                        .child(locale::text(
+                                            "No folders here",
+                                            "这里没有子目录",
+                                            "這裡沒有子目錄",
+                                        )),
+                                )
+                            })
+                            .children(browser.entries.iter().map(|(name, path)| {
+                                let label = name.clone();
+                                let target = path.clone();
+                                div()
+                                    .id(format!("worktree-path-entry:{path}"))
+                                    .w_full()
+                                    .min_h(px(theme::TOUCH_TARGET))
+                                    .px_3()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.load_worktree_directory(Some(target.clone()), cx)
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/folder.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .flex_shrink_0()
+                                            .text_color(theme::accent_blue()),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_size(theme::font_body())
+                                            .text_color(theme::text_primary())
+                                            .child(label),
+                                    )
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// What a group's members are doing, as the desktop's group label says it.
+    fn group_team_status(&self, group: &vibex_desktop_model::SessionGroupUiState) -> String {
+        let sessions = self.sessions();
+        let mut status = vibex_desktop_model::SessionGroupTeamStatus::default();
+        for id in &group.member_session_ids {
+            status.record(
+                self.delegated_nodes.get(id.as_str()),
+                sessions
+                    .iter()
+                    .find(|session| session.id.as_str() == id)
+                    .map(|session| session.state)
+                    .unwrap_or(AgentSessionState::Idle),
+            );
+        }
+        [
+            (status.running, locale::text("running", "运行中", "執行中")),
+            (
+                status.waiting,
+                locale::text("waiting", "等待用户", "等待使用者"),
+            ),
+            (status.review, locale::text("in review", "待审阅", "待審閱")),
+            (
+                status.results_ready,
+                locale::text("results ready", "待回收", "待回收"),
+            ),
+            (status.failed, locale::text("failed", "失败", "失敗")),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, label)| format!("{count} {label}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
+    }
+
+    /// The membership list for one group: the scope's sessions, ticked.
+    fn render_group_members_sheet(
+        &self,
+        editor: &MobileGroupMembersEditor,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let rows = self
+            .sessions()
+            .iter()
+            .filter(|session| {
+                session.project_id.as_str() == editor.project_id
+                    && session.workspace_id.as_str() == editor.workspace_id
+            })
+            .map(|session| {
+                let id = session.id.as_str().to_string();
+                let checked = editor.selected.contains(&id);
+                let toggle = id.clone();
+                div()
+                    .id(format!("group-member:{id}"))
+                    .w_full()
+                    .min_h(px(theme::TOUCH_TARGET))
+                    .px(px(theme::SPACING_MD))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.toggle_group_member(toggle.clone(), cx)
+                        }),
+                    )
+                    .child(
+                        svg()
+                            .path(if checked {
+                                "icons/check.svg"
+                            } else {
+                                "icons/circle-plus.svg"
+                            })
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(if checked {
+                                theme::primary()
+                            } else {
+                                theme::text_muted()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(theme::font_body())
+                            .text_color(theme::text_primary())
+                            .child(session.title.clone()),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let empty = rows.is_empty();
+        div()
+            .id("mobile-group-members")
+            .debug_selector(|| "mobile-group-members".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.45))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.group_members_editor = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .max_h(gpui::relative(0.7))
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(theme::border_subtle())
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(theme::font_title())
+                                    .text_color(theme::text_primary())
+                                    .child(locale::text("Group members", "分组成员", "群組成員")),
+                            )
+                            .child(
+                                div()
+                                    .id("group-members-close")
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.group_members_editor = None;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/x.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_secondary()),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("group-members-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .p_2()
+                            .when(empty, |list| {
+                                list.child(
+                                    div()
+                                        .p_3()
+                                        .text_size(theme::font_body())
+                                        .text_color(theme::text_muted())
+                                        .child(locale::text(
+                                            "No sessions in this worktree",
+                                            "该 Worktree 下没有会话",
+                                            "該 Worktree 下沒有工作階段",
+                                        )),
+                                )
+                            })
+                            .children(rows),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .border_t_1()
+                            .border_color(theme::border_subtle())
+                            .p_2()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_muted())
+                                    .child(locale::text(
+                                        "Unticking every session dissolves the group.",
+                                        "取消全部选择将解散该分组。",
+                                        "取消全部選擇將解散該群組。",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("group-members-save")
+                                    .flex_shrink_0()
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .px(px(theme::SPACING_LG))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(theme::primary())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(theme::font_caption())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::primary_foreground())
+                                    .cursor_pointer()
+                                    .active(|style| style.opacity(0.85))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.confirm_group_members(cx)
+                                        }),
+                                    )
+                                    .child(locale::common("Save")),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The guard in front of removing a project.
+    fn render_project_remove_confirmation(
+        &self,
+        project_id: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let label = self
+            .sidebar_projects()
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.label)
+            .unwrap_or_else(|| project_id.to_string());
+        let sessions = self
+            .sessions()
+            .iter()
+            .filter(|session| session.project_id.as_str() == project_id)
+            .count();
+        let target = project_id.to_string();
+        div()
+            .id("mobile-project-remove-confirmation")
+            .debug_selector(|| "mobile-project-remove-confirmation".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.62))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.project_remove_confirmation = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .bg(theme::bg_popover())
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .p(px(theme::SPACING_LG))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACING_SM))
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_size(theme::font_heading())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(locale::text(
+                                "Remove this project?",
+                                "移除该项目？",
+                                "移除該專案？",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::font_body())
+                            .text_color(theme::text_secondary())
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::font_caption())
+                            .text_color(theme::text_muted())
+                            .child(
+                                locale::text(
+                                    "{} sessions leave the workbench with it. Nothing on disk is deleted.",
+                                    "{} 个会话会一并移出工作台，磁盘上的文件不会被删除。",
+                                    "{} 個工作階段會一併移出工作台，磁碟上的檔案不會被刪除。",
+                                )
+                                .replace("{}", &sessions.to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt(px(theme::SPACING_SM))
+                            .flex()
+                            .gap(px(theme::SPACING_SM))
+                            .child(
+                                div()
+                                    .id("project-remove-cancel")
+                                    .flex_1()
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .border_1()
+                                    .border_color(theme::border_default())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(theme::font_body())
+                                    .text_color(theme::text_secondary())
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.project_remove_confirmation = None;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(locale::common("Cancel")),
+                            )
+                            .child(
+                                div()
+                                    .id("project-remove-confirm")
+                                    .flex_1()
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(theme::accent_red())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(theme::font_body())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::bg_primary())
+                                    .cursor_pointer()
+                                    .active(|style| style.opacity(0.8))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.remove_project(target.clone(), cx)
+                                        }),
+                                    )
+                                    .child(locale::common("Remove")),
                             ),
                     ),
             )
@@ -14126,6 +15967,37 @@ impl MobileApp {
             )
             .child(
                 div()
+                    .id("open-conversation-find")
+                    .size(px(theme::HEADER_BUTTON_SIZE))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .aria_label(
+                        locale::text("Find in conversation", "在会话中查找", "在工作階段中尋找")
+                            .to_string(),
+                    )
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            if this.timeline_find_open {
+                                this.close_timeline_find(window, cx);
+                            } else {
+                                this.open_timeline_find(window, cx);
+                            }
+                        }),
+                    )
+                    .child(
+                        svg()
+                            .path("icons/search.svg")
+                            .size(px(theme::ICON_MD))
+                            .text_color(theme::text_secondary()),
+                    ),
+            )
+            .child(
+                div()
                     .id("refresh-session")
                     .size(px(theme::HEADER_BUTTON_SIZE))
                     .flex_shrink_0()
@@ -14229,10 +16101,12 @@ impl MobileApp {
     /// grouping survives, the split layout does not.
     fn render_session_group_tabs(
         &self,
-        name: &str,
+        group: &vibex_desktop_model::SessionGroupUiState,
         members: &[(VibexSessionId, String, AgentSessionState)],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let name = group.name.as_str();
+        let summary = self.group_team_status(group);
         let selected = self
             .controller
             .as_ref()
@@ -14266,7 +16140,18 @@ impl MobileApp {
                             .text_size(theme::font_micro())
                             .text_color(theme::text_muted())
                             .child(name.to_string()),
-                    ),
+                    )
+                    // What the group's members are doing, where the desktop's
+                    // group label says it: a phone has no panes to read it off.
+                    .when(!summary.is_empty(), |header| {
+                        header.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(theme::font_micro())
+                                .text_color(theme::text_muted())
+                                .child(summary),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -14651,6 +16536,102 @@ impl MobileApp {
         Some((session.workspace_id.clone(), session.workspace_root.clone()))
     }
 
+    /// Fetches the picture an image-generation card refers to.
+    ///
+    /// The runtime writes a reference, not the pixels: a workspace path for a
+    /// picture the Agent saved, or a URL for one a provider is hosting. The
+    /// path is read through the same file route an attachment preview uses;
+    /// a URL is handed to the image element, which is the one thing on this
+    /// client that can fetch for itself.
+    fn ensure_generated_image(&mut self, reference: &str, cx: &mut Context<Self>) {
+        let reference = reference.trim();
+        if reference.is_empty() || self.generated_images.contains_key(reference) {
+            return;
+        }
+        if reference.starts_with("http://") || reference.starts_with("https://") {
+            // A provider hosts this one. The toolkit's own image element has
+            // no HTTP client behind it — its default answers every request
+            // with "No HttpClient available" — so the bytes are fetched here
+            // and handed over as an image.
+            let url = reference.to_string();
+            self.generated_images
+                .insert(url.clone(), GeneratedImageState::Loading);
+            let runner = gpui_tokio::Tokio::spawn(cx, async move {
+                let response = reqwest::get(&url).await?;
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let bytes = response.bytes().await?.to_vec();
+                Ok::<_, reqwest::Error>((bytes, content_type))
+            });
+            let key = reference.to_string();
+            let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+                // The join only reports whether the task itself was lost; a
+                // request that failed is a reference this client cannot show.
+                let outcome = runner.await.ok().and_then(Result::ok);
+                let _ = entity.update(cx, |this, cx| {
+                    let state = match outcome {
+                        Some((bytes, content_type)) => {
+                            match generated_image_format(&key, content_type.as_deref()) {
+                                Some(format) => GeneratedImageState::Ready(Arc::new(
+                                    Image::from_bytes(format, bytes),
+                                )),
+                                None => GeneratedImageState::Unavailable,
+                            }
+                        }
+                        None => GeneratedImageState::Unavailable,
+                    };
+                    this.generated_images.insert(key, state);
+                    cx.notify();
+                });
+            });
+            self.tasks.push(task);
+            cx.notify();
+            return;
+        }
+        let Some((workspace_id, workspace_root)) = self.active_workspace_context() else {
+            self.generated_images
+                .insert(reference.to_string(), GeneratedImageState::Unavailable);
+            return;
+        };
+        let Some(path) = message_attachment_workspace_path(reference, Some(&workspace_root)) else {
+            self.generated_images
+                .insert(reference.to_string(), GeneratedImageState::Unavailable);
+            return;
+        };
+        let Some(format) = crate::workbench::image_format_for_path(&path) else {
+            self.generated_images
+                .insert(reference.to_string(), GeneratedImageState::Unavailable);
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.generated_images
+            .insert(reference.to_string(), GeneratedImageState::Loading);
+        let key = reference.to_string();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.download_file(workspace_id, path).await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                let state = match outcome {
+                    Ok(bytes) => {
+                        GeneratedImageState::Ready(Arc::new(Image::from_bytes(format, bytes)))
+                    }
+                    Err(_) => GeneratedImageState::Unavailable,
+                };
+                this.generated_images.insert(key, state);
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
     fn close_attachment_preview(
         &mut self,
         _: &MouseUpEvent,
@@ -14746,9 +16727,9 @@ impl MobileApp {
             TimelineRowKind::ImageGeneration => self.render_image_generation_card(row, cx),
             TimelineRowKind::ToolCall
             | TimelineRowKind::WebSearch
-            | TimelineRowKind::TodoUpdate
-            | TimelineRowKind::Collaboration
-            | TimelineRowKind::Retry => self.render_process_activity_line(row, cx),
+            | TimelineRowKind::TodoUpdate => self.render_process_activity_line(row, cx),
+            TimelineRowKind::Collaboration => self.render_collaboration_card(row, cx),
+            TimelineRowKind::Retry => self.render_process_activity_line(row, cx),
             TimelineRowKind::GitNotice
             | TimelineRowKind::SystemNotice
             | TimelineRowKind::PermissionResolution
@@ -15270,6 +17251,107 @@ impl MobileApp {
         )
     }
 
+    /// Recomputes the conversation's matches for the query on screen.
+    ///
+    /// The search runs over the turns the phone is holding, which is the
+    /// window the reader can actually reach; a match further back is fetched
+    /// by scrolling, exactly as it is without a search.
+    fn refresh_timeline_find(&mut self, cx: &gpui::App) {
+        let Some(input) = self.timeline_find_input.as_ref() else {
+            return;
+        };
+        let query = input.read(cx).value().trim().to_lowercase();
+        if query == self.timeline_find_query {
+            return;
+        }
+        self.timeline_find_query = query.clone();
+        self.timeline_find_active = 0;
+        self.timeline_find_matches.clear();
+        if query.is_empty() {
+            return;
+        }
+        for turn in self.timeline_turns.iter() {
+            let rows = turn
+                .user_row
+                .iter()
+                .chain(turn.process_rows.iter())
+                .chain(turn.conclusion_row.iter());
+            for row in rows {
+                let body = row.body.to_lowercase();
+                let title = row.title.to_lowercase();
+                let line = if body.contains(&query) {
+                    row.body
+                        .lines()
+                        .find(|line| line.to_lowercase().contains(&query))
+                } else if title.contains(&query) {
+                    Some(row.title.as_str())
+                } else {
+                    None
+                };
+                if let Some(line) = line {
+                    self.timeline_find_matches.push((
+                        turn.id.clone(),
+                        row.id.clone(),
+                        line.trim().to_string(),
+                    ));
+                }
+            }
+        }
+        // The first match is where the search lands. The scroll itself happens
+        // on the next paint, because this path has no window and the list
+        // measures its items there.
+        self.timeline_find_scroll_pending = self
+            .timeline_find_matches
+            .first()
+            .map(|(turn_id, _, _)| turn_id.clone());
+    }
+
+    /// Whether a row is folded shut, so its text is not on screen.
+    fn timeline_row_is_collapsed(&self, row_id: &str) -> bool {
+        self.collapsed_timeline_rows.contains(row_id)
+    }
+
+    fn open_timeline_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.timeline_find_open = true;
+        if let Some(input) = self.timeline_find_input.clone() {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        }
+        crate::platform::show_keyboard();
+        cx.notify();
+    }
+
+    fn close_timeline_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.timeline_find_open = false;
+        self.timeline_find_query.clear();
+        self.timeline_find_matches.clear();
+        self.timeline_find_active = 0;
+        if let Some(input) = self.timeline_find_input.clone() {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        crate::platform::hide_keyboard();
+        cx.notify();
+    }
+
+    /// Steps to the next or previous match and takes the reader to it.
+    fn step_timeline_find(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.timeline_find_matches.is_empty() {
+            return;
+        }
+        let count = self.timeline_find_matches.len();
+        self.timeline_find_active = if forward {
+            (self.timeline_find_active + 1) % count
+        } else {
+            (self.timeline_find_active + count - 1) % count
+        };
+        let (turn_id, row_id, _) = self.timeline_find_matches[self.timeline_find_active].clone();
+        // A collapsed row hides the text that matched, so it is opened first.
+        if self.timeline_row_is_collapsed(&row_id) {
+            self.toggle_timeline_row(row_id, cx);
+        }
+        self.scroll_to_timeline_turn(&turn_id, cx);
+        cx.notify();
+    }
+
     fn scroll_to_timeline_turn(&mut self, turn_id: &str, _cx: &mut Context<Self>) {
         if let Some(index) = self
             .timeline_turns
@@ -15284,6 +17366,26 @@ impl MobileApp {
     }
 
     fn fork_session_at(&mut self, through_sequence: i64, cx: &mut Context<Self>) {
+        let Some(source_session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        self.fork_session(source_session_id, through_sequence, cx);
+    }
+
+    /// Forks one session at a point in its transcript.
+    ///
+    /// The session is named rather than assumed: a sidebar row forks the
+    /// conversation it stands for, which is not always the open one.
+    fn fork_session(
+        &mut self,
+        source_session_id: VibexSessionId,
+        through_sequence: i64,
+        cx: &mut Context<Self>,
+    ) {
         if self.fork_session_busy || through_sequence <= 0 {
             return;
         }
@@ -15302,13 +17404,6 @@ impl MobileApp {
                 ),
             ));
             cx.notify();
-            return;
-        };
-        let Some(source_session_id) = self
-            .controller
-            .as_ref()
-            .and_then(|controller| controller.state.selected_session_id.clone())
-        else {
             return;
         };
         self.fork_session_busy = true;
@@ -15411,12 +17506,20 @@ impl MobileApp {
                     .items_center()
                     .gap_2()
                     .when(can_expand, |header| {
+                        let reference = image.image_reference.clone();
                         header
                             .cursor_pointer()
                             .active(|style| style.bg(theme::row_pressed_bg()))
                             .on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
+                                    // Opening the card is what asks for the
+                                    // picture: a closed card costs nothing.
+                                    if !this.timeline_row_expanded(&row_id)
+                                        && let Some(reference) = reference.as_deref()
+                                    {
+                                        this.ensure_generated_image(reference, cx);
+                                    }
                                     this.toggle_timeline_row(row_id.clone(), cx)
                                 }),
                             )
@@ -15477,14 +17580,167 @@ impl MobileApp {
                             ))
                         })
                         .when_some(image.image_reference.as_ref(), |details, reference| {
-                            details.child(self.render_timeline_detail(
-                                locale::text("Image reference", "图片引用", "圖片參照"),
-                                reference,
-                            ))
+                            details.child(self.render_generated_image(reference)).child(
+                                self.render_timeline_detail(
+                                    locale::text("Image reference", "图片引用", "圖片參照"),
+                                    reference,
+                                ),
+                            )
                         }),
                 )
             })
             .into_any_element()
+    }
+
+    /// A hand-off to another Agent, as its own card.
+    ///
+    /// The desktop expands this into a live preview of the child session. A
+    /// phone cannot show two transcripts at once, so the card says who the
+    /// work went to and how it is doing, and the Team page — which lists the
+    /// task and its state — is one tap away.
+    fn render_collaboration_card(
+        &self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(TimelinePayload::Collaboration(collaboration)) =
+            self.timeline_row_latest_payload(row)
+        else {
+            return self.render_process_activity_line(row, cx);
+        };
+        let managed = collaboration.delegation_id.is_some();
+        let (status_label, status_color) = collaboration_status(collaboration.status);
+        let label = collaboration
+            .agent_label
+            .clone()
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or_else(|| {
+                locale::text("another Agent", "另一个 Agent", "另一個 Agent").to_string()
+            });
+        let summary = collaboration.summary.clone();
+        div()
+            .id(format!("collaboration-card:{}", row.id))
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            .border_color(theme::border_default())
+            .bg(theme::bg_card_dim())
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(44.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(managed, |header| {
+                        header.cursor_pointer().on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.show_overlay(MobileOverlay::Team, window, cx)
+                            }),
+                        )
+                    })
+                    .child(
+                        svg()
+                            .path("icons/user.svg")
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(theme::accent_blue()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(theme::font_caption())
+                                    .text_color(theme::text_primary())
+                                    .child(format!(
+                                        "{} {label}",
+                                        locale::text("Delegated to", "已委派给", "已委派給")
+                                    )),
+                            )
+                            .when(!summary.trim().is_empty(), |title| {
+                                title.child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_size(theme::font_micro())
+                                        .text_color(theme::text_muted())
+                                        .child(summary),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(theme::font_micro())
+                            .text_color(status_color)
+                            .child(status_label),
+                    )
+                    .when(managed, |header| {
+                        header.child(
+                            svg()
+                                .path("icons/chevron-right.svg")
+                                .size(px(14.0))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted()),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The picture an image-generation card produced, when it can be shown.
+    fn render_generated_image(&self, reference: &str) -> gpui::AnyElement {
+        match self.generated_images.get(reference.trim()) {
+            Some(GeneratedImageState::Ready(image)) => div()
+                .w_full()
+                .h(px(240.0))
+                .rounded(px(theme::RADIUS_CONTROL))
+                .border_1()
+                .border_color(theme::border_subtle())
+                .bg(theme::bg_card())
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    img(image.clone())
+                        .max_w_full()
+                        .max_h_full()
+                        .object_fit(ObjectFit::Contain),
+                )
+                .into_any_element(),
+            Some(GeneratedImageState::Loading) => div()
+                .w_full()
+                .h(px(64.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(theme::font_caption())
+                .text_color(theme::text_muted())
+                .child(locale::common("Loading"))
+                .into_any_element(),
+            // Nothing is drawn for a reference this client cannot show: the
+            // reference line underneath is what says what it was.
+            Some(GeneratedImageState::Unavailable) | None => div().into_any_element(),
+        }
     }
 
     fn render_permission_request_card(
@@ -17402,10 +19658,13 @@ impl MobileApp {
         let active = self.current_goal()?;
         let expanded = self.composer_goal_expanded;
         let phase = active.goal.phase;
+        let paused = phase == GoalPhase::Paused;
         let (phase_label, phase_color) = goal_phase_label(phase);
         let objective = active.goal.objective.clone();
         let progress = goal_progress_label(&active.goal);
-        let can_edit = self.composer_has_goal_command(cx);
+        // A rewrite needs either the Agent's own goal command or a goal
+        // surface that takes one; without either there is nothing to offer.
+        let can_edit = self.composer_has_goal_command(cx) || self.goal_objective_action().is_some();
         let expanded_body = expanded.then(|| {
             div()
                 .px(px(theme::SPACING_MD))
@@ -17426,6 +19685,83 @@ impl MobileApp {
                         .text_color(theme::text_muted())
                         .child(progress)
                 }))
+                .child(
+                    div()
+                        .mt(px(theme::SPACING_XS))
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::SPACING_XS))
+                        .child(
+                            div()
+                                .id("composer-goal-pause")
+                                .flex_shrink_0()
+                                .h(px(32.0))
+                                .px(px(theme::SPACING_MD))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(theme::border_default())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(theme::font_caption())
+                                .text_color(theme::text_secondary())
+                                .when(!self.operation_busy, |button| {
+                                    button
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.control_session_goal(
+                                                    if paused {
+                                                        vibex_core::GoalAction::Resume
+                                                    } else {
+                                                        vibex_core::GoalAction::Pause
+                                                    },
+                                                    None,
+                                                    cx,
+                                                )
+                                            }),
+                                        )
+                                })
+                                .child(if paused {
+                                    locale::text("Resume", "恢复", "恢復")
+                                } else {
+                                    locale::text("Pause", "暂停", "暫停")
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("composer-goal-clear")
+                                .flex_shrink_0()
+                                .h(px(32.0))
+                                .px(px(theme::SPACING_MD))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(theme::border_default())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(theme::font_caption())
+                                .text_color(theme::accent_red())
+                                .when(!self.operation_busy, |button| {
+                                    button
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.control_session_goal(
+                                                    vibex_core::GoalAction::Clear,
+                                                    None,
+                                                    cx,
+                                                )
+                                            }),
+                                        )
+                                })
+                                .child(locale::text("Clear", "清除", "清除")),
+                        ),
+                )
                 .when(can_edit, |body| {
                     body.child(
                         div()
@@ -17544,21 +19880,251 @@ impl MobileApp {
         })
     }
 
+    /// Pauses, resumes, or clears the session's goal.
+    ///
+    /// The desktop does this through the local manager; a paired client goes
+    /// through the same authority over the wire, which is what makes a goal
+    /// controllable from the phone at all.
+    fn control_session_goal(
+        &mut self,
+        action: vibex_core::GoalAction,
+        objective: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.operation_busy {
+            return;
+        }
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        let Some(backend) = self.backend.clone().filter(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentGoalControl)
+        }) else {
+            self.hint(
+                Tone::Warning,
+                locale::text(
+                    "This desktop cannot control a goal",
+                    "此桌面端不支持控制目标",
+                    "此桌面版不支援控制目標",
+                ),
+            );
+            cx.notify();
+            return;
+        };
+        let expected_revision = self.current_goal().and_then(|active| active.goal.revision);
+        let request = MutationRequest::new(vibex_core::AgentGoalControlRequest {
+            session_id,
+            action,
+            objective,
+            expected_revision,
+            correlation_id: None,
+        });
+        self.operation_busy = true;
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { backend.control_goal(request).await });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.operation_busy = false;
+                match outcome {
+                    Ok(_) => {
+                        // The control appends timeline items, so the window is
+                        // re-read rather than patched.
+                        this.reload_selected_session(cx);
+                    }
+                    Err(error) => this.fail(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
     /// Prefills the composer with the Agent's own goal command.
+    /// Whether the Agent's goal surface accepts a new objective at all.
+    ///
+    /// The vocabulary is the adapter's: one that spells the rewrite `set`,
+    /// another that spells it `edit`, and one that offers neither.
+    fn goal_objective_action(&self) -> Option<vibex_core::GoalAction> {
+        let active = self.current_goal()?;
+        if active.actions.contains(&vibex_core::GoalAction::Set) {
+            Some(vibex_core::GoalAction::Set)
+        } else if active.actions.contains(&vibex_core::GoalAction::Edit) {
+            Some(vibex_core::GoalAction::Edit)
+        } else {
+            None
+        }
+    }
+
+    /// Opens the objective editor, seeded with the goal on screen.
+    ///
+    /// The desktop edits the objective in its goal bar and issues a control;
+    /// the phone used to prefill `/goal <objective>` into the composer and let
+    /// the reader send it, which only worked on Agents that spell that command
+    /// themselves. Where the goal surface takes a rewrite, this calls it; where
+    /// it does not, the command is still the fallback.
     fn begin_composer_goal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(active) = self.current_goal() else {
             return;
         };
-        let draft = format!("/goal {}", active.goal.objective);
-        let selection_end = draft.len();
         self.composer_goal_expanded = false;
-        self.composer_input.update(cx, |input, cx| {
-            input.set_value(draft, window, cx);
+        if self.goal_objective_action().is_none()
+            || !self.backend.as_ref().is_some_and(|backend| {
+                backend
+                    .capability_snapshot()
+                    .agent
+                    .supports(BackendOperation::AgentGoalControl)
+            })
+        {
+            let draft = format!("/goal {}", active.goal.objective);
+            let selection_end = draft.len();
+            self.composer_input.update(cx, |input, cx| {
+                input.set_value(draft, window, cx);
+                input.set_selected_range(0..selection_end, cx);
+                input.focus(window, cx);
+            });
+            crate::platform::show_keyboard();
+            cx.notify();
+            return;
+        }
+        let objective = active.goal.objective.clone();
+        let selection_end = objective.len();
+        self.goal_objective_input.update(cx, |input, cx| {
+            input.set_value(objective, window, cx);
             input.set_selected_range(0..selection_end, cx);
             input.focus(window, cx);
         });
+        self.goal_objective_open = true;
         crate::platform::show_keyboard();
         cx.notify();
+    }
+
+    fn close_goal_objective(&mut self, cx: &mut Context<Self>) {
+        if self.goal_objective_open {
+            self.goal_objective_open = false;
+            cx.notify();
+        }
+    }
+
+    /// Sends the rewritten objective through the goal control.
+    fn confirm_goal_objective(&mut self, cx: &mut Context<Self>) {
+        let Some(action) = self.goal_objective_action() else {
+            return;
+        };
+        let objective = self
+            .goal_objective_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if objective.is_empty() {
+            return;
+        }
+        self.goal_objective_open = false;
+        self.control_session_goal(action, Some(objective), cx);
+    }
+
+    /// The objective editor: one field, and the control it will issue.
+    fn render_goal_objective_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .id("mobile-goal-objective")
+            .debug_selector(|| "mobile-goal-objective".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.45))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_goal_objective(cx)),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_size(theme::font_title())
+                            .text_color(theme::text_primary())
+                            .child(locale::text("Objective", "目标", "目標")),
+                    )
+                    .child(
+                        div()
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::bg_primary())
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .items_center()
+                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
+                            .child(
+                                Textarea::new(&self.goal_objective_input).appearance(false),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_muted())
+                                    .child(locale::text(
+                                        "The Agent keeps working toward this until it is done or cleared.",
+                                        "Agent 会持续朝这个目标工作，直到完成或被清除。",
+                                        "Agent 會持續朝這個目標工作，直到完成或被清除。",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("goal-objective-save")
+                                    .flex_shrink_0()
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .px(px(theme::SPACING_LG))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(theme::primary())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .active(|style| style.opacity(0.85))
+                                    .text_size(theme::font_caption())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::primary_foreground())
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.confirm_goal_objective(cx)
+                                        }),
+                                    )
+                                    .child(locale::common("Save")),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// The collaborator a draft is addressed to, when it is addressed to one.
@@ -18796,10 +21362,16 @@ impl MobileApp {
             return div().into_any_element();
         };
         let sessions = self.sessions();
-        let Some(session) = sessions.iter().find(|session| session.id == session_id) else {
+        let session = sessions.iter().find(|session| session.id == session_id);
+        // A delegated child is not in the ordinary list — the tree is where it
+        // is named — so its row is drawn from what the row itself carries.
+        if session.is_none() && !row.delegated_child {
             return div().into_any_element();
-        };
-        let session_state = row.state.unwrap_or(session.state);
+        }
+        let session_state = row
+            .state
+            .or_else(|| session.map(|session| session.state))
+            .unwrap_or(AgentSessionState::Idle);
         let generating = matches!(
             session_state,
             AgentSessionState::Running | AgentSessionState::Initializing
@@ -18815,6 +21387,7 @@ impl MobileApp {
             && session_state != AgentSessionState::Idle;
         let open_session_id = session_id.clone();
         let batch_session_id = session_id.clone();
+        let delegated_child = row.delegated_child;
         let (row_offset, row_right_margin) = if inside_workspace_card {
             (
                 -theme::SIDEBAR_ICON_SLOT_OVERHANG,
@@ -18843,7 +21416,9 @@ impl MobileApp {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
-                    if this.sidebar_batch_mode {
+                    // A delegated child is not an item of the organization:
+                    // it is opened, never selected or filed.
+                    if this.sidebar_batch_mode && !delegated_child {
                         this.toggle_sidebar_row_selection(batch_session_id.to_string(), cx);
                     } else {
                         this.open_session(open_session_id.clone(), cx);
@@ -18895,10 +21470,56 @@ impl MobileApp {
                                 }),
                         )
                     })
+                    // A session that owns others offers them here: the ordinary
+                    // list omits owned children, so this is where they are.
+                    .when(
+                        !self.sidebar_batch_mode
+                            && self.delegated_parents.contains(session_id.as_str()),
+                        |title| {
+                            let toggle_id = session_id.as_str().to_string();
+                            let expanded = self.delegated_expanded.contains(session_id.as_str());
+                            title.child(
+                                div()
+                                    .id(format!("mobile-session-children-{}", row.id()))
+                                    .size(px(20.0))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .cursor_pointer()
+                                    .aria_label(
+                                        locale::text("Sub-sessions", "子会话", "子工作階段")
+                                            .to_string(),
+                                    )
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_delegated_children(toggle_id.clone(), cx);
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path(if expanded {
+                                                "icons/chevron-down.svg"
+                                            } else {
+                                                "icons/chevron-right.svg"
+                                            })
+                                            .size(px(12.0))
+                                            .text_color(theme::sidebar_foreground(0.58)),
+                                    ),
+                            )
+                        },
+                    )
                     .when(!self.sidebar_batch_mode, |title| {
                         title.child(
                             svg()
-                                .path(agent_icon_path(&session.agent_id.to_string()))
+                                .path(agent_icon_path(&session.map_or_else(
+                                    || "unknown".to_string(),
+                                    |session| session.agent_id.to_string(),
+                                )))
                                 .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
                                 .flex_shrink_0()
                                 .text_color(theme::sidebar_foreground(if is_selected {
@@ -18954,7 +21575,10 @@ impl MobileApp {
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .whitespace_nowrap()
-                                    .child(session_sidebar_time_label(session.last_message_at_ms)),
+                                    .when_some(
+                                        session.map(|session| session.last_message_at_ms),
+                                        |time, last| time.child(session_sidebar_time_label(last)),
+                                    ),
                             )
                         },
                     )
@@ -19558,6 +22182,105 @@ impl MobileApp {
                                         .child(
                                             svg()
                                                 .path("icons/list-checks.svg")
+                                                .size(px(16.0))
+                                                .text_color(theme::sidebar_text_secondary()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("mobile-sidebar-batch-pin")
+                                        .size(px(32.0))
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .when(
+                                            !self.sidebar_state.selected_ids.is_empty(),
+                                            |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .active(|style| {
+                                                        style.bg(theme::row_pressed_bg())
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.pin_selected_sessions(cx)
+                                                        }),
+                                                    )
+                                            },
+                                        )
+                                        .when(
+                                            self.sidebar_state.selected_ids.is_empty(),
+                                            |button| button.opacity(0.4),
+                                        )
+                                        .child(
+                                            svg()
+                                                .path("icons/pin.svg")
+                                                .size(px(16.0))
+                                                .text_color(theme::sidebar_text_secondary()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("mobile-sidebar-batch-fork")
+                                        .size(px(32.0))
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .when(
+                                            !self.sidebar_state.selected_ids.is_empty(),
+                                            |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .active(|style| {
+                                                        style.bg(theme::row_pressed_bg())
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.fork_selected_sessions(cx)
+                                                        }),
+                                                    )
+                                            },
+                                        )
+                                        .when(
+                                            self.sidebar_state.selected_ids.is_empty(),
+                                            |button| button.opacity(0.4),
+                                        )
+                                        .child(
+                                            svg()
+                                                .path("icons/git-branch.svg")
+                                                .size(px(16.0))
+                                                .text_color(theme::sidebar_text_secondary()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("mobile-sidebar-batch-group")
+                                        .size(px(32.0))
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .when(self.selected_session_scope().is_some(), |button| {
+                                            button
+                                                .cursor_pointer()
+                                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.begin_group_create_from_selection(cx)
+                                                    }),
+                                                )
+                                        })
+                                        .when(self.selected_session_scope().is_none(), |button| {
+                                            button.opacity(0.4)
+                                        })
+                                        .child(
+                                            svg()
+                                                .path("icons/layers.svg")
                                                 .size(px(16.0))
                                                 .text_color(theme::sidebar_text_secondary()),
                                         ),
@@ -20441,6 +23164,10 @@ impl Render for MobileApp {
         // The display flag follows the work on screen; the call is a no-op
         // while the answer has not changed.
         self.sync_keep_screen_on(cx);
+        if let Some(turn_id) = self.timeline_find_scroll_pending.take() {
+            self.timeline_list.remeasure();
+            self.scroll_to_timeline_turn(&turn_id, cx);
+        }
         for hint in std::mem::take(&mut self.pending_hints) {
             let on_action: Option<toast::HintHandler> = hint.action.as_ref().map(|action| {
                 let entity = cx.weak_entity();
@@ -20513,6 +23240,8 @@ impl Render for MobileApp {
                 InputField::PairingServerUrl => &self.pairing_server_url_input,
                 InputField::PairingCode => &self.pairing_code_input,
                 InputField::NewSessionTitle => &self.new_session_title_input,
+                InputField::NewSessionWorktreeName => &self.new_session_worktree_name_input,
+                InputField::NewSessionWorktreePath => &self.new_session_worktree_path_input,
                 InputField::SidebarName => &self.sidebar_name_input,
                 InputField::SessionAction => &self.session_action_input,
                 InputField::HostName => &self.host_name_input,
@@ -21957,7 +24686,11 @@ impl MobileApp {
         let runtime_summary = runtime_selection_summary(runtime_catalog, runtime_selection);
         let prompt = self.new_session_prompt_input.read(cx).value();
         let new_session_mentions = self.new_session_mention_suggestions(cx);
-        let can_submit = !prompt.trim().is_empty() && !self.new_session_busy;
+        // A first message may be a file on its own, the same way a prompt in
+        // the composer may be: the field being empty is not the same as there
+        // being nothing to send.
+        let can_submit = (!prompt.trim().is_empty() || !self.new_session_attachments.is_empty())
+            && !self.new_session_busy;
         let worktree_supported = self.supports_new_session_worktree();
         let mode = self.normalize_new_session_workspace_mode(self.new_session_workspace_mode);
         let can_create_session = self.backend.as_ref().is_some_and(|backend| {
@@ -22088,6 +24821,125 @@ impl MobileApp {
                                     ),
                             ),
                     )
+                    // ── the new worktree's own fields ────────────────────────
+                    .when(mode == WorkspaceMode::VibexWorktree, |page| {
+                        page.child(
+                            div()
+                                .w_full()
+                                .rounded(px(theme::RADIUS_CARD))
+                                .border_1()
+                                .border_color(theme::border_subtle())
+                                .bg(theme::bg_card())
+                                .p(px(theme::SPACING_MD))
+                                .flex()
+                                .flex_col()
+                                .gap(px(theme::SPACING_SM))
+                                .child(
+                                    div()
+                                        .text_size(theme::font_micro())
+                                        .text_color(theme::text_muted())
+                                        .child(locale::text(
+                                            "NEW WORKTREE",
+                                            "新建 WORKTREE",
+                                            "新建 WORKTREE",
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(theme::TOUCH_TARGET))
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .border_1()
+                                        .border_color(theme::border_default())
+                                        .bg(theme::workbench_panel_bg())
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            resume_keyboard_on_tap,
+                                        )
+                                        .child(
+                                            Input::new(&self.new_session_worktree_name_input)
+                                                .appearance(false),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(theme::SPACING_XS))
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .h(px(theme::TOUCH_TARGET))
+                                                .rounded(px(theme::RADIUS_CONTROL))
+                                                .border_1()
+                                                .border_color(theme::border_default())
+                                                .bg(theme::workbench_panel_bg())
+                                                .px_2()
+                                                .flex()
+                                                .items_center()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    resume_keyboard_on_tap,
+                                                )
+                                                .child(
+                                                    Input::new(
+                                                        &self.new_session_worktree_path_input,
+                                                    )
+                                                    .appearance(false),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("browse-worktree-path")
+                                                .size(px(theme::TOUCH_TARGET))
+                                                .flex_shrink_0()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(theme::RADIUS_CONTROL))
+                                                .border_1()
+                                                .border_color(theme::border_default())
+                                                .cursor_pointer()
+                                                .aria_label(
+                                                    locale::text(
+                                                        "Browse the desktop's folders",
+                                                        "浏览桌面端文件夹",
+                                                        "瀏覽桌面版資料夾",
+                                                    )
+                                                    .to_string(),
+                                                )
+                                                .active(|style| {
+                                                    style.bg(theme::row_pressed_bg())
+                                                })
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        Self::open_worktree_path_browser,
+                                                    ),
+                                                )
+                                                .child(
+                                                    svg()
+                                                        .path("icons/folder-open.svg")
+                                                        .size(px(theme::ICON_SM))
+                                                        .text_color(theme::text_secondary()),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme::font_micro())
+                                        .text_color(theme::text_muted())
+                                        .child(locale::text(
+                                            "The worktree is created from the selected workspace's branch before the session starts.",
+                                            "会话启动前，会基于所选工作区的分支创建 Worktree。",
+                                            "工作階段啟動前，會基於所選工作區的分支建立 Worktree。",
+                                        )),
+                                ),
+                        )
+                    })
                     // ── title, only when the user wants one ──────────────────
                     .child(
                         div()
@@ -23181,6 +26033,17 @@ impl MobileApp {
                 )],
             ),
             settings_group(
+                locale::text("Text size", "文字大小", "文字大小"),
+                vec![settings_nav_row(
+                    "mobile-settings-text-size",
+                    "icons/file-type.svg",
+                    locale::text("Text size", "文字大小", "文字大小").to_string(),
+                    text_size_label(self.app_settings.font_scale_percent),
+                    theme::accent_chart3(),
+                    cx.listener(|this, _, _, cx| this.cycle_text_size(cx)),
+                )],
+            ),
+            settings_group(
                 locale::text("While working", "工作时", "工作時"),
                 vec![settings_switch_row(
                     "mobile-settings-keep-screen-on",
@@ -23478,8 +26341,76 @@ impl MobileApp {
         rows
     }
 
+    /// The installed release's notes, collapsed behind one row.
+    ///
+    /// The desktop has a Release notes row in the same place; the phone had
+    /// only the version, so there was no way to read what changed without
+    /// leaving the app.
+    fn render_release_notes(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let has_notes = self
+            .update_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.current_notes.as_deref())
+            .is_some_and(|notes| !notes.trim().is_empty());
+        if !has_notes {
+            return div().into_any_element();
+        }
+        let open = self.release_notes_open;
+        let body = open
+            .then(|| {
+                self.release_notes_view
+                    .as_ref()
+                    .map(|(_, view)| view.clone())
+            })
+            .flatten();
+        div()
+            .flex()
+            .flex_col()
+            .child(settings_nav_row(
+                "mobile-settings-release-notes",
+                "icons/book-open.svg",
+                locale::text("Release notes", "更新日志", "更新日誌").to_string(),
+                if open {
+                    locale::common("Hide").to_string()
+                } else {
+                    locale::common("Show").to_string()
+                },
+                theme::accent_chart3(),
+                cx.listener(|this, _, _, cx| {
+                    this.release_notes_open = !this.release_notes_open;
+                    if this.release_notes_open && this.release_notes_view.is_none() {
+                        let source: Arc<str> = Arc::from(
+                            this.update_snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.current_notes.clone())
+                                .unwrap_or_default()
+                                .as_str(),
+                        );
+                        this.release_notes_view = Some((
+                            String::new(),
+                            cx.new(|cx| markdown::render(source, 0, false, cx)),
+                        ));
+                    }
+                    cx.notify();
+                }),
+            ))
+            .when_some(body, |section, view| {
+                section.child(
+                    div()
+                        .id("mobile-release-notes-body")
+                        .max_h(px(320.0))
+                        .overflow_y_scroll()
+                        .px(px(theme::SPACING_MD))
+                        .pb(px(theme::SPACING_SM))
+                        .child(view),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_settings_about(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let mut rows = vec![self.render_update_section(cx)];
+        rows.push(self.render_release_notes(cx));
         rows.push(settings_group(
             locale::common("About"),
             vec![
@@ -25622,6 +28553,47 @@ fn sidebar_project_icon_color(color: SidebarProjectLogoColor) -> gpui::Hsla {
     }
 }
 
+/// The decoder for a fetched image, from its content type or its URL.
+fn generated_image_format(url: &str, content_type: Option<&str>) -> Option<ImageFormat> {
+    if let Some(format) = content_type
+        .and_then(|value| value.split(';').next())
+        .and_then(|mime| ImageFormat::from_mime_type(mime.trim()))
+    {
+        return Some(format);
+    }
+    crate::workbench::image_format_for_path(url.split('?').next().unwrap_or(url))
+}
+
+/// How a hand-off to another Agent is doing, as a word and a colour.
+fn collaboration_status(status: vibex_core::ToolCallStatus) -> (&'static str, gpui::Hsla) {
+    match status {
+        vibex_core::ToolCallStatus::Started => (
+            locale::text("Started", "已开始", "已開始"),
+            theme::accent_blue(),
+        ),
+        vibex_core::ToolCallStatus::Progress => (
+            locale::text("Running", "进行中", "進行中"),
+            theme::accent_blue(),
+        ),
+        vibex_core::ToolCallStatus::Completed => (
+            locale::text("Done", "已完成", "已完成"),
+            theme::accent_green(),
+        ),
+        vibex_core::ToolCallStatus::Failed => {
+            (locale::text("Failed", "失败", "失敗"), theme::accent_red())
+        }
+    }
+}
+
+/// The text-size step as the reader sees it.
+fn text_size_label(percent: u32) -> String {
+    match percent {
+        value if value < 100 => locale::text("Compact", "紧凑", "緊湊").to_string(),
+        100 => locale::common("Default").to_string(),
+        _ => locale::text("Large", "较大", "較大").to_string(),
+    }
+}
+
 fn session_sidebar_time_label(timestamp_ms: i64) -> String {
     if timestamp_ms <= 0 {
         return String::new();
@@ -26653,6 +29625,54 @@ mod tests {
         assert_eq!(truncate_single_line("abcdef", 3), "...");
         assert_eq!(truncate_single_line("abcdef", 2), "..");
         assert_eq!(truncate_single_line("abcdef", 0), "");
+    }
+
+    #[test]
+    fn a_conversation_match_names_the_line_it_was_found_in() {
+        // The search takes the row and the line, because a phone cannot mark a
+        // word inside a Markdown view: the reader is shown where the match is.
+        let row = |title: &str, body: &str| TimelineRow {
+            id: format!("row:{title}"),
+            kind: TimelineRowKind::AgentMessage,
+            item_ids: Vec::new(),
+            turn_id: None,
+            turn_item_count: 0,
+            turn_failed: false,
+            turn_pending_permission: false,
+            conclusion: false,
+            first_sequence: 0,
+            last_sequence: 0,
+            timestamp_ms: 0,
+            title: title.to_string(),
+            body: body.to_string(),
+            streaming: false,
+            collapsible: false,
+            pending_permission: false,
+            failed: false,
+            runtime_attribution: None,
+            file_path: None,
+        };
+        let query = "needle";
+        let body = "first line\nsecond line with a NEEDLE in it\nthird";
+        let found = body
+            .lines()
+            .find(|line| line.to_lowercase().contains(query))
+            .map(str::trim)
+            .expect("the line is found case-insensitively");
+        assert_eq!(found, "second line with a NEEDLE in it");
+        // A row that only matches in its title reports the title.
+        let titled = row("needle row", "nothing here");
+        let line = if titled.body.to_lowercase().contains(query) {
+            titled
+                .body
+                .lines()
+                .find(|line| line.to_lowercase().contains(query))
+        } else if titled.title.to_lowercase().contains(query) {
+            Some(titled.title.as_str())
+        } else {
+            None
+        };
+        assert_eq!(line, Some("needle row"));
     }
 
     #[test]

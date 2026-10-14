@@ -244,13 +244,52 @@ unsafe extern "C" {
     fn vibex_ios_open_app_settings();
 }
 
-/// The Android half of [`open_app_settings`].
+/// Hands a link to whichever app can open it.
 ///
-/// The host activity is the only object that can start an intent, so the call
-/// goes through [`crate::android_bridge`], which always addresses the Activity
+/// Only the two web schemes are accepted: the terminal prints hyperlinks an
+/// application wrote, and `file:` or `intent:` would let one of those reach a
+/// part of the system the reader never asked for. Anything else is dropped
+/// without a word, which is what the desktop does with an unknown scheme too.
+pub fn open_external_url(url: &str) -> bool {
+    let url = url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return false;
+    }
+    #[cfg(target_os = "android")]
+    {
+        android::open_external_url(url)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = url;
+        false
+    }
+}
+
+/// The Android half of [`open_app_settings`] and [`open_external_url`].
+///
+/// The host activity is the only object that can start an intent, so the calls
+/// go through [`crate::android_bridge`], which always addresses the Activity
 /// the platform layer recorded last.
 #[cfg(target_os = "android")]
 mod android {
+    use jni::objects::JString;
+
+    /// Opens one web link in the system browser.
+    pub fn open_external_url(url: &str) -> bool {
+        crate::android_bridge::with_activity(|env, activity| {
+            let url = env.new_string(url)?;
+            env.call_method(
+                activity,
+                jni::jni_str!("openExternalUrl"),
+                jni::jni_sig!((url: JString) -> ()),
+                &[(&url).into()],
+            )?;
+            Ok(())
+        })
+        .is_some()
+    }
+
     pub fn open_app_settings() -> bool {
         crate::android_bridge::with_activity(|env, activity| {
             let result = env.call_method(

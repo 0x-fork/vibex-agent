@@ -943,6 +943,23 @@ impl SidebarOrganizationView {
                     .insert(workspace_id.clone(), title.to_string());
                 SidebarMutationEffect::NAVIGATION.into()
             }
+            RemoteSidebarOrganizationMutation::SetProjectNewSessionLocation {
+                project_id,
+                location,
+            } => {
+                let next = match location {
+                    RemoteSidebarNewSessionLocation::NewWorktree => NewSessionLocation::NewWorktree,
+                    RemoteSidebarNewSessionLocation::CurrentCheckout => {
+                        NewSessionLocation::CurrentCheckout
+                    }
+                };
+                if self.project_location_preferences.get(project_id) == Some(&next) {
+                    return Ok(SidebarMutationOutcome::AlreadyApplied);
+                }
+                self.project_location_preferences
+                    .insert(project_id.clone(), next);
+                SidebarMutationEffect::NAVIGATION.into()
+            }
             RemoteSidebarOrganizationMutation::SetHierarchyMode { mode } => {
                 let next = match mode {
                     RemoteSidebarHierarchyMode::Detailed => SidebarHierarchyMode::Detailed,

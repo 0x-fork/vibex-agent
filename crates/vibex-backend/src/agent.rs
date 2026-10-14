@@ -147,6 +147,23 @@ pub trait AgentBackend: BackendBound {
         })
     }
 
+    /// Pauses, resumes, or clears the goal the session is working toward.
+    ///
+    /// A backend that does not carry goal control says so rather than
+    /// pretending the call happened: the goal surface belongs to the provider,
+    /// and not every one of them exposes it.
+    fn control_goal(
+        &self,
+        _request: MutationRequest<vibex_core::AgentGoalControlRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentGoalControlResult> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_goal_control_unavailable",
+                "Goal control is unavailable on this backend",
+            ))
+        })
+    }
+
     fn delegate_session(
         &self,
         _request: MutationRequest<vibex_core::HumanDelegationRequest>,

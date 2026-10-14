@@ -11,6 +11,9 @@ name = "vibex_mobile"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+# Fetching a provider's generated image is a plain GET, which is cheaper than
+# teaching the whole UI toolkit an HTTP client it does not otherwise need.
+reqwest.workspace = true
 base64.workspace = true
 chrono = "0.4.45"
 futures-channel.workspace = true

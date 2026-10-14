@@ -532,6 +532,7 @@ pub enum RemoteAgentOperationKind {
     SendMessageWithMentions,
     SetSessionAccess,
     DelegateSession,
+    ControlGoal,
     ControlTeamTask,
     PresentTeam,
     AcknowledgeTeamEvents,
@@ -1408,6 +1409,11 @@ pub enum RemoteAgentRequest {
     SendMessageWithMentions(crate::RemoteTeamMutationRequest<crate::HumanAgentMessageRequest>),
     SetSessionAccess(crate::RemoteTeamMutationRequest<crate::SessionAccessRequest>),
     DelegateSession(crate::RemoteTeamMutationRequest<crate::HumanDelegationRequest>),
+    /// Pause, resume, or clear the goal the Agent is working toward. The
+    /// desktop calls the local manager for this; a paired client has to be
+    /// able to say the same thing, or a goal set on the phone can only be
+    /// watched.
+    ControlGoal(crate::RemoteTeamMutationRequest<crate::AgentGoalControlRequest>),
     ControlTeamTask(crate::RemoteTeamMutationRequest<crate::TeamTaskControlRequest>),
     PresentTeam(crate::RemoteTeamMutationRequest<crate::TeamPresentationRequest>),
     AcknowledgeTeamEvents(crate::RemoteTeamMutationRequest<crate::TeamAcknowledgeRequest>),
@@ -1473,6 +1479,7 @@ impl RemoteAgentRequest {
             Self::SendMessageWithMentions(_) => RemoteAgentOperationKind::SendMessageWithMentions,
             Self::SetSessionAccess(_) => RemoteAgentOperationKind::SetSessionAccess,
             Self::DelegateSession(_) => RemoteAgentOperationKind::DelegateSession,
+            Self::ControlGoal(_) => RemoteAgentOperationKind::ControlGoal,
             Self::ControlTeamTask(_) => RemoteAgentOperationKind::ControlTeamTask,
             Self::PresentTeam(_) => RemoteAgentOperationKind::PresentTeam,
             Self::AcknowledgeTeamEvents(_) => RemoteAgentOperationKind::AcknowledgeTeamEvents,
@@ -4852,6 +4859,15 @@ pub enum RemoteSidebarOrganizationMutation {
     },
     SetHierarchyMode {
         mode: RemoteSidebarHierarchyMode,
+    },
+    /// Where a project's new sessions start by default.
+    ///
+    /// The preference is the reader's, not the project's, so it lives with the
+    /// rest of the sidebar arrangement rather than in the repository. A client
+    /// that can only read it is stuck with whatever the desktop last chose.
+    SetProjectNewSessionLocation {
+        project_id: String,
+        location: RemoteSidebarNewSessionLocation,
     },
     /// Move the hour a queued message waits for, or take it away.
     ///

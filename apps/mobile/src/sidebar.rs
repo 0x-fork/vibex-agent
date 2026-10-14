@@ -64,6 +64,10 @@ pub struct SidebarRow {
     pub session_id: Option<VibexSessionId>,
     pub unread: bool,
     pub auto_continue: bool,
+    /// A session owned by the one above it, shown because that parent is
+    /// expanded. It is not an item of the organization: it cannot be moved,
+    /// selected, or filed, so the paths that do those things skip it.
+    pub delegated_child: bool,
 }
 
 impl SidebarRow {
@@ -453,6 +457,7 @@ fn push_root_children(
                     session_id: None,
                     unread: false,
                     auto_continue: false,
+                    delegated_child: false,
                 });
                 if collapsed && query.is_empty() {
                     continue;
@@ -502,6 +507,7 @@ fn push_root_children(
                     session_id: None,
                     unread: false,
                     auto_continue: false,
+                    delegated_child: false,
                 });
                 if collapsed && query.is_empty() {
                     continue;
@@ -617,6 +623,7 @@ fn push_project_children(
                     session_id: None,
                     unread: false,
                     auto_continue: false,
+                    delegated_child: false,
                 });
                 if collapsed && query.is_empty() {
                     continue;
@@ -743,6 +750,7 @@ fn push_project_children(
             session_id: None,
             unread: workspace_status(&workspace_sessions, input.view).1,
             auto_continue: false,
+            delegated_child: false,
         });
         if workspace.collapsed && query.is_empty() {
             continue;
@@ -834,6 +842,7 @@ fn push_workspace_children(
                     session_id: None,
                     unread: false,
                     auto_continue: false,
+                    delegated_child: false,
                 });
                 if collapsed && query.is_empty() {
                     continue;
@@ -930,6 +939,7 @@ fn push_group_rows(
                 .any(|session| session.id.as_str() == session_id)
         }),
         auto_continue: group.auto_continue.unwrap_or(false),
+        delegated_child: false,
     });
     if collapsed && query.is_empty() {
         return;
@@ -992,6 +1002,7 @@ fn session_row(
             .view
             .auto_continue_session_ids
             .contains(session_id.as_str()),
+        delegated_child: false,
     }
 }
 
@@ -1021,6 +1032,7 @@ fn empty_workspace_row(
         session_id: None,
         unread: false,
         auto_continue: false,
+        delegated_child: false,
     }
 }
 
@@ -1261,6 +1273,7 @@ mod tests {
             session_id: None,
             unread: false,
             auto_continue: false,
+            delegated_child: false,
         }
     }
 

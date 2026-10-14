@@ -15,9 +15,13 @@ use vibex_backend::{
 use vibex_core::{
     FileEntryKind, FilePreviewKind, FileSearchRequest, GitBranchSummary, GitChange, GitChangeKind,
     GitCommitDetail, GitCommitDetailRequest, GitCommitFileChange, GitCommitSummary,
-    GitDiffResponse, GitHistoryRequest, GitRemoteActionKind, GitRemoteActionRequest,
-    GitStageRequest, RemoteActionClass, TerminalCreateRequest, TerminalId, TerminalSnapshot,
-    TerminalStatus, VibexSessionId, WorkspaceId,
+    GitDiffResponse, GitHistoryRequest, GitManagedWorktreeRecord, GitRemoteActionKind,
+    GitRemoteActionRequest, GitStageRequest, GitWorktreeConflictStageRequest,
+    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
+    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
+    GitWorktreeOperationRequest, GitWorktreeOperationStatus, GitWorktreeReadinessRequest,
+    GitWorktreeReadinessState, RemoteActionClass, TerminalCreateRequest, TerminalId,
+    TerminalSnapshot, TerminalStatus, VibexSessionId, WorkspaceId,
 };
 use vibex_desktop_model::{
     FileGitSignal, FileIconDescriptor, FileIconKind, GitPathSelectionState, GitQueryKind,
@@ -41,6 +45,9 @@ use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaSta
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(600);
 /// Cell metrics copied from the desktop terminal surface so both clients
 /// render the same grid geometry at the base 13px mono font size.
+/// How much of a long diff is shown at once, and how much more each "show
+/// more" adds.
+const GIT_DIFF_PAGE_LINES: usize = 800;
 const TERMINAL_FONT_SIZE: f32 = 13.0;
 const TERMINAL_CELL_WIDTH: f32 = 8.0;
 const TERMINAL_CELL_HEIGHT: f32 = 18.0;
@@ -263,6 +270,10 @@ pub struct MobileWorkbench {
     /// The path of the buffer the editor is holding, which is not always the
     /// selected path: a read that returned nothing must not claim the screen.
     file_editor_path: Option<String>,
+    /// A line to put the caret on once the file it belongs to has loaded. A
+    /// content-search result names a line, and opening the file without going
+    /// there leaves the reader to find it again by hand.
+    pending_file_reveal: Option<(String, usize)>,
     /// A file the user asked to open while the editor still had unsaved edits.
     /// Opening it immediately would overwrite the buffer, so the choice is
     /// theirs to make first.
@@ -280,6 +291,16 @@ pub struct MobileWorkbench {
     /// The rendered Markdown view, kept across frames so a preview does not
     /// rebuild its text layout on every paint. Keyed by path and revision.
     file_markdown_view: Option<(String, Entity<markdown::MarkdownView>)>,
+    /// How the content search is run. The desktop offers the same three
+    /// switches; a phone keeps them off until asked for.
+    /// Where this workbench is pointed, as one line: the project, the worktree
+    /// and its branch. The rail follows the open session, so this is a
+    /// read-out rather than a switcher — the desktop is where a worktree is
+    /// chosen.
+    context_label: Option<String>,
+    file_search_case_sensitive: bool,
+    file_search_whole_word: bool,
+    file_search_regex: bool,
     /// The editor's own find bar. The kit input already highlights matches and
     /// reveals the active one with padding, so the phone only has to own the
     /// field and the two step buttons.
@@ -296,6 +317,16 @@ pub struct MobileWorkbench {
     /// The scroll handle for the diff sheet, so a freshly opened diff starts at
     /// its first line instead of wherever the tree behind it was scrolled to.
     git_diff_scroll: ScrollHandle,
+    /// The worktree lifecycle: what the authority reports about this
+    /// workspace's worktree, the merge plan being confirmed, and the
+    /// destructive action waiting for its confirmation.
+    worktree_lifecycle: Option<GitWorktreeLifecycleSnapshot>,
+    worktree_lifecycle_loading: bool,
+    worktree_merge_plan: Option<GitWorktreeMergePlan>,
+    worktree_confirmation: Option<WorktreeConfirmation>,
+    /// How many lines of the open diff are shown. A long patch is read a page
+    /// at a time rather than cut off, which is what the hard limit used to do.
+    git_diff_limit: usize,
     /// Paths awaiting confirmation before a rollback. The desktop confirms this
     /// too; the phone used to discard local edits on a single tap.
     git_revert_confirmation: Option<Vec<String>>,
@@ -319,6 +350,11 @@ pub struct MobileWorkbench {
     git_branches: Option<Vec<GitBranchSummary>>,
     git_branches_loading: bool,
     git_branch_sheet_open: bool,
+    /// The author filter's sheet. The list comes from the history the model
+    /// already holds, so opening it costs nothing.
+    git_author_sheet_open: bool,
+    /// The date filter's sheet.
+    git_date_sheet_open: bool,
     /// Next chunk sequence to feed into the render model; 0 forces a rebuild
     /// from the retained snapshot window.
     terminal_render_sequence: i64,
@@ -411,11 +447,16 @@ impl MobileWorkbench {
             terminal_clear_pending: false,
             pending_file_editor_content: None,
             file_editor_path: None,
+            pending_file_reveal: None,
             file_discard_prompt: None,
             file_preview_mode: MobileFilePreviewMode::Source,
             file_image: None,
             file_image_loading: None,
             file_markdown_view: None,
+            context_label: None,
+            file_search_case_sensitive: false,
+            file_search_whole_word: false,
+            file_search_regex: false,
             file_find_open: false,
             file_find_input: None,
             file_find_subscription: None,
@@ -424,6 +465,11 @@ impl MobileWorkbench {
             file_goto_input: None,
             git_diff: None,
             git_diff_scroll: ScrollHandle::new(),
+            worktree_lifecycle: None,
+            worktree_lifecycle_loading: false,
+            worktree_merge_plan: None,
+            worktree_confirmation: None,
+            git_diff_limit: GIT_DIFF_PAGE_LINES,
             git_revert_confirmation: None,
             git_status_error: None,
             git_commit_detail: None,
@@ -436,6 +482,8 @@ impl MobileWorkbench {
             git_branches: None,
             git_branches_loading: false,
             git_branch_sheet_open: false,
+            git_author_sheet_open: false,
+            git_date_sheet_open: false,
             terminal_render_sequence: 0,
             terminal_close_confirmation: None,
             terminal_fit_size: None,
@@ -491,10 +539,20 @@ impl MobileWorkbench {
         self.surface = surface;
         match surface {
             WorkbenchSurface::Files => self.refresh_files(cx),
-            WorkbenchSurface::Git => self.refresh_git(cx),
+            WorkbenchSurface::Git => {
+                self.refresh_git(cx);
+                self.refresh_worktree_lifecycle(cx);
+            }
             WorkbenchSurface::Terminal => self.refresh_terminals(cx),
         }
         cx.notify();
+    }
+
+    /// Sets the one-line description of what this rail is pointed at.
+    pub fn set_context_label(&mut self, label: Option<String>) {
+        if self.context_label != label {
+            self.context_label = label;
+        }
     }
 
     pub fn set_workspace(&mut self, workspace_id: WorkspaceId, cx: &mut Context<Self>) {
@@ -628,6 +686,13 @@ impl MobileWorkbench {
     }
 
     fn open_file_now(&mut self, path: String, cx: &mut Context<Self>) {
+        if self
+            .pending_file_reveal
+            .as_ref()
+            .is_some_and(|(pending, _)| pending != &path)
+        {
+            self.pending_file_reveal = None;
+        }
         let ticket = match self.files.begin_open_file(path) {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -885,6 +950,65 @@ impl MobileWorkbench {
         }
     }
 
+    /// Collapses every directory the tree has open.
+    ///
+    /// Always complete, and always local: the paths are the ones the tree is
+    /// already holding open.
+    fn collapse_file_tree(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let expanded = self.files.state.tree.expanded_directory_paths();
+        if expanded.is_empty() {
+            return;
+        }
+        if self.files.state.tree.set_chain_expanded(&expanded, false) {
+            cx.notify();
+        }
+    }
+
+    /// Opens the next level of the tree.
+    ///
+    /// A lazy tree cannot be opened all at once — the children of a directory
+    /// do not exist until the authority lists it — so this expands every
+    /// directory that is on screen and fetches what is under it. Tapping again
+    /// goes a level deeper, which is the honest shape of the operation rather
+    /// than a button that claims to finish a job it cannot.
+    fn expand_file_tree_level(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        const MAX_DIRECTORIES_PER_LEVEL: usize = 25;
+        let directories = self
+            .files
+            .state
+            .tree
+            .all_visible_rows()
+            .iter()
+            .filter(|row| row.kind == FileEntryKind::Directory)
+            .filter(|row| !self.files.state.tree.is_expanded(&row.path))
+            .map(|row| row.path.clone())
+            .take(MAX_DIRECTORIES_PER_LEVEL)
+            .collect::<Vec<_>>();
+        if directories.is_empty() {
+            self.show_notice(
+                locale::text(
+                    "Every folder on screen is already open",
+                    "屏幕上的文件夹都已展开",
+                    "螢幕上的資料夾都已展開",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        }
+        for path in directories {
+            if self
+                .files
+                .state
+                .tree
+                .set_chain_expanded(std::slice::from_ref(&path), true)
+            {
+                self.load_file_tree_path(path, cx);
+            }
+        }
+        cx.notify();
+    }
+
     fn start_file_search(&mut self, cx: &mut Context<Self>) {
         let query = input_value(&self.file_search_input, cx).trim().to_string();
         if query.is_empty() {
@@ -902,9 +1026,9 @@ impl MobileWorkbench {
             workspace_id: self.workspace_id.clone(),
             query,
             include_content: self.file_search_mode == MobileFileSearchMode::Content,
-            case_sensitive: false,
-            whole_word: false,
-            regex: false,
+            case_sensitive: self.file_search_case_sensitive,
+            whole_word: self.file_search_whole_word,
+            regex: self.file_search_regex,
             limit: Some(100),
         };
         let runner = gpui_tokio::Tokio::spawn(cx, self.files.search_files(request));
@@ -917,6 +1041,49 @@ impl MobileWorkbench {
             });
         });
         self.tasks.push(task);
+    }
+
+    /// Opens a search result on the line it matched.
+    fn reveal_file_search_result(&mut self, path: String, line: u32, cx: &mut Context<Self>) {
+        let line = line as usize;
+        if line > 0 {
+            self.pending_file_reveal = Some((path.clone(), line));
+        }
+        self.select_file(path, cx);
+    }
+
+    /// Puts the caret on a line that was waiting for its file to load.
+    ///
+    /// Called from the paint that writes the buffer, because the selection can
+    /// only be set on content the editor already holds.
+    fn apply_pending_file_reveal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, line)) = self.pending_file_reveal.clone() else {
+            return;
+        };
+        if self.file_editor_path.as_deref() != Some(path.as_str()) {
+            // The file that was asked for never opened; the request goes with
+            // it rather than landing on whatever is in the buffer instead.
+            if !self.files.state.active_file.is_loading() {
+                self.pending_file_reveal = None;
+            }
+            return;
+        }
+        let Some(input) = self.file_editor_input.clone() else {
+            return;
+        };
+        self.pending_file_reveal = None;
+        let text = input.read(cx).value().to_string();
+        let Some((start, end)) = file_line_range(&text, line) else {
+            return;
+        };
+        let line_height = input.read(cx).line_height().map(f32::from).unwrap_or(18.0);
+        let offset_y = -((line.saturating_sub(2)) as f32) * line_height;
+        input.update(cx, |input, cx| {
+            input.set_selected_range(start..end, cx);
+            input.set_scroll_offset(point(px(0.0), px(offset_y)), cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
     }
 
     /// Picks one half of the search-mode switch.
@@ -1079,6 +1246,452 @@ impl MobileWorkbench {
             locale::common("Desktop file version loaded").to_string(),
             cx,
         );
+    }
+
+    /// Reads what the authority knows about this workspace's worktree.
+    ///
+    /// The desktop's Git panel carries a lifecycle card for a managed
+    /// worktree; a phone that starts a session in one had no way to finish
+    /// with it, so the worktree could be created and never merged back.
+    fn refresh_worktree_lifecycle(&mut self, cx: &mut Context<Self>) {
+        if !self
+            .git
+            .capabilities()
+            .supports(BackendOperation::GitWorktreeLifecycleMutate)
+            && !self
+                .git
+                .capabilities()
+                .supports(BackendOperation::GitWorktreeRead)
+        {
+            return;
+        }
+        let backend = self.backend.clone();
+        let workspace_id = self.workspace_id.clone();
+        self.worktree_lifecycle_loading = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.git_worktree_snapshot(workspace_id).await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.worktree_lifecycle_loading = false;
+                match outcome {
+                    Ok(snapshot) => this.worktree_lifecycle = Some(snapshot),
+                    // A workspace that is not a managed worktree is not an
+                    // error: the card is simply not drawn.
+                    Err(_) => this.worktree_lifecycle = None,
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// The managed worktree this rail is pointed at, when it is one.
+    fn managed_worktree(&self) -> Option<&GitManagedWorktreeRecord> {
+        let snapshot = self.worktree_lifecycle.as_ref()?;
+        snapshot.managed_worktrees.iter().find(|worktree| {
+            worktree
+                .workspace_id
+                .as_ref()
+                .is_some_and(|id| id == &self.workspace_id)
+        })
+    }
+
+    /// The merge or archive operation this worktree is in the middle of.
+    fn active_worktree_operation(&self) -> Option<&GitWorktreeOperationRecord> {
+        let snapshot = self.worktree_lifecycle.as_ref()?;
+        let workspace_id = self.workspace_id.as_str();
+        snapshot.operations.iter().find(|operation| {
+            operation.status == GitWorktreeOperationStatus::Running
+                || operation.status == GitWorktreeOperationStatus::Queued
+                || (operation.status == GitWorktreeOperationStatus::Failed
+                    && operation.source_workspace_id.as_ref().map(|id| id.as_str())
+                        == Some(workspace_id))
+        })
+    }
+
+    /// Marks the worktree ready to merge, or takes that back.
+    fn set_worktree_readiness(&mut self, ready: bool, cx: &mut Context<Self>) {
+        let Some(worktree) = self.managed_worktree() else {
+            return;
+        };
+        let request = GitWorktreeReadinessRequest {
+            workspace_id: self.workspace_id.clone(),
+            state: if ready {
+                GitWorktreeReadinessState::ReadyToMerge
+            } else {
+                GitWorktreeReadinessState::Working
+            },
+            expected_source_head: worktree.head.clone(),
+            expected_dirty_fingerprint: None,
+            checks: Vec::new(),
+        };
+        let backend = self.backend.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .git_worktree_set_readiness(MutationRequest::new(request))
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(_) => {
+                        this.notice = Some(
+                            locale::text(
+                                "Worktree marked",
+                                "Worktree 状态已更新",
+                                "Worktree 狀態已更新",
+                            )
+                            .to_string(),
+                        );
+                        this.refresh_worktree_lifecycle(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Asks what a merge would do, and shows the plan before running it.
+    fn plan_worktree_merge(&mut self, cx: &mut Context<Self>) {
+        let Some(worktree) = self.managed_worktree() else {
+            return;
+        };
+        let Some(target_workspace_id) = worktree.target_workspace_id.clone() else {
+            self.error = Some(BackendError::failed(
+                "worktree_target_missing",
+                locale::text(
+                    "This worktree has no workspace to merge into.",
+                    "该 Worktree 没有可合并的目标工作区。",
+                    "該 Worktree 沒有可合併的目標工作區。",
+                ),
+            ));
+            cx.notify();
+            return;
+        };
+        let request = GitWorktreeMergeRequest {
+            workspace_id: self.workspace_id.clone(),
+            source_path: worktree.worktree_path.clone(),
+            target_workspace_id: Some(target_workspace_id),
+            strategy: None,
+            expected_source_head: worktree.head.clone(),
+            expected_target_head: None,
+            preflight_revision: None,
+        };
+        let backend = self.backend.clone();
+        self.busy = true;
+        let runner =
+            gpui_tokio::Tokio::spawn(
+                cx,
+                async move { backend.git_worktree_merge_plan(request).await },
+            );
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(plan) => {
+                        this.worktree_confirmation =
+                            Some(WorktreeConfirmation::Merge(Box::new(plan)));
+                        this.error = None;
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Runs the merge the reader confirmed.
+    fn confirm_worktree_merge(&mut self, cx: &mut Context<Self>) {
+        let Some(WorktreeConfirmation::Merge(plan)) = self.worktree_confirmation.take() else {
+            return;
+        };
+        let request = GitWorktreeMergeRequest {
+            workspace_id: plan.source_workspace_id.clone(),
+            source_path: plan.source_path.clone(),
+            target_workspace_id: Some(plan.target_workspace_id.clone()),
+            strategy: None,
+            expected_source_head: Some(plan.source_head.clone()),
+            expected_target_head: Some(plan.target_head.clone()),
+            preflight_revision: Some(plan.preflight.revision.clone()),
+        };
+        let backend = self.backend.clone();
+        self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .git_worktree_merge(MutationRequest::new(request))
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(_) => {
+                        this.notice = Some(
+                            locale::text("Merge started", "已开始合并", "已開始合併").to_string(),
+                        );
+                        this.refresh_worktree_lifecycle(cx);
+                        this.refresh_git(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Abandons the merge that is in progress.
+    fn abort_worktree_merge(&mut self, cx: &mut Context<Self>) {
+        let Some(operation_id) = self
+            .active_worktree_operation()
+            .map(|operation| operation.operation_id.clone())
+        else {
+            return;
+        };
+        self.run_worktree_operation_action(WorktreeOperationAction::Abort, operation_id, cx);
+    }
+
+    /// Marks the conflicted paths resolved, which is what a merge needs to go
+    /// on. A phone cannot edit a three-way merge by hand, so the reader fixes
+    /// the files in the editor and then says so here.
+    fn stage_worktree_conflicts(&mut self, cx: &mut Context<Self>) {
+        let Some(operation_id) = self
+            .active_worktree_operation()
+            .map(|operation| operation.operation_id.clone())
+        else {
+            return;
+        };
+        let paths = self
+            .active_worktree_operation()
+            .map(|operation| {
+                operation
+                    .detail
+                    .conflicts
+                    .iter()
+                    .filter(|conflict| !conflict.resolved)
+                    .map(|conflict| conflict.path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if paths.is_empty() {
+            self.notice = Some(
+                locale::text(
+                    "No conflicted files are listed",
+                    "没有列出冲突文件",
+                    "沒有列出衝突檔案",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let request = GitWorktreeConflictStageRequest {
+            operation_id: operation_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            paths,
+        };
+        let backend = self.backend.clone();
+        self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .git_worktree_stage_conflicts(MutationRequest::new(request))
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(_) => {
+                        this.notice = Some(
+                            locale::text(
+                                "Conflicts staged",
+                                "冲突已标记为已解决",
+                                "衝突已標記為已解決",
+                            )
+                            .to_string(),
+                        );
+                        this.refresh_worktree_lifecycle(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Carries the merge on once its conflicts are resolved.
+    fn continue_worktree_merge(&mut self, cx: &mut Context<Self>) {
+        let Some(operation_id) = self
+            .active_worktree_operation()
+            .map(|operation| operation.operation_id.clone())
+        else {
+            return;
+        };
+        self.run_worktree_operation_action(WorktreeOperationAction::Continue, operation_id, cx);
+    }
+
+    /// Runs one of the two operations that act on a merge already in flight.
+    fn run_worktree_operation_action(
+        &mut self,
+        action: WorktreeOperationAction,
+        operation_id: vibex_core::RequestId,
+        cx: &mut Context<Self>,
+    ) {
+        let request = GitWorktreeOperationRequest {
+            operation_id,
+            workspace_id: self.workspace_id.clone(),
+        };
+        let backend = self.backend.clone();
+        self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            match action {
+                WorktreeOperationAction::Abort => {
+                    backend
+                        .git_worktree_abort_merge(MutationRequest::new(request))
+                        .await
+                }
+                WorktreeOperationAction::Continue => {
+                    backend
+                        .git_worktree_continue_merge(MutationRequest::new(request))
+                        .await
+                }
+            }
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(_) => {
+                        this.notice = Some(
+                            match action {
+                                WorktreeOperationAction::Abort => {
+                                    locale::text("Merge aborted", "已中止合并", "已中止合併")
+                                }
+                                WorktreeOperationAction::Continue => {
+                                    locale::text("Merge continued", "已继续合并", "已繼續合併")
+                                }
+                            }
+                            .to_string(),
+                        );
+                        this.refresh_worktree_lifecycle(cx);
+                        this.refresh_git(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Asks what discarding would cost, then asks the reader to confirm it.
+    fn plan_worktree_discard(&mut self, cx: &mut Context<Self>) {
+        let Some(worktree) = self.managed_worktree() else {
+            return;
+        };
+        let request = GitWorktreeDiscardRequest {
+            workspace_id: self.workspace_id.clone(),
+            worktree_path: worktree.worktree_path.clone(),
+            force: false,
+            delete_branch: false,
+            expected_head: worktree.head.clone(),
+            preflight_revision: None,
+        };
+        let backend = self.backend.clone();
+        self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.git_worktree_discard_preflight(request).await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(preflight) => {
+                        this.worktree_confirmation =
+                            Some(WorktreeConfirmation::Discard(Box::new(preflight)));
+                        this.error = None;
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Discards the worktree the reader confirmed.
+    fn confirm_worktree_discard(&mut self, cx: &mut Context<Self>) {
+        let Some(WorktreeConfirmation::Discard(preflight)) = self.worktree_confirmation.take()
+        else {
+            return;
+        };
+        let request = GitWorktreeDiscardRequest {
+            workspace_id: self.workspace_id.clone(),
+            worktree_path: self
+                .managed_worktree()
+                .map(|worktree| worktree.worktree_path.clone())
+                .unwrap_or_default(),
+            force: false,
+            delete_branch: false,
+            expected_head: preflight.source_head.clone(),
+            preflight_revision: Some(preflight.revision.clone()),
+        };
+        let backend = self.backend.clone();
+        self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .git_worktree_discard(MutationRequest::new(request))
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(_) => {
+                        this.notice = Some(
+                            locale::text(
+                                "Worktree discarded",
+                                "Worktree 已丢弃",
+                                "Worktree 已丟棄",
+                            )
+                            .to_string(),
+                        );
+                        this.refresh_worktree_lifecycle(cx);
+                        this.refresh_git(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    fn cancel_worktree_confirmation(&mut self, cx: &mut Context<Self>) {
+        if self.worktree_confirmation.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn refresh_git(&mut self, cx: &mut Context<Self>) {
@@ -1439,6 +2052,15 @@ impl MobileWorkbench {
             }
         }
 
+        if let Some(content) = self.pending_file_editor_content.take()
+            && let Some(input) = self.file_editor_input.clone()
+        {
+            input.update(cx, |input, cx| input.set_value(content, window, cx));
+        }
+        // After the buffer write, and before the clears borrow the fields the
+        // reveal also reads.
+        self.apply_pending_file_reveal(window, cx);
+
         let clears = [
             (&mut self.file_search_clear_pending, &self.file_search_input),
             (&mut self.git_commit_clear_pending, &self.git_commit_input),
@@ -1448,12 +2070,6 @@ impl MobileWorkbench {
             ),
             (&mut self.terminal_clear_pending, &self.terminal_input),
         ];
-        if let Some(content) = self.pending_file_editor_content.take()
-            && let Some(input) = self.file_editor_input.clone()
-        {
-            input.update(cx, |input, cx| input.set_value(content, window, cx));
-        }
-
         for (pending, input) in clears {
             if !*pending {
                 continue;
@@ -1495,29 +2111,69 @@ impl MobileWorkbench {
         self.refresh_git_history(false, cx);
     }
 
-    fn toggle_git_history_author(
+    fn open_git_author_sheet(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.git_author_sheet_open = true;
+        cx.notify();
+    }
+
+    fn close_git_author_sheet(&mut self, cx: &mut Context<Self>) {
+        if self.git_author_sheet_open {
+            self.git_author_sheet_open = false;
+            cx.notify();
+        }
+    }
+
+    /// Points the history filter at one author, or at everyone.
+    ///
+    /// A list rather than the cycle this used to be: the reader picked a name
+    /// by tapping through the authors one at a time, which is no way to reach
+    /// the fifth of nine.
+    fn set_git_history_author(&mut self, author: Option<String>, cx: &mut Context<Self>) {
+        let mut filter = self.git.state.model.history_filter.clone();
+        if filter.author == author {
+            self.git_author_sheet_open = false;
+            cx.notify();
+            return;
+        }
+        filter.author = author;
+        self.git.state.model.set_history_filter(filter);
+        self.git_author_sheet_open = false;
+        self.refresh_git_history(false, cx);
+        cx.notify();
+    }
+
+    fn open_git_date_sheet(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.git_date_sheet_open = true;
+        cx.notify();
+    }
+
+    fn close_git_date_sheet(&mut self, cx: &mut Context<Self>) {
+        if self.git_date_sheet_open {
+            self.git_date_sheet_open = false;
+            cx.notify();
+        }
+    }
+
+    /// Points the history filter at a window of time.
+    ///
+    /// Presets rather than a calendar: a phone date picker is three taps deep
+    /// for a question that is almost always "recently".
+    fn set_git_history_window(
         &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
+        window: Option<MobileHistoryWindow>,
         cx: &mut Context<Self>,
     ) {
-        let authors = self.git.state.model.history_authors.clone();
-        let current = self.git.state.model.history_filter.author.clone();
-        let next = if authors.is_empty() {
-            None
-        } else if let Some(current) = current {
-            authors
-                .iter()
-                .position(|author| author.email == current || author.name == current)
-                .and_then(|index| authors.get(index.saturating_add(1)))
-                .map(|author| author.email.clone())
-        } else {
-            authors.first().map(|author| author.email.clone())
-        };
         let mut filter = self.git.state.model.history_filter.clone();
-        filter.author = next;
+        let (after, before) = match window {
+            Some(window) => window.bounds(vibex_core::unix_timestamp_ms()),
+            None => (None, None),
+        };
+        filter.authored_after_ms = after;
+        filter.authored_before_ms = before;
         self.git.state.model.set_history_filter(filter);
+        self.git_date_sheet_open = false;
         self.refresh_git_history(false, cx);
+        cx.notify();
     }
 
     fn load_more_git_history(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1634,6 +2290,7 @@ impl MobileWorkbench {
     }
 
     fn open_git_diff(&mut self, path: String, staged: bool, cx: &mut Context<Self>) {
+        self.git_diff_limit = GIT_DIFF_PAGE_LINES;
         let ticket = match self.git.begin_diff_load(path, staged) {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -1867,6 +2524,12 @@ impl MobileWorkbench {
     }
 
     fn create_terminal(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.create_terminal_now(cx);
+    }
+
+    /// Opens a terminal session and attaches to it. The window the button has
+    /// is not needed for either, which is what lets a restart reuse this.
+    fn create_terminal_now(&mut self, cx: &mut Context<Self>) {
         let request = MutationRequest::new(TerminalCreateRequest {
             workspace_id: self.workspace_id.clone(),
             title: Some(locale::text("Mobile terminal", "移动端终端", "行動端終端機").to_string()),
@@ -1894,6 +2557,56 @@ impl MobileWorkbench {
                 this.error = this.terminal.state.last_error.clone();
                 if let Some(terminal_id) = created_id {
                     this.attach_terminal(terminal_id, cx);
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Replaces the running session with a fresh one.
+    ///
+    /// A phone has no way to type `exit` and start again in one gesture, and a
+    /// terminal that has wedged — a full-screen program that will not quit, a
+    /// shell waiting on something — leaves the reader with nothing to do. This
+    /// closes it without the confirmation the Close button asks for, because
+    /// restarting is itself the intent.
+    fn restart_terminal(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.busy
+            || !self
+                .terminal
+                .capabilities
+                .supports(BackendOperation::TerminalClose)
+        {
+            return;
+        }
+        if self.terminal.state.active_session.is_none() {
+            return;
+        }
+        self.terminal_close_confirmation = None;
+        let operation = match self.terminal.begin_close() {
+            Ok(operation) => operation,
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, self.terminal.run_close(operation.clone()));
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.terminal.apply_close(&operation, outcome);
+                this.busy = false;
+                this.terminal.state.render = None;
+                this.terminal_render_sequence = 0;
+                this.error = this.terminal.state.last_error.clone();
+                if this.error.is_none() {
+                    this.stop_terminal_poll();
+                    // A fresh session takes the place of the one that went.
+                    this.create_terminal_now(cx);
                 }
                 cx.notify();
             });
@@ -2172,11 +2885,33 @@ impl MobileWorkbench {
         let Some(render) = self.terminal.state.render.as_ref() else {
             return;
         };
-        if !render.frame.modes.mouse_reporting {
+        if render.frame.modes.mouse_reporting {
+            // An application that asked for the mouse owns the tap, exactly as
+            // it does on the desktop where Shift is what takes it back.
+            if let Some(input) = terminal_mouse_tap(point, render.frame.modes.sgr_mouse) {
+                self.send_terminal_value(input, false, cx);
+            }
             return;
         }
-        if let Some(input) = terminal_mouse_tap(point, render.frame.modes.sgr_mouse) {
-            self.send_terminal_value(input, false, cx);
+        // Nothing is claiming taps, so a link under the finger is the reader's.
+        let link = render
+            .frame
+            .cells
+            .iter()
+            .find(|cell| cell.row == point.row && cell.column == point.column)
+            .and_then(|cell| cell.hyperlink.clone());
+        if let Some(link) = link
+            && crate::platform::open_external_url(&link)
+        {
+            self.show_notice(
+                locale::text(
+                    "Opened in the browser",
+                    "已在浏览器中打开",
+                    "已在瀏覽器中開啟",
+                )
+                .to_string(),
+                cx,
+            );
         }
     }
 
@@ -2945,7 +3680,7 @@ impl MobileWorkbench {
                 // A code buffer in the interface font reads as prose; the
                 // desktop editor is monospace and so is this one.
                 .font_family("IBM Plex Mono")
-                .text_size(px(13.0))
+                .text_size(theme::code_font_size())
                 .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
                 .child(textarea_element(self.file_editor_input.as_ref()))
                 .into_any_element()
@@ -3488,6 +4223,602 @@ impl MobileWorkbench {
             .into_any_element()
     }
 
+    /// The worktree lifecycle card: what this worktree is, and what can be
+    /// done with it.
+    ///
+    /// Only drawn for a managed worktree. A phone could start a session in one
+    /// and never finish with it, which made the worktree a one-way door.
+    fn render_worktree_card(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let worktree = self.managed_worktree()?;
+        let readiness = self
+            .worktree_lifecycle
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .readiness
+                    .iter()
+                    .find(|record| record.workspace_id == self.workspace_id)
+            })
+            .map(|record| record.state)
+            .unwrap_or_default();
+        let branch = worktree
+            .branch
+            .clone()
+            .unwrap_or_else(|| locale::text("detached", "游离分支", "游離分支").to_string());
+        let ready = readiness == GitWorktreeReadinessState::ReadyToMerge;
+        let operation = self.active_worktree_operation();
+        let conflicts = operation
+            .map(|operation| {
+                operation
+                    .detail
+                    .conflicts
+                    .iter()
+                    .filter(|conflict| !conflict.resolved)
+                    .count()
+            })
+            .unwrap_or(0);
+        let merging = operation.is_some();
+        let can_mutate = self
+            .git
+            .capabilities()
+            .supports(BackendOperation::GitWorktreeLifecycleMutate);
+        Some(
+            div()
+                .id("mobile-worktree-card")
+                .debug_selector(|| "mobile-worktree-card".to_string())
+                .flex_shrink_0()
+                .mx_2()
+                .mt_2()
+                .rounded(px(theme::RADIUS_CARD))
+                .border_1()
+                .border_color(theme::border_default())
+                .bg(theme::bg_card())
+                .p_2()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            svg()
+                                .path("icons/git-branch.svg")
+                                .size(px(theme::ICON_SM))
+                                .flex_shrink_0()
+                                .text_color(theme::accent_purple()),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(theme::font_caption())
+                                .text_color(theme::text_primary())
+                                .child(branch),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(theme::font_micro())
+                                .text_color(if ready {
+                                    theme::accent_green()
+                                } else {
+                                    theme::text_muted()
+                                })
+                                .child(worktree_readiness_label(readiness)),
+                        ),
+                )
+                .when(conflicts > 0, |card| {
+                    card.child(
+                        div()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::accent_yellow())
+                            .child(
+                                locale::text(
+                                    "{} conflicted files",
+                                    "{} 个文件冲突",
+                                    "{} 個檔案衝突",
+                                )
+                                .replace("{}", &conflicts.to_string()),
+                            ),
+                    )
+                })
+                .child(
+                    div()
+                        .mt_1()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(theme::SPACING_XS))
+                        .when(!merging && can_mutate, |actions| {
+                            actions
+                                .child(
+                                    chip_action(
+                                        "worktree-readiness",
+                                        if ready {
+                                            locale::text("Not ready", "标记未就绪", "標記未就緒")
+                                        } else {
+                                            locale::text("Mark ready", "标记就绪", "標記就緒")
+                                        },
+                                        !self.busy,
+                                    )
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.set_worktree_readiness(!ready, cx)
+                                        }),
+                                    ),
+                                )
+                                .child(
+                                    chip_action(
+                                        "worktree-merge",
+                                        locale::text("Merge back", "合并回去", "合併回去"),
+                                        !self.busy,
+                                    )
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.plan_worktree_merge(cx)),
+                                    ),
+                                )
+                                .child(
+                                    chip_action(
+                                        "worktree-discard",
+                                        locale::text("Discard", "丢弃", "丟棄"),
+                                        !self.busy,
+                                    )
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.plan_worktree_discard(cx)
+                                        }),
+                                    ),
+                                )
+                        })
+                        // A merge in flight is finished or abandoned here; a
+                        // phone cannot edit a three-way merge, so the files are
+                        // fixed in the editor and marked resolved from here.
+                        .when(merging && can_mutate, |actions| {
+                            actions
+                                .when(conflicts > 0, |actions| {
+                                    actions.child(
+                                        chip_action(
+                                            "worktree-stage-conflicts",
+                                            locale::text(
+                                                "Mark resolved",
+                                                "标记已解决",
+                                                "標記已解決",
+                                            ),
+                                            !self.busy,
+                                        )
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.stage_worktree_conflicts(cx)
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .child(
+                                    chip_action(
+                                        "worktree-continue",
+                                        locale::text("Continue", "继续", "繼續"),
+                                        !self.busy,
+                                    )
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.continue_worktree_merge(cx)
+                                        }),
+                                    ),
+                                )
+                                .child(
+                                    chip_action(
+                                        "worktree-abort",
+                                        locale::text("Abort merge", "中止合并", "中止合併"),
+                                        !self.busy,
+                                    )
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.abort_worktree_merge(cx)),
+                                    ),
+                                )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The plan or preflight a lifecycle action is waiting on.
+    fn render_worktree_confirmation(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(confirmation) = self.worktree_confirmation.as_ref() else {
+            return div().into_any_element();
+        };
+        let (title, detail, confirm_label) = match confirmation {
+            WorktreeConfirmation::Merge(plan) => (
+                locale::text(
+                    "Merge this worktree back?",
+                    "把这个 Worktree 合并回去？",
+                    "把這個 Worktree 合併回去？",
+                ),
+                format!(
+                    "{} {} · +{} −{}",
+                    plan.source_branch,
+                    locale::text("into", "合并到", "合併到"),
+                    plan.summary.additions,
+                    plan.summary.deletions
+                ),
+                locale::common("Merge"),
+            ),
+            WorktreeConfirmation::Discard(preflight) => (
+                locale::text(
+                    "Discard this worktree?",
+                    "丢弃这个 Worktree？",
+                    "丟棄這個 Worktree？",
+                ),
+                if preflight.risks.is_empty() {
+                    locale::text(
+                        "The worktree is removed; its branch is kept.",
+                        "Worktree 会被移除，分支保留。",
+                        "Worktree 會被移除，分支保留。",
+                    )
+                    .to_string()
+                } else {
+                    format!(
+                        "{} {}",
+                        preflight.risks.len(),
+                        locale::text("risks reported", "项风险", "項風險")
+                    )
+                },
+                locale::common("Discard"),
+            ),
+        };
+        let merge = matches!(confirmation, WorktreeConfirmation::Merge(_));
+        div()
+            .id("mobile-worktree-confirmation")
+            .debug_selector(|| "mobile-worktree-confirmation".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.62))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.cancel_worktree_confirmation(cx)),
+            )
+            .child(
+                div()
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .bg(theme::bg_popover())
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .p(px(theme::SPACING_LG))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACING_SM))
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_size(theme::font_heading())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::font_caption())
+                            .text_color(theme::text_muted())
+                            .child(detail),
+                    )
+                    .child(
+                        div()
+                            .mt(px(theme::SPACING_SM))
+                            .flex()
+                            .gap(px(theme::SPACING_SM))
+                            .child(
+                                div()
+                                    .id("worktree-confirm-cancel")
+                                    .flex_1()
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .border_1()
+                                    .border_color(theme::border_default())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .text_size(theme::font_body())
+                                    .text_color(theme::text_secondary())
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.cancel_worktree_confirmation(cx)
+                                        }),
+                                    )
+                                    .child(locale::common("Cancel")),
+                            )
+                            .child(
+                                div()
+                                    .id("worktree-confirm-action")
+                                    .flex_1()
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(if merge {
+                                        theme::primary()
+                                    } else {
+                                        theme::accent_red()
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .active(|style| style.opacity(0.85))
+                                    .text_size(theme::font_body())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(if merge {
+                                        theme::primary_foreground()
+                                    } else {
+                                        theme::bg_primary()
+                                    })
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            if merge {
+                                                this.confirm_worktree_merge(cx)
+                                            } else {
+                                                this.confirm_worktree_discard(cx)
+                                            }
+                                        }),
+                                    )
+                                    .child(confirm_label),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The author list the history filter picks from.
+    fn render_git_author_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let selected = self.git.state.model.history_filter.author.clone();
+        let mut rows: Vec<(Option<String>, String)> =
+            vec![(None, locale::common("All authors").to_string())];
+        for author in &self.git.state.model.history_authors {
+            let label = if author.name.trim().is_empty() {
+                author.email.clone()
+            } else {
+                author.name.clone()
+            };
+            rows.push((Some(author.email.clone()), label));
+        }
+        self.render_git_filter_sheet(
+            "git-author-sheet",
+            locale::text("History author", "历史作者", "歷史作者"),
+            rows,
+            selected,
+            |this, value, cx| this.set_git_history_author(value, cx),
+            cx,
+        )
+    }
+
+    /// The date presets the history filter picks from.
+    fn render_git_date_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let now = vibex_core::unix_timestamp_ms();
+        let selected = MobileHistoryWindow::from_bounds(
+            self.git.state.model.history_filter.authored_after_ms,
+            self.git.state.model.history_filter.authored_before_ms,
+            now,
+        );
+        let mut rows: Vec<(Option<MobileHistoryWindow>, String)> =
+            vec![(None, locale::common("Any date").to_string())];
+        rows.extend(
+            MobileHistoryWindow::ALL
+                .into_iter()
+                .map(|window| (Some(window), window.label().to_string())),
+        );
+        self.render_git_filter_sheet(
+            "git-date-sheet",
+            locale::text("History date", "历史日期", "歷史日期"),
+            rows,
+            selected,
+            |this, value, cx| this.set_git_history_window(value, cx),
+            cx,
+        )
+    }
+
+    /// One list sheet, shared by the two history filters.
+    ///
+    /// They differ only in what a row carries, and a phone can only show one
+    /// shape of list anyway.
+    fn render_git_filter_sheet<T: Clone + PartialEq + 'static>(
+        &self,
+        debug_id: &'static str,
+        title: &'static str,
+        rows: Vec<(T, String)>,
+        selected: T,
+        choose: impl Fn(&mut Self, T, &mut Context<Self>) + Copy + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.45))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.git_author_sheet_open = false;
+                    this.git_date_sheet_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .debug_selector(move || debug_id.to_string())
+                    .w_full()
+                    .max_h(gpui::relative(0.7))
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(theme::border_subtle())
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(theme::font_title())
+                                    .text_color(theme::text_primary())
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .id("git-filter-sheet-close")
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.git_author_sheet_open = false;
+                                            this.git_date_sheet_open = false;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/x.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_secondary()),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("git-filter-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .p_2()
+                            .children(rows.into_iter().enumerate().map(
+                                |(index, (value, label))| {
+                                    let chosen = value == selected;
+                                    let target = value.clone();
+                                    div()
+                                        .id(("git-filter-row", index))
+                                        .w_full()
+                                        .min_h(px(theme::TOUCH_TARGET))
+                                        .px_3()
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                choose(this, target.clone(), cx)
+                                            }),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .text_size(theme::font_body())
+                                                .text_color(if chosen {
+                                                    theme::primary()
+                                                } else {
+                                                    theme::text_primary()
+                                                })
+                                                .child(label),
+                                        )
+                                        .when(chosen, |row| {
+                                            row.child(
+                                                svg()
+                                                    .path("icons/check.svg")
+                                                    .size(px(theme::ICON_SM))
+                                                    .flex_shrink_0()
+                                                    .text_color(theme::primary()),
+                                            )
+                                        })
+                                },
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// One of the content search's switches.
+    fn render_file_search_option(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        on: bool,
+        toggle: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id(id)
+            .flex_shrink_0()
+            .h(px(28.0))
+            .px_2()
+            .rounded(px(theme::RADIUS_PILL))
+            .border_1()
+            .border_color(if on {
+                theme::primary()
+            } else {
+                theme::border_default()
+            })
+            .bg(if on {
+                theme::primary().opacity(0.12)
+            } else {
+                theme::bg_card()
+            })
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .text_size(theme::font_micro())
+            .text_color(if on {
+                theme::primary()
+            } else {
+                theme::text_secondary()
+            })
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| toggle(this, cx)),
+            )
+            .child(label)
+            .into_any_element()
+    }
+
     /// The file tree panel (search bar + rows + search results).
     fn render_file_tree(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let view = self.files.state.view();
@@ -3600,6 +4931,22 @@ impl MobileWorkbench {
                             })),
                     )
                     .child(
+                        toolbar_icon_button(
+                            "collapse-files",
+                            "icons/chevrons-down-up.svg",
+                            "Collapse folders",
+                        )
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::collapse_file_tree)),
+                    )
+                    .child(
+                        toolbar_icon_button(
+                            "expand-files",
+                            "icons/folder-open.svg",
+                            "Open the next level of folders",
+                        )
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::expand_file_tree_level)),
+                    )
+                    .child(
                         toolbar_icon_button("refresh-files", "icons/refresh.svg", "Refresh")
                             .on_mouse_up(
                                 MouseButton::Left,
@@ -3609,6 +4956,54 @@ impl MobileWorkbench {
                                 }),
                             ),
                     ),
+            )
+            // The content search's switches sit under the field they change,
+            // and only in the mode that has them.
+            .when(
+                self.file_search_mode == MobileFileSearchMode::Content,
+                |panel| {
+                    panel.child(
+                        div()
+                            .id("file-search-options")
+                            .flex_shrink_0()
+                            .px(px(theme::SPACING_SM))
+                            .pb(px(theme::SPACING_XS))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_XS))
+                            .child(self.render_file_search_option(
+                                "file-search-case",
+                                locale::text("Aa", "区分大小写", "區分大小寫"),
+                                self.file_search_case_sensitive,
+                                |this, cx| {
+                                    this.file_search_case_sensitive =
+                                        !this.file_search_case_sensitive;
+                                    this.start_file_search(cx);
+                                },
+                                cx,
+                            ))
+                            .child(self.render_file_search_option(
+                                "file-search-word",
+                                locale::text("Word", "整词", "整詞"),
+                                self.file_search_whole_word,
+                                |this, cx| {
+                                    this.file_search_whole_word = !this.file_search_whole_word;
+                                    this.start_file_search(cx);
+                                },
+                                cx,
+                            ))
+                            .child(self.render_file_search_option(
+                                "file-search-regex",
+                                locale::text("Regex", "正则", "正則"),
+                                self.file_search_regex,
+                                |this, cx| {
+                                    this.file_search_regex = !this.file_search_regex;
+                                    this.start_file_search(cx);
+                                },
+                                cx,
+                            )),
+                    )
+                },
             )
             // The path bar: the tree ellipsises long names, so the full path
             // of the open file lives here and scrolls instead of truncating.
@@ -3684,7 +5079,11 @@ impl MobileWorkbench {
                                 .on_mouse_up(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
-                                        this.select_file(select_path.clone(), cx)
+                                        this.reveal_file_search_result(
+                                            select_path.clone(),
+                                            line,
+                                            cx,
+                                        )
                                     }),
                                 )
                                 .child(mobile_file_tree_icon(
@@ -3784,7 +5183,7 @@ impl MobileWorkbench {
                                 .font_family("IBM Plex Mono")
                                 .text_size(theme::font_micro())
                                 .text_color(theme::text_secondary())
-                                .child(path),
+                                .child(path.clone()),
                         ),
                 )
                 .child(
@@ -3794,6 +5193,41 @@ impl MobileWorkbench {
                         .text_color(status_color)
                         .child(status),
                 )
+                // The path is the one thing on this bar a reader wants to take
+                // with them — into a prompt, a chat, a bug report — and the bar
+                // scrolls, so selecting it by hand is not possible.
+                .child({
+                    let copy_path = path.clone();
+                    div()
+                        .id("copy-file-path")
+                        .aria_label(locale::text("Copy path", "复制路径", "複製路徑").to_string())
+                        .size(px(28.0))
+                        .mr_1()
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .cursor_pointer()
+                        .active(|style| style.bg(theme::row_pressed_bg()))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                                this.show_notice(
+                                    locale::text("Path copied", "路径已复制", "路徑已複製")
+                                        .to_string(),
+                                    cx,
+                                );
+                            }),
+                        )
+                        .child(
+                            svg()
+                                .path("icons/copy.svg")
+                                .size(px(theme::ICON_SM))
+                                .text_color(theme::text_muted()),
+                        )
+                })
                 .child(
                     svg()
                         .path("icons/chevron-right.svg")
@@ -4317,7 +5751,7 @@ impl MobileWorkbench {
                             )
                             .on_mouse_up(
                                 MouseButton::Left,
-                                cx.listener(Self::toggle_git_history_author),
+                                cx.listener(Self::open_git_author_sheet),
                             ),
                         )
                     }),
@@ -4408,11 +5842,21 @@ impl MobileWorkbench {
             .when_some(self.git_diff.clone(), |root, diff| {
                 root.child(self.render_git_diff(diff, cx))
             })
+            .when_some(self.render_worktree_card(cx), |root, card| root.child(card))
             .when(self.git_branch_sheet_open, |root| {
                 root.child(self.render_git_branch_sheet(cx))
             })
+            .when(self.git_author_sheet_open, |root| {
+                root.child(self.render_git_author_sheet(cx))
+            })
+            .when(self.git_date_sheet_open, |root| {
+                root.child(self.render_git_date_sheet(cx))
+            })
             .when(self.file_goto_open, |root| {
                 root.child(self.render_file_goto_prompt(cx))
+            })
+            .when(self.worktree_confirmation.is_some(), |root| {
+                root.child(self.render_worktree_confirmation(cx))
             })
             .into_any_element()
     }
@@ -5073,13 +6517,13 @@ impl MobileWorkbench {
     /// with the old/new line numbers the desktop shows. Long lines wrap with a
     /// hanging indent so a continuation cannot be mistaken for a new line.
     fn render_git_diff(&self, diff: GitDiffResponse, cx: &mut Context<Self>) -> gpui::AnyElement {
-        const MAX_DIFF_LINES: usize = 800;
+        let limit = self.git_diff_limit.max(GIT_DIFF_PAGE_LINES);
         let mut old_line = 0u32;
         let mut new_line = 0u32;
         let lines = diff
             .diff
             .lines()
-            .take(MAX_DIFF_LINES)
+            .take(limit)
             .map(|raw| {
                 let raw = raw.to_string();
                 let (kind, number) = if raw.starts_with("@@") {
@@ -5098,7 +6542,8 @@ impl MobileWorkbench {
                 (kind, number, raw)
             })
             .collect::<Vec<_>>();
-        let truncated = diff.diff.lines().count() > MAX_DIFF_LINES;
+        let total_lines = diff.diff.lines().count();
+        let remaining = total_lines.saturating_sub(limit);
         let path = diff.path.clone();
         div()
             .id("mobile-git-diff-sheet")
@@ -5140,6 +6585,27 @@ impl MobileWorkbench {
                             .text_size(theme::font_caption())
                             .text_color(theme::text_primary())
                             .child(path),
+                    )
+                    // Which side of the index this is, which the header used to
+                    // leave to the reader to infer from the contents.
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_2()
+                            .py(px(2.0))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::bg_card_dim())
+                            .text_size(theme::font_micro())
+                            .text_color(if diff.staged {
+                                theme::accent_green()
+                            } else {
+                                theme::text_secondary()
+                            })
+                            .child(if diff.staged {
+                                locale::text("Staged", "已暂存", "已暫存")
+                            } else {
+                                locale::text("Unstaged", "未暂存", "未暫存")
+                            }),
                     )
                     .child(
                         icon_button("git-diff-close", "icons/x.svg", "Close").on_mouse_up(
@@ -5206,21 +6672,44 @@ impl MobileWorkbench {
                             )
                     })),
             )
-            .when(truncated, |sheet| {
+            // A long patch is paged rather than cut off: the rest of it is one
+            // tap away instead of being a trip to the desktop.
+            .when(remaining > 0, |sheet| {
                 sheet.child(
                     div()
+                        .id("git-diff-more")
                         .flex_shrink_0()
+                        .min_h(px(theme::TOUCH_TARGET))
                         .px(px(theme::SPACING_MD))
-                        .py(px(theme::SPACING_SM))
                         .border_t_1()
                         .border_color(theme::border_subtle())
-                        .text_size(theme::font_micro())
-                        .text_color(theme::text_muted())
-                        .child(locale::text(
-                            "Diff truncated on the phone. Open it on the desktop for the rest.",
-                            "移动端已截断差异，完整内容请在桌面端查看。",
-                            "行動端已截斷差異，完整內容請在桌面版檢視。",
-                        )),
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .active(|style| style.bg(theme::row_pressed_bg()))
+                        .text_size(theme::font_caption())
+                        .text_color(theme::primary())
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.git_diff_limit =
+                                    this.git_diff_limit.saturating_add(GIT_DIFF_PAGE_LINES);
+                                cx.notify();
+                            }),
+                        )
+                        .child(locale::text("Show more lines", "显示更多行", "顯示更多行"))
+                        .child(
+                            div()
+                                .text_size(theme::font_micro())
+                                .text_color(theme::text_muted())
+                                .child(format!(
+                                    "{} {}",
+                                    remaining,
+                                    locale::text("left", "行未显示", "行未顯示")
+                                )),
+                        ),
                 )
             })
             .into_any_element()
@@ -5677,6 +7166,22 @@ impl MobileWorkbench {
                                 }),
                             ),
                     )
+                    .when_some(active.clone(), |bar, _| {
+                        bar.child(
+                            toolbar_icon_button(
+                                "restart-terminal",
+                                "icons/rotate-ccw.svg",
+                                "Restart",
+                            )
+                            .when(can_close && !self.busy, |button| {
+                                button.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::restart_terminal),
+                                )
+                            })
+                            .when(!can_close || self.busy, |button| button.opacity(0.55)),
+                        )
+                    })
                     .when_some(active.clone(), |bar, _| {
                         bar.child(
                             chip_action("close-terminal", locale::common("Close"), can_close).when(
@@ -6947,7 +8452,7 @@ fn file_preview_kind_for_path(path: &str) -> FilePreviewKind {
 
 /// The decoder an image path needs, or `None` when the extension names a
 /// format this build cannot draw.
-fn image_format_for_path(path: &str) -> Option<ImageFormat> {
+pub(crate) fn image_format_for_path(path: &str) -> Option<ImageFormat> {
     let extension = path
         .rsplit('/')
         .next()
@@ -6984,6 +8489,80 @@ fn file_line_range(text: &str, line_number: usize) -> Option<(usize, usize)> {
     }
     // The last line has no newline after it.
     (current == line_number && start <= text.len()).then_some((start, text.len()))
+}
+
+/// What a worktree's readiness state reads as.
+fn worktree_readiness_label(state: GitWorktreeReadinessState) -> &'static str {
+    match state {
+        GitWorktreeReadinessState::Working => locale::text("Working", "开发中", "開發中"),
+        GitWorktreeReadinessState::Reviewing => locale::text("In review", "审阅中", "審閱中"),
+        GitWorktreeReadinessState::ReadyToMerge => locale::text("Ready", "已就绪", "已就緒"),
+        GitWorktreeReadinessState::MergeQueued => locale::text("Queued", "排队中", "排隊中"),
+        GitWorktreeReadinessState::MergeRunning => locale::text("Merging", "合并中", "合併中"),
+        GitWorktreeReadinessState::Unknown => locale::text("Worktree", "Worktree", "Worktree"),
+    }
+}
+
+/// The two things that can be done to a merge already in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeOperationAction {
+    Abort,
+    Continue,
+}
+
+/// A lifecycle action waiting for the reader to confirm it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorktreeConfirmation {
+    /// The plan a merge would run, shown before it runs.
+    Merge(Box<GitWorktreeMergePlan>),
+    /// Discarding the worktree, with the preflight's own risks.
+    Discard(Box<GitWorktreeDestructivePreflight>),
+}
+
+/// The windows of time the history filter offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MobileHistoryWindow {
+    Today,
+    Week,
+    Month,
+}
+
+impl MobileHistoryWindow {
+    const ALL: [Self; 3] = [Self::Today, Self::Week, Self::Month];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Today => locale::text("Today", "今天", "今天"),
+            Self::Week => locale::text("Last 7 days", "最近 7 天", "最近 7 天"),
+            Self::Month => locale::text("Last 30 days", "最近 30 天", "最近 30 天"),
+        }
+    }
+
+    fn days(self) -> i64 {
+        match self {
+            Self::Today => 1,
+            Self::Week => 7,
+            Self::Month => 30,
+        }
+    }
+
+    /// The filter bounds this window stands for, given the current time.
+    fn bounds(self, now_ms: i64) -> (Option<i64>, Option<i64>) {
+        const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+        (
+            Some(now_ms.saturating_sub(self.days() * DAY_MS)),
+            Some(now_ms),
+        )
+    }
+
+    /// The preset a pair of bounds came from, when it is one of them.
+    fn from_bounds(after: Option<i64>, before: Option<i64>, now_ms: i64) -> Option<Self> {
+        let after = after?;
+        before?;
+        Self::ALL
+            .into_iter()
+            .find(|window| window.bounds(now_ms).0 == Some(after))
+    }
 }
 
 /// A branch name clipped to what a chip can show.
@@ -7902,6 +9481,29 @@ mod tests {
         // A point past the row's own width clamps into it rather than panicking.
         assert_eq!(terminal_word_range(&row, 40), (8, 9));
         assert_eq!(terminal_word_range(&[], 3), (3, 3));
+    }
+
+    #[test]
+    fn a_history_window_round_trips_through_the_bounds_it_sets() {
+        const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+        let now = 1_700_000_000_000i64;
+        for window in MobileHistoryWindow::ALL {
+            let (after, before) = window.bounds(now);
+            assert_eq!(before, Some(now));
+            assert_eq!(after, Some(now - window.days() * DAY_MS));
+            assert_eq!(
+                MobileHistoryWindow::from_bounds(after, before, now),
+                Some(window)
+            );
+        }
+        // No bounds at all is "any date", which is not a preset.
+        assert_eq!(MobileHistoryWindow::from_bounds(None, None, now), None);
+        // A window that is not one of the presets keeps its own bounds and
+        // simply reads as unset in the chip.
+        assert_eq!(
+            MobileHistoryWindow::from_bounds(Some(now - 3 * DAY_MS), Some(now), now),
+            None
+        );
     }
 
     #[test]
