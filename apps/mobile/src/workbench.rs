@@ -284,6 +284,11 @@ pub struct MobileWorkbench {
     /// The rendered Markdown view, kept across frames so a preview does not
     /// rebuild its text layout on every paint. Keyed by path and revision.
     file_markdown_view: Option<(String, Entity<markdown::MarkdownView>)>,
+    /// How the content search is run. The desktop offers the same three
+    /// switches; a phone keeps them off until asked for.
+    file_search_case_sensitive: bool,
+    file_search_whole_word: bool,
+    file_search_regex: bool,
     /// The editor's own find bar. The kit input already highlights matches and
     /// reveals the active one with padding, so the phone only has to own the
     /// field and the two step buttons.
@@ -426,6 +431,9 @@ impl MobileWorkbench {
             file_image: None,
             file_image_loading: None,
             file_markdown_view: None,
+            file_search_case_sensitive: false,
+            file_search_whole_word: false,
+            file_search_regex: false,
             file_find_open: false,
             file_find_input: None,
             file_find_subscription: None,
@@ -921,9 +929,9 @@ impl MobileWorkbench {
             workspace_id: self.workspace_id.clone(),
             query,
             include_content: self.file_search_mode == MobileFileSearchMode::Content,
-            case_sensitive: false,
-            whole_word: false,
-            regex: false,
+            case_sensitive: self.file_search_case_sensitive,
+            whole_word: self.file_search_whole_word,
+            regex: self.file_search_regex,
             limit: Some(100),
         };
         let runner = gpui_tokio::Tokio::spawn(cx, self.files.search_files(request));
@@ -3863,6 +3871,51 @@ impl MobileWorkbench {
             .into_any_element()
     }
 
+    /// One of the content search's switches.
+    fn render_file_search_option(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        on: bool,
+        toggle: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id(id)
+            .flex_shrink_0()
+            .h(px(28.0))
+            .px_2()
+            .rounded(px(theme::RADIUS_PILL))
+            .border_1()
+            .border_color(if on {
+                theme::primary()
+            } else {
+                theme::border_default()
+            })
+            .bg(if on {
+                theme::primary().opacity(0.12)
+            } else {
+                theme::bg_card()
+            })
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .text_size(theme::font_micro())
+            .text_color(if on {
+                theme::primary()
+            } else {
+                theme::text_secondary()
+            })
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| toggle(this, cx)),
+            )
+            .child(label)
+            .into_any_element()
+    }
+
     /// The file tree panel (search bar + rows + search results).
     fn render_file_tree(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let view = self.files.state.view();
@@ -3984,6 +4037,54 @@ impl MobileWorkbench {
                                 }),
                             ),
                     ),
+            )
+            // The content search's switches sit under the field they change,
+            // and only in the mode that has them.
+            .when(
+                self.file_search_mode == MobileFileSearchMode::Content,
+                |panel| {
+                    panel.child(
+                        div()
+                            .id("file-search-options")
+                            .flex_shrink_0()
+                            .px(px(theme::SPACING_SM))
+                            .pb(px(theme::SPACING_XS))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_XS))
+                            .child(self.render_file_search_option(
+                                "file-search-case",
+                                locale::text("Aa", "区分大小写", "區分大小寫"),
+                                self.file_search_case_sensitive,
+                                |this, cx| {
+                                    this.file_search_case_sensitive =
+                                        !this.file_search_case_sensitive;
+                                    this.start_file_search(cx);
+                                },
+                                cx,
+                            ))
+                            .child(self.render_file_search_option(
+                                "file-search-word",
+                                locale::text("Word", "整词", "整詞"),
+                                self.file_search_whole_word,
+                                |this, cx| {
+                                    this.file_search_whole_word = !this.file_search_whole_word;
+                                    this.start_file_search(cx);
+                                },
+                                cx,
+                            ))
+                            .child(self.render_file_search_option(
+                                "file-search-regex",
+                                locale::text("Regex", "正则", "正則"),
+                                self.file_search_regex,
+                                |this, cx| {
+                                    this.file_search_regex = !this.file_search_regex;
+                                    this.start_file_search(cx);
+                                },
+                                cx,
+                            )),
+                    )
+                },
             )
             // The path bar: the tree ellipsises long names, so the full path
             // of the open file lives here and scrolls instead of truncating.
@@ -4163,7 +4264,7 @@ impl MobileWorkbench {
                                 .font_family("IBM Plex Mono")
                                 .text_size(theme::font_micro())
                                 .text_color(theme::text_secondary())
-                                .child(path),
+                                .child(path.clone()),
                         ),
                 )
                 .child(
@@ -4173,6 +4274,41 @@ impl MobileWorkbench {
                         .text_color(status_color)
                         .child(status),
                 )
+                // The path is the one thing on this bar a reader wants to take
+                // with them — into a prompt, a chat, a bug report — and the bar
+                // scrolls, so selecting it by hand is not possible.
+                .child({
+                    let copy_path = path.clone();
+                    div()
+                        .id("copy-file-path")
+                        .aria_label(locale::text("Copy path", "复制路径", "複製路徑").to_string())
+                        .size(px(28.0))
+                        .mr_1()
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .cursor_pointer()
+                        .active(|style| style.bg(theme::row_pressed_bg()))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                                this.show_notice(
+                                    locale::text("Path copied", "路径已复制", "路徑已複製")
+                                        .to_string(),
+                                    cx,
+                                );
+                            }),
+                        )
+                        .child(
+                            svg()
+                                .path("icons/copy.svg")
+                                .size(px(theme::ICON_SM))
+                                .text_color(theme::text_muted()),
+                        )
+                })
                 .child(
                     svg()
                         .path("icons/chevron-right.svg")
@@ -5525,6 +5661,27 @@ impl MobileWorkbench {
                             .text_size(theme::font_caption())
                             .text_color(theme::text_primary())
                             .child(path),
+                    )
+                    // Which side of the index this is, which the header used to
+                    // leave to the reader to infer from the contents.
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_2()
+                            .py(px(2.0))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::bg_card_dim())
+                            .text_size(theme::font_micro())
+                            .text_color(if diff.staged {
+                                theme::accent_green()
+                            } else {
+                                theme::text_secondary()
+                            })
+                            .child(if diff.staged {
+                                locale::text("Staged", "已暂存", "已暫存")
+                            } else {
+                                locale::text("Unstaged", "未暂存", "未暫存")
+                            }),
                     )
                     .child(
                         icon_button("git-diff-close", "icons/x.svg", "Close").on_mouse_up(
