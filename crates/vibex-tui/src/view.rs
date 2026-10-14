@@ -8725,6 +8725,14 @@ fn render_runtime_catalogue(
     // Like the session list's, a mark is moved onto the screen once the window is
     // known, so one on a line the reader has scrolled past is never placed.
     let mut wanted_marks: Vec<(usize, SessionRowMark)> = Vec::new();
+    // The account column, measured once from the catalogue rather than from each
+    // row: the widest account the list has to show, capped so one long Provider
+    // Profile cannot spend the room the models need. Every group row pads its
+    // account to it, which is what makes the model beside it start at the same
+    // offset all the way down — the ragged column this replaces started it
+    // wherever the account happened to end.
+    let auth_column =
+        runtime_auth_column(&strings, &options, width.saturating_sub(RUNTIME_ENTRY_LEAD));
     let mut in_group = false;
     let mut in_section = false;
     for (index, row) in rows.iter().enumerate() {
@@ -8793,6 +8801,7 @@ fn render_runtime_catalogue(
                     index == selected,
                     in_group,
                     width,
+                    auth_column,
                     theme,
                 );
                 if let Some((column, identity)) = mark {
@@ -9033,6 +9042,10 @@ fn agent_mark_identity(
 /// Reports the Agent mark the row reserved cells for, and the column it starts
 /// at: a pinned row says which Agent it came from with the mark rather than with
 /// the name, the way the heading it no longer sits under would have.
+///
+/// `auth_column` is the account column the list settled on, so that every row of
+/// a group starts its model at the same offset.
+#[allow(clippy::too_many_arguments)]
 fn runtime_picker_entry_line(
     app: &App,
     options: &[vibex_core::SessionRuntimeOption],
@@ -9040,6 +9053,7 @@ fn runtime_picker_entry_line(
     selected: bool,
     in_group: bool,
     width: usize,
+    auth_column: usize,
     theme: &TuiTheme,
 ) -> (Line<'static>, Option<(u16, String)>) {
     let strings = app.strings;
@@ -9086,26 +9100,31 @@ fn runtime_picker_entry_line(
     let status_width = status.as_deref().map(display_width).unwrap_or_default();
     let status_gap = if status_width > 0 { 2 } else { 0 };
     let available = width.saturating_sub(indent + 2 + mark_width + status_width + status_gap);
-    // The model is what a reader scans for, so it takes the larger share and the
-    // account truncates first: "Agent account/…" names the provenance, but
-    // two rows of the same model on two accounts are still two rows.
+    // The model is what a reader scans for, so it takes what the account leaves
+    // and the account truncates first: "Agent account/…" names the provenance,
+    // but two rows of the same model on two accounts are still two rows.
+    //
+    // The account is a *column*: padded to the width the list measured for it,
+    // so the model starts at the same offset on every row of a group. The model
+    // is the row's last cell and keeps its ragged right edge — a list of names
+    // that all stopped at the same column would be a narrower list for no one.
     let auth_label = runtime_option_auth_label(&strings, option);
     let body = if in_group || mark.is_some() {
         // The Agent has already been said — by the heading above a group's row,
         // by the mark on a pinned one — so the row spends its columns on the two
         // names that tell two entries of one Agent apart.
-        let (auth_width, model_width) = runtime_columns(available);
+        let model_width = available.saturating_sub(auth_column + RUNTIME_COLUMN_SEPARATOR);
         format!(
             "{} · {}",
-            truncate_to_width(&auth_label, auth_width, "…"),
+            fixed_column(&auth_label, auth_column),
             truncate_to_width(&option.model_label, model_width, "…"),
         )
     } else {
         let (agent_width, auth_width, model_width) = pinned_columns(available);
         format!(
             "{} · {} · {}",
-            truncate_to_width(&option.agent_label, agent_width, "…"),
-            truncate_to_width(&auth_label, auth_width, "…"),
+            fixed_column(&option.agent_label, agent_width),
+            fixed_column(&auth_label, auth_width),
             truncate_to_width(&option.model_label, model_width, "…"),
         )
     };
@@ -9348,6 +9367,13 @@ fn selected_line(
     Line::from(spans).style(theme.selected())
 }
 
+/// The columns one of a group's rows spends before its names: the indent under
+/// its Agent's heading, and the two-cell marker.
+const RUNTIME_ENTRY_LEAD: usize = 6;
+
+/// The columns the " · " between two names of a catalogue row takes.
+const RUNTIME_COLUMN_SEPARATOR: usize = 3;
+
 /// Split the width left for "Agent · account · model" between the three names.
 ///
 /// Three names in one row is a squeeze, so the model keeps the largest share and
@@ -9366,15 +9392,39 @@ fn pinned_columns(available: usize) -> (usize, usize, usize) {
     (agent, rest - agent, model)
 }
 
-/// Split the width left for "account · model" between the two names.
-fn runtime_columns(available: usize) -> (usize, usize) {
-    const SEPARATOR: usize = 3;
-    if available <= SEPARATOR {
-        return (0, available);
-    }
-    let body = available - SEPARATOR;
-    let model = (body * 3 / 5).max(4).min(body);
-    (body - model, model)
+/// One cell of a catalogue row: the value cut to its column and the column
+/// filled either way.
+///
+/// A row that only cut its value would leave the column beside it starting
+/// wherever that value happened to end — which is what makes a list of accounts
+/// read as a sentence rather than as a column.
+fn fixed_column(value: &str, width: usize) -> String {
+    pad_to_width(&truncate_to_width(value, width, "…"), width)
+}
+
+/// How many columns the catalogue's account names are given.
+///
+/// As wide as the widest account the list has to show, so one width serves every
+/// row of it, and capped: the account is what a reader checks second, and a
+/// Provider Profile with a paragraph for a name must not spend the room the
+/// models are read in.
+fn runtime_auth_column(
+    strings: &Strings,
+    options: &[vibex_core::SessionRuntimeOption],
+    names: usize,
+) -> usize {
+    /// The widest an account column may grow, in columns.
+    const CAP: usize = 18;
+    /// The room the model keeps beside even the longest account.
+    const MODEL_FLOOR: usize = 12;
+    let widest = options
+        .iter()
+        .map(|option| display_width(&runtime_option_auth_label(strings, option)))
+        .max()
+        .unwrap_or_default();
+    widest
+        .min(CAP)
+        .min(names.saturating_sub(RUNTIME_COLUMN_SEPARATOR + MODEL_FLOOR))
 }
 
 /// The scroll bar beside a list: a track with a thumb that says where the window

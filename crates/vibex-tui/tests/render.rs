@@ -1069,6 +1069,71 @@ fn a_pinned_row_wears_its_agents_mark_where_the_terminal_can_draw_one() {
     );
 }
 
+#[test]
+fn the_models_under_an_agent_start_in_one_column() {
+    // The account is a column, not a word: every row pads it to the widest
+    // account the catalogue publishes, so the model beside it starts at the same
+    // offset all the way down. Cutting the account the way the model is cut — the
+    // state this replaces — starts the model wherever that account happened to
+    // end, which is what made a group of models read as a paragraph.
+    let mut app = app(140, 40);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let option = |account: &str, model: &str| vibex_core::SessionRuntimeOption {
+        selection: vibex_core::SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse("deepseek-harness").expect("agent id"),
+            vibex_core::ProviderProfileId::new(),
+            model,
+        ),
+        agent_label: "DeepSeek Harness".to_string(),
+        auth_source_label: account.to_string(),
+        model_label: model.to_string(),
+        reasoning_efforts: Vec::new(),
+        modes: Vec::new(),
+        features: Vec::new(),
+        availability: vibex_core::RuntimeOptionAvailability::Available,
+    };
+    let catalog = vibex_core::SessionRuntimeOptionCatalog {
+        revision: 1,
+        agents: Vec::new(),
+        auth_sources: Vec::new(),
+        options: vec![
+            option("bai", "m-short"),
+            // A wide glyph is two columns a character, so an account the padding
+            // measured by characters would move this row's model by seven.
+            option("一个很长的账户", "m-middle"),
+            option("go", "m-long-model-name"),
+        ],
+    };
+    app.runtime_options = Some(catalog.clone());
+    // The session is on the third: the row that says "Current" is the one whose
+    // status used to shorten the names before it.
+    open_session_on(&mut app, catalog.options[2].selection.clone());
+    app.show_runtime_picker();
+
+    let lines = render(&mut app, 140, 40);
+    let screen = text(&lines);
+    let column = |needle: &str| {
+        let line = lines
+            .iter()
+            .find(|line| line.contains('│') && line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} is not on screen:\n{screen}"));
+        let interior = modal_interior(line);
+        let at = interior
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} is not on its row: {line:?}"));
+        // Counted in buffer cells rather than in display columns: a wide glyph
+        // and the blank cell it leaves behind are one cell each, so the length of
+        // the prefix is where the needle starts on the screen.
+        interior[..at].chars().count()
+    };
+    let columns = ["m-short", "m-middle", "m-long-model-name"].map(column);
+    assert!(
+        columns.windows(2).all(|pair| pair[0] == pair[1]),
+        "the models do not start in one column: {columns:?}\n{screen}"
+    );
+}
+
 /// The part of a line that lies between the open modal's two vertical borders.
 ///
 /// The page behind the modal keeps drawing, so a line of the screen is not a
