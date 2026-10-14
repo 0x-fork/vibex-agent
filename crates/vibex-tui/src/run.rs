@@ -1317,12 +1317,10 @@ fn handle_composer_key(
         // the row it offers into the draft — the same answer the desktop gives
         // the same popup, and what keeps choosing a command from sending one.
         // It sends only when there is no row to take.
-        KeyCode::Enter => {
-            if app.completion_offers_row() {
-                let outcome = app.perform(Intent::CompletionAccept);
-                dispatch_all(worker, &outcome);
-                return Ok(Some(false));
-            }
+        KeyCode::Enter if app.completion_offers_row() => {
+            let outcome = app.perform(Intent::CompletionAccept);
+            dispatch_all(worker, &outcome);
+            return Ok(Some(false));
         }
         _ => {}
     }
@@ -3760,7 +3758,8 @@ mod tests {
             );
         }
 
-        assert_eq!(app.transcript.blocks()[0].id, "tool:call-1");
+        // The block keeps the name of the update that opened the row.
+        assert_eq!(app.transcript.blocks()[0].id, "tool:call-1:2");
         let screen = conversation_frame(&mut app, 100, 30);
         assert!(screen.contains("ls -la"), "{screen}");
         assert!(
@@ -4142,21 +4141,18 @@ mod tests {
         // than stopping where the sentence happened to.
         let band = app.theme.roles.surface_highlight;
         let band_end = |row: u16| -> Option<u16> {
-            (0..buffer.area.width)
-                .filter(|column| {
-                    buffer
-                        .cell((*column, row))
-                        .is_some_and(|cell| cell.style().bg == Some(band))
-                })
-                .next_back()
+            (0..buffer.area.width).rfind(|column| {
+                buffer
+                    .cell((*column, row))
+                    .is_some_and(|cell| cell.style().bg == Some(band))
+            })
         };
         let echo_text_end = (0..buffer.area.width)
-            .filter(|column| {
+            .rfind(|column| {
                 buffer
                     .cell((*column, echo_row))
                     .is_some_and(|cell| cell.symbol() != " ")
             })
-            .next_back()
             .expect("the echo has no text");
         assert_eq!(
             band_end(title_row),

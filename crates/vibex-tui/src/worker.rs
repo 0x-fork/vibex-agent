@@ -1477,9 +1477,7 @@ impl Dispatch {
                 let result = self.facade.device().cancel_lan_pairing().await;
                 // Taking a window down answers with no window, which is exactly
                 // the state the panel was just put into.
-                self.send(AppMessage::LanPairing(
-                    result.map(|()| None).map_err(Into::into),
-                ));
+                self.send(AppMessage::LanPairing(result.map(|()| None)));
             }
             Effect::RevokeDevice { device_id, reason } => {
                 let request = MutationRequest::new(vibex_core::RemoteRevokeDeviceRequest {
