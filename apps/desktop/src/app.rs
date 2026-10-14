@@ -18672,6 +18672,12 @@ impl VibexWorkbench {
                 let announced = session_rx.recv().await;
                 if let Some(session) = announced.as_ref() {
                     let _ = entity.update(cx, |this, cx| {
+                        // The creation's announcement may have arrived first and
+                        // registered this session among the delegated rows it
+                        // cannot place. This reply is the answer to a creation
+                        // this client asked for, so the row is a navigation root
+                        // here whatever the announcement decided first.
+                        this.delegated_sessions.remove(session.id.as_str());
                         this.upsert_session_snapshot(session.clone());
                         this.set_session_turn_pending(&session.id, true);
                         this.reconcile_sidebar_state();
@@ -32304,6 +32310,13 @@ impl VibexWorkbench {
             session_id: session_id.clone(),
             previous_session_id: self.selected_session_id.clone(),
         });
+        // The authority announces a creation to every client, so the snapshot
+        // may already have arrived and registered this session among the
+        // delegated rows it cannot place. This is the reply to a creation this
+        // client asked for, so the row is a navigation root here whatever the
+        // announcement decided first: a registry entry left in place would keep
+        // it off the sidebar until the next authoritative list read.
+        self.delegated_sessions.remove(session_id.as_str());
         self.upsert_session_snapshot(session);
         self.file_new_session_in_folder(&session_id);
         self.reconcile_sidebar_state();

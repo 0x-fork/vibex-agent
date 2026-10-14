@@ -844,9 +844,9 @@ is never a column count.
   draws.
 * **An act on a session is published to the authority that owns it.** The TUI
   and the Desktop are two windows on one runtime, so an act one of them performs
-  must not be invisible to the other. Two of them travel as
-  `RemoteSidebarOrganizationMutation`, the channel that already carries the
-  per-session marks:
+  must not be invisible to the other. An act travels on the channel that fits
+  it — the per-session marks ride `RemoteSidebarOrganizationMutation`, a row
+  that appears or disappears rides the session streams:
   - *The unread mark, in both directions.* "Unread" is the authority's memory,
     and reading is an act of whichever window has the session on screen, so the
     mark is a value those windows agree on rather than a one-way notification.
@@ -876,6 +876,16 @@ is never a column count.
     drop a row that then survived. A client that owns a Desktop drives the deletion
     through the same tombstone the local delete uses, so no read racing the
     deletion can rebuild the row.
+  - *Creating a session.* A creation adds a row no client's list has yet, and the
+    caller's reply reaches nobody else, so the manager publishes the committed
+    snapshot on the session-update stream (`subscribe_session_updates`) — the
+    same stream a rename, an archive or a turn boundary rides. The runtime fans
+    it out as `DesktopEvent::SessionUpdated`, which is what makes an in-process
+    client answer a session it cannot place by refreshing the authoritative root
+    list, and publishes the sidebar invalidation beside it, which is how a remote
+    client learns to re-read its own. The snapshot is published only after the
+    row commits, and a client whose own creation reply races the announcement
+    must still end up with a navigation row rather than a delegated one.
 * **A running turn is what the spinner animates on.** `is_animating` is the
   single question the loop asks before repainting on its own, and it answers
   yes while a turn reads as running (`turn_reads_running`), not only while
