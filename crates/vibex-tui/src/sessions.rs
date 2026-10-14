@@ -150,17 +150,12 @@ pub struct SessionListInput<'a> {
 
 /// The list as the page draws it.
 ///
-/// The rows are the tree; the counts beside them are what a heading needs to
-/// say *how much* it holds, which the drawn rows cannot answer once a group is
-/// folded shut. The tally is what the page's header summarises: the reader
-/// scanning for work wants to know how much of it there is before reading a
-/// single row.
+/// The rows are the tree; the tally is what the page's header summarises, so a
+/// reader scanning for work knows how much of it there is before reading a
+/// single row. How much one *heading* holds is not carried: nothing draws it,
+/// and a heading is read by opening it.
 pub struct SessionListRows {
     pub rows: Vec<AgentSidebarRow>,
-    /// Sessions under each row's heading, parallel to `rows`. A session row is
-    /// nobody's heading, so it carries zero; a folded heading still carries the
-    /// size of what it hides.
-    pub counts: Vec<usize>,
     /// Sessions the list holds, by the state family the header counts. Only
     /// families with something in them are worth a chip, so zero-count
     /// families are left out.
@@ -284,10 +279,8 @@ pub fn session_list_rows(input: &SessionListInput<'_>) -> SessionListRows {
     let project_ids = ordered_project_ids(&projects, &input.view.project_order);
 
     let mut rows = Vec::new();
-    let mut counts = Vec::new();
     push_root_children(
         &mut rows,
-        &mut counts,
         input,
         &sessions_by_project,
         &entries,
@@ -297,11 +290,7 @@ pub fn session_list_rows(input: &SessionListInput<'_>) -> SessionListRows {
         None,
         0,
     );
-    SessionListRows {
-        rows,
-        counts,
-        states,
-    }
+    SessionListRows { rows, states }
 }
 
 /// Projects in the order the sidebar shows them: the reader's arrangement
@@ -335,7 +324,6 @@ fn ordered_project_ids(projects: &[ProjectEntry], project_order: &[String]) -> V
 #[allow(clippy::too_many_arguments)]
 fn push_root_children(
     rows: &mut Vec<AgentSidebarRow>,
-    counts: &mut Vec<usize>,
     input: &SessionListInput<'_>,
     sessions_by_project: &BTreeMap<String, Vec<AgentSession>>,
     entries: &BTreeMap<String, ProjectEntry>,
@@ -351,7 +339,6 @@ fn push_root_children(
             SidebarOrganizationItem::Project(project_id) => {
                 push_project(
                     rows,
-                    counts,
                     input,
                     sessions_by_project,
                     entries,
@@ -369,13 +356,11 @@ fn push_root_children(
                 let matches_name = folder.name.to_lowercase().contains(query);
                 let collapsed = organization.collapsed_folder_ids.contains(&folder_id);
                 let mut children = Vec::new();
-                let mut child_counts = Vec::new();
                 // The folder's children are built even while it is folded shut:
-                // the heading says how much it holds either way, and a folded
-                // heading that could not count would be a heading that lies.
+                // a search reaches inside a folded folder, and a heading whose
+                // children were never built could not answer it.
                 push_root_children(
                     &mut children,
-                    &mut child_counts,
                     input,
                     sessions_by_project,
                     entries,
@@ -404,10 +389,8 @@ fn push_root_children(
                     child_count: 0,
                     parent_id: parent_folder_id.map(ToString::to_string),
                 });
-                counts.push(subtree_sessions(&children, &child_counts));
                 if !collapsed || searching {
                     rows.extend(children);
-                    counts.extend(child_counts);
                 }
             }
             SidebarOrganizationItem::Session(_) | SidebarOrganizationItem::Group(_) => {}
@@ -419,7 +402,6 @@ fn push_root_children(
 #[allow(clippy::too_many_arguments)]
 fn push_project(
     rows: &mut Vec<AgentSidebarRow>,
-    counts: &mut Vec<usize>,
     input: &SessionListInput<'_>,
     sessions_by_project: &BTreeMap<String, Vec<AgentSession>>,
     entries: &BTreeMap<String, ProjectEntry>,
@@ -463,10 +445,8 @@ fn push_project(
         ids
     };
     let mut children = Vec::new();
-    let mut child_counts = Vec::new();
     push_project_children(
         &mut children,
-        &mut child_counts,
         input,
         project_id,
         &project_sessions,
@@ -502,10 +482,8 @@ fn push_project(
         child_count: 0,
         parent_id: parent_folder_id.map(ToString::to_string),
     });
-    counts.push(subtree_sessions(&children, &child_counts));
     if !collapsed || searching {
         rows.extend(children);
-        counts.extend(child_counts);
     }
 }
 
@@ -513,7 +491,6 @@ fn push_project(
 #[allow(clippy::too_many_arguments)]
 fn push_project_children(
     rows: &mut Vec<AgentSidebarRow>,
-    counts: &mut Vec<usize>,
     input: &SessionListInput<'_>,
     project_id: &str,
     project_sessions: &[AgentSession],
@@ -561,7 +538,6 @@ fn push_project_children(
                     child_count,
                     parent_id: parent_folder_id.map(ToString::to_string),
                 });
-                counts.push(0);
                 // The branch hangs under the row that owns it, indented one
                 // step in, and only while the reader has it open. A search
                 // reaches inside a folded branch the way it reaches inside a
@@ -571,7 +547,6 @@ fn push_project_children(
                 {
                     push_child_rows(
                         rows,
-                        counts,
                         input.children,
                         project_id,
                         &session.id,
@@ -588,12 +563,10 @@ fn push_project_children(
                 let matches_name = folder.name.to_lowercase().contains(query);
                 let collapsed = organization.collapsed_folder_ids.contains(&folder_id);
                 let mut children = Vec::new();
-                let mut child_counts = Vec::new();
                 // Built whether or not the folder is open, for the same reason
-                // the root-level folder is: the count on the heading.
+                // the root-level folder is: a search reaches inside it.
                 push_project_children(
                     &mut children,
-                    &mut child_counts,
                     input,
                     project_id,
                     project_sessions,
@@ -622,10 +595,8 @@ fn push_project_children(
                     child_count: 0,
                     parent_id: parent_folder_id.map(ToString::to_string),
                 });
-                counts.push(subtree_sessions(&children, &child_counts));
                 if !collapsed || searching {
                     rows.extend(children);
-                    counts.extend(child_counts);
                 }
             }
             // A group row is a leaf this client does not draw yet; its members
@@ -634,46 +605,6 @@ fn push_project_children(
             SidebarOrganizationItem::Project(_) | SidebarOrganizationItem::Group(_) => {}
         }
     }
-}
-
-/// How many sessions a heading holds: every session in its subtree, folded or
-/// not.
-///
-/// Counted through the children's own counts rather than by looking at the
-/// drawn rows, because a folded heading keeps its sessions out of the row list
-/// while still holding them.
-///
-/// A folder's rows are the one thing that must not be counted here: they are
-/// spliced into the same list, one step in, and the folder's own count already
-/// holds them. Adding them again counted every session in an open folder twice,
-/// which is a heading that overstates what it holds — and the count is a badge
-/// beside the name now, so the overstatement is the first thing read.
-fn subtree_sessions(children: &[AgentSidebarRow], counts: &[usize]) -> usize {
-    // A child names its folder by the folder's own id, while the heading's row
-    // id carries the `folder:` prefix the list addresses rows by. Only that
-    // prefix is stripped: a delegated child names its parent as `session:<id>`,
-    // and those sessions are *not* inside the parent's own count.
-    let folders = children
-        .iter()
-        .filter(|row| row.kind == AgentSidebarRowKind::Folder)
-        .filter_map(|row| row.id.strip_prefix("folder:"))
-        .collect::<BTreeSet<_>>();
-    children
-        .iter()
-        .zip(counts)
-        .filter(|(row, _)| {
-            row.parent_id
-                .as_deref()
-                .is_none_or(|parent| !folders.contains(parent))
-        })
-        .map(|(row, count)| {
-            if row.kind == AgentSidebarRowKind::Session {
-                1
-            } else {
-                *count
-            }
-        })
-        .sum()
 }
 
 /// One session's delegated children, then theirs, under the row that owns them.
@@ -685,7 +616,6 @@ fn subtree_sessions(children: &[AgentSidebarRow], counts: &[usize]) -> usize {
 #[allow(clippy::too_many_arguments)]
 fn push_child_rows(
     rows: &mut Vec<AgentSidebarRow>,
-    counts: &mut Vec<usize>,
     children: &crate::children::ChildSessions,
     project_id: &str,
     parent_session_id: &VibexSessionId,
@@ -732,11 +662,9 @@ fn push_child_rows(
             // never treat a worker as a peer of the session that owns it.
             parent_id: Some(format!("session:{}", parent_session_id.as_str())),
         });
-        counts.push(0);
         if child_count > 0 && (!collapsed || searching) {
             push_child_rows(
                 rows,
-                counts,
                 children,
                 project_id,
                 &child_id,
@@ -852,7 +780,6 @@ pub fn nest_child_rows(
     let query = query.trim().to_lowercase();
     let searching = !query.is_empty();
     let mut nested = Vec::with_capacity(rows.len());
-    let mut scratch = Vec::new();
     for mut row in rows {
         let Some(session_id) = row.session_id.clone() else {
             nested.push(row);
@@ -869,10 +796,8 @@ pub fn nest_child_rows(
         if child_count == 0 || (collapsed && !searching) {
             continue;
         }
-        scratch.clear();
         push_child_rows(
             &mut nested,
-            &mut scratch,
             children,
             &project_id,
             &session_id,
@@ -949,39 +874,6 @@ pub(crate) fn session_matches(session: &AgentSession, query: &str) -> bool {
     query.is_empty()
         || session.title.to_lowercase().contains(query)
         || session.workspace_root.to_lowercase().contains(query)
-}
-
-/// Heading counts for a projection that draws its own rows.
-///
-/// The arranged tree counts a heading while it builds it, because only it knows
-/// which sessions it decided to keep. A projection built elsewhere does not, so
-/// the headings are counted here from the sessions the rows name: the same
-/// question, asked of the rows rather than of the tree.
-pub fn heading_counts(
-    rows: &[AgentSidebarRow],
-    sessions: &[AgentSession],
-    children: &crate::children::ChildSessions,
-    query: &str,
-) -> Vec<usize> {
-    rows.iter()
-        .map(|row| {
-            if row.kind == AgentSidebarRowKind::Session {
-                return 0;
-            }
-            let belongs = |session: &&AgentSession| {
-                session.deleted_at_ms.is_none()
-                    && session_matches(session, query)
-                    && session.project_id.as_str() == row.project_id
-                    && (row.workspace_id.is_empty()
-                        || session.workspace_id.as_str() == row.workspace_id)
-            };
-            // The root sessions and the children the tree named: a heading
-            // that counted only what the runtime's root list carried would
-            // under-report a project by every worker delegated in it.
-            sessions.iter().filter(belongs).count()
-                + children.child_sessions().filter(belongs).count()
-        })
-        .collect()
 }
 
 /// The last path segment of a workspace root, which is the name a project row
@@ -1182,126 +1074,27 @@ mod tests {
     }
 
     #[test]
-    fn a_heading_counts_what_it_holds_even_when_it_is_folded_shut() {
+    fn a_folded_folder_hides_its_rows_and_a_search_still_reaches_them() {
         let view = arranged_view();
         let list = list_for(&view, "");
-        let (index, _) = list
-            .rows
-            .iter()
-            .enumerate()
-            .find(|(_, row)| row.label == "archive")
-            .expect("the folded folder's heading");
-        // The folder hides its one session, and still says it holds one.
-        assert_eq!(
-            list.counts[index], 1,
-            "a folded heading stopped counting: {:#?}",
+        assert!(
+            !list.rows.iter().any(|row| row.label == "archived away"),
+            "a folded folder drew its child: {:#?}",
             list.rows
         );
-        assert!(!list.rows.iter().any(|row| row.label == "archived away"));
-        // A session row is nobody's heading.
-        let (session_index, _) = list
-            .rows
-            .iter()
-            .enumerate()
-            .find(|(_, row)| row.label == "kept")
-            .expect("a session row");
-        assert_eq!(list.counts[session_index], 0);
-        // The project heading counts its whole subtree, the folded folder's
-        // session included.
-        let (project_index, _) = list
-            .rows
-            .iter()
-            .enumerate()
-            .find(|(_, row)| row.label == "vibex")
-            .expect("the project heading");
-        assert_eq!(list.counts[project_index], 4);
-    }
-
-    /// A heading counts what it holds once, however deep the tree goes: a
-    /// folder's rows are spliced into the same list one step in, and the
-    /// folder's own count already holds them.
-    #[test]
-    fn a_heading_does_not_count_an_open_folders_rows_twice() {
-        let mut organization = SidebarOrganizationState::default();
-        organization.folders.insert(
-            "folder-notes".to_string(),
-            SidebarFolderUiState {
-                name: "notes".to_string(),
-                project_id: Some("project_vibex".to_string()),
-                workspace_id: None,
-                auto_archive_after_days: None,
-            },
+        assert!(
+            list.rows.iter().any(|row| row.label == "archive"),
+            "a folded folder lost its own heading: {:#?}",
+            list.rows
         );
-        organization.placements = vec![
-            SidebarOrganizationPlacement {
-                item: SidebarOrganizationItem::Project("project_vibex".to_string()),
-                parent_folder_id: None,
-            },
-            SidebarOrganizationPlacement {
-                item: SidebarOrganizationItem::Session("session_one00001".to_string()),
-                parent_folder_id: None,
-            },
-            SidebarOrganizationPlacement {
-                item: SidebarOrganizationItem::Folder("folder-notes".to_string()),
-                parent_folder_id: None,
-            },
-            SidebarOrganizationPlacement {
-                item: SidebarOrganizationItem::Session("session_two00001".to_string()),
-                parent_folder_id: Some("folder-notes".to_string()),
-            },
-        ];
-        let view = SidebarOrganizationView {
-            revision: 1,
-            organization,
-            collapsed_project_ids: BTreeSet::new(),
-            collapsed_workspace_ids: BTreeSet::new(),
-            pinned_session_ids: BTreeSet::new(),
-            session_order: vec![
-                "session_one00001".to_string(),
-                "session_two00001".to_string(),
-            ],
-            session_order_anchored_at_ms: i64::MAX,
-            hierarchy_mode: vibex_desktop_model::SidebarHierarchyMode::Compact,
-            project_order: vec!["project_vibex".to_string()],
-            workspace_order: BTreeMap::new(),
-            project_appearances: BTreeMap::new(),
-            worktree_titles: BTreeMap::new(),
-            project_location_preferences: BTreeMap::new(),
-            auto_continue_project_ids: BTreeSet::new(),
-            auto_continue_session_overrides: BTreeMap::new(),
-            auto_continue_session_ids: BTreeSet::new(),
-            auto_continue_paused_session_ids: BTreeSet::new(),
-            unread_session_ids: BTreeSet::new(),
-            scheduled_sends: Vec::new(),
-        };
-        let sessions = vec![
-            session("session_one00001", "vibex", "one", 2),
-            session("session_two00001", "vibex", "two", 1),
-        ];
-        let projects = vec![ProjectEntry {
-            id: "project_vibex".to_string(),
-            label: "vibex".to_string(),
-            created_at_ms: 1,
-            has_workspace: true,
-        }];
-        let list = session_list_rows(&SessionListInput {
-            view: &view,
-            sessions: &sessions,
-            projects: &projects,
-            unread_session_ids: &BTreeSet::new(),
-            children: &crate::children::ChildSessions::default(),
-            query: "",
-        });
-        assert_eq!(
-            labels(&list.rows),
-            vec!["vibex", "one", "notes", "two"],
-            "the open folder's rows are not drawn inside it"
+        // The folder's children are still built, which is what lets the filter
+        // find a session the reader cannot see.
+        let found = list_for(&view, "archived away");
+        assert!(
+            labels(&found.rows).contains(&"archived away".to_string()),
+            "a search did not reach inside the folder: {:#?}",
+            found.rows
         );
-        assert_eq!(
-            list.counts[0], 2,
-            "the project counts its open folder's session twice"
-        );
-        assert_eq!(list.counts[2], 1, "the folder's own count is wrong");
     }
 
     #[test]
@@ -1674,13 +1467,6 @@ mod tests {
             .find(|row| row.label == "the helper")
             .expect("the helper's row");
         assert_eq!(helper.depth, 3, "the branch stops one level deep");
-        // The owner's heading counts what the whole subtree holds.
-        let (index, _) = rows
-            .iter()
-            .enumerate()
-            .find(|(_, row)| row.label == "vibex")
-            .expect("the project heading");
-        assert_eq!(list.counts[index], 6, "the heading forgot the branch");
         // Folding the owner's branch hides both levels at once.
         let mut folded = children.clone();
         folded.toggle_collapsed("session_recent01");

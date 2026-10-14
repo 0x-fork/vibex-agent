@@ -2717,13 +2717,7 @@ impl App {
                     &self.children,
                     &self.filter,
                 );
-                let counts =
-                    crate::sessions::heading_counts(&rows, loaded, &self.children, &self.filter);
-                crate::sessions::SessionListRows {
-                    counts,
-                    rows,
-                    states,
-                }
+                crate::sessions::SessionListRows { rows, states }
             }
         }
     }

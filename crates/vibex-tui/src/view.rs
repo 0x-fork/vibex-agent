@@ -1562,7 +1562,6 @@ fn render_session_rows(
         let mut row_marks = Vec::new();
         let row_lines = session_list_item(
             row,
-            list.counts.get(index).copied().unwrap_or(0),
             index == selected,
             app.hover == Some((Scope::Sessions, index)),
             hovered_action
@@ -1710,7 +1709,6 @@ fn render_session_rows(
 #[allow(clippy::too_many_arguments)]
 fn session_list_item(
     row: &vibex_desktop_model::AgentSidebarRow,
-    count: usize,
     selected: bool,
     hovered: bool,
     hovered_control: Option<Intent>,
@@ -1732,7 +1730,6 @@ fn session_list_item(
         return vec![
             session_heading_line(
                 row,
-                count,
                 selected,
                 hovered,
                 hovered_control,
@@ -1841,12 +1838,11 @@ fn row_icon_slot(
 ///
 /// The rule is what turns a stack of rows into sections: without it a project
 /// name is one more line of text, and the reader has to read it to find the
-/// next one. The badge after the name is the count the desktop draws there, and
-/// the trailing mark is the "N running" it keeps at the row's far edge.
+/// next one. The trailing mark is the "N running" the desktop keeps at the
+/// row's far edge, and past it are the row's own buttons.
 #[allow(clippy::too_many_arguments)]
 fn session_heading_line(
     row: &vibex_desktop_model::AgentSidebarRow,
-    count: usize,
     selected: bool,
     hovered: bool,
     hovered_control: Option<Intent>,
@@ -1908,27 +1904,20 @@ fn session_heading_line(
     });
     spans.push(Span::styled(" ", blank));
     // What the row's right end holds, from the rule to the edge: the running
-    // count the desktop keeps at the far edge, the badge that says how much the
-    // heading holds, and the buttons. All of it is measured before the name is
-    // cut, so the name gives way rather than the shape of the row.
+    // count the desktop keeps at the far edge, and the buttons. Both are
+    // measured before the name is cut, so the name gives way rather than the
+    // shape of the row.
     let buttons = heading_buttons(row);
     let running = heading_running_label(row, app, strings);
-    // The badge sits against the buttons rather than beside the name: it is the
-    // number those buttons act on, and the name is what the reader is looking
-    // for — a digit in the middle of it is a digit between the reader and the
-    // word. It is drawn even at zero, because a project the reader has opened
-    // and not yet talked to is a fact the row should state rather than hide.
-    let badge = format!(" {count} ");
-    let badge_width = display_width(&badge);
     let running_block = if running.is_empty() {
         0
     } else {
         // The running count keeps a column of air on each side: against the rule
-        // it is punctuation, and against the badge it is a different kind of
+        // it is punctuation, and against the buttons it is a different kind of
         // fact.
         display_width(&running) + 2
     };
-    let right = running_block + badge_width + icon_cluster_width(buttons.len()) + ROW_CONTROL_AIR;
+    let right = running_block + icon_cluster_width(buttons.len()) + ROW_CONTROL_AIR;
     // The name gives way before the shape of the heading does: a heading whose
     // rule ran out is still a heading, but a heading without its name is not.
     let label_width = width
@@ -1957,8 +1946,7 @@ fn session_heading_line(
     // is drawn beside the badge instead of under the buttons.
     // Where the trailing block starts, and where each piece of it leaves the
     // cursor: the buttons publish the rect a click lands on, so a column that
-    // did not follow the count and the badge would be a button the pointer
-    // cannot hit.
+    // did not follow the running count would be a button the pointer cannot hit.
     let mut column = width.saturating_sub(right - ROW_CONTROL_AIR);
     if !running.is_empty() {
         spans.push(Span::styled(
@@ -1967,13 +1955,6 @@ fn session_heading_line(
         ));
         column += running_block;
     }
-    spans.push(Span::styled(
-        badge,
-        Style::default()
-            .fg(theme.roles.gray)
-            .bg(theme.roles.code_background),
-    ));
-    column += badge_width;
     for (index, (icon, intent)) in buttons.iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled(" ".repeat(ROW_CONTROL_GAP), blank));

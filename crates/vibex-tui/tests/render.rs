@@ -9717,8 +9717,18 @@ fn a_group_heading_counts_its_sessions_and_rules_the_section() {
         "the rule does not run from the name: {heading:?}"
     );
     assert!(
-        heading.trim_end().ends_with("2 …  +"),
-        "the count is not the last word before the buttons: {heading:?}"
+        !heading[..rule].contains(|character: char| character.is_ascii_digit()),
+        "a count is back beside the name: {heading:?}"
+    );
+    // The row's own buttons close it, and nothing is drawn between them and the
+    // rule.
+    assert!(
+        heading.trim_end().ends_with("…  +"),
+        "the heading does not end in its buttons: {heading:?}"
+    );
+    assert!(
+        !heading.trim_end().ends_with(|character: char| character.is_ascii_digit()),
+        "a count is back at the row's right end: {heading:?}"
     );
     // A session row is not a heading: it carries the mark and the age instead.
     let row = screen
