@@ -3340,6 +3340,43 @@ impl DesktopRuntime {
                 }
             }
         }));
+        let mut session_removals = self.agent.manager.subscribe_session_removals();
+        let removal_tx = self.events.clone();
+        let removal_gateway = self.remote.gateway.clone();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                match session_removals.recv().await {
+                    Ok(session_ids) => {
+                        let _ = removal_tx.send(DesktopEvent::SessionsRemoved(session_ids));
+                        // A remote client draws its list from the sidebar
+                        // projection, so a removal has to invalidate it exactly
+                        // as a snapshot update does.
+                        if let Err(error) = removal_gateway.publish_sidebar_invalidation() {
+                            tracing::warn!(
+                                target: "vibex_desktop",
+                                error_code = %error.code,
+                                "Remote session sidebar invalidation failed"
+                            );
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let _ = removal_tx.send(DesktopEvent::Lagged {
+                            stream: DesktopEventStream::Fanout,
+                            skipped,
+                            refetch: AuthoritativeRefetch::for_stream(DesktopEventStream::Fanout),
+                        });
+                        if let Err(error) = removal_gateway.publish_sidebar_invalidation() {
+                            tracing::warn!(
+                                target: "vibex_desktop",
+                                error_code = %error.code,
+                                "Remote session sidebar invalidation failed"
+                            );
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
         let mut runtime_events = self.agent.runtime_lifecycle.subscribe();
         let runtime_tx = self.events.clone();
         tasks.push(tokio::spawn(async move {

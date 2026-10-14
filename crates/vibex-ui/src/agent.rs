@@ -1811,6 +1811,37 @@ impl AgentWorkflowController {
                     AgentEventDecision::IgnoredStale
                 }
             }
+            BackendEvent::SessionsRemoved(session_ids) => {
+                // A removal names sessions that no longer exist, so the list is
+                // the only surface that can act on it: dropping the rows here is
+                // what keeps a read issued before the deletion from rebuilding
+                // them. The open session is dropped too, because continuing to
+                // show a timeline for a deleted row is how a client offers to
+                // work in something the runtime no longer has.
+                let mut changed = false;
+                let removed = session_ids.iter().collect::<BTreeSet<_>>();
+                if let Some(sessions) = self.state.sessions.value.as_mut() {
+                    let before = sessions.len();
+                    sessions.retain(|session| !removed.contains(&session.id));
+                    changed |= sessions.len() != before;
+                }
+                if self
+                    .state
+                    .selected_session_id
+                    .as_ref()
+                    .is_some_and(|selected| removed.contains(selected))
+                {
+                    self.state.selected_session_id = None;
+                    self.state.active_session = AsyncState::default();
+                    self.state.timeline = TimelineModel::default();
+                    changed = true;
+                }
+                if changed {
+                    AgentEventDecision::Applied
+                } else {
+                    AgentEventDecision::IgnoredStale
+                }
+            }
             BackendEvent::Notification(_) => AgentEventDecision::IgnoredStale,
             BackendEvent::Runtime(event) => {
                 if self.state.selected_session_id.as_ref() != Some(&event.session_id) {
@@ -2921,6 +2952,36 @@ mod tests {
             .expect("pending send should retain the user turn");
         assert!(turn.user_row.is_some());
         assert!(!turn.complete);
+    }
+
+    #[test]
+    fn a_removed_session_leaves_the_list_and_the_open_page() {
+        // A deletion deletes the row rather than updating it, so a client learns
+        // of it only from the ids. The open session goes with the row: offering
+        // to keep working in a session the runtime no longer has is the failure
+        // the event exists to prevent.
+        let mut session = session();
+        session.updated_at_ms = 10;
+        let backend = Arc::new(MockAgentBackend::new(session.clone(), Vec::new()));
+        let mut controller = AgentWorkflowController::new(backend, capabilities());
+        controller.state.sessions.resolve(vec![session.clone()]);
+        controller.state.selected_session_id = Some(session.id.clone());
+        controller.state.active_session.resolve(session.clone());
+
+        assert_eq!(
+            controller.apply_event(BackendEvent::SessionsRemoved(vec![session.id.clone()])),
+            AgentEventDecision::Applied
+        );
+        assert_eq!(controller.state.sessions.value, Some(Vec::new()));
+        assert_eq!(controller.state.selected_session_id, None);
+        assert!(controller.state.active_session.value.is_none());
+
+        // A second arrival for the same ids changes nothing, and one for a
+        // session this client never listed does not even count as a change.
+        assert_eq!(
+            controller.apply_event(BackendEvent::SessionsRemoved(vec![session.id])),
+            AgentEventDecision::IgnoredStale
+        );
     }
 
     #[test]

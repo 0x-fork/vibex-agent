@@ -68,6 +68,13 @@ impl AuthoritativeRefetch {
 pub enum DesktopEvent {
     Timeline(TimelineLiveEvent),
     SessionUpdated(AgentSession),
+    /// Sessions a committed deletion removed.
+    ///
+    /// A deletion deletes the row, so unlike an archive there is no updated
+    /// snapshot to broadcast: the ids are what a client drops from the list it
+    /// is drawing. A read in flight still describes the row, so the ids are the
+    /// only account of the removal that arrives in time to answer it.
+    SessionsRemoved(Vec<VibexSessionId>),
     Runtime(RuntimeSessionEvent),
     RuntimeSelection(AgentSessionRuntimeSelectionEvent),
     ProviderConfigChanged(ProviderConfigChangedEvent),

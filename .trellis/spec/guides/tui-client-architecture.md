@@ -803,6 +803,31 @@ is never a column count.
   does when the capability is unsupported. Two arrangements are never mixed:
   while one is loaded, the local `tui-sidebar.json` state is not what the list
   draws.
+* **An act on a session is published to the authority that owns it.** The TUI
+  and the Desktop are two windows on one runtime, so an act one of them performs
+  must not be invisible to the other. Two of them travel as
+  `RemoteSidebarOrganizationMutation`, the channel that already carries the
+  per-session marks:
+  - *Reading a session.* "Unread" is the authority's memory, so opening a
+    session here sends `MarkSessionsRead` before it clears anything locally, and
+    the Desktop drops the same id from its own badge set. The unread set is
+    therefore stored on its own (`App::authority_unread_sessions`) rather than
+    read out of the arrangement view: an arrangement that arranges nothing is
+    deliberately dropped, and the marks have to survive that. A read is not an
+    edit of the tree, so it carries **no expected revision** — a rearrangement on
+    the Desktop between the read and the mark must not refuse the read or make it
+    look like a failed tree edit.
+  - *Deleting a session.* A deletion deletes the row, so there is no surviving
+    snapshot to broadcast. The manager publishes the removed ids on its own
+    channel (`subscribe_session_removals`), the runtime fans them out as
+    `DesktopEvent::SessionsRemoved` / `BackendEvent::SessionsRemoved`, and a
+    client drops the rows, the open page and its own per-session state
+    (`forget_removed_sessions`). A remote client learns the same news from the
+    sidebar invalidation the runtime publishes with it and re-reads the list. The
+    ids are published only after the deletion commits: a client told earlier would
+    drop a row that then survived. A client that owns a Desktop drives the deletion
+    through the same tombstone the local delete uses, so no read racing the
+    deletion can rebuild the row.
 * **A running turn is what the spinner animates on.** `is_animating` is the
   single question the loop asks before repainting on its own, and it answers
   yes while a turn reads as running (`turn_reads_running`), not only while

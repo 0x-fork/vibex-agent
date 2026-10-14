@@ -61,6 +61,11 @@ pub struct BackendRefetch {
 pub enum BackendEvent {
     Timeline(TimelineLiveEvent),
     SessionUpdated(AgentSession),
+    /// Sessions a committed deletion removed, as the ids a client drops.
+    ///
+    /// A deletion deletes the row rather than updating it, so there is no
+    /// snapshot to carry the change: the ids are the whole account of it.
+    SessionsRemoved(Vec<vibex_core::VibexSessionId>),
     Notification(AgentNotificationIntent),
     Runtime(RuntimeSessionEvent),
     RuntimeSelection(AgentSessionRuntimeSelectionEvent),

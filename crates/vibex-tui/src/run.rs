@@ -2587,6 +2587,13 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             // early update cannot put the default back on a named row.
             let event = app.reconcile_session_event(event);
             let session_update = matches!(&event, vibex_backend::BackendEvent::SessionUpdated(_));
+            // A removal names sessions this client may still badge or hold an
+            // echo for; the controller drops the shared rows, so the client's
+            // own per-session state has to go with them or the maps keep a
+            // line for a row no reader can ever open again.
+            if let vibex_backend::BackendEvent::SessionsRemoved(session_ids) = &event {
+                app.forget_removed_sessions(session_ids);
+            }
             let decision = app.agent.apply_event(event);
             match decision {
                 vibex_ui::AgentEventDecision::Applied => {

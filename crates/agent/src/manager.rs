@@ -163,6 +163,11 @@ pub struct AgentManager {
     generic_acp_runtime: Option<Arc<dyn AgentProvider>>,
     live_events: broadcast::Sender<TimelineLiveEvent>,
     session_events: broadcast::Sender<AgentSession>,
+    /// Sessions a committed deletion removed. A deletion is a hard row delete,
+    /// so there is no surviving snapshot to broadcast; clients that draw a
+    /// session list need the ids to drop the rows a read in flight still
+    /// describes.
+    session_removals: broadcast::Sender<Vec<VibexSessionId>>,
     notification_events: broadcast::Sender<AgentNotificationIntent>,
     runtime_selection: OnceLock<Weak<RuntimeSelectionService>>,
     runtime_lifecycle: OnceLock<Weak<RuntimeLifecycleService>>,
@@ -607,6 +612,7 @@ impl AgentManager {
         let context_bridge = ContextBridgeService::new(db_path.clone())?;
         let (live_events, _) = broadcast::channel(512);
         let (session_events, _) = broadcast::channel(256);
+        let (session_removals, _) = broadcast::channel(256);
         let (notification_events, _) = broadcast::channel(256);
         let manager = Self {
             db_path,
@@ -615,6 +621,7 @@ impl AgentManager {
             generic_acp_runtime: None,
             live_events,
             session_events,
+            session_removals,
             notification_events,
             runtime_selection: OnceLock::new(),
             runtime_lifecycle: OnceLock::new(),
@@ -701,6 +708,11 @@ impl AgentManager {
 
     pub fn subscribe_session_updates(&self) -> broadcast::Receiver<AgentSession> {
         self.session_events.subscribe()
+    }
+
+    /// Sessions a committed deletion removed, as the ids a client should drop.
+    pub fn subscribe_session_removals(&self) -> broadcast::Receiver<Vec<VibexSessionId>> {
+        self.session_removals.subscribe()
     }
 
     pub fn subscribe_notifications(&self) -> broadcast::Receiver<AgentNotificationIntent> {
@@ -4635,8 +4647,14 @@ impl AgentManager {
                 )
                 .with_diagnostic("error", error.to_string())
             })?;
-            runtimes
+            (runtimes, session_ids)
         };
+        let (runtimes, removed_ids) = runtimes;
+        // The row is gone, so no snapshot can say so: the ids are the only
+        // account of the deletion a client drawing a session list can get.
+        // Published after the commit, because until then the deletion can still
+        // fail and a client told otherwise would drop a row that survives.
+        let _ = self.session_removals.send(removed_ids);
         for runtime in runtimes {
             self.close_provider_session(Some(runtime)).await;
         }
@@ -9120,6 +9138,52 @@ mod tests {
             "the restore above leaves nothing on the archived page"
         );
 
+        drop(manager);
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn a_committed_deletion_broadcasts_the_ids_it_removed() {
+        // A deletion deletes the row, so it cannot ride a session snapshot the
+        // way an archive does. The ids are the only account of it a client
+        // drawing a session list can get, and they must arrive only after the
+        // commit — a client told earlier would drop a row that then survived.
+        let db_path = temp_db_path("session-deletion-broadcast");
+        let manager = Arc::new(AgentManager::new(&db_path).unwrap());
+        let conn = manager.open_migrated().unwrap();
+        let workspace_root = temp_workspace_path("session-deletion-broadcast");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let session = insert_session(
+            &conn,
+            "delete broadcast",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            AgentId::parse("delete-broadcast-agent").unwrap(),
+            AgentSessionState::Idle,
+        );
+        drop(conn);
+        let mut removals = manager.subscribe_session_removals();
+
+        manager.delete_session(&session.id).await.unwrap();
+        let removed = removals.try_recv().unwrap();
+        assert!(
+            removed.contains(&session.id),
+            "the root id must be among the removed: {removed:?}"
+        );
+        let conn = manager.open_migrated().unwrap();
+        assert!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .is_none(),
+            "a committed deletion leaves no row behind"
+        );
+
+        drop(conn);
         drop(manager);
         cleanup_db(&db_path);
         let _ = fs::remove_dir_all(workspace_root);

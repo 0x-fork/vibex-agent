@@ -959,9 +959,31 @@ impl SidebarOrganizationView {
                 message_id,
                 scheduled_at_ms,
             } => self.set_scheduled_send(session_id, *message_id, *scheduled_at_ms)?,
+            RemoteSidebarOrganizationMutation::MarkSessionsRead { session_ids } => {
+                self.mark_sessions_read(session_ids)
+            }
         };
         self.revision = self.revision.wrapping_add(1);
         Ok(outcome)
+    }
+
+    /// Clear the unread mark on the named sessions, reporting whether anything
+    /// changed so an already-read session is an idempotent no-op rather than a
+    /// round trip the reader did not ask for.
+    ///
+    /// Ids the view does not hold are ignored: the marks live only in memory,
+    /// and a client that retried after a reconnect may name a session the
+    /// authority has since read by another route.
+    fn mark_sessions_read(&mut self, session_ids: &[String]) -> SidebarMutationOutcome {
+        let mut changed = false;
+        for session_id in session_ids {
+            changed |= self.unread_session_ids.remove(session_id);
+        }
+        if changed {
+            SidebarMutationEffect::UNREAD.into()
+        } else {
+            SidebarMutationOutcome::AlreadyApplied
+        }
     }
 }
 
@@ -1171,6 +1193,9 @@ pub struct SidebarMutationEffect {
     /// The holder's queue changed: a deadline was moved or taken away, and the
     /// message it names is still the queue's to send.
     pub scheduled: bool,
+    /// The unread marks changed: another client read sessions the authority was
+    /// still badging, and its own readers must stop badging them too.
+    pub unread: bool,
 }
 
 impl SidebarMutationEffect {
@@ -1178,16 +1203,25 @@ impl SidebarMutationEffect {
         organization: true,
         navigation: false,
         scheduled: false,
+        unread: false,
     };
     pub const NAVIGATION: Self = Self {
         organization: false,
         navigation: true,
         scheduled: false,
+        unread: false,
     };
     pub const SCHEDULED: Self = Self {
         organization: false,
         navigation: false,
         scheduled: true,
+        unread: false,
+    };
+    pub const UNREAD: Self = Self {
+        organization: false,
+        navigation: false,
+        scheduled: false,
+        unread: true,
     };
 }
 
@@ -1553,6 +1587,55 @@ mod tests {
         );
         assert_eq!(outcome, Ok(SidebarMutationOutcome::AlreadyApplied));
         assert_eq!(view.organization.placements, before);
+    }
+
+    #[test]
+    fn a_session_one_client_read_stops_being_unread_on_the_others() {
+        // "Unread" lives in the authority's memory, so reading a session on a
+        // compact client is only visible everywhere if that client says so. The
+        // mutation clears exactly the ids it names and reports that the marks
+        // changed, so the shell republishes them to its own readers.
+        let mut view = view_with_folder();
+        view.unread_session_ids.insert("session-a".to_string());
+        view.unread_session_ids.insert("session-b".to_string());
+        let outcome = view.apply_remote(
+            &RemoteSidebarOrganizationMutation::MarkSessionsRead {
+                session_ids: vec!["session-a".to_string()],
+            },
+            &session_projects(),
+            &session_workspaces(),
+            "unused",
+            "unused",
+        );
+        assert_eq!(
+            outcome,
+            Ok(SidebarMutationOutcome::Applied(
+                SidebarMutationEffect::UNREAD
+            ))
+        );
+        assert!(!view.unread_session_ids.contains("session-a"));
+        assert!(
+            view.unread_session_ids.contains("session-b"),
+            "an id the reader did not open keeps its mark"
+        );
+    }
+
+    #[test]
+    fn reading_an_already_read_session_is_a_noop_not_a_republish() {
+        // A client that retried after a reconnect, or that opened a session the
+        // authority had already read by another route, must not make the shell
+        // republish every sidebar mark for nothing.
+        let mut view = view_with_folder();
+        let outcome = view.apply_remote(
+            &RemoteSidebarOrganizationMutation::MarkSessionsRead {
+                session_ids: vec!["session-a".to_string()],
+            },
+            &session_projects(),
+            &session_workspaces(),
+            "unused",
+            "unused",
+        );
+        assert_eq!(outcome, Ok(SidebarMutationOutcome::AlreadyApplied));
     }
 
     #[test]

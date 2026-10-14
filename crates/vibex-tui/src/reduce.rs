@@ -3588,6 +3588,11 @@ impl App {
                 return Outcome::quiet();
             }
         };
+        // Reading is the act that clears the mark, so the authority is told
+        // before `open_session` clears this client's copy — the effect is read
+        // from the arrangement's unread set, which is what the authority
+        // published, not from the local set the open is about to empty.
+        let mark_read = self.sidebar_mark_read_effect(&session_id);
         self.open_session(session_id.clone());
         self.sync_transcript();
         // The open session's own page is what names its children and the path
@@ -3595,6 +3600,9 @@ impl App {
         // rather than when the list is next refreshed.
         let child_read = self.load_child_page(Some(session_id.clone()), false);
         let mut effects = vec![Effect::OpenSession { session_id, ticket }];
+        if let Some(mark_read) = mark_read {
+            effects.push(mark_read);
+        }
         if self.runtime_options.is_none() && self.runtime_catalog_available() {
             effects.push(self.read_runtime_catalogue());
         }
@@ -8530,6 +8538,64 @@ mod tests {
     }
 
     #[test]
+    fn opening_an_unread_session_tells_the_authority_it_was_read() {
+        // Opening a session is what "read" means, and the mark the reader sees
+        // comes from the authority. A client that only cleared its own copy
+        // would leave the Desktop badging a session the reader has read, so the
+        // open sends the read back before it clears anything locally.
+        let mut app = arranged_app();
+        let session_id = vibex_core::VibexSessionId::parse("session_org000001").unwrap();
+        assert!(app.session_is_unread(&session_id));
+
+        let outcome = app.open_session_effects(session_id.clone());
+        let read = outcome.effects.iter().find_map(|effect| match effect {
+            Effect::MutateSidebarOrganization { mutation, .. } => Some(mutation.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            read,
+            Some(
+                vibex_core::RemoteSidebarOrganizationMutation::MarkSessionsRead {
+                    session_ids: vec!["session_org000001".to_string()],
+                }
+            ),
+            "opening the session did not tell the authority: {:?}",
+            outcome.effects
+        );
+        assert!(
+            !outcome.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::MutateSidebarOrganization {
+                    expected_revision: Some(_),
+                    ..
+                }
+            )),
+            "a read is not an edit of the tree and must not quote its revision"
+        );
+        assert!(
+            !app.session_is_unread(&session_id),
+            "the optimistic clear did not take"
+        );
+    }
+
+    #[test]
+    fn opening_a_session_the_authority_never_badged_sends_no_read() {
+        // A session this client badged itself, or one already read elsewhere,
+        // has nothing to clear on the authority: sending a mark anyway would be
+        // a write per open for no change.
+        let mut app = arranged_app();
+        let mut snapshot = arranged_snapshot();
+        snapshot.unread_session_ids = Vec::new();
+        app.apply_sidebar_organization(&snapshot);
+        assert!(
+            app.sidebar_mark_read_effect(
+                &vibex_core::VibexSessionId::parse("session_org000001").unwrap()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn a_pin_is_asked_of_the_authority_that_owns_the_list() {
         let mut app = arranged_app();
         app.set_selection(crate::keymap::Scope::Sessions, 2);
@@ -9302,7 +9368,6 @@ mod tests {
         );
         assert_eq!(app.overlay, None);
     }
-
     /// A snapshot carrying one send another client is holding for a session.
     fn held_send_snapshot(
         session_id: &VibexSessionId,

@@ -4866,6 +4866,16 @@ pub enum RemoteSidebarOrganizationMutation {
         #[serde(default)]
         scheduled_at_ms: Option<i64>,
     },
+    /// Clear the unread mark on sessions another client has now read.
+    ///
+    /// "Unread" is not durability: the authority keeps it in memory, so a
+    /// session a compact client opened is marked read on the Desktop only if
+    /// that client says so. The ids are the ones the client rendered as
+    /// unread, and clearing an id the authority does not hold is a harmless
+    /// no-op — which is what makes a retry after a reconnect safe.
+    MarkSessionsRead {
+        session_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

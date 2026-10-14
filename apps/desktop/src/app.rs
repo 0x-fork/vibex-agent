@@ -3988,6 +3988,9 @@ fn map_backend_event(event: BackendEvent) -> Option<DesktopEvent> {
     match event {
         BackendEvent::Timeline(event) => Some(DesktopEvent::Timeline(event)),
         BackendEvent::SessionUpdated(session) => Some(DesktopEvent::SessionUpdated(session)),
+        BackendEvent::SessionsRemoved(session_ids) => {
+            Some(DesktopEvent::SessionsRemoved(session_ids))
+        }
         BackendEvent::Runtime(event) => Some(DesktopEvent::Runtime(event)),
         BackendEvent::RuntimeSelection(event) => Some(DesktopEvent::RuntimeSelection(event)),
         BackendEvent::ProjectionInvalidated(BackendProjection::Management) => {
@@ -11784,6 +11787,19 @@ impl VibexWorkbench {
                                 window_handle,
                                 cx,
                             );
+                        }
+                        if effect.unread
+                            && let vibex_core::RemoteSidebarOrganizationMutation::MarkSessionsRead {
+                                session_ids,
+                            } = &mutation
+                        {
+                            // Another client read these sessions. The authority's
+                            // own badge and the client's mark are the same fact
+                            // seen from two seats, so clearing the local set is
+                            // what stops this shell badging a session the reader
+                            // has already read elsewhere.
+                            self.unread_agent_completion_session_ids
+                                .retain(|session_id| !session_ids.contains(session_id));
                         }
                         self.invalidate_sidebar_projection_cache();
                         self.publish_sidebar_invalidation();
@@ -23553,6 +23569,44 @@ impl VibexWorkbench {
                     changed,
                     sidebar_changed,
                 )
+            }
+            DesktopEvent::SessionsRemoved(session_ids) => {
+                // The row is gone, so no snapshot will describe it. The ids are
+                // promoted to the deletion tombstone, which is what keeps a read
+                // issued before the deletion from rebuilding the row, and the
+                // list is reloaded so the rest of the removal is authoritative.
+                let removed = session_ids
+                    .iter()
+                    .map(|session_id| session_id.as_str().to_string())
+                    .collect::<BTreeSet<_>>();
+                let removed_selected = self
+                    .selected_session_id
+                    .as_ref()
+                    .is_some_and(|selected| removed.contains(selected.as_str()));
+                self.deleted_session_ids.extend(removed.iter().cloned());
+                self.optimistically_removed_session_ids
+                    .retain(|session_id| !removed.contains(session_id));
+                self.pending_session_deletion_ids
+                    .retain(|session_id| !removed.contains(session_id));
+                if removed_selected {
+                    self.clear_child_agent_context();
+                    self.selected_session_id = None;
+                    self.timeline = TimelineModel::default();
+                    self.timeline_scroll = VirtualListScrollHandle::new();
+                    self.runtime_selection = None;
+                    self.token_usage = None;
+                }
+                self.sessions
+                    .retain(|session| !removed.contains(session.id.as_str()));
+                self.delegated_sessions
+                    .retain(|session_id, _| !removed.contains(session_id));
+                self.delegated_tree
+                    .retain(|session_id, _| !removed.contains(session_id));
+                self.reconcile_sidebar_state();
+                self.publish_sidebar_invalidation();
+                self.queue_ui_state();
+                self.load_agent_overview(cx);
+                true
             }
             DesktopEvent::Runtime(event) => {
                 let changed = self

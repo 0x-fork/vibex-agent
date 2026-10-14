@@ -1091,6 +1091,14 @@ pub struct App {
     /// The client's own notion, not the runtime's: it is what "unread" means in
     /// a list of sessions, and it is cleared by opening the session.
     pub unread_sessions: std::collections::BTreeSet<String>,
+    /// The unread marks the authority is holding, as it last published them.
+    ///
+    /// Kept apart from the arrangement view because the two are not the same
+    /// kind of fact: an arrangement that arranges nothing is dropped, and the
+    /// unread marks must survive that — they are the only account of which
+    /// sessions the Desktop is badging, and clearing one is a mutation this
+    /// client has to send back.
+    pub authority_unread_sessions: std::collections::BTreeSet<String>,
     /// What each session last did, one line, for the list's second line.
     ///
     /// The runtime publishes a session's *state* but not its last words, and a
@@ -1724,6 +1732,7 @@ impl App {
             inflight_sends: BTreeMap::new(),
             pending_send_serial: 0,
             unread_sessions: std::collections::BTreeSet::new(),
+            authority_unread_sessions: std::collections::BTreeSet::new(),
             session_echoes: BTreeMap::new(),
             pending_session_titles: BTreeMap::new(),
             notify: crate::notify::Notifier::new(options.notify_path.clone()),
@@ -2575,12 +2584,15 @@ impl App {
             }
             // No arrangement to mirror: the list is projected from the
             // sessions themselves, which is all a client without a desktop
-            // can honestly say about the order.
+            // can honestly say about the order. The ownership rows are spliced
+            // in afterwards, because the projection knows nothing about them —
+            // and the filter is applied there too, so a session whose child
+            // matches is not dropped from under it.
             None => {
                 let sessions = self
                     .agent
                     .state
-                    .view(&self.projection.sidebar, &self.filter, self.shell)
+                    .view(&self.projection.sidebar, "", self.shell)
                     .sessions;
                 let loaded = self
                     .agent
@@ -2840,17 +2852,24 @@ impl App {
             sessions,
         );
         let view = vibex_desktop_model::SidebarOrganizationView::from_remote(snapshot);
+        // The unread marks are the authority's account of what it is still
+        // badging, and they are what an opened session has to clear there. They
+        // are stored before the arrangement is judged, because a tree that
+        // arranges nothing says nothing about marks either way.
+        let authority_unread = snapshot.unread_session_ids.iter().cloned().collect();
+        let unread_changed = self.authority_unread_sessions != authority_unread;
+        self.authority_unread_sessions = authority_unread;
         // An arrangement that arranges nothing is dropped rather than adopted,
         // but a snapshot can carry something else a client cannot invent: the
         // scheduled sends the authority is holding. Those are kept even when
         // the tree is empty, because dropping the view would drop the only
         // account of a session waiting on an hour.
         if !view.arranges_anything() && view.scheduled_sends.is_empty() {
-            return self.projection.sidebar_organization.take().is_some();
+            return self.projection.sidebar_organization.take().is_some() || unread_changed;
         }
         let changed = self.projection.sidebar_organization.as_ref() != Some(&view);
         self.projection.sidebar_organization = Some(view);
-        changed
+        changed || unread_changed
     }
 
     /// The authority change that opens or closes the row the cursor is on.
@@ -2902,6 +2921,31 @@ impl App {
                 enabled,
             },
             expected_revision: Some(view.revision),
+        })
+    }
+
+    /// The authority change that clears the unread mark on a session this client
+    /// has just opened.
+    ///
+    /// "Unread" is the authority's in-memory fact, and reading is an act of the
+    /// client that has the session on screen — so opening a session here has to
+    /// say so, or the Desktop keeps badging it. `None` when the authority was
+    /// not badging it, which is the common case: a session read here is usually
+    /// already read there.
+    ///
+    /// No expected revision travels with it: a mark is not an edit of the tree,
+    /// so a rearrangement on the Desktop between the read and the mark does not
+    /// make the read stale. Quoting a revision would refuse the mark — and make
+    /// the read look like a failed tree edit — for a change that cannot conflict.
+    pub fn sidebar_mark_read_effect(&self, session_id: &VibexSessionId) -> Option<Effect> {
+        if !self.authority_unread_sessions.contains(session_id.as_str()) {
+            return None;
+        }
+        Some(Effect::MutateSidebarOrganization {
+            mutation: vibex_core::RemoteSidebarOrganizationMutation::MarkSessionsRead {
+                session_ids: vec![session_id.as_str().to_string()],
+            },
+            expected_revision: None,
         })
     }
 
@@ -4923,6 +4967,10 @@ impl App {
         self.cancel_runtime_picker();
         self.switch_composer(ComposerTarget::Session(session_id.clone()));
         self.unread_sessions.remove(session_id.as_str());
+        // The authority's mark is cleared optimistically with the local one; a
+        // refusal puts it back on the next read. Leaving it badged would make
+        // the row disagree with the page the reader is looking at.
+        self.authority_unread_sessions.remove(session_id.as_str());
         self.navigation.enter_session(session_id.as_str());
         self.navigate_to(Page::Agent);
         // Opening a session is a request to work in it, so the keyboard lands
@@ -6466,6 +6514,25 @@ impl App {
             .retain(|session_id, _| live.contains(session_id));
     }
 
+    /// Drop the client's own per-session state for sessions the runtime removed.
+    ///
+    /// A removal event names sessions that no longer exist, and the shared
+    /// controller drops their rows. Everything this client derives from events
+    /// it received — the unread mark, the last-thing-said echo, a composed draft
+    /// — is keyed by the same id and would otherwise outlive the row it
+    /// describes, so it goes with the session.
+    pub fn forget_removed_sessions(&mut self, session_ids: &[VibexSessionId]) {
+        for session_id in session_ids {
+            let id = session_id.as_str();
+            self.unread_sessions.remove(id);
+            self.authority_unread_sessions.remove(id);
+            self.session_echoes.remove(id);
+            self.pending_session_titles.remove(session_id);
+            self.pending_creations
+                .retain(|pending_id, _| pending_id != session_id);
+        }
+    }
+
     /// The Agent a session runs on, named for the session list.
     ///
     /// The catalogue is where a display name lives; a session whose Agent is
@@ -6503,11 +6570,7 @@ impl App {
     /// Whether the session list marks this session as having something new.
     pub fn session_is_unread(&self, session_id: &VibexSessionId) -> bool {
         self.unread_sessions.contains(session_id.as_str())
-            || self
-                .projection
-                .sidebar_organization
-                .as_ref()
-                .is_some_and(|view| view.unread_session_ids.contains(session_id.as_str()))
+            || self.authority_unread_sessions.contains(session_id.as_str())
     }
 
     /// The title of a session by id, when the client has listed it.

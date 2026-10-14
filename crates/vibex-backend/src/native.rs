@@ -172,6 +172,7 @@ fn map_desktop_event(event: DesktopEvent) -> BackendEvent {
     match event {
         DesktopEvent::Timeline(event) => BackendEvent::Timeline(event),
         DesktopEvent::SessionUpdated(session) => BackendEvent::SessionUpdated(session),
+        DesktopEvent::SessionsRemoved(session_ids) => BackendEvent::SessionsRemoved(session_ids),
         DesktopEvent::Runtime(event) => BackendEvent::Runtime(event),
         DesktopEvent::RuntimeSelection(event) => BackendEvent::RuntimeSelection(event),
         DesktopEvent::ProviderConfigChanged(_) => {
