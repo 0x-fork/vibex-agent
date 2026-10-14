@@ -1489,6 +1489,8 @@ pub struct MobileApp {
     sidebar_batch_mode: bool,
     /// Whether the batch-delete confirmation sheet is up.
     sidebar_batch_delete_confirmation: bool,
+    /// The project whose removal is being confirmed.
+    project_remove_confirmation: Option<String>,
     /// Top edge and right edge of the row list in window space, recorded during
     /// paint so a touch pan can be resolved to a row without hit-test plumbing.
     sidebar_list_frame: Rc<Cell<(f32, f32)>>,
@@ -2709,6 +2711,7 @@ impl MobileApp {
             sidebar_drag: None,
             sidebar_batch_mode: false,
             sidebar_batch_delete_confirmation: false,
+            project_remove_confirmation: None,
             sidebar_list_frame: Rc::new(Cell::new((0.0, 0.0))),
             composer_queue_frame: Rc::new(Cell::new((0.0, 0.0))),
             attachment_preview_frame: Rc::new(Cell::new((0.0, 0.0))),
@@ -7507,6 +7510,65 @@ impl MobileApp {
         self.archive_sessions(ids, cx);
     }
 
+    /// Takes a project out of the workbench.
+    ///
+    /// The authority removes the project record; nothing on disk is deleted,
+    /// which is why the confirmation says so rather than warning about files.
+    fn remove_project(&mut self, project_id: String, cx: &mut Context<Self>) {
+        self.project_remove_confirmation = None;
+        if self.operation_busy {
+            return;
+        }
+        let Ok(project_id) = vibex_core::ProjectId::parse(project_id) else {
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if !backend
+            .capability_snapshot()
+            .workspace
+            .supports(BackendOperation::WorkspaceDelete)
+        {
+            self.hint(
+                Tone::Warning,
+                locale::text(
+                    "This desktop cannot remove projects",
+                    "此桌面端不支持移除项目",
+                    "此桌面版不支援移除專案",
+                ),
+            );
+            cx.notify();
+            return;
+        }
+        self.operation_busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .delete_project(MutationRequest::new(project_id))
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.operation_busy = false;
+                match outcome {
+                    Ok(()) => {
+                        this.refresh_sessions(cx);
+                        this.refresh_workspaces(cx);
+                        this.hint(
+                            Tone::Success,
+                            locale::text("Project removed", "项目已移除", "專案已移除"),
+                        );
+                    }
+                    Err(error) => this.fail(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
     fn delete_selected_sessions(
         &mut self,
         _: &MouseUpEvent,
@@ -7844,6 +7906,11 @@ impl MobileApp {
         // it, otherwise the screen is a dead end for the whole timeout.
         if self.sidebar_batch_delete_confirmation {
             self.sidebar_batch_delete_confirmation = false;
+            cx.notify();
+            return;
+        }
+        if self.project_remove_confirmation.is_some() {
+            self.project_remove_confirmation = None;
             cx.notify();
             return;
         }
@@ -11847,6 +11914,12 @@ impl MobileApp {
                 .when(self.composer_history_open, |root| {
                     root.child(self.render_composer_history_sheet(cx))
                 })
+                .when_some(
+                    self.project_remove_confirmation.clone(),
+                    |root, project_id| {
+                        root.child(self.render_project_remove_confirmation(&project_id, cx))
+                    },
+                )
                 .when(self.timeline_file_diff.is_some(), |root| {
                     root.child(self.render_timeline_file_diff(cx))
                 })
@@ -12477,6 +12550,20 @@ impl MobileApp {
                         }),
                     );
                 }
+                let fork_session_id = row.session_id.clone();
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-fork",
+                    locale::text("Fork session", "分叉会话", "分支會話").to_string(),
+                    false,
+                    Box::new(move |this, _, cx| {
+                        if let Some(session_id) = fork_session_id.clone() {
+                            // At the tip: a row stands for a whole conversation,
+                            // and the desktop's sidebar forks it the same way.
+                            this.fork_session(session_id, ForkAgentSessionRequest::AT_TIP, cx);
+                        }
+                    }),
+                );
                 let pin_session_id = row.id().to_string();
                 let pinned = row.pinned;
                 let auto_continue_session_id = row.id().to_string();
@@ -12578,6 +12665,7 @@ impl MobileApp {
             SidebarRowKind::Project => {
                 let project_id = row.id().to_string();
                 let folder_project_id = row.id().to_string();
+                let remove_project_id = row.id().to_string();
                 sheet = entry(
                     sheet,
                     "mobile-row-menu-project-new-session",
@@ -12601,6 +12689,19 @@ impl MobileApp {
                             },
                             cx,
                         );
+                    }),
+                );
+                // Removing a project takes its sessions out of the workbench,
+                // so it asks first — and it is a workbench change, not a disk
+                // one: nothing under the project's path is touched.
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-project-remove",
+                    locale::text("Remove project", "移除项目", "移除專案").to_string(),
+                    true,
+                    Box::new(move |this, _, cx| {
+                        this.project_remove_confirmation = Some(remove_project_id.clone());
+                        cx.notify();
                     }),
                 );
             }
@@ -12941,6 +13042,139 @@ impl MobileApp {
                                         cx.listener(Self::confirm_batch_delete),
                                     )
                                     .child(locale::common("Delete")),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The guard in front of removing a project.
+    fn render_project_remove_confirmation(
+        &self,
+        project_id: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let label = self
+            .sidebar_projects()
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.label)
+            .unwrap_or_else(|| project_id.to_string());
+        let sessions = self
+            .sessions()
+            .iter()
+            .filter(|session| session.project_id.as_str() == project_id)
+            .count();
+        let target = project_id.to_string();
+        div()
+            .id("mobile-project-remove-confirmation")
+            .debug_selector(|| "mobile-project-remove-confirmation".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.62))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.project_remove_confirmation = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .bg(theme::bg_popover())
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .p(px(theme::SPACING_LG))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACING_SM))
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_size(theme::font_heading())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(locale::text(
+                                "Remove this project?",
+                                "移除该项目？",
+                                "移除該專案？",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::font_body())
+                            .text_color(theme::text_secondary())
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::font_caption())
+                            .text_color(theme::text_muted())
+                            .child(
+                                locale::text(
+                                    "{} sessions leave the workbench with it. Nothing on disk is deleted.",
+                                    "{} 个会话会一并移出工作台，磁盘上的文件不会被删除。",
+                                    "{} 個工作階段會一併移出工作台，磁碟上的檔案不會被刪除。",
+                                )
+                                .replace("{}", &sessions.to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt(px(theme::SPACING_SM))
+                            .flex()
+                            .gap(px(theme::SPACING_SM))
+                            .child(
+                                div()
+                                    .id("project-remove-cancel")
+                                    .flex_1()
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .border_1()
+                                    .border_color(theme::border_default())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(theme::font_body())
+                                    .text_color(theme::text_secondary())
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.project_remove_confirmation = None;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(locale::common("Cancel")),
+                            )
+                            .child(
+                                div()
+                                    .id("project-remove-confirm")
+                                    .flex_1()
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(theme::accent_red())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(theme::font_body())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::bg_primary())
+                                    .cursor_pointer()
+                                    .active(|style| style.opacity(0.8))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.remove_project(target.clone(), cx)
+                                        }),
+                                    )
+                                    .child(locale::common("Remove")),
                             ),
                     ),
             )
@@ -15364,6 +15598,26 @@ impl MobileApp {
     }
 
     fn fork_session_at(&mut self, through_sequence: i64, cx: &mut Context<Self>) {
+        let Some(source_session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        self.fork_session(source_session_id, through_sequence, cx);
+    }
+
+    /// Forks one session at a point in its transcript.
+    ///
+    /// The session is named rather than assumed: a sidebar row forks the
+    /// conversation it stands for, which is not always the open one.
+    fn fork_session(
+        &mut self,
+        source_session_id: VibexSessionId,
+        through_sequence: i64,
+        cx: &mut Context<Self>,
+    ) {
         if self.fork_session_busy || through_sequence <= 0 {
             return;
         }
@@ -15382,13 +15636,6 @@ impl MobileApp {
                 ),
             ));
             cx.notify();
-            return;
-        };
-        let Some(source_session_id) = self
-            .controller
-            .as_ref()
-            .and_then(|controller| controller.state.selected_session_id.clone())
-        else {
             return;
         };
         self.fork_session_busy = true;

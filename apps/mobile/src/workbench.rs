@@ -1925,6 +1925,12 @@ impl MobileWorkbench {
     }
 
     fn create_terminal(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.create_terminal_now(cx);
+    }
+
+    /// Opens a terminal session and attaches to it. The window the button has
+    /// is not needed for either, which is what lets a restart reuse this.
+    fn create_terminal_now(&mut self, cx: &mut Context<Self>) {
         let request = MutationRequest::new(TerminalCreateRequest {
             workspace_id: self.workspace_id.clone(),
             title: Some(locale::text("Mobile terminal", "移动端终端", "行動端終端機").to_string()),
@@ -1952,6 +1958,56 @@ impl MobileWorkbench {
                 this.error = this.terminal.state.last_error.clone();
                 if let Some(terminal_id) = created_id {
                     this.attach_terminal(terminal_id, cx);
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Replaces the running session with a fresh one.
+    ///
+    /// A phone has no way to type `exit` and start again in one gesture, and a
+    /// terminal that has wedged — a full-screen program that will not quit, a
+    /// shell waiting on something — leaves the reader with nothing to do. This
+    /// closes it without the confirmation the Close button asks for, because
+    /// restarting is itself the intent.
+    fn restart_terminal(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.busy
+            || !self
+                .terminal
+                .capabilities
+                .supports(BackendOperation::TerminalClose)
+        {
+            return;
+        }
+        if self.terminal.state.active_session.is_none() {
+            return;
+        }
+        self.terminal_close_confirmation = None;
+        let operation = match self.terminal.begin_close() {
+            Ok(operation) => operation,
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, self.terminal.run_close(operation.clone()));
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.terminal.apply_close(&operation, outcome);
+                this.busy = false;
+                this.terminal.state.render = None;
+                this.terminal_render_sequence = 0;
+                this.error = this.terminal.state.last_error.clone();
+                if this.error.is_none() {
+                    this.stop_terminal_poll();
+                    // A fresh session takes the place of the one that went.
+                    this.create_terminal_now(cx);
                 }
                 cx.notify();
             });
@@ -2230,11 +2286,33 @@ impl MobileWorkbench {
         let Some(render) = self.terminal.state.render.as_ref() else {
             return;
         };
-        if !render.frame.modes.mouse_reporting {
+        if render.frame.modes.mouse_reporting {
+            // An application that asked for the mouse owns the tap, exactly as
+            // it does on the desktop where Shift is what takes it back.
+            if let Some(input) = terminal_mouse_tap(point, render.frame.modes.sgr_mouse) {
+                self.send_terminal_value(input, false, cx);
+            }
             return;
         }
-        if let Some(input) = terminal_mouse_tap(point, render.frame.modes.sgr_mouse) {
-            self.send_terminal_value(input, false, cx);
+        // Nothing is claiming taps, so a link under the finger is the reader's.
+        let link = render
+            .frame
+            .cells
+            .iter()
+            .find(|cell| cell.row == point.row && cell.column == point.column)
+            .and_then(|cell| cell.hyperlink.clone());
+        if let Some(link) = link
+            && crate::platform::open_external_url(&link)
+        {
+            self.show_notice(
+                locale::text(
+                    "Opened in the browser",
+                    "已在浏览器中打开",
+                    "已在瀏覽器中開啟",
+                )
+                .to_string(),
+                cx,
+            );
         }
     }
 
@@ -5739,6 +5817,22 @@ impl MobileWorkbench {
                                 }),
                             ),
                     )
+                    .when_some(active.clone(), |bar, _| {
+                        bar.child(
+                            toolbar_icon_button(
+                                "restart-terminal",
+                                "icons/rotate-ccw.svg",
+                                "Restart",
+                            )
+                            .when(can_close && !self.busy, |button| {
+                                button.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::restart_terminal),
+                                )
+                            })
+                            .when(!can_close || self.busy, |button| button.opacity(0.55)),
+                        )
+                    })
                     .when_some(active.clone(), |bar, _| {
                         bar.child(
                             chip_action("close-terminal", locale::common("Close"), can_close).when(
