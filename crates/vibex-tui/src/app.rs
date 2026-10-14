@@ -569,6 +569,13 @@ pub struct ManagementData {
 #[serde(rename_all = "camelCase")]
 pub struct SidebarArrangement {
     pub sidebar: vibex_desktop_model::SidebarState,
+    /// Branches of delegated children the reader folded shut.
+    ///
+    /// The collapse is this client's own display choice, so it lives in this
+    /// client's own file rather than in the arrangement the authority owns;
+    /// a reader who folded a noisy branch finds it folded when they come back.
+    #[serde(default)]
+    pub collapsed_child_ids: BTreeSet<String>,
 }
 
 impl SidebarArrangement {
@@ -801,6 +808,12 @@ pub struct App {
     pub team_detail: Option<vibex_core::AgentDelegationId>,
     pub team_confirm_cancel: Option<vibex_core::TeamTaskControlRequest>,
     pub team_busy: bool,
+    /// The ownership tree behind the list and the open session's page.
+    ///
+    /// A session a delegated task created never appears in the runtime's root
+    /// session list, so this is the only thing that can name it, nest it under
+    /// the session that owns it, and say which session to go back to.
+    pub children: crate::children::ChildSessions,
     pub management: ManagementWorkflowController,
     pub projection: ProjectionState,
     /// The reader's auto-continue preferences and the turns they act on.
@@ -1124,6 +1137,8 @@ pub const MAX_DOCK_ROWS: usize = 8;
 /// One section of the dock panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DockSection {
+    /// Sessions the open one delegated, which is where the reader goes next.
+    Children,
     Team,
     Agents,
     Plan,
@@ -1131,10 +1146,17 @@ pub enum DockSection {
 }
 
 impl DockSection {
-    pub const ALL: [DockSection; 4] = [Self::Team, Self::Agents, Self::Plan, Self::Queue];
+    pub const ALL: [DockSection; 5] = [
+        Self::Children,
+        Self::Team,
+        Self::Agents,
+        Self::Plan,
+        Self::Queue,
+    ];
 
     pub const fn label(self, strings: Strings) -> &'static str {
         match self {
+            DockSection::Children => strings.dock_children(),
             DockSection::Team => strings.locale.text("Team", "团队", "團隊"),
             DockSection::Agents => strings.dock_agents(),
             DockSection::Plan => strings.dock_plan(),
@@ -1149,6 +1171,13 @@ pub enum DockRow {
     Team {
         label: String,
         action: crate::team::TeamDockAction,
+    },
+    /// A session the open one delegated. Activating it opens that session,
+    /// which is how the reader moves down the ownership tree.
+    Child {
+        title: String,
+        state: Option<vibex_core::AgentSessionState>,
+        session_id: VibexSessionId,
     },
     /// A section heading, which the cursor steps over.
     Header { section: DockSection, count: usize },
@@ -1547,6 +1576,9 @@ impl App {
             team_detail: None,
             team_confirm_cancel: None,
             team_busy: false,
+            children: crate::children::ChildSessions::with_collapsed(
+                arrangement.collapsed_child_ids.clone(),
+            ),
             management,
             auto_continue: crate::auto_continue::AutoContinue::default(),
             projection: ProjectionState {
@@ -2465,6 +2497,10 @@ impl App {
         // its own.
         effects.push(Effect::ListWorkspaces);
         effects.push(Effect::LoadSidebarOrganization);
+        // A session that just appeared may own children, and one that just
+        // changed may have changed a worker's state: the tree is re-read with
+        // the list it hangs under.
+        effects.extend(self.child_tree_effects());
         effects
     }
 
@@ -2495,6 +2531,7 @@ impl App {
                     sessions,
                     projects: &crate::sessions::project_entries(&self.workspace_rows, sessions),
                     unread_session_ids: &self.unread_sessions,
+                    children: &self.children,
                     query: &self.filter,
                 })
             }
@@ -2514,11 +2551,19 @@ impl App {
                     .value
                     .as_deref()
                     .unwrap_or_default();
-                let states = crate::sessions::session_state_tally(loaded, &self.filter);
-                let counts = crate::sessions::heading_counts(&sessions, loaded, &self.filter);
+                let states =
+                    crate::sessions::session_state_tally(loaded, &self.children, &self.filter);
+                let rows = crate::sessions::filtered_child_rows(
+                    sessions,
+                    loaded,
+                    &self.children,
+                    &self.filter,
+                );
+                let counts =
+                    crate::sessions::heading_counts(&rows, loaded, &self.children, &self.filter);
                 crate::sessions::SessionListRows {
                     counts,
-                    rows: sessions,
+                    rows,
                     states,
                 }
             }
@@ -2624,6 +2669,7 @@ impl App {
         }
         let arrangement = SidebarArrangement {
             sidebar: self.projection.sidebar.clone(),
+            collapsed_child_ids: self.children.collapsed_ids(),
         };
         if let Ok(body) = serde_json::to_string_pretty(&arrangement) {
             let _ = std::fs::write(path, body);
@@ -2843,12 +2889,19 @@ impl App {
         let rows = self.sidebar_rows();
         let index = self.selection_for(Scope::Sessions);
         let row = rows.get(index)?;
+        if row.delegated {
+            return Some(SidebarMove::Blocked);
+        }
         let moving_id = row.session_id.as_ref()?.as_str().to_string();
         let project_id = row.project_id.clone();
         let parent_id = row.parent_id.clone();
         let mut cursor = index as isize + delta;
         while cursor >= 0 && (cursor as usize) < rows.len() {
             let candidate = &rows[cursor as usize];
+            if candidate.delegated {
+                cursor += delta;
+                continue;
+            }
             if let Some(target_id) = candidate.session_id.as_ref()
                 && candidate.project_id == project_id
                 && candidate.parent_id == parent_id
@@ -2919,6 +2972,12 @@ impl App {
         let Some(row) = self.selected_sidebar_row() else {
             return false;
         };
+        // A delegated child is not the reader's to pin: the branch follows the
+        // session that delegated it, and a pin would promise a place the list
+        // cannot give it.
+        if row.delegated {
+            return false;
+        }
         let Some(session_id) = row.session_id.as_ref().map(ToString::to_string) else {
             return false;
         };
@@ -2940,12 +2999,22 @@ impl App {
         let rows = self.sidebar_rows();
         let index = self.selection_for(Scope::Sessions);
         let row = rows.get(index)?;
+        // A delegated child is not a row the reader arranges: it sits where the
+        // session that owns it sits, and moving it would only move the list it
+        // is nested in.
+        if row.delegated {
+            return Some(false);
+        }
         let moving_id = row.session_id.as_ref()?.to_string();
         let moving_pinned = row.pinned;
         let mut cursor = index as isize + delta;
         let mut target = None;
         while cursor >= 0 && (cursor as usize) < rows.len() {
             let candidate = &rows[cursor as usize];
+            if candidate.delegated {
+                cursor += delta;
+                continue;
+            }
             if let Some(id) = candidate.session_id.as_ref() {
                 target = Some((cursor as usize, id.to_string(), candidate.pinned));
                 break;
@@ -3641,17 +3710,11 @@ impl App {
     /// The session the session-list selection points at, when it points at one.
     pub fn selected_session_row(&self) -> Option<&AgentSession> {
         let session_id = self.selected_session_row_id()?;
-        self.agent
-            .state
-            .sessions
-            .value
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .find(|session| session.id == session_id)
+        self.session_by_id(&session_id)
     }
 
-    /// The full record for one session id, when the list has loaded it.
+    /// The full record for one session id, whether the runtime's root list
+    /// holds it or the ownership tree named it as somebody's child.
     pub fn session_by_id(&self, session_id: &VibexSessionId) -> Option<&AgentSession> {
         self.agent
             .state
@@ -3661,6 +3724,176 @@ impl App {
             .unwrap_or_default()
             .iter()
             .find(|session| &session.id == session_id)
+            .or_else(|| self.children.session(session_id.as_str()))
+    }
+
+    // ---- delegated children ---------------------------------------------
+
+    /// The ownership reads the list is missing or has let go stale.
+    ///
+    /// One page of ownership roots says which sessions have children at all;
+    /// every unfolded branch is re-read so a worker's state cannot lag behind
+    /// its parent's row; the open session's own page carries the path back to
+    /// the session that owns it. A read already in flight is not asked for
+    /// twice, a runtime that cannot answer is asked once, and a pass is
+    /// bounded — so this costs one round trip per branch per window however
+    /// often the list is refreshed.
+    pub(crate) fn child_tree_effects(&mut self) -> Vec<Effect> {
+        const READS_PER_PASS: usize = 8;
+        if self.children.is_unsupported() || !self.supports(BackendOperation::AgentTeamRead) {
+            return Vec::new();
+        }
+        let now_ms = vibex_core::unix_timestamp_ms();
+        let mut parents: Vec<Option<VibexSessionId>> = vec![None];
+        parents.extend(self.children.expanded_parents().into_iter().map(Some));
+        if let Some(open) = self.selected_session_id().cloned() {
+            parents.push(Some(open));
+        }
+        let mut effects = Vec::new();
+        for parent in parents {
+            if effects.len() >= READS_PER_PASS {
+                break;
+            }
+            if !self.children.needs_refresh(parent.as_ref(), now_ms) {
+                continue;
+            }
+            if let Some(effect) = self.load_child_page(parent, false) {
+                effects.push(effect);
+            }
+        }
+        effects
+    }
+
+    /// Ask for one parent's children now, fresh page or not.
+    ///
+    /// Opening a session and unfolding a branch both need the answer on the
+    /// gesture rather than on the next refresh cycle.
+    pub fn load_child_page(
+        &mut self,
+        parent: Option<VibexSessionId>,
+        append: bool,
+    ) -> Option<Effect> {
+        if self.children.is_unsupported() || !self.supports(BackendOperation::AgentTeamRead) {
+            return None;
+        }
+        let cursor = if append {
+            parent
+                .as_ref()
+                .and_then(|id| self.children.next_cursor(id.as_str()))
+        } else {
+            None
+        };
+        if !self.children.begin_load(parent.as_ref()) {
+            return None;
+        }
+        Some(Effect::LoadSessionTree {
+            parent_session_id: parent,
+            cursor,
+            append,
+        })
+    }
+
+    /// The session that owns the session the reader has open.
+    pub fn parent_session_id(&self) -> Option<VibexSessionId> {
+        let open = self.selected_session_id()?;
+        self.parent_of_session(open)
+    }
+
+    /// The session that owns one session, whether it is the open one or a row.
+    ///
+    /// The path the open session's own page answered with is the authority
+    /// while it applies; otherwise the tree edge is, so a child opened from
+    /// the list still knows where it came from.
+    pub fn parent_of_session(&self, session_id: &VibexSessionId) -> Option<VibexSessionId> {
+        if self.children.open_session() == Some(session_id.as_str())
+            && let Some(parent) = self.children.parent_of_open()
+        {
+            return parent.session_ref.session_id();
+        }
+        self.children.parent_of(session_id.as_str())
+    }
+
+    /// The name a session is drawn under, wherever this client learned it.
+    pub fn session_display_title(&self, session_id: &VibexSessionId) -> Option<String> {
+        self.session_by_id(session_id)
+            .map(|session| self.session_row_title(session))
+            .or_else(|| {
+                self.children
+                    .node(session_id.as_str())
+                    .map(|node| node.title.clone())
+            })
+    }
+
+    /// What the dock draws for the open session's children.
+    ///
+    /// The titles and states come from the ownership metadata, so the section
+    /// can name a worker the root session list never carried.
+    pub fn child_session_rows(&self) -> Vec<DockRow> {
+        let Some(open) = self.selected_session_id() else {
+            return Vec::new();
+        };
+        self.children
+            .children(open.as_str())
+            .iter()
+            .filter_map(|node| {
+                let session_id = node.session_ref.session_id()?;
+                let session = self.children.session(session_id.as_str());
+                Some(DockRow::Child {
+                    title: session
+                        .map(|session| session.title.clone())
+                        .unwrap_or_else(|| node.title.clone()),
+                    state: session.map(|session| session.state),
+                    session_id,
+                })
+            })
+            .collect()
+    }
+
+    /// Fold or unfold the branch of the session the list cursor is on.
+    ///
+    /// Unfolding a branch nobody has read asks for it, so the rows appear on
+    /// the gesture; unfolding one that is already held is local. A row with no
+    /// children has no branch and the key does nothing.
+    pub fn toggle_child_branch(&mut self) -> Option<Effect> {
+        let row = self.selected_sidebar_row()?;
+        let session_id = row.session_id?;
+        if row.child_count == 0 {
+            return None;
+        }
+        let folded = self.children.toggle_collapsed(session_id.as_str());
+        self.save_sidebar_arrangement();
+        if folded {
+            return None;
+        }
+        if self.children.child_count(session_id.as_str()) > 0 {
+            return None;
+        }
+        self.load_child_page(Some(session_id), false)
+    }
+
+    /// Forget the branches of sessions the list no longer holds.
+    pub fn retain_child_tree(&mut self) {
+        let mut known = self
+            .agent
+            .state
+            .sessions
+            .value
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|session| session.id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        known.extend(
+            self.children
+                .child_sessions()
+                .map(|session| session.id.as_str().to_string()),
+        );
+        self.children.retain(&known);
+    }
+
+    /// Whether the client can ask the runtime about session ownership.
+    pub fn child_tree_available(&self) -> bool {
+        !self.children.is_unsupported() && self.supports(BackendOperation::AgentTeamRead)
     }
 
     /// Whether the terminal is narrow enough that chrome must give way.
@@ -3691,6 +3924,22 @@ impl App {
     pub fn dock_rows(&self) -> Vec<DockRow> {
         let items = &self.agent.state.timeline.items;
         let mut rows = Vec::new();
+
+        // The sessions this one delegated come first: they are the only rows
+        // that lead somewhere new. The section is drawn from the ownership
+        // tree rather than from the transcript, so a worker whose card has
+        // scrolled out of the page is still one key away.
+        let children = self.child_session_rows();
+        if !children.is_empty() {
+            rows.push(DockRow::Header {
+                section: DockSection::Children,
+                count: children.len(),
+            });
+            if !self.dock_collapsed.contains(&DockSection::Children) {
+                rows.extend(children);
+            }
+        }
+
         rows.extend(self.team_dock_rows());
 
         // Delegated child agents, newest row first and one row per delegation:
@@ -3892,6 +4141,10 @@ impl App {
         };
         match rows[index].clone() {
             DockRow::Team { .. } => false,
+            // A child session is a door rather than a row this method opens:
+            // `activate_child_dock_row` answers for it with the effects opening
+            // a session needs.
+            DockRow::Child { .. } => false,
             DockRow::Header { section, .. } => {
                 if !self.dock_collapsed.remove(&section) {
                     self.dock_collapsed.insert(section);
@@ -3920,6 +4173,37 @@ impl App {
                 true
             }
         }
+    }
+
+    /// Put the dock cursor on the first child session, opening the panel.
+    ///
+    /// The key that asks to see a session's children has to land somewhere the
+    /// reader can choose from, and the dock's own section is where they are
+    /// named.
+    pub fn focus_dock_children(&mut self) -> bool {
+        let Some(index) = self
+            .dock_rows()
+            .iter()
+            .position(|row| matches!(row, DockRow::Child { .. }))
+        else {
+            return false;
+        };
+        self.dock_open = true;
+        self.dock_selection = Some(index);
+        true
+    }
+
+    /// Act on the dock's child-session row under the cursor, when it is one.
+    ///
+    /// A child row is a door rather than a place in this transcript: activating
+    /// it opens that session's own page, which is how the reader walks down the
+    /// ownership tree.
+    pub fn activate_child_dock_row(&mut self) -> Option<crate::reduce::Outcome> {
+        let row = self.dock_rows().get(self.dock_selection?).cloned()?;
+        let DockRow::Child { session_id, .. } = row else {
+            return None;
+        };
+        Some(self.open_session_effects(session_id))
     }
 
     /// Fold finished work out of the dock, or bring it back.
@@ -7241,6 +7525,17 @@ pub enum Effect {
     ListSessions {
         include_archived: bool,
     },
+    /// Read one page of the session ownership tree.
+    ///
+    /// `parent_session_id` is `None` for the ownership roots and `Some` for one
+    /// session's direct children; `append` continues a branch the runtime said
+    /// had more. A delegated child never appears in `ListSessions`, so this is
+    /// the only read that can name one.
+    LoadSessionTree {
+        parent_session_id: Option<VibexSessionId>,
+        cursor: Option<String>,
+        append: bool,
+    },
     /// Read the arrangement the authority draws its own sidebar from.
     LoadSidebarOrganization,
     /// Ask the runtime what one session's latest turn did. The session list
@@ -7505,6 +7800,7 @@ impl Effect {
             Effect::ControlTeam { .. } => "team_control",
             Effect::AcknowledgeTeam { .. } => "team_acknowledge",
             Effect::ListSessions { .. } => "sessions",
+            Effect::LoadSessionTree { .. } => "session_tree",
             Effect::LoadSidebarOrganization => "sidebar_organization",
             Effect::ProbeAutoContinue { .. } => "auto_continue_probe",
             Effect::MutateSidebarOrganization { .. } => "sidebar_organization_mutation",

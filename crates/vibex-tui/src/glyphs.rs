@@ -62,6 +62,20 @@ pub fn connector(tier: GlyphTier) -> &'static str {
     }
 }
 
+/// The mark a delegated sub-session wears in the column a session row spends on
+/// its selection bar. One column.
+///
+/// The indent already says the row is nested; this says *what* it is nested
+/// under — a session that delegated it rather than a folder the reader made.
+/// It is a shape of its own, so a monochrome terminal reads the difference and
+/// not only the colour.
+pub fn child_marker(tier: GlyphTier) -> &'static str {
+    match tier {
+        GlyphTier::Full => "↳",
+        GlyphTier::Legacy => ">",
+    }
+}
+
 /// Failure and close markers. One column.
 pub fn ballot_x(tier: GlyphTier) -> &'static str {
     match tier {

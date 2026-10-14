@@ -82,6 +82,17 @@ pub enum AppMessage {
         result: BackendResult<()>,
     },
     Sessions(BackendResult<Vec<AgentSession>>),
+    /// One page of the session ownership tree: the children of one session, or
+    /// the ownership roots themselves.
+    ///
+    /// `parent_session_id` is the page's own key rather than the open session's,
+    /// so an answer that lands after the reader moved on is filed where it was
+    /// asked for instead of over another branch.
+    SessionTree {
+        parent_session_id: Option<VibexSessionId>,
+        append: bool,
+        result: BackendResult<vibex_core::SessionTreePage>,
+    },
     /// What a session's latest turn did, asked for by auto-continue.
     AutoContinueTurnStatus {
         session_id: VibexSessionId,
@@ -965,6 +976,24 @@ impl Dispatch {
             Effect::ListSessions { include_archived } => {
                 let result = self.facade.agent().list_sessions(include_archived).await;
                 self.send(AppMessage::Sessions(result));
+            }
+            Effect::LoadSessionTree {
+                parent_session_id,
+                cursor,
+                append,
+            } => {
+                let request = vibex_core::SessionTreeRequest {
+                    parent_session_id: parent_session_id.clone(),
+                    cursor,
+                    limit: Some(crate::children::CHILD_PAGE_LIMIT),
+                    include_archived: false,
+                };
+                let result = self.facade.agent().session_tree(request).await;
+                self.send(AppMessage::SessionTree {
+                    parent_session_id,
+                    append,
+                    result,
+                });
             }
             Effect::ProbeAutoContinue {
                 session_id,

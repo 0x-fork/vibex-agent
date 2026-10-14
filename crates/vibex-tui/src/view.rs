@@ -1683,7 +1683,11 @@ fn session_row_lines(
         Some(band) => bar_style.bg(band),
         None => bar_style,
     };
-    let bar = if selected {
+    let bar = if row.delegated {
+        // A child row spends the selection bar's column on the mark that says
+        // it hangs under the session above it; the selection is the row's band.
+        crate::glyphs::child_marker(tier)
+    } else if selected {
         crate::glyphs::accent_bar(tier)
     } else {
         " "
@@ -1747,9 +1751,15 @@ fn session_row_lines(
         None
     };
     let indent = usize::from(row.depth) * SESSION_ROW_INDENT;
+    // A session that delegated work carries a disclosure before its title, the
+    // way a heading does: it is the one mark that says the rows under it are
+    // this session's, and it is a control whether or not the row is selected.
+    let disclosure = (row.child_count > 0).then(|| crate::glyphs::disclosure(!row.collapsed, tier));
+    let disclosure_width = usize::from(disclosure.is_some());
     let text_width = width
         .saturating_sub(indent)
         .saturating_sub(SESSION_ROW_LEAD)
+        .saturating_sub(disclosure_width)
         .saturating_sub(reserved)
         .saturating_sub(badge_block);
     let mut spans = vec![
@@ -1757,6 +1767,20 @@ fn session_row_lines(
         Span::styled(format!("{bar} "), bar_style),
         Span::styled(format!("{icon} "), icon_style),
     ];
+    if let Some(disclosure) = disclosure {
+        let disclosure_style = paint(if row.collapsed {
+            theme.roles.gray
+        } else {
+            theme.roles.accent_user
+        });
+        spans.push(Span::styled(disclosure.to_string(), disclosure_style));
+        controls.push(SessionRowControl {
+            line: 0,
+            column: (indent + SESSION_ROW_LEAD) as u16,
+            width: 1,
+            intent: Intent::ToggleChildBranch,
+        });
+    }
     // The name a session that exists only to wait for its scheduled message
     // comes from that message until the send actually leaves the queue, so the
     // manager's default `<agent> session` title never labels the wait.
@@ -1863,7 +1887,7 @@ fn session_row_lines(
             None => (String::new(), false),
         };
         if !text.is_empty() {
-            let budget = width.saturating_sub(indent + 4);
+            let budget = width.saturating_sub(indent + 4 + disclosure_width);
             let style = if actionable {
                 paint(theme.roles.warning)
             } else {
@@ -1872,8 +1896,14 @@ fn session_row_lines(
             // The mark under the title stands in the column the title's own
             // mark took: the indent comes first, exactly as it does above, and
             // the text then opens under the title it belongs to. Drawn before
-            // the indent, a nested row's rail broke in two at every level.
-            let lead = format!("{}{bar}{}", " ".repeat(indent), " ".repeat(3));
+            // the indent, a nested row's rail broke in two at every level. A
+            // disclosure shifts the title by its own column, so the line under
+            // it follows.
+            let lead = format!(
+                "{}{bar}{}",
+                " ".repeat(indent),
+                " ".repeat(3 + disclosure_width)
+            );
             let text = truncate_to_width(&text, budget, "…");
             // What the echo does not reach keeps the band: the row is one
             // object, so its second line is as wide as its first rather than
@@ -2103,6 +2133,14 @@ fn session_card_fields(
         ),
         (strings.session_card_agent(), session.agent_id.to_string()),
     ];
+    // Where the session sits in the ownership tree, when the reader can act on
+    // it: a child's card names the session it was delegated by, which is what
+    // makes the card the second way back up.
+    if let Some(parent) = app.parent_of_session(&session.id)
+        && let Some(title) = app.session_display_title(&parent)
+    {
+        fields.push((strings.session_card_parent(), title));
+    }
     // The model is only known for the session whose runtime selection has been
     // loaded, which is the open one.
     if app.selected_session_id() == Some(&session.id)
@@ -2729,6 +2767,34 @@ fn render_dock_band(
                     ),
                 ]));
             }
+            crate::app::DockRow::Child {
+                title,
+                state,
+                session_id: _,
+            } => {
+                // A child row is read like a session row in the list: its own
+                // state mark first, then the name it answers to. The reader is
+                // choosing which session to move into, so what it is doing is
+                // the fact that decides.
+                let (marker, tone) = match state {
+                    Some(state) => (
+                        crate::view::session_state_mark(*state, app.glyph_tier()),
+                        state_marker_colour(*state, theme),
+                    ),
+                    None => ("·", theme.roles.gray_dim),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", if active { "▸" } else { " " }),
+                        Style::default().fg(theme.roles.accent_user),
+                    ),
+                    Span::styled(format!("{marker} "), Style::default().fg(tone)),
+                    Span::styled(
+                        truncate_to_width(title, usize::from(area.width).saturating_sub(8), "…"),
+                        base,
+                    ),
+                ]));
+            }
             crate::app::DockRow::Plan { title, status, .. } => {
                 let marker = match status {
                     vibex_core::PlanStepStatus::Completed => {
@@ -2968,6 +3034,57 @@ fn render_status_band(
         ),
     );
 
+    // ---- the way back up, when this session was delegated -----------------
+    // A sub-session is a page the reader arrived at *from* another session, so
+    // the band names where it came from the way it names the list: a control
+    // that runs the same intent the chord does. It yields to the segments
+    // before it, and the Sessions entry after it yields in turn.
+    let mut parent_entry: Option<(u16, u16)> = None;
+    if app.page_owns_session()
+        && let Some(parent_id) = app.parent_session_id()
+    {
+        let title = app
+            .session_display_title(&parent_id)
+            .unwrap_or_else(|| strings.parent_session().to_string());
+        let chord = app
+            .keymap
+            .chord_for_in(Scope::Agent, Intent::GotoParentSession)
+            .or_else(|| app.keymap.chord_for(Intent::GotoParentSession));
+        let label = format!(
+            "{} {}",
+            crate::glyphs::chevron(true, app.glyph_tier()),
+            title
+        );
+        let budget = usize::from(area.width) / 3;
+        let label = truncate_to_width(&label, budget.max(8), "…");
+        let mut width = display_width(&label) as u16;
+        let chord = chord.map(|chord| format!(" {}", chord.display()));
+        if let Some(chord) = &chord {
+            width += display_width(chord) as u16;
+        }
+        let status_width = right.iter().map(Span::width).sum::<usize>() as u16;
+        let separator = if right.is_empty() {
+            0
+        } else {
+            sep.width() as u16
+        };
+        if status_width + separator + width + 1 < area.width {
+            if !right.is_empty() {
+                right.push(sep.clone());
+            }
+            right.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(theme.roles.accent_user)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if let Some(chord) = chord {
+                right.push(Span::styled(chord, theme.dimmed(theme.roles.gray_dim)));
+            }
+            parent_entry = Some((status_width + separator, width));
+        }
+    }
+
     // ---- the corner: the way to the sessions that already exist ----------
     // Both session pages carry it. On the prompt — where the client starts —
     // the list is the other half of that home; on a session's own page it is
@@ -3039,6 +3156,21 @@ fn render_status_band(
                 height: 1,
             },
             Intent::GotoSessions,
+        ));
+    }
+    // The parent crumb is the same kind of control: a click goes back up the
+    // tree exactly as Alt+Left does.
+    if let Some((offset, width)) = parent_entry
+        && right_width + 1 < area.width
+    {
+        app.regions.hints.push((
+            Rect {
+                x: area.x + area.width - right_width + offset,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            Intent::GotoParentSession,
         ));
     }
 

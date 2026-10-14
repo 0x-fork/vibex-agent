@@ -437,6 +437,12 @@ impl App {
                 self.show_archived = !self.show_archived;
                 Outcome::effects(self.session_page_effects())
             }
+            Intent::ToggleChildBranch => {
+                // A row with no children has no branch: the key does nothing
+                // rather than folding a heading the reader did not point at.
+                let folded = self.toggle_child_branch();
+                Outcome::effects(folded.into_iter().collect())
+            }
             Intent::ToggleSessionCard => {
                 let Some(session_id) = self.selected_session_row_id() else {
                     return Outcome::quiet();
@@ -787,11 +793,52 @@ impl App {
                 Outcome::effects(effects)
             }
             Intent::DockActivate => {
+                if let Some(outcome) = self.activate_child_dock_row() {
+                    return outcome;
+                }
                 if let Some(outcome) = self.activate_team_dock_row() {
                     return outcome;
                 }
                 self.activate_dock_row();
                 Outcome::effects(vec![])
+            }
+            Intent::GotoParentSession => {
+                // The page the reader came from, one level up: a root session
+                // has none, and saying so is better than a key that seems dead.
+                let Some(parent) = self.parent_session_id() else {
+                    let message = self.strings.session_no_parent().to_string();
+                    self.toast(Toast::info(message));
+                    return Outcome::quiet();
+                };
+                self.open_session_effects(parent)
+            }
+            Intent::OpenChildSessions => {
+                let Some(open) = self.selected_session_id().cloned() else {
+                    return Outcome::quiet();
+                };
+                match self.children.child_ids(open.as_str()).as_slice() {
+                    // Nothing is known yet: the key becomes the read that finds
+                    // out, and the next press has something to act on.
+                    [] => {
+                        if let Some(effect) = self.load_child_page(Some(open), false) {
+                            let message = self.strings.dock_children_loading().to_string();
+                            self.toast(Toast::info(message));
+                            return Outcome::effects(vec![effect]);
+                        }
+                        let message = self.strings.dock_children_none().to_string();
+                        self.toast(Toast::info(message));
+                        Outcome::quiet()
+                    }
+                    // One worker is a destination, not a list to choose from.
+                    [only] => self.open_session_effects(only.clone()),
+                    // Several: the dock is where they are named, and the key
+                    // lands the cursor on the first of them.
+                    _ => {
+                        self.dock_open = true;
+                        self.focus_dock_children();
+                        Outcome::effects(vec![])
+                    }
+                }
             }
             Intent::DockHideDone => {
                 let hidden = self.toggle_dock_hide_done();
@@ -3539,10 +3586,16 @@ impl App {
         };
         self.open_session(session_id.clone());
         self.sync_transcript();
+        // The open session's own page is what names its children and the path
+        // back to the session that owns it, so it is read as the page opens
+        // rather than when the list is next refreshed.
+        let child_read = self.load_child_page(Some(session_id.clone()), false);
         let mut effects = vec![Effect::OpenSession { session_id, ticket }];
         if self.runtime_options.is_none() && self.runtime_catalog_available() {
             effects.push(self.read_runtime_catalogue());
         }
+        effects.extend(child_read);
+        effects.extend(self.child_tree_effects());
         Outcome::effects(effects)
     }
 

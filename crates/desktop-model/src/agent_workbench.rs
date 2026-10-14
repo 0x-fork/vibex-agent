@@ -37,6 +37,18 @@ pub struct AgentSidebarRow {
     /// only when this matches, which is what a reorder acts on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    /// Whether this row is a session a delegated task created rather than one
+    /// the reader started. A child row hangs under the session that delegated
+    /// it and is never a navigation root of its own.
+    #[serde(default)]
+    pub delegated: bool,
+    /// How many direct child sessions the row's session owns.
+    ///
+    /// Only a client that reads the ownership tree can answer this; a
+    /// projection that never asked carries zero, which is also what every
+    /// heading carries — a branch is a property of a session, not of a folder.
+    #[serde(default)]
+    pub child_count: usize,
 }
 
 pub fn project_sidebar_rows(
@@ -115,6 +127,8 @@ pub fn project_sidebar_rows(
             collapsed,
             state: None,
             parent_id: None,
+            delegated: false,
+            child_count: 0,
         });
         if !collapsed || !query.is_empty() {
             rows.extend(visible_sessions.into_iter().map(|session| AgentSidebarRow {
@@ -130,6 +144,8 @@ pub fn project_sidebar_rows(
                 collapsed: false,
                 state: Some(session.state),
                 parent_id: None,
+                delegated: false,
+                child_count: 0,
             }));
         }
     }

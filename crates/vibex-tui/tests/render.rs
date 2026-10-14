@@ -9166,3 +9166,177 @@ fn an_agent_account_is_named_in_the_readers_language_on_the_runtime_surfaces() {
 fn unspaced(screen: &str) -> String {
     screen.replace(' ', "")
 }
+
+// ---- delegated sub-sessions ------------------------------------------------
+
+/// One ownership node, for the tree fixtures below.
+fn tree_node(id: &str, parent: Option<&str>, child_count: usize) -> vibex_core::SessionTreeNode {
+    vibex_core::SessionTreeNode {
+        session_ref: vibex_core::VibexUseRef::session(
+            &vibex_core::VibexSessionId::parse(id).expect("valid session id"),
+        ),
+        parent_session_ref: parent.map(|parent| {
+            vibex_core::VibexUseRef::session(
+                &vibex_core::VibexSessionId::parse(parent).expect("valid session id"),
+            )
+        }),
+        title: id.to_string(),
+        agent_id: None,
+        agent_label: None,
+        task_ref: None,
+        task_title: None,
+        task_phase: None,
+        completion_policy: None,
+        child_count,
+        has_more_children: false,
+        blocked_on: None,
+        active_descendants: 0,
+        blocked_descendants: 0,
+        current_task_ref: None,
+        updated_at_ms: 1,
+    }
+}
+
+fn tree_page(
+    nodes: Vec<vibex_core::SessionTreeNode>,
+    registry: Vec<vibex_core::AgentSession>,
+) -> vibex_core::SessionTreePage {
+    vibex_core::SessionTreePage {
+        nodes,
+        ancestors: Vec::new(),
+        registry,
+        next_cursor: None,
+        has_more: false,
+    }
+}
+
+/// A main session and one worker it delegated, as the ownership tree reports
+/// them.
+fn sub_session_app(
+    width: u16,
+    height: u16,
+) -> (App, vibex_core::VibexSessionId, vibex_core::VibexSessionId) {
+    let mut app = app(width, height);
+    let mut parent = seeded_session("session_parent001", "the main session");
+    parent.state = vibex_core::AgentSessionState::NeedsInput;
+    let mut worker = seeded_session("session_worker001", "the worker");
+    worker.state = vibex_core::AgentSessionState::Running;
+    let parent_id = parent.id.clone();
+    let worker_id = worker.id.clone();
+    let registry = vec![parent.clone(), worker.clone()];
+    app.agent
+        .apply_sessions(Ok(vec![parent]))
+        .expect("sessions apply");
+    app.children
+        .apply(None, false, 1_000, tree_page(Vec::new(), Vec::new()));
+    app.children.apply(
+        Some(&parent_id),
+        false,
+        1_000,
+        tree_page(
+            vec![tree_node("session_worker001", Some("session_parent001"), 0)],
+            registry,
+        ),
+    );
+    (app, parent_id, worker_id)
+}
+
+/// The row the session list draws a session on.
+fn session_row(app: &App, id: &vibex_core::VibexSessionId) -> usize {
+    app.sidebar_rows()
+        .iter()
+        .position(|row| row.session_id.as_ref() == Some(id))
+        .expect("the session's row is on the list")
+}
+
+#[test]
+fn the_session_list_nests_a_sessions_delegated_workers() {
+    use vibex_tui::action::Intent;
+    let (mut app, parent_id, worker_id) = sub_session_app(120, 40);
+    app.perform(Intent::GotoSessions);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("the main session") && screen.contains("the worker"),
+        "the list hid a delegated session:\n{screen}"
+    );
+    assert!(
+        screen.contains('↳'),
+        "a child row lost its nesting mark:\n{screen}"
+    );
+    // The worker hangs one indent in from the session that owns it.
+    let owner = session_row(&app, &parent_id);
+    let worker = session_row(&app, &worker_id);
+    assert_eq!(worker, owner + 1, "the worker is not drawn under its owner");
+    assert!(app.sidebar_rows()[worker].delegated);
+    assert_eq!(
+        app.sidebar_rows()[worker].depth,
+        app.sidebar_rows()[owner].depth + 1,
+        "the branch is not indented"
+    );
+
+    // The owner says it can fold, and folding hides the whole branch.
+    assert!(app.sidebar_rows()[owner].child_count > 0);
+    app.set_selection(Scope::Sessions, owner);
+    app.perform(Intent::ToggleChildBranch);
+    let folded = text(&render(&mut app, 120, 40));
+    assert!(
+        !folded.contains("the worker"),
+        "a folded branch kept drawing its worker:\n{folded}"
+    );
+    // The folded row still says how much it holds, so the reader can find it
+    // again rather than reading the row as an ordinary leaf.
+    assert!(
+        app.sidebar_rows()[session_row(&app, &parent_id)].child_count > 0,
+        "a folded branch forgot that it has children"
+    );
+}
+
+#[test]
+fn a_main_session_offers_the_workers_it_delegated() {
+    use vibex_tui::action::Intent;
+    let (mut app, parent_id, _) = sub_session_app(120, 40);
+    let parent = app.session_by_id(&parent_id).cloned().expect("the parent");
+    app.agent.state.selected_session_id = Some(parent_id.clone());
+    app.agent.state.active_session.resolve(parent);
+    app.navigate_to(Page::Agent);
+    app.perform(Intent::ToggleDock);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("Sub-sessions"),
+        "the dock has no section for the sessions this one delegated:\n{screen}"
+    );
+    assert!(
+        screen.contains("the worker"),
+        "the delegated session is not named in the dock:\n{screen}"
+    );
+}
+
+#[test]
+fn a_sub_session_page_names_the_way_back_to_its_main_session() {
+    let (mut app, parent_id, worker_id) = sub_session_app(120, 40);
+    let worker = app.session_by_id(&worker_id).cloned().expect("the worker");
+    app.agent.state.selected_session_id = Some(worker_id.clone());
+    app.agent.state.active_session.resolve(worker);
+    // The worker's own page is what answered with the path back up.
+    app.children
+        .set_open_path(&worker_id, vec![tree_node("session_parent001", None, 1)]);
+    app.navigate_to(Page::Agent);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("the main session"),
+        "the way back is not named after the session it leads to:\n{screen}"
+    );
+    assert!(
+        screen.contains('▴'),
+        "the way back wears no mark of its own:\n{screen}"
+    );
+    assert!(
+        screen.contains("Alt+←"),
+        "the way back does not spell the chord that answers:\n{screen}"
+    );
+    assert_eq!(
+        app.parent_session_id().as_ref(),
+        Some(&parent_id),
+        "the page cannot answer which session owns this one"
+    );
+}

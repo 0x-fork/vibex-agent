@@ -1787,6 +1787,7 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             // no longer draw, so its last words are not worth keeping.
             app.retain_session_echoes();
             app.retain_pending_session_titles();
+            app.retain_child_tree();
             // Fold the loaded ids into the reader's arrangement: their pins and
             // manual order survive a refresh, and new sessions are appended
             // rather than dropped from the order.
@@ -1795,7 +1796,45 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             if let Some(effect) = app.pending_session_list_refresh() {
                 worker.dispatch(effect);
             }
+            // A session that has just appeared may own children, and one that
+            // has just changed may have changed a worker's state. The reads are
+            // coalesced and bounded by the tree itself, so a burst of session
+            // events does not become a burst of ownership reads.
+            for effect in app.child_tree_effects() {
+                worker.dispatch(effect);
+            }
         }
+        AppMessage::SessionTree {
+            parent_session_id,
+            append,
+            result,
+        } => match result {
+            Ok(page) => {
+                // Only the page the open session asked for describes the path
+                // back to the session that owns it; a branch's ancestors are
+                // its own and never this reader's way home.
+                if let Some(open) = parent_session_id.clone()
+                    && app.selected_session_id() == Some(&open)
+                {
+                    app.children.set_open_path(&open, page.ancestors.clone());
+                }
+                app.children.apply(
+                    parent_session_id.as_ref(),
+                    append,
+                    vibex_core::unix_timestamp_ms(),
+                    page,
+                );
+            }
+            Err(error) => {
+                if error.kind == vibex_backend::BackendErrorKind::Unsupported {
+                    // This runtime has no ownership tree to read. Stop asking
+                    // and keep drawing the list this client has always drawn.
+                    app.children.mark_unsupported();
+                } else {
+                    app.children.fail(parent_session_id.as_ref());
+                }
+            }
+        },
         AppMessage::AutoContinueTurnStatus {
             session_id,
             updated_at_ms,
@@ -5614,6 +5653,147 @@ mod tests {
         assert!(
             read.is_ok(),
             "the completed write did not re-read the area it changed"
+        );
+    }
+
+    /// One ownership node for the delegation tests below.
+    fn ownership_node(
+        id: &str,
+        parent: Option<&str>,
+        child_count: usize,
+    ) -> vibex_core::SessionTreeNode {
+        vibex_core::SessionTreeNode {
+            session_ref: vibex_core::VibexUseRef::session(
+                &vibex_core::VibexSessionId::parse(id).unwrap(),
+            ),
+            parent_session_ref: parent.map(|parent| {
+                vibex_core::VibexUseRef::session(
+                    &vibex_core::VibexSessionId::parse(parent).unwrap(),
+                )
+            }),
+            title: id.to_string(),
+            agent_id: None,
+            agent_label: None,
+            task_ref: None,
+            task_title: None,
+            task_phase: None,
+            completion_policy: None,
+            child_count,
+            has_more_children: false,
+            blocked_on: None,
+            active_descendants: 0,
+            blocked_descendants: 0,
+            current_task_ref: None,
+            updated_at_ms: 1,
+        }
+    }
+
+    fn ownership_page(
+        nodes: Vec<vibex_core::SessionTreeNode>,
+        registry: Vec<vibex_core::AgentSession>,
+    ) -> vibex_core::SessionTreePage {
+        vibex_core::SessionTreePage {
+            nodes,
+            ancestors: Vec::new(),
+            registry,
+            next_cursor: None,
+            has_more: false,
+        }
+    }
+
+    /// The ownership tree is what makes a delegated session reachable at all:
+    /// the root list omits it, so the tree names it, the page has to be able to
+    /// say which session owns the open one, and both directions have to open
+    /// the other session.
+    #[test]
+    fn the_ownership_tree_opens_the_main_session_and_its_workers() {
+        let (worker, _messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+        let mut app = isolation_app();
+        let main_id = vibex_core::VibexSessionId::parse("session_main00001").unwrap();
+        let sub_id = vibex_core::VibexSessionId::parse("session_sub000001").unwrap();
+        let mut main = isolation_session(main_id.clone(), "codex");
+        main.title = "the main session".into();
+        let mut sub = isolation_session(sub_id.clone(), "codex");
+        sub.title = "the worker".into();
+        app.agent.apply_sessions(Ok(vec![main.clone()])).unwrap();
+        app.agent.state.selected_session_id = Some(sub_id.clone());
+
+        // The sub-session's own page: no children of its own, and the path back
+        // up to the session that delegated it.
+        let mut page = ownership_page(Vec::new(), vec![main.clone(), sub.clone()]);
+        page.ancestors = vec![ownership_node("session_main00001", None, 1)];
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::SessionTree {
+                parent_session_id: Some(sub_id.clone()),
+                append: false,
+                result: Ok(page),
+            },
+        )
+        .unwrap();
+        assert_eq!(app.parent_session_id(), Some(main_id.clone()));
+
+        // The key that goes back up opens the session that delegated this one.
+        let outcome = app.perform(crate::action::Intent::GotoParentSession);
+        assert!(
+            outcome.effects.iter().any(|effect| matches!(
+                effect,
+                crate::app::Effect::OpenSession { session_id, .. } if session_id == &main_id
+            )),
+            "the way back opened something else: {:?}",
+            outcome.effects
+        );
+
+        // A root session has no way up, and its page answers none.
+        app.agent.state.selected_session_id = Some(main_id.clone());
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::SessionTree {
+                parent_session_id: Some(main_id.clone()),
+                append: false,
+                result: Ok(ownership_page(Vec::new(), vec![main.clone()])),
+            },
+        )
+        .unwrap();
+        assert_eq!(app.parent_session_id(), None);
+
+        // The main session's page names the worker it delegated, and the key
+        // opens it.
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::SessionTree {
+                parent_session_id: Some(main_id.clone()),
+                append: false,
+                result: Ok(ownership_page(
+                    vec![ownership_node(
+                        "session_sub000001",
+                        Some("session_main00001"),
+                        0,
+                    )],
+                    vec![main.clone(), sub.clone()],
+                )),
+            },
+        )
+        .unwrap();
+        assert_eq!(app.children.child_ids(main_id.as_str()).len(), 1);
+        assert!(
+            app.sidebar_rows()
+                .iter()
+                .any(|row| row.delegated && row.session_id.as_ref() == Some(&sub_id)),
+            "the delegated session has no nested row"
+        );
+        let outcome = app.perform(crate::action::Intent::OpenChildSessions);
+        assert!(
+            outcome.effects.iter().any(|effect| matches!(
+                effect,
+                crate::app::Effect::OpenSession { session_id, .. } if session_id == &sub_id
+            )),
+            "the sub-session key opened something else: {:?}",
+            outcome.effects
         );
     }
 }

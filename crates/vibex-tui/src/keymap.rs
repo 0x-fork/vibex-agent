@@ -548,6 +548,14 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::CollapseSessionCards,
         "Close cards",
     ),
+    // A branch of delegated sub-sessions folds on one key, the way the heading
+    // above it folds on one click; `z` is free here and reads as "fold".
+    binding(
+        Scope::Sessions,
+        Chord::plain(KeyCode::Char('z')),
+        Intent::ToggleChildBranch,
+        "Sub-sessions",
+    ),
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char('y')),
@@ -774,6 +782,22 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Chord::new(KeyCode::Char('h'), KeyModifiers::ALT),
         Intent::DockHideDone,
         "Hide done",
+    ),
+    // The ownership tree is walked with the arrows that mean "in" and "back":
+    // into the sessions this one delegated, and back to the one that delegated
+    // it. Neither chord is claimed by the composer, so both answer wherever the
+    // keyboard is on the page.
+    binding(
+        Scope::Agent,
+        Chord::new(KeyCode::Right, KeyModifiers::ALT),
+        Intent::OpenChildSessions,
+        "Sub-sessions",
+    ),
+    binding(
+        Scope::Agent,
+        Chord::new(KeyCode::Left, KeyModifiers::ALT),
+        Intent::GotoParentSession,
+        "Main session",
     ),
     // ---- composer -------------------------------------------------------
     binding(

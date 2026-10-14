@@ -716,6 +716,37 @@ is never a column count.
   arrangement's tree unreadable — the rows would look like one flat list with
   headings scattered through it. The indent is part of the title's budget (and
   of the published control columns), not padding painted over the row.
+* **A delegated session is a row, one indent in from the session that owns it.**
+  The runtime's root list deliberately omits a child a delegated task created,
+  so the list is built from two reads: the root sessions it always had, and the
+  ownership tree (`children::ChildSessions`, fed by `Effect::LoadSessionTree` →
+  `AgentBackend::session_tree`). A session the tree says has children carries a
+  disclosure before its title — a control that folds its branch on one press
+  (`z`, or a click on the mark) and stays a row that opens on Enter — and its
+  children hang under it with `delegated: true`, the `↳` mark in the column a
+  root row spends on its selection bar, and the same state mark, age and echo
+  every other row has. The tree is walked to whatever depth the runtime
+  published, a filter reaches inside a folded branch the way it reaches inside a
+  folder, and a heading's count includes the children it holds. Folding is the
+  client's own display choice and rides `tui-sidebar.json`
+  (`SidebarArrangement::collapsed_child_ids`), never the authority's
+  arrangement: the desktop persists the same fact in its own UI state, and the
+  two must not overwrite each other. A runtime with no ownership read says so
+  once (`ChildSessions::mark_unsupported`) and the list goes on drawing exactly
+  what it drew before. Pin and move refuse a child, because a branch follows the
+  session that owns it; opening, renaming, archiving and deleting work by the
+  same intents as any other row, and the Agent label, echo and unread marks are
+  kept for it too.
+* **The ownership tree is walked from both ends.** A session's own page reads
+  its branch on open, so the dock names the sessions it delegated — a
+  `DockSection::Children` section whose rows open that session — and the status
+  band draws the way back up for a child: `▴ <main session>` with the `Alt+Left`
+  chord, published as a click target like the Sessions entry. `Alt+Right` is the
+  other direction: it opens the single child, or lands the dock cursor on the
+  first of several, or becomes the read that finds out when the branch has not
+  been read yet. The detail card carries the same fact as a `Main` field, so all
+  three surfaces answer "where did this session come from" from one reading of
+  the ownership edges.
 * **The list is a window over lines, not a selection over rows.** A workspace can
   hold hundreds of sessions and a row can carry a detail card, so the page lays
   every row out, measures them in lines, and draws the window it is scrolled to

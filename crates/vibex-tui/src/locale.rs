@@ -199,6 +199,7 @@ strings! {
     // Detail-card field labels. Kept to one word each so the label column can
     // stay narrow enough for the value beside it.
     session_card_id => { "ID", "ID", "ID" },
+    session_card_parent => { "Main", "主会话", "主工作階段" },
     session_card_agent => { "Agent", "Agent", "Agent" },
     session_card_model => { "Model", "模型", "模型" },
     session_card_created => { "Created", "创建于", "建立於" },
@@ -208,6 +209,23 @@ strings! {
     session_card_turns => { "Turns", "轮次", "輪次" },
     session_card_tools => { "Tools", "工具", "工具" },
     dock_agents => { "Agents", "子代理", "子代理" },
+    dock_children => { "Sub-sessions", "子会话", "子工作階段" },
+    dock_children_none => {
+        "No sub-sessions delegated by this session",
+        "这个会话没有委派子会话",
+        "這個工作階段沒有委派子工作階段"
+    },
+    dock_children_loading => {
+        "Reading this session's sub-sessions…",
+        "正在读取这个会话的子会话…",
+        "正在讀取這個工作階段的子工作階段…"
+    },
+    session_no_parent => {
+        "This session was not delegated by another",
+        "这个会话不是由其他会话委派的",
+        "這個工作階段不是由其他工作階段委派的"
+    },
+    parent_session => { "Main session", "主会话", "主工作階段" },
     dock_plan => { "Plan", "计划", "計畫" },
     dock_queue => { "Held", "排队", "排隊" },
     dock_title => { "Running", "运行中", "執行中" },

@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use vibex_core::{AgentSession, AgentSessionState, TimelineItem, TimelinePayload};
+use vibex_core::{AgentSession, AgentSessionState, TimelineItem, TimelinePayload, VibexSessionId};
 use vibex_desktop_model::{
     AgentSidebarRow, AgentSidebarRowKind, SidebarOrganizationItem, SidebarOrganizationView,
     sidebar_project_items_for_workspace, sidebar_root_items, sort_sidebar_sessions,
@@ -42,6 +42,8 @@ pub struct SessionListInput<'a> {
     pub projects: &'a [ProjectEntry],
     /// The client's own unread marks, folded in beside the authority's.
     pub unread_session_ids: &'a BTreeSet<String>,
+    /// The ownership tree the child rows are drawn from.
+    pub children: &'a crate::children::ChildSessions,
     pub query: &'a str,
 }
 
@@ -98,15 +100,23 @@ pub fn session_state_chip(state: AgentSessionState) -> Option<AgentSessionState>
 /// the count the same way it narrows the list.
 pub fn session_state_tally(
     sessions: &[AgentSession],
+    children: &crate::children::ChildSessions,
     query: &str,
 ) -> Vec<(AgentSessionState, usize)> {
     let mut states = SESSION_STATE_CHIPS
         .iter()
         .map(|state| (*state, 0usize))
         .collect::<Vec<_>>();
-    for session in sessions
-        .iter()
-        .filter(|session| session.deleted_at_ms.is_none() && session_matches(session, query))
+    // The root list and the children the ownership tree named: a worker that is
+    // waiting on the reader is as much news as the session that delegated it,
+    // and the header describes the list they are both drawn in.
+    for session in
+        sessions
+            .iter()
+            .filter(|session| session.deleted_at_ms.is_none() && session_matches(session, query))
+            .chain(children.child_sessions().filter(|session| {
+                session.deleted_at_ms.is_none() && session_matches(session, query)
+            }))
     {
         let Some(chip) = session_state_chip(session.state) else {
             continue;
@@ -140,7 +150,7 @@ pub fn session_list_rows(input: &SessionListInput<'_>) -> SessionListRows {
             .push(session.clone());
     }
 
-    let states = session_state_tally(input.sessions, &query);
+    let states = session_state_tally(input.sessions, input.children, &query);
 
     let mut projects = input.projects.to_vec();
     // A session can outlive the workspace listing this client last fetched.
@@ -289,6 +299,8 @@ fn push_root_children(
                     selected: false,
                     collapsed,
                     state: None,
+                    delegated: false,
+                    child_count: 0,
                     parent_id: parent_folder_id.map(ToString::to_string),
                 });
                 counts.push(subtree_sessions(&children, &child_counts));
@@ -330,11 +342,25 @@ fn push_project(
         input.view.session_order_anchored_at_ms,
         &input.view.pinned_session_ids,
     );
-    let session_ids = project_sessions
-        .iter()
-        .filter(|session| session_matches(session, query))
-        .map(|session| session.id.as_str().to_string())
-        .collect::<Vec<_>>();
+    let session_ids = {
+        let mut ids = project_sessions
+            .iter()
+            .filter(|session| session_matches(session, query))
+            .map(|session| session.id.as_str().to_string())
+            .collect::<Vec<_>>();
+        // A session whose own name does not match is still the way *to* a child
+        // that does: dropping it would make the matching worker unreachable.
+        if searching {
+            for session in &project_sessions {
+                if !ids.iter().any(|id| id == session.id.as_str())
+                    && descendant_matches(input.children, &session.id, query, 0)
+                {
+                    ids.push(session.id.as_str().to_string());
+                }
+            }
+        }
+        ids
+    };
     let mut children = Vec::new();
     let mut child_counts = Vec::new();
     push_project_children(
@@ -371,6 +397,8 @@ fn push_project(
         selected: false,
         collapsed,
         state: None,
+        delegated: false,
+        child_count: 0,
         parent_id: parent_folder_id.map(ToString::to_string),
     });
     counts.push(subtree_sessions(&children, &child_counts));
@@ -415,6 +443,7 @@ fn push_project_children(
                 else {
                     continue;
                 };
+                let child_count = input.children.declared_child_count(session.id.as_str());
                 rows.push(AgentSidebarRow {
                     id: format!("session:{}", session.id.as_str()),
                     kind: AgentSidebarRowKind::Session,
@@ -425,11 +454,31 @@ fn push_project_children(
                     depth,
                     pinned: input.view.pinned_session_ids.contains(session.id.as_str()),
                     selected: false,
-                    collapsed: false,
+                    collapsed: input.children.is_collapsed(session.id.as_str()),
                     state: Some(session.state),
+                    delegated: false,
+                    child_count,
                     parent_id: parent_folder_id.map(ToString::to_string),
                 });
                 counts.push(0);
+                // The branch hangs under the row that owns it, indented one
+                // step in, and only while the reader has it open. A search
+                // reaches inside a folded branch the way it reaches inside a
+                // folded folder, so the reader finds the worker by name.
+                if child_count > 0
+                    && (!input.children.is_collapsed(session.id.as_str()) || searching)
+                {
+                    push_child_rows(
+                        rows,
+                        counts,
+                        input.children,
+                        project_id,
+                        &session.id,
+                        depth + 1,
+                        query,
+                        searching,
+                    );
+                }
             }
             SidebarOrganizationItem::Folder(folder_id) => {
                 let Some(folder) = organization.folder(&folder_id) else {
@@ -468,6 +517,8 @@ fn push_project_children(
                     selected: false,
                     collapsed,
                     state: None,
+                    delegated: false,
+                    child_count: 0,
                     parent_id: parent_folder_id.map(ToString::to_string),
                 });
                 counts.push(subtree_sessions(&children, &child_counts));
@@ -502,6 +553,214 @@ fn subtree_sessions(children: &[AgentSidebarRow], counts: &[usize]) -> usize {
             }
         })
         .sum()
+}
+
+/// One session's delegated children, then theirs, under the row that owns them.
+///
+/// A child is a session row like any other — it opens, it carries its state and
+/// its own age — that happens to hang one indent in from the session that
+/// delegated it. The chain is walked to whatever depth the runtime published,
+/// so a worker that delegated further work is not drawn as a leaf.
+#[allow(clippy::too_many_arguments)]
+fn push_child_rows(
+    rows: &mut Vec<AgentSidebarRow>,
+    counts: &mut Vec<usize>,
+    children: &crate::children::ChildSessions,
+    project_id: &str,
+    parent_session_id: &VibexSessionId,
+    depth: u8,
+    query: &str,
+    searching: bool,
+) {
+    for node in children.children(parent_session_id.as_str()) {
+        let Some(child_id) = node.session_ref.session_id() else {
+            continue;
+        };
+        let session = children.session(child_id.as_str());
+        let title = session
+            .map(|session| session.title.as_str())
+            .unwrap_or(node.title.as_str());
+        // A child whose own name does not match is still the way to a
+        // grandchild that does; dropping it would hide the match.
+        if searching
+            && !child_matches(session, title, query)
+            && !descendant_matches(children, &child_id, query, 0)
+        {
+            continue;
+        }
+        let child_count = children.declared_child_count(child_id.as_str());
+        let collapsed = children.is_collapsed(child_id.as_str());
+        rows.push(AgentSidebarRow {
+            id: format!("session:{}", child_id.as_str()),
+            kind: AgentSidebarRowKind::Session,
+            project_id: project_id.to_string(),
+            workspace_id: session
+                .map(|session| session.workspace_id.as_str().to_string())
+                .unwrap_or_default(),
+            session_id: Some(child_id.clone()),
+            label: title.to_string(),
+            depth,
+            pinned: false,
+            selected: false,
+            collapsed,
+            state: session.map(|session| session.state),
+            delegated: true,
+            child_count,
+            // A child's siblings are its own, not its parent's neighbours: the
+            // key names the session the branch hangs from, so a reorder can
+            // never treat a worker as a peer of the session that owns it.
+            parent_id: Some(format!("session:{}", parent_session_id.as_str())),
+        });
+        counts.push(0);
+        if child_count > 0 && (!collapsed || searching) {
+            push_child_rows(
+                rows,
+                counts,
+                children,
+                project_id,
+                &child_id,
+                depth + 1,
+                query,
+                searching,
+            );
+        }
+    }
+}
+
+/// Whether a child session is one the list is about, for a given filter.
+fn child_matches(session: Option<&AgentSession>, title: &str, query: &str) -> bool {
+    query.is_empty()
+        || title.to_lowercase().contains(query)
+        || session.is_some_and(|session| session.workspace_root.to_lowercase().contains(query))
+}
+
+/// Whether anything under a session is what the reader is looking for.
+fn descendant_matches(
+    children: &crate::children::ChildSessions,
+    parent: &VibexSessionId,
+    query: &str,
+    depth: u8,
+) -> bool {
+    // The runtime bounds ownership depth; this is the guard that keeps a
+    // malformed graph from making a filter walk forever.
+    if depth > 16 {
+        return false;
+    }
+    children.children(parent.as_str()).iter().any(|node| {
+        let Some(child_id) = node.session_ref.session_id() else {
+            return false;
+        };
+        let session = children.session(child_id.as_str());
+        let title = session
+            .map(|session| session.title.as_str())
+            .unwrap_or(node.title.as_str());
+        child_matches(session, title, query)
+            || descendant_matches(children, &child_id, query, depth + 1)
+    })
+}
+
+/// The fallback list, with the filter applied where the ownership tree is.
+///
+/// The shared projection filters a session by its own name alone, which would
+/// hide the session a matching worker hangs under and make the worker
+/// unreachable. So the projection is asked for everything and the filter is
+/// applied here, where the tree is known: a session stays when it matches or
+/// when something under it does, a heading stays when its own name matches or
+/// when it still has a row, and the children are filtered and nested by the
+/// same rules the arranged list uses.
+pub fn filtered_child_rows(
+    rows: Vec<AgentSidebarRow>,
+    loaded: &[AgentSession],
+    children: &crate::children::ChildSessions,
+    query: &str,
+) -> Vec<AgentSidebarRow> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return nest_child_rows(rows, children, "");
+    }
+    let mut kept = Vec::with_capacity(rows.len());
+    // A heading the reader's own name matched keeps everything under it, the
+    // way the shared projection keeps a matching project's sessions.
+    let mut keep_all_below: Option<u8> = None;
+    // Headings wait for the first row that proves them worth drawing.
+    let mut pending: Vec<AgentSidebarRow> = Vec::new();
+    for row in rows {
+        let Some(session_id) = row.session_id.clone() else {
+            if keep_all_below.is_some_and(|depth| row.depth > depth) {
+                kept.push(row);
+                continue;
+            }
+            if row.label.to_lowercase().contains(&query) {
+                keep_all_below = Some(row.depth);
+                kept.append(&mut pending);
+                kept.push(row);
+                continue;
+            }
+            keep_all_below = None;
+            pending.push(row);
+            continue;
+        };
+        let session = loaded
+            .iter()
+            .find(|session| session.id == session_id)
+            .or_else(|| children.session(session_id.as_str()));
+        let matches = keep_all_below.is_some()
+            || session.is_some_and(|session| session_matches(session, &query))
+            || descendant_matches(children, &session_id, &query, 0);
+        if matches {
+            kept.append(&mut pending);
+            kept.push(row);
+        }
+    }
+    nest_child_rows(kept, children, &query)
+}
+
+/// Hang each session's children under its row, for a projection built
+/// elsewhere.
+///
+/// The fallback projection is a flat list of headings and sessions, so the
+/// ownership rows are spliced in afterwards with the same filter and the same
+/// indentation the arranged tree uses. Counts are *not* rebuilt here: the
+/// heading tally is counted from the sessions themselves, which is the only way
+/// a folded heading can still hold what it hides.
+pub fn nest_child_rows(
+    rows: Vec<AgentSidebarRow>,
+    children: &crate::children::ChildSessions,
+    query: &str,
+) -> Vec<AgentSidebarRow> {
+    let query = query.trim().to_lowercase();
+    let searching = !query.is_empty();
+    let mut nested = Vec::with_capacity(rows.len());
+    let mut scratch = Vec::new();
+    for mut row in rows {
+        let Some(session_id) = row.session_id.clone() else {
+            nested.push(row);
+            continue;
+        };
+        let child_count = children.declared_child_count(session_id.as_str());
+        let collapsed = children.is_collapsed(session_id.as_str());
+        row.delegated = false;
+        row.child_count = child_count;
+        row.collapsed = collapsed;
+        let project_id = row.project_id.clone();
+        let depth = row.depth;
+        nested.push(row);
+        if child_count == 0 || (collapsed && !searching) {
+            continue;
+        }
+        scratch.clear();
+        push_child_rows(
+            &mut nested,
+            &mut scratch,
+            children,
+            &project_id,
+            &session_id,
+            depth + 1,
+            &query,
+            searching,
+        );
+    }
+    nested
 }
 
 /// How many characters of a session's last words the list keeps.
@@ -580,6 +839,7 @@ pub(crate) fn session_matches(session: &AgentSession, query: &str) -> bool {
 pub fn heading_counts(
     rows: &[AgentSidebarRow],
     sessions: &[AgentSession],
+    children: &crate::children::ChildSessions,
     query: &str,
 ) -> Vec<usize> {
     rows.iter()
@@ -587,16 +847,18 @@ pub fn heading_counts(
             if row.kind == AgentSidebarRowKind::Session {
                 return 0;
             }
-            sessions
-                .iter()
-                .filter(|session| {
-                    session.deleted_at_ms.is_none()
-                        && session_matches(session, query)
-                        && session.project_id.as_str() == row.project_id
-                        && (row.workspace_id.is_empty()
-                            || session.workspace_id.as_str() == row.workspace_id)
-                })
-                .count()
+            let belongs = |session: &&AgentSession| {
+                session.deleted_at_ms.is_none()
+                    && session_matches(session, query)
+                    && session.project_id.as_str() == row.project_id
+                    && (row.workspace_id.is_empty()
+                        || session.workspace_id.as_str() == row.workspace_id)
+            };
+            // The root sessions and the children the tree named: a heading
+            // that counted only what the runtime's root list carried would
+            // under-report a project by every worker delegated in it.
+            sessions.iter().filter(belongs).count()
+                + children.child_sessions().filter(belongs).count()
         })
         .collect()
 }
@@ -751,6 +1013,14 @@ mod tests {
     }
 
     fn list_for(view: &SidebarOrganizationView, query: &str) -> SessionListRows {
+        list_with_children(view, query, &crate::children::ChildSessions::default())
+    }
+
+    fn list_with_children(
+        view: &SidebarOrganizationView,
+        query: &str,
+        children: &crate::children::ChildSessions,
+    ) -> SessionListRows {
         let sessions = vec![
             session("session_older001", "vibex", "older", 3),
             session("session_recent01", "vibex", "recent", 2),
@@ -777,6 +1047,7 @@ mod tests {
             sessions: &sessions,
             projects: &projects,
             unread_session_ids: &BTreeSet::new(),
+            children,
             query,
         })
     }
@@ -854,6 +1125,7 @@ mod tests {
             sessions: &sessions,
             projects: &projects,
             unread_session_ids: &BTreeSet::new(),
+            children: &crate::children::ChildSessions::default(),
             query: "",
         });
         assert_eq!(
@@ -872,6 +1144,7 @@ mod tests {
             sessions: &sessions,
             projects: &projects,
             unread_session_ids: &BTreeSet::new(),
+            children: &crate::children::ChildSessions::default(),
             query: "quiet",
         });
         assert_eq!(
@@ -1040,6 +1313,7 @@ mod tests {
             sessions: &sessions,
             projects: &projects,
             unread_session_ids: &BTreeSet::new(),
+            children: &crate::children::ChildSessions::default(),
             query: "",
         })
         .rows;
@@ -1061,6 +1335,7 @@ mod tests {
             sessions: &[],
             projects: &projects,
             unread_session_ids: &BTreeSet::new(),
+            children: &crate::children::ChildSessions::default(),
             query: "",
         })
         .rows;
@@ -1076,11 +1351,209 @@ mod tests {
             sessions: &sessions,
             projects: &[],
             unread_session_ids: &BTreeSet::new(),
+            children: &crate::children::ChildSessions::default(),
             query: "",
         })
         .rows;
         // The project names the session's own root, so the session is not lost
         // behind a listing that has not caught up.
         assert_eq!(labels(&rows), vec!["project-gone", "orphan"], "{rows:#?}");
+    }
+
+    /// An ownership page: `nodes` name the children, `sessions` name them for
+    /// the list.
+    fn tree_page(
+        nodes: Vec<vibex_core::SessionTreeNode>,
+        registry: Vec<AgentSession>,
+    ) -> vibex_core::SessionTreePage {
+        vibex_core::SessionTreePage {
+            nodes,
+            ancestors: Vec::new(),
+            registry,
+            next_cursor: None,
+            has_more: false,
+        }
+    }
+
+    fn child_node(id: &str, parent: &str, child_count: usize) -> vibex_core::SessionTreeNode {
+        vibex_core::SessionTreeNode {
+            session_ref: vibex_core::VibexUseRef::session(
+                &VibexSessionId::parse(id).expect("valid session id"),
+            ),
+            parent_session_ref: Some(vibex_core::VibexUseRef::session(
+                &VibexSessionId::parse(parent).expect("valid session id"),
+            )),
+            title: id.to_string(),
+            agent_id: None,
+            agent_label: None,
+            task_ref: None,
+            task_title: None,
+            task_phase: None,
+            completion_policy: None,
+            child_count,
+            has_more_children: false,
+            blocked_on: None,
+            active_descendants: 0,
+            blocked_descendants: 0,
+            current_task_ref: None,
+            updated_at_ms: 1,
+        }
+    }
+
+    /// A tree holding one child under `session_recent01`, and one grandchild
+    /// under that child.
+    fn children_tree() -> crate::children::ChildSessions {
+        let mut children = crate::children::ChildSessions::default();
+        let parent = VibexSessionId::parse("session_recent01").unwrap();
+        children.apply(None, false, 1_000, tree_page(Vec::new(), Vec::new()));
+        children.apply(
+            Some(&parent),
+            false,
+            1_000,
+            tree_page(
+                vec![child_node("session_worker001", "session_recent01", 1)],
+                vec![session("session_worker001", "vibex", "the worker", 6)],
+            ),
+        );
+        let worker = VibexSessionId::parse("session_worker001").unwrap();
+        children.apply(
+            Some(&worker),
+            false,
+            1_000,
+            tree_page(
+                vec![child_node("session_helper001", "session_worker001", 0)],
+                vec![session("session_helper001", "vibex", "the helper", 7)],
+            ),
+        );
+        children
+    }
+
+    #[test]
+    fn a_delegated_session_hangs_under_the_session_that_owns_it() {
+        let view = arranged_view();
+        let children = children_tree();
+        let list = list_with_children(&view, "", &children);
+        let rows = &list.rows;
+        // The arranged order is kept, and each worker follows its own owner one
+        // indent in.
+        assert_eq!(
+            labels(rows),
+            vec![
+                "vibex",
+                "kept",
+                "recent",
+                "the worker",
+                "the helper",
+                "archive",
+                "older",
+                "vibex-site",
+                "the site",
+            ],
+            "the branch is not under its owner: {rows:#?}"
+        );
+        let worker = rows
+            .iter()
+            .find(|row| row.label == "the worker")
+            .expect("the worker's row");
+        assert!(worker.delegated, "a child row did not say it is delegated");
+        assert_eq!(
+            worker.depth, 2,
+            "a child row is not indented under its owner"
+        );
+        assert_eq!(worker.child_count, 1, "a child's own branch was lost");
+        let helper = rows
+            .iter()
+            .find(|row| row.label == "the helper")
+            .expect("the helper's row");
+        assert_eq!(helper.depth, 3, "the branch stops one level deep");
+        // The owner's heading counts what the whole subtree holds.
+        let (index, _) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.label == "vibex")
+            .expect("the project heading");
+        assert_eq!(list.counts[index], 6, "the heading forgot the branch");
+        // Folding the owner's branch hides both levels at once.
+        let mut folded = children.clone();
+        folded.toggle_collapsed("session_recent01");
+        let list = list_with_children(&view, "", &folded);
+        assert_eq!(
+            labels(&list.rows),
+            vec![
+                "vibex",
+                "kept",
+                "recent",
+                "archive",
+                "older",
+                "vibex-site",
+                "the site"
+            ],
+            "a folded branch was still drawn: {:#?}",
+            list.rows
+        );
+    }
+
+    #[test]
+    fn a_search_reaches_inside_a_folded_branch() {
+        let view = arranged_view();
+        let mut children = children_tree();
+        children.toggle_collapsed("session_recent01");
+        let list = list_with_children(&view, "helper", &children);
+        assert_eq!(
+            labels(&list.rows),
+            vec!["vibex", "recent", "the worker", "the helper"],
+            "a filter did not reach into a folded branch: {:#?}",
+            list.rows
+        );
+    }
+
+    #[test]
+    fn the_fallback_projection_nests_the_same_way() {
+        let children = children_tree();
+        let rows = vec![
+            AgentSidebarRow {
+                id: "project:project_vibex".to_string(),
+                kind: AgentSidebarRowKind::Project,
+                project_id: "project_vibex".to_string(),
+                workspace_id: String::new(),
+                session_id: None,
+                label: "vibex".to_string(),
+                depth: 0,
+                pinned: false,
+                selected: false,
+                collapsed: false,
+                state: None,
+                parent_id: None,
+                delegated: false,
+                child_count: 0,
+            },
+            AgentSidebarRow {
+                id: "session:session_recent01".to_string(),
+                kind: AgentSidebarRowKind::Session,
+                project_id: "project_vibex".to_string(),
+                workspace_id: "workspace_one".to_string(),
+                session_id: Some(VibexSessionId::parse("session_recent01").unwrap()),
+                label: "recent".to_string(),
+                depth: 1,
+                pinned: false,
+                selected: false,
+                collapsed: false,
+                state: Some(AgentSessionState::Idle),
+                parent_id: None,
+                delegated: false,
+                child_count: 0,
+            },
+        ];
+        let nested = nest_child_rows(rows, &children, "");
+        assert_eq!(
+            labels(&nested),
+            vec!["vibex", "recent", "the worker", "the helper"],
+            "{nested:#?}"
+        );
+        assert_eq!(nested[1].child_count, 1);
+        assert_eq!(nested[1].depth, 1);
+        assert!(nested[2].delegated);
+        assert_eq!(nested[2].depth, 2);
+        assert_eq!(nested[3].depth, 3);
     }
 }

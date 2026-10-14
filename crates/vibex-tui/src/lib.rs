@@ -45,6 +45,7 @@ pub mod action;
 pub mod app;
 pub mod attachment;
 pub mod auto_continue;
+pub mod children;
 pub mod composer;
 pub mod config_center;
 pub mod console;
