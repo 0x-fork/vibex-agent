@@ -1543,14 +1543,15 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             let Some((line, column)) = mouse_cell(app, mouse.column, mouse.row) else {
                 return false;
             };
-            // The divider at the top of a turn's answer folds the process
-            // section above it. It is a control before it is a row: pressing it
+            // The fold's own rows put a turn's process away: the title above an
+            // open section, the rule below it, and the single title row a shut
+            // one draws. They are controls before they are rows: pressing one
             // toggles the work, and a drag that happens to start on it still
-            // selects text, so the gesture only claims its own line. The
+            // selects text, so the gesture only claims its own lines. The
             // pointer resolves the row it landed on rather than asking which
             // affordance `e` would have chosen.
             if let Some(index) = app.transcript.block_at_line(line)
-                && app.transcript.fold_control_line(index) == Some(line)
+                && app.transcript.fold_control_lines(index).contains(&line)
             {
                 app.clear_text_selection();
                 app.focus = Focus::Main;
@@ -2934,6 +2935,33 @@ mod tests {
             app.page,
             crate::app::Page::NewSession,
             "a newline chord submitted the draft"
+        );
+    }
+
+    #[test]
+    fn ctrl_l_reaches_the_session_list_from_the_transcript() {
+        // The global digit that names the session list is taken by the composer
+        // whenever a draft owns the keyboard, so the page binds the chord
+        // itself. A reader whose hand is on the transcript is not typing in a
+        // draft: without this binding there is no key at all that leaves the
+        // session, which is the page the reader spends the session on.
+        use crate::action::Intent;
+        let mut app = isolation_app();
+        app.navigate_to(crate::app::Page::Agent);
+        app.focus = crate::app::Focus::Main;
+        let chord = crate::keymap::Chord::ctrl('l');
+        // The resolution `handle_key` performs, against the scopes the page
+        // actually publishes.
+        let intent = app
+            .keymap
+            .resolve(&app.active_scopes(), chord)
+            .expect("Ctrl+L is unbound on the session page");
+        assert_eq!(intent, Intent::GotoSessions);
+        app.perform(intent);
+        assert_eq!(
+            app.page,
+            crate::app::Page::Sessions,
+            "Ctrl+L did not reach the session list"
         );
     }
 

@@ -123,14 +123,21 @@ Transcript::advance_disclosures(&mut self, Instant) -> bool
   never saw. This matches the desktop's `timeline_turn_process_expanded`
   (`explicit.unwrap_or(conclusion.is_none() && (!complete || superseded))`),
   with the added guard that the drawable process run is non-empty.
-- The TUI fold control is the divider row itself, drawn as the first row of the
-  conclusion block: a disclosure glyph plus `Worked for <duration>`, centred
-  between `glyphs::heading_rule` rules that reach both margins while open and
-  collapse to just the labelled title while shut. The duration comes from the
-  turn's own `started_at_ms`/`ended_at_ms` (a running turn measures to now), so
-  it survives a reload and agrees with the desktop and mobile labels. The
-  divider rides on the conclusion block rather than being a synthetic block, so
-  it adds nothing to layout, search, or copy.
+- The TUI fold control is the fold's own row, drawn inside the blocks the turn
+  already has: `Worked for <duration>` alone as the first row of the conclusion
+  while the section is shut, and open, the same labelled title as the first row
+  of the turn's first process block with a `glyphs::heading_rule` rule below the
+  work on the conclusion. The two ends are one gesture: the title's `▾` and the
+  rule's `▴` both point into the work they put away, both toggle the turn, and
+  one blank row parts either end from the text beside it. The title leads with
+  the Agent's brand mark in both states, in the same two-cell slot the session
+  list reserves and matched by the same identity string
+  (`vibex_brands::agent_mark`); a terminal that cannot hold a picture, or an
+  Agent with no mark, keeps the words alone rather than indenting for nothing.
+  The duration comes from the turn's own `started_at_ms`/`ended_at_ms` (a
+  running turn measures to now), so it survives a reload and agrees with the
+  desktop and mobile labels. The rows ride on the turn's own blocks rather than
+  on a synthetic block, so they add nothing to search or copy.
 - TUI turn folds keep explicit choices by turn id in the transcript's own map,
   exactly as reasoning expansion does: the projection supplies the default on
   every rebuild and the map overrides it. It is applied to every block of the

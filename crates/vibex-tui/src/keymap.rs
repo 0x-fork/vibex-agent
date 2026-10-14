@@ -608,6 +608,12 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         "Move down",
     ),
     // ---- agent (transcript) ---------------------------------------------
+    // The session list is a digit in the global table, which the composer
+    // takes whenever it owns the keyboard, so the page that has both a
+    // composer and a transcript needs the chord on the page itself: with the
+    // reader's hand on the transcript rather than in the draft, `Ctrl+L` is
+    // the same destination the composer already names.
+    alias(Scope::Agent, Chord::ctrl('l'), Intent::GotoSessions),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::PageUp),
@@ -2045,6 +2051,19 @@ mod tests {
             keymap.chord_for_in(Scope::Sessions, Intent::GotoSessions),
             None,
             "the list's own scope does not rebind a global key"
+        );
+        // The page that owns a transcript answers it too, so the chord works
+        // with the reader's hand outside the draft: the composer's copy of the
+        // binding is only reachable while the composer has the keyboard.
+        assert_eq!(
+            keymap.resolve(&[Scope::Agent, Scope::Global], Chord::ctrl('l')),
+            Some(Intent::GotoSessions)
+        );
+        // And it stays off the bar, where the global digit already names the
+        // destination: `advertised` walks the table, and the digit is older.
+        assert_eq!(
+            keymap.chord_for(Intent::GotoSessions),
+            Some(Chord::plain(KeyCode::Char('1')))
         );
     }
 

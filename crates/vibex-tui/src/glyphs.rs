@@ -126,6 +126,20 @@ pub fn disclosure(open: bool, tier: GlyphTier) -> &'static str {
     }
 }
 
+/// The disclosure on the *bottom* edge of an open region. One column.
+///
+/// An open fold is bracketed by two marks that both close it, and each points
+/// into the work it would put away: the header above wears the down mark and
+/// the rule below wears this one. A down mark on the bottom row would point
+/// away from the section and read as "open something further down" — the one
+/// thing pressing it does not do.
+pub fn disclosure_up(tier: GlyphTier) -> &'static str {
+    match tier {
+        GlyphTier::Full => "▴",
+        GlyphTier::Legacy => "^",
+    }
+}
+
 /// The marker beside a row the reader has pinned. One column.
 ///
 /// A star rather than a flag: this column already carries the Agent's letter in

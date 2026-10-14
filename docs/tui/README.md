@@ -122,14 +122,17 @@ live content uses a short tail window or expands in full.
 **A settled turn folds its work.** Once the Agent has answered and the turn is
 done, the rows that produced the answer fold away behind a divider that carries
 the turn's duration: `▸ Worked for 12s`, the same label the desktop and mobile
-clients use. The divider is the control — click it or press `e` with the answer
-selected to bring the work back, at which point the duration sits centred
-between rules that span the transcript. A running turn keeps its work visible,
-and so does a settled turn with no answer: there the work is the only record of
-what happened. What you opened stays open across streaming updates and reloads,
-and an as-yet-unanswered question never pays a rule for process you never saw.
-`F2` expands these folds along with every block body, and a search hit inside a
-fold opens it before it scrolls you there.
+clients use, and the same Agent brand mark the session list draws. The divider
+is the control — click it or press `e` with the answer selected to bring the
+work back. Open, the section is bracketed by the same label above the work,
+marked `▾` and led by the Agent's mark, and a rule below it marked `▴`; both
+ends fold it again, and one blank row parts either end from the text beside it.
+A running turn keeps its work visible, and so does a settled turn with no
+answer: there the work is the only record of what happened. What you opened
+stays open across streaming updates and reloads, and an as-yet-unanswered
+question never pays a rule for process you never saw. `F2` expands these folds
+along with every block body, and a search hit inside a fold opens it before it
+scrolls you there.
 
 **Layered surfaces.** Backgrounds step away from the canvas, so a tool body or a
 raised row reads as a distinct plane rather than as more text on the same

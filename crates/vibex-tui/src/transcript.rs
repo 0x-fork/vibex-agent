@@ -193,6 +193,20 @@ pub struct TurnFold {
     pub expanded: bool,
     /// This block is the turn's answer, and owns the divider control.
     pub is_conclusion: bool,
+    /// This block is the turn's first process row, and opens the section.
+    ///
+    /// An open section is bracketed: the title sits above these rows and the
+    /// rule below them, so the reader meets the turn's name wherever they enter
+    /// it from. Shut, there is nothing above the control to name and only the
+    /// answer draws a row.
+    pub is_head: bool,
+    /// The string the turn's Agent brand mark is matched against.
+    ///
+    /// The identity rather than the runtime's label, so the mark is the one the
+    /// session list draws for the same Agent: both clients ask
+    /// [`vibex_brands::agent_mark`] the same question. `None` when no row of the
+    /// turn named a runtime — the header then carries its words alone.
+    pub agent_identity: Option<String>,
 }
 
 impl TurnFold {
@@ -206,6 +220,23 @@ impl TurnFold {
     /// Whether this block draws the divider that folds the section.
     pub fn is_control(&self) -> bool {
         self.is_conclusion
+    }
+
+    /// Whether this block draws the title above an open section.
+    pub fn draws_title(&self) -> bool {
+        self.is_head && self.expanded
+    }
+
+    /// The identity whose mark this block's fold row draws, if any.
+    ///
+    /// The mark is a picture, so a terminal that cannot hold one keeps the
+    /// words alone rather than the empty cells a slot would spend: the row is
+    /// read for its duration either way.
+    pub fn drawn_identity(&self, pictures: bool) -> Option<&str> {
+        pictures
+            .then_some(self.agent_identity.as_deref())
+            .flatten()
+            .filter(|identity| vibex_brands::agent_mark(identity).is_some())
     }
 }
 
@@ -297,6 +328,7 @@ impl Block {
 pub struct RenderedBlock {
     pub lines: Vec<Line<'static>>,
     pub plain: Vec<String>,
+    pub height: usize,
     /// The rows of `plain` drawn as the body of the reader's own box, when
     /// there are any.
     ///
@@ -305,7 +337,35 @@ pub struct RenderedBlock {
     /// holds only the text: the range is what reads a pointer column on one of
     /// those rows as a column of its text.
     pub boxed_body: Option<std::ops::Range<usize>>,
-    pub height: usize,
+    /// The picture the block wants the terminal to hold over one of its rows.
+    pub mark: Option<RowMark>,
+}
+
+/// A picture a transcript row wants drawn over the cells it reserved.
+///
+/// The rows of a transcript are text to ratatui, and a brand mark is not text:
+/// the row keeps a slot of blank cells and this says what to put in it, in the
+/// coordinates of the block. The renderer turns it into a screen rectangle once
+/// the window is known, exactly as the session list does with its own marks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowMark {
+    /// The row of the block the picture sits on, counting from its first.
+    pub line: usize,
+    /// The picture's first column, from the left edge of the transcript band.
+    pub column: u16,
+    /// The identity string [`vibex_brands::agent_mark`] is asked for.
+    pub identity: String,
+}
+
+/// One mark a rendered window wants, in the window's own coordinates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowMark {
+    /// The row of the window the picture sits on, counting from its first.
+    pub row: usize,
+    /// The picture's first column, from the left edge of the band.
+    pub column: u16,
+    /// The identity string [`vibex_brands::agent_mark`] is asked for.
+    pub identity: String,
 }
 
 impl RenderedBlock {
@@ -425,6 +485,18 @@ pub struct Transcript {
     /// Counters that make the cache behaviour observable in tests and in the
     /// benchmark harness.
     pub stats: TranscriptStats,
+    /// Whether the terminal can hold a picture, so a fold's title reserves the
+    /// cells its Agent's mark is drawn over.
+    ///
+    /// A terminal that cannot draw one keeps the words alone: the slot would be
+    /// air, and a row that indents its title for nothing reads as a mistake.
+    pictures: bool,
+    /// The marks the last window asked for, in the window's own coordinates.
+    ///
+    /// Published by [`Transcript::visible_lines`] for the renderer that owns
+    /// the terminal: a picture has no clip rect, so it may only be placed by
+    /// the layer that knows which rows the window actually drew.
+    window_marks: Vec<WindowMark>,
 }
 
 /// Observable counters. The performance contract is stated in terms of these.
@@ -471,7 +543,30 @@ impl Transcript {
             scroll_offset: 0,
             viewport_rows: 0,
             stats: TranscriptStats::default(),
+            pictures: false,
+            window_marks: Vec::new(),
         }
+    }
+
+    /// Tell the transcript whether the terminal can hold a picture.
+    ///
+    /// The capability is the renderer's to know — it owns the terminal — and
+    /// the layout's to obey, because the cells a mark is drawn over are
+    /// reserved by the row that draws it. A change drops every measured height:
+    /// whether a fold's title leads with a mark is part of its shape.
+    pub fn set_pictures(&mut self, pictures: bool) {
+        if self.pictures == pictures {
+            return;
+        }
+        self.pictures = pictures;
+        for index in 0..self.blocks.len() {
+            self.invalidate(index);
+        }
+    }
+
+    /// The pictures the last rendered window wants drawn over it.
+    pub fn window_marks(&self) -> &[WindowMark] {
+        &self.window_marks
     }
 
     pub fn blocks(&self) -> &[Block] {
@@ -1226,12 +1321,16 @@ impl Transcript {
     }
 
     /// Set the process section of the turn whose fold control is at `index`.
+    ///
+    /// Either end of the section answers: the title above it and the rule below
+    /// it are the same gesture, so they resolve to the same turn here. The
+    /// answer is where the projection put the control, which is what the fold's
+    /// own state is read from when the projection is rebuilt.
     fn set_turn_fold(&mut self, index: usize, expanded: bool) -> bool {
         let Some(turn_id) = self
             .blocks
             .get(index)
             .and_then(|block| block.fold.as_ref())
-            .filter(|fold| fold.is_control())
             .map(|fold| fold.turn_id.clone())
         else {
             return false;
@@ -1428,10 +1527,13 @@ impl Transcript {
         // its first line *is* the message.
         let headerless = is_headerless(block);
         let header = usize::from(!headerless);
-        // The divider is one row of its own, added by the renderer before the
-        // body. An estimate that forgot it would lay the tail out one row short
-        // of what is drawn, and the scroll would not reach the bottom.
-        let divider = usize::from(block.fold.as_ref().is_some_and(TurnFold::is_control));
+        // The fold's own rows are drawn by the renderer around the block's
+        // content: the title above it when this block opens an open section,
+        // and the rule below it when this block owns the control, each with the
+        // air that follows it. An estimate that forgot them would lay the tail
+        // out short of what is drawn, and the scroll would not reach the bottom.
+        let title = block.fold.as_ref().is_some_and(TurnFold::draws_title);
+        let furniture = fold_title_rows(title) + fold_divider_rows(block);
         let body_lines = if block.group.is_head() {
             0
         } else if open && !block.details.is_empty() {
@@ -1473,7 +1575,7 @@ impl Transcript {
         let status = usize::from(block.failed && !dense && block.kind != TimelineRowKind::Error)
             + usize::from(block.pending_permission)
             + usize::from(block.runtime_attribution.is_some() && block.expanded);
-        (header + divider + body_lines + status + gap).max(1)
+        (furniture + header + body_lines + status + gap).max(1)
     }
 
     /// Measure one block precisely and cache the height.
@@ -1598,6 +1700,7 @@ impl Transcript {
             show_attribution,
             self.phase,
             body_open,
+            self.pictures,
         )
     }
 
@@ -1636,20 +1739,32 @@ impl Transcript {
         self.offsets.get(index).copied().unwrap_or(0)
     }
 
-    /// The display line the fold control of `index` occupies, if it owns one.
+    /// The display lines of `index` that toggle its turn's fold.
     ///
-    /// The control is the divider row, which the renderer draws after any
-    /// header the block has and before its body. Deriving it here keeps the
-    /// renderer the single authority on where the control landed: the pointer
-    /// handler asks for the row rather than re-deriving the layout, so the two
+    /// An open section is bracketed by two rows that do the same thing — the
+    /// title above the work and the rule below it — and a shut one by a single
+    /// row, where the title *is* the control. Deriving them here keeps the
+    /// renderer the single authority on where a gesture landed: the pointer
+    /// handler asks for the rows rather than re-deriving the layout, so the two
     /// cannot disagree about what was pressed.
-    pub fn fold_control_line(&mut self, index: usize) -> Option<usize> {
-        let block = self.blocks.get(index)?;
-        if !block.fold.as_ref().is_some_and(TurnFold::is_control) {
-            return None;
+    pub fn fold_control_lines(&mut self, index: usize) -> Vec<usize> {
+        let Some(fold) = self.blocks.get(index).and_then(|block| block.fold.as_ref()) else {
+            return Vec::new();
+        };
+        let (title, control) = (fold.draws_title(), fold.is_control());
+        if !title && !control {
+            return Vec::new();
         }
-        let header = usize::from(!is_headerless(block));
-        Some(self.line_of_block(index) + header)
+        let header = usize::from(self.blocks.get(index).is_some_and(|b| !is_headerless(b)));
+        let start = self.line_of_block(index);
+        let mut lines = Vec::with_capacity(2);
+        if title {
+            lines.push(start);
+        }
+        if control {
+            lines.push(start + fold_title_rows(title) + header);
+        }
+        lines
     }
 
     /// Materialise the blocks covering `[scroll.offset, scroll.offset + height)`.
@@ -1665,6 +1780,7 @@ impl Transcript {
         strings: Strings,
     ) -> Vec<Line<'static>> {
         self.viewport_rows = height;
+        self.window_marks.clear();
         if height == 0 || self.blocks.is_empty() {
             return Vec::new();
         }
@@ -1685,6 +1801,11 @@ impl Transcript {
         self.scroll_offset = offset;
 
         let mut lines = Vec::with_capacity(height);
+        // The pictures of the rows this window draws, in its own coordinates:
+        // a mark on a row the window scrolled past is not placed at all, and a
+        // picture has no clip rect, so it may only be drawn by a caller that
+        // knows which rows the window actually holds.
+        let mut window_marks = Vec::new();
         // Find the first block whose range intersects the window.
         let first = self
             .offsets
@@ -1708,18 +1829,33 @@ impl Transcript {
             }
             if let Some(rendered) = self.rendered.get(&index) {
                 for (row, line) in rendered.lines.iter().enumerate().skip(skip).take(take) {
+                    if let Some(mark) = rendered.mark.as_ref().filter(|mark| mark.line == row) {
+                        window_marks.push(WindowMark {
+                            row: lines.len(),
+                            column: mark.column,
+                            identity: mark.identity.clone(),
+                        });
+                    }
                     lines.push(self.disclosure_line(index, row, line.clone(), theme));
                 }
             } else {
                 // Not resident: rebuild it for this frame.
                 let rendered = self.render_block(index, theme, strings);
                 for (row, line) in rendered.lines.iter().enumerate().skip(skip).take(take) {
+                    if let Some(mark) = rendered.mark.as_ref().filter(|mark| mark.line == row) {
+                        window_marks.push(WindowMark {
+                            row: lines.len(),
+                            column: mark.column,
+                            identity: mark.identity.clone(),
+                        });
+                    }
                     lines.push(self.disclosure_line(index, row, line.clone(), theme));
                 }
                 self.store_rendered(index, rendered);
             }
             index += 1;
         }
+        self.window_marks = window_marks;
         if lines.is_empty() && !self.blocks.is_empty() && offset < total {
             self.stats.idle_frames += 1;
         }
@@ -2522,6 +2658,24 @@ fn is_headerless(block: &Block) -> bool {
     ) && !block.body.is_empty()
 }
 
+/// The rows a block spends on its turn fold's title, above its own content.
+///
+/// Two when the block opens an open section: the title row itself and the air
+/// under it, which is what stops the duration from reading as a heading of the
+/// work below. A shut section draws no title — the control *is* the title — and
+/// a block that does not open the section draws none either.
+fn fold_title_rows(title: bool) -> usize {
+    usize::from(title) * 2
+}
+
+/// The rows a block spends on the rule that closes its turn's process section.
+///
+/// Two, for the same reason: the rule and the air under it, so the answer is
+/// not read as one more line of the work above.
+fn fold_divider_rows(block: &Block) -> usize {
+    usize::from(block.fold.as_ref().is_some_and(TurnFold::is_control)) * 2
+}
+
 fn detail_indent(block: &Block) -> usize {
     if !block.group.is_head() && (is_tool_item(block.kind) || block.activity.is_some()) {
         chrome::NEST
@@ -2802,10 +2956,14 @@ pub fn gap_after(block: &Block, next: Option<&Block>) -> usize {
     gap_with_body(block, next, block.expanded)
 }
 
+/// The blank rows a block leaves under itself, before the next one is drawn.
+///
+/// A run of work items reads as one list, so while its rows are being drawn the
+/// hair between them is what holds them together. The run is still an object
+/// among the blocks around it: the summary that heads it takes the ordinary gap
+/// as soon as what follows is not one of its own rows, or the group's last line
+/// and the sentence that answers it would be one paragraph.
 fn gap_with_body(block: &Block, next: Option<&Block>, body_open: bool) -> usize {
-    if block.group.is_head() {
-        return 0;
-    }
     let dense_run =
         is_dense_row(block.kind) && !body_open && next.is_some_and(|next| is_dense_row(next.kind));
     if dense_run { 0 } else { chrome::GAP }
@@ -2926,6 +3084,7 @@ pub fn render_block_with_attribution(
         show_attribution,
         phase,
         block.expanded,
+        false,
     )
 }
 
@@ -2941,6 +3100,7 @@ fn render_block_inner(
     show_attribution: bool,
     phase: u32,
     body_open: bool,
+    pictures: bool,
 ) -> RenderedBlock {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut plain: Vec<String> = Vec::new();
@@ -3149,14 +3309,56 @@ fn render_block_inner(
         fold_live_window(rendered, theme);
     }
 
+    let fold_title = block.fold.as_ref().filter(|fold| fold.draws_title());
+    let fold_control = block.fold.as_ref().filter(|fold| fold.is_control());
+    // The cursor is the reader's place, and a block's place is its first drawn
+    // row. A fold draws its own rows before the block's, so when one of them is
+    // there *it* is the block's first row: the author who pressed the title
+    // sees the title lit, not the answer's opening line under it.
+    let furniture_holds_cursor = fold_title.is_some() || fold_control.is_some();
+    // The rows the fold spent before the block's own content, so the group
+    // rail and the connector column are drawn on the rows that belong to the
+    // run and not on the turn's title above it.
+    let furniture_rows = fold_title_rows(fold_title.is_some()) + fold_divider_rows(block);
+    let mut mark = None::<RowMark>;
+
+    // The title above an open process section, on the turn's first process row:
+    // the desktop's own header, so a reader who opened the work still knows
+    // whose turn it is and can put it away again from where they entered.
+    if let Some(fold) = fold_title {
+        let (line, text, column) = fold_title_line(
+            crate::glyphs::disclosure(true, crate::glyphs::GlyphTier::of(theme)),
+            &format!("{} {}", strings.transcript_worked_for(), fold.label),
+            content_width,
+            theme,
+            selected,
+            fold.drawn_identity(pictures).map(str::to_owned),
+            phase,
+        );
+        if let Some((column, identity)) = column {
+            mark = Some(RowMark {
+                line: lines.len(),
+                column,
+                identity,
+            });
+        }
+        lines.push(line);
+        plain.push(text);
+        // The air under it: a duration with the first tool row against it reads
+        // as that row's heading rather than as the section's.
+        lines.push(row_line(Span::raw(" "), Vec::new()));
+        plain.push(String::new());
+    }
+
     if !headerless {
         let header = truncate_parts(parts, content_width);
         let header_plain = header
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        let mut header_line = row_line(row_marker(0, live, selected, phase, theme), header);
-        if selected {
+        let pointer = selected && !furniture_holds_cursor;
+        let mut header_line = row_line(row_marker(0, live, pointer, phase, theme), header);
+        if pointer {
             header_line = header_line.style(Style::default().bg(theme.roles.surface_highlight));
         }
         lines.push(header_line);
@@ -3166,11 +3368,42 @@ fn render_block_inner(
     // The turn's fold control and the rule that closes its process section, on
     // the first row of the answer: everything above is work, everything below
     // is what the work was for. It is drawn before the body so a long answer
-    // never buries the gesture that hides the work it came from.
-    if let Some(fold) = block.fold.as_ref().filter(|fold| fold.is_control()) {
-        let (rule_line, rule_plain) = divider_line(fold, content_width, theme, selected, strings);
-        lines.push(rule_line);
-        plain.push(rule_plain);
+    // never buries the gesture that hides the work it came from. While the
+    // section is shut it is the turn's title instead, since there is no work
+    // above it to separate the answer from.
+    if let Some(fold) = fold_control {
+        // The rule carries the cursor only when there is no title above it to
+        // carry it first: the two rows are one gesture, and one gesture has one
+        // place.
+        let pointer = selected && fold_title.is_none();
+        if fold.expanded {
+            let (rule_line, rule_plain) = divider_line(content_width, theme, pointer, phase);
+            lines.push(rule_line);
+            plain.push(rule_plain);
+        } else {
+            let (line, text, column) = fold_title_line(
+                crate::glyphs::disclosure(false, crate::glyphs::GlyphTier::of(theme)),
+                &format!("{} {}", strings.transcript_worked_for(), fold.label),
+                content_width,
+                theme,
+                pointer,
+                fold.drawn_identity(pictures).map(str::to_owned),
+                phase,
+            );
+            if let Some((column, identity)) = column {
+                mark = Some(RowMark {
+                    line: lines.len(),
+                    column,
+                    identity,
+                });
+            }
+            lines.push(line);
+            plain.push(text);
+        }
+        // Either way the answer keeps its own air: the rule is where the work
+        // stops, and a sentence drawn against it reads as more of the work.
+        lines.push(row_line(Span::raw(" "), Vec::new()));
+        plain.push(String::new());
     }
 
     if let Some(rendered) = rendered {
@@ -3250,17 +3483,18 @@ fn render_block_inner(
                 clock_style,
             );
             // The pointer is the first body row's marker only where there is no
-            // rail to give it up: a live window's rail runs unbroken, and the
-            // header above already carries the cursor. The rail counts from the
-            // header, so the body's first row is cell one whatever padding the
-            // block drew above it.
-            let pointer = selected && block_row == 0 && !live;
+            // rail to give it up and no fold row above to carry it: a live
+            // window's rail runs unbroken, and a fold's title or rule is the
+            // block's first drawn row. The rail counts from the header, so the
+            // body's first row is cell one whatever padding the block drew
+            // above it.
+            let pointer = selected && block_row == 0 && !live && !furniture_holds_cursor;
             let mut row = row_line(
                 row_marker(block_row + 1, live, pointer, phase, theme),
                 spans,
             )
             .style(row_style);
-            if block_row == 0 && selected {
+            if block_row == 0 && pointer {
                 row = row.style(Style::default().bg(theme.roles.surface_highlight));
             }
             lines.push(row);
@@ -3330,6 +3564,9 @@ fn render_block_inner(
     let content_end = lines.len().saturating_sub(gap);
     let connector = crate::glyphs::connector(crate::glyphs::GlyphTier::of(theme));
     for (index, (line, text)) in lines.iter_mut().zip(&mut plain).enumerate() {
+        if index < furniture_rows {
+            continue;
+        }
         let mut prefix = Vec::new();
         if let GroupRole::Member { last, .. } = block.group {
             let glyph = if !last || index == 0 { connector } else { " " };
@@ -3355,6 +3592,7 @@ fn render_block_inner(
         lines,
         plain,
         boxed_body,
+        mark,
     }
 }
 
@@ -3376,70 +3614,79 @@ fn row_line(marker: Span<'static>, spans: Vec<Span<'static>>) -> Line<'static> {
     Line::from(out)
 }
 
-/// The rule that closes a turn's process section, with the work's duration in
-/// the middle and the control that folds it at the left.
+/// The row that names a turn's process section: the mark that folds it, the
+/// Agent's brand mark when the terminal can hold one, and the duration.
 ///
-/// One row carries both jobs because they are one decision: the rule is where
-/// the work stops and the answer begins, and pressing the mark beside it is how
-/// the reader moves that boundary. Closed, there is no work above it to separate
-/// from, so only the mark and the label are drawn and the row reads as the
-/// turn's title — the desktop's "worked for" header. Open, the process sits
-/// above and the rules run out to both edges, so the row reads as the separator
-/// it has become. The label is centred by giving both rules the widths that
-/// leave it so, which keeps the row exact at every terminal width.
-fn divider_line(
-    fold: &TurnFold,
+/// It is drawn at the top of an open section and *is* the control while the
+/// section is shut — the desktop's "worked for" header, in both places. The
+/// gesture is the disclosure at the left and the words beside it; the picture
+/// sits in a slot of its own, so the label starts in the same column whether or
+/// not the terminal could draw the Agent.
+fn fold_title_line(
+    glyph: &str,
+    label: &str,
     content_width: usize,
     theme: &TuiTheme,
     selected: bool,
-    strings: Strings,
-) -> (Line<'static>, String) {
-    let tier = crate::glyphs::GlyphTier::of(theme);
-    let glyph = crate::glyphs::disclosure(fold.expanded, tier);
-    // Two cells frame the label — one space on either side — and one cell
-    // separates the disclosure mark from the left rule. At a width too narrow
-    // for the whole label the mark and the start of the text are what matter,
-    // so the label gives way rather than the row overflowing the band.
-    let mark_width = display_width(glyph) + 1;
-    let budget = content_width.saturating_sub(mark_width + 2);
-    let label = truncate_to_width(
-        &format!("{} {}", strings.transcript_worked_for(), fold.label),
-        budget,
-        "…",
-    );
-    let framed = display_width(&label) + 2;
-    let rules = content_width.saturating_sub(framed + mark_width);
-    // Closed, the row is a title and the rules would be furniture around a
-    // single word; open, they are the only thing separating the work from the
-    // answer, so both edges get one.
-    let (left, right) = if fold.expanded {
-        (rules / 2, rules - rules / 2)
-    } else {
-        (0, 0)
-    };
-    let rule = crate::glyphs::heading_rule(tier);
+    identity: Option<String>,
+    phase: u32,
+) -> (Line<'static>, String, Option<(u16, String)>) {
+    let glyph_width = display_width(glyph);
+    // One cell separates the disclosure from what follows; the mark's slot is
+    // two cells, the width a picture is drawn in; and the label is framed by one
+    // space on either side. At a width too narrow for all of it the words are
+    // what matter, so the label gives way rather than the row overflowing.
+    let slot = identity
+        .as_ref()
+        .map_or(0, |_| usize::from(crate::row_marks::MARK_COLS));
+    let budget = content_width
+        .saturating_sub(glyph_width + 1 + slot + 2)
+        .max(1);
+    let label = truncate_to_width(label, budget, "…");
     let mut spans = vec![
         Span::styled(glyph.to_string(), theme.muted()),
         Span::raw(" "),
     ];
-    if left > 0 {
-        spans.push(Span::styled(
-            rule.repeat(left),
-            theme.dimmed(theme.roles.gray_dim),
-        ));
+    if identity.is_some() {
+        spans.push(Span::raw(" ".repeat(slot)));
     }
     spans.push(Span::styled(
         format!(" {label} "),
         theme.dimmed(theme.roles.gray),
     ));
-    if right > 0 {
-        spans.push(Span::styled(
-            rule.repeat(right),
-            theme.dimmed(theme.roles.gray_dim),
-        ));
+    let text = format!("{glyph} {}{label}", " ".repeat(slot));
+    let mut line = row_line(row_marker(0, false, selected, phase, theme), spans);
+    if selected {
+        line = line.style(Style::default().bg(theme.roles.surface_highlight));
     }
-    let text = format!("{glyph} {}{label}{}", rule.repeat(left), rule.repeat(right));
-    let mut line = row_line(Span::raw(" "), spans);
+    let mark = identity.map(|identity| ((chrome::PAD_LEFT + glyph_width + 1) as u16, identity));
+    (line, text, mark)
+}
+
+/// The rule that closes a turn's process section, with the control that folds
+/// the work at its left.
+///
+/// The rule is where the work stops and the answer begins. It carries the same
+/// gesture as the title above it, and its mark points up into the work: a
+/// disclosure pointing down on the row that closes a section would promise an
+/// opening that pressing it does not make.
+fn divider_line(
+    content_width: usize,
+    theme: &TuiTheme,
+    selected: bool,
+    phase: u32,
+) -> (Line<'static>, String) {
+    let tier = crate::glyphs::GlyphTier::of(theme);
+    let glyph = crate::glyphs::disclosure_up(tier);
+    let rules = content_width.saturating_sub(display_width(glyph) + 1);
+    let rule = crate::glyphs::heading_rule(tier);
+    let spans = vec![
+        Span::styled(glyph.to_string(), theme.muted()),
+        Span::raw(" "),
+        Span::styled(rule.repeat(rules), theme.dimmed(theme.roles.gray_dim)),
+    ];
+    let text = format!("{glyph} {}", rule.repeat(rules));
+    let mut line = row_line(row_marker(0, false, selected, phase, theme), spans);
     if selected {
         line = line.style(Style::default().bg(theme.roles.surface_highlight));
     }
@@ -4392,6 +4639,42 @@ mod tests {
     }
 
     #[test]
+    fn a_work_run_is_separated_from_the_text_under_it() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        let mut blocks = (0..3)
+            .map(|index| block(&format!("t{index}"), TimelineRowKind::ToolCall, "ran"))
+            .collect::<Vec<_>>();
+        blocks.push(block("answer", TimelineRowKind::AgentMessage, "the answer"));
+        transcript.set_blocks(blocks);
+        let lines = transcript.visible_lines(ScrollState::default(), 60, &theme(), strings());
+        let text = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let summary = text
+            .iter()
+            .position(|line| line.contains("+2"))
+            .expect("the run's summary is drawn");
+        let answer = text
+            .iter()
+            .position(|line| line.contains("the answer"))
+            .expect("the answer is drawn");
+        // The run is one object among the blocks around it: the sentence that
+        // answers it is a paragraph of its own, not the run's last line.
+        assert_eq!(
+            answer,
+            summary + 2,
+            "the answer is drawn against the run: {text:?}"
+        );
+        assert!(
+            text[summary + 1].trim().is_empty(),
+            "the row under the run is not blank: {:?}",
+            text[summary + 1]
+        );
+    }
+
+    #[test]
     fn an_expanded_or_failed_item_breaks_the_run() {
         let mut transcript = Transcript::new();
         transcript.configure(80, &theme());
@@ -5252,6 +5535,8 @@ mod density_tests {
             label: "12s".into(),
             expanded,
             is_conclusion: false,
+            is_head: true,
+            agent_identity: None,
         });
         let mut answer = item("t2", TimelineRowKind::AgentMessage, "the answer", false);
         // The projection never makes an Agent message collapsible: an answer
@@ -5263,6 +5548,8 @@ mod density_tests {
             label: "12s".into(),
             expanded,
             is_conclusion: true,
+            is_head: false,
+            agent_identity: None,
         });
         vec![work, answer]
     }
@@ -5293,7 +5580,7 @@ mod density_tests {
     }
 
     #[test]
-    fn opening_a_fold_draws_the_work_and_a_rule() {
+    fn opening_a_fold_draws_the_work_between_a_title_and_a_rule() {
         let mut transcript = Transcript::new();
         transcript.configure(80, &theme());
         transcript.set_blocks(folded_turn(true));
@@ -5306,14 +5593,163 @@ mod density_tests {
             text.iter().any(|line| line.contains("the tool's output")),
             "the open fold hides the work it stands for: {text:?}"
         );
-        // Expanded, the label is a separator: ruled to both edges and marked
-        // open.
+        // Open, the section is bracketed: the title above the work, with the
+        // mark that puts it away pointing down into it, and the rule below,
+        // pointing back up at what it closes.
+        let title = text
+            .iter()
+            .position(|line| line.contains("Worked for 12s"))
+            .expect("the title is drawn");
+        assert!(text[title].contains('▾'), "{:?}", text[title]);
+        let work = text
+            .iter()
+            .position(|line| line.contains("the tool's output"))
+            .expect("the work is drawn");
+        assert!(title < work, "the title is below the work: {text:?}");
         let rule = text
             .iter()
-            .find(|line| line.contains("Worked for 12s"))
-            .expect("the divider is drawn");
-        assert!(rule.contains("─ Worked for 12s ─"), "{rule:?}");
-        assert!(rule.contains('▾'), "{rule:?}");
+            .position(|line| line.contains('▴'))
+            .expect("the rule is drawn");
+        assert!(rule > work, "the rule is above the work: {text:?}");
+        assert!(
+            !text[rule].contains("Worked for"),
+            "the title is repeated on the rule: {:?}",
+            text[rule]
+        );
+        assert!(text[rule].contains('─'), "{:?}", text[rule]);
+        // Both ends are the control, so a press on either one folds the turn.
+        let work_index = transcript
+            .blocks()
+            .iter()
+            .position(|block| block.fold.as_ref().is_some_and(|fold| fold.is_head))
+            .expect("the work row opens the section");
+        assert_eq!(
+            transcript.fold_control_lines(work_index),
+            vec![title],
+            "the title does not fold the turn"
+        );
+        let answer = transcript
+            .blocks()
+            .iter()
+            .position(|block| block.fold.as_ref().is_some_and(TurnFold::is_control))
+            .expect("the answer owns the control");
+        assert_eq!(
+            transcript.fold_control_lines(answer),
+            vec![rule],
+            "the rule does not fold the turn"
+        );
+    }
+
+    #[test]
+    fn a_fold_row_is_separated_from_what_follows_it() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        transcript.set_blocks(folded_turn(false));
+        let lines = transcript.visible_lines(ScrollState::default(), 20, &theme(), strings());
+        let text = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let title = text
+            .iter()
+            .position(|line| line.contains("Worked for 12s"))
+            .expect("the title is drawn");
+        let answer = text
+            .iter()
+            .position(|line| line.contains("the answer"))
+            .expect("the answer is drawn");
+        assert_eq!(
+            answer,
+            title + 2,
+            "the answer is drawn against the fold row: {text:?}"
+        );
+        assert!(
+            text[title + 1].trim().is_empty(),
+            "the row between the title and the answer is not blank: {:?}",
+            text[title + 1]
+        );
+    }
+
+    #[test]
+    fn a_selected_fold_lights_its_own_row_and_not_the_answer() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        transcript.set_blocks(folded_turn(false));
+        let answer = transcript
+            .blocks()
+            .iter()
+            .position(|block| block.fold.as_ref().is_some_and(TurnFold::is_control))
+            .expect("the answer owns the control");
+        let scroll = ScrollState {
+            selected: Some(answer),
+            ..Default::default()
+        };
+        let lines = transcript.visible_lines(scroll, 20, &theme(), strings());
+        let highlighted = lines
+            .iter()
+            .position(|line| line.style.bg == Some(theme().roles.surface_highlight))
+            .expect("the current block is lifted");
+        assert!(
+            lines[highlighted].to_string().contains("Worked for 12s"),
+            "the cursor left the fold row: {:?}",
+            lines[highlighted].to_string()
+        );
+        assert_eq!(
+            lines[highlighted].spans[0].content.as_ref(),
+            "▌",
+            "the fold row does not carry the pointer"
+        );
+        assert!(
+            lines[highlighted + 1..]
+                .iter()
+                .all(|line| line.style.bg != Some(theme().roles.surface_highlight)),
+            "the answer's first row kept the cursor"
+        );
+    }
+
+    #[test]
+    fn a_fold_title_reserves_a_slot_for_the_agents_mark() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        let mut blocks = folded_turn(false);
+        for block in &mut blocks {
+            if let Some(fold) = block.fold.as_mut() {
+                fold.agent_identity = Some("codex".into());
+            }
+        }
+        // A terminal that cannot hold a picture keeps the words alone: the slot
+        // would be air, and the title would indent for nothing.
+        transcript.set_blocks(blocks.clone());
+        let plain = transcript.visible_lines(ScrollState::default(), 20, &theme(), strings());
+        let title = plain
+            .iter()
+            .find(|line| line.to_string().contains("Worked for 12s"))
+            .expect("the title is drawn")
+            .to_string();
+        assert!(transcript.window_marks().is_empty());
+        // The margin and the pad come first on every transcript row, so the
+        // title's own row starts two cells in.
+        assert!(title.trim_start().starts_with("▸  Worked for"), "{title:?}");
+
+        transcript.set_pictures(true);
+        let lines = transcript.visible_lines(ScrollState::default(), 20, &theme(), strings());
+        let title = lines
+            .iter()
+            .find(|line| line.to_string().contains("Worked for 12s"))
+            .expect("the title is drawn")
+            .to_string();
+        let mark = transcript
+            .window_marks()
+            .first()
+            .expect("the title asks for the Agent's mark");
+        assert_eq!(mark.identity, "codex");
+        assert_eq!(mark.column, 4, "the mark does not sit after the disclosure");
+        // The label keeps its column, so the words after the picture line up
+        // whether or not the terminal drew it.
+        assert!(
+            title.trim_start().starts_with("▸    Worked for"),
+            "{title:?}"
+        );
     }
 
     #[test]

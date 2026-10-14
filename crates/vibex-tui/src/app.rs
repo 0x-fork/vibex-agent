@@ -5585,6 +5585,36 @@ impl App {
             if let Some(index) = index.filter(|_| has_process) {
                 blocks[index].conclusion = true;
                 conclusion.insert(turn.id.clone(), index);
+                // The rows the fold hides sit above the answer, so the title
+                // belongs on the first of them. A turn whose only process row
+                // the projection ordered after its answer still gets the title
+                // on that row rather than none at all.
+                let first_process = blocks
+                    .iter()
+                    .take(index)
+                    .position(|block| in_turn(block) && block.kind != TimelineRowKind::UserMessage)
+                    .or_else(|| {
+                        blocks.iter().enumerate().position(|(other, block)| {
+                            other != index
+                                && in_turn(block)
+                                && block.kind != TimelineRowKind::UserMessage
+                        })
+                    })
+                    .unwrap_or(index);
+                head.insert(turn.id.clone(), first_process);
+                // The attribution is "Agent · account · model"; the first
+                // segment is the name the catalogue knows the Agent by, which
+                // is what turns it into the identity both clients match marks
+                // against.
+                identity.insert(
+                    turn.id.clone(),
+                    turn.runtime_attribution
+                        .as_deref()
+                        .and_then(|attribution| attribution.split('·').next())
+                        .map(str::trim)
+                        .filter(|label| !label.is_empty())
+                        .map(|label| self.agent_identity_for_label(label)),
+                );
                 labels.insert(
                     turn.id.as_str(),
                     crate::turn::format_worked_duration(crate::turn::worked_duration(turn)),
@@ -5608,6 +5638,8 @@ impl App {
                 continue;
             }
             let is_conclusion = conclusion.get(&turn_id) == Some(&index);
+            let is_head = head.get(&turn_id) == Some(&index);
+            let agent_identity = identity.get(&turn_id).cloned().flatten();
             // The projection asks for a settled turn's work to be hidden; a
             // reader who opens it says so in the transcript's expansion map,
             // which `set_blocks` re-applies on every rebuild.
@@ -5616,6 +5648,8 @@ impl App {
                 label,
                 expanded: false,
                 is_conclusion,
+                is_head,
+                agent_identity,
             });
         }
     }
@@ -6947,6 +6981,26 @@ impl App {
     pub fn session_agent_identity(&self, session: &AgentSession) -> String {
         let label = self.session_agent_label(session);
         self.agent_identity(&session.agent_id, &label)
+    }
+
+    /// The string an Agent's brand mark is matched against, from a label.
+    ///
+    /// A timeline row names the Agent that answered for it by its display
+    /// label, which is not enough on its own: the mark is matched against the
+    /// id, the label, the command and the preset together, exactly as the
+    /// session list matches it, so an Agent whose display name is not its slug
+    /// still wears the one face it wears everywhere. A label the catalogue does
+    /// not know is matched as it stands — a custom Agent is still an Agent, and
+    /// a mark it does not have leaves the row its words.
+    pub fn agent_identity_for_label(&self, label: &str) -> String {
+        if let Some(agent) = self
+            .runtime_options
+            .as_ref()
+            .and_then(|catalog| catalog.agents.iter().find(|agent| agent.label == label))
+        {
+            return self.agent_identity(&agent.agent_id, &agent.label);
+        }
+        label.to_string()
     }
 
     /// Whether the session list marks this session as having something new.
