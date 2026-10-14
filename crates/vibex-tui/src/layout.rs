@@ -9,7 +9,7 @@
 //!   │                                                            │
 //!   │  transcript — no border, its own left edge is the margin    │  fills
 //!   │                                                            │
-//!   │ ⠹ running · read src/net/upload.rs          12s ⇣1.2k      │  turn status
+//!   │ ⠦ read src/net/upload.rs · 12s · 3 tool calls              │  turn status
 //!   │   ❯ draft                                                 │  prompt
 //!   │                                                            │
 //!   │   agent · model · run options                    branch    │  context

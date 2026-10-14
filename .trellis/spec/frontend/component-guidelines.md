@@ -732,15 +732,21 @@ replacement box instead of a spinner. The fixed `size_5()` canvas paints the
 ring dot by dot at the two-by-four Braille cell centers, so the mark renders in
 whatever font the workbench is set to and only brightness carries the motion.
 
-The mark does not replay the TUI's frames. `SIDEBAR_RING` walks the six spinner
-dots in the order the frames light them, and the animation drives one head
-around that ring with the same cosine falloff the timeline sweep uses: every dot
-takes its turn at full contrast, and none is skipped. Replaying frames under
+The mark does not replay the TUI's frames. `SIDEBAR_RING` — the character
+client's `vibex_tui::glyphs::ACTIVITY_RING`, so the two surfaces walk one table
+— holds the six spinner dots in the order the frames light them, and the
+animation drives one head around that ring with the same cosine falloff the
+timeline sweep uses: every dot takes its turn at full contrast, and none is
+skipped. Replaying frames under
 `with_max_fps` is what made the old mark stutter — a throttled re-render lands
 some time *after* the interval it waits for, so the phase read on arrival jumps
 whole frames and drops dots. `vibex_tui::glyphs::spinner_frames(GlyphTier::Full)`
 still names the dot set and the pace — one lap lasts the frames' 8 × 100ms — and
-a test holds the ring to both. Sample the mark at the timeline's 30 fps budget:
+a test holds the ring to both. The TUI's turn band draws the same walk on the
+character grid, one dot per its 120ms animation tick
+(`glyphs::activity_ring_frames`): frame `i` lights the window around ring
+position `i`, which is what that test reads back. Sample the mark at the
+timeline's 30 fps budget:
 a running row already carries the title `ShimmerText`, which requests a frame per
 display refresh, so the old 10 fps cap never bought the row a frame. The timeline
 keeps its separate 2100ms cycle. Scope animation IDs under the domain-keyed row,

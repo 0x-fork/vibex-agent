@@ -289,6 +289,43 @@ pub fn spinner_frames(tier: GlyphTier) -> &'static [&'static str] {
     }
 }
 
+/// The dots of the activity ring, as indexes into the Braille cell.
+///
+/// The order is the walk: down the left column (dots 1-3) and back up the right
+/// one (dots 6-4), so consecutive entries are neighbours in the cell and the
+/// last closes onto the first. The desktop's sidebar paints a highlight around
+/// this ring; the turn band steps the same ring on the character grid. One
+/// table rather than two, so the surfaces cannot drift apart by a dot.
+pub const ACTIVITY_RING: [usize; 6] = [0, 1, 2, 5, 4, 3];
+
+/// The activity ring's frames: the highlight, one step per frame. One column
+/// each.
+///
+/// A cell cannot paint one dot brighter than its neighbours, so the highlight
+/// is the *window* of dots a frame lights — the ring position it is on, the one
+/// it came from and the one it is going to — and each frame is the Braille cell
+/// that lights those three. A console with no Braille falls back to the ASCII
+/// rotation [`spinner_frames`] uses, which is the same cue in the only alphabet
+/// it has.
+pub fn activity_ring_frames(tier: GlyphTier) -> &'static [&'static str] {
+    const FULL: &[&str] = &["⠋", "⠇", "⠦", "⠴", "⠸", "⠙"];
+    const LEGACY: &[&str] = &["|", "/", "-", "\\"];
+    match tier {
+        GlyphTier::Full => FULL,
+        GlyphTier::Legacy => LEGACY,
+    }
+}
+
+/// How many ticks of the animation clock each activity-ring frame is held.
+///
+/// The working spinner holds a frame for three ticks because a shape that
+/// changes every 120ms is a flicker. The ring is not that shape: it is the
+/// desktop sidebar's mark, and one step per tick is what makes it read as a
+/// light travelling around the ring rather than as a glyph being replaced. The
+/// desktop sweeps a lap in its working spinner's 8 × 100ms; this client's 120ms
+/// clock takes the same six steps in 720ms.
+pub const ACTIVITY_RING_TICKS_PER_FRAME: u32 = 1;
+
 /// The idle pulse: a ring that fills and empties. One column each.
 ///
 /// Used for a session that is alive but not working, so the interface still
@@ -393,7 +430,11 @@ mod tests {
     fn every_spinner_frame_is_one_column_in_both_tiers() {
         // A spinner frame wider than its neighbours would jitter the label.
         for tier in [full(), legacy()] {
-            for frame in spinner_frames(tier).iter().chain(idle_pulse_frames(tier)) {
+            for frame in spinner_frames(tier)
+                .iter()
+                .chain(activity_ring_frames(tier))
+                .chain(idle_pulse_frames(tier))
+            {
                 assert_eq!(
                     crate::text::display_width(frame),
                     1,
@@ -401,6 +442,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The dot mask a frame lights, as a bit per Braille dot.
+    fn dots(frame: &str) -> u8 {
+        frame
+            .chars()
+            .next()
+            .and_then(|glyph| (glyph as u32).checked_sub('\u{2800}' as u32))
+            .filter(|dots| *dots <= u32::from(u8::MAX))
+            .map_or(0, |dots| dots as u8)
+    }
+
+    /// Every ring frame lights the window around one ring position, and the
+    /// frames step the ring in order.
+    ///
+    /// This is the whole contract with the desktop's sidebar: it paints a
+    /// highlight walking [`ACTIVITY_RING`], and a terminal cell can only draw
+    /// which dots the highlight covers — so a frame that lit some other set
+    /// would be a different mark on the two surfaces.
+    #[test]
+    fn the_activity_ring_frames_walk_the_ring() {
+        let frames = activity_ring_frames(full());
+        assert_eq!(
+            frames.len(),
+            ACTIVITY_RING.len(),
+            "a lap is one frame per dot of the ring"
+        );
+        let lap = ACTIVITY_RING.len();
+        for (step, frame) in frames.iter().enumerate() {
+            let window = [step + lap - 1, step, step + 1]
+                .into_iter()
+                .map(|index| 1u8 << ACTIVITY_RING[index % lap])
+                .fold(0u8, |all, dot| all | dot);
+            assert_eq!(
+                dots(frame),
+                window,
+                "{frame:?} at step {step} is not the ring's own window"
+            );
+        }
+    }
+
+    /// The ring lights the working spinner's own dots.
+    ///
+    /// The desktop holds its painted ring to this same dot set, so the two
+    /// marks are one mark rather than two that happen to look alike.
+    #[test]
+    fn the_activity_ring_lights_the_spinner_dots() {
+        let lit = spinner_frames(full())
+            .iter()
+            .map(|frame| dots(frame))
+            .fold(0u8, |all, dots| all | dots);
+        let ring = ACTIVITY_RING
+            .iter()
+            .map(|index| 1u8 << index)
+            .fold(0u8, |all, dot| all | dot);
+        assert_eq!(ring, lit, "the ring and the spinner light different dots");
+        assert_eq!(
+            ring.count_ones() as usize,
+            ACTIVITY_RING.len(),
+            "a dot is on the ring twice"
+        );
+    }
+
+    /// The ring steps faster than the working spinner holds its frames.
+    ///
+    /// The desktop's sidebar mark turns a lap in 800ms where the spinner takes
+    /// 8 × 360ms; a ring that held its frames for the spinner's three ticks
+    /// would be the slower one, which is not the mark the band is asked for.
+    #[test]
+    fn the_activity_ring_turns_faster_than_the_working_spinner() {
+        const { assert!(ACTIVITY_RING_TICKS_PER_FRAME < SPINNER_TICKS_PER_FRAME) };
     }
 
     #[test]
@@ -429,6 +541,7 @@ mod tests {
             heading_rule(tier),
         ];
         drawn.extend_from_slice(spinner_frames(tier));
+        drawn.extend_from_slice(activity_ring_frames(tier));
         drawn.extend_from_slice(idle_pulse_frames(tier));
         for glyph in drawn {
             for character in forbidden {

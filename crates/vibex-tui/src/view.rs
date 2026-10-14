@@ -2284,6 +2284,11 @@ fn render_gutter(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTh
 /// has been happening, how many tools it has called, and how fast it is going.
 /// An idle-but-connected session says so, rather than showing nothing and
 /// leaving the reader unsure whether the client is still there.
+///
+/// The running mark is the desktop sidebar's: a highlight walking the ring of
+/// the Braille cell, one step per animation tick, in the theme's primary — or
+/// green when the session continues itself. Idle is not animated at all, so a
+/// glance at the band cannot mistake "nothing is happening" for progress.
 fn render_turn_status(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2318,12 +2323,12 @@ fn render_turn_status(
     } else if live {
         (
             crate::glyphs::frame_at(
-                crate::glyphs::spinner_frames(tier),
+                crate::glyphs::activity_ring_frames(tier),
                 phase,
-                crate::glyphs::SPINNER_TICKS_PER_FRAME,
+                crate::glyphs::ACTIVITY_RING_TICKS_PER_FRAME,
             ),
             turn_label(app, strings),
-            theme.roles.accent_running,
+            running_mark_colour(app, theme),
         )
     } else {
         // Idle is a fact, not an animation: a plain mark in the dim grey, so a
@@ -2372,6 +2377,24 @@ fn render_turn_status(
     // rather than wrapping a band that is one row tall.
     truncate_spans(&mut line, usize::from(area.width));
     frame.render_widget(Paragraph::new(Line::from(line)), area);
+}
+
+/// The ink the running mark wears.
+///
+/// One session has one running mark, and the desktop's sidebar already answers
+/// what colour it is: the theme's primary while the Agent works, and green when
+/// the session will continue itself. The band is the same session's mark on
+/// another surface, so it says the same thing — a reader who has both open must
+/// not have to read the preference off the session list to know whether the
+/// turn will pick itself up.
+///
+/// A page with no session of its own cannot be continuing anything, so it keeps
+/// the primary. In the shipped dark themes that primary is white.
+fn running_mark_colour(app: &App, theme: &TuiTheme) -> ratatui::style::Color {
+    match app.page_session_id() {
+        Some(session_id) if app.auto_continue.is_enabled(session_id) => theme.roles.success,
+        _ => theme.roles.accent,
+    }
 }
 
 /// What the turn line calls the running turn.

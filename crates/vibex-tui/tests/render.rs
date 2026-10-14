@@ -186,6 +186,21 @@ fn text(lines: &[String]) -> String {
     lines.join("\n")
 }
 
+/// Every frame the chrome draws for work in progress, in the tier these tests
+/// render at: the working spinner's and the activity ring's.
+///
+/// The two marks are different tables, so a test that means "no spinner on this
+/// page" has to ask for both — a frame the other mark uses would otherwise slip
+/// through the check.
+fn running_frames() -> Vec<&'static str> {
+    let tier = vibex_tui::glyphs::GlyphTier::Full;
+    vibex_tui::glyphs::spinner_frames(tier)
+        .iter()
+        .chain(vibex_tui::glyphs::activity_ring_frames(tier))
+        .copied()
+        .collect()
+}
+
 #[test]
 fn every_supported_size_produces_a_full_frame() {
     // The matrix from the design report: the layout must degrade, not break.
@@ -6495,10 +6510,10 @@ fn the_new_session_page_does_not_wear_the_session_behind_it() {
         "the composing page is not on screen:\n{page_screen}"
     );
     assert!(
-        !page_screen
-            .chars()
-            .any(|character| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(character)),
-        "the session's turn spinner is on the composing page:\n{page_screen}"
+        !page_screen.chars().any(|character| running_frames()
+            .iter()
+            .any(|frame| frame.contains(character))),
+        "the session's turn mark is on the composing page:\n{page_screen}"
     );
     assert!(
         !page_screen.contains("3m09s") && !page_screen.contains("189"),
@@ -7841,12 +7856,33 @@ fn the_workspace_key_from_the_session_list_does_not_move_the_reader() {
     assert_eq!(app.workspace_path.as_deref(), Some("/home/peatboy/notes"));
 }
 
+/// The mark the turn band is drawing, with the ink it wears.
+///
+/// The band's ring is the only Braille frame a session page with no plan or
+/// dock on screen draws, so a scan for one is a scan for the mark — and it
+/// reads the cell rather than the text, because half of what these tests are
+/// about is the colour.
+fn turn_band_mark(app: &mut App, frames: &[&str]) -> (String, Option<ratatui::style::Color>) {
+    let buffer = render_buffer(app, 110, 30);
+    for row in 0..30u16 {
+        for column in 0..110u16 {
+            let cell = buffer.cell((column, row)).expect("cell");
+            if frames.iter().any(|frame| *frame == cell.symbol()) {
+                return (cell.symbol().to_string(), cell.style().fg);
+            }
+        }
+    }
+    panic!("the turn band draws no activity ring");
+}
+
 #[test]
-fn the_spinner_turns_through_the_quiet_parts_of_a_turn() {
+fn the_turn_band_walks_the_sidebar_ring_in_its_own_colour() {
     // The runtime spends whole seconds starting up, thinking, or waiting on a
-    // tool, with nothing streaming into the transcript. A spinner held on one
-    // frame for that stretch reads as a frozen client — which is exactly what
-    // the turn line is there to disprove.
+    // tool, with nothing streaming into the transcript. A mark held on one frame
+    // for that stretch reads as a frozen client — which is exactly what the turn
+    // line is there to disprove. And it is the desktop sidebar's mark: one dot
+    // per step around the ring of the Braille cell, in the theme's primary, or
+    // green when the session continues itself.
     let mut app = app(110, 30);
     app.navigate_to(Page::Agent);
     let mut session = seeded_session("session_spinner0001", "quiet turn");
@@ -7854,33 +7890,56 @@ fn the_spinner_turns_through_the_quiet_parts_of_a_turn() {
     app.agent
         .apply_sessions(Ok(vec![session.clone()]))
         .expect("sessions apply");
-    app.agent.state.selected_session_id = Some(session.id.clone());
+    let session_id = session.id.clone();
+    app.agent.state.selected_session_id = Some(session_id.clone());
     app.agent.state.active_session.resolve(session);
     // Nothing else moves: no stream, no question, no send in flight.
     app.sync_transcript();
     assert!(!app.transcript_animating(), "the transcript is idle");
     assert!(app.is_animating(), "a running turn is not animating");
 
-    // The spinner is a function of the phase, so a moving one is a phase that
-    // moves — and the frame drawn at each phase has to differ.
-    let glyph = |app: &mut App| {
-        let screen = text(&render(app, 110, 30));
-        screen
-            .chars()
-            .find(|character| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(*character))
-            .unwrap_or_else(|| panic!("no spinner on screen:\n{screen}"))
-    };
+    let frames = vibex_tui::glyphs::activity_ring_frames(vibex_tui::glyphs::GlyphTier::Full);
+    let theme = vibex_tui::theme::TuiTheme::resolve(
+        Some("vibex-dark"),
+        vibex_ui::GpuiThemeMode::Dark,
+        ColorCapability {
+            mode: ColorMode::TrueColor,
+            glyphs: GlyphMode::Unicode,
+        },
+    );
+
+    // One step per animation tick, so a lap is the ring's own frames in order.
+    app.animation_phase = 0;
     let mut seen = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..frames.len() {
+        let (glyph, colour) = turn_band_mark(&mut app, frames);
+        assert_eq!(
+            colour,
+            Some(theme.roles.accent),
+            "a working session's mark is not the theme's primary: {glyph}"
+        );
+        seen.push(glyph);
         assert!(
             app.advance_transcript_animation(),
             "the client stopped animating mid-turn"
         );
-        seen.push(glyph(&mut app));
     }
-    assert!(
-        seen.iter().collect::<std::collections::HashSet<_>>().len() > 1,
-        "the spinner never changed frame: {seen:?}"
+    assert_eq!(seen, frames, "the ring does not walk one frame per tick");
+    // The lap closes rather than sticking on its last frame.
+    assert_eq!(
+        turn_band_mark(&mut app, frames).0,
+        frames[0],
+        "the ring's lap does not close"
+    );
+
+    // Auto-continue is the one thing that recolours the mark, because it is the
+    // one thing that changes what the running turn will do next.
+    app.auto_continue.set_enabled(&session_id, true);
+    let (glyph, colour) = turn_band_mark(&mut app, frames);
+    assert_eq!(
+        colour,
+        Some(theme.roles.success),
+        "a session that continues itself is not marked in green: {glyph}"
     );
 
     // And the idle contract still holds: a session with nothing running costs

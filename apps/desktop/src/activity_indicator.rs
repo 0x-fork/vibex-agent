@@ -57,7 +57,11 @@ const TIMELINE_CELLS: [(f32, f32); 7] = [
 /// lit window along. The mark walks that ring instead of replaying the frames:
 /// the same rotation, with the light moving continuously instead of jumping
 /// 100ms at a time.
-const SIDEBAR_RING: [usize; 6] = [0, 1, 2, 5, 4, 3];
+///
+/// The table is the character client's, because the turn band steps the same
+/// ring (`glyphs::activity_ring_frames`): one definition, so a surface cannot
+/// keep walking a ring the other has stopped drawing.
+const SIDEBAR_RING: [usize; 6] = glyphs::ACTIVITY_RING;
 
 #[derive(Clone, Copy)]
 enum ActivityStyle {
@@ -304,6 +308,35 @@ mod tests {
             sidebar_cycle(),
             SIDEBAR_FRAME_DURATION * frames.len() as u32
         );
+    }
+
+    /// The ring this mark sweeps is the walk the character client steps.
+    ///
+    /// The band above the TUI's composer draws the same running mark, so the
+    /// two surfaces have to make the same move: frame `i` of the client's ring
+    /// lights the window around `ACTIVITY_RING[i]`, which is where this canvas
+    /// puts the head at step `i`. A ring that lit a different window would be a
+    /// second mark that happens to share the dot set.
+    #[test]
+    fn the_sidebar_ring_steps_the_frames_the_turn_band_draws() {
+        let frames = glyphs::activity_ring_frames(GlyphTier::Full);
+        assert_eq!(
+            frames.len(),
+            SIDEBAR_RING.len(),
+            "a lap is one frame per dot of the ring"
+        );
+        let lap = SIDEBAR_RING.len();
+        for (step, frame) in frames.iter().enumerate() {
+            let window = [step + lap - 1, step, step + 1]
+                .into_iter()
+                .map(|index| 1u8 << SIDEBAR_RING[index % lap])
+                .fold(0u8, |all, dot| all | dot);
+            assert_eq!(
+                braille_dots(frame),
+                window,
+                "{frame} is not the ring's step {step}"
+            );
+        }
     }
 
     /// Consecutive ring positions are neighbours in the Braille cell.

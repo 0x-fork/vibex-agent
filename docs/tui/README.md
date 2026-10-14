@@ -178,13 +178,17 @@ it must keep, so a degradation never shifts the layout.
 The row above the composer is where the interface reports what is happening:
 
 ```text
-⠹ read src/net/upload.rs                                     1m12s ⇣12K
-○ Idle                                                        1m12s ⇣12K
+⠦ read src/net/upload.rs · 1m12s · 12 tool calls
+○ Idle
 ◆ 2 Approvals
 ```
 
 It sits between the transcript and the composer because it must never scroll
-away. Idle remains static. Running turns animate even while waiting for a tool or runtime startup.
+away. Idle remains static. Running turns animate even while waiting for a tool or
+runtime startup. The running mark is the desktop sidebar's own: a highlight
+stepping around the ring of the Braille cell, one dot at a time, drawn in the
+theme's primary — green when the session continues itself, so the band says what
+the turn will do next without a second line.
 
 ### Composer
 
