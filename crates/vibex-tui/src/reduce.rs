@@ -630,26 +630,36 @@ impl App {
                     self.toast(Toast::info(
                         self.strings.toast_action_unavailable().to_string(),
                     ));
-                } else if self
-                    .transcript
-                    .block(index)
-                    .and_then(|block| block.fold.as_ref())
-                    .is_some_and(crate::transcript::TurnFold::is_control)
-                {
-                    // Opening a turn's fold can reveal activities the summary
-                    // page withheld, and it opens them all at once rather than
-                    // the one the reader pointed at.
-                    self.note_all_block_details();
                 } else {
-                    // An activity opens onto output a summary page withheld,
-                    // so the expand is what asks for the read.
-                    self.note_block_detail(index);
+                    // Opening a row is a reading gesture, so the view holds the
+                    // frame it was on — the same thing a click on the row does.
+                    // A running turn's new rows otherwise carry the section the
+                    // reader just opened away under their eyes.
+                    self.pin_transcript_view();
+                    if self
+                        .transcript
+                        .block(index)
+                        .and_then(|block| block.fold.as_ref())
+                        .is_some_and(crate::transcript::TurnFold::is_control)
+                    {
+                        // Opening a turn's fold can reveal activities the
+                        // summary page withheld, and it opens them all at once
+                        // rather than the one the reader pointed at.
+                        self.note_all_block_details();
+                    } else {
+                        // An activity opens onto output a summary page withheld,
+                        // so the expand is what asks for the read.
+                        self.note_block_detail(index);
+                    }
                 }
                 Outcome::effects(self.take_timeline_detail_effects())
             }
             Intent::ToggleAllBlocksExpanded => {
                 let expand = !self.transcript.all_expanded();
                 self.transcript.toggle_all(expand);
+                // "Show me everything" is a reading gesture too, and the whole
+                // transcript just changed shape under the reader.
+                self.pin_transcript_view();
                 if let Some(index) = self
                     .transcript
                     .visible_block(self.selection_for(Scope::Agent))
@@ -663,6 +673,7 @@ impl App {
             }
             Intent::ToggleReasoningExpanded => {
                 self.transcript.toggle_reasoning();
+                self.pin_transcript_view();
                 if let Some(index) = self
                     .transcript
                     .visible_block(self.selection_for(Scope::Agent))

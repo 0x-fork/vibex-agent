@@ -4649,6 +4649,23 @@ impl App {
         }
     }
 
+    /// Hold the reader's place while a gesture reveals or hides transcript
+    /// content.
+    ///
+    /// The transcript moves on its own in two ways: it follows the tail while
+    /// `follow` is set, and it clamps a parked offset to the bottom when the
+    /// content under it shrinks. A gesture that changes what is drawn is a
+    /// reading gesture — the reader asked to see something — so both are
+    /// settled against the frame that is on screen: following stops, and the
+    /// offset is pinned where the frame actually is rather than where the state
+    /// was last dragged to. Every gesture that opens or closes a row goes
+    /// through this, so a click and the key that does the same thing cannot
+    /// leave the view in different states.
+    pub fn pin_transcript_view(&mut self) {
+        self.scroll.follow = false;
+        self.scroll.offset = self.transcript.scroll_offset();
+    }
+
     /// Whether the transcript has a running block worth animating.
     ///
     /// The interface repaints without input only while this is true. The

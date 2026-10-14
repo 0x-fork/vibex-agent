@@ -1556,8 +1556,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 app.clear_text_selection();
                 app.focus = Focus::Main;
                 app.set_selection(crate::keymap::Scope::Agent, index);
-                app.scroll.follow = false;
-                app.scroll.offset = app.transcript.scroll_offset();
+                app.pin_transcript_view();
                 let opened = app.transcript.toggle_fold_at(index);
                 let effects = if opened {
                     // The act of opening can reveal an activity whose payload
@@ -1582,8 +1581,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 app.clear_text_selection();
                 app.focus = Focus::Main;
                 app.set_selection(crate::keymap::Scope::Agent, index);
-                app.scroll.follow = false;
-                app.scroll.offset = app.transcript.scroll_offset();
+                app.pin_transcript_view();
                 let outcome = app.perform(crate::action::Intent::ToggleBlockExpanded);
                 dispatch_all(worker, &outcome);
                 return true;

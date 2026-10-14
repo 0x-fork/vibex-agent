@@ -130,6 +130,105 @@ fn file(path: &str, operation: FileOperationKind) -> TimelinePayload {
 }
 
 #[test]
+fn opening_a_row_from_the_keyboard_holds_the_readers_place() {
+    // A running session keeps the view following the tail. The key that opens a
+    // row is a reading gesture, so — like a click on the same row — it has to
+    // stop the following and hold the frame that is on screen. Otherwise every
+    // row the turn adds carries the section the reader just opened away under
+    // their eyes, which reads as the interface moving on its own.
+    let tool = |name: &str| {
+        TimelinePayload::ToolCall(ToolCallPayload {
+            tool_call_id: format!("call-{name}"),
+            tool_name: name.into(),
+            status: ToolCallStatus::Completed,
+            summary: String::new(),
+            input_summary: Some(format!("src/{name}.rs")),
+            output_summary: Some("412 lines".into()),
+            raw_extension: None,
+        })
+    };
+    let mut app = app(
+        vec![
+            tool("read_file"),
+            // Long enough that the transcript is taller than the band, so the
+            // pinned offset is a real place rather than the clamp at 0.
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: (1..=12)
+                    .map(|line| format!("paragraph {line}\n"))
+                    .collect::<String>(),
+                is_final: true,
+            }),
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "Now change it".into(),
+                ..Default::default()
+            }),
+            tool("write_file"),
+        ],
+        AgentSessionState::Running,
+    );
+    let _ = draw(&mut app, 100, 14);
+    assert!(
+        app.scroll.follow,
+        "the fixture does not start out following the tail"
+    );
+    let control = app
+        .transcript
+        .blocks()
+        .iter()
+        .position(|block| {
+            block
+                .fold
+                .as_ref()
+                .is_some_and(vibex_tui::transcript::TurnFold::is_control)
+        })
+        .expect("the settled turn folds");
+    app.set_selection(vibex_tui::keymap::Scope::Agent, control);
+    app.perform(Intent::ToggleBlockExpanded);
+    assert!(
+        !app.scroll.follow,
+        "opening a row left the view following the tail"
+    );
+    let pinned = app.scroll.offset;
+    let _ = draw(&mut app, 100, 14);
+
+    // The running turn keeps producing rows under the reader.
+    for step in 0..3 {
+        let mut items = app.agent.state.timeline.items.clone();
+        let session_id = items[0].session_id.clone();
+        let sequence = items.len() as i64 + 1;
+        items.push(TimelineItem {
+            id: TimelineItemId::new(),
+            session_id,
+            sequence,
+            timestamp_ms: 0,
+            source: TimelineSource::Agent,
+            kind: TimelineItemKind::ToolCall,
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
+            payload: tool(&format!("step_{step}")),
+        });
+        let session_id = items[0].session_id.clone();
+        app.agent
+            .state
+            .timeline
+            .replace_authoritative(session_id, items);
+        app.sync_transcript();
+        let _ = draw(&mut app, 100, 14);
+        assert!(
+            !app.scroll.follow,
+            "row {step} put the view back on the tail"
+        );
+        assert_eq!(
+            app.scroll.offset, pinned,
+            "row {step} carried the parked viewport along"
+        );
+    }
+}
+
+#[test]
 fn typed_tool_details_keep_the_full_input_and_refresh_captured_output() {
     let input = r#"{"path":"src/nested/main.rs","limit":40}"#;
     let extension = AgentEventRawExtension::new(

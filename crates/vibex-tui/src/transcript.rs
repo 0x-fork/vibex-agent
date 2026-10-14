@@ -1345,7 +1345,26 @@ impl Transcript {
             }
             fold.expanded = expanded;
             self.keys[index] = self.blocks[index].content_key();
-            self.invalidate(index);
+            // The fold draws its own row on two of the turn's blocks — the
+            // title above the work, the rule below it — so the lines they
+            // cached are stale. What they *measure* is not: the answer spends
+            // one row and one row of air whether the title or the rule is drawn
+            // on it, and the work rows only appear and disappear, which the
+            // layout reads from the fold itself. Keeping those heights is what
+            // lets a reader parked in the section keep their place; dropping
+            // them would put the whole turn back on estimates, and the answer's
+            // estimate is nowhere near its height.
+            self.drop_lines(index);
+        }
+        // The one block whose shape the fold changes is the row that opens the
+        // section: open, it spends the title and its air above its own content.
+        if let Some(head) = self.blocks.iter().position(|block| {
+            block
+                .fold
+                .as_ref()
+                .is_some_and(|fold| fold.turn_id == turn_id && fold.is_head)
+        }) {
+            self.invalidate(head);
         }
         self.layout_valid = false;
         true
@@ -1437,9 +1456,19 @@ impl Transcript {
         if let Some(height) = self.heights.get_mut(index) {
             *height = UNMEASURED;
         }
+        self.drop_lines(index);
+        self.layout_valid = false;
+    }
+
+    /// Drop a block's cached lines while keeping the height it measured at.
+    ///
+    /// A row can be redrawn without changing the room it takes — the fold's own
+    /// row swaps a title for a rule on the same line — and re-measuring it then
+    /// would throw a parked reader onto an estimate for a shape that never
+    /// changed.
+    fn drop_lines(&mut self, index: usize) {
         self.rendered.remove(&index);
         self.recency.retain(|value| *value != index);
-        self.layout_valid = false;
     }
 
     fn next_visible_block(&self, index: usize) -> Option<&Block> {
@@ -5891,6 +5920,61 @@ mod density_tests {
         assert!(
             title.trim_start().starts_with("▸    Worked for"),
             "{title:?}"
+        );
+    }
+
+    #[test]
+    fn a_fold_toggle_keeps_the_heights_the_turn_measured() {
+        // Opening or shutting a turn's process section changes which rows are
+        // drawn, not how tall its answer is. Re-measuring the turn would put a
+        // long answer back on its estimate — which is nowhere near the rows
+        // markdown actually draws — and a reader parked in the section would be
+        // dropped by the distance between the two.
+        let long = (1..=12)
+            .map(|line| format!("paragraph {line}\n"))
+            .collect::<String>();
+        let mut work = item("t1", TimelineRowKind::ToolCall, "ran", false);
+        work.fold = Some(TurnFold {
+            turn_id: "turn-1".into(),
+            label: "12s".into(),
+            expanded: false,
+            is_conclusion: false,
+            is_head: true,
+            agent_identity: None,
+        });
+        let mut answer = item("t2", TimelineRowKind::AgentMessage, &long, false);
+        answer.collapsible = false;
+        answer.fold = Some(TurnFold {
+            turn_id: "turn-1".into(),
+            label: "12s".into(),
+            expanded: false,
+            is_conclusion: true,
+            is_head: false,
+            agent_identity: None,
+        });
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        transcript.set_blocks(vec![work, answer]);
+        let control = transcript
+            .blocks()
+            .iter()
+            .position(|block| block.fold.as_ref().is_some_and(TurnFold::is_control))
+            .expect("the answer owns the control");
+        // A frame measures the shut layout; the toggles below run without one,
+        // so what they read is what the fold left behind.
+        let _ = transcript.visible_lines(ScrollState::default(), 40, &theme(), strings());
+        let shut = transcript.total_height();
+        assert!(transcript.toggle_block(control));
+        let open = transcript.total_height();
+        assert!(transcript.toggle_block(control));
+        assert!(
+            open > shut,
+            "the open section does not draw the work it stands for"
+        );
+        assert_eq!(
+            transcript.total_height(),
+            shut,
+            "the fold toggle put the turn back on its estimates"
         );
     }
 
