@@ -1181,6 +1181,7 @@ fn apply_app_settings(settings: &AppSettings, window: &mut Window, cx: &mut App)
     theme::set_system_dark(system_appearance_is_dark(cx));
     locale::set_preference(settings.language.unwrap_or_default());
     theme::set_reduce_motion(settings.reduce_motion);
+    theme::set_font_scale_percent(settings.font_scale_percent);
     theme::set_theme_selection(&settings.theme_selection);
     // The kit's own components (inputs, sheets, notification layer) read the
     // theme global, and it was only ever applied at startup: changing the
@@ -3390,6 +3391,21 @@ impl MobileApp {
     /// host, the route, or the credential that failed — so it travels whole.
     fn fail(&mut self, error: BackendError) {
         self.hint(Tone::Error, error.message);
+    }
+
+    /// Steps the text size through its three settings.
+    fn cycle_text_size(&mut self, cx: &mut Context<Self>) {
+        let steps = theme::FONT_SCALE_STEPS;
+        let current = self.app_settings.font_scale_percent;
+        let next = steps
+            .iter()
+            .position(|step| *step == current)
+            .map(|index| steps[(index + 1) % steps.len()])
+            .unwrap_or(100);
+        self.app_settings.font_scale_percent = next;
+        theme::set_font_scale_percent(next);
+        self.persist_app_settings(cx);
+        cx.notify();
     }
 
     /// Holds the display awake exactly while the setting says so.
@@ -12555,7 +12571,7 @@ impl MobileApp {
                     .px_2()
                     .bg(background)
                     .font_family("IBM Plex Mono")
-                    .text_size(px(12.0))
+                    .text_size(theme::code_font_size())
                     .line_height(px(17.0))
                     .text_color(color)
                     .whitespace_normal()
@@ -24247,6 +24263,17 @@ impl MobileApp {
                 )],
             ),
             settings_group(
+                locale::text("Text size", "文字大小", "文字大小"),
+                vec![settings_nav_row(
+                    "mobile-settings-text-size",
+                    "icons/file-type.svg",
+                    locale::text("Text size", "文字大小", "文字大小").to_string(),
+                    text_size_label(self.app_settings.font_scale_percent),
+                    theme::accent_chart3(),
+                    cx.listener(|this, _, _, cx| this.cycle_text_size(cx)),
+                )],
+            ),
+            settings_group(
                 locale::text("While working", "工作时", "工作時"),
                 vec![settings_switch_row(
                     "mobile-settings-keep-screen-on",
@@ -26685,6 +26712,15 @@ fn sidebar_project_icon_color(color: SidebarProjectLogoColor) -> gpui::Hsla {
         SidebarProjectLogoColor::Orange => rgb(0xf97316).into(),
         SidebarProjectLogoColor::Red => theme::accent_red(),
         SidebarProjectLogoColor::Magenta => rgb(0xe879f9).into(),
+    }
+}
+
+/// The text-size step as the reader sees it.
+fn text_size_label(percent: u32) -> String {
+    match percent {
+        value if value < 100 => locale::text("Compact", "紧凑", "緊湊").to_string(),
+        100 => locale::common("Default").to_string(),
+        _ => locale::text("Large", "较大", "較大").to_string(),
     }
 }
 

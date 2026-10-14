@@ -6,7 +6,7 @@
 //! same product as the desktop shell in every palette. Views must go through
 //! these accessors instead of hardcoding colors.
 
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use gpui::{Anchor, App, Hsla, Pixels, Rems, Rgba, Window, hsla, px, rems, rgb};
@@ -261,6 +261,9 @@ pub const FONT_TITLE: f32 = 20.0;
 pub const FONT_HEADING: f32 = 17.0;
 /// Conversation text and every primary row label.
 pub const FONT_BODY: f32 = 16.0;
+/// Code buffers: monospace reads larger than the interface face at the same
+/// size, so it sits one step down.
+pub const FONT_CODE: f32 = 13.0;
 /// Supporting text under a primary label: row details, timeline metadata.
 pub const FONT_DETAIL: f32 = 14.0;
 /// Captions, chips, and button labels.
@@ -277,8 +280,19 @@ pub const FONT_SIDEBAR_META: f32 = 13.0;
 
 /// The rem ladder. Views must reach for these instead of `px(theme::FONT_*)`,
 /// which ignores the platform's text-scaling setting.
+///
+/// The reader's own text-size step multiplies the ladder here, in the one
+/// place every size passes through, so a step repaints the whole interface
+/// rather than the handful of views that remembered to ask.
 pub fn ui_rems(value: f32) -> Rems {
-    rems(value / UI_REM)
+    let scale = font_scale_percent() as f32 / 100.0;
+    rems(value * scale / UI_REM)
+}
+
+/// The size a code buffer is drawn at, which is a step below the body text and
+/// follows the same preference.
+pub fn code_font_size() -> Rems {
+    ui_rems(FONT_CODE)
 }
 
 pub fn font_app_title() -> Rems {
@@ -378,6 +392,24 @@ pub const MOTION_BASE_MS: u64 = 200;
 pub const MOTION_SLOW_MS: u64 = 280;
 
 static REDUCE_MOTION: AtomicU8 = AtomicU8::new(0);
+
+/// The reader's text-size step, as a percentage of the ladder below. Held as
+/// an integer because atomics do not carry floats; 100 is the default.
+static FONT_SCALE_PERCENT: AtomicU32 = AtomicU32::new(100);
+
+/// The steps the text-size setting offers. Three is what a phone can show
+/// without turning the choice into a slider nobody can judge.
+pub const FONT_SCALE_STEPS: [u32; 3] = [90, 100, 115];
+
+/// Applies the persisted text-size preference. Called at startup and when the
+/// setting changes.
+pub fn set_font_scale_percent(percent: u32) {
+    FONT_SCALE_PERCENT.store(percent.clamp(75, 150), Ordering::Relaxed);
+}
+
+pub fn font_scale_percent() -> u32 {
+    FONT_SCALE_PERCENT.load(Ordering::Relaxed)
+}
 
 /// Applies the persisted Reduce Motion preference. Called at startup and when
 /// the setting changes.

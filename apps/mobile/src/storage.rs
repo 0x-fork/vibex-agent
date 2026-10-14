@@ -160,6 +160,9 @@ pub struct AppSettings {
     /// screen. A phone that sleeps mid-run stops showing the thing the reader
     /// opened it to watch.
     pub keep_screen_on: bool,
+    /// The text-size step, as a percentage of the type ladder. The platform's
+    /// own text-scaling setting still applies on top of it.
+    pub font_scale_percent: u32,
     /// The notification categories the user wants to hear about. `notifications`
     /// is the master switch; the three below gate the individual events.
     pub notifications: bool,
@@ -182,6 +185,8 @@ struct StoredAppSettings {
     reduce_motion: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     keep_screen_on: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    font_scale_percent: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     notifications: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -739,6 +744,7 @@ impl CredentialStorage {
             theme_selection: stored.theme_selection.unwrap_or_default(),
             reduce_motion: stored.reduce_motion.unwrap_or(false),
             keep_screen_on: stored.keep_screen_on.unwrap_or(false),
+            font_scale_percent: stored.font_scale_percent.unwrap_or(100),
             notifications: stored.notifications.unwrap_or(true),
             notify_completed: stored.notify_completed.unwrap_or(true),
             notify_needs_input: stored.notify_needs_input.unwrap_or(true),
@@ -759,6 +765,7 @@ impl CredentialStorage {
                 .filter(|selection| selection.light.is_some() || selection.dark.is_some()),
             reduce_motion: Some(settings.reduce_motion),
             keep_screen_on: Some(settings.keep_screen_on),
+            font_scale_percent: Some(settings.font_scale_percent),
             notifications: Some(settings.notifications),
             notify_completed: Some(settings.notify_completed),
             notify_needs_input: Some(settings.notify_needs_input),

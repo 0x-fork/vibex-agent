@@ -323,6 +323,11 @@ pub struct MobileWorkbench {
     git_branches: Option<Vec<GitBranchSummary>>,
     git_branches_loading: bool,
     git_branch_sheet_open: bool,
+    /// The author filter's sheet. The list comes from the history the model
+    /// already holds, so opening it costs nothing.
+    git_author_sheet_open: bool,
+    /// The date filter's sheet.
+    git_date_sheet_open: bool,
     /// Next chunk sequence to feed into the render model; 0 forces a rebuild
     /// from the retained snapshot window.
     terminal_render_sequence: i64,
@@ -441,6 +446,8 @@ impl MobileWorkbench {
             git_branches: None,
             git_branches_loading: false,
             git_branch_sheet_open: false,
+            git_author_sheet_open: false,
+            git_date_sheet_open: false,
             terminal_render_sequence: 0,
             terminal_close_confirmation: None,
             terminal_fit_size: None,
@@ -1553,29 +1560,69 @@ impl MobileWorkbench {
         self.refresh_git_history(false, cx);
     }
 
-    fn toggle_git_history_author(
+    fn open_git_author_sheet(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.git_author_sheet_open = true;
+        cx.notify();
+    }
+
+    fn close_git_author_sheet(&mut self, cx: &mut Context<Self>) {
+        if self.git_author_sheet_open {
+            self.git_author_sheet_open = false;
+            cx.notify();
+        }
+    }
+
+    /// Points the history filter at one author, or at everyone.
+    ///
+    /// A list rather than the cycle this used to be: the reader picked a name
+    /// by tapping through the authors one at a time, which is no way to reach
+    /// the fifth of nine.
+    fn set_git_history_author(&mut self, author: Option<String>, cx: &mut Context<Self>) {
+        let mut filter = self.git.state.model.history_filter.clone();
+        if filter.author == author {
+            self.git_author_sheet_open = false;
+            cx.notify();
+            return;
+        }
+        filter.author = author;
+        self.git.state.model.set_history_filter(filter);
+        self.git_author_sheet_open = false;
+        self.refresh_git_history(false, cx);
+        cx.notify();
+    }
+
+    fn open_git_date_sheet(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.git_date_sheet_open = true;
+        cx.notify();
+    }
+
+    fn close_git_date_sheet(&mut self, cx: &mut Context<Self>) {
+        if self.git_date_sheet_open {
+            self.git_date_sheet_open = false;
+            cx.notify();
+        }
+    }
+
+    /// Points the history filter at a window of time.
+    ///
+    /// Presets rather than a calendar: a phone date picker is three taps deep
+    /// for a question that is almost always "recently".
+    fn set_git_history_window(
         &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
+        window: Option<MobileHistoryWindow>,
         cx: &mut Context<Self>,
     ) {
-        let authors = self.git.state.model.history_authors.clone();
-        let current = self.git.state.model.history_filter.author.clone();
-        let next = if authors.is_empty() {
-            None
-        } else if let Some(current) = current {
-            authors
-                .iter()
-                .position(|author| author.email == current || author.name == current)
-                .and_then(|index| authors.get(index.saturating_add(1)))
-                .map(|author| author.email.clone())
-        } else {
-            authors.first().map(|author| author.email.clone())
-        };
         let mut filter = self.git.state.model.history_filter.clone();
-        filter.author = next;
+        let (after, before) = match window {
+            Some(window) => window.bounds(vibex_core::unix_timestamp_ms()),
+            None => (None, None),
+        };
+        filter.authored_after_ms = after;
+        filter.authored_before_ms = before;
         self.git.state.model.set_history_filter(filter);
+        self.git_date_sheet_open = false;
         self.refresh_git_history(false, cx);
+        cx.notify();
     }
 
     fn load_more_git_history(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -3081,7 +3128,7 @@ impl MobileWorkbench {
                 // A code buffer in the interface font reads as prose; the
                 // desktop editor is monospace and so is this one.
                 .font_family("IBM Plex Mono")
-                .text_size(px(13.0))
+                .text_size(theme::code_font_size())
                 .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
                 .child(textarea_element(self.file_editor_input.as_ref()))
                 .into_any_element()
@@ -3608,6 +3655,198 @@ impl MobileWorkbench {
                                                     .child(detail),
                                             )
                                         })
+                                        .when(chosen, |row| {
+                                            row.child(
+                                                svg()
+                                                    .path("icons/check.svg")
+                                                    .size(px(theme::ICON_SM))
+                                                    .flex_shrink_0()
+                                                    .text_color(theme::primary()),
+                                            )
+                                        })
+                                },
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The author list the history filter picks from.
+    fn render_git_author_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let selected = self.git.state.model.history_filter.author.clone();
+        let mut rows: Vec<(Option<String>, String)> =
+            vec![(None, locale::common("All authors").to_string())];
+        for author in &self.git.state.model.history_authors {
+            let label = if author.name.trim().is_empty() {
+                author.email.clone()
+            } else {
+                author.name.clone()
+            };
+            rows.push((Some(author.email.clone()), label));
+        }
+        self.render_git_filter_sheet(
+            "git-author-sheet",
+            locale::text("History author", "历史作者", "歷史作者"),
+            rows,
+            selected,
+            |this, value, cx| this.set_git_history_author(value, cx),
+            cx,
+        )
+    }
+
+    /// The date presets the history filter picks from.
+    fn render_git_date_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let now = vibex_core::unix_timestamp_ms();
+        let selected = MobileHistoryWindow::from_bounds(
+            self.git.state.model.history_filter.authored_after_ms,
+            self.git.state.model.history_filter.authored_before_ms,
+            now,
+        );
+        let mut rows: Vec<(Option<MobileHistoryWindow>, String)> =
+            vec![(None, locale::common("Any date").to_string())];
+        rows.extend(
+            MobileHistoryWindow::ALL
+                .into_iter()
+                .map(|window| (Some(window), window.label().to_string())),
+        );
+        self.render_git_filter_sheet(
+            "git-date-sheet",
+            locale::text("History date", "历史日期", "歷史日期"),
+            rows,
+            selected,
+            |this, value, cx| this.set_git_history_window(value, cx),
+            cx,
+        )
+    }
+
+    /// One list sheet, shared by the two history filters.
+    ///
+    /// They differ only in what a row carries, and a phone can only show one
+    /// shape of list anyway.
+    fn render_git_filter_sheet<T: Clone + PartialEq + 'static>(
+        &self,
+        debug_id: &'static str,
+        title: &'static str,
+        rows: Vec<(T, String)>,
+        selected: T,
+        choose: impl Fn(&mut Self, T, &mut Context<Self>) + Copy + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.45))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.git_author_sheet_open = false;
+                    this.git_date_sheet_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .debug_selector(move || debug_id.to_string())
+                    .w_full()
+                    .max_h(gpui::relative(0.7))
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(theme::border_subtle())
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(theme::font_title())
+                                    .text_color(theme::text_primary())
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .id("git-filter-sheet-close")
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.git_author_sheet_open = false;
+                                            this.git_date_sheet_open = false;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/x.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_secondary()),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("git-filter-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .p_2()
+                            .children(rows.into_iter().enumerate().map(
+                                |(index, (value, label))| {
+                                    let chosen = value == selected;
+                                    let target = value.clone();
+                                    div()
+                                        .id(("git-filter-row", index))
+                                        .w_full()
+                                        .min_h(px(theme::TOUCH_TARGET))
+                                        .px_3()
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                choose(this, target.clone(), cx)
+                                            }),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .text_size(theme::font_body())
+                                                .text_color(if chosen {
+                                                    theme::primary()
+                                                } else {
+                                                    theme::text_primary()
+                                                })
+                                                .child(label),
+                                        )
                                         .when(chosen, |row| {
                                             row.child(
                                                 svg()
@@ -4457,7 +4696,7 @@ impl MobileWorkbench {
                             )
                             .on_mouse_up(
                                 MouseButton::Left,
-                                cx.listener(Self::toggle_git_history_author),
+                                cx.listener(Self::open_git_author_sheet),
                             ),
                         )
                     }),
@@ -4550,6 +4789,12 @@ impl MobileWorkbench {
             })
             .when(self.git_branch_sheet_open, |root| {
                 root.child(self.render_git_branch_sheet(cx))
+            })
+            .when(self.git_author_sheet_open, |root| {
+                root.child(self.render_git_author_sheet(cx))
+            })
+            .when(self.git_date_sheet_open, |root| {
+                root.child(self.render_git_date_sheet(cx))
             })
             .when(self.file_goto_open, |root| {
                 root.child(self.render_file_goto_prompt(cx))
@@ -7142,6 +7387,52 @@ fn file_line_range(text: &str, line_number: usize) -> Option<(usize, usize)> {
     (current == line_number && start <= text.len()).then_some((start, text.len()))
 }
 
+/// The windows of time the history filter offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MobileHistoryWindow {
+    Today,
+    Week,
+    Month,
+}
+
+impl MobileHistoryWindow {
+    const ALL: [Self; 3] = [Self::Today, Self::Week, Self::Month];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Today => locale::text("Today", "今天", "今天"),
+            Self::Week => locale::text("Last 7 days", "最近 7 天", "最近 7 天"),
+            Self::Month => locale::text("Last 30 days", "最近 30 天", "最近 30 天"),
+        }
+    }
+
+    fn days(self) -> i64 {
+        match self {
+            Self::Today => 1,
+            Self::Week => 7,
+            Self::Month => 30,
+        }
+    }
+
+    /// The filter bounds this window stands for, given the current time.
+    fn bounds(self, now_ms: i64) -> (Option<i64>, Option<i64>) {
+        const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+        (
+            Some(now_ms.saturating_sub(self.days() * DAY_MS)),
+            Some(now_ms),
+        )
+    }
+
+    /// The preset a pair of bounds came from, when it is one of them.
+    fn from_bounds(after: Option<i64>, before: Option<i64>, now_ms: i64) -> Option<Self> {
+        let after = after?;
+        before?;
+        Self::ALL
+            .into_iter()
+            .find(|window| window.bounds(now_ms).0 == Some(after))
+    }
+}
+
 /// A branch name clipped to what a chip can show.
 fn short_branch_label(branch: &str, max_chars: usize) -> String {
     if branch.chars().count() <= max_chars {
@@ -8058,6 +8349,29 @@ mod tests {
         // A point past the row's own width clamps into it rather than panicking.
         assert_eq!(terminal_word_range(&row, 40), (8, 9));
         assert_eq!(terminal_word_range(&[], 3), (3, 3));
+    }
+
+    #[test]
+    fn a_history_window_round_trips_through_the_bounds_it_sets() {
+        const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+        let now = 1_700_000_000_000i64;
+        for window in MobileHistoryWindow::ALL {
+            let (after, before) = window.bounds(now);
+            assert_eq!(before, Some(now));
+            assert_eq!(after, Some(now - window.days() * DAY_MS));
+            assert_eq!(
+                MobileHistoryWindow::from_bounds(after, before, now),
+                Some(window)
+            );
+        }
+        // No bounds at all is "any date", which is not a preset.
+        assert_eq!(MobileHistoryWindow::from_bounds(None, None, now), None);
+        // A window that is not one of the presets keeps its own bounds and
+        // simply reads as unset in the chip.
+        assert_eq!(
+            MobileHistoryWindow::from_bounds(Some(now - 3 * DAY_MS), Some(now), now),
+            None
+        );
     }
 
     #[test]
