@@ -746,6 +746,8 @@ enum InputField {
     PairingCode,
     NewSessionTitle,
     NewSessionPrompt,
+    NewSessionWorktreeName,
+    NewSessionWorktreePath,
     SidebarName,
     SessionAction,
     /// The runtime rename sheet's field.
@@ -8408,9 +8410,14 @@ impl MobileApp {
             self.new_session_workspace_id = None;
             self.new_session_picker = None;
             // The first message's files and references belong to the page that
-            // was just closed, not to the next one.
+            // was just closed, not to the next one, and so do the worktree's
+            // name and path: the next session is a different piece of work.
             self.new_session_attachments.clear();
             self.new_session_armed_mentions.clear();
+            self.pending_input_writes
+                .push((InputField::NewSessionWorktreeName, String::new()));
+            self.pending_input_writes
+                .push((InputField::NewSessionWorktreePath, String::new()));
         }
         self.overlay = None;
         self.overlay_returns_to_drawer = false;
@@ -21820,6 +21827,8 @@ impl Render for MobileApp {
                 InputField::PairingServerUrl => &self.pairing_server_url_input,
                 InputField::PairingCode => &self.pairing_code_input,
                 InputField::NewSessionTitle => &self.new_session_title_input,
+                InputField::NewSessionWorktreeName => &self.new_session_worktree_name_input,
+                InputField::NewSessionWorktreePath => &self.new_session_worktree_path_input,
                 InputField::SidebarName => &self.sidebar_name_input,
                 InputField::SessionAction => &self.session_action_input,
                 InputField::HostName => &self.host_name_input,
