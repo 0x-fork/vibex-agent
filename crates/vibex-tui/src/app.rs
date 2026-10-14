@@ -4715,15 +4715,49 @@ impl App {
             && self.page_elicitation_count() == 0
     }
 
+    /// Whether the session list has a row on it whose state ring is turning.
+    ///
+    /// The ring belongs to the page rather than to the session the page has
+    /// open. A reader who leaves a turn running and steps out to the list is
+    /// looking at work that is still going, and the rings on those rows are the
+    /// only thing there that moves — a clock that answered only for the *open*
+    /// session left every other running row standing still, which said the
+    /// session had stopped when it had not.
+    ///
+    /// The sessions are read rather than the rows the frame built: the window,
+    /// the folds and the filter belong to the frame's own projection, which is
+    /// rebuilt on every repaint, and the clock may not build the list a second
+    /// time for an answer that costs at most one frame. The clock therefore
+    /// keeps running for a row the reader has folded away or filtered out,
+    /// which is the price of never stopping one they are looking at.
+    fn session_list_turns_a_ring(&self) -> bool {
+        self.page == Page::Sessions
+            && self
+                .agent
+                .state
+                .sessions
+                .value
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|session| {
+                    session.deleted_at_ms.is_none()
+                        && crate::sessions::session_state_turns_ring(session.state)
+                })
+    }
+
     /// Whether anything on screen is moving without the reader's input.
     ///
-    /// The landing mark's light crosses the page; a turn's spinner turns.
-    /// Everything else holds still, which is what keeps an idle session — and
-    /// the prompt the client opens on, between passes — at zero frames.
+    /// The landing mark's light crosses the page; a turn's spinner turns. A page
+    /// of sessions turns the ring on every row whose session is still working,
+    /// whether or not that session is the one the page has open. Everything else
+    /// holds still, which is what keeps an idle session — and the prompt the
+    /// client opens on, between passes — at zero frames.
     pub fn chrome_animating(&self) -> bool {
         self.transcript_animating()
             || self.landing_mark_moves()
             || self.transitions.running(self.animation_phase)
+            || self.session_list_turns_a_ring()
     }
 
     /// Step the running indicator. Returns whether a repaint is due.
@@ -4830,6 +4864,7 @@ impl App {
             || self.page_elicitation_count() > 0
             || self.mark_animates()
             || self.transitions.running(self.animation_phase)
+            || self.session_list_turns_a_ring()
     }
 
     /// The approvals the page in front of the reader is waiting on.

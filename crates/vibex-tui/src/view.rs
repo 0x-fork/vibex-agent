@@ -2158,27 +2158,29 @@ fn session_status_column(
         // the one mark that moves: a session continuing itself wears it in the
         // success colour, which is how the desktop says auto-continue without a
         // word. A session that is over — archived, or closed — wears the quiet
-        // dot instead, which is the mark the desktop gives it.
-        match state {
-            AgentSessionState::Running | AgentSessionState::Initializing => {
-                let frames = crate::glyphs::activity_ring_frames(tier);
-                let phase = app.animation_phase / crate::glyphs::ACTIVITY_RING_TICKS_PER_FRAME;
-                let frame = crate::glyphs::frame_at(frames, phase, 1).to_string();
-                let color = if app.auto_continue.is_enabled(&session.id) {
-                    theme.roles.accent_success
-                } else {
-                    theme.roles.accent_running
-                };
-                push(&mut spans, frame, color);
-            }
-            AgentSessionState::Archived | AgentSessionState::Closed => {
-                push(
-                    &mut spans,
-                    crate::glyphs::state_marker("idle", tier).to_string(),
-                    theme.roles.gray_dim,
-                );
-            }
-            _ => {}
+        // dot instead, which is the mark the desktop gives it. Which states turn
+        // the ring lives with the list
+        // ([`crate::sessions::session_state_turns_ring`]), because the clock
+        // that steps it has to ask the same question.
+        if crate::sessions::session_state_turns_ring(state) {
+            let frames = crate::glyphs::activity_ring_frames(tier);
+            let phase = app.animation_phase / crate::glyphs::ACTIVITY_RING_TICKS_PER_FRAME;
+            let frame = crate::glyphs::frame_at(frames, phase, 1).to_string();
+            let color = if app.auto_continue.is_enabled(&session.id) {
+                theme.roles.accent_success
+            } else {
+                theme.roles.accent_running
+            };
+            push(&mut spans, frame, color);
+        } else if matches!(
+            state,
+            AgentSessionState::Archived | AgentSessionState::Closed
+        ) {
+            push(
+                &mut spans,
+                crate::glyphs::state_marker("idle", tier).to_string(),
+                theme.roles.gray_dim,
+            );
         }
     }
     // The countdown is this client's own: the desktop's ring can say *that* a

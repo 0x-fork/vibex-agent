@@ -6593,6 +6593,93 @@ fn the_mark_moves_only_where_it_is_drawn() {
 }
 
 #[test]
+fn a_running_row_turns_its_ring_while_the_list_is_up() {
+    // The row's ring is the list page's own mark, and the session that wears it
+    // is usually not the one the list has open: a reader scouting the list while
+    // another session works. The clock has to answer for the page it is on — a
+    // ring that stopped under a running session said the work had stopped.
+    use vibex_core::AgentSessionState;
+    use vibex_tui::action::Intent;
+    let ring_of = |screen: &str| {
+        screen
+            .lines()
+            .find(|line| line.contains("work for me"))
+            .and_then(|line| {
+                vibex_tui::glyphs::activity_ring_frames(vibex_tui::glyphs::GlyphTier::Full)
+                    .iter()
+                    .copied()
+                    .find(|frame| line.contains(frame))
+            })
+    };
+
+    let mut app = app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let quiet = seeded_session("session_ringrow01", "read me");
+    let mut working = seeded_session("session_ringrow02", "work for me");
+    working.state = AgentSessionState::Running;
+    app.agent
+        .apply_sessions(Ok(vec![quiet.clone(), working.clone()]))
+        .expect("sessions apply");
+    // The quiet session is the one the list has open. Nothing else on the page
+    // moves: the running row is the page's whole reason to repaint.
+    app.agent.state.selected_session_id = Some(quiet.id.clone());
+    app.agent.state.active_session.resolve(quiet.clone());
+    app.perform(Intent::GotoSessions);
+
+    let mut drawn = Vec::new();
+    for _ in 0..6 {
+        let screen = text(&render(&mut app, 120, 40));
+        drawn.push(
+            ring_of(&screen)
+                .unwrap_or_else(|| panic!("no ring on the running row:\n{screen}"))
+                .to_string(),
+        );
+        assert!(
+            app.chrome_animating(),
+            "the list stopped asking for frames under a running row"
+        );
+        assert!(
+            app.advance_transcript_animation(),
+            "the clock stopped under a running row"
+        );
+    }
+    assert!(
+        drawn.iter().any(|frame| *frame != drawn[0]),
+        "the ring never moved: {drawn:?}"
+    );
+
+    // The ring belongs to the state, not to the list: a session still being
+    // started wears it too — the Agent has been asked and has not answered — so
+    // the clock answers for it the same way.
+    let mut starting = working.clone();
+    starting.state = AgentSessionState::Initializing;
+    app.agent
+        .apply_sessions(Ok(vec![quiet.clone(), starting]))
+        .expect("sessions apply");
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(ring_of(&screen).is_some(), "a starting row lost its ring");
+    assert!(
+        app.chrome_animating(),
+        "a starting row does not turn the clock"
+    );
+
+    // And once the session settles the page holds still again rather than
+    // repainting for a mark that is not there.
+    let mut settled = working.clone();
+    settled.state = AgentSessionState::Idle;
+    app.agent
+        .apply_sessions(Ok(vec![quiet.clone(), settled]))
+        .expect("sessions apply");
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(ring_of(&screen).is_none(), "a settled row keeps its ring");
+    assert!(
+        !app.chrome_animating(),
+        "the list animates with nothing on it"
+    );
+    assert!(!app.advance_transcript_animation());
+}
+
+#[test]
 fn the_page_draws_the_mark_the_reader_chose() {
     use vibex_tui::action::Intent;
     use vibex_tui::settings::SettingRow;

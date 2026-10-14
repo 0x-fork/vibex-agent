@@ -188,6 +188,20 @@ pub fn session_state_chip(state: AgentSessionState) -> Option<AgentSessionState>
     }
 }
 
+/// Whether a session in this state wears the row's turning ring.
+///
+/// The one mark in the list that moves, so the row that draws the frame and the
+/// clock that steps the phase have to answer with the same reading of the
+/// state: two copies of this question is how a ring ends up standing still
+/// under a clock that thinks it has nothing to draw — or a clock running for a
+/// mark no row paints.
+pub fn session_state_turns_ring(state: AgentSessionState) -> bool {
+    matches!(
+        state,
+        AgentSessionState::Running | AgentSessionState::Initializing
+    )
+}
+
 /// How many sessions the header counts in each state family.
 ///
 /// Counted from the sessions the list is *about* rather than from the rows it

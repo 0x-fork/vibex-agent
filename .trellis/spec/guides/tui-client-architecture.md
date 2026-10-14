@@ -693,6 +693,16 @@ is never a column count.
   own `▶`/`✗`/`◇`/`◆`/`▤`, and `↻`/`↻N` for auto-continue. The state is *only* a
   mark: the words were removed once the shapes were learned, because they cost
   the title a third of the row and said nothing the mark did not.
+* **The list's clock answers for the rows it draws.** The ring on a running row
+  is the only thing on the page that moves, and the session wearing it is usually
+  not the one the list has open — a reader scouting the list while another
+  session works has to see that work turning. `sessions::session_state_turns_ring`
+  is the one reading of which states wear the ring: the row draws its frame from
+  it and `App::chrome_animating`/`App::is_animating` step the phase from it, so
+  the row and the clock cannot drift apart by a state. The answer is read from
+  the session set rather than from the rows the frame built — the window, the
+  folds and the filter belong to the frame's own projection — so a folded row
+  keeps the clock running rather than stopping a ring under a running one.
 * **A row's own controls act on their row, not on the cursor.** Rename and
   delete are drawn at the right end of a session row while the reader is on it —
   the selected row, or the row under the pointer — *in the age's place*, flush
