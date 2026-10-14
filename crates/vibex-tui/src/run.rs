@@ -3759,7 +3759,8 @@ mod tests {
         }
 
         // The block keeps the name of the update that opened the row.
-        assert_eq!(app.transcript.blocks()[0].id, "tool:call-1:2");
+        // The block keeps the name of the update that opened the row.
+        assert_eq!(app.transcript.blocks()[0].id, "tool:call-1:1");
         let screen = conversation_frame(&mut app, 100, 30);
         assert!(screen.contains("ls -la"), "{screen}");
         assert!(

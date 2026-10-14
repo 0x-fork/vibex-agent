@@ -1107,6 +1107,31 @@ pub fn timeline_rows(items: &[TimelineItem]) -> Vec<TimelineRow> {
     timeline_rows_from_refs(&item_refs)
 }
 
+/// The id of one Agent message row, completed by the item that opened it.
+///
+/// A provider message is not a row. An interleaved thought or tool call ends the
+/// row the message's next chunk would have joined, and a chunk and the final
+/// answer carry different phases, so one message can open several rows. The
+/// correlation id alone therefore names the message and not the row, and row ids
+/// are element ids in the clients: two rows sharing one share a single element,
+/// which left the later row's Markdown fragments unable to reclaim their shaped
+/// text and painted its inline-code backgrounds without their glyphs. The
+/// opening item's sequence makes the id unique, and it stays put as the row
+/// grows.
+fn agent_message_row_id(correlation: &str, item: &TimelineItem) -> String {
+    format!("agent:{correlation}:{}", item.sequence)
+}
+
+/// The id of one tool-call row.
+///
+/// A tool call reports more than once — started, progress, completed — and each
+/// report is a row of its own, so the call's own id cannot name a row. The
+/// sequence of the item that opened the row completes it, for the same reason
+/// [`agent_message_row_id`] carries one.
+fn tool_call_row_id(tool_call_id: &str, item: &TimelineItem) -> String {
+    format!("tool:{tool_call_id}:{}", item.sequence)
+}
+
 fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
     let resolved_permission_ids = items
         .iter()
@@ -1138,7 +1163,7 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                 let final_answer = delta.phase == Some(AgentMessagePhase::FinalAnswer);
                 let key = correlation
                     .as_deref()
-                    .map(|value| format!("agent:{value}"))
+                    .map(|value| agent_message_row_id(value, item))
                     .unwrap_or_else(|| format!("agent-delta:{}", item.id));
                 if let Some(previous) = rows.last_mut().filter(|row| {
                     row.kind == TimelineRowKind::AgentMessage
@@ -1180,7 +1205,7 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                 let message_text = compact_reconnect_progress_text(&message.text);
                 let key = correlation
                     .as_deref()
-                    .map(|value| format!("agent:{value}"))
+                    .map(|value| agent_message_row_id(value, item))
                     .unwrap_or_else(|| format!("agent:{}", item.id));
                 if let Some(previous) = rows.last_mut().filter(|row| {
                     row.kind == TimelineRowKind::AgentMessage
@@ -1252,7 +1277,7 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
             TimelinePayload::Goal(_) => {}
             TimelinePayload::ToolCall(tool) => rows.push(simple_row(
                 item,
-                format!("tool:{}", tool.tool_call_id),
+                tool_call_row_id(&tool.tool_call_id, item),
                 TimelineRowKind::ToolCall,
                 tool.tool_name.clone(),
                 tool.output_summary
@@ -1983,7 +2008,9 @@ mod tests {
             ),
         ]);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, "agent:correlation_turn_a");
+        // The row is named for the message and the item that opened it, so a
+        // message split across rows cannot hand two of them one id.
+        assert_eq!(rows[0].id, "agent:correlation_turn_a:1");
         assert_eq!(rows[0].body, "hello");
         assert!(!rows[0].streaming);
         assert_eq!(rows[0].item_ids.len(), 2);
@@ -2126,7 +2153,9 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].id, "tool:call-1");
+        // The folded row keeps the name of the update that opened it, so a call
+        // reported in two turns cannot hand both rows one id.
+        assert_eq!(tools[0].id, "tool:call-1:2");
         assert_eq!(tools[0].body, r#"{"command":"ls -la"}"#);
         assert!(!tools[0].streaming);
         assert_eq!(tools[0].first_sequence, 2);
@@ -2138,7 +2167,7 @@ mod tests {
         let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].process_rows.len(), 1);
-        assert_eq!(turns[0].process_rows[0].id, "tool:call-1");
+        assert_eq!(turns[0].process_rows[0].id, "tool:call-1:2");
     }
 
     #[test]
@@ -2191,6 +2220,151 @@ mod tests {
         assert_ne!(tools[0].turn_id, tools[1].turn_id);
         assert_eq!(tools[0].body, "first");
         assert_eq!(tools[1].body, "second");
+        // Both reports name the same call, so only the item that opened each row
+        // tells them apart; sharing an id would share a client element.
+        assert_ne!(tools[0].id, tools[1].id);
+    }
+
+    /// One provider message can open more than one row: a thought or tool call
+    /// between its chunks ends the row the next chunk would have joined. Those
+    /// rows are separate rows of one message, so the message's own correlation
+    /// alone cannot name them — and row ids are element ids in the clients, where
+    /// two rows sharing one lost the text of the later row's Markdown.
+    #[test]
+    fn a_message_split_by_an_interleaved_thought_opens_rows_with_distinct_ids() {
+        let delta = |sequence: i64, text: &str| {
+            item(
+                sequence,
+                Some("correlation_turn_a"),
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: text.into(),
+                    chunk_index: sequence as u32,
+                    phase: None,
+                }),
+            )
+        };
+        let items = vec![
+            delta(1, "First half"),
+            item(
+                2,
+                Some("correlation_turn_a"),
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "a thought".into(),
+                    is_final: true,
+                }),
+            ),
+            delta(3, " second half"),
+        ];
+
+        let rows = timeline_rows(&items);
+        let messages = rows
+            .iter()
+            .filter(|row| row.kind == TimelineRowKind::AgentMessage)
+            .collect::<Vec<_>>();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].body, "First half");
+        assert_eq!(messages[1].body, " second half");
+        assert_ne!(messages[0].id, messages[1].id);
+        assert_eq!(messages[0].id, "agent:correlation_turn_a:1");
+        assert_eq!(messages[1].id, "agent:correlation_turn_a:3");
+    }
+
+    /// The clients key a row's elements and its retained Markdown by row id, so
+    /// a turn that reports the same message or the same tool call more than once
+    /// must still hand every row an id of its own. This walks a turn that does
+    /// both, through both projections, because the turn projection folds and
+    /// re-keys rows on its way out.
+    #[test]
+    fn every_projected_row_of_a_repeating_turn_carries_a_unique_id() {
+        let tool = |sequence: i64, status: ToolCallStatus| {
+            item(
+                sequence,
+                None,
+                TimelinePayload::ToolCall(ToolCallPayload {
+                    tool_call_id: "call-1".into(),
+                    tool_name: "execute".into(),
+                    status,
+                    summary: "ls -la".into(),
+                    input_summary: None,
+                    output_summary: None,
+                    raw_extension: None,
+                }),
+            )
+        };
+        let delta = |sequence: i64, text: &str| {
+            item(
+                sequence,
+                Some("correlation_turn_a"),
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: text.into(),
+                    chunk_index: sequence as u32,
+                    phase: None,
+                }),
+            )
+        };
+        let items = vec![
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Inspect".into(),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+            ),
+            tool(2, ToolCallStatus::Started),
+            tool(3, ToolCallStatus::Progress),
+            tool(4, ToolCallStatus::Completed),
+            delta(5, "First half"),
+            item(
+                6,
+                Some("correlation_turn_a"),
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "a thought".into(),
+                    is_final: true,
+                }),
+            ),
+            delta(7, " second half"),
+            // The same call reported again, in a turn of its own, keeps a row.
+            item(
+                8,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Again".into(),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+            ),
+            tool(9, ToolCallStatus::Completed),
+        ];
+
+        let assert_unique = |ids: Vec<String>| {
+            let mut seen = BTreeSet::new();
+            for id in ids {
+                assert!(seen.insert(id.clone()), "two rows are named {id}");
+            }
+        };
+
+        assert_unique(
+            timeline_rows(&items)
+                .into_iter()
+                .map(|row| row.id)
+                .collect(),
+        );
+        let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Idle), false);
+        assert_unique(
+            turns
+                .iter()
+                .flat_map(|turn| {
+                    turn.user_row
+                        .iter()
+                        .chain(turn.process_rows.iter())
+                        .chain(turn.conclusion_row.iter())
+                })
+                .map(|row| row.id.clone())
+                .collect(),
+        );
     }
 
     #[test]
@@ -3562,7 +3736,7 @@ mod tests {
         let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Idle), false);
 
         assert_eq!(turns[0].process_rows.len(), 1);
-        assert_eq!(turns[0].process_rows[0].id, "tool:tool_read");
+        assert_eq!(turns[0].process_rows[0].id, "tool:tool_read:2");
         assert_eq!(turns[0].process_rows[0].item_ids.len(), 2);
         assert_eq!(turns[0].process_rows[0].first_sequence, 2);
         assert_eq!(turns[0].process_rows[0].last_sequence, 3);
@@ -3634,12 +3808,12 @@ mod tests {
             turn.process_activity_groups,
             vec![
                 TimelineProcessActivityGroup {
-                    id: "activity-group:tool:tool_read".into(),
+                    id: "activity-group:tool:tool_read:3".into(),
                     start_row: 1,
                     end_row: 3,
                 },
                 TimelineProcessActivityGroup {
-                    id: "activity-group:tool:tool_search".into(),
+                    id: "activity-group:tool:tool_search:6".into(),
                     start_row: 4,
                     end_row: 6,
                 },

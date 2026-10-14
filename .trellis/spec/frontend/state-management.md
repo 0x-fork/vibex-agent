@@ -421,6 +421,41 @@ The Markdown regression uses a retained component entity: append Chinese text
 and Emoji, verify the existing selection survives, then replace the source and
 verify the corrected rendered text. The component owns block-level tests.
 
+### Convention: A row id is an element id, so each row owns one
+
+A projected `TimelineRow`'s id names the row to every client: the desktop
+workbench uses it as the row's GPUI element id and as the key of the row's
+retained `TextViewState`, the TUI uses it as its transcript block id, and mobile
+keys its activity groups from it. Two rows may therefore never share an id, and
+the id must not move while the row lives.
+
+A provider message is not a row. An interleaved thought or tool call ends the row
+the message's next chunk would have joined, and a chunk and the final answer
+carry different phases, so one message opens several rows; a tool call reports
+started, progress and completed as separate items, and the same call id returns
+in a later turn. Keying such rows by the message's correlation id or the call's
+own id handed several rows one id, so two Markdown surfaces shared one element
+and one retained text view: the later row painted its inline-code chip backgrounds
+without their glyphs — the backgrounds come from the parent inline flow, the
+glyphs from the shared fragment text that could no longer be reclaimed — and it
+blinked as the timeline restreamed. The id names the item that opened the row as
+well as the message or call it belongs to.
+
+```rust
+// Wrong: one correlation id, several rows — and one element state for all of them.
+let key = format!("agent:{correlation}");
+
+// Correct: the message plus the item that opened this row.
+let key = format!("agent:{correlation}:{}", item.sequence);
+```
+
+Folds keep the identity of the row they fold into rather than minting a new one:
+process compaction and the retry/delegation merges adopt the existing row's id and
+`first_sequence`, so a row that absorbs more items keeps the name the clients
+already hold for it. Regression coverage walks a turn that reports one message and
+one tool call more than once and asserts that every row of `timeline_rows` and of
+the turn projection carries a unique id.
+
 ### Convention: Reasoning disclosures retain measured geometry
 
 A reasoning toggle changes one disclosure. Keep the turn's measured extent and
