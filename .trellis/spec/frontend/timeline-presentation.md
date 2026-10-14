@@ -105,10 +105,12 @@ Transcript::advance_disclosures(&mut self, Instant) -> bool
   survives streamed updates, including a temporarily absent bottom indicator
   within the same turn. **Window** mode is a shape, not an invitation: once a
   row is open it clips a body that is still arriving to its newest rows, while
-  a settled thought opens in full. Changing display mode or default expansion
-  clears per-row reasoning overrides; changing expansion mode preserves them.
-  Mobile likewise supports full reasoning and explicit collapse during
-  streaming. TUI keeps its incremental Markdown renderer, tail fold marker,
+  a settled thought opens in full. Every row of that window is the thought's
+  own text: the live header and the rail already say it is unfinished, so no
+  row is spent marking where the older rows went. Changing display mode or
+  default expansion clears per-row reasoning overrides; changing expansion
+  mode preserves them. Mobile likewise supports full reasoning and explicit
+  collapse during streaming. TUI keeps its incremental Markdown renderer,
   rail, and scroll controls.
 - Reasoning content keeps its natural height, bottom-aligned within the
   six-line cap. Answers and commentary use body foreground; reasoning stays
@@ -155,7 +157,7 @@ are optional, and absent or unknown choices resolve to the shipped default:
 | JSON field | Values | TUI default |
 | --- | --- | --- |
 | `reasoningDisplayMode` | `latest_at_bottom`, `timeline` | `latest_at_bottom` |
-| `reasoningExpandedByDefault` | boolean | `false` |
+| `reasoningExpandedByDefault` | boolean | `true` |
 | `reasoningExpansionMode` | `window`, `full` | `window` |
 
 ## 4. Validation & Error Matrix
@@ -177,7 +179,7 @@ are optional, and absent or unknown choices resolve to the shipped default:
 | Turn running, or settled with no answer, or no drawn process | Keep every row visible and draw no divider |
 | Reader opens/closes a turn fold | The explicit choice survives rebuilds and streaming deltas for that turn |
 | Search matches a row inside a shut fold | Open the fold, then reveal the matched row |
-| Older preference file omits reasoning settings | Latest at bottom, default expansion off, Window |
+| Older preference file omits reasoning settings | Latest at bottom, default expansion on, Window |
 | Disclosure is reversed or Motion is disabled | Continue from displayed progress or settle immediately |
 | Failed or pending operation | Keep its failure/approval affordance visible |
 

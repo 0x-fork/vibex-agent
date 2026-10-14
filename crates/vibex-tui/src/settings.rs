@@ -720,7 +720,7 @@ impl App {
             // this page already has.
             SettingRow::Motion | SettingRow::Transitions => "on".to_string(),
             SettingRow::ReasoningDisplay => "latest_at_bottom".to_string(),
-            SettingRow::ReasoningExpanded => "off".to_string(),
+            SettingRow::ReasoningExpanded => "on".to_string(),
             SettingRow::ReasoningExpansion => "window".to_string(),
             // Every notification switch is on as shipped, the title is off, and
             // the transport follows the terminal: a reset puts the layer back

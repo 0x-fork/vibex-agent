@@ -87,15 +87,10 @@ pub const MIN_GROUP_RUN: usize = 3;
 /// would push the rest of the session off the screen while the reader is
 /// reading it. The window is the compromise: a fixed number of rows at the
 /// tail, so the newest lines push the oldest off the top instead of adding
-/// height. One of the rows is the fold marker once the thought outgrows the
-/// window, so the block is never taller than this plus its header.
+/// height. Every row of the window is the thought's own content — the rail
+/// marks the extent, and the live header marks the row as still arriving — so
+/// the block is never taller than this plus its header.
 pub const STREAMING_WINDOW_LINES: usize = vibex_ui::timeline::REASONING_WINDOW_LINES;
-
-/// The mark that says older rows of a live thought are above the window.
-///
-/// A character rather than a chevron: the window's oldest row is *content*, and
-/// a glyph that pointed at a fold would read as a control the reader can press.
-const FOLD_MARKER: &str = "…";
 
 /// How far the rail's wave travels per animation tick, in radians.
 ///
@@ -133,7 +128,7 @@ fn is_running_thought(block: &Block) -> bool {
 ///
 /// Such a block is *not* a one-row work item while it is live: it shows a
 /// bounded window onto the tail of its body, and everything the window does —
-/// the animation, the fold marker, the bound on its height — is gated on this
+/// the animation, the bound on its height — is gated on this
 /// one predicate.
 pub fn is_live_thinking_window(block: &Block, trailing: bool) -> bool {
     trailing && is_running_thought(block)
@@ -2749,7 +2744,13 @@ fn band_row(
 /// the words under it start on the composer's own column. The cursor's bar is the
 /// same cell, so the row the reader is on is marked by the pointer rather than by
 /// the rule — one column, one mark.
-fn box_marker(row: usize, live: bool, pointer: bool, phase: u32, theme: &TuiTheme) -> Span<'static> {
+fn box_marker(
+    row: usize,
+    live: bool,
+    pointer: bool,
+    phase: u32,
+    theme: &TuiTheme,
+) -> Span<'static> {
     if pointer || live {
         return row_marker(row, live, pointer, phase, theme);
     }
@@ -3336,13 +3337,14 @@ fn render_block_inner(
     });
     // A running thought is held to a fixed window on its tail: the newest rows
     // are the ones being read, and once the window is full the oldest leaves
-    // the top instead of the block growing without bound. The rail is then one
-    // cell per row of the window, its header included, so the bar the reader
-    // sees is exactly as tall as the range it stands for.
+    // the top instead of the block growing without bound. Every row of the
+    // window is content, so the rail is one cell per row of the window, its
+    // header included, and the bar the reader sees is exactly as tall as the
+    // range it stands for.
     if let Some(rendered) = rendered.as_mut()
         && live
     {
-        fold_live_window(rendered, theme);
+        fold_live_window(rendered);
     }
 
     let fold_title = block.fold.as_ref().filter(|fold| fold.draws_title());
@@ -3791,21 +3793,16 @@ fn rail_weight(row: usize, phase: u32) -> f32 {
 ///
 /// The newest rows are kept and the oldest leave the top, which is what makes
 /// the window fixed: a thought a hundred lines long costs the same rows on
-/// screen as a thought ten lines long. Once rows have left, the top row says so
-/// — without it the reader would take the first visible line for the beginning
-/// of the thought.
-fn fold_live_window(rendered: &mut crate::markdown::RenderedMarkdown, theme: &TuiTheme) {
-    let window = STREAMING_WINDOW_LINES.max(2);
+/// screen as a thought ten lines long. Nothing is spent saying that rows have
+/// left: the row is only ever windowed while it is still arriving, so its live
+/// header and the rail down its side already say the thought is unfinished, and
+/// a mark of its own would take a row from the newest text the window is for.
+fn fold_live_window(rendered: &mut crate::markdown::RenderedMarkdown) {
+    let window = STREAMING_WINDOW_LINES.max(1);
     if rendered.lines.len() > window {
-        let keep = window - 1;
-        let cut = rendered.lines.len() - keep;
+        let cut = rendered.lines.len() - window;
         rendered.lines.drain(..cut);
         rendered.plain.drain(..cut);
-        rendered.lines.insert(
-            0,
-            Line::from(Span::styled(FOLD_MARKER, theme.dimmed(theme.roles.gray))),
-        );
-        rendered.plain.insert(0, FOLD_MARKER.to_string());
     }
 }
 
@@ -4547,7 +4544,7 @@ mod tests {
         let mut entry = block(
             "thought",
             TimelineRowKind::Reasoning,
-            "- read the cache path\n- check how a delta invalidates it\n- decide where the window lives\n- keep the newest rows\n- drop the oldest\n- mark the fold\n- draw the rail\n- animate the rail",
+            "- read the cache path\n- check how a delta invalidates it\n- decide where the window lives\n- keep the newest rows\n- drop the oldest\n- hold the window's height\n- draw the rail\n- animate the rail",
         );
         entry.streaming = true;
         entry.expanded = true;
@@ -4568,21 +4565,26 @@ mod tests {
             rendered.plain[0]
         );
         assert!(rendered.plain[0].contains('▾'), "{}", rendered.plain[0]);
-        // The newest rows are the ones shown, the oldest have left the top, and
-        // the row above them says so.
+        // The newest rows are the ones shown and the oldest have left the top;
+        // nothing is spent saying so, so the first row under the header is the
+        // oldest text the window still holds.
         assert!(text.contains("animate the rail"), "{text}");
-        assert!(text.contains(FOLD_MARKER), "{text}");
         assert!(!text.contains("read the cache path"), "{text}");
+        assert!(
+            rendered.plain[1].contains("decide where the window lives"),
+            "the window does not open on its oldest kept row: {:?}",
+            rendered.plain[1]
+        );
+        assert!(
+            rendered.plain[1..].iter().all(|row| !row.contains('…')),
+            "a row of the window was spent on a mark: {:?}",
+            rendered.plain
+        );
         // The window is bounded: header, window rows, gap.
         assert!(
             rendered.height <= 1 + STREAMING_WINDOW_LINES + chrome::GAP,
             "the window grew past its bound: {} rows",
             rendered.height
-        );
-        assert!(
-            rendered.plain[1] == FOLD_MARKER,
-            "the fold marker is not the first row of the window: {:?}",
-            rendered.plain[1]
         );
     }
 

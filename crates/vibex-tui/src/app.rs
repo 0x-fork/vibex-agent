@@ -8729,7 +8729,8 @@ mod tests {
         assert!(app.apply_setting_value(SettingRow::Motion, "off"));
         assert!(app.apply_setting_value(SettingRow::Transitions, "off"));
         assert!(app.apply_setting_value(SettingRow::ReasoningDisplay, "timeline"));
-        assert!(app.apply_setting_value(SettingRow::ReasoningExpanded, "on"));
+        // Expansion is on as shipped, so the moved row is the one that closes it.
+        assert!(app.apply_setting_value(SettingRow::ReasoningExpanded, "off"));
         assert!(app.apply_setting_value(SettingRow::ReasoningExpansion, "full"));
         assert!(app.apply_setting_value(SettingRow::Language, "zh-TW"));
         assert!(app.apply_setting_value(SettingRow::Workspace, "/tmp/vibex-default-ws"));
@@ -8777,7 +8778,7 @@ mod tests {
             reloaded.settings.reasoning_display_mode,
             vibex_desktop_model::ReasoningDisplayMode::Timeline
         );
-        assert!(reloaded.settings.reasoning_expanded_by_default);
+        assert!(!reloaded.settings.reasoning_expanded_by_default);
         assert_eq!(
             reloaded.settings.reasoning_expansion_mode,
             vibex_desktop_model::ReasoningExpansionMode::Full

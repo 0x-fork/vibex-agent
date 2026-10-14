@@ -411,12 +411,18 @@ fn reasoning_keeps_its_live_tail_window_and_settles_when_a_tool_follows() {
         })],
         AgentSessionState::Running,
     );
-    // The preference is off, so the running thought stays folded: nothing
-    // opens itself, not even the thought the Agent is on.
+    // The preference is on, so the running thought opens itself on the tail of
+    // its body: the newest rows are there, the oldest have left the top.
+    let text = draw(&mut app, 80, 30);
+    assert!(app.transcript.blocks()[1].expanded);
+    assert!(text.contains("Reasoning paragraph 19"), "{text}");
+    assert!(!text.contains("Reasoning paragraph 0"));
+    // The reader folds it, and it stays folded.
+    app.transcript.toggle_block(1);
     let text = draw(&mut app, 80, 30);
     assert!(!app.transcript.blocks()[1].expanded);
     assert!(!text.contains("Reasoning paragraph 19"), "{text}");
-    // The reader opens it, and the live window shows the tail only.
+    // The reader opens it again, and the live window shows the tail only.
     app.transcript.toggle_block(1);
     let text = draw(&mut app, 80, 30);
     assert!(text.contains("Reasoning paragraph 19"), "{text}");
@@ -452,6 +458,8 @@ fn reasoning_keeps_its_live_tail_window_and_settles_when_a_tool_follows() {
     app.agent.state.timeline.items.push(item);
     app.sync_transcript();
     let text = draw(&mut app, 80, 30);
+    // The reader's collapse belongs to the turn's live row, so the same turn's
+    // later thought arrives folded rather than reopening on the new default.
     assert!(!app.transcript.blocks().last().unwrap().expanded);
     assert!(!text.contains("A later thought"), "{text}");
 }
@@ -499,7 +507,7 @@ fn reasoning_settings_choose_placement_and_the_default_for_every_row() {
         app.settings.reasoning_display_mode,
         ReasoningDisplayMode::LatestAtBottom
     );
-    assert!(!app.settings.reasoning_expanded_by_default);
+    assert!(app.settings.reasoning_expanded_by_default);
     assert_eq!(
         app.settings.reasoning_expansion_mode,
         ReasoningExpansionMode::Window
@@ -512,22 +520,23 @@ fn reasoning_settings_choose_placement_and_the_default_for_every_row() {
             .map(|block| (block.body.clone(), block.expanded, block.streaming))
             .collect::<Vec<_>>()
     };
-    // Default expansion is off, so even the trailing live thought is folded:
-    // the timeline only opens what the reader opens.
+    // Default expansion is on, so the trailing live thought opens itself.
     assert_eq!(
         reasoning(&app),
-        vec![("Current thought".into(), false, true)]
+        vec![("Current thought".into(), true, true)]
     );
 
     app.apply_setting_value(SettingRow::ReasoningDisplay, "timeline");
     assert_eq!(
         reasoning(&app),
         vec![
-            ("Earlier thought".into(), false, false),
-            ("Current thought".into(), false, true)
+            ("Earlier thought".into(), true, false),
+            ("Current thought".into(), true, true)
         ]
     );
     assert_eq!(app.transcript.blocks()[2].kind, TimelineRowKind::Command);
+    app.apply_setting_value(SettingRow::ReasoningExpanded, "off");
+    assert!(reasoning(&app).iter().all(|(_, expanded, _)| !expanded));
     app.apply_setting_value(SettingRow::ReasoningExpanded, "on");
     assert!(reasoning(&app).iter().all(|(_, expanded, _)| *expanded));
     app.agent.state.active_session.value.as_mut().unwrap().state = AgentSessionState::Idle;
@@ -561,6 +570,9 @@ fn reasoning_disclosure_keeps_explicit_choices_and_obeys_both_expansion_modes() 
         let mut app = app(vec![thought(&body)], AgentSessionState::Running);
         app.apply_setting_value(SettingRow::ReasoningDisplay, display);
         app.apply_setting_value(SettingRow::ReasoningExpansion, "full");
+        // Folded to start with, so the reader's own opening is what the rest of
+        // this test measures against the two expansion modes.
+        app.apply_setting_value(SettingRow::ReasoningExpanded, "off");
         assert!(!app.transcript.blocks()[1].expanded);
         let text = draw(&mut app, 80, 65);
         assert!(!text.contains("Reasoning paragraph"), "{text}");

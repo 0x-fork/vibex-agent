@@ -483,15 +483,17 @@ historical reasoning; Latest at bottom follows the current turn's live status.
 See [Timeline Presentation](../frontend/timeline-presentation.md) for the
 setting fields, state retention, and disclosure contracts.
 
-A live window shows up to `STREAMING_WINDOW_LINES` rows of newest content, with
-a `…` row once older rows have left the top. Its marker column carries an
-animated rail including the header. The rail follows the chrome animation
-clock, so a phase change invalidates rendered rows without re-measuring. A
-terminal that cannot blend colours draws the rail flat.
+A live window shows up to `STREAMING_WINDOW_LINES` rows of newest content. Every
+row of it is the thought's own text: the live header and the rail say the
+thought is unfinished, so no row is spent on a `…` mark when older rows have
+left the top. Its marker column carries an animated rail including the header.
+The rail follows the chrome animation clock, so a phase change invalidates
+rendered rows without re-measuring. A terminal that cannot blend colours draws
+the rail flat.
 
 The six-row count comes from `vibex_ui::timeline::REASONING_WINDOW_LINES`, shared
 with desktop and mobile. Keep the terminal's incremental Markdown renderer,
-fold marker, animated rail, and follow/scroll controls when aligning activity
+animated rail, and follow/scroll controls when aligning activity
 presentation with the GUI clients.
 
 Provider reasoning flags can remain stale after another activity starts. Use

@@ -7778,7 +7778,7 @@ fn a_running_session_reads_as_rows() {
                    without a bound would push the session off the screen.\n\n\
                    The fix is a window on the tail of the thought.\n\n\
                    The newest rows stay and the oldest leave the top.\n\n\
-                   A fold marker says that older rows are above.\n\n\
+                   Nothing is spent saying that older rows are above.\n\n\
                    The rail says how tall the window is.\n\n\
                    LAST-SENTINEL keep a dense row one row tall while it streams."
                 .to_string(),
@@ -7803,17 +7803,26 @@ fn a_running_session_reads_as_rows() {
         .replace_authoritative(session_id.clone(), vec![user_item.clone(), thought.clone()]);
     app.sync_transcript();
     with_attribution(&mut app);
-    // Default expansion is off, so the running thought is one folded row:
-    // nothing opens itself, not even the thought the Agent is on.
+    // Default expansion is on, so the running thought opens itself — windowed
+    // on its tail: the newest rows are there, the oldest have left the top.
+    let screen = text(&render(&mut app, 110, 26));
+    assert!(
+        screen.contains("LAST-SENTINEL") && !screen.contains("FIRST-SENTINEL"),
+        "the running thought did not open on its newest rows:\n{screen}"
+    );
+
+    // The reader closes it, and it stays one folded row.
+    app.transcript.toggle_block(1);
     let screen = text(&render(&mut app, 110, 26));
     assert!(
         screen.contains("▸ Thinking") && !screen.contains("LAST-SENTINEL"),
-        "the running thought did not stay folded:\n{screen}"
+        "the collapsed running thought did not stay folded:\n{screen}"
     );
 
-    // The reader opens it, and the body is drawn in a fixed window on its tail:
-    // the newest rows are there, the oldest have left the top, and the rail
-    // marks the window's height — one cell per row, the header included.
+    // Reopened, the body is drawn in a fixed window on its tail: the newest
+    // rows are there, the oldest have left the top, and the rail marks the
+    // window's height — one cell per row, the header included. Every row of the
+    // window is the thought's own text.
     app.transcript.toggle_block(1);
     let screen = text(&render(&mut app, 110, 26));
     assert!(
@@ -7823,10 +7832,6 @@ fn a_running_session_reads_as_rows() {
     assert!(
         !screen.contains("FIRST-SENTINEL"),
         "the window grew to the whole thought:\n{screen}"
-    );
-    assert!(
-        screen.contains("┃ …"),
-        "the fold marker is missing from the window:\n{screen}"
     );
     let thinking = screen
         .lines()
@@ -7838,6 +7843,14 @@ fn a_running_session_reads_as_rows() {
         .take_while(|line| line.starts_with("  ┃"))
         .count();
     assert!(railed >= 2, "the live window is not drawn:\n{screen}");
+    assert!(
+        screen
+            .lines()
+            .skip(thinking + 1)
+            .take(railed.saturating_sub(1))
+            .all(|line| !line.contains('…')),
+        "the window spent a row on a mark:\n{screen}"
+    );
     assert!(
         railed <= 1 + vibex_tui::transcript::STREAMING_WINDOW_LINES,
         "the window grew past its bound: {railed} rows:\n{screen}"
@@ -9725,7 +9738,9 @@ fn a_group_heading_names_its_group_and_rules_the_section() {
         "the heading does not end in its buttons: {heading:?}"
     );
     assert!(
-        !heading.trim_end().ends_with(|character: char| character.is_ascii_digit()),
+        !heading
+            .trim_end()
+            .ends_with(|character: char| character.is_ascii_digit()),
         "a count is back at the row's right end: {heading:?}"
     );
     // A session row is not a heading: it carries the mark and the age instead.

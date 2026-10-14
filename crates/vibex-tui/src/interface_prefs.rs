@@ -145,8 +145,9 @@ impl InterfacePreferences {
             .unwrap_or_default()
     }
 
+    /// Whether reasoning opens by default, or the shipped default when unchosen.
     pub fn reasoning_expanded_by_default(&self) -> bool {
-        self.reasoning_expanded_by_default.unwrap_or(false)
+        self.reasoning_expanded_by_default.unwrap_or(true)
     }
 
     pub fn reasoning_expansion_mode(&self) -> ReasoningExpansionMode {
@@ -275,7 +276,7 @@ mod tests {
             loaded.reasoning_display_mode(),
             ReasoningDisplayMode::LatestAtBottom
         );
-        assert!(!loaded.reasoning_expanded_by_default());
+        assert!(loaded.reasoning_expanded_by_default());
         assert_eq!(
             loaded.reasoning_expansion_mode(),
             ReasoningExpansionMode::Window
