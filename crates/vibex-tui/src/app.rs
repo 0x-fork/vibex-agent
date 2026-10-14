@@ -772,7 +772,12 @@ pub struct App {
     pub seat: SeatKind,
     /// What kind of runtime this client is attached to, as the composition root
     /// resolved it.
-    pub runtime_kind: vibex_core::RemoteServerKind,
+    ///
+    /// Read through [`App::runtime_kind`] and written through
+    /// [`App::set_runtime_kind`], because the notification policy keeps its own
+    /// copy of the one fact that matters here: a desktop shell announces the
+    /// same events itself.
+    pub(crate) runtime_kind: vibex_core::RemoteServerKind,
 
     pub theme: TuiTheme,
     pub capability: ColorCapability,
@@ -1649,6 +1654,11 @@ impl App {
             .preferred_workspace
             .clone()
             .or_else(Self::starting_workspace);
+        // The seat resolved this before the interface started; the notification
+        // policy is the one part of the client that acts on it, and the setter is
+        // what keeps the notifier's copy in step with this one.
+        let runtime_kind = app.runtime_kind;
+        app.set_runtime_kind(runtime_kind);
         app.navigate_to(Page::NewSession);
         app.focus = Focus::Composer;
         app
@@ -1791,6 +1801,24 @@ impl App {
     /// session's, and a session's own page moves only itself.
     pub fn page_shows_session(&self) -> bool {
         self.page_shows_transcript() && self.selected_session_id().is_some()
+    }
+
+    /// What kind of runtime this client is attached to.
+    pub fn runtime_kind(&self) -> vibex_core::RemoteServerKind {
+        self.runtime_kind
+    }
+
+    /// Note what kind of runtime this client is attached to.
+    ///
+    /// The seat resolves it once, before the interface starts, and the
+    /// notification policy is one of its readers: a desktop shell announces the
+    /// same events itself, so the client is told which runtime it is looking at
+    /// rather than inferring it from the seat. Setting the field and telling the
+    /// notifier are one operation, because a copy that drifts is a notification
+    /// policy that lies.
+    pub fn set_runtime_kind(&mut self, kind: vibex_core::RemoteServerKind) {
+        self.runtime_kind = kind;
+        self.notify.set_desktop_present(kind.is_desktop());
     }
 
     /// Open the session view for a session that does not exist yet.
@@ -6496,9 +6524,11 @@ impl Availability {
 pub struct AppOptions {
     pub seat: SeatKind,
     /// What kind of runtime this client is attached to. The devices page reads
-    /// it to decide whether a desktop client may pair here at all; the client
-    /// cannot work it out for itself, because the license is a property of the
-    /// runtime rather than of the connection.
+    /// it to decide whether a desktop client may pair here at all, and the
+    /// notification layer reads it to decide whether to step back for a desktop
+    /// that announces the same events itself; the client cannot work it out for
+    /// itself, because the license is a property of the runtime rather than of
+    /// the connection.
     pub runtime_kind: vibex_core::RemoteServerKind,
     pub capability: ColorCapability,
     /// The theme this run was started with, when the composition root named

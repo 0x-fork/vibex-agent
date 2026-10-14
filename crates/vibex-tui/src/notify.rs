@@ -64,6 +64,35 @@
 //! session's own page is in front *and* the terminal reports focus; a reader
 //! sitting on the session list has not read the failure that just landed on it.
 //!
+//! # One reminder per event
+//!
+//! Two channels that both work would otherwise say the same thing twice — a bell
+//! beside a bubble — which is what a reader who turned on both the popup and an
+//! escape used to get. They are routed rather than duplicated, by the rule the
+//! desktop already applies to its own window: a reader who is *at* the terminal
+//! is told by the terminal ([`Transport`]), and a reader who has switched away
+//! is told by the popup, which reaches across applications and carries words.
+//! When no popup can be drawn — a remote seat, no program, the switch off — the
+//! escape carries the news in both cases, because it is the only channel that
+//! survives `ssh`. Focus that was never reported counts as "at the terminal", so
+//! a terminal without DECSET 1004 keeps its escape and simply never raises a
+//! bubble.
+//!
+//! The reader's own test notification is the exception, deliberately: it goes
+//! through every live channel, because its job is to show which ones work.
+//!
+//! # A desktop on the other end
+//!
+//! When the runtime on the other end is a Vibex desktop
+//! (`RemoteServerKind::Desktop`), that desktop announces the same events to the
+//! same reader, and the routing above cannot see it: the second announcer is not
+//! in this process. [`NotifyPreferences::light_when_desktop`] — on by default —
+//! is the answer. While a desktop is on the other end this client steps back to
+//! the lightest signal it has, the window title, and leaves the popup to the
+//! desktop. It is a switch rather than an inference because a reader may be
+//! driving a desktop they are not watching, and it is the reader's call which of
+//! the two speaks.
+//!
 //! # What is in the message
 //!
 //! Only what the runtime already publishes plus the Agent's name: a kind and a
@@ -129,6 +158,73 @@ impl NotificationKind {
             Self::Completed => 0,
             Self::NeedsInput => 1,
             Self::Failed => 2,
+        }
+    }
+}
+
+/// What one notification says, before a channel lays it out.
+///
+/// The parts are kept apart because the channels have different room. A control
+/// sequence is one line whatever it carries — a control character inside an OSC
+/// payload can end it, so the payload is flattened before it is written — while
+/// a desktop bubble has a summary line and as much body as the reader will read.
+/// Joining the parts early is what made a bubble read as one run-on sentence:
+/// the Agent, the event and the session title all ran together with a `·`
+/// between them and the reader had to parse it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationMessage {
+    /// The Agent the news is about, when it is about one. A test is not.
+    pub agent: Option<String>,
+    /// What happened, in the reader's language.
+    pub sentence: String,
+    /// The session's own title, when the reader lets it ride.
+    pub session_title: Option<String>,
+}
+
+impl NotificationMessage {
+    /// The one line a terminal sequence can carry.
+    ///
+    /// The Agent leads because it is the reader's only way to tell one session
+    /// from another, and the session title trails because it is the part a
+    /// reader who is scanning for the Agent does not need.
+    fn line(&self) -> String {
+        let mut line = String::new();
+        if let Some(agent) = &self.agent {
+            line.push_str(agent);
+            line.push_str(" · ");
+        }
+        line.push_str(&self.sentence);
+        if let Some(title) = &self.session_title {
+            line.push_str(" · ");
+            line.push_str(title);
+        }
+        line
+    }
+
+    /// The bubble's own line, above the body.
+    ///
+    /// The product is named here because the two popup programs disagree about
+    /// where a name comes from — `notify-send` hands one to the notification
+    /// service, `osascript` does not — and the Agent is the half a reader with
+    /// several sessions actually needs.
+    fn summary(&self, app: &str) -> String {
+        match &self.agent {
+            Some(agent) => format!("{app} · {agent}"),
+            None => app.to_string(),
+        }
+    }
+
+    /// The bubble's body: what happened, and below it which session.
+    ///
+    /// Two lines rather than one sentence, because a title read after the event
+    /// is what tells the reader which of several sessions to come back to. Each
+    /// part is flattened before it is placed, so the only line breaks in a body
+    /// are the ones the layout put there: a newline inside a session's title is
+    /// not a line the runtime gets to write.
+    fn body(&self) -> String {
+        match &self.session_title {
+            Some(title) => format!("{}\n{}", sanitize(&self.sentence), sanitize(title)),
+            None => sanitize(&self.sentence),
         }
     }
 }
@@ -321,9 +417,20 @@ pub struct NotifyPreferences {
     ///
     /// On by default, because a reader who is away from the terminal is exactly
     /// the reader a bubble reaches — but only ever on a local seat, where the
-    /// bubble lands on the machine they are sitting at.
+    /// bubble lands on the machine they are sitting at, and only while the
+    /// terminal window is not the focused one, so it does not say the same thing
+    /// beside the escape the reader is looking at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_popup: Option<bool>,
+    /// Whether this client steps back while a Vibex desktop is on the other end.
+    ///
+    /// On by default: the desktop hosting the runtime announces the same events
+    /// itself, and two clients telling one reader about one failure is the
+    /// duplicate this switch exists to stop. While it is on and the runtime is a
+    /// desktop shell, the terminal channel is pinned to the title and the popup
+    /// is left to the desktop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light_when_desktop: Option<bool>,
 }
 
 impl NotifyPreferences {
@@ -378,6 +485,10 @@ impl NotifyPreferences {
 
     fn includes_system_popup(&self) -> bool {
         self.system_popup.unwrap_or(true)
+    }
+
+    fn stays_light_for_desktop(&self) -> bool {
+        self.light_when_desktop.unwrap_or(true)
     }
 }
 
@@ -455,15 +566,18 @@ pub struct SystemNotification {
 
 /// What the desktop-popup setting can honestly say.
 ///
-/// `On` and `Off` are choices the reader may change; `Remote` and `Unsupported`
-/// are facts about where the client runs, and the row reports them instead of a
-/// switch position that would not do anything.
+/// `On` and `Off` are choices the reader may change; `Desktop`, `Remote` and
+/// `Unsupported` are facts about where the client runs, and the row reports them
+/// instead of a switch position that would not do anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotifySystemState {
     /// The reader asked for a bubble and this host will draw one.
     On,
     /// The reader asked for none.
     Off,
+    /// The desktop shell hosting this runtime draws the notifications itself,
+    /// so this client leaves the channel to it.
+    Desktop,
     /// The seat is reached over `ssh`, so a bubble would be raised on the wrong
     /// machine.
     Remote,
@@ -526,23 +640,30 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// A string as an AppleScript string literal.
+/// A string as an AppleScript expression.
 ///
-/// AppleScript has no escape for a newline inside a literal, so the two
-/// characters that could end it — the quote and the backslash — are the ones
-/// that are escaped, and the payload has already been flattened to one line by
-/// [`sanitize`] before it gets here.
+/// AppleScript has no escape for a newline inside a literal, so a multi-line
+/// body is built as one literal per line joined with `linefeed` — the language's
+/// own name for the character — which is how a bubble gets its second line. The
+/// two characters that could end a literal, the quote and the backslash, are
+/// escaped; everything else has already been sanitized by the caller.
 fn quote(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('"');
-    for character in value.chars() {
-        if matches!(character, '"' | '\\') {
-            quoted.push('\\');
-        }
-        quoted.push(character);
-    }
-    quoted.push('"');
-    quoted
+    value
+        .split('\n')
+        .map(|line| {
+            let mut quoted = String::with_capacity(line.len() + 2);
+            quoted.push('"');
+            for character in line.chars() {
+                if matches!(character, '"' | '\\') {
+                    quoted.push('\\');
+                }
+                quoted.push(character);
+            }
+            quoted.push('"');
+            quoted
+        })
+        .collect::<Vec<_>>()
+        .join(" & linefeed & ")
 }
 
 /// What the reader is doing while a notification is considered.
@@ -574,6 +695,8 @@ pub struct Notifier {
     /// Where those choices are written back, when the reader's home is known.
     preferences_path: Option<std::path::PathBuf>,
     enabled: bool,
+    /// The transport the reader chose, or detection picked. What is actually
+    /// written is [`Notifier::transport`], which the desktop policy can pin.
     transport: Transport,
     /// The transport detection picked, for the "automatic" setting to name.
     detected: Transport,
@@ -584,6 +707,10 @@ pub struct Notifier {
     remote: bool,
     delivery: Option<SystemDelivery>,
     system_popup: bool,
+    /// Whether the runtime on the other end is a Vibex desktop shell, which
+    /// announces the same events to the same reader.
+    desktop_present: bool,
+    light_when_desktop: bool,
     kind_switches: [bool; 3],
     include_session_title: bool,
     focused: bool,
@@ -633,6 +760,7 @@ impl Notifier {
         let transport = preferences.transport().unwrap_or(profile.transport);
         let enabled = preferences.is_enabled();
         let system_popup = preferences.includes_system_popup();
+        let light_when_desktop = preferences.stays_light_for_desktop();
         let kind_switches = [
             preferences.kind_enabled(NotificationKind::Completed),
             preferences.kind_enabled(NotificationKind::NeedsInput),
@@ -650,6 +778,11 @@ impl Notifier {
             remote: profile.remote,
             delivery,
             system_popup,
+            // Nothing is known about the runtime at build time: the seat is the
+            // composition root's answer, and it arrives through
+            // [`Self::with_runtime_kind`] before the first event can be seen.
+            desktop_present: false,
+            light_when_desktop,
             kind_switches,
             include_session_title,
             // Before the terminal has told us otherwise, the reader is assumed
@@ -665,9 +798,35 @@ impl Notifier {
         }
     }
 
-    /// The transport this client will use.
+    /// Note what the runtime on the other end is.
+    ///
+    /// The seat resolves this once, before the interface starts, so it is a fact
+    /// about the run rather than something that changes under the reader. A
+    /// desktop shell is the one kind that announces the same events itself, and
+    /// it is what [`Self::desktop_takes_over`] reads.
+    pub fn with_runtime_kind(mut self, kind: vibex_core::RemoteServerKind) -> Self {
+        self.set_desktop_present(kind.is_desktop());
+        self
+    }
+
+    /// Note whether a Vibex desktop is on the other end.
+    pub fn set_desktop_present(&mut self, present: bool) {
+        self.desktop_present = present;
+    }
+
+    /// The transport this client will actually write.
+    ///
+    /// Not always the one the reader chose: while a desktop is on the other end
+    /// and they asked this client to stay light, the title is the only signal
+    /// left — the desktop draws the rest. A reader who turned the terminal
+    /// channel off keeps it off, because "light" is not "louder than what I
+    /// asked for".
     pub fn transport(&self) -> Transport {
-        self.transport
+        match self.transport {
+            Transport::Off => Transport::Off,
+            _ if self.desktop_takes_over() => Transport::Title,
+            chosen => chosen,
+        }
     }
 
     /// The transport the environment identified, which "automatic" resolves to.
@@ -702,10 +861,26 @@ impl Notifier {
 
     /// Whether a bubble would actually be drawn right now.
     ///
-    /// Three facts, not one: the reader asked for it, the host has a program to
-    /// draw it with, and the reader is sitting at this host.
+    /// Four facts, not one: the reader asked for it, the host has a program to
+    /// draw it with, the reader is sitting at this host, and no desktop on the
+    /// other end has taken the channel over.
     pub fn system_available(&self) -> bool {
-        self.system_popup && !self.remote && self.delivery.is_some()
+        self.system_popup && !self.remote && self.delivery.is_some() && !self.desktop_takes_over()
+    }
+
+    /// Whether a Vibex desktop on the other end speaks for this client.
+    ///
+    /// The runtime is a desktop shell and the reader asked this client to stay
+    /// light while it is: the popup is the desktop's, and the terminal channel is
+    /// pinned to the title. Both halves are the reader's to change — the switch
+    /// here, the seat at the command line.
+    pub fn desktop_takes_over(&self) -> bool {
+        self.light_when_desktop && self.desktop_present
+    }
+
+    /// Whether this client steps back for a desktop, as the reader set it.
+    pub fn light_when_desktop(&self) -> bool {
+        self.light_when_desktop
     }
 
     /// Whether notifications are on at all.
@@ -728,9 +903,26 @@ impl Notifier {
         self.focused
     }
 
+    /// Whether the popup is the channel this event should use.
+    ///
+    /// The popup is for a reader who is not at the terminal: it reaches across
+    /// applications and carries words, where an escape only decorates a window
+    /// they are not looking at. A reader who is at the terminal gets that
+    /// terminal's own signal instead, so one event is one reminder rather than
+    /// two. When no popup can be drawn the escape carries the news in both cases,
+    /// which is what keeps a remote seat informed.
+    fn popup_carries(&self) -> bool {
+        self.system_available() && !self.focused
+    }
+
     /// Whether any channel would carry news right now.
+    ///
+    /// The routing is what makes this more than "either channel is on": with the
+    /// popup live and the reader at the terminal, an `Off` transport has nothing
+    /// to write, and the event is not announced rather than announced into a
+    /// channel that will not use it.
     fn any_channel(&self) -> bool {
-        self.transport != Transport::Off || self.system_available()
+        self.popup_carries() || self.transport() != Transport::Off
     }
 
     /// Turn the whole layer on or off.
@@ -769,6 +961,12 @@ impl Notifier {
     pub fn set_system_popup(&mut self, on: bool) {
         self.system_popup = on;
         self.preferences.system_popup = Some(on);
+    }
+
+    /// Step back for a desktop on the other end, or speak beside it.
+    pub fn set_light_when_desktop(&mut self, on: bool) {
+        self.light_when_desktop = on;
+        self.preferences.light_when_desktop = Some(on);
     }
 
     /// Let the session title ride the payload, or keep it off.
@@ -820,25 +1018,35 @@ impl Notifier {
         self.remember(session_id, source_event_id)
     }
 
-    /// Build one notification and queue it on every live channel.
-    pub fn emit(&mut self, session_id: &str, title: &str, body: &str) {
-        self.queue_terminal(session_id, title, body);
-        self.queue_system(title, body);
+    /// Build one notification and queue it on the one channel that carries it.
+    ///
+    /// The channel is chosen, not stacked: a reader who is at the terminal is
+    /// told by the terminal, a reader who has switched away is told by the popup,
+    /// and one event is one reminder either way. [`Self::emit_test`] is the one
+    /// caller that wants every live channel at once.
+    pub fn emit(&mut self, session_id: &str, app: &str, message: &NotificationMessage) {
+        if self.popup_carries() {
+            self.queue_system(&message.summary(app), &message.body());
+        } else {
+            self.queue_terminal(session_id, &message.line());
+        }
     }
 
     /// Raise the reader's own test notification.
     ///
-    /// It goes through the same two channels a real one uses — that is the
-    /// point of it: a reader who cannot see it knows the terminal, the
-    /// multiplexer or the desktop is the reason, not the client. The policy is
-    /// skipped (a test is asked for, not news) but the master switch is not: a
-    /// notification layer that is off has nothing to test.
-    pub fn emit_test(&mut self, title: &str, body: &str) -> bool {
+    /// It goes through every channel a real one could use — that is the point of
+    /// it: a reader who cannot see it knows the terminal, the multiplexer or the
+    /// desktop is the reason, not the client. A real event is routed to one
+    /// channel, but a test is the one moment the reader asked to see all of them,
+    /// and the row that offers it names them. The policy is skipped (a test is
+    /// asked for, not news) but the master switch is not: a notification layer
+    /// that is off has nothing to test.
+    pub fn emit_test(&mut self, app: &str, sentence: &str) -> bool {
         if !self.enabled {
             return false;
         }
-        let terminal = self.queue_terminal("test", title, body);
-        let system = self.queue_system(title, body);
+        let terminal = self.queue_terminal("test", sentence);
+        let system = self.queue_system(app, sentence);
         terminal || system
     }
 
@@ -846,12 +1054,12 @@ impl Notifier {
     ///
     /// Reports whether a sequence was queued: an `Off` transport writes
     /// nothing, which is not the same as a payload that came out empty.
-    fn queue_terminal(&mut self, session_id: &str, title: &str, body: &str) -> bool {
-        let sequence = self.sequence(session_id, title, body);
+    fn queue_terminal(&mut self, session_id: &str, line: &str) -> bool {
+        let sequence = self.sequence(session_id, line);
         if sequence.is_empty() {
             return false;
         }
-        if self.transport == Transport::Title {
+        if self.transport() == Transport::Title {
             self.title_marked = true;
         }
         self.pending.extend_from_slice(sequence.as_bytes());
@@ -859,13 +1067,16 @@ impl Notifier {
     }
 
     /// Queue one popup for the host's own desktop.
-    fn queue_system(&mut self, title: &str, body: &str) -> bool {
+    ///
+    /// The body keeps its line breaks: a bubble is read by a person, and the
+    /// second line is the session's name rather than more of the sentence.
+    fn queue_system(&mut self, summary: &str, body: &str) -> bool {
         if !self.system_available() {
             return false;
         }
         self.pending_system.push(SystemNotification {
-            title: sanitize(title),
-            body: sanitize(body),
+            title: sanitize(summary),
+            body: sanitize_lines(body),
         });
         true
     }
@@ -896,10 +1107,11 @@ impl Notifier {
     }
 
     /// The control sequence one notification is carried by.
-    fn sequence(&self, session_id: &str, title: &str, body: &str) -> String {
-        let title = sanitize(title);
-        let body = sanitize(body);
-        let inner = match self.transport {
+    fn sequence(&self, session_id: &str, line: &str) -> String {
+        let app = APP_TITLE;
+        let body = sanitize(line);
+        let transport = self.transport();
+        let inner = match transport {
             Transport::Off => return String::new(),
             Transport::Bell => "\x07".to_string(),
             // The marker is what makes the tab name readable at a glance, and
@@ -912,17 +1124,17 @@ impl Notifier {
                 // field would be read as the next one.
                 format!(
                     "\x1b]777;notify;{};{}\x07",
-                    title.replace(';', ","),
+                    app.replace(';', ","),
                     body.replace(';', ",")
                 )
             }
             Transport::Osc99 => {
-                format!("\x1b]99;i={};{title} · {body}\x07", identifier(session_id))
+                format!("\x1b]99;i={};{body}\x07", identifier(session_id))
             }
             Transport::Iterm2Attention => "\x1b]1337;RequestAttention=yes\x07".to_string(),
         };
         match self.multiplexer {
-            Some(Multiplexer::Tmux) if self.transport.is_osc() => tmux_passthrough(&inner),
+            Some(Multiplexer::Tmux) if transport.is_osc() => tmux_passthrough(&inner),
             // screen has no passthrough envelope; an OSC it does not implement
             // is ignored, which the reader notices as a missing notification
             // rather than as a broken screen.
@@ -984,6 +1196,22 @@ fn sanitize(value: &str) -> String {
         }
     }
     out
+}
+
+/// Make a value safe to put in a notification body that is read as lines.
+///
+/// The popup's body is read by a person rather than parsed by a terminal, so a
+/// line break is kept — it is the whole point of a two-part message — while
+/// every other control character is dropped by [`sanitize`], which is applied
+/// per line. Empty lines disappear, so a message with no session title is one
+/// line rather than one line and a blank one.
+fn sanitize_lines(value: &str) -> String {
+    value
+        .split('\n')
+        .map(sanitize)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The notification one backend event carries, if it carries one.
@@ -1080,9 +1308,9 @@ impl App {
         {
             return;
         }
-        let body = self.notification_body(kind, &session_id);
-        let title = self.strings.app_name();
-        self.notify.emit(&session_id, title, &body);
+        let message = self.notification_message(kind, &session_id);
+        let app = self.strings.app_name();
+        self.notify.emit(&session_id, app, &message);
     }
 
     /// Note whether the terminal currently has focus.
@@ -1103,17 +1331,21 @@ impl App {
     /// Raise the reader's own test notification, reporting whether any channel
     /// took it.
     pub fn test_notification(&mut self) -> bool {
-        let title = self.strings.app_name().to_string();
-        let body = self.strings.settings_notify_test_body().to_string();
-        self.notify.emit_test(&title, &body)
+        let app = self.strings.app_name();
+        let body = self.strings.settings_notify_test_body();
+        self.notify.emit_test(app, body)
     }
 
     /// What the desktop-popup row should say.
     ///
     /// The state is the one the reader can act on, not the stored preference: a
-    /// remote seat and a host with no program both leave the toggle inert, and
-    /// saying so is better than letting the reader flip a switch nothing reads.
+    /// desktop on the other end that draws its own, a remote seat, and a host
+    /// with no program all leave the toggle inert, and saying so is better than
+    /// letting the reader flip a switch nothing reads.
     pub fn notification_system_state(&self) -> NotifySystemState {
+        if self.notify.desktop_takes_over() {
+            return NotifySystemState::Desktop;
+        }
         if self.notify.remote() {
             return NotifySystemState::Remote;
         }
@@ -1141,10 +1373,16 @@ impl App {
 
     /// The message one notification says.
     ///
-    /// The Agent's name is the reader's only way to tell one session from
-    /// another, so it leads; the sentence is the runtime's kind, localized. The
-    /// session title rides only when the reader asked for it.
-    fn notification_body(&self, kind: NotificationKind, session_id: &str) -> String {
+    /// The parts are handed over separately rather than joined here: the Agent's
+    /// name is the reader's only way to tell one session from another, the
+    /// sentence is the runtime's kind localized, and the session title rides only
+    /// when the reader asked for it — and each channel decides how much of that
+    /// fits on a line.
+    fn notification_message(
+        &self,
+        kind: NotificationKind,
+        session_id: &str,
+    ) -> NotificationMessage {
         let sentence = match kind {
             NotificationKind::Failed => self.strings.notify_turn_failed(),
             NotificationKind::NeedsInput => self.strings.notify_needs_input(),
@@ -1160,14 +1398,19 @@ impl App {
             .iter()
             .find(|session| session.id.as_str() == session_id);
         let Some(session) = session else {
-            return sentence.to_string();
+            return NotificationMessage {
+                agent: None,
+                sentence: sentence.to_string(),
+                session_title: None,
+            };
         };
-        let mut body = format!("{} · {sentence}", self.session_agent_label(session));
-        if self.notify.includes_session_title() && !session.title.trim().is_empty() {
-            body.push_str(" · ");
-            body.push_str(session.title.trim());
+        let session_title = session.title.trim();
+        NotificationMessage {
+            agent: Some(self.session_agent_label(session)),
+            sentence: sentence.to_string(),
+            session_title: (self.notify.includes_session_title() && !session_title.is_empty())
+                .then(|| session_title.to_string()),
         }
-        body
     }
 }
 
@@ -1205,6 +1448,23 @@ mod tests {
         NotifyContext {
             selected_session_id: selected,
             session_page,
+        }
+    }
+
+    /// A message as an Agent event produces one.
+    fn message(agent: &str, sentence: &str) -> NotificationMessage {
+        NotificationMessage {
+            agent: Some(agent.to_string()),
+            sentence: sentence.to_string(),
+            session_title: None,
+        }
+    }
+
+    /// A message that carries the session's own title as well.
+    fn titled(agent: &str, sentence: &str, title: &str) -> NotificationMessage {
+        NotificationMessage {
+            session_title: Some(title.to_string()),
+            ..message(agent, sentence)
         }
     }
 
@@ -1257,13 +1517,14 @@ mod tests {
         assert!(local.system_available());
         // The terminal channel is off, so the popup alone is reason enough to
         // announce: the two channels are independent.
+        local.set_focus(false);
         assert!(local.accept(NotificationKind::Failed, "s1", "e1", &context(None, false)));
-        local.emit("s1", "Vibex", "Agent failed");
+        local.emit("s1", "Vibex", &message("Codex", "Agent failed"));
         assert!(local.take_pending().is_empty());
         assert_eq!(
             local.take_pending_system(),
             vec![SystemNotification {
-                title: "Vibex".to_string(),
+                title: "Vibex · Codex".to_string(),
                 body: "Agent failed".to_string(),
             }]
         );
@@ -1278,8 +1539,9 @@ mod tests {
             None,
         );
         assert!(!remote.system_available());
+        remote.set_focus(false);
         assert!(!remote.accept(NotificationKind::Failed, "s1", "e1", &context(None, false)));
-        remote.emit("s1", "Vibex", "Agent failed");
+        remote.emit("s1", "Vibex", &message("Codex", "Agent failed"));
         assert!(remote.take_pending_system().is_empty());
 
         // A host with no program to draw it: the preference is not a promise.
@@ -1290,7 +1552,8 @@ mod tests {
             None,
         );
         assert!(!bare.system_available());
-        bare.emit("s1", "Vibex", "Agent failed");
+        bare.set_focus(false);
+        bare.emit("s1", "Vibex", &message("Codex", "Agent failed"));
         assert!(bare.take_pending_system().is_empty());
 
         // And the reader's own switch, off.
@@ -1307,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn a_popup_payload_cannot_carry_control_bytes_either() {
+    fn a_bubble_is_laid_out_in_lines_and_keeps_no_control_bytes() {
         let mut notifier = Notifier::build(
             NotifyPreferences {
                 transport: Some(Transport::Off.id().to_string()),
@@ -1317,7 +1580,22 @@ mod tests {
             Some(SystemDelivery::NotifySend),
             None,
         );
-        notifier.emit("s1", "Vibex", "line\nbreak\x07");
+        // The Agent names the summary, the event is the first body line, and the
+        // session is the second: the run-on sentence this replaced was one line
+        // the reader had to parse.
+        notifier.set_focus(false);
+        notifier.emit(
+            "s1",
+            "Vibex",
+            &titled("Codex", "Agent failed", "Fix the flaky test"),
+        );
+        let pending = notifier.take_pending_system();
+        assert_eq!(pending[0].title, "Vibex · Codex");
+        assert_eq!(pending[0].body, "Agent failed\nFix the flaky test");
+
+        // Everything a payload could use to invent a line of its own is still
+        // dropped, and a blank title leaves one line rather than two.
+        notifier.emit("s1", "Vibex", &titled("Codex", "line\nbreak\x07", "  "));
         let pending = notifier.take_pending_system();
         assert_eq!(pending[0].body, "line break");
     }
@@ -1336,6 +1614,22 @@ mod tests {
                 "display notification \"he said \\\"hi\\\" \\\\ bye\" with title \"Vibex\""
                     .to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn osascript_joins_the_lines_of_a_multi_line_body() {
+        // AppleScript has no escape for a newline inside a literal, so the body
+        // arrives as two literals joined with the language's own `linefeed`.
+        let command = SystemDelivery::OsaScript.command("Vibex · Codex", "Agent failed\nFix it");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args[1],
+            "display notification \"Agent failed\" & linefeed & \"Fix it\" \
+             with title \"Vibex · Codex\""
         );
     }
 
@@ -1429,6 +1723,125 @@ mod tests {
         );
         assert!(remote.remote());
         assert!(!remote.system_available());
+    }
+
+    #[test]
+    fn one_event_is_one_reminder() {
+        // Both channels are live, and the reader is at the terminal: the escape
+        // is the one that speaks, because the terminal is what they are looking
+        // at. The popup would be the same news beside it.
+        let mut at_the_terminal = Notifier::build(
+            NotifyPreferences::default(),
+            profile(Transport::Bell, None),
+            Some(SystemDelivery::NotifySend),
+            None,
+        );
+        at_the_terminal.emit("s1", "Vibex", &message("Codex", "Agent failed"));
+        assert_eq!(at_the_terminal.take_pending(), b"\x07".to_vec());
+        assert!(at_the_terminal.take_pending_system().is_empty());
+
+        // The reader has switched away: the bubble reaches them, and the bell
+        // would only ring in a window they are not looking at.
+        let mut away = Notifier::build(
+            NotifyPreferences::default(),
+            profile(Transport::Bell, None),
+            Some(SystemDelivery::NotifySend),
+            None,
+        );
+        away.set_focus(false);
+        assert!(away.accept(NotificationKind::Failed, "s1", "e1", &context(None, false)));
+        away.emit("s1", "Vibex", &message("Codex", "Agent failed"));
+        assert!(away.take_pending().is_empty());
+        assert_eq!(away.take_pending_system().len(), 1);
+
+        // No popup to draw — a remote seat, or a host with no program — so the
+        // escape carries the news in both focus states, which is what keeps an
+        // ssh reader informed.
+        for focused in [true, false] {
+            let mut remote_profile = profile(Transport::Bell, None);
+            remote_profile.remote = true;
+            let mut notifier = Notifier::build(
+                NotifyPreferences::default(),
+                remote_profile,
+                Some(SystemDelivery::NotifySend),
+                None,
+            );
+            notifier.set_focus(focused);
+            notifier.emit("s1", "Vibex", &message("Codex", "Agent failed"));
+            assert_eq!(notifier.take_pending(), b"\x07".to_vec());
+            assert!(notifier.take_pending_system().is_empty());
+        }
+    }
+
+    #[test]
+    fn an_off_terminal_channel_is_not_announced_into_a_popup_that_will_not_use_it() {
+        // The reader turned the terminal channel off and left the popup on. A
+        // focused event has no channel at all — the popup only speaks to a
+        // reader who is away — so it is not announced rather than announced
+        // into nothing.
+        let mut notifier = Notifier::build(
+            NotifyPreferences {
+                transport: Some(Transport::Off.id().to_string()),
+                ..NotifyPreferences::default()
+            },
+            profile(Transport::Off, None),
+            Some(SystemDelivery::NotifySend),
+            None,
+        );
+        assert!(!notifier.accept(NotificationKind::Failed, "s1", "e1", &context(None, false)));
+        notifier.set_focus(false);
+        assert!(notifier.accept(NotificationKind::Failed, "s1", "e1", &context(None, false)));
+    }
+
+    #[test]
+    fn a_desktop_on_the_other_end_gets_the_light_treatment() {
+        let preferences = NotifyPreferences {
+            transport: Some(Transport::Osc9.id().to_string()),
+            ..NotifyPreferences::default()
+        };
+        let notifier = built(preferences.clone(), profile(Transport::Osc9, None))
+            .with_runtime_kind(vibex_core::RemoteServerKind::Desktop);
+        assert!(notifier.light_when_desktop());
+        assert!(notifier.desktop_takes_over());
+        // The channel the reader named is pinned to the lightest one there is,
+        // and the popup is the desktop's.
+        assert_eq!(notifier.transport(), Transport::Title);
+        assert!(!notifier.system_available());
+
+        // A headless runtime, or an authority seat that never named a desktop,
+        // leaves both choices exactly as they were.
+        let mut headless = built(preferences.clone(), profile(Transport::Osc9, None))
+            .with_runtime_kind(vibex_core::RemoteServerKind::Headless);
+        assert!(!headless.desktop_takes_over());
+        assert_eq!(headless.transport(), Transport::Osc9);
+
+        // The reader can hand the channels back to this client.
+        headless.set_desktop_present(true);
+        headless.set_light_when_desktop(false);
+        assert!(!headless.desktop_takes_over());
+        assert_eq!(headless.transport(), Transport::Osc9);
+        assert_eq!(headless.preferences.light_when_desktop, Some(false));
+
+        // "Light" is not "louder than what I asked for": a reader who turned the
+        // terminal channel off keeps it off while the desktop speaks.
+        let off = built(
+            NotifyPreferences {
+                transport: Some(Transport::Off.id().to_string()),
+                ..NotifyPreferences::default()
+            },
+            profile(Transport::Off, None),
+        )
+        .with_runtime_kind(vibex_core::RemoteServerKind::Desktop);
+        assert_eq!(off.transport(), Transport::Off);
+    }
+
+    #[test]
+    fn the_desktop_switch_is_written_down_with_the_others() {
+        let mut notifier = built(NotifyPreferences::default(), profile(Transport::Bell, None));
+        assert!(notifier.light_when_desktop());
+        notifier.set_light_when_desktop(false);
+        let written = serde_json::to_value(&notifier.preferences).unwrap();
+        assert_eq!(written["lightWhenDesktop"], serde_json::json!(false));
     }
 
     #[test]
@@ -1563,46 +1976,46 @@ mod tests {
 
         let mut off = notifier(Transport::Off);
         assert!(!off.accept(NotificationKind::Failed, "s1", "e1", &context(None, false)));
-        off.emit("s1", "Vibex", "nope");
+        off.emit("s1", "Vibex", &message("Codex", "nope"));
         assert!(off.take_pending().is_empty());
     }
 
     #[test]
     fn each_transport_writes_its_own_sequence() {
         let mut bell = notifier(Transport::Bell);
-        bell.emit("s1", "Vibex", "Agent failed");
+        bell.emit("s1", "Vibex", &message("Codex", "Agent failed"));
         assert_eq!(bell.take_pending(), b"\x07".to_vec());
 
         let mut title = notifier(Transport::Title);
-        title.emit("s1", "Vibex", "Agent failed");
+        title.emit("s1", "Vibex", &message("Codex", "Agent failed"));
         assert_eq!(
             String::from_utf8(title.take_pending()).unwrap(),
-            "\x1b]2;● Agent failed\x07"
+            "\x1b]2;● Codex · Agent failed\x07"
         );
 
         let mut osc9 = notifier(Transport::Osc9);
-        osc9.emit("s1", "Vibex", "Agent failed");
+        osc9.emit("s1", "Vibex", &message("Codex", "Agent failed"));
         assert_eq!(
             String::from_utf8(osc9.take_pending()).unwrap(),
-            "\x1b]9;Agent failed\x07"
+            "\x1b]9;Codex · Agent failed\x07"
         );
 
         let mut osc777 = notifier(Transport::Osc777);
-        osc777.emit("s1", "Vibex", "Agent; failed");
+        osc777.emit("s1", "Vibex", &message("Codex", "Agent; failed"));
         assert_eq!(
             String::from_utf8(osc777.take_pending()).unwrap(),
-            "\x1b]777;notify;Vibex;Agent, failed\x07"
+            "\x1b]777;notify;Vibex;Codex · Agent, failed\x07"
         );
 
         let mut osc99 = notifier(Transport::Osc99);
-        osc99.emit("s 1", "Vibex", "Agent failed");
+        osc99.emit("s 1", "Vibex", &message("Codex", "Agent failed"));
         assert_eq!(
             String::from_utf8(osc99.take_pending()).unwrap(),
-            "\x1b]99;i=s1;Vibex · Agent failed\x07"
+            "\x1b]99;i=s1;Codex · Agent failed\x07"
         );
 
         let mut iterm = notifier(Transport::Iterm2Attention);
-        iterm.emit("s1", "Vibex", "Agent failed");
+        iterm.emit("s1", "Vibex", &message("Codex", "Agent failed"));
         assert_eq!(
             String::from_utf8(iterm.take_pending()).unwrap(),
             "\x1b]1337;RequestAttention=yes\x07"
@@ -1618,10 +2031,10 @@ mod tests {
             },
             profile(Transport::Osc9, Some(Multiplexer::Tmux)),
         );
-        notifier.emit("s1", "Vibex", "Agent failed");
+        notifier.emit("s1", "Vibex", &message("Codex", "Agent failed"));
         assert_eq!(
             String::from_utf8(notifier.take_pending()).unwrap(),
-            "\x1bPtmux;\x1b\x1b]9;Agent failed\x07\x1b\\"
+            "\x1bPtmux;\x1b\x1b]9;Codex · Agent failed\x07\x1b\\"
         );
     }
 
@@ -1631,7 +2044,7 @@ mod tests {
             NotifyPreferences::default(),
             profile(Transport::Bell, Some(Multiplexer::Tmux)),
         );
-        notifier.emit("s1", "Vibex", "Agent failed");
+        notifier.emit("s1", "Vibex", &message("Codex", "Agent failed"));
         assert_eq!(notifier.take_pending(), b"\x07".to_vec());
     }
 
@@ -1639,7 +2052,7 @@ mod tests {
     fn a_marked_title_is_cleared_when_the_terminal_comes_back() {
         let mut notifier = notifier(Transport::Title);
         notifier.set_focus(false);
-        notifier.emit("s1", "Vibex", "Agent failed");
+        notifier.emit("s1", "Vibex", &message("Codex", "Agent failed"));
         assert!(!notifier.take_pending().is_empty());
         notifier.set_focus(true);
         assert_eq!(

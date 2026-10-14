@@ -1323,9 +1323,9 @@ strings! {
     },
     settings_notify_transport => { "Terminal signal", "终端提示方式", "終端提示方式" },
     settings_notify_transport_hint => {
-        "The escape sequence this terminal understands; automatic follows the terminal it detects.",
-        "该终端能识别的控制序列；自动会跟随探测到的终端。",
-        "該終端能識別的控制序列；自動會跟隨探測到的終端。"
+        "The escape sequence this terminal understands, written while the terminal window is focused; automatic follows the terminal it detects.",
+        "该终端能识别的控制序列，在终端窗口有焦点时使用；自动会跟随探测到的终端。",
+        "該終端能識別的控制序列，在終端視窗有焦點時使用；自動會跟隨探測到的終端。"
     },
     settings_notify_transport_auto => { "Automatic", "自动", "自動" },
     settings_notify_transport_off => { "Off (in-app only)", "关闭（仅界面内）", "關閉（僅介面內）" },
@@ -1337,9 +1337,9 @@ strings! {
     settings_notify_transport_iterm2 => { "iTerm2 attention", "iTerm2 提醒", "iTerm2 提醒" },
     settings_notify_system => { "Desktop popup", "系统弹窗", "系統彈窗" },
     settings_notify_system_hint => {
-        "Draw a desktop notification with notify-send or osascript. Only on the machine running this client, never over ssh.",
-        "用 notify-send 或 osascript 弹出系统通知。仅在运行本客户端的机器上生效，SSH 连接下不会触发。",
-        "用 notify-send 或 osascript 彈出系統通知。僅在執行本客戶端的機器上生效，SSH 連線下不會觸發。"
+        "Draw a desktop notification with notify-send or osascript while the terminal window is not focused (tmux needs focus-events on). Only on the machine running this client, never over ssh.",
+        "终端窗口失去焦点时用 notify-send 或 osascript 弹出系统通知（tmux 需开启 focus-events）。仅在运行本客户端的机器上生效，SSH 连接下不会触发。",
+        "終端視窗失去焦點時用 notify-send 或 osascript 彈出系統通知（tmux 需開啟 focus-events）。僅在執行本客戶端的機器上生效，SSH 連線下不會觸發。"
     },
     settings_notify_system_remote => {
         "Unavailable over ssh",
@@ -1351,6 +1351,22 @@ strings! {
         "未安装通知程序",
         "未安裝通知程式"
     },
+    settings_notify_system_desktop => {
+        "The desktop's own",
+        "由桌面端弹出",
+        "由桌面端彈出"
+    },
+    settings_notify_light => { "Light reminders", "轻提醒", "輕提醒" },
+    settings_notify_light_hint => {
+        "While a Vibex desktop is hosting this runtime it announces the same events itself; this client stays light and only marks the window title instead of ringing or popping up.",
+        "当桌面端托管该运行时，它自己会通知同样的消息；本客户端只用窗口标题做轻提醒，不再响铃或弹窗。",
+        "當桌面端託管該執行階段時，它自己會通知同樣的訊息；本客戶端只用視窗標題做輕提醒，不再響鈴或彈窗。"
+    },
+    settings_notify_desktop_present => {
+        "desktop present",
+        "桌面端在运行",
+        "桌面端在執行"
+    },
     settings_notify_title => { "Include session title", "通知带会话标题", "通知帶工作階段標題" },
     settings_notify_title_hint => {
         "Let the session's own title ride the notification. Off by default: a terminal may log it.",
@@ -1359,9 +1375,9 @@ strings! {
     },
     settings_notify_test => { "Test notification", "测试通知", "測試通知" },
     settings_notify_test_hint => {
-        "Send one now through the channels above, so you can see what this terminal does with it.",
-        "立即通过上面的通道发送一条，看看你的终端会怎么显示。",
-        "立即透過上面的通道傳送一條，看看你的終端會怎麼顯示。"
+        "Send one now through every channel that is on, so you can see what each one does. A real event goes to one of them, chosen by whether the terminal window has focus.",
+        "立即通过每个已开启的通道各发一条，看看它们各自的效果。真实事件只会走其中一个通道，由终端窗口是否有焦点决定。",
+        "立即透過每個已開啟的通道各傳送一條，看看它們各自的效果。真實事件只會走其中一個通道，由終端視窗是否有焦點決定。"
     },
     settings_notify_test_body => {
         "Test notification from Vibex",

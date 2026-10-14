@@ -74,6 +74,13 @@ fn capable_app(columns: u16, rows: u16) -> App {
         },
     );
     app.keymap = vibex_tui::keymap::Keymap::built_in();
+    // And no picture protocol, for the same reason the plain fixture pins it:
+    // a developer running the tests inside kitty must not be asserting that the
+    // escapes a kitty terminal gets are absent. The test that means to exercise
+    // the picture path forces the protocol itself.
+    app.terminal_images = vibex_tui::terminal_image::ImageSupport::forced(
+        vibex_tui::terminal_image::ImageProtocol::None,
+    );
     app.resize(columns, rows);
     app
 }
@@ -82,10 +89,12 @@ fn capable_app(columns: u16, rows: u16) -> App {
 ///
 /// The devices page is the one surface whose rows depend on what the runtime
 /// is rather than on what it can do, so its tests have to say which runtime
-/// they are looking at.
+/// they are looking at. The notification policy reads the same fact, which is
+/// why this goes through the setter rather than the field: the two copies of it
+/// are kept in step by the app, not by whoever writes the test.
 fn device_app(columns: u16, rows: u16, kind: vibex_core::RemoteServerKind) -> App {
     let mut app = capable_app(columns, rows);
-    app.runtime_kind = kind;
+    app.set_runtime_kind(kind);
     app
 }
 
@@ -2838,6 +2847,7 @@ fn the_settings_page_carries_the_notification_switches() {
         SettingRow::NotifyFailed,
         SettingRow::NotifyTransport,
         SettingRow::NotifySystem,
+        SettingRow::NotifyLight,
         SettingRow::NotifyTitle,
         SettingRow::NotifyTest,
     ] {
@@ -2851,6 +2861,7 @@ fn the_settings_page_carries_the_notification_switches() {
         "Agent failed",
         "Terminal signal",
         "Desktop popup",
+        "Light reminders",
         "Test notification",
     ] {
         assert!(screen.contains(word), "{word} is not drawn:\n{screen}");
@@ -2921,10 +2932,13 @@ fn a_test_notification_reaches_the_channels_the_page_names() {
         "the test did not reach the terminal channel"
     );
     let toast = app.toast.as_ref().expect("the test answers with a toast");
-    assert!(
-        toast.text.contains("sent"),
-        "the answer does not say what happened: {}",
-        toast.text
+    // The answer is the product copy for "sent", not a literal: the sentence is
+    // the locale's to change, and a test that spells it out fails on a copy edit
+    // rather than on a behaviour change.
+    assert_eq!(
+        toast.text,
+        app.strings.settings_notify_test_sent(),
+        "the answer does not say what happened"
     );
 
     // With the layer off there is nothing to send, and the answer says so
@@ -2933,10 +2947,10 @@ fn a_test_notification_reaches_the_channels_the_page_names() {
     app.perform(vibex_tui::action::Intent::ActivateSetting);
     assert!(app.take_terminal_notifications().is_empty());
     let toast = app.toast.as_ref().expect("the refusal is answered too");
-    assert!(
-        toast.text.contains("Nothing to send"),
-        "the refusal does not say why: {}",
-        toast.text
+    assert_eq!(
+        toast.text,
+        app.strings.settings_notify_test_none(),
+        "the refusal does not say why"
     );
 }
 
@@ -2969,6 +2983,7 @@ fn a_notification_switch_is_written_to_the_notification_file() {
     app.apply_setting_value(SettingRow::NotifyNeedsInput, "off");
     app.apply_setting_value(SettingRow::NotifyTransport, "osc9");
     app.apply_setting_value(SettingRow::NotifyTitle, "on");
+    app.apply_setting_value(SettingRow::NotifyLight, "off");
 
     let written = std::fs::read_to_string(&path).expect("the choices are written");
     for needle in [
@@ -2976,6 +2991,7 @@ fn a_notification_switch_is_written_to_the_notification_file() {
         "\"notifyAgentNeedsInput\": false",
         "\"transport\": \"osc9\"",
         "\"includeSessionTitle\": true",
+        "\"lightWhenDesktop\": false",
     ] {
         assert!(
             written.contains(needle),
@@ -2985,6 +3001,63 @@ fn a_notification_switch_is_written_to_the_notification_file() {
     // The interface's own file is not the notification layer's, and nothing
     // else was written beside it.
     assert!(!directory.path().join("tui-interface.json").exists());
+}
+
+#[test]
+fn the_settings_page_steps_back_while_a_desktop_is_hosting() {
+    use vibex_tui::settings::SettingRow;
+    let mut app = device_app(120, 40, vibex_core::RemoteServerKind::Desktop);
+    app.perform(vibex_tui::action::Intent::OpenSettings);
+
+    // As shipped, this client yields to the desktop: the popup is the desktop's
+    // and the terminal channel is pinned to the lightest one there is, whatever
+    // the reader named.
+    app.apply_setting_value(SettingRow::NotifyTransport, "osc9");
+    assert_eq!(app.setting_value(SettingRow::NotifyLight), "On");
+    assert_eq!(
+        app.setting_value(SettingRow::NotifySystem),
+        "The desktop's own"
+    );
+    assert_eq!(
+        app.setting_value(SettingRow::NotifyTransport),
+        "Window title · desktop present"
+    );
+
+    // The popup switch is inert while the desktop speaks for this client: there
+    // is nothing to flip, so pressing it changes nothing.
+    select_setting(&mut app, SettingRow::NotifySystem);
+    app.perform(vibex_tui::action::Intent::ActivateSetting);
+    assert_eq!(
+        app.setting_value(SettingRow::NotifySystem),
+        "The desktop's own"
+    );
+
+    // Turning the light switch off hands both channels back to this client, and
+    // the two rows stop claiming the desktop is speaking.
+    app.apply_setting_value(SettingRow::NotifyLight, "off");
+    assert_eq!(app.setting_value(SettingRow::NotifyLight), "Off");
+    assert_ne!(
+        app.setting_value(SettingRow::NotifySystem),
+        "The desktop's own"
+    );
+    assert_eq!(
+        app.setting_value(SettingRow::NotifyTransport),
+        "OSC 9 notification"
+    );
+
+    // A runtime that is not a desktop leaves the whole section alone.
+    let mut headless = device_app(120, 40, vibex_core::RemoteServerKind::Headless);
+    headless.perform(vibex_tui::action::Intent::OpenSettings);
+    headless.apply_setting_value(SettingRow::NotifyTransport, "osc9");
+    assert_eq!(headless.setting_value(SettingRow::NotifyLight), "On");
+    assert_ne!(
+        headless.setting_value(SettingRow::NotifySystem),
+        "The desktop's own"
+    );
+    assert_eq!(
+        headless.setting_value(SettingRow::NotifyTransport),
+        "OSC 9 notification"
+    );
 }
 
 #[test]

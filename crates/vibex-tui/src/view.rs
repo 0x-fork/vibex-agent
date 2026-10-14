@@ -4958,7 +4958,7 @@ fn render_device_tabs(
         spans.push(Span::styled(" ", Style::default()));
         used += width + 1;
     }
-    let kind = runtime_kind_label(app.runtime_kind, strings);
+    let kind = runtime_kind_label(app.runtime_kind(), strings);
     let kind_label = format!("{kind}  ");
     let kind_width = display_width(&kind_label) as u16;
     if used + kind_width + 2 < area.width {

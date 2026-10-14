@@ -102,9 +102,10 @@ use crate::interface_prefs::InterfacePreferences;
 pub struct TuiOptions {
     pub seat: SeatKind,
     /// What the runtime on the other end is. The pairing page answers "which
-    /// clients can pair here" with it, and only the composition root knows: a
-    /// remote seat learns it in the handshake, an authority seat is whatever
-    /// flavour the host started.
+    /// clients can pair here" with it, and the notification layer answers
+    /// "should this client step back for a desktop" with the same fact. Only the
+    /// composition root knows: a remote seat learns it in the handshake, an
+    /// authority seat is whatever flavour the host started.
     pub runtime_kind: vibex_core::RemoteServerKind,
     pub theme_id: Option<String>,
     pub mode: Option<vibex_ui::GpuiThemeMode>,

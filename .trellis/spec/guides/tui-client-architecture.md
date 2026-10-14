@@ -1113,6 +1113,34 @@ exactly two channels:
   bubble would be drawn on the cloud host and the client would report success.
   The child is reaped on its own thread, and a missing program is a state the
   settings row states rather than a failure to retry.
+* **One event is one reminder: the channels are routed, not stacked.** A reader
+  who is *at* the terminal is told by the terminal channel; a reader who has
+  switched away is told by the popup, which reaches across applications and
+  carries words. That is the rule the desktop already applies to its own window,
+  and it is what stops a bell from ringing beside a bubble. When no popup can be
+  drawn — a remote seat, no program, the switch off, or a desktop on the other
+  end — the escape carries the news in both focus states, because it is the only
+  channel that survives `ssh`. Focus that was never reported counts as "at the
+  terminal", so a terminal without DECSET 1004 keeps its escape and simply never
+  raises a bubble. `Notifier::popup_carries` is the whole rule.
+* **A desktop on the other end takes the heavy channels.** When the seat resolved
+  `RemoteServerKind::Desktop`, that desktop shell announces the same events to
+  the same reader, and no routing inside this process can see it.
+  `NotifyPreferences::light_when_desktop` (default on) is the answer: the
+  terminal channel is pinned to the title and the popup is left to the desktop.
+  An `Off` transport stays `Off` — the policy is "lighter", never "louder than
+  what I asked for" — and the settings rows say which of the two is speaking
+  rather than naming a sequence that will not be written. `App::set_runtime_kind`
+  is the one writer of the fact, because the app and the notifier each keep a
+  copy of it.
+* **The channel that carries a message also lays it out.** `NotificationMessage`
+  keeps the Agent, the sentence and the session title apart: a terminal sequence
+  gets them on one line (a control character inside an OSC payload can end it),
+  while a popup gets `Vibex · <agent>` as its summary and the sentence with the
+  session title on the next line. The parts are sanitized before they are placed,
+  so the only line breaks in a body are the ones the layout put there. AppleScript
+  has no escape for a newline inside a literal, so `SystemDelivery::OsaScript`
+  joins one literal per line with `linefeed`.
 * **A notification is news only when the reader is not already reading it.**
   `accept` is the one policy: the layer must be on, at least one channel must be
   live, the kind must be switched on, and the reader must not be looking at that
@@ -1133,20 +1161,21 @@ exactly two channels:
   bounded.
 * **The settings page is a second door onto the same file.** The Notifications
   section of the settings surface (master switch, the three kinds, the transport
-  chooser with an "automatic" value, the desktop popup, the title, and a test
-  button) edits the same `NotifyPreferences` the hand-written
-  `~/.vibex/tui-notify.json` holds, and `apply_setting_value` is the only
-  writer, so the page and the file cannot disagree. An unknown transport id in
-  the file falls back to detection rather than to "off".
+  chooser with an "automatic" value, the desktop popup, the light-reminders
+  switch, the title, and a test button) edits the same `NotifyPreferences` the
+  hand-written `~/.vibex/tui-notify.json` holds, and `apply_setting_value` is the
+  only writer, so the page and the file cannot disagree. An unknown transport id
+  in the file falls back to detection rather than to "off".
 * **The path is the composition root's, like every other file.** `AppOptions`
   carries `notify_path`; `None` reads and writes nothing, which is what a test
   wants — a test that flipped a switch would otherwise edit the home of whoever
   ran it. `App::notification_preferences_path()` is what `lib.rs::run` names.
-* **The test button goes through the real channels.** It skips the "is the
+* **The test button goes through every live channel.** It skips the "is the
   reader looking" policy (a test is asked for, not news) but not the master
   switch, and its answer is a toast that says whether anything was sent — the
   point of the button is to make a terminal's or a desktop's silence
-  attributable.
+  attributable. A real event is routed to one channel; the test is the one moment
+  the reader asked to see all of them, and the row that offers it names them.
 
 ## 9. Security
 

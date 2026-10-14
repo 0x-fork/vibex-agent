@@ -63,6 +63,7 @@ pub enum SettingRow {
     NotifyFailed,
     NotifyTransport,
     NotifySystem,
+    NotifyLight,
     NotifyTitle,
     NotifyTest,
     Language,
@@ -88,6 +89,7 @@ impl SettingRow {
                 | Self::NotifyFailed
                 | Self::NotifyTransport
                 | Self::NotifySystem
+                | Self::NotifyLight
                 | Self::NotifyTitle
         )
     }
@@ -220,6 +222,11 @@ pub const SETTINGS: &[SettingDef] = &[
     },
     SettingDef {
         row: SettingRow::NotifySystem,
+        section: SettingsSection::Notifications,
+        kind: SettingKind::Toggle,
+    },
+    SettingDef {
+        row: SettingRow::NotifyLight,
         section: SettingsSection::Notifications,
         kind: SettingKind::Toggle,
     },
@@ -416,6 +423,7 @@ impl App {
             SettingRow::NotifyFailed => strings.settings_notify_failed(),
             SettingRow::NotifyTransport => strings.settings_notify_transport(),
             SettingRow::NotifySystem => strings.settings_notify_system(),
+            SettingRow::NotifyLight => strings.settings_notify_light(),
             SettingRow::NotifyTitle => strings.settings_notify_title(),
             SettingRow::NotifyTest => strings.settings_notify_test(),
             SettingRow::Language => strings.settings_language(),
@@ -445,6 +453,7 @@ impl App {
             SettingRow::NotifyFailed => strings.settings_notify_failed_hint(),
             SettingRow::NotifyTransport => strings.settings_notify_transport_hint(),
             SettingRow::NotifySystem => strings.settings_notify_system_hint(),
+            SettingRow::NotifyLight => strings.settings_notify_light_hint(),
             SettingRow::NotifyTitle => strings.settings_notify_title_hint(),
             SettingRow::NotifyTest => strings.settings_notify_test_hint(),
             SettingRow::Language => strings.settings_language_hint(),
@@ -498,17 +507,36 @@ impl App {
             SettingRow::NotifyFailed => {
                 self.toggle_label(self.notify.kind_enabled(NotificationKind::Failed))
             }
-            SettingRow::NotifyTransport => match self.notify.transport_preference() {
-                Some(transport) => transport_label(transport, self.strings).to_string(),
-                None => format!(
-                    "{} · {}",
-                    self.strings.settings_notify_transport_auto(),
-                    transport_label(self.notify.detected_transport(), self.strings)
-                ),
-            },
+            // The channel that will actually be written, not the one stored: a
+            // desktop on the other end pins this row to the title, and naming
+            // the sequence the reader picked would promise bytes that are never
+            // sent. An `Off` transport stays `Off` — the policy is "lighter",
+            // never "louder than what I asked for".
+            SettingRow::NotifyTransport => {
+                let effective = self.notify.transport();
+                if self.notify.desktop_takes_over() && effective != Transport::Off {
+                    format!(
+                        "{} · {}",
+                        transport_label(effective, self.strings),
+                        self.strings.settings_notify_desktop_present()
+                    )
+                } else {
+                    match self.notify.transport_preference() {
+                        Some(transport) => transport_label(transport, self.strings).to_string(),
+                        None => format!(
+                            "{} · {}",
+                            self.strings.settings_notify_transport_auto(),
+                            transport_label(self.notify.detected_transport(), self.strings)
+                        ),
+                    }
+                }
+            }
             SettingRow::NotifySystem => match self.notification_system_state() {
                 NotifySystemState::On => self.strings.settings_on().to_string(),
                 NotifySystemState::Off => self.strings.settings_off().to_string(),
+                NotifySystemState::Desktop => {
+                    self.strings.settings_notify_system_desktop().to_string()
+                }
                 NotifySystemState::Remote => {
                     self.strings.settings_notify_system_remote().to_string()
                 }
@@ -516,6 +544,7 @@ impl App {
                     self.strings.settings_notify_system_missing().to_string()
                 }
             },
+            SettingRow::NotifyLight => self.toggle_label(self.notify.light_when_desktop()),
             SettingRow::NotifyTitle => self.toggle_label(self.notify.includes_session_title()),
             // An action rather than a value, so the row reports what the button
             // would actually reach: a reader who turned every channel off can
@@ -605,6 +634,7 @@ impl App {
             | SettingRow::NotifyNeedsInput
             | SettingRow::NotifyFailed
             | SettingRow::NotifySystem
+            | SettingRow::NotifyLight
             | SettingRow::NotifyTitle => self.toggle_choices(row),
             SettingRow::ReasoningDisplay => [
                 (
@@ -694,12 +724,15 @@ impl App {
             SettingRow::ReasoningExpansion => "window".to_string(),
             // Every notification switch is on as shipped, the title is off, and
             // the transport follows the terminal: a reset puts the layer back
-            // to what a reader who never opened this page already has.
+            // to what a reader who never opened this page already has. Stepping
+            // back for a desktop is on for the same reason — it is the shipped
+            // answer to a duplicate the reader did not ask for.
             SettingRow::Notifications
             | SettingRow::NotifyCompleted
             | SettingRow::NotifyNeedsInput
             | SettingRow::NotifyFailed
-            | SettingRow::NotifySystem => "on".to_string(),
+            | SettingRow::NotifySystem
+            | SettingRow::NotifyLight => "on".to_string(),
             SettingRow::NotifyTransport => "auto".to_string(),
             SettingRow::NotifyTitle => "off".to_string(),
             SettingRow::Language => Locale::En.tag().to_string(),
@@ -736,11 +769,14 @@ impl App {
                 Some(self.notify.kind_enabled(NotificationKind::NeedsInput))
             }
             SettingRow::NotifyFailed => Some(self.notify.kind_enabled(NotificationKind::Failed)),
+            SettingRow::NotifyLight => Some(self.notify.light_when_desktop()),
             SettingRow::NotifyTitle => Some(self.notify.includes_session_title()),
             SettingRow::NotifySystem => match self.notification_system_state() {
                 NotifySystemState::On => Some(true),
                 NotifySystemState::Off => Some(false),
-                NotifySystemState::Remote | NotifySystemState::Unsupported => None,
+                NotifySystemState::Desktop
+                | NotifySystemState::Remote
+                | NotifySystemState::Unsupported => None,
             },
             _ => None,
         }
@@ -986,6 +1022,16 @@ impl App {
                     return false;
                 }
                 self.notify.set_system_popup(on);
+                true
+            }
+            SettingRow::NotifyLight => {
+                let Some(on) = Self::toggle_value(value) else {
+                    return false;
+                };
+                if on == self.notify.light_when_desktop() {
+                    return false;
+                }
+                self.notify.set_light_when_desktop(on);
                 true
             }
             SettingRow::NotifyTitle => {
