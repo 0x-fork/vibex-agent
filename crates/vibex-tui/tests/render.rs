@@ -5362,9 +5362,13 @@ fn a_tool_heavy_turn_stays_a_short_run_of_rows() {
         screen.contains("▾  Worked for 1s"),
         "the open fold does not name the turn above its work:\n{screen}"
     );
+    let rule = screen
+        .lines()
+        .find(|line| line.contains('▴'))
+        .expect("the open fold has no rule to close it");
     assert!(
-        screen.contains('▴'),
-        "the open fold has no rule to close it:\n{screen}"
+        rule.contains("Worked for 1s"),
+        "the rule does not repeat the turn's duration: {rule:?}"
     );
     // Mixed runs report each semantic category, including the changed file.
     assert!(

@@ -126,10 +126,11 @@ Transcript::advance_disclosures(&mut self, Instant) -> bool
 - The TUI fold control is the fold's own row, drawn inside the blocks the turn
   already has: `Worked for <duration>` alone as the first row of the conclusion
   while the section is shut, and open, the same labelled title as the first row
-  of the turn's first process block with a `glyphs::heading_rule` rule below the
-  work on the conclusion. The two ends are one gesture: the title's `▾` and the
-  rule's `▴` both point into the work they put away, both toggle the turn, and
-  one blank row parts either end from the text beside it. The title leads with
+  of the turn's first process block, and the rule below the work on the
+  conclusion, which repeats the duration between its rules. The two ends are one
+  gesture: the title's `▾` and the rule's `▴` both point into the work they put
+  away, both toggle the turn, and one blank row parts either end from the text
+  beside it. The title leads with
   the Agent's brand mark in both states, in the same two-cell slot the session
   list reserves and matched by the same identity string
   (`vibex_brands::agent_mark`); a terminal that cannot hold a picture, or an

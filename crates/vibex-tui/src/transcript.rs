@@ -3377,7 +3377,8 @@ fn render_block_inner(
         // place.
         let pointer = selected && fold_title.is_none();
         if fold.expanded {
-            let (rule_line, rule_plain) = divider_line(content_width, theme, pointer, phase);
+            let (rule_line, rule_plain) =
+                divider_line(fold, content_width, theme, pointer, strings, phase);
             lines.push(rule_line);
             plain.push(rule_plain);
         } else {
@@ -3663,29 +3664,48 @@ fn fold_title_line(
     (line, text, mark)
 }
 
-/// The rule that closes a turn's process section, with the control that folds
-/// the work at its left.
+/// The rule that closes a turn's process section: the control that folds the
+/// work at its left, and the turn's duration on the rule itself.
 ///
-/// The rule is where the work stops and the answer begins. It carries the same
-/// gesture as the title above it, and its mark points up into the work: a
-/// disclosure pointing down on the row that closes a section would promise an
-/// opening that pressing it does not make.
+/// The rule is where the work stops and the answer begins, so it repeats what
+/// the title above the work says. A reader who has scrolled into the middle of
+/// a long section meets the duration on the row that ends it rather than having
+/// to climb back to the top — and the row is the same one they press to put the
+/// work away, so its mark points up into what it closes. A disclosure pointing
+/// down would promise an opening that pressing it does not make.
 fn divider_line(
+    fold: &TurnFold,
     content_width: usize,
     theme: &TuiTheme,
     selected: bool,
+    strings: Strings,
     phase: u32,
 ) -> (Line<'static>, String) {
     let tier = crate::glyphs::GlyphTier::of(theme);
     let glyph = crate::glyphs::disclosure_up(tier);
-    let rules = content_width.saturating_sub(display_width(glyph) + 1);
+    // One cell separates the disclosure from the left rule, and two cells frame
+    // the label — one space on either side. At a width too narrow for all of it
+    // the mark and the start of the words are what matter, so the label gives
+    // way rather than the row overflowing the band.
+    let mark_width = display_width(glyph) + 1;
+    let budget = content_width.saturating_sub(mark_width + 2);
+    let label = truncate_to_width(
+        &format!("{} {}", strings.transcript_worked_for(), fold.label),
+        budget,
+        "…",
+    );
+    let framed = display_width(&label) + 2;
+    let rules = content_width.saturating_sub(framed + mark_width);
+    let (left, right) = (rules / 2, rules - rules / 2);
     let rule = crate::glyphs::heading_rule(tier);
     let spans = vec![
         Span::styled(glyph.to_string(), theme.muted()),
         Span::raw(" "),
-        Span::styled(rule.repeat(rules), theme.dimmed(theme.roles.gray_dim)),
+        Span::styled(rule.repeat(left), theme.dimmed(theme.roles.gray_dim)),
+        Span::styled(format!(" {label} "), theme.dimmed(theme.roles.gray)),
+        Span::styled(rule.repeat(right), theme.dimmed(theme.roles.gray_dim)),
     ];
-    let text = format!("{glyph} {}", rule.repeat(rules));
+    let text = format!("{glyph} {}{label}{}", rule.repeat(left), rule.repeat(right));
     let mut line = row_line(row_marker(0, false, selected, phase, theme), spans);
     if selected {
         line = line.style(Style::default().bg(theme.roles.surface_highlight));
@@ -5612,11 +5632,10 @@ mod density_tests {
             .expect("the rule is drawn");
         assert!(rule > work, "the rule is above the work: {text:?}");
         assert!(
-            !text[rule].contains("Worked for"),
-            "the title is repeated on the rule: {:?}",
+            text[rule].contains("─ Worked for 12s ─"),
+            "the rule does not carry the duration between its rules: {:?}",
             text[rule]
         );
-        assert!(text[rule].contains('─'), "{:?}", text[rule]);
         // Both ends are the control, so a press on either one folds the turn.
         let work_index = transcript
             .blocks()
