@@ -1243,16 +1243,6 @@ const ERROR_MESSAGES: &[MessageTranslation] = &[
         zh_tw: "請先儲存自動化圖，再取代其定義",
     },
     MessageTranslation {
-        en: "Fixture workspace",
-        zh_cn: "测试工作区",
-        zh_tw: "測試工作區",
-    },
-    MessageTranslation {
-        en: "Workspace files and Git state are loading",
-        zh_cn: "正在加载工作区文件和 Git 状态",
-        zh_tw: "正在載入工作區檔案和 Git 狀態",
-    },
-    MessageTranslation {
         en: "Opened link in the system browser",
         zh_cn: "已在系统浏览器中打开链接",
         zh_tw: "已在系統瀏覽器中開啟連結",

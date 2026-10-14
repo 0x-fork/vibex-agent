@@ -169,6 +169,12 @@ struct GitMutationNotification;
 /// screen instead of stacking a queue of them.
 struct WorkbenchErrorNotification;
 
+/// Replace-by-id marker for the workbench's result hints.
+///
+/// A completed file or worktree action reports itself as a light hint, and one
+/// id keeps the newest result on screen instead of stacking a queue of them.
+struct WorkbenchNoteNotification;
+
 fn git_mutation_result_notice(kind: GitMutationKind) -> Option<&'static str> {
     match kind {
         GitMutationKind::Pull => Some(locale::text("Pull completed", "拉取已完成", "拉取已完成")),
@@ -974,7 +980,6 @@ struct CodeRightRailRevision {
     mode: RightRailMode,
     amend_commit: bool,
     selected_git_path: Option<String>,
-    note: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1057,7 +1062,6 @@ impl CodeRightRailGitProjection {
 struct CodeRightRailProjection {
     revision: CodeRightRailRevision,
     mode: RightRailMode,
-    note: Option<String>,
     files: CodeRightRailFileProjection,
     git: CodeRightRailGitProjection,
     workspace_name: String,
@@ -1439,7 +1443,14 @@ pub struct CodeWorkbench {
     /// until [`Self::present_pending_error`] takes it during a paint that has
     /// the window `hint_layer::push` needs.
     pending_error: Option<String>,
-    pub(crate) note: Option<String>,
+    /// The result the workbench still owes the hint layer.
+    ///
+    /// A completed file or worktree action is a top-centered light hint like
+    /// every other result the workbench produces, not a line printed under the
+    /// right rail's header. Most producers run where only `cx` is available, so
+    /// the message waits here until [`Self::present_pending_note`] takes it
+    /// during a paint that has the window `hint_layer::push` needs.
+    pending_note: Option<String>,
     tree_loading: bool,
     status_loading: bool,
     history_loading: bool,
@@ -1635,7 +1646,7 @@ impl CodeWorkbench {
             amend_commit: false,
             commit_reset_window: None,
             pending_error: None,
-            note: None,
+            pending_note: None,
             tree_loading: false,
             status_loading: false,
             history_loading: false,
@@ -1912,7 +1923,6 @@ impl CodeWorkbench {
                 this.preview.focus(&diff_tab);
             }
         }
-        this.note = Some("Fixture workspace".to_string());
         this
     }
 
@@ -1947,6 +1957,33 @@ impl CodeWorkbench {
         });
     }
 
+    /// Hands the completed result the workbench is holding to its hint layer.
+    ///
+    /// A finished file or worktree action reads the same way as the rest of the
+    /// workbench's results: as a top-centered light hint. Nothing paints a
+    /// fixed result line under the rail header, and a message superseded by a
+    /// newer one is dropped rather than queued. The pending slot is taken here
+    /// because the producers are mostly tasks that have no `Window`, and
+    /// `window.defer` keeps the push out of the update that raised it.
+    fn present_pending_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(note) = self.pending_note.take() else {
+            return;
+        };
+        window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            hint_layer::push(
+                window,
+                hint_notification(
+                    NotificationType::Success,
+                    locale::localize_ui_message(&note),
+                )
+                .id::<WorkbenchNoteNotification>()
+                .autohide(true),
+                cx,
+            );
+        });
+    }
+
     fn right_rail_revision(&self) -> CodeRightRailRevision {
         CodeRightRailRevision {
             file_tree: self.file_tree.presentation_revision(),
@@ -1973,7 +2010,6 @@ impl CodeWorkbench {
             mode: self.right_rail_mode,
             amend_commit: self.amend_commit,
             selected_git_path: self.selected_git_path.clone(),
-            note: self.note.clone(),
         }
     }
 
@@ -1990,7 +2026,6 @@ impl CodeWorkbench {
         CodeRightRailProjection {
             revision,
             mode: self.right_rail_mode,
-            note: self.note.clone(),
             files: CodeRightRailFileProjection {
                 workspace_available: self.workspace.is_some(),
                 workspace_root: self
@@ -2405,7 +2440,7 @@ impl CodeWorkbench {
         {
             return;
         }
-        self.save_editor(path, cx);
+        self.save_editor(path, false, cx);
     }
 
     /// Write every buffer with unsaved edits, used when focus leaves the window.
@@ -2432,7 +2467,7 @@ impl CodeWorkbench {
         {
             return false;
         }
-        if !self.save_editor(path.to_string(), cx) {
+        if !self.save_editor(path.to_string(), false, cx) {
             return false;
         }
         self.pending_close_after_save.insert(path.to_string());
@@ -3040,7 +3075,6 @@ impl CodeWorkbench {
             .to_string();
         self.file_tree.set_root_name(root_name);
         self.git.reset_workspace(workspace_id);
-        self.note = Some("Workspace files and Git state are loading".to_string());
         let restored_expanded_paths = adopted_panel
             .as_ref()
             .map(|panel| {
@@ -3782,7 +3816,6 @@ impl CodeWorkbench {
                             this.continue_file_search_directory_reveal(cx);
                             this.continue_file_tree_reveal(cx);
                         }
-                        this.note = None;
                     }
                     Ok(Err(error)) => {
                         this.file_tree.fail_load(ticket, &task_path, &error.code);
@@ -4095,7 +4128,6 @@ impl CodeWorkbench {
         };
         self.lifecycle_action_pending = true;
         self.set_lifecycle_confirmation(None);
-        self.note = Some("Worktree lifecycle action is running".to_string());
         let runner = gpui_tokio::Tokio::spawn(cx, operation(backend));
         self.lifecycle_action_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
@@ -4106,7 +4138,7 @@ impl CodeWorkbench {
                 this.lifecycle_action_pending = false;
                 match outcome {
                     Ok(Ok(operation)) => {
-                        this.note = Some("Worktree lifecycle action completed".to_string());
+                        this.pending_note = Some("Worktree lifecycle action completed".to_string());
                         this.request_operation_target_focus(&operation, cx);
                         this.load_git_status(cx);
                         this.load_worktree_lifecycle(cx);
@@ -4120,13 +4152,11 @@ impl CodeWorkbench {
                                 retry_confirmation.clone()
                             },
                         );
-                        this.note = None;
                         this.pending_error = Some(format!("{}: {}", error.code, error.message));
                         this.load_worktree_lifecycle(cx);
                     }
                     Err(error) => {
                         this.set_lifecycle_confirmation(retry_confirmation.clone());
-                        this.note = None;
                         this.pending_error =
                             Some(format!("Worktree lifecycle task failed: {error}"));
                         this.load_worktree_lifecycle(cx);
@@ -4245,7 +4275,7 @@ impl CodeWorkbench {
                 this.lifecycle_action_pending = false;
                 match outcome {
                     Ok(Ok(_)) => {
-                        this.note = Some("Worktree readiness updated".to_string());
+                        this.pending_note = Some("Worktree readiness updated".to_string());
                         this.load_worktree_lifecycle(cx);
                         this.request_parent_lifecycle_refresh(cx);
                     }
@@ -6149,7 +6179,7 @@ impl CodeWorkbench {
         let outcome = validate_external_open_url(&url)
             .and_then(|validated| open_external_url(&validated.url));
         match outcome {
-            Ok(()) => self.note = Some("Opened link in the system browser".into()),
+            Ok(()) => self.pending_note = Some("Opened link in the system browser".into()),
             Err(error) => self.pending_error = Some(format!("{}: {}", error.code, error.message)),
         }
         cx.notify();
@@ -6846,7 +6876,17 @@ impl CodeWorkbench {
 
     /// Start writing an editor buffer back to disk. Returns whether a write was
     /// actually queued, so autosave can tell a started save from a refused one.
-    pub(crate) fn save_editor(&mut self, path: String, cx: &mut Context<Self>) -> bool {
+    ///
+    /// `announce` reports a completed write as a light hint. An explicit save
+    /// answers an action the user just took and says so; an autosave or a
+    /// write-before-close is bookkeeping the user did not ask for, and a hint
+    /// on every idle pause would be noise.
+    pub(crate) fn save_editor(
+        &mut self,
+        path: String,
+        announce: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if is_local_external_path(&path) {
             self.pending_error = Some(
                 locale::text(
@@ -6890,7 +6930,9 @@ impl CodeWorkbench {
                 match outcome {
                     Ok(Ok(file)) => {
                         buffer.finish_save(request_id, file);
-                        this.note = Some(format!("Saved {task_path}"));
+                        if announce {
+                            this.pending_note = Some(format!("Saved {task_path}"));
+                        }
                         stored = true;
                     }
                     Ok(Err(error)) => {
@@ -6952,7 +6994,7 @@ impl CodeWorkbench {
             .get(&path)
             .is_some_and(|buffer| buffer.dirty)
         {
-            self.save_editor(path, cx);
+            self.save_editor(path, true, cx);
         }
     }
 
@@ -7632,7 +7674,7 @@ impl CodeWorkbench {
                         apply(this, cx);
                         this.sync_terminal_surface_activity(cx);
                         this.sync_browser_surface_activity(cx);
-                        this.note = Some("File operation completed".into());
+                        this.pending_note = Some("File operation completed".into());
                         this.load_tree(cx);
                         this.load_git_status(cx);
                         this.persist(cx);
@@ -7683,7 +7725,7 @@ impl CodeWorkbench {
                 this.update(cx, |this, cx| {
                     match outcome {
                         Ok(Ok(absolute)) => match reveal_path_in_file_manager(&absolute) {
-                            Ok(()) => this.note = Some(format!("Revealed {task_path}")),
+                            Ok(()) => this.pending_note = Some(format!("Revealed {task_path}")),
                             Err(error) => {
                                 this.pending_error =
                                     Some(format!("{}: {}", error.code, error.message))
@@ -7738,7 +7780,7 @@ impl CodeWorkbench {
             if let Some(this) = entity.upgrade() {
                 this.update(cx, |this, cx| {
                     match outcome {
-                        Ok(()) => this.note = Some(format!("Opened {task_path}")),
+                        Ok(()) => this.pending_note = Some(format!("Opened {task_path}")),
                         Err(error) => {
                             this.pending_error = Some(format!("{}: {}", error.code, error.message))
                         }
@@ -8118,7 +8160,6 @@ impl CodeWorkbench {
         };
         let reset_commit_form =
             matches!(scope.kind, GitMutationKind::Commit | GitMutationKind::Amend);
-        self.note = None;
         if !self.git.begin_mutation(scope.clone()) {
             if reset_commit_form {
                 self.commit_reset_window = None;
@@ -10628,7 +10669,7 @@ impl CodeWorkbench {
                                         .tooltip(locale::text("Save file", "保存文件", "儲存檔案"))
                                         .disabled(!editable || !dirty || pending_save)
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            let _ = this.save_editor(save_path.clone(), cx);
+                                            let _ = this.save_editor(save_path.clone(), true, cx);
                                         })),
                                 )
                                 .when(!external_file, |this| {
@@ -11500,6 +11541,7 @@ impl Render for CodeWorkbench {
         }
         self.schedule_restore_hydration(window, cx);
         self.present_pending_error(window, cx);
+        self.present_pending_note(window, cx);
         if !cx.has_active_drag() {
             self.preview_tab_drop_target = None;
             self.preview_pane_drop_target = None;
@@ -17080,7 +17122,6 @@ impl Render for CodeRightRail {
             self.render_count = self.render_count.saturating_add(1);
         }
         let mode = self.projection.mode;
-        let note = self.projection.note.clone();
         v_flex()
             .id("code-workbench-right-rail")
             .size_full()
@@ -17126,19 +17167,6 @@ impl Render for CodeRightRail {
                             ),
                     ),
             )
-            .when(mode != RightRailMode::Git, |this| {
-                this.when_some(note, |this, note| {
-                    this.child(
-                        div()
-                            .flex_none()
-                            .px_3()
-                            .py_1()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(locale::localize_ui_message(&note)),
-                    )
-                })
-            })
             .child(match mode {
                 RightRailMode::Files => self.render_files(cx),
                 RightRailMode::Git => self.render_git(cx),
@@ -21523,8 +21551,63 @@ mod tests {
         );
     }
 
+    /// A completed file or worktree action reports itself the same way: a
+    /// top-centered light hint on the window's hint layer. The rail paints no
+    /// result line under its header, and a newer result replaces the one on
+    /// screen.
+    #[gpui::test]
+    fn workbench_results_are_light_hints_instead_of_a_rail_strip(cx: &mut gpui::TestAppContext) {
+        fn draw(cx: &mut gpui::VisualTestContext) {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+        fn mounted_hints(cx: &mut gpui::VisualTestContext) -> usize {
+            cx.update(|window, cx| {
+                hint_layer::list(window, cx)
+                    .expect("the fixture window mounts the hint layer")
+                    .read(cx)
+                    .hints()
+                    .len()
+            })
+        }
+
+        let (workbench, cx) = fixture_workbench_with_root(cx);
+        draw(cx);
+        assert_eq!(mounted_hints(cx), 0);
+
+        workbench.update(cx, |workbench, cx| {
+            workbench.pending_note = Some("Saved src/main.rs".to_string());
+            cx.notify();
+        });
+        draw(cx);
+        assert_eq!(
+            workbench.read_with(cx, |workbench, _| workbench.pending_note.clone()),
+            None,
+            "the paint takes the pending result and hands it to the hint layer"
+        );
+        assert_eq!(
+            mounted_hints(cx),
+            1,
+            "a completed action is a hint, not a strip printed at the top of the rail"
+        );
+
+        workbench.update(cx, |workbench, cx| {
+            workbench.pending_note = Some("File operation completed".to_string());
+            cx.notify();
+        });
+        draw(cx);
+        assert_eq!(
+            mounted_hints(cx),
+            1,
+            "a newer result replaces the previous hint instead of stacking"
+        );
+    }
+
     /// The source contract behind the test above: the rail renderer has no error
-    /// band left to fill, and the workbench's paint is what presents a failure.
+    /// or result band left to fill, and the workbench's paint is what presents
+    /// both a failure and a completed result.
     #[test]
     fn the_rail_renderer_has_no_fixed_error_band() {
         let source = include_str!("code_workbench.rs");
@@ -21535,6 +21618,11 @@ mod tests {
             .expect("the right rail renderer should remain inspectable");
         assert!(!rail_renderer.contains("localize_error_message"));
         assert!(!rail_renderer.contains("self.projection.error"));
+        assert!(
+            !rail_renderer.contains("localize_ui_message"),
+            "a result is a light hint, not a strip printed at the top of the rail"
+        );
+        assert!(!rail_renderer.contains("projection.note"));
 
         let workbench_renderer = source
             .split_once("impl Render for CodeWorkbench {")
@@ -21542,7 +21630,9 @@ mod tests {
             .map(|(renderer, _)| renderer)
             .expect("the workbench renderer should remain inspectable");
         assert!(workbench_renderer.contains("self.present_pending_error(window, cx);"));
+        assert!(workbench_renderer.contains("self.present_pending_note(window, cx);"));
         assert!(!workbench_renderer.contains(".when_some(self.pending_error"));
+        assert!(!workbench_renderer.contains(".when_some(self.pending_note"));
 
         let presenter = source
             .split_once("    fn present_pending_error(")
@@ -21557,6 +21647,20 @@ mod tests {
         assert!(presenter.contains(".autohide(true)"));
         assert!(presenter.contains("hint_layer::push("));
         assert!(presenter.contains("Anchor::TopCenter"));
+
+        let note_presenter = source
+            .split_once("    fn present_pending_note(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(presenter, _)| presenter)
+            .expect("the result presenter should remain inspectable");
+        assert!(note_presenter.contains("self.pending_note.take()"));
+        assert!(note_presenter.contains("hint_notification("));
+        assert!(note_presenter.contains("NotificationType::Success"));
+        assert!(note_presenter.contains("locale::localize_ui_message(&note)"));
+        assert!(note_presenter.contains(".id::<WorkbenchNoteNotification>()"));
+        assert!(note_presenter.contains(".autohide(true)"));
+        assert!(note_presenter.contains("hint_layer::push("));
+        assert!(note_presenter.contains("Anchor::TopCenter"));
     }
 
     /// The fixture already binds an editor for `README.md`, so typing into that
