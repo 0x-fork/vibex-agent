@@ -10780,3 +10780,60 @@ fn a_picture_capable_terminal_draws_the_desktops_own_icons() {
         app.regions.row_actions
     );
 }
+
+/// A dialog takes the icons it covers and no others.
+///
+/// A picture is a layer above the text, so a mark under the box would float
+/// over the dialog — but a mark the box never reaches is one the reader can
+/// still see, and taking every icon down because a palette is somewhere on the
+/// screen is the bug this pins. The list's marks sit at the row's left edge and
+/// the palette is a centred box, so at this size the two cannot meet.
+#[test]
+fn a_modal_keeps_the_marks_it_does_not_cover() {
+    use vibex_tui::terminal_image::{ImageProtocol, ImageSupport};
+    let now = vibex_core::unix_timestamp_ms();
+    let mut session = seeded_session("session_pixels002", "the one beside the dialog");
+    session.state = vibex_core::AgentSessionState::NeedsInput;
+    session.last_message_at_ms = now;
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![session]))
+        .expect("sessions apply");
+    app.terminal_images = ImageSupport::forced(ImageProtocol::Kitty);
+
+    // The page on its own: the row wears the marks the desktop's own icons name.
+    let _ = render(&mut app, 120, 40);
+    let mut before = app.row_marks.held_labels();
+    before.sort();
+    assert!(!before.is_empty(), "the fixture drew no mark at all");
+    // Everything the first frame owed the terminal is written before the dialog
+    // opens, so what the next frame owes is what the dialog itself caused.
+    let _ = app.take_terminal_control();
+
+    // The palette is a box in the middle of the frame, and the marks are at the
+    // row's left edge: every one of them is a mark the box does not cover.
+    app.perform(vibex_tui::action::Intent::OpenCommandPalette);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("Command palette"), "{screen}");
+    let popup = app.regions.modal.expect("the modal published no box");
+    assert!(
+        popup.x > 0,
+        "the box starts at the frame's edge, so this fixture cannot tell a \
+         covered mark from an uncovered one: {popup:?}"
+    );
+    let mut after = app.row_marks.held_labels();
+    after.sort();
+    assert_eq!(
+        after, before,
+        "the dialog took icons it does not cover: {after:?} against {before:?}"
+    );
+    // And it caused no picture escapes at all: every mark it does not cover is
+    // already on the terminal exactly where the row put it, so nothing is sent
+    // again and nothing is deleted.
+    let control = String::from_utf8(app.take_terminal_control()).expect("escapes are text");
+    assert!(
+        control.is_empty(),
+        "opening the dialog moved a picture: {control:?}"
+    );
+}

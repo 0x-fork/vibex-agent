@@ -44,6 +44,16 @@
 //! The bytes behind them are shared through a small cache, because rastering and
 //! encoding the same mark twice is the expensive half and the terminal only ever
 //! needs one copy per id.
+//!
+//! # The modal's box
+//!
+//! A picture is a layer above the text, so one drawn under a dialog would float
+//! over it. A page therefore *asks* for its marks ([`RowMarks::want`]) while it
+//! draws instead of placing them, and the frame places what was asked for once
+//! the modal has published the box it took ([`RowMarks::place_asked`]) — so the
+//! marks that box covers never reach the terminal, and the ones beside it are
+//! left exactly where they were. Taking every mark down because a dialog is
+//! somewhere on screen is what this exists to avoid.
 
 use std::sync::Arc;
 
@@ -159,12 +169,22 @@ impl Slot {
 /// The marks the terminal is holding for the frame being drawn.
 ///
 /// Frame-shaped: [`RowMarks::begin_frame`] starts one, each row that wants a
-/// mark calls [`RowMarks::show`], and [`RowMarks::settle`] takes down every mark
-/// no row asked for — including all of them on a terminal that cannot hold a
-/// picture, and on every frame of a page that has no rows.
+/// mark asks for it — with [`RowMarks::want`] when the frame still has a modal
+/// to draw, with [`RowMarks::show`] when it is the modal — and
+/// [`RowMarks::settle`] takes down every mark no row asked for, including all
+/// of them on a terminal that cannot hold a picture, and on every frame of a
+/// page that has no rows.
 #[derive(Debug, Default)]
 pub struct RowMarks {
     slots: Vec<Slot>,
+    /// Marks a row asked for this frame, waiting for the modal's box.
+    ///
+    /// A page cannot place its own marks: the box is drawn after the page, and
+    /// a picture that lands under it cannot be covered, only deleted. So the
+    /// page asks, the frame learns the box, and [`RowMarks::place_asked`] does
+    /// the placing — which is also what keeps a mark the box hides from being
+    /// sent and deleted on every frame the dialog stands.
+    asked: Vec<(Mark, Option<u32>, Rect)>,
     /// Marks already rastered, by label and colour, oldest first.
     cache: Vec<(String, Option<u32>, Arc<Vec<u8>>)>,
 }
@@ -172,8 +192,40 @@ pub struct RowMarks {
 impl RowMarks {
     /// Begin a frame: no row has asked for a mark yet.
     pub fn begin_frame(&mut self) {
+        self.asked.clear();
         for slot in &mut self.slots {
             slot.wanted = false;
+        }
+    }
+
+    /// Ask for `mark` in `rect`, to be placed once the frame knows its modal.
+    ///
+    /// This is what a *page* asks through, because the modal's box is drawn
+    /// after the page and a picture cannot be covered once it is on the
+    /// terminal: the frame places what was asked for in one pass
+    /// ([`RowMarks::place_asked`]), dropping only the marks that box covers. A
+    /// caller that is the modal itself — the switcher's own rows — places with
+    /// [`RowMarks::show`] instead, because a mark inside the box is the box's
+    /// own content and is never the thing the box hides.
+    pub fn want(&mut self, support: &ImageSupport, mark: &Mark, color: Option<u32>, rect: Rect) {
+        if !support.supports_pixels() || rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        self.asked.push((mark.clone(), color, rect));
+    }
+
+    /// Place every mark the frame asked for, except the ones `covered` hides.
+    ///
+    /// Run after the modal has been drawn: `covered` is the box it took, and a
+    /// mark sharing a cell with it is dropped rather than placed, because the
+    /// terminal would hold the picture above the dialog. `None` — no box on
+    /// screen — drops nothing.
+    pub fn place_asked(&mut self, support: &ImageSupport, covered: Option<Rect>) {
+        for (mark, color, rect) in std::mem::take(&mut self.asked) {
+            if covered.is_some_and(|box_area| box_area.intersects(rect)) {
+                continue;
+            }
+            self.show(support, &mark, color, rect);
         }
     }
 
@@ -454,6 +506,92 @@ mod tests {
             "taking a mark down named another surface's picture: {cleared:?}"
         );
         assert!(!marks.is_holding());
+    }
+
+    /// A page asks rather than places, so a mark the modal's box covers is never
+    /// sent at all — a picture placed and deleted on every frame the dialog
+    /// stands would be hundreds of kilobytes of escapes for a mark nobody sees.
+    #[test]
+    fn a_mark_the_modal_covers_is_never_sent() {
+        let support = ImageSupport::forced(ImageProtocol::Kitty);
+        let mut marks = RowMarks::default();
+        marks.begin_frame();
+        marks.want(&support, &agent(DEEPSEEK), None, rect(4, 6));
+        marks.place_asked(&support, Some(Rect::new(0, 5, 10, 4)));
+        assert!(
+            marks.take_escapes().is_empty(),
+            "a mark under the dialog reached the terminal"
+        );
+        assert!(!marks.is_holding());
+
+        // The same mark with the box somewhere else is a mark the reader sees.
+        marks.begin_frame();
+        marks.want(&support, &agent(DEEPSEEK), None, rect(4, 6));
+        marks.place_asked(&support, Some(Rect::new(40, 5, 10, 4)));
+        let sent = String::from_utf8(marks.take_escapes()).expect("escapes are text");
+        assert!(
+            sent.contains("a=T,f=100"),
+            "a mark the dialog leaves alone was not placed: {sent:?}"
+        );
+        assert!(marks.is_holding());
+    }
+
+    /// The box takes the marks it covers and leaves the rest standing: a dialog
+    /// is not a reason to take down every icon on the screen.
+    #[test]
+    fn the_modal_box_takes_only_the_marks_it_covers() {
+        let support = ImageSupport::forced(ImageProtocol::Kitty);
+        let mut marks = RowMarks::default();
+        marks.begin_frame();
+        marks.want(&support, &agent(DEEPSEEK), None, rect(4, 6));
+        marks.want(&support, &agent(CURSOR), Some(0xffffff), rect(40, 6));
+        marks.place_asked(&support, None);
+        let ids = marks.ids();
+        assert_eq!(ids.len(), 2, "the page's two marks were not both placed");
+        marks.take_escapes();
+
+        // The dialog covers the first mark's row and stops well short of the
+        // second's, so only the first is the frame's to take down.
+        marks.begin_frame();
+        marks.want(&support, &agent(DEEPSEEK), None, rect(4, 6));
+        marks.want(&support, &agent(CURSOR), Some(0xffffff), rect(40, 6));
+        marks.place_asked(&support, Some(Rect::new(0, 5, 10, 4)));
+        marks.settle(&support);
+        let cleared = String::from_utf8(marks.take_escapes()).expect("escapes are text");
+        let deleted = image_ids(&cleared);
+        assert!(
+            deleted.contains(&ids[0]),
+            "the mark the dialog covers was left floating over it: {cleared:?}"
+        );
+        assert!(
+            !deleted.contains(&ids[1]),
+            "the mark beside the dialog was taken down with it: {cleared:?}"
+        );
+        assert!(marks.is_holding(), "the frame kept no mark at all");
+        assert_eq!(marks.ids(), vec![ids[1]], "the wrong slot survived");
+    }
+
+    /// A mark the dialog covered comes back when the dialog leaves: the box
+    /// belongs to the frame that drew it, not to the pool.
+    #[test]
+    fn a_mark_the_dialog_covered_returns_when_it_closes() {
+        let support = ImageSupport::forced(ImageProtocol::Kitty);
+        let mut marks = RowMarks::default();
+        marks.begin_frame();
+        marks.want(&support, &agent(DEEPSEEK), None, rect(4, 6));
+        marks.place_asked(&support, Some(Rect::new(0, 5, 10, 4)));
+        marks.settle(&support);
+        assert!(!marks.is_holding(), "the covered mark was placed anyway");
+        marks.take_escapes();
+
+        marks.begin_frame();
+        marks.want(&support, &agent(DEEPSEEK), None, rect(4, 6));
+        marks.place_asked(&support, None);
+        let sent = String::from_utf8(marks.take_escapes()).expect("escapes are text");
+        assert!(
+            sent.contains("a=T,f=100"),
+            "the mark did not come back with the page: {sent:?}"
+        );
     }
 
     /// Two rows showing two Agents hold two marks at once, and neither is lost

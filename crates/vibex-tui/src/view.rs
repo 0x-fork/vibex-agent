@@ -586,6 +586,17 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(overlay) = app.overlay.clone() {
         render_overlay(frame, area, app, &overlay, &theme);
     }
+    // The page asked for its marks as it drew, and the modal has published its
+    // box by now, so this is the first moment the frame can tell a mark the box
+    // covers from one it does not. An overlay that published no box is read as
+    // the whole frame: the frame cannot say which marks it left alone, and
+    // taking all of them down is the answer that cannot be wrong.
+    let covered = if app.overlay.is_some() {
+        Some(app.regions.modal.unwrap_or(area))
+    } else {
+        None
+    };
+    app.row_marks.place_asked(&app.terminal_images, covered);
     // Last, because the switcher places its own Agent marks from inside the
     // overlay: everything that could ask for one has asked by now, and a mark
     // nobody asked for is a layer the terminal is still holding.
@@ -890,30 +901,29 @@ fn render_scrollback(
             header_area,
         );
     }
-    // The Agent's mark on a fold's title, placed where the row that reserved
-    // its cells was drawn. A picture has no clip rect, so a mark is placed only
-    // while its row is in the window — and never under a modal that covers the
-    // transcript, where it would float over the dialog as a layer above it.
-    if app.overlay.is_none() {
-        for mark in app.transcript.window_marks() {
-            if mark.column + crate::row_marks::MARK_COLS > content.width {
-                continue;
-            }
-            let rect = Rect {
-                x: content.x.saturating_add(mark.column),
-                y: content
-                    .y
-                    .saturating_add(u16::try_from(mark.row).unwrap_or(u16::MAX)),
-                width: crate::row_marks::MARK_COLS,
-                height: crate::row_marks::MARK_ROWS,
-            };
-            let _ = app.row_marks.show(
-                &app.terminal_images,
-                &crate::row_marks::Mark::Agent(mark.identity.clone()),
-                crate::theme::color_rgb(theme.roles.foreground),
-                rect,
-            );
+    // The Agent's mark on a fold's title, asked for where the row that reserved
+    // its cells was drawn. A picture has no clip rect, so a mark is asked for
+    // only while its row is in the window; the frame places it once the modal's
+    // box is known, so a mark the box covers never reaches the terminal and one
+    // beside the dialog is still the Agent's mark.
+    for mark in app.transcript.window_marks() {
+        if mark.column + crate::row_marks::MARK_COLS > content.width {
+            continue;
         }
+        let rect = Rect {
+            x: content.x.saturating_add(mark.column),
+            y: content
+                .y
+                .saturating_add(u16::try_from(mark.row).unwrap_or(u16::MAX)),
+            width: crate::row_marks::MARK_COLS,
+            height: crate::row_marks::MARK_ROWS,
+        };
+        app.row_marks.want(
+            &app.terminal_images,
+            &crate::row_marks::Mark::Agent(mark.identity.clone()),
+            crate::theme::color_rgb(theme.roles.foreground),
+            rect,
+        );
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), content);
     if let Some(rows) = search_bar {
@@ -1644,39 +1654,37 @@ fn render_session_rows(
     frame.render_widget(Paragraph::new(Text::from(visible)), area);
     // The pictures land where the rows they belong to were drawn. One on a line
     // the window has scrolled past, or one a terminal too narrow to hold it has
-    // pushed out of the band, is not placed at all: a picture has no clip rect,
-    // so one left standing over the row below would be worse than the character
-    // it replaced.
+    // pushed out of the band, is not asked for at all: a picture has no clip
+    // rect, so one left standing over the row below would be worse than the
+    // character it replaced.
     //
-    // A modal is open over the list, nothing is placed either. A picture is a
-    // layer above the text, so a mark drawn under a dialog would float over it —
-    // the one failure mode a clip rect would have prevented and a character cell
-    // does not need.
+    // A modal over the list does not take the list's marks with it. The frame
+    // places what is asked for here once the modal has published its box, so
+    // only the marks that box actually covers are dropped and the reader keeps
+    // every icon the dialog leaves in the open. See [`crate::row_marks`].
     //
     // `app.row_marks` is settled at the end of the frame, so a mark nobody
     // wants any more is taken down rather than left over the list.
-    if app.overlay.is_none() {
-        for (line, mark) in &wanted_marks {
-            let fits = mark.column + crate::row_marks::MARK_COLS <= area.width;
-            let drawn = line
-                .checked_sub(offset)
-                .is_some_and(|screen_line| screen_line < window);
-            if !fits || !drawn {
-                continue;
-            }
-            let rect = Rect {
-                x: area.x.saturating_add(mark.column),
-                y: area.y.saturating_add((line - offset) as u16),
-                width: crate::row_marks::MARK_COLS,
-                height: crate::row_marks::MARK_ROWS,
-            };
-            let _ = app.row_marks.show(
-                &app.terminal_images,
-                &mark.mark,
-                crate::theme::color_rgb(mark.color),
-                rect,
-            );
+    for (line, mark) in &wanted_marks {
+        let fits = mark.column + crate::row_marks::MARK_COLS <= area.width;
+        let drawn = line
+            .checked_sub(offset)
+            .is_some_and(|screen_line| screen_line < window);
+        if !fits || !drawn {
+            continue;
         }
+        let rect = Rect {
+            x: area.x.saturating_add(mark.column),
+            y: area.y.saturating_add((line - offset) as u16),
+            width: crate::row_marks::MARK_COLS,
+            height: crate::row_marks::MARK_ROWS,
+        };
+        app.row_marks.want(
+            &app.terminal_images,
+            &mark.mark,
+            crate::theme::color_rgb(mark.color),
+            rect,
+        );
     }
     // The rows are not all one line tall, so the mouse needs to know which row
     // the drawn window starts on and how many of its lines are on screen.
@@ -7505,11 +7513,14 @@ fn render_zoned_line(
     frame.render_widget(Paragraph::new(centre_line), centre_area);
 }
 
-/// Draw one modal and publish the one control its chrome hands the mouse.
+/// Draw one modal and publish what the frame has to know about it.
 ///
-/// The close affordance belongs to the frame that draws it: the rect is
-/// republished every frame the modal is up, and cleared with the frame once it
-/// is gone. Nothing remembers it across frames.
+/// Two things are published. The close affordance belongs to the frame that
+/// draws it: the rect is republished every frame the modal is up, and cleared
+/// with the frame once it is gone. Nothing remembers it across frames. The
+/// box itself is published for the picture layer, which cannot be covered by
+/// the backdrop and so has to be told what the box took — see
+/// [`crate::row_marks::RowMarks::place_asked`].
 fn render_modal(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -7517,9 +7528,12 @@ fn render_modal(
     theme: &TuiTheme,
     app: &mut App,
 ) -> Option<ModalLayout> {
-    let layout = modal::render_modal(frame, area, chrome, theme)?;
-    app.regions.modal_close = layout.close;
-    Some(layout)
+    let layout = modal::render_modal(frame, area, chrome, theme);
+    // A box too small to draw fills the whole area with its own notice, so that
+    // is the box the frame took; a box that was drawn is the popup's own rect.
+    app.regions.modal = Some(layout.as_ref().map_or(area, |layout| layout.area));
+    app.regions.modal_close = layout.as_ref().and_then(|layout| layout.close);
+    layout
 }
 
 /// The form overlay: one record's fields, edited in place.

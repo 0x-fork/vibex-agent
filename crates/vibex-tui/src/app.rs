@@ -1363,6 +1363,14 @@ pub struct FrameRegions {
     /// The rows that actually show transcript text: the band, less the pinned
     /// header and the search bar.
     pub scrollback: ratatui::layout::Rect,
+    /// The open modal's box, border included.
+    ///
+    /// A picture the terminal holds is a layer above the text and cannot be
+    /// darkened by the modal's own backdrop, so the frame has to know which
+    /// cells the box took: a mark that shares one would float over the dialog
+    /// and is taken down, and a mark beside it is left standing. See
+    /// [`crate::row_marks`].
+    pub modal: Option<ratatui::layout::Rect>,
     /// The close affordance on the open modal's top border.
     pub modal_close: Option<ratatui::layout::Rect>,
     /// The composer's text rows, for click-to-place-the-cursor.
@@ -1439,6 +1447,7 @@ impl FrameRegions {
         // composer nobody can see would take the keyboard.
         self.list = None;
         self.banner = None;
+        self.modal = None;
         self.modal_close = None;
         self.composer = None;
         self.composer_band = None;
