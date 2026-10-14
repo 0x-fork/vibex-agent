@@ -22139,7 +22139,8 @@ impl VibexWorkbench {
                                 request_session_id.clone(),
                             )
                             .await?;
-                            (page.items, page.has_older)
+                            let starts_mid_turn = !page.starts_at_turn_start;
+                            (page.items, page.has_older, starts_mid_turn)
                         }
                     }
                 }
@@ -102850,6 +102851,7 @@ mod tests {
             end_sequence: Some(500),
             has_older: false,
             has_newer: true,
+            starts_at_turn_start: true,
         };
 
         assert_eq!(
