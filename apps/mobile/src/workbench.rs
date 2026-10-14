@@ -15,9 +15,13 @@ use vibex_backend::{
 use vibex_core::{
     FileEntryKind, FilePreviewKind, FileSearchRequest, GitBranchSummary, GitChange, GitChangeKind,
     GitCommitDetail, GitCommitDetailRequest, GitCommitFileChange, GitCommitSummary,
-    GitDiffResponse, GitHistoryRequest, GitRemoteActionKind, GitRemoteActionRequest,
-    GitStageRequest, RemoteActionClass, TerminalCreateRequest, TerminalId, TerminalSnapshot,
-    TerminalStatus, VibexSessionId, WorkspaceId,
+    GitDiffResponse, GitHistoryRequest, GitManagedWorktreeRecord, GitRemoteActionKind,
+    GitRemoteActionRequest, GitStageRequest, GitWorktreeConflictStageRequest,
+    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
+    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
+    GitWorktreeOperationRequest, GitWorktreeOperationStatus, GitWorktreeReadinessRequest,
+    GitWorktreeReadinessState, RemoteActionClass, TerminalCreateRequest, TerminalId,
+    TerminalSnapshot, TerminalStatus, VibexSessionId, WorkspaceId,
 };
 use vibex_desktop_model::{
     FileGitSignal, FileIconDescriptor, FileIconKind, GitPathSelectionState, GitQueryKind,
@@ -313,6 +317,13 @@ pub struct MobileWorkbench {
     /// The scroll handle for the diff sheet, so a freshly opened diff starts at
     /// its first line instead of wherever the tree behind it was scrolled to.
     git_diff_scroll: ScrollHandle,
+    /// The worktree lifecycle: what the authority reports about this
+    /// workspace's worktree, the merge plan being confirmed, and the
+    /// destructive action waiting for its confirmation.
+    worktree_lifecycle: Option<GitWorktreeLifecycleSnapshot>,
+    worktree_lifecycle_loading: bool,
+    worktree_merge_plan: Option<GitWorktreeMergePlan>,
+    worktree_confirmation: Option<WorktreeConfirmation>,
     /// How many lines of the open diff are shown. A long patch is read a page
     /// at a time rather than cut off, which is what the hard limit used to do.
     git_diff_limit: usize,
@@ -454,6 +465,10 @@ impl MobileWorkbench {
             file_goto_input: None,
             git_diff: None,
             git_diff_scroll: ScrollHandle::new(),
+            worktree_lifecycle: None,
+            worktree_lifecycle_loading: false,
+            worktree_merge_plan: None,
+            worktree_confirmation: None,
             git_diff_limit: GIT_DIFF_PAGE_LINES,
             git_revert_confirmation: None,
             git_status_error: None,
@@ -524,7 +539,10 @@ impl MobileWorkbench {
         self.surface = surface;
         match surface {
             WorkbenchSurface::Files => self.refresh_files(cx),
-            WorkbenchSurface::Git => self.refresh_git(cx),
+            WorkbenchSurface::Git => {
+                self.refresh_git(cx);
+                self.refresh_worktree_lifecycle(cx);
+            }
             WorkbenchSurface::Terminal => self.refresh_terminals(cx),
         }
         cx.notify();
@@ -1228,6 +1246,452 @@ impl MobileWorkbench {
             locale::common("Desktop file version loaded").to_string(),
             cx,
         );
+    }
+
+    /// Reads what the authority knows about this workspace's worktree.
+    ///
+    /// The desktop's Git panel carries a lifecycle card for a managed
+    /// worktree; a phone that starts a session in one had no way to finish
+    /// with it, so the worktree could be created and never merged back.
+    fn refresh_worktree_lifecycle(&mut self, cx: &mut Context<Self>) {
+        if !self
+            .git
+            .capabilities()
+            .supports(BackendOperation::GitWorktreeLifecycleMutate)
+            && !self
+                .git
+                .capabilities()
+                .supports(BackendOperation::GitWorktreeRead)
+        {
+            return;
+        }
+        let backend = self.backend.clone();
+        let workspace_id = self.workspace_id.clone();
+        self.worktree_lifecycle_loading = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.git_worktree_snapshot(workspace_id).await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.worktree_lifecycle_loading = false;
+                match outcome {
+                    Ok(snapshot) => this.worktree_lifecycle = Some(snapshot),
+                    // A workspace that is not a managed worktree is not an
+                    // error: the card is simply not drawn.
+                    Err(_) => this.worktree_lifecycle = None,
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// The managed worktree this rail is pointed at, when it is one.
+    fn managed_worktree(&self) -> Option<&GitManagedWorktreeRecord> {
+        let snapshot = self.worktree_lifecycle.as_ref()?;
+        snapshot.managed_worktrees.iter().find(|worktree| {
+            worktree
+                .workspace_id
+                .as_ref()
+                .is_some_and(|id| id == &self.workspace_id)
+        })
+    }
+
+    /// The merge or archive operation this worktree is in the middle of.
+    fn active_worktree_operation(&self) -> Option<&GitWorktreeOperationRecord> {
+        let snapshot = self.worktree_lifecycle.as_ref()?;
+        let workspace_id = self.workspace_id.as_str();
+        snapshot.operations.iter().find(|operation| {
+            operation.status == GitWorktreeOperationStatus::Running
+                || operation.status == GitWorktreeOperationStatus::Queued
+                || (operation.status == GitWorktreeOperationStatus::Failed
+                    && operation.source_workspace_id.as_ref().map(|id| id.as_str())
+                        == Some(workspace_id))
+        })
+    }
+
+    /// Marks the worktree ready to merge, or takes that back.
+    fn set_worktree_readiness(&mut self, ready: bool, cx: &mut Context<Self>) {
+        let Some(worktree) = self.managed_worktree() else {
+            return;
+        };
+        let request = GitWorktreeReadinessRequest {
+            workspace_id: self.workspace_id.clone(),
+            state: if ready {
+                GitWorktreeReadinessState::ReadyToMerge
+            } else {
+                GitWorktreeReadinessState::Working
+            },
+            expected_source_head: worktree.head.clone(),
+            expected_dirty_fingerprint: None,
+            checks: Vec::new(),
+        };
+        let backend = self.backend.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .git_worktree_set_readiness(MutationRequest::new(request))
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(_) => {
+                        this.notice = Some(
+                            locale::text(
+                                "Worktree marked",
+                                "Worktree 状态已更新",
+                                "Worktree 狀態已更新",
+                            )
+                            .to_string(),
+                        );
+                        this.refresh_worktree_lifecycle(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Asks what a merge would do, and shows the plan before running it.
+    fn plan_worktree_merge(&mut self, cx: &mut Context<Self>) {
+        let Some(worktree) = self.managed_worktree() else {
+            return;
+        };
+        let Some(target_workspace_id) = worktree.target_workspace_id.clone() else {
+            self.error = Some(BackendError::failed(
+                "worktree_target_missing",
+                locale::text(
+                    "This worktree has no workspace to merge into.",
+                    "该 Worktree 没有可合并的目标工作区。",
+                    "該 Worktree 沒有可合併的目標工作區。",
+                ),
+            ));
+            cx.notify();
+            return;
+        };
+        let request = GitWorktreeMergeRequest {
+            workspace_id: self.workspace_id.clone(),
+            source_path: worktree.worktree_path.clone(),
+            target_workspace_id: Some(target_workspace_id),
+            strategy: None,
+            expected_source_head: worktree.head.clone(),
+            expected_target_head: None,
+            preflight_revision: None,
+        };
+        let backend = self.backend.clone();
+        self.busy = true;
+        let runner =
+            gpui_tokio::Tokio::spawn(
+                cx,
+                async move { backend.git_worktree_merge_plan(request).await },
+            );
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(plan) => {
+                        this.worktree_confirmation =
+                            Some(WorktreeConfirmation::Merge(Box::new(plan)));
+                        this.error = None;
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Runs the merge the reader confirmed.
+    fn confirm_worktree_merge(&mut self, cx: &mut Context<Self>) {
+        let Some(WorktreeConfirmation::Merge(plan)) = self.worktree_confirmation.take() else {
+            return;
+        };
+        let request = GitWorktreeMergeRequest {
+            workspace_id: plan.source_workspace_id.clone(),
+            source_path: plan.source_path.clone(),
+            target_workspace_id: Some(plan.target_workspace_id.clone()),
+            strategy: None,
+            expected_source_head: Some(plan.source_head.clone()),
+            expected_target_head: Some(plan.target_head.clone()),
+            preflight_revision: Some(plan.preflight.revision.clone()),
+        };
+        let backend = self.backend.clone();
+        self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .git_worktree_merge(MutationRequest::new(request))
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(_) => {
+                        this.notice = Some(
+                            locale::text("Merge started", "已开始合并", "已開始合併").to_string(),
+                        );
+                        this.refresh_worktree_lifecycle(cx);
+                        this.refresh_git(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Abandons the merge that is in progress.
+    fn abort_worktree_merge(&mut self, cx: &mut Context<Self>) {
+        let Some(operation_id) = self
+            .active_worktree_operation()
+            .map(|operation| operation.operation_id.clone())
+        else {
+            return;
+        };
+        self.run_worktree_operation_action(WorktreeOperationAction::Abort, operation_id, cx);
+    }
+
+    /// Marks the conflicted paths resolved, which is what a merge needs to go
+    /// on. A phone cannot edit a three-way merge by hand, so the reader fixes
+    /// the files in the editor and then says so here.
+    fn stage_worktree_conflicts(&mut self, cx: &mut Context<Self>) {
+        let Some(operation_id) = self
+            .active_worktree_operation()
+            .map(|operation| operation.operation_id.clone())
+        else {
+            return;
+        };
+        let paths = self
+            .active_worktree_operation()
+            .map(|operation| {
+                operation
+                    .detail
+                    .conflicts
+                    .iter()
+                    .filter(|conflict| !conflict.resolved)
+                    .map(|conflict| conflict.path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if paths.is_empty() {
+            self.notice = Some(
+                locale::text(
+                    "No conflicted files are listed",
+                    "没有列出冲突文件",
+                    "沒有列出衝突檔案",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let request = GitWorktreeConflictStageRequest {
+            operation_id: operation_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            paths,
+        };
+        let backend = self.backend.clone();
+        self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .git_worktree_stage_conflicts(MutationRequest::new(request))
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(_) => {
+                        this.notice = Some(
+                            locale::text(
+                                "Conflicts staged",
+                                "冲突已标记为已解决",
+                                "衝突已標記為已解決",
+                            )
+                            .to_string(),
+                        );
+                        this.refresh_worktree_lifecycle(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Carries the merge on once its conflicts are resolved.
+    fn continue_worktree_merge(&mut self, cx: &mut Context<Self>) {
+        let Some(operation_id) = self
+            .active_worktree_operation()
+            .map(|operation| operation.operation_id.clone())
+        else {
+            return;
+        };
+        self.run_worktree_operation_action(WorktreeOperationAction::Continue, operation_id, cx);
+    }
+
+    /// Runs one of the two operations that act on a merge already in flight.
+    fn run_worktree_operation_action(
+        &mut self,
+        action: WorktreeOperationAction,
+        operation_id: vibex_core::RequestId,
+        cx: &mut Context<Self>,
+    ) {
+        let request = GitWorktreeOperationRequest {
+            operation_id,
+            workspace_id: self.workspace_id.clone(),
+        };
+        let backend = self.backend.clone();
+        self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            match action {
+                WorktreeOperationAction::Abort => {
+                    backend
+                        .git_worktree_abort_merge(MutationRequest::new(request))
+                        .await
+                }
+                WorktreeOperationAction::Continue => {
+                    backend
+                        .git_worktree_continue_merge(MutationRequest::new(request))
+                        .await
+                }
+            }
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(_) => {
+                        this.notice = Some(
+                            match action {
+                                WorktreeOperationAction::Abort => {
+                                    locale::text("Merge aborted", "已中止合并", "已中止合併")
+                                }
+                                WorktreeOperationAction::Continue => {
+                                    locale::text("Merge continued", "已继续合并", "已繼續合併")
+                                }
+                            }
+                            .to_string(),
+                        );
+                        this.refresh_worktree_lifecycle(cx);
+                        this.refresh_git(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Asks what discarding would cost, then asks the reader to confirm it.
+    fn plan_worktree_discard(&mut self, cx: &mut Context<Self>) {
+        let Some(worktree) = self.managed_worktree() else {
+            return;
+        };
+        let request = GitWorktreeDiscardRequest {
+            workspace_id: self.workspace_id.clone(),
+            worktree_path: worktree.worktree_path.clone(),
+            force: false,
+            delete_branch: false,
+            expected_head: worktree.head.clone(),
+            preflight_revision: None,
+        };
+        let backend = self.backend.clone();
+        self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.git_worktree_discard_preflight(request).await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(preflight) => {
+                        this.worktree_confirmation =
+                            Some(WorktreeConfirmation::Discard(Box::new(preflight)));
+                        this.error = None;
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Discards the worktree the reader confirmed.
+    fn confirm_worktree_discard(&mut self, cx: &mut Context<Self>) {
+        let Some(WorktreeConfirmation::Discard(preflight)) = self.worktree_confirmation.take()
+        else {
+            return;
+        };
+        let request = GitWorktreeDiscardRequest {
+            workspace_id: self.workspace_id.clone(),
+            worktree_path: self
+                .managed_worktree()
+                .map(|worktree| worktree.worktree_path.clone())
+                .unwrap_or_default(),
+            force: false,
+            delete_branch: false,
+            expected_head: preflight.source_head.clone(),
+            preflight_revision: Some(preflight.revision.clone()),
+        };
+        let backend = self.backend.clone();
+        self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .git_worktree_discard(MutationRequest::new(request))
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(_) => {
+                        this.notice = Some(
+                            locale::text(
+                                "Worktree discarded",
+                                "Worktree 已丢弃",
+                                "Worktree 已丟棄",
+                            )
+                            .to_string(),
+                        );
+                        this.refresh_worktree_lifecycle(cx);
+                        this.refresh_git(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    fn cancel_worktree_confirmation(&mut self, cx: &mut Context<Self>) {
+        if self.worktree_confirmation.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn refresh_git(&mut self, cx: &mut Context<Self>) {
@@ -3759,6 +4223,365 @@ impl MobileWorkbench {
             .into_any_element()
     }
 
+    /// The worktree lifecycle card: what this worktree is, and what can be
+    /// done with it.
+    ///
+    /// Only drawn for a managed worktree. A phone could start a session in one
+    /// and never finish with it, which made the worktree a one-way door.
+    fn render_worktree_card(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let worktree = self.managed_worktree()?;
+        let readiness = self
+            .worktree_lifecycle
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .readiness
+                    .iter()
+                    .find(|record| record.workspace_id == self.workspace_id)
+            })
+            .map(|record| record.state)
+            .unwrap_or_default();
+        let branch = worktree
+            .branch
+            .clone()
+            .unwrap_or_else(|| locale::text("detached", "游离分支", "游離分支").to_string());
+        let ready = readiness == GitWorktreeReadinessState::ReadyToMerge;
+        let operation = self.active_worktree_operation();
+        let conflicts = operation
+            .map(|operation| {
+                operation
+                    .detail
+                    .conflicts
+                    .iter()
+                    .filter(|conflict| !conflict.resolved)
+                    .count()
+            })
+            .unwrap_or(0);
+        let merging = operation.is_some();
+        let can_mutate = self
+            .git
+            .capabilities()
+            .supports(BackendOperation::GitWorktreeLifecycleMutate);
+        Some(
+            div()
+                .id("mobile-worktree-card")
+                .debug_selector(|| "mobile-worktree-card".to_string())
+                .flex_shrink_0()
+                .mx_2()
+                .mt_2()
+                .rounded(px(theme::RADIUS_CARD))
+                .border_1()
+                .border_color(theme::border_default())
+                .bg(theme::bg_card())
+                .p_2()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            svg()
+                                .path("icons/git-branch.svg")
+                                .size(px(theme::ICON_SM))
+                                .flex_shrink_0()
+                                .text_color(theme::accent_purple()),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(theme::font_caption())
+                                .text_color(theme::text_primary())
+                                .child(branch),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(theme::font_micro())
+                                .text_color(if ready {
+                                    theme::accent_green()
+                                } else {
+                                    theme::text_muted()
+                                })
+                                .child(worktree_readiness_label(readiness)),
+                        ),
+                )
+                .when(conflicts > 0, |card| {
+                    card.child(
+                        div()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::accent_yellow())
+                            .child(
+                                locale::text(
+                                    "{} conflicted files",
+                                    "{} 个文件冲突",
+                                    "{} 個檔案衝突",
+                                )
+                                .replace("{}", &conflicts.to_string()),
+                            ),
+                    )
+                })
+                .child(
+                    div()
+                        .mt_1()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(theme::SPACING_XS))
+                        .when(!merging && can_mutate, |actions| {
+                            actions
+                                .child(
+                                    chip_action(
+                                        "worktree-readiness",
+                                        if ready {
+                                            locale::text("Not ready", "标记未就绪", "標記未就緒")
+                                        } else {
+                                            locale::text("Mark ready", "标记就绪", "標記就緒")
+                                        },
+                                        !self.busy,
+                                    )
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.set_worktree_readiness(!ready, cx)
+                                        }),
+                                    ),
+                                )
+                                .child(
+                                    chip_action(
+                                        "worktree-merge",
+                                        locale::text("Merge back", "合并回去", "合併回去"),
+                                        !self.busy,
+                                    )
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.plan_worktree_merge(cx)),
+                                    ),
+                                )
+                                .child(
+                                    chip_action(
+                                        "worktree-discard",
+                                        locale::text("Discard", "丢弃", "丟棄"),
+                                        !self.busy,
+                                    )
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.plan_worktree_discard(cx)
+                                        }),
+                                    ),
+                                )
+                        })
+                        // A merge in flight is finished or abandoned here; a
+                        // phone cannot edit a three-way merge, so the files are
+                        // fixed in the editor and marked resolved from here.
+                        .when(merging && can_mutate, |actions| {
+                            actions
+                                .when(conflicts > 0, |actions| {
+                                    actions.child(
+                                        chip_action(
+                                            "worktree-stage-conflicts",
+                                            locale::text(
+                                                "Mark resolved",
+                                                "标记已解决",
+                                                "標記已解決",
+                                            ),
+                                            !self.busy,
+                                        )
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.stage_worktree_conflicts(cx)
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .child(
+                                    chip_action(
+                                        "worktree-continue",
+                                        locale::text("Continue", "继续", "繼續"),
+                                        !self.busy,
+                                    )
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.continue_worktree_merge(cx)
+                                        }),
+                                    ),
+                                )
+                                .child(
+                                    chip_action(
+                                        "worktree-abort",
+                                        locale::text("Abort merge", "中止合并", "中止合併"),
+                                        !self.busy,
+                                    )
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.abort_worktree_merge(cx)),
+                                    ),
+                                )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The plan or preflight a lifecycle action is waiting on.
+    fn render_worktree_confirmation(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(confirmation) = self.worktree_confirmation.as_ref() else {
+            return div().into_any_element();
+        };
+        let (title, detail, confirm_label) = match confirmation {
+            WorktreeConfirmation::Merge(plan) => (
+                locale::text(
+                    "Merge this worktree back?",
+                    "把这个 Worktree 合并回去？",
+                    "把這個 Worktree 合併回去？",
+                ),
+                format!(
+                    "{} {} · +{} −{}",
+                    plan.source_branch,
+                    locale::text("into", "合并到", "合併到"),
+                    plan.summary.additions,
+                    plan.summary.deletions
+                ),
+                locale::common("Merge"),
+            ),
+            WorktreeConfirmation::Discard(preflight) => (
+                locale::text(
+                    "Discard this worktree?",
+                    "丢弃这个 Worktree？",
+                    "丟棄這個 Worktree？",
+                ),
+                if preflight.risks.is_empty() {
+                    locale::text(
+                        "The worktree is removed; its branch is kept.",
+                        "Worktree 会被移除，分支保留。",
+                        "Worktree 會被移除，分支保留。",
+                    )
+                    .to_string()
+                } else {
+                    format!(
+                        "{} {}",
+                        preflight.risks.len(),
+                        locale::text("risks reported", "项风险", "項風險")
+                    )
+                },
+                locale::common("Discard"),
+            ),
+        };
+        let merge = matches!(confirmation, WorktreeConfirmation::Merge(_));
+        div()
+            .id("mobile-worktree-confirmation")
+            .debug_selector(|| "mobile-worktree-confirmation".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.62))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.cancel_worktree_confirmation(cx)),
+            )
+            .child(
+                div()
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .bg(theme::bg_popover())
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .p(px(theme::SPACING_LG))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACING_SM))
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_size(theme::font_heading())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::font_caption())
+                            .text_color(theme::text_muted())
+                            .child(detail),
+                    )
+                    .child(
+                        div()
+                            .mt(px(theme::SPACING_SM))
+                            .flex()
+                            .gap(px(theme::SPACING_SM))
+                            .child(
+                                div()
+                                    .id("worktree-confirm-cancel")
+                                    .flex_1()
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .border_1()
+                                    .border_color(theme::border_default())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .text_size(theme::font_body())
+                                    .text_color(theme::text_secondary())
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.cancel_worktree_confirmation(cx)
+                                        }),
+                                    )
+                                    .child(locale::common("Cancel")),
+                            )
+                            .child(
+                                div()
+                                    .id("worktree-confirm-action")
+                                    .flex_1()
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(if merge {
+                                        theme::primary()
+                                    } else {
+                                        theme::accent_red()
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .active(|style| style.opacity(0.85))
+                                    .text_size(theme::font_body())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(if merge {
+                                        theme::primary_foreground()
+                                    } else {
+                                        theme::bg_primary()
+                                    })
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            if merge {
+                                                this.confirm_worktree_merge(cx)
+                                            } else {
+                                                this.confirm_worktree_discard(cx)
+                                            }
+                                        }),
+                                    )
+                                    .child(confirm_label),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// The author list the history filter picks from.
     fn render_git_author_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let selected = self.git.state.model.history_filter.author.clone();
@@ -5019,6 +5842,7 @@ impl MobileWorkbench {
             .when_some(self.git_diff.clone(), |root, diff| {
                 root.child(self.render_git_diff(diff, cx))
             })
+            .when_some(self.render_worktree_card(cx), |root, card| root.child(card))
             .when(self.git_branch_sheet_open, |root| {
                 root.child(self.render_git_branch_sheet(cx))
             })
@@ -5030,6 +5854,9 @@ impl MobileWorkbench {
             })
             .when(self.file_goto_open, |root| {
                 root.child(self.render_file_goto_prompt(cx))
+            })
+            .when(self.worktree_confirmation.is_some(), |root| {
+                root.child(self.render_worktree_confirmation(cx))
             })
             .into_any_element()
     }
@@ -7662,6 +8489,34 @@ fn file_line_range(text: &str, line_number: usize) -> Option<(usize, usize)> {
     }
     // The last line has no newline after it.
     (current == line_number && start <= text.len()).then_some((start, text.len()))
+}
+
+/// What a worktree's readiness state reads as.
+fn worktree_readiness_label(state: GitWorktreeReadinessState) -> &'static str {
+    match state {
+        GitWorktreeReadinessState::Working => locale::text("Working", "开发中", "開發中"),
+        GitWorktreeReadinessState::Reviewing => locale::text("In review", "审阅中", "審閱中"),
+        GitWorktreeReadinessState::ReadyToMerge => locale::text("Ready", "已就绪", "已就緒"),
+        GitWorktreeReadinessState::MergeQueued => locale::text("Queued", "排队中", "排隊中"),
+        GitWorktreeReadinessState::MergeRunning => locale::text("Merging", "合并中", "合併中"),
+        GitWorktreeReadinessState::Unknown => locale::text("Worktree", "Worktree", "Worktree"),
+    }
+}
+
+/// The two things that can be done to a merge already in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeOperationAction {
+    Abort,
+    Continue,
+}
+
+/// A lifecycle action waiting for the reader to confirm it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorktreeConfirmation {
+    /// The plan a merge would run, shown before it runs.
+    Merge(Box<GitWorktreeMergePlan>),
+    /// Discarding the worktree, with the preflight's own risks.
+    Discard(Box<GitWorktreeDestructivePreflight>),
 }
 
 /// The windows of time the history filter offers.
