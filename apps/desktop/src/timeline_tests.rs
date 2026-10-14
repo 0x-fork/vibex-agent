@@ -1123,11 +1123,20 @@ fn expanding_and_collapsing_process_events_never_overlap_siblings(cx: &mut TestA
 #[test]
 fn an_offscreen_pinned_process_event_keeps_its_own_origin() {
     assert_eq!(
-        timeline_process_measured_origin(20, px(900.0), Some((2, px(300.0)))),
+        timeline_process_measured_origin(20, px(900.0), Some((2, px(300.0))), px(0.0)),
         px(900.0)
     );
     assert_eq!(
-        timeline_process_measured_origin(3, px(72.0), Some((2, px(300.0)))),
+        timeline_process_measured_origin(3, px(72.0), Some((2, px(300.0))), px(0.0)),
+        px(300.0)
+    );
+    assert_eq!(
+        timeline_process_measured_origin(
+            3,
+            px(72.0),
+            Some((2, px(300.0))),
+            px(TIMELINE_PROCESS_UNIT_GAP)
+        ),
         px(300.0 + TIMELINE_PROCESS_UNIT_GAP)
     );
 }
@@ -2194,5 +2203,122 @@ fn an_expanded_group_body_builds_only_the_rows_the_viewport_shows(cx: &mut TestA
         last + 1,
         group_rows,
         "the window should reach the last row, built {built:?}"
+    );
+}
+
+/// The windowed body stacks its rows adjacently, exactly as the inline body it
+/// stands in for does, and never paints one below the box it reserved.
+///
+/// The body reserves the sum of its row table and then places the visible rows
+/// after each other's measured bottoms. Placing them apart by the unit run's
+/// gap instead walked every row after the first past that reserved bottom, and
+/// the body's own clip cut the group's newest rows off at the timeline's
+/// bottom — the occlusion a reader sees while following a live turn, where the
+/// newest activity is a long expanded group.
+#[gpui::test]
+fn an_expanded_group_body_keeps_its_rows_inside_the_box_it_reserves(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    const TOOL_ROWS: usize = 240;
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let workbench = cx.new(|cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            ui_state.session.enhanced_command_execution_display = false;
+            ui_state.session.turn_preview_rail = false;
+            let mut workbench =
+                VibexWorkbench::with_initial_state(None, ui_state, None, window, cx);
+            workbench.agent_loading = false;
+            workbench.selected_session_id = Some(session_id.clone());
+            workbench.view_session_id = Some(session_id.clone());
+            let mut items = vec![live_timeline_item(
+                1,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Check the workspace".into(),
+                    ..Default::default()
+                }),
+            )];
+            for tool in 0..TOOL_ROWS {
+                items.push(progress_tool(items.len() as i64 + 1, tool));
+            }
+            workbench.timeline.replace_authoritative(session_id, items);
+            workbench.rebuild_timeline_sizes();
+            let group_id = workbench
+                .conversation_turns_cache
+                .iter()
+                .find_map(|turn| {
+                    turn.process_activity_groups_with_commands_and_file_operations
+                        .first()
+                        .map(|group| group.id.clone())
+                })
+                .expect("the tool run projects one activity group");
+            workbench.timeline_command_expansion.insert(group_id, true);
+            workbench.request_timeline_scroll_to_latest();
+            workbench
+        });
+        LiveTimelineProbe { workbench }
+    });
+    let workbench = view.read_with(cx, |view, _| view.workbench.clone());
+    for _ in 0..4 {
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+    }
+
+    let (group_id, row_ids) = workbench.read_with(cx, |workbench, _| {
+        let turn = workbench
+            .conversation_turns_cache
+            .iter()
+            .find(|turn| !turn.process_rows.is_empty())
+            .cloned()
+            .expect("the fixture projects one turn");
+        let group = turn
+            .process_activity_groups_with_commands_and_file_operations
+            .first()
+            .cloned()
+            .expect("the fixture projects one activity group");
+        let rows = turn.process_rows[group.start_row..group.end_row]
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        (group.id, rows)
+    });
+
+    let body_selector: &'static str =
+        Box::leak(format!("activity-group-body:{group_id}").into_boxed_str());
+    let body = cx
+        .debug_bounds(body_selector)
+        .expect("the expanded group body is on screen");
+    let mut previous: Option<Bounds<Pixels>> = None;
+    let mut last_built: Option<Bounds<Pixels>> = None;
+    let mut built = 0;
+    for row_id in &row_ids {
+        let selector: &'static str = Box::leak(format!("activity-row:{row_id}").into_boxed_str());
+        let Some(row) = cx.debug_bounds(selector) else {
+            // The window builds one contiguous band, so the rows it skipped sit
+            // above or below it — never between two it built.
+            continue;
+        };
+        if let Some(previous) = previous {
+            assert_eq!(
+                row.top(),
+                previous.bottom(),
+                "rows of one group body stack adjacently, without the unit run's gap ({row_id})"
+            );
+        }
+        assert!(
+            row.bottom() <= body.bottom(),
+            "a row must stay inside the box the body reserved for it ({row_id}): {row:?} vs {body:?}"
+        );
+        previous = Some(row);
+        last_built = Some(row);
+        built += 1;
+    }
+    assert!(built > 1, "the body must build the rows the viewport shows");
+    assert_eq!(
+        last_built.map(|row| row.bottom()),
+        Some(body.bottom() - px(2.0)),
+        "the body's last row ends at the box it reserved, minus its own padding"
     );
 }

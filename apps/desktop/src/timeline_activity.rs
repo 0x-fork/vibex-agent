@@ -403,6 +403,7 @@ pub(super) fn row(
         );
     h_flex()
         .id(id.to_string())
+        .debug_selector(|| format!("activity-row:{id}"))
         .group(HOVER_GROUP)
         .w_full()
         .min_w_0()

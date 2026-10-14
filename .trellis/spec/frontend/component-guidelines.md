@@ -945,13 +945,21 @@ must not pass through a zero-height measurement frame or replay an entry effect.
 
 Windowed process runs place consecutive visible units after the preceding
 unit's current measured bottom (`timeline_process_measured_origin`). A pinned
-offscreen unit keeps its own cached origin. Clip the run while the total extent
-catches up, invalidate nested heights on disclosure changes, and wake an idle
-view when a deferred turn measurement differs from its virtual extent. Active
-disclosure motion may shrink immediately; the streaming text shrink guard must
-not hold a manually closing tool open. Cached unit heights bypass body-based
-estimation. GPUI layout regressions cover repeated open/close without overlap,
-pinned units, first-frame history height, reversal, and settled content resize.
+offscreen unit keeps its own cached origin. The gap handed to that placement is
+the window's own container gap and nothing else: the unit run separates its
+units by `TIMELINE_PROCESS_UNIT_GAP`, while an expanded process group's windowed
+body stacks its rows adjacently, exactly as the inline body it stands in for
+does. The placement and the height the window reserves in the flow are derived
+from the same table, so a gap the table does not hold walks every sibling after
+the first past the reserved bottom and the window's own clip cuts the newest
+rows off. Clip the run while the total extent catches up, invalidate nested
+heights on disclosure changes, and wake an idle view when a deferred turn
+measurement differs from its virtual extent. Active disclosure motion may shrink
+immediately; the streaming text shrink guard must not hold a manually closing
+tool open. Cached unit heights bypass body-based estimation. GPUI layout
+regressions cover repeated open/close without overlap, pinned units, first-frame
+history height, reversal, and settled content resize; a windowed group body also
+asserts that its rows stay adjacent and inside the box it reserved.
 Activity tests additionally cover semantic counts, exact invocation details,
 automatic versus explicit disclosure state, and pointer/keyboard operation with
 aligned columns at narrow widths and multiple rem sizes.

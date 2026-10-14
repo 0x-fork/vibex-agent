@@ -57783,19 +57783,13 @@ impl VibexWorkbench {
             // a unit.
             let pending_reveal = self.pending_permission_reveal_item_id.is_some()
                 || self.pending_session_search_reveal_item_id.is_some();
-            let body_element = if timeline_group_body_windowing()
+            let rows_element = if timeline_group_body_windowing()
                 && !pending_reveal
                 && rows.len() > TIMELINE_GROUP_ROW_WINDOW_MIN_ROWS
             {
                 // SPIKE: build only the rows the viewport shows. See
                 // [`timeline_group_body`] for what the real element still owes.
-                v_flex()
-                    .w_full()
-                    .min_w_0()
-                    .flex_none()
-                    .py_0p5()
-                    .child(self.windowed_group_body(turn, group, rows, turn_live, window, cx))
-                    .into_any_element()
+                self.windowed_group_body(turn, group, rows, turn_live, window, cx)
             } else {
                 let children = rows
                     .iter()
@@ -57810,14 +57804,27 @@ impl VibexWorkbench {
                     .w_full()
                     .min_w_0()
                     .flex_none()
-                    .py_0p5()
                     .children(children)
                     .into_any_element()
             };
             body = body.child(timeline_disclosure_body(
                 format!("activity-body:{}", group.id),
                 progress,
-                body_element,
+                // The box every row of the body is laid out inside, whether the
+                // body windows them or not. The regression that clipped a
+                // windowed group's newest rows is a row painted below this box,
+                // so the test reads it by the group's own selector.
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_none()
+                    .py_0p5()
+                    .debug_selector({
+                        let selector = format!("activity-group-body:{}", group.id);
+                        move || selector.clone()
+                    })
+                    .child(rows_element)
+                    .into_any_element(),
             ));
         }
         body.into_any_element()
@@ -57892,24 +57899,35 @@ impl VibexWorkbench {
         });
 
         let record_entity = entity;
+        let record_session = session_id;
         let record_turn = turn_id;
         let record_group = group_id;
         let record_row_count = rows.len();
         let record = Box::new(move |measurements: &[(usize, f32)], cx: &mut App| {
             let _ = record_entity.update(cx, |this, cx| {
-                let Some(turn) = this.timeline_turn_by_id(&record_turn) else {
-                    return;
-                };
-                let enhanced = this.ui_state.session.enhanced_command_execution_display;
-                let Some(rows) = timeline_group_body_rows(&turn, &record_group, enhanced) else {
-                    return;
-                };
-                // A projection that changed shape under the frame belongs to the
-                // next one; its indices no longer address these measurements.
-                if rows.len() != record_row_count {
-                    return;
-                }
-                this.record_timeline_group_row_heights(rows, measurements, cx);
+                // Prepaint runs after the whole tree is built, so the borrowed
+                // view may already belong to another pane. The measurement
+                // belongs to the session whose rows were laid out, exactly as
+                // the builder routes above and the unit run's recorder does:
+                // writing it into the focused pane's table leaves this pane
+                // placing its rows from estimates for every frame.
+                this.with_session_view_for_render(record_session.as_ref(), |this| {
+                    let Some(turn) = this.timeline_turn_by_id(&record_turn) else {
+                        return;
+                    };
+                    let enhanced = this.ui_state.session.enhanced_command_execution_display;
+                    let Some(rows) = timeline_group_body_rows(&turn, &record_group, enhanced)
+                    else {
+                        return;
+                    };
+                    // A projection that changed shape under the frame belongs to
+                    // the next one; its indices no longer address these
+                    // measurements.
+                    if rows.len() != record_row_count {
+                        return;
+                    }
+                    this.record_timeline_group_row_heights(rows, measurements, cx);
+                });
             });
         });
 
@@ -67337,13 +67355,23 @@ fn timeline_process_visible_units(
 }
 
 /// Place consecutive visible units using this frame's measured extent.
+///
+/// `gap` is the space the window's own container puts between two siblings —
+/// the unit run separates its units by [`TIMELINE_PROCESS_UNIT_GAP`], while an
+/// expanded group's body stacks its rows adjacently, exactly as the inline body
+/// that stands in for the window does. The placement and the extent the window
+/// reserves have to agree on it: a larger gap than the row table was summed
+/// with walks every row after the first past the reserved bottom, and the
+/// window's own clip then cuts the newest rows off. See
+/// [`TimelineGroupBody::prepaint`].
 fn timeline_process_measured_origin(
     index: usize,
     cached_origin: Pixels,
     previous_end: Option<(usize, Pixels)>,
+    gap: Pixels,
 ) -> Pixels {
     match previous_end {
-        Some((previous, end)) if previous + 1 == index => end + px(TIMELINE_PROCESS_UNIT_GAP),
+        Some((previous, end)) if previous + 1 == index => end + gap,
         _ => cached_origin,
     }
 }
@@ -67434,7 +67462,12 @@ impl Element for TimelineProcessRun {
             // The preceding disclosure may have changed height in this very
             // frame. Place siblings after its measured bottom, not its stale
             // cached bottom. A pinned offscreen unit keeps its own origin.
-            let origin = timeline_process_measured_origin(index, origin, previous_end);
+            let origin = timeline_process_measured_origin(
+                index,
+                origin,
+                previous_end,
+                px(TIMELINE_PROCESS_UNIT_GAP),
+            );
             previous_end = Some((index, origin + measured.height));
             window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
                 unit.prepaint_at(bounds.origin + point(px(0.0), origin), window, cx);

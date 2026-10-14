@@ -173,8 +173,13 @@ impl Element for TimelineGroupBody {
             let measured = row.layout_as_root(available_space, window, cx);
             // The preceding disclosure may have changed height in this very
             // frame. Place siblings after its measured bottom, not its stale
-            // cached bottom.
-            let origin = super::timeline_process_measured_origin(index, origin, previous_end);
+            // cached bottom. The body's rows are adjacent, exactly as the
+            // inline body stacks them: the row table the reserved height is
+            // summed from holds no gap either, so placing them with the unit
+            // run's gap instead would push every row after the first past the
+            // bottom this element reserves and clip the group's newest rows.
+            let origin =
+                super::timeline_process_measured_origin(index, origin, previous_end, px(0.0));
             previous_end = Some((index, origin + measured.height));
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
                 row.prepaint_at(bounds.origin + point(px(0.0), origin), window, cx);
