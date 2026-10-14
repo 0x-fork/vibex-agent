@@ -2756,7 +2756,12 @@ impl App {
             sessions,
         );
         let view = vibex_desktop_model::SidebarOrganizationView::from_remote(snapshot);
-        if !view.arranges_anything() {
+        // An arrangement that arranges nothing is dropped rather than adopted,
+        // but a snapshot can carry something else a client cannot invent: the
+        // scheduled sends the authority is holding. Those are kept even when
+        // the tree is empty, because dropping the view would drop the only
+        // account of a session waiting on an hour.
+        if !view.arranges_anything() && view.scheduled_sends.is_empty() {
             return self.projection.sidebar_organization.take().is_some();
         }
         let changed = self.projection.sidebar_organization.as_ref() != Some(&view);
@@ -5759,19 +5764,72 @@ impl App {
             .min_by_key(|queued| queued.scheduled_at_ms)
     }
 
+    /// The next send another client is holding for one session.
+    ///
+    /// A schedule belongs to whoever keeps its clock, and this client is not
+    /// always that client: the Desktop arms a message, waits for the hour in
+    /// its own process and publishes the fact through the arrangement every
+    /// client already polls for its sidebar marks. Reading it here is what lets
+    /// a row count down — and a session page say what is waiting — without this
+    /// client pretending it could send something it is not holding.
+    pub fn authority_scheduled_send(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> Option<&vibex_desktop_model::SidebarScheduledSend> {
+        self.projection
+            .sidebar_organization
+            .as_ref()?
+            .scheduled_send_for(session_id.as_str())
+    }
+
+    /// The earliest send one session is waiting for, whichever client holds it.
+    ///
+    /// The words and the hour come back together: a row borrows the words as
+    /// the session's name while it has none of its own, and every surface that
+    /// shows the wait counts down to the same hour. Two clients can be holding
+    /// a send for one session, and what the reader is waiting for is whichever
+    /// goes out first.
+    pub fn earliest_scheduled_send(&self, session_id: &VibexSessionId) -> Option<(&str, i64)> {
+        let held = self
+            .scheduled_message_for(session_id)
+            .and_then(|queued| Some((queued.text.as_str(), queued.scheduled_at_ms?)));
+        let shared = self
+            .authority_scheduled_send(session_id)
+            .map(|send| (send.text.as_str(), send.scheduled_at_ms));
+        match (held, shared) {
+            (Some(held), Some(shared)) => Some(if held.1 <= shared.1 { held } else { shared }),
+            (held, shared) => held.or(shared),
+        }
+    }
+
     /// The deadline of the next message one session is waiting to send.
     pub fn next_scheduled_message_at(&self, session_id: &VibexSessionId) -> Option<i64> {
-        self.scheduled_message_for(session_id)
-            .and_then(|queued| queued.scheduled_at_ms)
+        self.earliest_scheduled_send(session_id)
+            .map(|(_, at_ms)| at_ms)
     }
 
     /// The earliest deadline any session is waiting on, so a tick can tell
     /// whether the countdowns on screen have moved.
     pub fn next_scheduled_message_at_anywhere(&self) -> Option<i64> {
-        self.queued_messages
+        let held = self
+            .queued_messages
             .iter()
             .filter_map(|queued| queued.scheduled_at_ms)
-            .min()
+            .min();
+        // Another client's sends count too: the seconds on its rows are the
+        // same seconds, and a page that only repainted for this client's own
+        // queue would sit on a countdown that had stopped moving.
+        let shared = self
+            .projection
+            .sidebar_organization
+            .as_ref()
+            .and_then(|view| {
+                view.scheduled_sends
+                    .iter()
+                    .map(|send| send.scheduled_at_ms)
+                    .min()
+            });
+        [held, shared].into_iter().flatten().min()
     }
 
     /// The name a session borrows from the scheduled message it is still
@@ -5783,10 +5841,12 @@ impl App {
     /// snapshot would put that placeholder on the row. The name is read from
     /// what the reader wrote instead, and stops being read the moment the send
     /// leaves the queue — which is exactly what leaves the Agent's own rename
-    /// free to land once the message has really been sent.
+    /// free to land once the message has really been sent. A send another client
+    /// is holding names the row the same way: the reader who armed it on the
+    /// Desktop is owed the same row here.
     pub fn pending_scheduled_session_title(&self, session: &AgentSession) -> Option<String> {
-        let queued = self.scheduled_message_for(&session.id)?;
-        let title = vibex_core::normalize_agent_session_title(&queued.text)?;
+        let (text, _) = self.earliest_scheduled_send(&session.id)?;
+        let title = vibex_core::normalize_agent_session_title(text)?;
         let fallback = session_fallback_title(&session.agent_id);
         (session.title == fallback || session.title == title).then_some(title)
     }
@@ -8152,6 +8212,121 @@ mod tests {
         session.title = "Migrate the scheduler".to_string();
         assert_eq!(app.pending_scheduled_session_title(&session), None);
         assert_eq!(app.session_row_title(&session), "Migrate the scheduler");
+    }
+
+    /// A snapshot carrying one send another client is holding.
+    fn held_send_snapshot(
+        session_id: &VibexSessionId,
+        message_id: u64,
+        text: &str,
+        scheduled_at_ms: i64,
+    ) -> vibex_core::RemoteSidebarOrganizationSnapshot {
+        vibex_core::RemoteSidebarOrganizationSnapshot {
+            revision: 3,
+            scheduled_sends: vec![vibex_core::RemoteScheduledSend {
+                session_id: session_id.as_str().to_string(),
+                message_id,
+                text: text.to_string(),
+                scheduled_at_ms,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_send_another_client_holds_marks_the_row_and_names_it() {
+        // The Desktop armed the message and keeps its clock; this client can
+        // neither send it nor move it, but a reader looking at the list is owed
+        // the same row the Desktop draws.
+        let session_id = VibexSessionId::new();
+        let mut app = scheduled_app(&session_id);
+        let at_ms = vibex_core::unix_timestamp_ms() + 90_000;
+        app.apply_sidebar_organization(&held_send_snapshot(
+            &session_id,
+            4,
+            "  Fix   the flake  ",
+            at_ms,
+        ));
+
+        let mut session = unnamed_session(&session_id, "codex");
+        assert_eq!(app.next_scheduled_message_at(&session_id), Some(at_ms));
+        assert_eq!(
+            app.session_schedule_countdown(&session_id, at_ms - 90_000)
+                .as_deref(),
+            Some("00:01:30")
+        );
+        assert_eq!(
+            app.pending_scheduled_session_title(&session).as_deref(),
+            Some("Fix the flake")
+        );
+        assert_eq!(app.session_row_title(&session), "Fix the flake");
+
+        // The borrowed name stands in for the placeholder and nothing else.
+        session.title = "Migrate the scheduler".to_string();
+        assert_eq!(app.pending_scheduled_session_title(&session), None);
+    }
+
+    #[test]
+    fn a_snapshot_that_only_carries_a_send_is_still_kept() {
+        // The arrangement is not the only thing the authority publishes. A
+        // client that dropped a sends-only snapshot would drop the only account
+        // of a session waiting on an hour.
+        let session_id = VibexSessionId::new();
+        let mut app = scheduled_app(&session_id);
+        let at_ms = vibex_core::unix_timestamp_ms() + 60_000;
+        app.apply_sidebar_organization(&held_send_snapshot(&session_id, 1, "later", at_ms));
+        assert!(app.sidebar_organization().is_some());
+        assert_eq!(app.next_scheduled_message_at(&session_id), Some(at_ms));
+
+        // A snapshot with nothing at all still lets the view go.
+        app.apply_sidebar_organization(&vibex_core::RemoteSidebarOrganizationSnapshot {
+            revision: 4,
+            ..Default::default()
+        });
+        assert!(app.sidebar_organization().is_none());
+        assert_eq!(app.next_scheduled_message_at(&session_id), None);
+    }
+
+    #[test]
+    fn the_row_counts_down_to_the_send_that_goes_out_first() {
+        let session_id = VibexSessionId::new();
+        let mut app = scheduled_app(&session_id);
+        let now_ms = vibex_core::unix_timestamp_ms();
+        let theirs = now_ms + 600_000;
+        app.apply_sidebar_organization(&held_send_snapshot(&session_id, 1, "theirs", theirs));
+
+        app.enqueue_scheduled(
+            session_id.clone(),
+            "mine".to_string(),
+            Vec::new(),
+            Some(now_ms + 60_000),
+        );
+        assert_eq!(
+            app.next_scheduled_message_at(&session_id),
+            Some(now_ms + 60_000)
+        );
+        assert_eq!(
+            app.earliest_scheduled_send(&session_id)
+                .map(|(text, _)| text),
+            Some("mine")
+        );
+
+        // And the other way round: the hour another client holds is the one the
+        // row counts down to, and the one the seconds are repainted for.
+        app.queued_messages.clear();
+        app.enqueue_scheduled(
+            session_id.clone(),
+            "mine".to_string(),
+            Vec::new(),
+            Some(now_ms + 900_000),
+        );
+        assert_eq!(app.next_scheduled_message_at(&session_id), Some(theirs));
+        assert_eq!(
+            app.earliest_scheduled_send(&session_id)
+                .map(|(text, _)| text),
+            Some("theirs")
+        );
+        assert_eq!(app.next_scheduled_message_at_anywhere(), Some(theirs));
     }
 
     /// A session the manager persisted for a creation that carried no title.

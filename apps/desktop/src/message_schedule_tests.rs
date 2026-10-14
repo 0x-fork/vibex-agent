@@ -250,6 +250,63 @@ fn moving_a_scheduled_message_keeps_its_deadline_but_send_now_clears_it() {
 }
 
 #[test]
+fn only_the_messages_waiting_on_an_hour_are_published_to_other_clients() {
+    // A queue holds two different things: a message waiting for this window's
+    // turn, and a message waiting for the clock. Only the second is a fact
+    // another client can draw — and act on.
+    let session = VibexSessionId::new();
+    assert!(published_scheduled_send(&queued(1, &session, None)).is_none());
+
+    let published = published_scheduled_send(&queued(2, &session, Some(1_800_000_000_000)))
+        .expect("a message with an hour travels");
+    assert_eq!(published.session_id, session.as_str());
+    assert_eq!(published.message_id, 2);
+    assert_eq!(published.text, "scheduled message 2");
+    assert_eq!(published.scheduled_at_ms, 1_800_000_000_000);
+}
+
+#[test]
+fn another_clients_deadline_lands_on_the_message_it_names() {
+    let session = VibexSessionId::new();
+    let other = VibexSessionId::new();
+    let mut queue = vec![
+        queued(1, &session, Some(1_000)),
+        queued(2, &other, Some(2_000)),
+    ];
+
+    assert!(set_queued_message_schedule(
+        &mut queue,
+        session.as_str(),
+        1,
+        Some(9_000)
+    ));
+    assert_eq!(queue[0].scheduled_at_ms, Some(9_000));
+    assert_eq!(queue[0].text, "scheduled message 1", "the words stay");
+    assert_eq!(queue[1].scheduled_at_ms, Some(2_000), "the other session's");
+    assert_eq!(queue.len(), 2, "a deadline is not a deletion");
+
+    // Cancelling hands the message back to the ordinary queue.
+    assert!(set_queued_message_schedule(
+        &mut queue,
+        session.as_str(),
+        1,
+        None
+    ));
+    assert_eq!(queue[0].scheduled_at_ms, None);
+    assert_eq!(queue[0].id, 1);
+
+    // An id is only unique inside the queue that minted it, so the session is
+    // part of the address: another session's message is not this one.
+    assert!(!set_queued_message_schedule(
+        &mut queue,
+        other.as_str(),
+        1,
+        Some(1_000)
+    ));
+    assert_eq!(queue[0].scheduled_at_ms, None);
+}
+
+#[test]
 fn empty_scheduled_drafts_survive_switches_and_are_consumed_with_the_message() {
     let mut drafts = ComposerDraftStore::default();
     let draft = |schedule| ComposerDraft {

@@ -23,6 +23,7 @@ use crate::app::{
 use crate::composer::{CompletionMenu, CompletionTrigger};
 use crate::keymap::Scope;
 use crate::runtime_picker::{PICKER_PAGE_ROWS, RuntimePickerRow};
+use crate::schedule::ScheduleEditTarget;
 use crate::view::block_detail_text;
 use vibex_core::SessionRuntimeSelection;
 
@@ -722,7 +723,11 @@ impl App {
                     return Outcome::quiet();
                 }
                 let Some((text, attachments)) = self.take_queued_message() else {
-                    return Outcome::quiet();
+                    // Nothing of this client's is held, so the send the reader
+                    // is asking for is the one another client is waiting on:
+                    // the same instruction travels as a deadline of now, and
+                    // the holder releases it through the ordinary send path.
+                    return self.send_held_schedule_now();
                 };
                 let Some(session_id) = self.selected_session_id().cloned() else {
                     return Outcome::quiet();
@@ -1810,16 +1815,49 @@ impl App {
     /// reader who came back to change the hour does not have to type the whole
     /// deadline again — and a draft with no schedule opens on the deadline
     /// someone who has not decided yet almost always means.
+    ///
+    /// An empty draft is nothing to put an hour on, and a reader pressing the
+    /// clock there is looking at the send their session is already waiting for
+    /// — which another client may be the one keeping. Editing that one is the
+    /// same gesture: the value travels to whoever holds the clock, and this
+    /// client arms nothing it cannot send.
     fn open_message_schedule(&mut self) -> Outcome {
         let Some(target) = self.composer_target.clone() else {
             return Outcome::quiet();
         };
-        let initial = self.draft_schedule();
         let now_ms = vibex_core::unix_timestamp_ms();
+        let edit = if self.composer.is_empty() && self.draft_schedule().is_none() {
+            self.held_schedule_target(&target)
+                .unwrap_or(ScheduleEditTarget::Draft(target))
+        } else {
+            ScheduleEditTarget::Draft(target)
+        };
+        let initial = match &edit {
+            ScheduleEditTarget::Draft(_) => self.draft_schedule(),
+            ScheduleEditTarget::Held { session_id, .. } => self
+                .authority_scheduled_send(session_id)
+                .map(|send| crate::schedule::MessageSchedule::At(send.scheduled_at_ms)),
+        };
         self.overlay = Some(Overlay::Schedule(
-            crate::schedule::MessageScheduleForm::new(target, initial, now_ms),
+            crate::schedule::MessageScheduleForm::new(edit, initial, now_ms),
         ));
         Outcome::effects(vec![])
+    }
+
+    /// The send this client is not holding, when the Composer is sitting on the
+    /// session that is waiting for one.
+    ///
+    /// The composing page has no session yet, so there is nothing published to
+    /// edit there: a draft that has not been sent has no queue entry anywhere.
+    fn held_schedule_target(&self, target: &ComposerTarget) -> Option<ScheduleEditTarget> {
+        let ComposerTarget::Session(session_id) = target else {
+            return None;
+        };
+        let send = self.authority_scheduled_send(session_id)?;
+        Some(ScheduleEditTarget::Held {
+            session_id: session_id.clone(),
+            message_id: send.message_id,
+        })
     }
 
     /// The schedule editor's own keys.
@@ -1868,13 +1906,16 @@ impl App {
         }
     }
 
-    /// Write the editor's value onto the draft it was opened for.
+    /// Write the editor's value onto the draft it was opened for, or send it to
+    /// whoever is holding the send it was opened for.
     ///
     /// A value the send path would refuse keeps the surface open with the
     /// reason, which is what lets the reader fix it rather than lose it. The
     /// target is re-checked because the reader may have navigated while the
     /// editor was up: a schedule written onto whatever happens to be in front
-    /// of them now is worse than no schedule at all.
+    /// of them now is worse than no schedule at all. A held send is re-checked
+    /// the same way, against the send the authority last published — a message
+    /// that has gone out since cannot be given a new hour.
     fn apply_schedule(&mut self, form: crate::schedule::MessageScheduleForm) -> Outcome {
         let now_ms = vibex_core::unix_timestamp_ms();
         let schedule = match form.validate(now_ms) {
@@ -1886,36 +1927,135 @@ impl App {
                 return Outcome::effects(vec![]);
             }
         };
-        if self.composer_target.as_ref() != Some(&form.target) {
-            self.overlay = None;
-            return Outcome::effects(vec![]);
+        match &form.target {
+            ScheduleEditTarget::Draft(target) => {
+                if self.composer_target.as_ref() != Some(target) {
+                    self.overlay = None;
+                    return Outcome::effects(vec![]);
+                }
+                self.set_draft_schedule(Some(schedule));
+                self.overlay = None;
+                self.toast(Toast::info(format!(
+                    "{} · {}",
+                    self.strings.schedule_set(),
+                    crate::schedule::schedule_summary(schedule)
+                )));
+                Outcome::effects(vec![])
+            }
+            ScheduleEditTarget::Held {
+                session_id,
+                message_id,
+            } => {
+                let (session_id, message_id) = (session_id.clone(), *message_id);
+                let at_ms = schedule
+                    .deadline(now_ms)
+                    .expect("a validated schedule names a deadline");
+                self.overlay = None;
+                let Some(effect) = self.set_held_schedule(session_id, message_id, Some(at_ms))
+                else {
+                    return Outcome::effects(vec![]);
+                };
+                self.toast(Toast::info(format!(
+                    "{} · {}",
+                    self.strings.schedule_set(),
+                    crate::schedule::format_send_time(at_ms)
+                )));
+                Outcome::effects(vec![effect])
+            }
         }
-        self.set_draft_schedule(Some(schedule));
-        self.overlay = None;
-        self.toast(Toast::info(format!(
-            "{} · {}",
-            self.strings.schedule_set(),
-            crate::schedule::schedule_summary(schedule)
-        )));
-        Outcome::effects(vec![])
     }
 
-    /// Void the draft's schedule. The message is kept: clearing a timer is not
-    /// deleting what the reader wrote.
+    /// Void the draft's schedule — or the held send's. The message is kept:
+    /// clearing a timer is not deleting what the reader wrote.
     fn clear_schedule(&mut self, form: crate::schedule::MessageScheduleForm) -> Outcome {
         // Nothing armed is nothing to void: the key that means "clear" must not
         // be the one that closes an editor the reader is still deciding in.
         if !form.clearable {
             return Outcome::quiet();
         }
-        if self.composer_target.as_ref() != Some(&form.target) {
-            self.overlay = None;
-            return Outcome::effects(vec![]);
+        match &form.target {
+            ScheduleEditTarget::Draft(target) => {
+                if self.composer_target.as_ref() != Some(target) {
+                    self.overlay = None;
+                    return Outcome::effects(vec![]);
+                }
+                self.set_draft_schedule(None);
+                self.overlay = None;
+                self.toast(Toast::info(self.strings.schedule_cleared().to_string()));
+                Outcome::effects(vec![])
+            }
+            ScheduleEditTarget::Held {
+                session_id,
+                message_id,
+            } => {
+                let (session_id, message_id) = (session_id.clone(), *message_id);
+                self.overlay = None;
+                let Some(effect) = self.set_held_schedule(session_id, message_id, None) else {
+                    return Outcome::effects(vec![]);
+                };
+                self.toast(Toast::info(self.strings.schedule_cleared().to_string()));
+                Outcome::effects(vec![effect])
+            }
         }
-        self.set_draft_schedule(None);
-        self.overlay = None;
-        self.toast(Toast::info(self.strings.schedule_cleared().to_string()));
-        Outcome::effects(vec![])
+    }
+
+    /// The authority change that moves, or takes away, a send this client is
+    /// not holding.
+    ///
+    /// `None` when the authority is not publishing that send any more: there is
+    /// no clock here to change, and inventing a deadline for a message this
+    /// client cannot see would only promise a send nobody has.
+    fn set_held_schedule(
+        &mut self,
+        session_id: VibexSessionId,
+        message_id: u64,
+        scheduled_at_ms: Option<i64>,
+    ) -> Option<crate::app::Effect> {
+        let view = self.sidebar_organization()?;
+        // The send is looked up in the same snapshot the value is written
+        // against, so the reader's glance at the row and the change it makes
+        // are about one message.
+        let published = view
+            .scheduled_sends
+            .iter()
+            .any(|send| send.session_id == session_id.as_str() && send.message_id == message_id);
+        if !published {
+            return None;
+        }
+        Some(crate::app::Effect::MutateSidebarOrganization {
+            mutation: vibex_core::RemoteSidebarOrganizationMutation::SetScheduledSend {
+                session_id: session_id.as_str().to_string(),
+                message_id,
+                scheduled_at_ms,
+            },
+            expected_revision: Some(view.revision),
+        })
+    }
+
+    /// Ask the holder to send its waiting message now.
+    ///
+    /// "Now" is a deadline rather than a separate verb: the holder's ordinary
+    /// dispatch is what sends a scheduled message, and a deadline that has
+    /// arrived is exactly what it acts on. A message this client cannot see —
+    /// nothing published, or the reader is on the composing page — says so
+    /// instead of silently doing nothing.
+    fn send_held_schedule_now(&mut self) -> Outcome {
+        let Some(session_id) = self.selected_session_id().cloned() else {
+            return Outcome::quiet();
+        };
+        let Some(send) = self.authority_scheduled_send(&session_id) else {
+            return Outcome::quiet();
+        };
+        let message_id = send.message_id;
+        let at_ms = send.scheduled_at_ms;
+        // The earlier of the two: a deadline that has already arrived stays
+        // due, and one still ahead comes back to now.
+        let at_ms = vibex_core::unix_timestamp_ms().min(at_ms);
+        let Some(effect) = self.set_held_schedule(session_id, message_id, Some(at_ms)) else {
+            return Outcome::quiet();
+        };
+        self.toast(Toast::info(self.strings.queue_released().to_string()));
+        Outcome::effects(vec![effect])
     }
 
     fn step_form_field(&mut self, delta: isize) {
@@ -7824,6 +7964,7 @@ mod tests {
             auto_continue_session_ids: Vec::new(),
             auto_continue_paused_session_ids: Vec::new(),
             unread_session_ids: vec!["session_org000001".to_string()],
+            scheduled_sends: Vec::new(),
         }
     }
 
@@ -7879,6 +8020,7 @@ mod tests {
             pinned_session_ids: Vec::new(),
             session_order: Vec::new(),
             unread_session_ids: Vec::new(),
+            scheduled_sends: Vec::new(),
             ..empty
         };
         app.apply_sidebar_organization(&empty);
@@ -8449,9 +8591,9 @@ mod tests {
         };
         assert_eq!(
             form.target,
-            ComposerTarget::Session(
+            ScheduleEditTarget::Draft(ComposerTarget::Session(
                 vibex_core::VibexSessionId::parse("session_sched0001").expect("session id")
-            )
+            ))
         );
         assert!(!form.clearable, "the draft had no schedule to clear");
         // Nothing is written until the reader confirms: opening an editor is
@@ -8663,6 +8805,246 @@ mod tests {
             app.draft_schedule(),
             None,
             "the value followed the reader onto another session's draft"
+        );
+        assert_eq!(app.overlay, None);
+    }
+
+    /// A snapshot carrying one send another client is holding for a session.
+    fn held_send_snapshot(
+        session_id: &VibexSessionId,
+        message_id: u64,
+        text: &str,
+        scheduled_at_ms: i64,
+    ) -> vibex_core::RemoteSidebarOrganizationSnapshot {
+        vibex_core::RemoteSidebarOrganizationSnapshot {
+            revision: 7,
+            scheduled_sends: vec![vibex_core::RemoteScheduledSend {
+                session_id: session_id.as_str().to_string(),
+                message_id,
+                text: text.to_string(),
+                scheduled_at_ms,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn send_now_change(
+        effects: &[Effect],
+    ) -> (&vibex_core::RemoteSidebarOrganizationMutation, &Option<i64>) {
+        let Some(Effect::MutateSidebarOrganization { mutation, .. }) = effects.first() else {
+            panic!("no authority change was sent: {effects:?}");
+        };
+        let vibex_core::RemoteSidebarOrganizationMutation::SetScheduledSend {
+            scheduled_at_ms, ..
+        } = mutation
+        else {
+            panic!("the wrong change was sent: {mutation:?}");
+        };
+        (mutation, scheduled_at_ms)
+    }
+
+    #[test]
+    fn the_clock_edits_the_send_another_client_holds() {
+        // An empty draft is nothing to put an hour on. The send the session is
+        // already waiting for is what the reader came to move, and it belongs
+        // to whoever keeps its clock — this client arms nothing it cannot send.
+        let mut app = scheduled_session_app();
+        let session_id = app
+            .agent
+            .state
+            .selected_session_id
+            .clone()
+            .expect("a session is open");
+        let at_ms = vibex_core::unix_timestamp_ms() + 600_000;
+        app.apply_sidebar_organization(&held_send_snapshot(
+            &session_id,
+            4,
+            "send this later",
+            at_ms,
+        ));
+
+        app.perform(Intent::ScheduleMessage);
+        let Some(Overlay::Schedule(form)) = app.overlay.clone() else {
+            panic!("the editor did not open");
+        };
+        assert_eq!(
+            form.target,
+            ScheduleEditTarget::Held {
+                session_id: session_id.clone(),
+                message_id: 4
+            }
+        );
+        assert!(form.clearable, "the held send has an hour to clear");
+        assert_eq!(
+            app.draft_schedule(),
+            None,
+            "the draft is not the message being edited"
+        );
+
+        // A countdown is measured from the moment it is committed, and it
+        // travels to the holder instead of arming anything here.
+        app.perform(Intent::OverlayToggleValue);
+        {
+            let Some(Overlay::Schedule(form)) = app.overlay.as_mut() else {
+                unreachable!("the editor is open");
+            };
+            form.hours = "0".to_string();
+            form.minutes = "5".to_string();
+            form.seconds = "0".to_string();
+        }
+        let outcome = app.perform(Intent::ConfirmOverlay);
+        let (mutation, at_ms) = send_now_change(&outcome.effects);
+        let vibex_core::RemoteSidebarOrganizationMutation::SetScheduledSend {
+            session_id: changed,
+            message_id,
+            ..
+        } = mutation
+        else {
+            unreachable!("checked by the helper");
+        };
+        assert_eq!(changed, session_id.as_str());
+        assert_eq!(*message_id, 4);
+        assert!(
+            at_ms.is_some_and(|at| at > vibex_core::unix_timestamp_ms()),
+            "a new deadline in the future"
+        );
+        assert_eq!(app.draft_schedule(), None);
+        assert_eq!(
+            app.composer.text(),
+            "",
+            "the held message is not the composer's"
+        );
+    }
+
+    #[test]
+    fn clearing_the_clock_holds_the_message_and_keeps_it_queued() {
+        let mut app = scheduled_session_app();
+        let session_id = app
+            .agent
+            .state
+            .selected_session_id
+            .clone()
+            .expect("a session is open");
+        app.apply_sidebar_organization(&held_send_snapshot(
+            &session_id,
+            9,
+            "send this later",
+            vibex_core::unix_timestamp_ms() + 600_000,
+        ));
+
+        app.perform(Intent::ScheduleMessage);
+        let outcome = app.perform(Intent::ScheduleClear);
+        let (mutation, at_ms) = send_now_change(&outcome.effects);
+        assert_eq!(
+            at_ms, &None,
+            "clearing is a message that is no longer scheduled, not a send"
+        );
+        let vibex_core::RemoteSidebarOrganizationMutation::SetScheduledSend { message_id, .. } =
+            mutation
+        else {
+            unreachable!("checked by the helper");
+        };
+        assert_eq!(*message_id, 9);
+        assert_eq!(app.overlay, None);
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text == app.strings.schedule_cleared())
+        );
+    }
+
+    #[test]
+    fn send_now_is_a_deadline_of_now_for_the_holders_message() {
+        let mut app = scheduled_session_app();
+        let session_id = app
+            .agent
+            .state
+            .selected_session_id
+            .clone()
+            .expect("a session is open");
+        app.apply_sidebar_organization(&held_send_snapshot(
+            &session_id,
+            11,
+            "send this later",
+            vibex_core::unix_timestamp_ms() + 3_600_000,
+        ));
+
+        let outcome = app.perform(Intent::QueueSendNow);
+        let (mutation, at_ms) = send_now_change(&outcome.effects);
+        let vibex_core::RemoteSidebarOrganizationMutation::SetScheduledSend { message_id, .. } =
+            mutation
+        else {
+            unreachable!("checked by the helper");
+        };
+        assert_eq!(*message_id, 11);
+        let now_ms = vibex_core::unix_timestamp_ms();
+        assert!(
+            at_ms.is_some_and(|at| at <= now_ms),
+            "the holder sends it as soon as it looks"
+        );
+        assert!(
+            app.queued_messages.is_empty(),
+            "another client's message is not this client's queue"
+        );
+    }
+
+    #[test]
+    fn a_draft_with_words_in_it_keeps_the_clock() {
+        // Regression: the held send is only what the clock edits when there is
+        // nothing written to send instead.
+        let mut app = scheduled_session_app();
+        let session_id = app
+            .agent
+            .state
+            .selected_session_id
+            .clone()
+            .expect("a session is open");
+        app.apply_sidebar_organization(&held_send_snapshot(
+            &session_id,
+            4,
+            "theirs",
+            vibex_core::unix_timestamp_ms() + 600_000,
+        ));
+        app.composer.insert_str("mine");
+
+        app.perform(Intent::ScheduleMessage);
+        let Some(Overlay::Schedule(form)) = app.overlay.clone() else {
+            panic!("the editor did not open");
+        };
+        assert_eq!(
+            form.target,
+            ScheduleEditTarget::Draft(ComposerTarget::Session(session_id))
+        );
+        assert!(!form.clearable, "the draft had no schedule to clear");
+    }
+
+    #[test]
+    fn a_send_the_authority_no_longer_publishes_is_not_edited() {
+        // The holder sent it (or dropped it) between the frame the reader
+        // looked at and the commit: there is no clock here to change, and
+        // answering with a change nobody holds would promise a send that is
+        // already gone.
+        let mut app = scheduled_session_app();
+        let session_id = app
+            .agent
+            .state
+            .selected_session_id
+            .clone()
+            .expect("a session is open");
+        let at_ms = vibex_core::unix_timestamp_ms() + 600_000;
+        app.apply_sidebar_organization(&held_send_snapshot(&session_id, 4, "theirs", at_ms));
+        app.perform(Intent::ScheduleMessage);
+        app.apply_sidebar_organization(&vibex_core::RemoteSidebarOrganizationSnapshot {
+            revision: 8,
+            scheduled_sends: Vec::new(),
+            ..Default::default()
+        });
+
+        let outcome = app.perform(Intent::ConfirmOverlay);
+        assert!(
+            outcome.effects.is_empty(),
+            "a change was sent for a send that is gone: {:?}",
+            outcome.effects
         );
         assert_eq!(app.overlay, None);
     }

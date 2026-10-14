@@ -8496,6 +8496,7 @@ fn the_session_list_draws_the_arrangement_the_desktop_published() {
         auto_continue_session_ids: Vec::new(),
         auto_continue_paused_session_ids: Vec::new(),
         unread_session_ids: Vec::new(),
+        scheduled_sends: Vec::new(),
     };
 
     let mut app = app(110, 24);

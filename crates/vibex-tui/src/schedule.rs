@@ -20,6 +20,7 @@
 //! accepts.
 
 use chrono::{Local, NaiveDateTime, TimeZone as _};
+use vibex_core::VibexSessionId;
 
 use crate::app::ComposerTarget;
 use crate::locale::Strings;
@@ -223,16 +224,37 @@ pub enum ScheduleField {
     Seconds,
 }
 
+/// What the deadline the editor is holding is being given to.
+///
+/// The Desktop's clock button sits beside one Composer, so its value always
+/// belongs to a draft: the message is written, and the hour says when it goes.
+/// A client that is not the one holding a message has the same button to press
+/// and no draft to put a value on — what it edits is the send the authority is
+/// already keeping, and the value travels to whoever keeps the clock rather
+/// than arming anything here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleEditTarget {
+    /// The Composer's own draft.
+    Draft(ComposerTarget),
+    /// A send another client is holding, named the way the authority published
+    /// it: the session it belongs to, and the queue entry under that session.
+    Held {
+        session_id: VibexSessionId,
+        message_id: u64,
+    },
+}
+
 /// The schedule editor one Composer target is showing.
 ///
 /// The values live here rather than in the overlay's rendering, so a frame that
 /// redraws the modal never rebuilds the fields the reader is typing into.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageScheduleForm {
-    /// The Composer the value belongs to. A reader who navigates away while the
-    /// overlay is open is applying the schedule to a draft that is gone, so the
+    /// What the value belongs to. A reader who navigates away while the overlay
+    /// is open is applying the schedule to something that is gone — a draft the
+    /// Composer has left, or a send the authority has since released — so the
     /// target travels with the form and is checked before the value is written.
-    pub target: ComposerTarget,
+    pub target: ScheduleEditTarget,
     pub mode: ScheduleMode,
     pub field: ScheduleField,
     pub when: String,
@@ -248,7 +270,7 @@ pub struct MessageScheduleForm {
 impl MessageScheduleForm {
     /// Open the editor on the value the target already holds, or on the
     /// deadline a reader who has not decided yet almost always means.
-    pub fn new(target: ComposerTarget, initial: Option<MessageSchedule>, now_ms: i64) -> Self {
+    pub fn new(target: ScheduleEditTarget, initial: Option<MessageSchedule>, now_ms: i64) -> Self {
         let default_hours = (DEFAULT_COUNTDOWN_SECONDS / 3_600).to_string();
         let default_minutes = (DEFAULT_COUNTDOWN_SECONDS / 60 % 60).to_string();
         let default_seconds = (DEFAULT_COUNTDOWN_SECONDS % 60).to_string();
@@ -426,8 +448,10 @@ mod tests {
     use crate::locale::Locale;
     use vibex_core::VibexSessionId;
 
-    fn target() -> ComposerTarget {
-        ComposerTarget::Session(VibexSessionId::parse("session_a").expect("valid session id"))
+    fn target() -> ScheduleEditTarget {
+        ScheduleEditTarget::Draft(ComposerTarget::Session(
+            VibexSessionId::parse("session_a").expect("valid session id"),
+        ))
     }
 
     #[test]

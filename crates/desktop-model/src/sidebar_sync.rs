@@ -44,6 +44,27 @@ pub struct SidebarOrganizationView {
     pub auto_continue_session_ids: BTreeSet<String>,
     pub auto_continue_paused_session_ids: BTreeSet<String>,
     pub unread_session_ids: BTreeSet<String>,
+    /// The messages the holder is waiting to send at a later hour.
+    ///
+    /// A schedule is not arrangement — it does not move a row or change what a
+    /// collapse hides — but it is the same kind of fact as the unread badge
+    /// beside it: state the reader set that every client has to be able to
+    /// show, and that only the holder can act on. It travels here because this
+    /// is the one view a client already polls for the marks it draws on a
+    /// session row, and a second channel would only be a second thing to keep
+    /// in step.
+    pub scheduled_sends: Vec<SidebarScheduledSend>,
+}
+
+/// One message waiting for its hour, as the holder publishes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarScheduledSend {
+    pub session_id: String,
+    /// The holder's queue entry, which is what an edit or a cancellation
+    /// addresses.
+    pub message_id: u64,
+    pub text: String,
+    pub scheduled_at_ms: i64,
 }
 
 /// Why the Desktop refused a client-originated sidebar change.
@@ -85,6 +106,30 @@ pub enum SidebarMutationOutcome {
     /// The requested state already held; answering with the current snapshot
     /// is enough for the client to resynchronize.
     AlreadyApplied,
+}
+
+/// Move, or take away, the hour one queued message waits for.
+///
+/// The message stays where it is in the queue and keeps its words; only the
+/// clock it waits on changes. `None` is a message that is no longer scheduled —
+/// it goes out when its session is next ready, which is what cancelling a
+/// deadline means. Answers whether the queue held that message at all: a
+/// deadline that arrived for a message the holder has already sent is not a
+/// change to make, it is a change that has already happened.
+pub fn set_queued_send_schedule(
+    queue: &mut [crate::ComposerQueueEntry],
+    session_id: &str,
+    message_id: u64,
+    scheduled_at_ms: Option<i64>,
+) -> bool {
+    let Some(entry) = queue
+        .iter_mut()
+        .find(|entry| entry.session_id == session_id && entry.id == message_id)
+    else {
+        return false;
+    };
+    entry.scheduled_at_ms = scheduled_at_ms;
+    true
 }
 
 fn item_to_remote(item: &SidebarOrganizationItem) -> RemoteSidebarItemRef {
@@ -212,6 +257,16 @@ impl SidebarOrganizationView {
                 .cloned()
                 .collect(),
             unread_session_ids: self.unread_session_ids.iter().cloned().collect(),
+            scheduled_sends: self
+                .scheduled_sends
+                .iter()
+                .map(|send| vibex_core::RemoteScheduledSend {
+                    session_id: send.session_id.clone(),
+                    message_id: send.message_id,
+                    text: send.text.clone(),
+                    scheduled_at_ms: send.scheduled_at_ms,
+                })
+                .collect(),
         }
     }
 
@@ -323,6 +378,16 @@ impl SidebarOrganizationView {
                 .cloned()
                 .collect(),
             unread_session_ids: snapshot.unread_session_ids.iter().cloned().collect(),
+            scheduled_sends: snapshot
+                .scheduled_sends
+                .iter()
+                .map(|send| SidebarScheduledSend {
+                    session_id: send.session_id.clone(),
+                    message_id: send.message_id,
+                    text: send.text.clone(),
+                    scheduled_at_ms: send.scheduled_at_ms,
+                })
+                .collect(),
         }
     }
 
@@ -334,8 +399,12 @@ impl SidebarOrganizationView {
     /// tree the reader arranged rather than two different ones. The persisted
     /// auto-continue preferences travel with it: they are the reader's, not the
     /// Desktop's, and a session the Desktop would continue by itself must be
-    /// continued by whichever shell is running. Live-only fields (unread
-    /// badges, in-flight countdowns) have no persisted form and come back empty.
+    /// continued by whichever shell is running. The scheduled sends travel with
+    /// it for the same reason: they are the reader's, they are persisted, and a
+    /// shell that took the home over from a Desktop that is no longer running
+    /// must still be able to say which sessions are waiting on an hour. Only
+    /// what has no persisted form — unread badges, in-flight countdowns — comes
+    /// back empty.
     pub fn from_desktop_ui_state(state: &crate::DesktopUiStateV1) -> Self {
         let sidebar = &state.sidebar;
         let mut view = Self {
@@ -369,6 +438,19 @@ impl SidebarOrganizationView {
                 .auto_continue_paused_session_ids
                 .clone(),
             unread_session_ids: BTreeSet::new(),
+            scheduled_sends: state
+                .composer
+                .queue
+                .iter()
+                .filter_map(|entry| {
+                    Some(SidebarScheduledSend {
+                        session_id: entry.session_id.clone(),
+                        message_id: entry.id,
+                        text: entry.text.clone(),
+                        scheduled_at_ms: entry.scheduled_at_ms?,
+                    })
+                })
+                .collect(),
         };
         view.refresh_revision();
         view
@@ -421,6 +503,60 @@ impl SidebarOrganizationView {
             || !self.project_order.is_empty()
             || !self.workspace_order.is_empty()
             || !self.organization.collapsed_folder_ids.is_empty()
+    }
+
+    /// Move, or take away, the hour one published send waits for.
+    ///
+    /// The message belongs to the holder's queue, so the view can only answer
+    /// for what it published: a send this client was never told about is one it
+    /// cannot reschedule or cancel, and guessing would arm a message the holder
+    /// does not have. The holder applies the change to the queue itself — this
+    /// only reports that the hour moved, and takes a cancelled deadline out of
+    /// the published list without touching the message, which is still the
+    /// queue's to send when its session is next ready.
+    fn set_scheduled_send(
+        &mut self,
+        session_id: &str,
+        message_id: u64,
+        scheduled_at_ms: Option<i64>,
+    ) -> Result<SidebarMutationOutcome, SidebarMutationRejection> {
+        let Some(send) = self
+            .scheduled_sends
+            .iter_mut()
+            .find(|send| send.session_id == session_id && send.message_id == message_id)
+        else {
+            return Err(SidebarMutationRejection::Rejected);
+        };
+        match scheduled_at_ms {
+            Some(at_ms) if at_ms == send.scheduled_at_ms => {
+                Ok(SidebarMutationOutcome::AlreadyApplied)
+            }
+            Some(at_ms) => {
+                send.scheduled_at_ms = at_ms;
+                Ok(SidebarMutationEffect::SCHEDULED.into())
+            }
+            None => {
+                self.scheduled_sends.retain(|send| {
+                    !(send.session_id == session_id && send.message_id == message_id)
+                });
+                Ok(SidebarMutationEffect::SCHEDULED.into())
+            }
+        }
+    }
+
+    /// The next send one session is waiting for, among those the holder
+    /// published.
+    ///
+    /// A session can hold more than one scheduled message — the reader queued
+    /// them, and the queue is ordered by what they wrote — so the row's
+    /// countdown reads the one that goes out first. The others keep their own
+    /// deadlines with the holder; a row that counted down to the last of them
+    /// would name an hour nothing happens at.
+    pub fn scheduled_send_for(&self, session_id: &str) -> Option<&SidebarScheduledSend> {
+        self.scheduled_sends
+            .iter()
+            .filter(|send| send.session_id == session_id)
+            .min_by_key(|send| send.scheduled_at_ms)
     }
 
     /// Content fingerprint of the tree, for optimistic-concurrency checks.
@@ -818,6 +954,11 @@ impl SidebarOrganizationView {
                 self.hierarchy_mode = next;
                 SidebarMutationEffect::NAVIGATION.into()
             }
+            RemoteSidebarOrganizationMutation::SetScheduledSend {
+                session_id,
+                message_id,
+                scheduled_at_ms,
+            } => self.set_scheduled_send(session_id, *message_id, *scheduled_at_ms)?,
         };
         self.revision = self.revision.wrapping_add(1);
         Ok(outcome)
@@ -1027,16 +1168,26 @@ pub fn sidebar_project_items_for_workspace(
 pub struct SidebarMutationEffect {
     pub organization: bool,
     pub navigation: bool,
+    /// The holder's queue changed: a deadline was moved or taken away, and the
+    /// message it names is still the queue's to send.
+    pub scheduled: bool,
 }
 
 impl SidebarMutationEffect {
     pub const ORGANIZATION: Self = Self {
         organization: true,
         navigation: false,
+        scheduled: false,
     };
     pub const NAVIGATION: Self = Self {
         organization: false,
         navigation: true,
+        scheduled: false,
+    };
+    pub const SCHEDULED: Self = Self {
+        organization: false,
+        navigation: false,
+        scheduled: true,
     };
 }
 
@@ -1514,5 +1665,217 @@ mod tests {
                 "workspace-a".to_string(),
             ])
         );
+    }
+
+    fn queued_message(
+        id: u64,
+        session_id: &str,
+        text: &str,
+        scheduled_at_ms: Option<i64>,
+    ) -> crate::ComposerQueueEntry {
+        crate::ComposerQueueEntry {
+            id,
+            session_id: session_id.to_string(),
+            desired_runtime: vibex_core::SessionRuntimeSelection::provider(
+                vibex_core::AgentId::parse("claude").expect("agent id"),
+                vibex_core::ProviderProfileId::parse("provider_local_default").expect("profile id"),
+                "model:opus",
+            ),
+            text: text.to_string(),
+            attachments: Vec::new(),
+            mentions: Vec::new(),
+            command: None,
+            scheduled_at_ms,
+        }
+    }
+
+    #[test]
+    fn only_the_sends_waiting_on_an_hour_are_published() {
+        // The queue holds messages for other reasons — a turn still running is
+        // this shell's own business. What another client can act on is the
+        // message with an hour on it, and that is the whole list.
+        let mut state = crate::DesktopUiStateV1::default();
+        state.composer.queue = vec![
+            queued_message(1, "session-a", "held for the turn", None),
+            queued_message(2, "session-a", "send this at nine", Some(1_800_000_000_000)),
+            queued_message(3, "session-b", "and this tomorrow", Some(1_800_000_060_000)),
+        ];
+        let view = SidebarOrganizationView::from_desktop_ui_state(&state);
+
+        assert_eq!(view.scheduled_sends.len(), 2);
+        assert_eq!(view.scheduled_sends[0].session_id, "session-a");
+        assert_eq!(view.scheduled_sends[0].message_id, 2);
+        assert_eq!(view.scheduled_sends[0].text, "send this at nine");
+        assert_eq!(view.scheduled_sends[0].scheduled_at_ms, 1_800_000_000_000);
+        assert_eq!(
+            view.scheduled_send_for("session-a")
+                .map(|send| send.message_id),
+            Some(2)
+        );
+        assert!(view.scheduled_send_for("session-c").is_none());
+    }
+
+    #[test]
+    fn the_next_send_is_the_one_that_goes_out_first() {
+        let mut state = crate::DesktopUiStateV1::default();
+        state.composer.queue = vec![
+            queued_message(1, "session-a", "later", Some(1_800_000_060_000)),
+            queued_message(2, "session-a", "sooner", Some(1_800_000_000_000)),
+        ];
+        let view = SidebarOrganizationView::from_desktop_ui_state(&state);
+
+        assert_eq!(
+            view.scheduled_send_for("session-a")
+                .map(|send| send.text.as_str()),
+            Some("sooner")
+        );
+    }
+
+    #[test]
+    fn a_held_send_survives_the_wire() {
+        let mut state = crate::DesktopUiStateV1::default();
+        state.composer.queue = vec![queued_message(
+            7,
+            "session-a",
+            "send this at nine",
+            Some(1_800_000_000_000),
+        )];
+        let view = SidebarOrganizationView::from_desktop_ui_state(&state);
+
+        let round_tripped = SidebarOrganizationView::from_remote(&view.to_remote());
+
+        assert_eq!(round_tripped.scheduled_sends, view.scheduled_sends);
+    }
+
+    #[test]
+    fn a_deadline_moves_and_a_deadline_is_taken_away() {
+        let mut view = SidebarOrganizationView {
+            scheduled_sends: vec![
+                SidebarScheduledSend {
+                    session_id: "session-a".to_string(),
+                    message_id: 4,
+                    text: "send this at nine".to_string(),
+                    scheduled_at_ms: 1_800_000_000_000,
+                },
+                SidebarScheduledSend {
+                    session_id: "session-b".to_string(),
+                    message_id: 5,
+                    text: "and this tomorrow".to_string(),
+                    scheduled_at_ms: 1_800_000_060_000,
+                },
+            ],
+            ..SidebarOrganizationView::default()
+        };
+
+        // The same value again is what a client that raced the authority sends:
+        // the send already waits for that hour, so nothing moved.
+        assert_eq!(
+            view.apply_remote(
+                &RemoteSidebarOrganizationMutation::SetScheduledSend {
+                    session_id: "session-a".to_string(),
+                    message_id: 4,
+                    scheduled_at_ms: Some(1_800_000_000_000),
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            ),
+            Ok(SidebarMutationOutcome::AlreadyApplied)
+        );
+
+        let moved = view
+            .apply_remote(
+                &RemoteSidebarOrganizationMutation::SetScheduledSend {
+                    session_id: "session-a".to_string(),
+                    message_id: 4,
+                    scheduled_at_ms: Some(1_800_000_120_000),
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .expect("moving a published deadline is legal");
+        let SidebarMutationOutcome::Applied(effect) = moved else {
+            panic!("a moved deadline should report an applied effect");
+        };
+        assert!(effect.scheduled && !effect.navigation && !effect.organization);
+        assert_eq!(
+            view.scheduled_send_for("session-a")
+                .map(|send| send.scheduled_at_ms),
+            Some(1_800_000_120_000)
+        );
+
+        // Cancelling takes the send out of the published list and nothing else:
+        // the message is still the holder's to send when its session is ready.
+        view.apply_remote(
+            &RemoteSidebarOrganizationMutation::SetScheduledSend {
+                session_id: "session-a".to_string(),
+                message_id: 4,
+                scheduled_at_ms: None,
+            },
+            &session_projects(),
+            &session_workspaces(),
+            "unused",
+            "unused",
+        )
+        .expect("cancelling a published deadline is legal");
+        assert!(view.scheduled_send_for("session-a").is_none());
+        assert_eq!(view.scheduled_sends.len(), 1, "the other session keeps its");
+    }
+
+    #[test]
+    fn a_send_the_holder_never_published_cannot_be_edited() {
+        // A message the authority has already sent — or never had — is not a
+        // deadline this client may move: arming one would promise a send nobody
+        // is holding.
+        let mut view = SidebarOrganizationView::default();
+        assert_eq!(
+            view.apply_remote(
+                &RemoteSidebarOrganizationMutation::SetScheduledSend {
+                    session_id: "session-a".to_string(),
+                    message_id: 9,
+                    scheduled_at_ms: Some(1_800_000_000_000),
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            ),
+            Err(SidebarMutationRejection::Rejected)
+        );
+    }
+
+    #[test]
+    fn a_deadline_lands_on_the_queue_entry_it_names() {
+        let mut queue = vec![
+            queued_message(1, "session-a", "first", None),
+            queued_message(2, "session-a", "second", Some(1_800_000_000_000)),
+        ];
+
+        assert!(set_queued_send_schedule(
+            &mut queue,
+            "session-a",
+            1,
+            Some(1_800_000_120_000)
+        ));
+        assert_eq!(queue[0].scheduled_at_ms, Some(1_800_000_120_000));
+        assert_eq!(queue[0].text, "first", "the words are not the deadline's");
+
+        // Clearing gives the message back to the ordinary queue rather than
+        // deleting it.
+        assert!(set_queued_send_schedule(&mut queue, "session-a", 2, None));
+        assert_eq!(queue[1].scheduled_at_ms, None);
+        assert_eq!(queue[1].text, "second");
+
+        // The session is part of the address: ids are only unique in one queue.
+        assert!(!set_queued_send_schedule(
+            &mut queue,
+            "session-b",
+            1,
+            Some(1_800_000_000_000)
+        ));
+        assert_eq!(queue[0].scheduled_at_ms, Some(1_800_000_120_000));
     }
 }

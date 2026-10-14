@@ -746,6 +746,7 @@ mod tests {
             auto_continue_session_ids: BTreeSet::new(),
             auto_continue_paused_session_ids: BTreeSet::new(),
             unread_session_ids: BTreeSet::from(["session_recent01".to_string()]),
+            scheduled_sends: Vec::new(),
         }
     }
 

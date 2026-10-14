@@ -3549,7 +3549,7 @@ fn render_scheduled_empty_timeline(
     }
     let now_ms = vibex_core::unix_timestamp_ms();
     let remaining = at_ms.saturating_sub(now_ms);
-    let height = area.height.min(6);
+    let height = area.height.min(8);
     let region = Rect {
         y: area.y + area.height.saturating_sub(height) / 2,
         height,
@@ -3576,11 +3576,27 @@ fn render_scheduled_empty_timeline(
             Style::default().fg(theme.roles.gray),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            format!("  {}", strings.schedule_note()),
-            Style::default().fg(theme.roles.gray_dim),
-        )),
     ];
+    // What is waiting, in the reader's own words. A countdown alone says that
+    // something will happen; the message is the part only they can recognise,
+    // and the part that tells them whether it is the one they meant to arm —
+    // which matters most when another client is the one holding it.
+    if let Some((text, _)) = app
+        .page_session_id()
+        .and_then(|session_id| app.earliest_scheduled_send(session_id))
+    {
+        let first_line = text.lines().next().unwrap_or_default();
+        let width = usize::from(area.width).saturating_sub(4);
+        lines.push(Line::from(Span::styled(
+            format!("  {}", truncate_to_width(first_line, width, "…")),
+            Style::default().fg(theme.roles.foreground),
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("  {}", strings.schedule_note()),
+        Style::default().fg(theme.roles.gray_dim),
+    )));
     lines.truncate(usize::from(region.height));
     frame.render_widget(Paragraph::new(Text::from(lines)), region);
 }

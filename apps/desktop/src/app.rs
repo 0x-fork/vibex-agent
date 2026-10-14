@@ -158,20 +158,21 @@ use vibex_desktop_model::{
     SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome, SidebarMutationRejection,
     SidebarOrganizationItem, SidebarOrganizationScope, SidebarOrganizationState,
     SidebarOrganizationView, SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
-    SidebarProjectProjection, SidebarState, SidebarUiState, SidebarWorkspaceProjection,
-    StartupDestination, TerminalOpenMode, TerminalWorkingDirectory, ThemeMode as ModelThemeMode,
-    ThrottledUiStateWriter, TimelineConversationTurn, TimelineDelegationProjection,
-    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
-    UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceContextProjection,
-    WorkspaceLayoutState, WorkspaceStateScope, WorktreeLifecycleDisplayState,
-    active_collaborations, clamp_editor_autosave_delay_ms, complete_string_order,
-    composer_trigger_at, current_active_goal, current_agent_plan, custom_worktree_path_is_absolute,
-    has_managed_child_agent_delegations, move_string_relative, move_strings_relative,
-    ordered_agent_ids, parse_unified_diff, sidebar_project_custom_logo_file_is_valid,
-    sidebar_project_items, sidebar_project_items_for_workspace,
-    sidebar_project_projections_with_workspace_order, sidebar_root_items, split_share,
-    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
-    timeline_conversation_turns_with_reasoning_mode, timeline_row_delegation,
+    SidebarProjectProjection, SidebarScheduledSend, SidebarState, SidebarUiState,
+    SidebarWorkspaceProjection, StartupDestination, TerminalOpenMode, TerminalWorkingDirectory,
+    ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
+    TimelineDelegationProjection, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
+    TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
+    WorkspaceContextProjection, WorkspaceLayoutState, WorkspaceStateScope,
+    WorktreeLifecycleDisplayState, active_collaborations, clamp_editor_autosave_delay_ms,
+    complete_string_order, composer_trigger_at, current_active_goal, current_agent_plan,
+    custom_worktree_path_is_absolute, has_managed_child_agent_delegations, move_string_relative,
+    move_strings_relative, ordered_agent_ids, parse_unified_diff,
+    sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
+    sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
+    sidebar_root_items, split_share, timeline_agent_message_count_after_sequence,
+    timeline_conversation_turns, timeline_conversation_turns_with_reasoning_mode,
+    timeline_row_delegation,
 };
 use vibex_desktop_runtime::DriverState;
 use vibex_desktop_runtime::{
@@ -11582,6 +11583,7 @@ impl VibexWorkbench {
             auto_continue_session_ids: self.auto_continue_session_ids.clone(),
             auto_continue_paused_session_ids: self.auto_continue_paused_session_ids.clone(),
             unread_session_ids: self.unread_agent_completion_session_ids.clone(),
+            scheduled_sends: self.published_scheduled_sends(),
         };
         // Keep the remote order complete even when a newly-created Worktree has
         // not been written to the persisted preference list yet. This lets a
@@ -11762,6 +11764,26 @@ impl VibexWorkbench {
                                 view.auto_continue_paused_session_ids.clone();
                             self.queue_agent_ui_state();
                             self.queue_ui_state();
+                        }
+                        if effect.scheduled
+                            && let vibex_core::RemoteSidebarOrganizationMutation::SetScheduledSend {
+                                session_id,
+                                message_id,
+                                scheduled_at_ms,
+                            } = &mutation
+                        {
+                            // The view only reports that an hour moved; the
+                            // queue it belongs to and the clock that keeps it
+                            // are this shell's, and the message keeps its place
+                            // in that queue either way.
+                            let window_handle = self.window_handle;
+                            self.set_queued_send_schedule(
+                                session_id,
+                                *message_id,
+                                *scheduled_at_ms,
+                                window_handle,
+                                cx,
+                            );
                         }
                         self.invalidate_sidebar_projection_cache();
                         self.publish_sidebar_invalidation();

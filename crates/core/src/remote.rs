@@ -4686,6 +4686,33 @@ pub struct RemoteSidebarOrganizationSnapshot {
     pub auto_continue_paused_session_ids: Vec<String>,
     #[serde(default)]
     pub unread_session_ids: Vec<String>,
+    /// The messages the Desktop is holding for a later hour. A schedule is the
+    /// reader's own instruction and outlives the window that took it, so it
+    /// travels with the rest of the per-session marks: a client that is not the
+    /// one doing the waiting still has to show that a session is waiting, and
+    /// say what it is waiting to send.
+    #[serde(default)]
+    pub scheduled_sends: Vec<RemoteScheduledSend>,
+}
+
+/// One message a client armed for a later hour.
+///
+/// The deadline is absolute (milliseconds since the epoch, in the reader's own
+/// local time), exactly as the holder's own queue stores it: a countdown would
+/// have to be re-based by every reader, and two clients counting down from one
+/// number would disagree about the hour.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledSend {
+    pub session_id: String,
+    /// The holder's own queue entry, which is what an edit or a cancellation
+    /// addresses. Ids are unique within one queue, not across clients: a
+    /// mutation names the session as well.
+    pub message_id: u64,
+    /// What the message says, so a row can borrow the words as the session's
+    /// name and a session page can show what is waiting.
+    pub text: String,
+    pub scheduled_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -4825,6 +4852,19 @@ pub enum RemoteSidebarOrganizationMutation {
     },
     SetHierarchyMode {
         mode: RemoteSidebarHierarchyMode,
+    },
+    /// Move the hour a queued message waits for, or take it away.
+    ///
+    /// The message itself belongs to the holder's queue — this changes only
+    /// when it goes out, which is why it is a mutation of the shared marks
+    /// rather than a second way to send. `None` leaves the message queued and
+    /// no longer scheduled: it goes out when its session is next ready, which
+    /// is what cancelling a deadline means.
+    SetScheduledSend {
+        session_id: String,
+        message_id: u64,
+        #[serde(default)]
+        scheduled_at_ms: Option<i64>,
     },
 }
 

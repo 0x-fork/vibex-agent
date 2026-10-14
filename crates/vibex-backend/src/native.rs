@@ -1121,12 +1121,15 @@ impl SidebarBackend for NativeBackend {
             }
             // Folding only changes UI-state flags. Listing sessions also
             // scans their timelines for recency, so it must not delay a fold
-            // just to build membership maps the mutation never reads.
+            // just to build membership maps the mutation never reads. A send
+            // time is the same kind of change: it names the queue entry and
+            // nothing about the tree.
             let sessions = match &mutation {
                 RemoteSidebarOrganizationMutation::SetFolderCollapsed { .. }
                 | RemoteSidebarOrganizationMutation::SetProjectCollapsed { .. }
                 | RemoteSidebarOrganizationMutation::SetWorkspaceCollapsed { .. }
-                | RemoteSidebarOrganizationMutation::SetGroupCollapsed { .. } => Vec::new(),
+                | RemoteSidebarOrganizationMutation::SetGroupCollapsed { .. }
+                | RemoteSidebarOrganizationMutation::SetScheduledSend { .. } => Vec::new(),
                 _ => runtime.agent().list_sessions(false).await?,
             };
             let session_projects = sessions
@@ -1156,8 +1159,28 @@ impl SidebarBackend for NativeBackend {
                 &folder_id,
                 &group_id,
             ) {
-                Ok(SidebarMutationOutcome::Applied(_))
-                | Ok(SidebarMutationOutcome::AlreadyApplied) => {}
+                // A deadline lands in the queue the file holds rather than in
+                // the tree, so it is written where it lives. Nobody is running
+                // the clock that would release it here: the shell that owns the
+                // queue keeps its own, and this is the arrangement it will read
+                // when it comes back.
+                Ok(SidebarMutationOutcome::Applied(effect)) => {
+                    if effect.scheduled
+                        && let RemoteSidebarOrganizationMutation::SetScheduledSend {
+                            session_id,
+                            message_id,
+                            scheduled_at_ms,
+                        } = &mutation
+                    {
+                        vibex_desktop_model::set_queued_send_schedule(
+                            &mut state.composer.queue,
+                            session_id,
+                            *message_id,
+                            *scheduled_at_ms,
+                        );
+                    }
+                }
+                Ok(SidebarMutationOutcome::AlreadyApplied) => {}
                 Err(rejection) => {
                     return Err(sidebar_mutation_error(
                         rejection.stable_code(),

@@ -837,6 +837,70 @@ impl VibexWorkbench {
         self.persist_composer_queue();
     }
 
+    /// The sends this shell is holding for a later hour, as the shared view
+    /// publishes them to the clients that are not the one waiting.
+    ///
+    /// Only the entries with a deadline travel: an ordinary held message is a
+    /// fact about this window's own turn, and another client rendering it would
+    /// only be showing a queue it cannot drain.
+    pub(super) fn published_scheduled_sends(&self) -> Vec<SidebarScheduledSend> {
+        self.composer_queue
+            .iter()
+            .filter_map(published_scheduled_send)
+            .collect()
+    }
+
+    /// Move, or take away, the hour one queued message waits for.
+    ///
+    /// The message keeps its place and its words: a send time says *when* it
+    /// goes out, never what it says. Answers whether the queue still holds that
+    /// message — a deadline that arrived for a message that has already gone
+    /// out is a change that has already happened, not one to make.
+    ///
+    /// A bridge request arrives without a window, and both the clock that
+    /// releases the message and the send itself need one, so the shell's own
+    /// window is asked for. Without a window the queue still changes and is
+    /// persisted; the deadline is honoured by whichever pass next has a window
+    /// to run the timer in.
+    pub(super) fn set_queued_send_schedule(
+        &mut self,
+        session_id: &str,
+        message_id: u64,
+        scheduled_at_ms: Option<i64>,
+        window_handle: Option<AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !set_queued_message_schedule(
+            &mut self.composer_queue,
+            session_id,
+            message_id,
+            scheduled_at_ms,
+        ) {
+            return false;
+        }
+        // The dispatch rule the panel's own editor applies: a deadline moved by
+        // a reader is a decision about this message, so it does not wait behind
+        // a turn that is merely continuing.
+        self.composer_queue_ready_after_continuation_session_ids
+            .insert(session_id.to_string());
+        if let Some(handle) = window_handle {
+            let entity = cx.weak_entity();
+            let _ = cx.update_window(handle, move |_, window, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    this.start_message_schedule_timer(window, cx);
+                    // A deadline that is already due — a client asking for the
+                    // message now, which is a deadline of "now" — is released on
+                    // this pass rather than on a tick of a clock that may not
+                    // have been running at all.
+                    this.dispatch_due_messages(unix_timestamp_ms(), window, cx);
+                });
+            });
+        }
+        self.publish_sidebar_invalidation();
+        self.composer_queue_changed();
+        true
+    }
+
     /// Loads the queue the previous session left behind.
     ///
     /// The entries are held until the overview arrives. Missing owned sessions
@@ -1209,6 +1273,41 @@ fn scheduled_session_title(
     // or an earlier message — keeps it.
     (session.title == agent_session_fallback_title(&session.agent_id) || session.title == title)
         .then_some(title)
+}
+
+/// The published shape of one queued message, when it is waiting on an hour.
+///
+/// An ordinary held message has no hour to publish: it waits for this window's
+/// own turn, and a client that has no part in that turn has nothing to draw.
+fn published_scheduled_send(message: &ComposerQueueMessage) -> Option<SidebarScheduledSend> {
+    Some(SidebarScheduledSend {
+        session_id: message.session_id.as_str().to_string(),
+        message_id: message.id,
+        text: message.text.clone(),
+        scheduled_at_ms: message.scheduled_at_ms?,
+    })
+}
+
+/// Move, or take away, the hour one queued message waits for.
+///
+/// Answers whether the queue still holds that message: a deadline that arrived
+/// for a message that has already gone out is a change that has already
+/// happened, not one to make. The message keeps its place either way — a
+/// schedule says when it goes, never whether it does.
+fn set_queued_message_schedule(
+    queue: &mut [ComposerQueueMessage],
+    session_id: &str,
+    message_id: u64,
+    scheduled_at_ms: Option<i64>,
+) -> bool {
+    let Some(message) = queue
+        .iter_mut()
+        .find(|message| message.id == message_id && message.session_id.as_str() == session_id)
+    else {
+        return false;
+    };
+    message.scheduled_at_ms = scheduled_at_ms;
+    true
 }
 
 /// The persisted shape of one queued message.
