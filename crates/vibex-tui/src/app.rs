@@ -2977,9 +2977,45 @@ impl App {
         if !self.authority_unread_sessions.contains(session_id.as_str()) {
             return None;
         }
+        self.sidebar_unread_effect(std::slice::from_ref(session_id), false)
+    }
+
+    /// The authority change that reports a session this client has just marked
+    /// unread, so the Desktop badges what the reader here was told about.
+    ///
+    /// This is the other half of [`Self::sidebar_mark_read_effect`]: a finished
+    /// answer for a session the reader is not looking at is unread for every
+    /// window on the runtime, not only the one that happened to receive the
+    /// event. `None` when the authority already badges it, so an event cannot
+    /// queue a write per turn for a mark that is already there.
+    pub fn sidebar_mark_unread_effect(&self, session_id: &VibexSessionId) -> Option<Effect> {
+        if self.authority_unread_sessions.contains(session_id.as_str()) {
+            return None;
+        }
+        self.sidebar_unread_effect(std::slice::from_ref(session_id), true)
+    }
+
+    /// The authority change that sets the unread mark on the named sessions.
+    ///
+    /// No expected revision travels with it: a mark is not an edit of the tree,
+    /// so a rearrangement on the Desktop between the read and the mark does not
+    /// make it stale. Quoting a revision would refuse the mark — and make a read
+    /// look like a failed tree edit — for a change that cannot conflict.
+    fn sidebar_unread_effect(
+        &self,
+        session_ids: &[VibexSessionId],
+        unread: bool,
+    ) -> Option<Effect> {
+        if session_ids.is_empty() {
+            return None;
+        }
         Some(Effect::MutateSidebarOrganization {
-            mutation: vibex_core::RemoteSidebarOrganizationMutation::MarkSessionsRead {
-                session_ids: vec![session_id.as_str().to_string()],
+            mutation: vibex_core::RemoteSidebarOrganizationMutation::SetSessionsUnread {
+                session_ids: session_ids
+                    .iter()
+                    .map(|session_id| session_id.as_str().to_string())
+                    .collect(),
+                unread,
             },
             expected_revision: None,
         })

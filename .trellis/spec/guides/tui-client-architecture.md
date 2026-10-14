@@ -818,15 +818,24 @@ is never a column count.
   must not be invisible to the other. Two of them travel as
   `RemoteSidebarOrganizationMutation`, the channel that already carries the
   per-session marks:
-  - *Reading a session.* "Unread" is the authority's memory, so opening a
-    session here sends `MarkSessionsRead` before it clears anything locally, and
-    the Desktop drops the same id from its own badge set. The unread set is
-    therefore stored on its own (`App::authority_unread_sessions`) rather than
-    read out of the arrangement view: an arrangement that arranges nothing is
-    deliberately dropped, and the marks have to survive that. A read is not an
-    edit of the tree, so it carries **no expected revision** — a rearrangement on
-    the Desktop between the read and the mark must not refuse the read or make it
-    look like a failed tree edit.
+  - *The unread mark, in both directions.* "Unread" is the authority's memory,
+    and reading is an act of whichever window has the session on screen, so the
+    mark is a value those windows agree on rather than a one-way notification.
+    Both moves are one mutation, `SetSessionsUnread { session_ids, unread }`,
+    because they are the same fact seen from two seats: a client that opens a
+    session sends `unread: false` (the Desktop stops badging what was read
+    there), and a client that draws a dot for a finished answer on a session
+    nobody is looking at sends `unread: true` (the Desktop draws the same dot).
+    One boolean rather than two mutations is deliberate: a mark is a value, not
+    an event, so two clients racing to read and to be notified resolve by intent
+    rather than by arrival order. A mark that already holds is an
+    `AlreadyApplied` no-op, which is what keeps a finished turn from costing a
+    write per turn. The unread set is stored on its own
+    (`App::authority_unread_sessions`) rather than read out of the arrangement
+    view: an arrangement that arranges nothing is deliberately dropped, and the
+    marks have to survive that. A mark is not an edit of the tree, so it carries
+    **no expected revision** — a rearrangement on the Desktop between the read
+    and the mark must not refuse it or make a read look like a failed tree edit.
   - *Deleting a session.* A deletion deletes the row, so there is no surviving
     snapshot to broadcast. The manager publishes the removed ids on its own
     channel (`subscribe_session_removals`), the runtime fans them out as

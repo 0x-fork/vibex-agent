@@ -4866,15 +4866,27 @@ pub enum RemoteSidebarOrganizationMutation {
         #[serde(default)]
         scheduled_at_ms: Option<i64>,
     },
-    /// Clear the unread mark on sessions another client has now read.
+    /// Set or clear the unread mark on sessions another client has seen.
     ///
-    /// "Unread" is not durability: the authority keeps it in memory, so a
-    /// session a compact client opened is marked read on the Desktop only if
-    /// that client says so. The ids are the ones the client rendered as
-    /// unread, and clearing an id the authority does not hold is a harmless
-    /// no-op — which is what makes a retry after a reconnect safe.
-    MarkSessionsRead {
+    /// "Unread" is not durability: the authority keeps it in memory, so the
+    /// mark moves only when a client says so. Both directions travel here
+    /// because they are one fact seen from two seats:
+    ///
+    /// * a client that opens a session sends `unread: false`, so the Desktop
+    ///   stops badging a session the reader has read;
+    /// * a client that receives a finished answer for a session nobody is
+    ///   looking at sends `unread: true`, so the Desktop badges a session the
+    ///   reader has something new in — the same dot the reading client drew.
+    ///
+    /// One boolean rather than two mutations because a mark is a value, not an
+    /// event: two clients racing to read and to be notified would otherwise
+    /// resolve in arrival order, and the last writer's intent is the truth
+    /// either way. Setting an id the authority already holds (or clearing one
+    /// it does not) is a harmless no-op, which is what makes a retry after a
+    /// reconnect safe.
+    SetSessionsUnread {
         session_ids: Vec<String>,
+        unread: bool,
     },
 }
 

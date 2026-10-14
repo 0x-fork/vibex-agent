@@ -959,25 +959,38 @@ impl SidebarOrganizationView {
                 message_id,
                 scheduled_at_ms,
             } => self.set_scheduled_send(session_id, *message_id, *scheduled_at_ms)?,
-            RemoteSidebarOrganizationMutation::MarkSessionsRead { session_ids } => {
-                self.mark_sessions_read(session_ids)
-            }
+            RemoteSidebarOrganizationMutation::SetSessionsUnread {
+                session_ids,
+                unread,
+            } => self.set_sessions_unread(session_ids, *unread),
         };
         self.revision = self.revision.wrapping_add(1);
         Ok(outcome)
     }
 
-    /// Clear the unread mark on the named sessions, reporting whether anything
-    /// changed so an already-read session is an idempotent no-op rather than a
-    /// round trip the reader did not ask for.
+    /// Set or clear the unread mark on the named sessions, reporting whether
+    /// anything changed so a mark that already holds is an idempotent no-op
+    /// rather than a round trip nobody asked for.
     ///
-    /// Ids the view does not hold are ignored: the marks live only in memory,
-    /// and a client that retried after a reconnect may name a session the
-    /// authority has since read by another route.
-    fn mark_sessions_read(&mut self, session_ids: &[String]) -> SidebarMutationOutcome {
+    /// The mark is the authority's in-memory value, so both directions are one
+    /// assignment: a client that read a session clears it, a client that saw a
+    /// finished answer for a session nobody was looking at sets it. A session
+    /// the view does not list is still stored — the set is pruned when the row
+    /// is removed, and an id with no row draws no dot — because requiring the
+    /// session to exist would put a database scan on the hot path of every
+    /// finished turn just to reject a name that cannot be seen anyway.
+    fn set_sessions_unread(
+        &mut self,
+        session_ids: &[String],
+        unread: bool,
+    ) -> SidebarMutationOutcome {
         let mut changed = false;
         for session_id in session_ids {
-            changed |= self.unread_session_ids.remove(session_id);
+            changed |= if unread {
+                self.unread_session_ids.insert(session_id.clone())
+            } else {
+                self.unread_session_ids.remove(session_id)
+            };
         }
         if changed {
             SidebarMutationEffect::UNREAD.into()
@@ -1599,8 +1612,9 @@ mod tests {
         view.unread_session_ids.insert("session-a".to_string());
         view.unread_session_ids.insert("session-b".to_string());
         let outcome = view.apply_remote(
-            &RemoteSidebarOrganizationMutation::MarkSessionsRead {
+            &RemoteSidebarOrganizationMutation::SetSessionsUnread {
                 session_ids: vec!["session-a".to_string()],
+                unread: false,
             },
             &session_projects(),
             &session_workspaces(),
@@ -1621,14 +1635,53 @@ mod tests {
     }
 
     #[test]
+    fn a_completion_one_client_saw_badges_the_session_on_the_others() {
+        // The reverse direction: a compact client that drew a dot for a finished
+        // answer reports it, and the authority starts badging the session so the
+        // Desktop draws the same dot. A session the authority already badges is
+        // an idempotent no-op, not a second republish.
+        let mut view = view_with_folder();
+        let outcome = view.apply_remote(
+            &RemoteSidebarOrganizationMutation::SetSessionsUnread {
+                session_ids: vec!["session-a".to_string()],
+                unread: true,
+            },
+            &session_projects(),
+            &session_workspaces(),
+            "unused",
+            "unused",
+        );
+        assert_eq!(
+            outcome,
+            Ok(SidebarMutationOutcome::Applied(
+                SidebarMutationEffect::UNREAD
+            ))
+        );
+        assert!(view.unread_session_ids.contains("session-a"));
+
+        let again = view.apply_remote(
+            &RemoteSidebarOrganizationMutation::SetSessionsUnread {
+                session_ids: vec!["session-a".to_string()],
+                unread: true,
+            },
+            &session_projects(),
+            &session_workspaces(),
+            "unused",
+            "unused",
+        );
+        assert_eq!(again, Ok(SidebarMutationOutcome::AlreadyApplied));
+    }
+
+    #[test]
     fn reading_an_already_read_session_is_a_noop_not_a_republish() {
         // A client that retried after a reconnect, or that opened a session the
         // authority had already read by another route, must not make the shell
         // republish every sidebar mark for nothing.
         let mut view = view_with_folder();
         let outcome = view.apply_remote(
-            &RemoteSidebarOrganizationMutation::MarkSessionsRead {
+            &RemoteSidebarOrganizationMutation::SetSessionsUnread {
                 session_ids: vec!["session-a".to_string()],
+                unread: false,
             },
             &session_projects(),
             &session_workspaces(),

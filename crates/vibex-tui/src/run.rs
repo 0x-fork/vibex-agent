@@ -2586,6 +2586,14 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             if let vibex_backend::BackendEvent::Timeline(item) = &event {
                 app.note_session_echo(&item.item);
                 if app.note_activity(item) {
+                    // The mark is the reader's, but the badge is shared: the
+                    // Desktop is another window on this runtime, and the
+                    // finished answer it did not receive here is just as new
+                    // there. Sending the mark is what makes the two lists agree;
+                    // a mark the authority already holds sends nothing.
+                    if let Some(effect) = app.sidebar_mark_unread_effect(&item.session_id) {
+                        worker.dispatch(effect);
+                    }
                     // Deliberately not `dirty`: the frame is repainted when the
                     // event itself is applied below.
                 }
@@ -3190,6 +3198,73 @@ mod tests {
         assert!(
             app.agent.state.sessions.is_loading(),
             "a lag that named the sidebar left the list stale"
+        );
+    }
+
+    #[test]
+    fn a_finished_answer_elsewhere_reports_the_unread_mark_to_the_authority() {
+        // The event loop, not just the reducer: a completion for a session the
+        // reader is not looking at must reach the worker as a sidebar mutation,
+        // or the Desktop window never learns to badge it. The write is observed
+        // where every other sidebar write is — the answer that comes back.
+        use vibex_core::{AgentMessagePayload, TimelinePayload};
+        let (worker, mut messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+        let mut app = isolation_app();
+        let elsewhere = isolation_session(vibex_core::VibexSessionId::new(), "codex");
+        app.agent
+            .apply_sessions(Ok(vec![elsewhere.clone()]))
+            .unwrap();
+        // The reader is looking at some other session, so the answer lands in
+        // the background.
+        let open = isolation_session(vibex_core::VibexSessionId::new(), "codex");
+        app.agent.state.selected_session_id = Some(open.id.clone());
+        app.agent.state.active_session.resolve(open.clone());
+
+        let sequence = 1;
+        let item = conversation_item(
+            &elsewhere.id,
+            sequence,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "done".into(),
+                is_final: true,
+            }),
+        );
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Event(vibex_backend::BackendEvent::Timeline(
+                vibex_core::TimelineLiveEvent {
+                    session_id: elsewhere.id.clone(),
+                    sequence,
+                    item,
+                },
+            )),
+        )
+        .unwrap();
+        assert!(
+            app.session_is_unread(&elsewhere.id),
+            "the completion did not mark the background session unread"
+        );
+
+        // The mutation was dispatched to the worker: its answer — a refusal from
+        // the disconnected backend — is the proof, and it names the mark.
+        let observer = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let reported = observer.block_on(async {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), messages.recv()).await {
+                    Ok(Some(AppMessage::SidebarOrganizationMutated(_))) => break true,
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break false,
+                }
+            }
+        });
+        assert!(
+            reported,
+            "the unread mark never reached the worker's sidebar mutation"
         );
     }
 

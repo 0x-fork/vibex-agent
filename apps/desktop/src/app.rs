@@ -11818,17 +11818,29 @@ impl VibexWorkbench {
                             );
                         }
                         if effect.unread
-                            && let vibex_core::RemoteSidebarOrganizationMutation::MarkSessionsRead {
+                            && let vibex_core::RemoteSidebarOrganizationMutation::SetSessionsUnread {
                                 session_ids,
+                                unread,
                             } = &mutation
                         {
-                            // Another client read these sessions. The authority's
+                            // Another client moved these marks. The authority's
                             // own badge and the client's mark are the same fact
-                            // seen from two seats, so clearing the local set is
-                            // what stops this shell badging a session the reader
-                            // has already read elsewhere.
-                            self.unread_agent_completion_session_ids
-                                .retain(|session_id| !session_ids.contains(session_id));
+                            // seen from two seats: a session that client read
+                            // stops being badged here, and a finished answer it
+                            // saw for a session nobody is looking at starts
+                            // being badged here — which is the dot that client
+                            // drew. The view already holds the new value, so the
+                            // shell's set is replaced from it rather than
+                            // replayed one id at a time.
+                            for session_id in session_ids {
+                                if *unread {
+                                    self.unread_agent_completion_session_ids
+                                        .insert(session_id.clone());
+                                } else {
+                                    self.unread_agent_completion_session_ids
+                                        .remove(session_id);
+                                }
+                            }
                         }
                         self.invalidate_sidebar_projection_cache();
                         self.publish_sidebar_invalidation();

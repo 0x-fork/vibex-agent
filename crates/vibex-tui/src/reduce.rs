@@ -8560,8 +8560,9 @@ mod tests {
         assert_eq!(
             read,
             Some(
-                vibex_core::RemoteSidebarOrganizationMutation::MarkSessionsRead {
+                vibex_core::RemoteSidebarOrganizationMutation::SetSessionsUnread {
                     session_ids: vec!["session_org000001".to_string()],
+                    unread: false,
                 }
             ),
             "opening the session did not tell the authority: {:?}",
@@ -8597,6 +8598,41 @@ mod tests {
                 &vibex_core::VibexSessionId::parse("session_org000001").unwrap()
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn a_finished_answer_elsewhere_tells_the_authority_it_is_unread() {
+        // The other half of the read sync: a completion this client draws a dot
+        // for is just as new in the Desktop window, so the mark travels back.
+        // The authority's own set is the one that decides whether a write is
+        // needed, so an already-badged session sends nothing.
+        let app = arranged_app();
+        let quiet = vibex_core::VibexSessionId::parse("session_org000002").unwrap();
+        let badged = vibex_core::VibexSessionId::parse("session_org000001").unwrap();
+
+        let reported = app.sidebar_mark_unread_effect(&quiet);
+        let Some(Effect::MutateSidebarOrganization {
+            mutation,
+            expected_revision,
+        }) = reported
+        else {
+            panic!("a completion the authority does not badge was not reported: {reported:?}");
+        };
+        assert_eq!(
+            mutation,
+            vibex_core::RemoteSidebarOrganizationMutation::SetSessionsUnread {
+                session_ids: vec!["session_org000002".to_string()],
+                unread: true,
+            }
+        );
+        assert_eq!(
+            expected_revision, None,
+            "a mark is not an edit of the tree and must not quote its revision"
+        );
+        assert!(
+            app.sidebar_mark_unread_effect(&badged).is_none(),
+            "a session the authority already badges must not queue a write per turn"
         );
     }
 
