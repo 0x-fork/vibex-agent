@@ -570,9 +570,16 @@ fn the_prompt_is_the_last_band_on_a_session_page() {
         .iter()
         .position(|line| line.contains('❯'))
         .expect("the prompt is on screen");
-    // One padding row, then the info line, then the outer padding: nothing is
-    // drawn between the prompt and the bottom of the screen.
-    assert!(lines[prompt_row + 1].trim().is_empty());
+    // The box's floor — its edge and nothing else — then the info line, then the
+    // outer padding: nothing is drawn between the prompt and the bottom of the
+    // screen.
+    let edge = vibex_tui::glyphs::accent_bar(vibex_tui::glyphs::GlyphTier::of(&app.theme));
+    assert_eq!(
+        lines[prompt_row + 1].trim(),
+        edge,
+        "the box drew something under the draft:\n{}",
+        lines.join("\n")
+    );
     assert!(
         !lines[prompt_row + 2].trim().is_empty(),
         "the prompt's info line is missing:\n{}",
@@ -624,6 +631,32 @@ fn the_prompt_has_a_padded_surface_and_separate_context_line() {
         buffer[(band.x, band.bottom() - 1)].bg,
         app.theme.roles.surface_raised
     );
+}
+
+#[test]
+fn the_prompt_wears_the_edge_the_readers_own_message_does() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    let buffer = render_buffer(&mut app, 120, 40);
+    let band = app.regions.composer_band.unwrap();
+    let editor = app.regions.composer.unwrap();
+    let edge = vibex_tui::glyphs::accent_bar(vibex_tui::glyphs::GlyphTier::of(&app.theme));
+    // Every row of the writing surface, top to bottom: the edge is the box, not
+    // a mark on the row the draft happens to be on.
+    for row in band.y..band.y + band.height - 1 {
+        let cell = &buffer[(band.x, row)];
+        assert_eq!(cell.symbol(), edge, "row {row} of the prompt has no edge");
+        assert_eq!(
+            cell.fg, app.theme.roles.accent_success,
+            "row {row} of the edge is not the reader's green"
+        );
+        // Drawn on the surface, not over the canvas beside it.
+        assert_eq!(cell.bg, app.theme.roles.surface_raised, "row {row}");
+    }
+    // The draft starts behind the edge and the padding cell the reader's own
+    // message is also drawn behind, so the box and the message it produced are
+    // the same surface in the same column.
+    assert_eq!(editor.x, band.x + 2);
 }
 
 #[test]
@@ -5871,13 +5904,16 @@ fn a_new_session_shows_one_tick_per_turn_and_nothing_when_empty() {
     use vibex_desktop_model::TimelineRowKind;
     let rail = |app: &mut App, width: u16, rows: u16| {
         let buffer = render_buffer(app, width, rows);
-        (0..rows)
-            .filter(|row| {
-                (0..width).any(|column| {
-                    buffer
-                        .cell((column, *row))
-                        .is_some_and(|cell| matches!(cell.symbol(), "•" | "▪" | "┃"))
-                })
+        // The rail publishes the cell it draws each turn in, so the count is
+        // taken from the rail itself: a heavy vertical anywhere else on the page
+        // — the composer's edge, the bar beside a live thought — is not a turn.
+        app.regions
+            .turns
+            .iter()
+            .filter(|(cell, _)| {
+                buffer
+                    .cell((cell.x, cell.y))
+                    .is_some_and(|cell| matches!(cell.symbol(), "•" | "▪" | "┃"))
             })
             .count()
     };

@@ -42,6 +42,13 @@ fn bordered(theme: &TuiTheme) -> Block<'static> {
 /// pasted document from taking the whole screen away from the transcript.
 const MAX_COMPOSER_DRAFT_ROWS: usize = 8;
 
+/// Columns the composer spends on the edge that marks its writing surface.
+///
+/// The transcript draws the reader's own message behind the same cell, so the
+/// width is asked for rather than repeated: the two surfaces are one object at
+/// two moments, and an edge of two different widths would say otherwise.
+const BOX_EDGE_COLUMNS: u16 = crate::transcript::BOX_EDGE as u16;
+
 /// Which seat the client is attached by. Decided by the composition root, not
 /// by the library.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4388,22 +4395,42 @@ fn composer_vocabulary(strings: Strings) -> String {
     )
 }
 
+/// The edge down the left of the composer: the cell that marks the writing
+/// surface as the reader's own.
+///
+/// One column, the height of the surface, in the colour the transcript draws
+/// the reader's own message with. The box and the message are one object at two
+/// moments, and the edge is what says so before a word is read.
+fn render_composer_edge(frame: &mut Frame<'_>, input: Rect, theme: &TuiTheme) {
+    if input.width == 0 || input.height == 0 {
+        return;
+    }
+    let edge = Rect {
+        width: BOX_EDGE_COLUMNS.min(input.width),
+        ..input
+    };
+    let rows = (0..input.height)
+        .map(|_| Line::from(crate::transcript::box_edge(theme)))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(Text::from(rows)), edge);
+}
+
 /// Draw the composer.
 ///
 /// The composer is the one place the user types, so it gets the interface's
 /// strongest affordances:
 ///
 /// ```text
-/// ╭─ <session title> ─────────────────────────────╮
-/// │ ❯ the draft so far                             │
-/// ╰─ <agent> · <account> · <model> · <mode>   multi╯
+/// ┃ ❯ the draft so far
+/// <agent> · <account> · <model> · <mode>
 /// ```
 ///
-/// The top border carries the session, and the bottom border is an info line —
+/// The writing surface is the reader's own, so it wears the same green edge on
+/// its left as the message they last sent. The line under it is an info line —
 /// the runtime a message will go through and any warning — which is where a
-/// terminal UI can show context without spending a row on it. Both fade toward
-/// the canvas when the composer does not have focus, so "where will my
-/// keystrokes go" is answerable at a glance rather than by reading.
+/// terminal UI can show context without spending a row on it. The prompt mark
+/// fades toward the canvas when the composer does not have focus, so "where will
+/// my keystrokes go" is answerable at a glance rather than by reading.
 fn render_composer(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -4429,10 +4456,13 @@ fn render_composer(
         Paragraph::new("").style(Style::default().bg(theme.roles.surface_raised)),
         input,
     );
+    render_composer_edge(frame, input, theme);
+    // The edge, then the padding cell the draft is inset by: the same two cells
+    // the reader's own message is drawn behind in the transcript.
     let text_area = Rect {
-        x: input.x + 1,
+        x: input.x + BOX_EDGE_COLUMNS + 1,
         y: input.y + 1,
-        width: input.width.saturating_sub(2),
+        width: input.width.saturating_sub(BOX_EDGE_COLUMNS + 2),
         height: input.height.saturating_sub(2),
     };
     if text_area.height == 0 {
@@ -4535,12 +4565,14 @@ fn render_composer(
         }
     }
 
-    // Runtime context sits below the padded writing surface.
+    // Runtime context sits below the padded writing surface, on the draft's own
+    // column: the edge and the padding above it are the box, and a caption
+    // belongs under what it describes.
     if area.height >= 2 {
         let bottom = Rect {
             y: area.y + area.height - 1,
-            x: area.x + 1,
-            width: area.width.saturating_sub(2),
+            x: area.x + BOX_EDGE_COLUMNS + 1,
+            width: area.width.saturating_sub(BOX_EDGE_COLUMNS + 2),
             height: 1,
         };
         render_composer_info(frame, bottom, app, theme, strings);

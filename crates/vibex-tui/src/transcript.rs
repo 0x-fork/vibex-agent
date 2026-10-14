@@ -2172,10 +2172,11 @@ impl Transcript {
                         .is_some_and(|body| body.contains(&offset));
                     lines.push(PlainLine {
                         text: line.clone(),
-                        // A row the reader's own box draws sits its body one
-                        // cell further in than any other row does.
+                        // A row the reader's own box draws sits its body behind
+                        // its edge and its padding, one cell further in than any
+                        // other row does.
                         chrome: if boxed {
-                            chrome::PAD_LEFT + BOX_INSET
+                            chrome::PAD_LEFT + BOX_EDGE + BOX_INSET
                         } else {
                             chrome::PAD_LEFT
                         },
@@ -2570,6 +2571,28 @@ const CLOCK_GAP: usize = 2;
 /// cell the session list leaves after its own age column.
 const CLOCK_EDGE: usize = 1;
 
+/// Columns the reader's own box spends on the edge that marks it.
+///
+/// One cell, on the left of the band: the same cell the composer draws its own
+/// edge in, so the message and the box it was typed into are recognisably the
+/// same object at two moments.
+pub(crate) const BOX_EDGE: usize = 1;
+
+/// The edge drawn down the left of the reader's own surfaces.
+///
+/// The transcript's message band and the composer's writing surface are one
+/// object — what the reader wrote and what they are writing — so both are
+/// marked by the same cell: one column of the heavy vertical the rail
+/// vocabulary already draws, in the green every shipped theme resolves
+/// `chart-2` to. It is the one rail on the page that belongs to the reader
+/// rather than to the Agent.
+pub(crate) fn box_edge(theme: &TuiTheme) -> Span<'static> {
+    Span::styled(
+        crate::glyphs::accent_bar(crate::glyphs::GlyphTier::of(theme)).to_string(),
+        Style::default().fg(theme.roles.accent_success),
+    )
+}
+
 /// Columns the reader's own message keeps clear inside its band, on each side.
 ///
 /// One cell, the same the composer insets its draft by. The message and the box
@@ -2620,11 +2643,11 @@ fn clock_columns(block: &Block, strings: Strings) -> usize {
 /// on the width or the last settled line and the first live one would break in
 /// different places.
 pub fn body_width_for(block: &Block, width: usize, strings: Strings) -> usize {
-    // The reader's own message pays for its box — the padding cell the text is
-    // inset by, then the prompt mark — and a message of either kind pays for
-    // the clock, whatever its label needs.
+    // The reader's own message pays for its box — the edge that marks it, the
+    // padding cell the text is inset by, then the prompt mark — and a message of
+    // either kind pays for the clock, whatever its label needs.
     let boxed = if band_fills_row(block) {
-        BOX_INSET + 2
+        BOX_EDGE + BOX_INSET + 2
     } else {
         0
     };
@@ -2696,8 +2719,9 @@ fn band_fills_row(block: &Block) -> bool {
 /// One empty row of a banded block: the padding above and below the text.
 ///
 /// It is a row of the box rather than a gap between blocks, which is why it
-/// carries the band to the content edge and the pointer, and why it keeps an
-/// empty plain line — the copy of a message is the message, not its padding.
+/// carries the edge, the band to the content edge and the pointer, and why it
+/// keeps an empty plain line — the copy of a message is the message, not its
+/// padding.
 fn band_row(
     row: usize,
     live: bool,
@@ -2707,10 +2731,10 @@ fn band_row(
     theme: &TuiTheme,
 ) -> Line<'static> {
     let band = Style::default().bg(theme.roles.surface_raised);
-    let mut spans = vec![Span::raw(" ".repeat(BOX_INSET))];
+    let mut spans = vec![box_edge(theme), Span::raw(" ".repeat(BOX_INSET))];
     close_body_row(
         &mut spans,
-        BOX_INSET,
+        BOX_EDGE + BOX_INSET,
         content_width,
         Some(band),
         None,
@@ -3421,10 +3445,12 @@ fn render_block_inner(
             Some(band) => band.fg(theme.roles.gray_dim),
             None => Style::default().fg(theme.roles.gray_dim),
         };
-        // The reader's own message carries the box the composer does: a cell of
-        // padding on every side. A band that hugged its text would read as a
-        // highlight behind a sentence rather than as the thing they wrote into.
+        // The reader's own message carries the box the composer does: the edge
+        // that marks it, then a cell of padding on every side. A band that
+        // hugged its text would read as a highlight behind a sentence rather
+        // than as the thing they wrote into.
         let inset = band.map_or(0, |_| BOX_INSET);
+        let edge = band.map_or(0, |_| BOX_EDGE);
         let mut block_row = 0usize;
         if band.is_some() {
             for _ in 0..BOX_PAD_ROWS {
@@ -3472,12 +3498,17 @@ fn render_block_inner(
                 // prompt mark sits one cell in from the edge of the box.
                 spans.insert(0, Span::raw(" ".repeat(inset)));
             }
+            if edge > 0 {
+                // The edge that marks the box, outside its padding: the two
+                // surfaces the reader owns wear it in the same column.
+                spans.insert(0, box_edge(theme));
+            }
             // Neither the band nor the clock is text, so neither enters
             // `plain`: what a reader drags out of the transcript is the message
             // they wrote, without the chrome that framed it.
             close_body_row(
                 &mut spans,
-                display_width(&text) + inset,
+                display_width(&text) + inset + edge,
                 content_width,
                 band,
                 (index == 0).then_some(clock.as_deref()).flatten(),
@@ -5228,6 +5259,61 @@ mod density_tests {
         assert!(!rendered.plain[BOX_PAD_ROWS].is_empty());
     }
 
+    /// The cell a line draws at `column`, as the text and the style it wears.
+    fn cell_at(line: &Line<'static>, column: usize) -> (String, Style) {
+        let mut at = 0usize;
+        for span in &line.spans {
+            let width = display_width(span.content.as_ref());
+            if column < at + width {
+                return (span.content.to_string(), span.style);
+            }
+            at += width;
+        }
+        (String::new(), Style::default())
+    }
+
+    #[test]
+    fn the_readers_message_wears_an_edge_down_its_left() {
+        let theme = theme();
+        let row = item("user", TimelineRowKind::UserMessage, "a question", false);
+        let rendered = render_block(&row, &theme, 60, strings());
+        let edge = crate::glyphs::accent_bar(crate::glyphs::GlyphTier::of(&theme));
+        // The box's own rows, its padding included: the edge is the box, not the
+        // text, so a message short enough to fit one row still wears it top to
+        // bottom.
+        let box_rows = rendered.height - chrome::GAP;
+        for (index, line) in rendered.lines.iter().take(box_rows).enumerate() {
+            let (glyph, style) = cell_at(line, chrome::PAD_LEFT);
+            assert_eq!(glyph, edge, "row {index} of the box has no edge");
+            assert_eq!(
+                style.fg,
+                Some(theme.roles.accent_success),
+                "row {index} of the edge is not the reader's green"
+            );
+        }
+        // Everything the box holds sits behind the edge and the padding cell the
+        // composer insets its draft by, as one column of chrome.
+        let body = line_text(&rendered.lines[BOX_PAD_ROWS]);
+        let prompt = prompt_glyph(&theme);
+        assert!(
+            body.starts_with(&format!("  {edge} {prompt} a question")),
+            "{body:?}"
+        );
+        // The copy of the box's rows leaves the chrome behind: a reader who
+        // drags the message out gets the words, not the rule that framed them.
+        assert_eq!(rendered.plain[BOX_PAD_ROWS], format!("{prompt} a question"));
+
+        // A reply is prose on the page, not a surface the reader wrote into.
+        let answer = item("agent", TimelineRowKind::AgentMessage, "an answer", false);
+        let rendered = render_block(&answer, &theme, 60, strings());
+        for line in rendered.lines.iter() {
+            assert!(
+                !line_text(line).contains(edge),
+                "the answer wears the reader's edge"
+            );
+        }
+    }
+
     #[test]
     fn work_rows_and_unstamped_rows_draw_no_clock() {
         // Only the conversation is stamped: a work item's clock would be one of
@@ -5244,7 +5330,7 @@ mod density_tests {
         assert_eq!(clock_label(&unstamped, strings()), None);
         assert_eq!(
             body_width_for(&unstamped, 60, strings()),
-            chrome::content_width(60) - BOX_INSET - 2
+            chrome::content_width(60) - BOX_EDGE - BOX_INSET - 2
         );
         let rendered = render_block(&unstamped, &theme(), 60, strings());
         assert!(rendered.lines[0].width() < 60);
