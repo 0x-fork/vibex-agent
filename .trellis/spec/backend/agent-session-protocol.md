@@ -1085,6 +1085,16 @@ PermissionRepository::pending_for_session(VibexSessionId)
 - While a permission is pending, the provider turn remains running or the
   session remains `needs_input`; once the permission is resolved and the agent
   finishes streaming, the session settles to `idle`.
+- Resolving a permission or elicitation may settle the session to `idle` only
+  when no user-input request is still pending **and** no provider turn is still
+  in flight. The persisted state cannot carry that second fact: a mid-turn card
+  parks the state in `needs_input` while the turn keeps streaming, so the state
+  alone cannot tell "the turn is over" from "the turn is blocked on this card".
+  A resolution that settles early unblocks auto-continue, whose next prompt the
+  ACP attachment rejects with `acp_turn_already_running`; the recoverable error
+  then re-arms the loop and the turn does not finish. When the turn is still in
+  flight, a `needs_input` session returns to `running` and the turn settles the
+  session when it completes.
 - Turn interrupt, session close, process shutdown, process exit, or missing
   active turn sink must drain pending ACP permissions with a cancelled response
   where the child process is still reachable.
@@ -1127,6 +1137,11 @@ PermissionRepository::pending_for_session(VibexSessionId)
   `resolve_permission`, leaving the ACP child blocked forever.
 - Bad: Runtime holds a pending-permission lock while writing to child stdin.
 - Bad: Missing active turn sink leaves `session/request_permission` unanswered.
+- Bad: `resolve_permission` settles the session to `idle` from a mid-turn card
+  because the persisted state reads `needs_input`. Auto-continue then starts a
+  second prompt against the live turn; the ACP prompt gate answers
+  `conflict/acp_turn_already_running`, and because that error is recoverable the
+  session flips to `error` and the countdown fires again.
 
 ### 6. Tests Required
 
@@ -1135,6 +1150,10 @@ PermissionRepository::pending_for_session(VibexSessionId)
 - Manager-level tests must assert permission timeline persistence includes
   `provider_request_id`, `resolve_permission` delegates to the provider, and
   duplicate resolution succeeds without a second provider callback.
+- Manager-level tests must assert that resolving a card recorded while a turn is
+  still in flight leaves the session out of `idle` (and back in `running`), so a
+  client's auto-continue cannot race a live turn; the completed turn then
+  settles the session to `idle`.
 - End-to-end ACP provider tests must assert a mid-turn permission blocks the
   turn until resolution, then streams post-resolution output and settles the
   session to `idle`.

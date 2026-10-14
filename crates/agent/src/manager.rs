@@ -221,6 +221,31 @@ pub struct AgentManager {
     /// Sessions with a registered out-of-turn provider event pump. Shared with
     /// the pump task so it can release the slot when the attachment goes away.
     session_event_pumps: Arc<StdMutex<HashSet<String>>>,
+    /// Sessions with a provider turn currently in flight.
+    ///
+    /// Session state cannot answer "is a turn active?" on its own: a mid-turn
+    /// permission request parks the persisted state in `NeedsInput` while the
+    /// provider turn keeps streaming. Permission and elicitation resolution
+    /// need the live answer, so each turn registers here for its whole lifetime
+    /// and an RAII guard releases the entry on every exit path.
+    active_turn_sessions: Arc<StdMutex<HashSet<String>>>,
+}
+
+/// Releases a session's in-flight turn slot when its turn future ends.
+///
+/// The guard owns the removal rather than the turn body so an early return, an
+/// error, or a cancelled future all clear the slot.
+struct ActiveTurnGuard {
+    sessions: Arc<StdMutex<HashSet<String>>>,
+    session_id: String,
+}
+
+impl Drop for ActiveTurnGuard {
+    fn drop(&mut self) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.remove(&self.session_id);
+        }
+    }
 }
 
 /// Per-desktop-process launch metadata for the built-in, session-scoped MCP
@@ -609,6 +634,7 @@ impl AgentManager {
             stream_writer: StdMutex::new(None),
             context_bridge,
             session_event_pumps: Arc::new(StdMutex::new(HashSet::new())),
+            active_turn_sessions: Arc::new(StdMutex::new(HashSet::new())),
         };
         manager.recover_interrupted_sessions(&mut conn)?;
         Ok(manager)
@@ -2809,6 +2835,76 @@ impl AgentManager {
             .map(Some)
     }
 
+    /// Marks a session as running a provider turn until the returned guard is
+    /// dropped.
+    ///
+    /// The persisted session state is not enough to answer whether a turn is in
+    /// flight — a pending permission request parks the state in `NeedsInput`
+    /// while the provider turn is still streaming — so callers that must not
+    /// settle the session mid-turn consult this live set instead.
+    fn begin_active_turn(&self, session_id: &VibexSessionId) -> ActiveTurnGuard {
+        if let Ok(mut sessions) = self.active_turn_sessions.lock() {
+            sessions.insert(session_id.as_str().to_string());
+        }
+        ActiveTurnGuard {
+            sessions: Arc::clone(&self.active_turn_sessions),
+            session_id: session_id.as_str().to_string(),
+        }
+    }
+
+    /// Whether a provider turn is currently in flight for `session_id`.
+    ///
+    /// A poisoned lock reports `true`: resolving a permission must not mistake
+    /// an unknown turn for a finished one and prematurely settle the session.
+    fn session_turn_in_flight(&self, session_id: &VibexSessionId) -> bool {
+        self.active_turn_sessions
+            .lock()
+            .map(|sessions| sessions.contains(session_id.as_str()))
+            .unwrap_or(true)
+    }
+
+    /// Settles a session after one of its user-input requests is resolved.
+    ///
+    /// Resolution only returns the session to `Idle` when nothing else is
+    /// waiting on the user *and* no provider turn is still in flight. A
+    /// mid-turn permission parks the persisted state in `NeedsInput`, so the
+    /// state alone cannot distinguish "the turn is over" from "the turn is
+    /// blocked on this card". Settling the second case early would let
+    /// auto-continue start a second prompt against the still-active turn, which
+    /// the ACP layer rejects with `acp_turn_already_running`.
+    fn settle_after_user_input_resolution(
+        &self,
+        conn: &DbConnection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<()> {
+        let still_pending_permissions =
+            PermissionRepository::pending_for_session(conn, session_id)?;
+        let still_pending_elicitations =
+            ElicitationRepository::pending_for_session(conn, session_id)?;
+        if !still_pending_permissions.is_empty() || !still_pending_elicitations.is_empty() {
+            return Ok(());
+        }
+        let Some(latest) = SessionRepository::get(conn, session_id)? else {
+            return Ok(());
+        };
+        if latest.state == AgentSessionState::Running {
+            return Ok(());
+        }
+        if self.session_turn_in_flight(session_id) {
+            // The provider turn outlived the card: the resolution unblocked it,
+            // so it is working again rather than waiting on the user. Project
+            // `Running` instead of leaving the answered card's `NeedsInput` in
+            // place, which the sidebar would keep painting as a request for an
+            // answer. The turn settles the session when it finishes.
+            if latest.state == AgentSessionState::NeedsInput {
+                SessionRepository::update_state(conn, session_id, AgentSessionState::Running)?;
+            }
+            return Ok(());
+        }
+        SessionRepository::update_state(conn, session_id, AgentSessionState::Idle)?;
+        Ok(())
+    }
+
     pub async fn discover_commands(
         &self,
         request: AgentCommandDiscoverRequest,
@@ -3349,6 +3445,11 @@ impl AgentManager {
             vibex_db::authorize_vibex_use_submission(&conn, &payload.request, true)?;
         }
         SessionRepository::claim_running_turn(&conn, &session.id, session.state)?;
+        // The provider turn is now admitted and runs below; every exit path
+        // (success, error, or a dropped future) must clear this slot, so the
+        // registration is owned by a guard rather than written next to each
+        // return.
+        let _active_turn_guard = self.begin_active_turn(&session.id);
         // Human takeover was recorded when this input was accepted. Replaying
         // it here would overwrite a newer explicit handback while the input
         // was waiting for its runtime.
@@ -4062,19 +4163,7 @@ impl AgentManager {
         // turn completes; only sessions parked in NeedsInput flip back to Idle
         // here, and only when nothing else is still waiting for the user.
         let conn = self.open_migrated()?;
-        let latest = SessionRepository::get(&conn, &session.id)?;
-        let still_pending_permissions =
-            PermissionRepository::pending_for_session(&conn, &session.id)?;
-        let still_pending_elicitations =
-            ElicitationRepository::pending_for_session(&conn, &session.id)?;
-        if still_pending_permissions.is_empty()
-            && still_pending_elicitations.is_empty()
-            && latest
-                .map(|session| session.state != AgentSessionState::Running)
-                .unwrap_or(false)
-        {
-            SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle)?;
-        }
+        self.settle_after_user_input_resolution(&conn, &session.id)?;
         Ok(item)
     }
 
@@ -4152,17 +4241,7 @@ impl AgentManager {
             None,
             TimelineRedactionState::None,
         )?;
-        let latest = SessionRepository::get(&conn, &session.id)?;
-        let pending_permissions = PermissionRepository::pending_for_session(&conn, &session.id)?;
-        let pending_elicitations = ElicitationRepository::pending_for_session(&conn, &session.id)?;
-        if pending_permissions.is_empty()
-            && pending_elicitations.is_empty()
-            && latest
-                .map(|session| session.state != AgentSessionState::Running)
-                .unwrap_or(false)
-        {
-            SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle)?;
-        }
+        self.settle_after_user_input_resolution(&conn, &session.id)?;
         Ok(item)
     }
 
@@ -6465,7 +6544,8 @@ mod tests {
     use async_trait::async_trait;
     use vibex_core::{
         AcpAdapterId, AgentRuntimeRouteKey, AgentSessionSafety, MessageSubmissionStatus,
-        NativeStateHomeId, PromptCreateRequest, PromptScopeKind, ProviderConfiguredModel,
+        NativeStateHomeId, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+        PermissionRiskCategory, PromptCreateRequest, PromptScopeKind, ProviderConfiguredModel,
         RuntimeBinding, RuntimeBindingId, RuntimeMaterializationStatus, RuntimeProcessId,
         RuntimeProcessSnapshot, RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId,
         RuntimeSwitchPolicy, RuntimeSwitchStatus, SessionRuntimeConfigState, WorkspaceMode,
@@ -6508,6 +6588,16 @@ mod tests {
         identity: ProviderTurnExecutionIdentity,
         discoveries: Mutex<Vec<AgentCommandDiscoverRequest>>,
         executed_turns: Mutex<Vec<String>>,
+    }
+
+    /// A provider whose turn stays in flight until the test releases it, so a
+    /// test can record and resolve a permission card mid-turn exactly the way
+    /// the embedded browser host does.
+    struct MidTurnPermissionProvider {
+        identity: ProviderTurnExecutionIdentity,
+        /// Signalled once the turn has started and is about to block.
+        armed: tokio::sync::Notify,
+        release: tokio::sync::Notify,
     }
 
     struct TitlePushingProvider {
@@ -6698,6 +6788,60 @@ mod tests {
                 self.callback_started.notify_one();
                 self.callback_release.notified().await;
             }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl AgentProvider for MidTurnPermissionProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Acp
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            let mut capabilities =
+                ProviderCapabilities::conservative(ProviderKind::Acp, "mid-turn-permission-test");
+            capabilities.permission_requests = true;
+            capabilities
+        }
+
+        async fn create_session(
+            &self,
+            _request: ProviderCreateRequest,
+        ) -> VibexResult<ProviderSessionHandle> {
+            unreachable!("mid-turn permission test uses a seeded binding")
+        }
+
+        async fn resume_session(
+            &self,
+            binding: ProviderBinding,
+        ) -> VibexResult<ProviderSessionHandle> {
+            Ok(ProviderSessionHandle {
+                binding,
+                capabilities: self.capabilities(),
+            })
+        }
+
+        async fn prepare_turn_execution(
+            &self,
+            _handle: &ProviderSessionHandle,
+            _request: &ProviderTurnRequest,
+        ) -> VibexResult<Option<ProviderTurnExecutionIdentity>> {
+            Ok(Some(self.identity.clone()))
+        }
+
+        async fn send_turn(
+            &self,
+            _handle: ProviderSessionHandle,
+            _request: ProviderTurnRequest,
+        ) -> VibexResult<ProviderTurnResult> {
+            unreachable!("mid-turn permission test injects a runner")
+        }
+
+        async fn resolve_permission(
+            &self,
+            _request: ProviderPermissionResolution,
+        ) -> VibexResult<()> {
             Ok(())
         }
     }
@@ -7960,6 +8104,246 @@ mod tests {
                     if resolution == &winning_resolution
             )
         }));
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    /// A permission resolved while its turn is still streaming must not settle
+    /// the session to `Idle`.
+    ///
+    /// The regression: resolving a mid-turn card flipped `NeedsInput` to `Idle`
+    /// because the state check could not tell a parked turn from a finished
+    /// one. Auto-continue then started a second prompt against the live turn,
+    /// which ACP rejected with `acp_turn_already_running` on every countdown.
+    #[tokio::test]
+    async fn resolving_a_mid_turn_permission_keeps_the_turn_active() {
+        let db_path = temp_db_path("mid-turn-permission");
+        let workspace_root = temp_workspace_path("mid-turn-permission");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let mut manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        ProviderProfileRepository::ensure_local_defaults(&conn).unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let agent_id = AgentId::parse("mid-turn-permission-agent").unwrap();
+        let adapter_id = AcpAdapterId::parse("mid-turn-permission-acp").unwrap();
+        let provider_profile_id =
+            ProviderProfileId::parse(ProviderKind::Acp.local_default_profile_id().to_string())
+                .unwrap();
+        let session = insert_session(
+            &conn,
+            "mid-turn permission",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Idle,
+        );
+        let selection = SessionRuntimeSelection::provider(
+            agent_id.clone(),
+            provider_profile_id.clone(),
+            "mid-turn-permission-model",
+        );
+        let mut runtime_config = SessionRuntimeConfigState {
+            preferred_model: selection.model_id().map(str::to_string),
+            effective_model: selection.model_id().map(str::to_string),
+            ..SessionRuntimeConfigState::default()
+        };
+        runtime_config.mark_generation_if_converged(0);
+        let now = unix_timestamp_ms();
+        let binding = RuntimeBinding {
+            binding_id: RuntimeBindingId::new(),
+            session_id: session.id.clone(),
+            agent_id: agent_id.clone(),
+            transport_kind: TransportKind::Acp,
+            auth_source: selection.auth_source.clone(),
+            auth_source_revision: 1,
+            adapter_id: adapter_id.clone(),
+            adapter_version: "1.0.0".to_string(),
+            adapter_compatibility_identity: "mid-turn-permission-acp@1".to_string(),
+            native_session_id: Some("native-mid-turn-permission".to_string()),
+            native_state_home_id: NativeStateHomeId::new(),
+            provider_resume_identity: None,
+            process_spawn_fingerprint: "mid-turn-permission".to_string(),
+            session_runtime_config_state: runtime_config,
+            capability_snapshot: None,
+            restore_compatibility_key: None,
+            last_context_sequence: 0,
+            last_summary_sequence: 0,
+            context_bridge_version: 0,
+            activation_generation: 0,
+            binding_state: BindingState::Current,
+            created_by_switch_id: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        AgentSessionRuntimeRepository::initialize_runtime_selection(
+            &mut conn, &binding, &selection,
+        )
+        .unwrap();
+        let permission = PermissionRequest {
+            id: vibex_core::RequestId::new(),
+            session_id: session.id.clone(),
+            project_id: Some(project.id.clone()),
+            workspace_id: Some(workspace.id.clone()),
+            provider_request_id: Some("acp-permission-1".to_string()),
+            risk_category: PermissionRiskCategory::Network,
+            title: "Agent wants to visit github.com".to_string(),
+            details: Vec::new(),
+            allowed_responses: vec![
+                PermissionResponseKind::Approve,
+                PermissionResponseKind::Deny,
+                PermissionResponseKind::AlwaysAllowForSession,
+            ],
+            response_options: Vec::new(),
+            status: PermissionRequestStatus::Pending,
+            requested_at_ms: now,
+            expires_at_ms: None,
+        };
+        drop(conn);
+
+        let provider = Arc::new(MidTurnPermissionProvider {
+            identity: ProviderTurnExecutionIdentity {
+                binding_id: binding.binding_id.clone(),
+                activation_generation: binding.activation_generation,
+                model_id: Some(selection.model_id().unwrap().to_string()),
+            },
+            armed: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        manager
+            .register_runtime(
+                AgentRuntimeRouteKey {
+                    agent_id: agent_id.clone(),
+                    transport_kind: TransportKind::Acp,
+                    adapter_id,
+                },
+                provider.clone(),
+            )
+            .unwrap();
+
+        // The turn starts and then stays in flight. The permission card is
+        // recorded out of band, the way the embedded browser host raises one
+        // while the provider prompt is still streaming.
+        let manager = Arc::new(manager);
+        let turn_manager = Arc::clone(&manager);
+        let turn_session_id = session.id.clone();
+        let turn_selection = selection.clone();
+        let turn_provider = Arc::clone(&provider);
+        let turn = tokio::spawn(async move {
+            turn_manager
+                .run_agent_turn(
+                    AgentTurnRequest {
+                        mentions: Vec::new(),
+                        session_id: turn_session_id,
+                        required_runtime: Some(turn_selection),
+                        text: "look this up".to_string(),
+                        attachments: Vec::new(),
+                        reasoning_effort: None,
+                        correlation_id: None,
+                        delivery: UserMessageDelivery::Prompt,
+                        prompt_context: None,
+                        provenance: vibex_core::MessageProvenance::HumanInput,
+                    },
+                    AgentTurnDisplayPolicy::USER_AUTHORED,
+                    ContextBridgeTurnBehavior::ConsumePending,
+                    None,
+                    move |_provider, _handle, _request| {
+                        let provider = Arc::clone(&turn_provider);
+                        async move {
+                            provider.armed.notify_one();
+                            provider.release.notified().await;
+                            Ok(ProviderTurnResult {
+                                stop_reason: None,
+                                events: vec![ProviderEvent::agent(TimelinePayload::AgentMessage(
+                                    vibex_core::AgentMessagePayload {
+                                        text: "looked it up".to_string(),
+                                        is_final: true,
+                                    },
+                                ))],
+                                binding_update: None,
+                                completed: true,
+                            })
+                        }
+                    },
+                )
+                .await
+        });
+        provider.armed.notified().await;
+
+        // The browser host records the card while the turn is streaming; that
+        // is what parks the persisted state in `NeedsInput`.
+        manager
+            .record_permission_request(permission.clone())
+            .await
+            .unwrap();
+
+        let conn = manager.open_migrated().unwrap();
+        assert_eq!(
+            PermissionRepository::get_request(&conn, &permission.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            PermissionRequestStatus::Pending
+        );
+        assert_eq!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionState::NeedsInput
+        );
+        drop(conn);
+
+        manager
+            .resolve_permission(ResolvePermissionRequest {
+                session_id: session.id.clone(),
+                request_id: permission.id.clone(),
+                resolution: PermissionResolution {
+                    request_id: permission.id.clone(),
+                    session_id: session.id.clone(),
+                    response: PermissionResponseKind::AlwaysAllowForSession,
+                    responder_device_id: None,
+                    provider_resolution_id: None,
+                    note: None,
+                    resolved_at_ms: unix_timestamp_ms(),
+                },
+            })
+            .await
+            .unwrap();
+
+        // Resolving the card must not settle the session while its turn is
+        // still in flight: an `Idle` here is what let auto-continue fire a
+        // second prompt and loop on `acp_turn_already_running`.
+        let conn = manager.open_migrated().unwrap();
+        let state_after_resolution = SessionRepository::get(&conn, &session.id)
+            .unwrap()
+            .unwrap()
+            .state;
+        drop(conn);
+        assert_ne!(
+            state_after_resolution,
+            AgentSessionState::Idle,
+            "a mid-turn permission resolution must not settle the session to Idle"
+        );
+
+        provider.release.notify_one();
+        turn.await.unwrap().unwrap();
+
+        // With the turn finished, its own completion settles the session.
+        let conn = manager.open_migrated().unwrap();
+        let settled = SessionRepository::get(&conn, &session.id)
+            .unwrap()
+            .unwrap()
+            .state;
+        drop(conn);
+        assert_eq!(
+            settled,
+            AgentSessionState::Idle,
+            "the completed turn settles the session once it stops streaming"
+        );
 
         cleanup_db(&db_path);
         let _ = fs::remove_dir_all(workspace_root);
