@@ -1275,6 +1275,10 @@ fn handle_composer_key(
                 return Ok(Some(false));
             }
         }
+        KeyCode::Enter if shift => {
+            app.composer.insert_char('\n');
+            return Ok(Some(false));
+        }
         // The drawer is the thing on screen with the keyboard, so `Enter` takes
         // the row it offers into the draft — the same answer the desktop gives
         // the same popup, and what keeps choosing a command from sending one.
@@ -2851,7 +2855,6 @@ mod tests {
         );
     }
 
-    #[test]
     #[test]
     fn the_newline_chords_break_the_line_instead_of_sending() {
         // `Shift+Enter` is only a key of its own once the terminal has been
@@ -5321,7 +5324,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn workspace_callback_cannot_move_a_newer_draft_or_page() {
         use crate::action::Intent;
         let worker = isolation_worker();
@@ -5411,7 +5413,6 @@ mod tests {
         assert_eq!(app.composer_workspace_id(), None);
     }
 
-    #[test]
     #[test]
     fn slow_creation_and_send_expiry_never_release_followup_before_send_ack() {
         let worker = isolation_worker();
