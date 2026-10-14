@@ -636,6 +636,10 @@ fn draw_panel(
     theme: &TuiTheme,
 ) -> Rect {
     frame.render_widget(Clear, popup);
+    // The panel is drawn over the transcript rather than in a band of its own,
+    // so a line that ends against its left edge is cut in half and has to give:
+    // see [`crate::modal::blank_cut_glyphs`].
+    crate::modal::blank_cut_glyphs(frame, popup);
     let title = truncate_to_width(title, usize::from(popup.width).saturating_sub(4), "…");
     let block = border_block(theme)
         .border_style(theme.muted())

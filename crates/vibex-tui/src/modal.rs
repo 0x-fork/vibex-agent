@@ -29,8 +29,14 @@
 //! ([`crate::row_marks`], [`crate::preview`]). It sits outside the grid, with no
 //! colour of its own to darken, so whoever placed it is the only thing that can
 //! take it down.
+//!
+//! Nor is the scrim all the page loses at the box's edge: a line of text that
+//! ends against it is a character cut in two, and a terminal cannot draw half a
+//! character. [`blank_cut_glyphs`] settles which half wins, before the box goes
+//! down.
 
 use ratatui::Frame;
+use ratatui::buffer::{CellDiffOption, CellWidth};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
@@ -279,6 +285,47 @@ fn paint_backdrop(frame: &mut Frame<'_>, area: Rect, popup: Rect, theme: &TuiThe
     }
 }
 
+/// Blank the page's half of every character a box is about to cut in two.
+///
+/// A terminal paints a two-column character as one picture, and the frame's diff
+/// follows it: the cell after a wide character is not sent on its own, because
+/// the terminal is assumed to paint it as part of the glyph. A border drawn over
+/// that trailing cell is therefore a cell the frame never sends — the character
+/// is sent again (a style patched onto it, the one [`paint_backdrop`] leaves, is
+/// enough to do that), it covers the column the border is in, and the border,
+/// unchanged, is never sent again either. The reader sees a line that disappears
+/// wherever the page has text against it.
+///
+/// There is no half a character to draw, so the page's character is what gives:
+/// the box already covered its second column, and blanking it keeps the grid
+/// honest about which plane is on top. The frame then has to send the border
+/// cell *after* the blank — the order is what leaves the line standing — which
+/// is what the always-update mark on it is for, since the buffer holds the same
+/// border it held a frame ago and would otherwise stay quiet.
+///
+/// Shared with [`crate::preview::draw_panel`], the other box this client draws
+/// over a page rather than in a band of its own.
+pub(crate) fn blank_cut_glyphs(frame: &mut Frame<'_>, popup: Rect) {
+    let buffer = frame.buffer_mut();
+    for y in popup.y..popup.bottom() {
+        let Some(x) = popup.x.checked_sub(1) else {
+            continue;
+        };
+        let cut = buffer
+            .cell((x, y))
+            .is_some_and(|cell| cell.cell_width() > 1);
+        if !cut {
+            continue;
+        }
+        if let Some(cell) = buffer.cell_mut((x, y)) {
+            cell.set_symbol(" ");
+        }
+        if let Some(border) = buffer.cell_mut((popup.x, y)) {
+            border.set_diff_option(CellDiffOption::AlwaysUpdate);
+        }
+    }
+}
+
 /// Draw one modal's chrome and return the regions to fill.
 ///
 /// A modal that cannot be drawn at a usable size renders a single explanatory
@@ -312,6 +359,9 @@ pub fn render_modal(
     // The popup's own cells still hold the page underneath: the backdrop skips
     // them precisely because this resets every one of them.
     frame.render_widget(Clear, popup);
+    // A character the box cuts in half is settled before the border goes down,
+    // so the border is the glyph the terminal ends up with in that column.
+    blank_cut_glyphs(frame, popup);
 
     let close_rect = chrome.close.then(|| close_rect(popup));
     let title_budget = usize::from(popup.width).saturating_sub(if chrome.close { 8 } else { 4 });
@@ -425,6 +475,7 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::{Buffer, Cell};
 
     fn theme() -> TuiTheme {
         TuiTheme::resolve(
@@ -435,6 +486,143 @@ mod tests {
                 glyphs: GlyphMode::Unicode,
             },
         )
+    }
+
+    /// A terminal that knows the one rule the cell grid leans on.
+    ///
+    /// [`TestBackend`] paints the cell it was handed, which is not what a
+    /// terminal does with a two-column character: the character is one picture,
+    /// it covers the column after it, and writing over either half of it takes
+    /// the whole thing down. That rule is *why* a border beside a wide character
+    /// can vanish — the frame sends the character again and the border, unchanged
+    /// in the buffer, not at all — so a test about that has to read the screen
+    /// the way a terminal would.
+    ///
+    /// Each cell is read as the glyph that owns it: the column that glyph starts
+    /// at, and how many columns it covers.
+    #[derive(Debug)]
+    struct Screen {
+        width: u16,
+        owners: Vec<Option<(u16, u16)>>,
+    }
+
+    impl Screen {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                width,
+                owners: vec![None; usize::from(width) * usize::from(height)],
+            }
+        }
+
+        /// A terminal showing `buffer`, which is what one full frame leaves
+        /// behind: the frame is read as the diff a full redraw sends, so the
+        /// cells a wide character covers are read as that character's, not as
+        /// the blanks the buffer holds there.
+        fn showing(buffer: &Buffer) -> Self {
+            let mut screen = Self::new(buffer.area.width, buffer.area.height);
+            screen.send(Buffer::empty(buffer.area).diff(buffer));
+            screen
+        }
+
+        fn index(&self, x: u16, y: u16) -> usize {
+            usize::from(y) * usize::from(self.width) + usize::from(x)
+        }
+
+        /// Send cells the way a terminal receives them, in order.
+        fn send<'a>(&mut self, cells: impl IntoIterator<Item = (u16, u16, &'a Cell)>) {
+            let stride = usize::from(self.width);
+            for (x, y, cell) in cells {
+                let index = usize::from(y) * stride + usize::from(x);
+                if x >= self.width || index >= self.owners.len() {
+                    continue;
+                }
+                // Writing over either half of a glyph takes the whole glyph
+                // down; the cell then holds a glyph of its own.
+                if let Some((head, covered)) = self.owners[index] {
+                    for column in usize::from(head)..usize::from(head + covered) {
+                        let owned = usize::from(y) * stride + column;
+                        if owned < self.owners.len() {
+                            self.owners[owned] = None;
+                        }
+                    }
+                }
+                let width = cell.cell_width();
+                self.owners[index] = Some((x, width));
+                for column in 1..width {
+                    if x + column < self.width && index + usize::from(column) < self.owners.len() {
+                        self.owners[index + usize::from(column)] = Some((x, width));
+                    }
+                }
+            }
+        }
+
+        /// Whether the cell shows a glyph of its own, rather than the second
+        /// column of the character before it.
+        fn shows_its_own(&self, x: u16, y: u16) -> bool {
+            matches!(self.owners[self.index(x, y)], Some((head, _)) if head == x)
+        }
+    }
+
+    /// A line of the page that ends against the box keeps the box's border.
+    ///
+    /// This is the failure a reader reports as "the line breaks wherever there is
+    /// text beside it". The page's last character sits in the cell before the
+    /// border, its second column *is* the border's column, and the frame sends
+    /// the character again — the style [`paint_backdrop`] patches onto it is
+    /// enough — while the border, unchanged in the buffer, is not sent at all.
+    /// The terminal paints the character over the border column and the line is
+    /// gone for as long as the box is up.
+    #[test]
+    fn a_wide_character_against_the_border_does_not_take_it_down() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let theme = theme();
+        let area = Rect::new(0, 0, 120, 40);
+        let popup = dimensions(area, ModalSizing::picker());
+        // A row the box covers, with a page line whose last character starts in
+        // the cell before the box: `中` is two columns wide, so the border's own
+        // column is the second half of it.
+        let row = popup.y + 3;
+        let page = |frame: &mut Frame<'_>| {
+            frame
+                .buffer_mut()
+                .set_stringn(popup.x - 3, row, "ab中", 4, theme.base());
+        };
+
+        // The page alone, which is what the terminal is showing when the box
+        // opens over it.
+        terminal
+            .draw(|frame| page(frame))
+            .expect("the page frame draws");
+        let before = terminal.backend().buffer().clone();
+        let mut screen = Screen::showing(&before);
+        assert!(
+            !screen.shows_its_own(popup.x, row),
+            "the page's character does not reach the border column"
+        );
+
+        // The same page with the box over it. The page is redrawn every frame,
+        // so the character is sent again and the border has to survive it.
+        terminal
+            .draw(|frame| {
+                page(frame);
+                let chrome = ModalChrome::new("Test", ModalSizing::picker());
+                render_modal(frame, area, &chrome, &theme);
+            })
+            .expect("the modal frame draws");
+        let after = terminal.backend().buffer().clone();
+        screen.send(before.diff(&after));
+
+        assert!(
+            screen.shows_its_own(popup.x, row),
+            "the popup's left border is hidden under the page's character"
+        );
+        // And the rest of the box is where it was: the fix settles one column,
+        // it does not move the frame.
+        assert!(
+            screen.shows_its_own(popup.x + 1, row),
+            "the popup's content was pushed by the character beside it"
+        );
     }
 
     #[test]
