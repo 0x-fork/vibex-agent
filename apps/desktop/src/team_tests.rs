@@ -1134,8 +1134,8 @@ fn delegated_rows_branch_from_the_parent_logo_and_share_its_columns(cx: &mut Tes
         .debug_bounds("delegated-logo-session_team_1")
         .expect("the delegated row draws its Agent logo");
     let child_status = cx
-        .debug_bounds("delegated-status-session_team_1")
-        .expect("the delegated row keeps a status column");
+        .debug_bounds("sidebar-delegated-status-session_team_1")
+        .expect("the delegated row paints the session status column every row paints");
     let trunk = cx
         .debug_bounds("delegated-trunk-session_team_1-0")
         .expect("a child row draws the trunk of its own level");
@@ -1182,67 +1182,61 @@ fn delegated_rows_branch_from_the_parent_logo_and_share_its_columns(cx: &mut Tes
     );
 }
 
-/// A child row reports the child session, not the delegation record.
+/// A row reports the session it stands for, whatever list draws it.
 ///
-/// The ownership node's phase moves when the task does and not when the session
-/// does: a task that failed and was then continued keeps `Failed` while its
-/// session works again, and a task still marked active says nothing about a
-/// session the reader has since stopped. The row therefore resolves the state a
-/// session row resolves — from the live snapshot — and keeps the phase only as
-/// the fallback for a child the registry cannot describe yet.
-#[test]
-fn a_delegated_row_follows_the_child_session_over_the_task_phase() {
-    let mut failed_task = node(1, Some(0), 0);
-    failed_task.task_phase = Some(DelegationTaskPhase::Failed);
-
+/// The delegated child rows resolve their state through the same projection the
+/// navigation rows use, from the child's own live snapshot — never from the
+/// ownership node, whose task phase moves when the delegation record does and
+/// not when the session does. A task that failed and was then continued keeps
+/// `Failed` while its session works again, and the row above and the row below
+/// would otherwise describe one session two ways.
+#[gpui::test]
+fn a_row_reports_the_state_its_session_projection_resolves(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 3);
+    let child = session(1).id.as_str().to_string();
     let mut working = session(1);
     working.state = AgentSessionState::Running;
-    assert_eq!(
-        delegation_row_display_state(&failed_task, Some(&working), false, false),
-        AgentSessionState::Running,
-        "a spent failure phase does not outrank a session that is working again"
-    );
-
-    let mut active_task = node(1, Some(0), 0);
-    active_task.task_phase = Some(DelegationTaskPhase::Active);
-    let mut stopped = session(1);
-    stopped.state = AgentSessionState::Idle;
-    assert_eq!(
-        delegation_row_display_state(&active_task, Some(&stopped), false, false),
-        AgentSessionState::Idle,
-        "a task still marked active says nothing about a session that stopped"
-    );
-
-    // The projections a session row folds in hold here too: a local dispatch is
-    // optimistic, and a request parked on the user outranks it.
-    assert_eq!(
-        delegation_row_display_state(&active_task, Some(&stopped), true, false),
-        AgentSessionState::Running
-    );
-    assert_eq!(
-        delegation_row_display_state(&active_task, Some(&stopped), true, true),
-        AgentSessionState::NeedsInput
-    );
-    let mut parked = session(1);
-    parked.state = AgentSessionState::NeedsInput;
-    assert_eq!(
-        delegation_row_display_state(&active_task, Some(&parked), true, false),
-        AgentSessionState::NeedsInput
-    );
-
-    // Without a snapshot the phase still answers, and a node the task parked on
-    // the user says so even before the session reports it.
-    assert_eq!(
-        delegation_row_display_state(&failed_task, None, false, false),
-        AgentSessionState::Error
-    );
-    let mut blocked = node(2, Some(0), 0);
-    blocked.blocked_on = Some(DelegationBlockedOn::Permission {
-        request_id: "request_team".into(),
+    workbench.update(cx, |workbench, _| {
+        let mut failed = node(1, Some(0), 0);
+        failed.task_phase = Some(DelegationTaskPhase::Failed);
+        workbench.delegated_tree.insert(child.clone(), failed);
+        workbench
+            .delegated_sessions
+            .insert(child.clone(), working.clone());
     });
     assert_eq!(
-        delegation_row_display_state(&blocked, None, false, false),
-        AgentSessionState::NeedsInput
+        workbench.read_with(cx, |workbench, _| workbench
+            .sidebar_session_row_state(&working)),
+        AgentSessionState::Running,
+        "the row reads the session's own snapshot, not the task phase"
+    );
+
+    // The projections a session row folds in hold for every row: a local
+    // dispatch is optimistic, and a request parked on the user outranks both it
+    // and the still-open provider turn.
+    let mut stopped = working.clone();
+    stopped.state = AgentSessionState::Idle;
+    workbench.update(cx, |workbench, _| {
+        workbench
+            .pending_agent_turn_session_ids
+            .insert(child.clone());
+    });
+    assert_eq!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .sidebar_session_row_state(&stopped)),
+        AgentSessionState::Running,
+        "a dispatched turn shows progress before the authority admits it"
+    );
+    workbench.update(cx, |workbench, _| {
+        workbench
+            .pending_user_request_ids
+            .insert(child.clone(), BTreeSet::new());
+    });
+    assert_eq!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .sidebar_session_row_state(&stopped)),
+        AgentSessionState::NeedsInput,
+        "a request parked on the user is not progress"
     );
 }
 

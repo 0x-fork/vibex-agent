@@ -1227,7 +1227,7 @@ impl VibexWorkbench {
 
     pub(super) fn render_scheduled_session_indicator(
         &self,
-        session_id: &VibexSessionId,
+        session_id: &str,
         at_ms: i64,
         cx: &App,
     ) -> AnyElement {

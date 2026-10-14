@@ -795,17 +795,16 @@ the two surfaces. The tab's own projection folds in the optimistic local dispatc
 and the requests parked on the user exactly as the row's does.
 
 A delegated child row in the ownership tree is that same lane one level down, and
-its status column draws the row's mark rather than a state label. It resolves the
-state through the row's own projection — `sidebar_session_display_state` over the
-optimistic local dispatch, with the requests parked on the user outranking it —
-from the child session's live snapshot, never from the ownership node's task
-phase. The phase moves when the delegation record moves and not when the session
-does, so a row that read it kept showing `Failed` for a task that had failed and
-was then continued, and "active" for a session the reader had since stopped. The
-node's phase answers only for a child the registry cannot describe yet: a spinner
-while the task gets ready or runs, the failure dot for a failed one, the settled
-dot once it is done, and the attention glyph when the record itself is parked on
-the user.
+it keeps no column of its own: it fills the description the navigation rows fill
+— the session's resolved state, its last message, the queued send it may be
+waiting for, its paused auto-continue, its pin — and paints it through the one
+`render_sidebar_status_column`. Unread is the only mark a child leaves out, since
+its parent's row already reports it. The state is the child session's own live
+snapshot, resolved by the same `sidebar_session_row_state` the row above it uses;
+the ownership node's task phase never stands in for it, because the phase moves
+when the delegation record moves and not when the session does — a row that read
+it kept showing `Failed` for a task that had failed and was then continued, and
+"active" for a session the reader had since stopped.
 
 ## Timeline Cards
 

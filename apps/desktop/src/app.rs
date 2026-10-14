@@ -7734,6 +7734,35 @@ struct SessionGroupTabState {
     has_unread_completion: bool,
 }
 
+/// Everything one sidebar status column draws, resolved once per row.
+///
+/// Every row that lists a session paints the column from this one description —
+/// the session's own mark, the label or time beside it, and the marks that are
+/// not its state: a paused auto-continue, an unread completion, a failure, a
+/// pin. A delegated child row fills the same fields from its own session
+/// snapshot, so the two lanes cannot drift into two schemes; the one field it
+/// leaves empty is the unread completion, which its parent's row already
+/// reports.
+struct SidebarSessionStatusColumn {
+    /// The row's key: scopes the column's element ids and the one mark that
+    /// moves.
+    prefix: &'static str,
+    session_id: String,
+    /// The state the column reports, after the row's own projection.
+    display_state: AgentSessionState,
+    auto_continue_enabled: bool,
+    auto_continue_paused: bool,
+    /// The session's last message, for the time the column falls back to.
+    last_message_at_ms: i64,
+    /// The hour a queued send still waits for, when the row reports one.
+    scheduled_at_ms: Option<i64>,
+    has_unread_completion: bool,
+    pinned: bool,
+    /// The hover group whose action cluster paints over this column, for the
+    /// rows that own one.
+    hover_group: Option<SharedString>,
+}
+
 #[derive(Clone)]
 struct SessionGroupTabDrag {
     group_id: String,
@@ -17196,33 +17225,33 @@ impl VibexWorkbench {
         } else {
             None
         };
-        // The status column draws the same mark a session row draws, resolved
-        // from the same source: the live snapshot the runtime streams for the
-        // child. The ownership node's task phase is only the fallback for a
-        // child the registry has not answered for yet, because the phase
-        // describes the delegation record rather than the session — a task that
-        // failed and was then continued keeps its `Failed` phase while the
-        // session is working again.
-        let display_state = delegation_row_display_state(
-            node,
-            self.registered_session(&session_id),
-            self.pending_agent_turn_session_ids.contains(&session_id),
-            self.pending_user_request_ids.contains_key(&session_id),
-        );
-        let status_mark: AnyElement = if display_state == AgentSessionState::NeedsInput {
-            sidebar_attention_icon(
-                format!("sidebar-delegated-attention-{session_id}"),
-                self.strings().sidebar_needs_input,
+        // The row answers its session the way every other row does: the live
+        // snapshot the runtime streams for the child, resolved through the row's
+        // own projection, and painted by the row's own status column. The
+        // ownership node supplies the branch's shape — its task phase describes
+        // the delegation record, which moves when the task does and not when the
+        // session does, so it never stands in for the session's state. Unread is
+        // the one mark a child leaves to the row above it.
+        let status_column = self.registered_session(&session_id).map(|session| {
+            let display_state = self.sidebar_session_row_state(session);
+            self.render_sidebar_status_column(
+                SidebarSessionStatusColumn {
+                    prefix: "sidebar-delegated",
+                    session_id: session_id.clone(),
+                    display_state,
+                    auto_continue_enabled: self.auto_continue_enabled_for(&session_id),
+                    auto_continue_paused: self
+                        .auto_continue_paused_session_ids
+                        .contains(&session_id),
+                    last_message_at_ms: session.last_message_at_ms,
+                    scheduled_at_ms: self.scheduled_message_at_for_row(&session.id, display_state),
+                    has_unread_completion: false,
+                    pinned: self.sidebar_state.pinned_ids.contains(&session_id),
+                    hover_group: None,
+                },
                 cx,
             )
-        } else {
-            session_status_mark_for(
-                format!("sidebar-delegated-activity-{session_id}"),
-                display_state,
-                self.auto_continue_enabled_for(&session_id),
-                cx,
-            )
-        };
+        });
         let guides = self.render_delegated_guides(node, depth, cx);
         let hover_group: SharedString = format!("sidebar-delegated-session-{session_id}").into();
         let disclosure = self.delegated_toggle_slot(&session_id, &hover_group, cx);
@@ -17388,18 +17417,7 @@ impl VibexWorkbench {
                             }),
                     )
                     .children(disclosure)
-                    .child(
-                        h_flex()
-                            .debug_selector({
-                                let selector = format!("delegated-status-{session_id}");
-                                move || selector.clone()
-                            })
-                            .w(px(SIDEBAR_STATUS_COLUMN_WIDTH))
-                            .flex_none()
-                            .items_center()
-                            .justify_end()
-                            .child(status_mark),
-                    ),
+                    .when_some(status_column, |row, column| row.child(column)),
             );
         row.into_any_element()
     }
@@ -42979,22 +42997,9 @@ impl VibexWorkbench {
                     .session_desired_agent_id(session_id)
                     .cloned()
                     .unwrap_or_else(|| session.agent_id.clone());
-                // An unanswered approval or input request outranks both the
-                // optimistic local dispatch and the still-open provider turn:
-                // the Agent is parked on the user, so the tab asks for the
-                // answer instead of spinning.
-                let awaiting_user = session.state == AgentSessionState::NeedsInput
-                    || self
-                        .pending_user_request_ids
-                        .contains_key(session_id.as_str());
-                let display_state = if awaiting_user {
-                    AgentSessionState::NeedsInput
-                } else {
-                    sidebar_session_display_state(
-                        session.state,
-                        self.pending_agent_turn_session_ids.contains(session_id),
-                    )
-                };
+                // The tab answers its session the way the row does: one
+                // projection, so a session parked on the user asks there too.
+                let display_state = self.sidebar_session_row_state(session);
                 Some(SessionGroupTabState {
                     session_id: session_id.clone(),
                     title: session.title.clone(),
@@ -46430,6 +46435,203 @@ impl VibexWorkbench {
         }
     }
 
+    /// The state one sidebar row reports for a session.
+    ///
+    /// Every row that lists a session answers the same question — is this
+    /// session working, parked on the user, or settled — so the navigation rows
+    /// and the delegated child rows below them resolve it here instead of each
+    /// keeping a projection of its own. An unanswered approval or input request
+    /// outranks both the optimistic local dispatch and the still-open provider
+    /// turn: the Agent is parked on the user, so the row asks for the answer
+    /// instead of spinning.
+    fn sidebar_session_row_state(&self, session: &AgentSession) -> AgentSessionState {
+        let awaiting_user = session.state == AgentSessionState::NeedsInput
+            || self
+                .pending_user_request_ids
+                .contains_key(session.id.as_str());
+        if awaiting_user {
+            AgentSessionState::NeedsInput
+        } else {
+            sidebar_session_display_state(session.state, self.session_turn_pending(&session.id))
+        }
+    }
+
+    /// The hour a row reports for a queued send, when its state can still send.
+    ///
+    /// A pending scheduled send is the row's posture for as long as it waits. A
+    /// session created for such a send reports `Initializing` until the message
+    /// is actually submitted, and that transient state must not take the mark:
+    /// the row is waiting on the clock, not on a runtime. The states that can
+    /// still send take the mark; a running turn, an Agent parked on the user, or
+    /// a closed session keeps its own.
+    fn scheduled_message_at_for_row(
+        &self,
+        session_id: &VibexSessionId,
+        display_state: AgentSessionState,
+    ) -> Option<i64> {
+        matches!(
+            display_state,
+            AgentSessionState::Initializing | AgentSessionState::Idle | AgentSessionState::Error
+        )
+        .then(|| self.next_scheduled_message_at(session_id))
+        .flatten()
+    }
+
+    /// The status column one session row paints.
+    ///
+    /// One builder for every row that lists a session, so a mark, a label, a
+    /// time and a pin cannot mean one thing on a navigation row and another one
+    /// level down.
+    fn render_sidebar_status_column(
+        &self,
+        status: SidebarSessionStatusColumn,
+        cx: &App,
+    ) -> AnyElement {
+        let SidebarSessionStatusColumn {
+            prefix,
+            session_id,
+            display_state,
+            auto_continue_enabled,
+            auto_continue_paused,
+            last_message_at_ms,
+            scheduled_at_ms,
+            has_unread_completion,
+            pinned,
+            hover_group,
+        } = status;
+        let strings = self.strings();
+        // The attention glyph answers the user, so it outranks the optimistic
+        // local dispatch, the still-open provider turn and the row's own label.
+        let awaiting_user = display_state == AgentSessionState::NeedsInput;
+        let generating = display_state == AgentSessionState::Running;
+        let has_error = display_state == AgentSessionState::Error;
+        let state_label = if scheduled_at_ms.is_some() {
+            None
+        } else {
+            (display_state != AgentSessionState::Error)
+                .then(|| sidebar_session_state_label(display_state, strings))
+                .flatten()
+        };
+        // The compact mark every row shows for the session's own state: a light
+        // pulse while the Agent works, the attention glyph while it is parked on
+        // the user, a dot for the states a dot can carry. A pinned row keeps it
+        // too, drawn in the lane left of the pin mark, so pinning a session
+        // never hides whether it is still working.
+        let status_mark = if awaiting_user {
+            Some(sidebar_attention_icon(
+                format!("{prefix}-attention-{session_id}"),
+                strings.sidebar_needs_input,
+                cx,
+            ))
+        } else if let Some(at_ms) = scheduled_at_ms {
+            Some(self.render_scheduled_session_indicator(session_id.as_str(), at_ms, cx))
+        } else if !has_unread_completion && !has_error && display_state != AgentSessionState::Idle {
+            Some(session_status_mark_for(
+                format!("{prefix}-activity-{session_id}"),
+                display_state,
+                auto_continue_enabled,
+                cx,
+            ))
+        } else {
+            None
+        };
+        // A row that is waiting for a send reads as the time left to wait; the
+        // absolute deadline stays in the indicator's own tooltip, where there is
+        // room to say both.
+        let time_label = match scheduled_at_ms {
+            Some(at_ms) => message_schedule::format_schedule_countdown(
+                at_ms.saturating_sub(unix_timestamp_ms()),
+            ),
+            None => {
+                format_sidebar_session_time(last_message_at_ms, self.resolved_locale(), strings)
+            }
+        };
+        let auto_continue_paused_label =
+            locale::text("Auto continue paused", "自动继续已暂停", "自動繼續已暫停");
+        h_flex()
+            .debug_selector({
+                let selector = format!("{prefix}-status-{session_id}");
+                move || selector.clone()
+            })
+            .w(px(SIDEBAR_STATUS_COLUMN_WIDTH))
+            .flex_none()
+            .items_center()
+            .justify_end()
+            .gap(px(6.0))
+            .text_sm()
+            .text_color(cx.theme().sidebar_foreground.opacity(0.48))
+            // The hover action cluster paints over this exact column, so the
+            // whole column yields to it in every row that owns one. A pinned
+            // row yields too: the cluster's own pin button carries the pinned
+            // mark in the warning color while the pointer is on the row.
+            .when_some(
+                hover_group.filter(|_| !self.sidebar_batch_mode),
+                |this, hover_group| this.group_hover(&hover_group, |style| style.invisible()),
+            )
+            .when(auto_continue_paused, |this| {
+                this.child(
+                    div()
+                        .id(format!("{prefix}-auto-continue-paused-{session_id}"))
+                        .flex_none()
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(auto_continue_paused_label).build(window, cx)
+                        })
+                        .child(
+                            sidebar_icon("icons/vibex/pause.svg")
+                                .size(px(14.0))
+                                .text_color(cx.theme().muted_foreground),
+                        ),
+                )
+            })
+            .when_some(status_mark, |this, mark| this.child(mark))
+            .when(!pinned && !awaiting_user && !generating, |this| {
+                this.when_some(state_label, |this, label| {
+                    this.child(
+                        div()
+                            .h(px(16.0))
+                            .flex_none()
+                            .rounded(px(4.0))
+                            .px(px(6.0))
+                            .text_xs()
+                            .bg(cx.theme().secondary)
+                            .text_color(cx.theme().muted_foreground)
+                            .child(label),
+                    )
+                })
+                .when(
+                    state_label.is_none()
+                        && !has_unread_completion
+                        && !has_error
+                        && !auto_continue_paused,
+                    |this| this.child(time_label),
+                )
+            })
+            .when(has_unread_completion, |this| {
+                this.child(
+                    div()
+                        .id(format!("{prefix}-unread-{session_id}"))
+                        .size(px(7.0))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(cx.theme().primary),
+                )
+            })
+            .when(has_error, |this| {
+                this.child(sidebar_status_dot(cx.theme().danger))
+            })
+            // The pin mark owns the column's trailing slot, so a pinned session
+            // reports its state to the mark's left instead of losing it to the
+            // pin.
+            .when(pinned, |this| {
+                this.child(
+                    sidebar_icon("icons/vibex/pin.svg")
+                        .size(px(14.0))
+                        .text_color(cx.theme().warning),
+                )
+            })
+            .into_any_element()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_sidebar_session(
         &mut self,
@@ -46473,18 +46675,7 @@ impl VibexWorkbench {
             .or_insert_with(|| cx.focus_handle())
             .clone();
         let key_session_id = session_id_string.clone();
-        // An unanswered approval or input request outranks both the optimistic
-        // local dispatch and the still-open provider turn: the Agent is parked
-        // on the user, so the row must ask for the answer instead of spinning.
-        let session_awaiting_user = session.state == AgentSessionState::NeedsInput
-            || self
-                .pending_user_request_ids
-                .contains_key(session_id_string.as_str());
-        let display_state = if session_awaiting_user {
-            AgentSessionState::NeedsInput
-        } else {
-            sidebar_session_display_state(session.state, self.session_turn_pending(&session.id))
-        };
+        let display_state = self.sidebar_session_row_state(session);
         let session_item = SidebarOrganizationItem::Session(session_id_string.clone());
         // A row that moves with the selection is painted like one, so the wash
         // the user sees is exactly the set a drag carries.
@@ -46760,8 +46951,6 @@ impl VibexWorkbench {
         };
         let auto_continue_label =
             batch_label(locale::text("Auto continue", "自动继续", "自動繼續"));
-        let auto_continue_paused_label =
-            locale::text("Auto continue paused", "自动继续已暂停", "自動繼續已暫停");
         let resume_auto_continue_label = batch_label(locale::text(
             "Resume auto continue",
             "恢复自动继续",
@@ -46783,68 +46972,26 @@ impl VibexWorkbench {
             }
         };
         let session_generating = display_state == AgentSessionState::Running;
-        let session_has_error = display_state == AgentSessionState::Error;
         let has_unread_completion = !selected
             && self
                 .unread_agent_completion_session_ids
                 .contains(session.id.as_str());
-        // A pending scheduled send is the row's posture for as long as it waits.
-        // A session created for such a send reports `Initializing` until the
-        // message is actually submitted, and that transient state must not take
-        // the mark: the row is waiting on the clock, not on a runtime. The
-        // states that can still send take the mark; a running turn, an Agent
-        // parked on the user, or a closed session keeps its own.
-        let scheduled_at_ms = matches!(
-            display_state,
-            AgentSessionState::Initializing | AgentSessionState::Idle | AgentSessionState::Error
-        )
-        .then(|| self.next_scheduled_message_at(&session.id))
-        .flatten();
-        let state_label = if scheduled_at_ms.is_some() {
-            None
-        } else {
-            (display_state != AgentSessionState::Error)
-                .then(|| sidebar_session_state_label(display_state, strings))
-                .flatten()
-        };
-        // The compact mark every row shows for the session's own state: a
-        // light pulse while the Agent works, the attention glyph while it is
-        // parked on the user, a dot for the states a dot can carry. A pinned row keeps
-        // it too, drawn in the lane left of the pin mark, so pinning a session
-        // never hides whether it is still working.
-        let session_status_mark = if session_awaiting_user {
-            Some(sidebar_attention_icon(
-                format!("sidebar-session-attention-{session_id_string}"),
-                strings.sidebar_needs_input,
-                cx,
-            ))
-        } else if let Some(at_ms) = scheduled_at_ms {
-            Some(self.render_scheduled_session_indicator(&session.id, at_ms, cx))
-        } else if !has_unread_completion
-            && !session_has_error
-            && display_state != AgentSessionState::Idle
-        {
-            Some(sidebar_session_status_indicator(
+        let scheduled_at_ms = self.scheduled_message_at_for_row(&session.id, display_state);
+        let status_column = self.render_sidebar_status_column(
+            SidebarSessionStatusColumn {
+                prefix: "sidebar-session",
+                session_id: session_id_string.clone(),
                 display_state,
                 auto_continue_enabled,
-                cx,
-            ))
-        } else {
-            None
-        };
-        // A row that is waiting for a send reads as the time left to wait; the
-        // absolute deadline stays in the indicator's own tooltip, where there is
-        // room to say both.
-        let time_label = match scheduled_at_ms {
-            Some(at_ms) => message_schedule::format_schedule_countdown(
-                at_ms.saturating_sub(unix_timestamp_ms()),
-            ),
-            None => format_sidebar_session_time(
-                session.last_message_at_ms,
-                self.resolved_locale(),
-                strings,
-            ),
-        };
+                auto_continue_paused,
+                last_message_at_ms: session.last_message_at_ms,
+                scheduled_at_ms,
+                has_unread_completion,
+                pinned,
+                hover_group: Some(hover_group.clone()),
+            },
+            cx,
+        );
         // The name of a session that exists only to wait for its scheduled
         // message comes from that message until the send actually leaves the
         // queue, so the manager's default `<agent> session` title never labels
@@ -47543,96 +47690,8 @@ impl VibexWorkbench {
                                 ),
                             )
                             .children(disclosure),
-                    )                    .child(
-                        h_flex()
-                            .debug_selector({
-                                let selector =
-                                    format!("sidebar-session-status-{session_id_string}");
-                                move || selector.clone()
-                            })
-                            .w(px(SIDEBAR_STATUS_COLUMN_WIDTH))
-                            .flex_none()
-                            .items_center()
-                            .justify_end()
-                            .gap(px(6.0))
-                            .text_sm()
-                            .text_color(cx.theme().sidebar_foreground.opacity(0.48))
-                            // The hover action cluster paints over this exact
-                            // column, so the whole column yields to it in every
-                            // row. A pinned row yields too: the cluster's own
-                            // pin button carries the pinned mark in the warning
-                            // color while the pointer is on the row.
-                            .when(!self.sidebar_batch_mode, |this| {
-                                this.group_hover(&hover_group, |style| style.invisible())
-                            })
-                            .when(auto_continue_paused, |this| {
-                                this.child(
-                                    div()
-                                        .id(format!(
-                                            "sidebar-session-auto-continue-paused-{session_id_string}"
-                                        ))
-                                        .flex_none()
-                                        .tooltip(move |window, cx| {
-                                            Tooltip::new(auto_continue_paused_label)
-                                                .build(window, cx)
-                                        })
-                                        .child(
-                                            sidebar_icon("icons/vibex/pause.svg")
-                                                .size(px(14.0))
-                                                .text_color(cx.theme().muted_foreground),
-                                        ),
-                                )
-                            })
-                            .when_some(session_status_mark, |this, mark| this.child(mark))
-                            .when(
-                                !pinned && !session_awaiting_user && !session_generating,
-                                |this| {
-                                    this.when_some(state_label, |this, label| {
-                                        this.child(
-                                            div()
-                                                .h(px(16.0))
-                                                .flex_none()
-                                                .rounded(px(4.0))
-                                                .px(px(6.0))
-                                                .text_xs()
-                                                .bg(cx.theme().secondary)
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(label),
-                                        )
-                                    })
-                                    .when(
-                                        state_label.is_none()
-                                            && !has_unread_completion
-                                            && !session_has_error
-                                            && !auto_continue_paused,
-                                        |this| this.child(time_label),
-                                    )
-                                },
-                            )
-                            .when(has_unread_completion, |this| {
-                                this.child(
-                                    div()
-                                        .id(format!("sidebar-session-unread-{session_id_string}"))
-                                        .size(px(7.0))
-                                        .flex_none()
-                                        .rounded_full()
-                                        .bg(cx.theme().primary),
-                                )
-                            })
-                            .when(session_has_error, |this| {
-                                this.child(sidebar_status_dot(cx.theme().danger))
-                            })
-                            // The pin mark owns the column's trailing slot, so a
-                            // pinned session reports its state to the mark's
-                            // left instead of losing it to the pin.
-                            .when(pinned, |this| {
-                                this.child(
-                                    sidebar_icon("icons/vibex/pin.svg")
-                                        .size(px(14.0))
-                                        .text_color(cx.theme().warning),
-                                )
-                            }),
-                    ),
+                    )
+                    .child(status_column),
             )
             .when(self.sidebar_batch_mode, |this| {
                 this.child(
@@ -67571,77 +67630,6 @@ fn sidebar_project_uses_detailed_hierarchy(
         })
 }
 
-/// The state a delegated row draws for one node of the ownership tree.
-///
-/// A child session's row answers the same question its parent's row answers —
-/// what is this session doing — so it resolves the same state a session row
-/// does, from the live snapshot the runtime streams for that session. The
-/// node's task phase is only the fallback for a child the registry has not
-/// answered for yet: the phase describes the delegation record, which moves
-/// when the task does and not when the session does. A task that failed and was
-/// then continued keeps its `Failed` phase while the session works again, and a
-/// task still marked active says nothing about a session the user has since
-/// stopped.
-fn delegation_row_display_state(
-    node: &SessionTreeNode,
-    session: Option<&AgentSession>,
-    turn_pending: bool,
-    request_pending: bool,
-) -> AgentSessionState {
-    // An unanswered approval or input request outranks both the optimistic
-    // local dispatch and the still-open provider turn: the Agent is parked on
-    // the user, so the row asks for the answer instead of spinning.
-    if request_pending
-        || session.is_some_and(|session| session.state == AgentSessionState::NeedsInput)
-        || delegation_node_awaits_user(node)
-    {
-        return AgentSessionState::NeedsInput;
-    }
-    session.map_or_else(
-        || delegation_node_state(node),
-        |session| sidebar_session_display_state(session.state, turn_pending),
-    )
-}
-
-/// Whether the delegation record itself is parked on the user.
-fn delegation_node_awaits_user(node: &SessionTreeNode) -> bool {
-    matches!(
-        node.blocked_on,
-        Some(
-            vibex_core::DelegationBlockedOn::Permission { .. }
-                | vibex_core::DelegationBlockedOn::Question { .. }
-                | vibex_core::DelegationBlockedOn::PlanApproval { .. }
-        )
-    )
-}
-
-/// The state a task phase stands for, for a child the registry cannot describe.
-///
-/// The mapping keeps the phase's own reading: a task still getting ready
-/// pulses, one being worked on or stopped pulses, a failed one carries the
-/// failure dot, a cancelled one the settled dot, and a task parked on a
-/// resource that is not the user is neither working nor asking.
-fn delegation_node_state(node: &SessionTreeNode) -> AgentSessionState {
-    if let Some(blocked) = node.blocked_on.as_ref() {
-        return match blocked {
-            vibex_core::DelegationBlockedOn::Configuration { .. }
-            | vibex_core::DelegationBlockedOn::Resource { .. } => AgentSessionState::Idle,
-            _ => AgentSessionState::NeedsInput,
-        };
-    }
-    match node.task_phase {
-        Some(vibex_core::DelegationTaskPhase::Queued)
-        | Some(vibex_core::DelegationTaskPhase::Starting) => AgentSessionState::Initializing,
-        Some(vibex_core::DelegationTaskPhase::Active)
-        | Some(vibex_core::DelegationTaskPhase::Cancelling) => AgentSessionState::Running,
-        Some(vibex_core::DelegationTaskPhase::Failed) => AgentSessionState::Error,
-        Some(vibex_core::DelegationTaskPhase::Cancelled) => AgentSessionState::Closed,
-        Some(vibex_core::DelegationTaskPhase::AwaitingReview)
-        | Some(vibex_core::DelegationTaskPhase::Completed)
-        | None => AgentSessionState::Idle,
-    }
-}
-
 /// One column of the ownership tree's connector.
 ///
 /// The trunk runs down the column's center — the center of the parent row's
@@ -70496,21 +70484,13 @@ fn sidebar_aggregate_status_indicator(
     }
 }
 
-fn sidebar_session_status_indicator(
-    state: AgentSessionState,
-    auto_continue_enabled: bool,
-    cx: &App,
-) -> AnyElement {
-    session_status_mark_for("sidebar-session-activity", state, auto_continue_enabled, cx)
-}
-
 /// The compact state mark for one listed session, whatever lists it.
 ///
-/// A sidebar row and a session-group tab are the same lane at two widths, so
-/// they resolve their marks from one projection: a light pulse while the Agent
-/// works, the attention glyph while it is parked on the user, a dot for the
-/// states a dot can carry. `id` scopes the pulse — the one mark with motion —
-/// so several listed sessions animate independently.
+/// A sidebar row, a delegated child row and a session-group tab are the same
+/// lane at three widths, so they resolve their marks from one projection: a
+/// light pulse while the Agent works, the attention glyph while it is parked on
+/// the user, a dot for the states a dot can carry. `id` scopes the pulse — the
+/// one mark with motion — so several listed sessions animate independently.
 fn session_status_mark_for(
     id: impl Into<ElementId>,
     state: AgentSessionState,
@@ -90600,11 +90580,12 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the session row should remain inspectable");
 
-        let posture = row
-            .split_once("let scheduled_at_ms = matches!(")
-            .map(|(_, tail)| tail)
-            .and_then(|tail| {
-                tail.split_once(".then(|| self.next_scheduled_message_at(&session.id))")
+        // The clock the row reports is the shared one every row reports, so a
+        // delegated child row waits on the same gate.
+        let posture = source
+            .split_once("    fn scheduled_message_at_for_row(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The status column one session row paints.")
             })
             .map(|(body, _)| body)
             .expect("the scheduled posture should remain inspectable");
@@ -90612,17 +90593,33 @@ mod tests {
         assert!(posture.contains("AgentSessionState::Idle"));
         assert!(!posture.contains("AgentSessionState::Running"));
 
-        assert!(row.contains("message_schedule::format_schedule_countdown("));
+        assert!(row.contains("self.scheduled_message_at_for_row(&session.id, display_state)"));
         assert!(row.contains(".pending_scheduled_session_title(session)"));
         assert!(row.contains(".child(row_title)"));
-        // The schedule mark must be placed before the generic state indicator,
-        // or a waiting row would keep painting the spinner it replaces.
-        let mark = row
-            .find("Some(self.render_scheduled_session_indicator(&session.id, at_ms, cx))")
-            .expect("the row should render the scheduled indicator");
-        let spinner = row
-            .find("Some(sidebar_session_status_indicator(")
-            .expect("the row should render the session state indicator");
+
+        // The column paints the clock's mark where the generic state indicator
+        // would go, or a waiting row would keep painting the spinner it
+        // replaces. The countdown is the time label of the same column.
+        let column = source
+            .split_once("    fn render_sidebar_status_column(")
+            .and_then(|(_, tail)| tail.split_once("\n    #[allow(clippy::too_many_arguments)]"))
+            .map(|(body, _)| body)
+            .expect("the status column should remain inspectable");
+        assert!(
+            column.contains(
+                "self.render_scheduled_session_indicator(session_id.as_str(), at_ms, cx)"
+            )
+        );
+        assert!(
+            column.contains("message_schedule::format_schedule_countdown("),
+            "a waiting row reads as the time left to wait"
+        );
+        let mark = column
+            .find("Some(self.render_scheduled_session_indicator(session_id.as_str(), at_ms, cx))")
+            .expect("the column should render the scheduled indicator");
+        let spinner = column
+            .find("Some(session_status_mark_for(")
+            .expect("the column should render the session state mark");
         assert!(mark < spinner);
     }
 
@@ -91159,7 +91156,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("sidebar session renderer should remain inspectable");
 
-        assert!(sidebar_session.contains("self.session_turn_pending(&session.id)"));
+        assert!(sidebar_session.contains("self.sidebar_session_row_state(session)"));
         assert!(source.contains("const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 40.0;"));
         assert!(sidebar_session.contains(".h(px(SIDEBAR_SESSION_ROW_HEIGHT))"));
         assert!(sidebar_session.contains(".min_h(px(SIDEBAR_SESSION_ROW_HEIGHT))"));
@@ -91191,36 +91188,75 @@ mod tests {
             sidebar_session
                 .contains("let session_generating = display_state == AgentSessionState::Running")
         );
+        assert!(sidebar_session.contains("sidebar-session-actions-{session_id_string}"));
+        assert!(sidebar_session.contains(".group_hover(&hover_group, |style| style.visible())"));
+        assert!(!sidebar_session.contains("Icon::new(IconName::LoaderCircle)"));
+        assert!(!sidebar_session.contains("sidebar-session-error-{session_id_string}"));
+        assert!(!sidebar_session.contains(".child(strings.sidebar_state_error)"));
+
+        // The status column is not the row's own: the row hands the shared
+        // builder its session's resolved state, and the builder paints every
+        // row that lists one.
+        assert!(sidebar_session.contains("SidebarSessionStatusColumn {"));
+        assert!(sidebar_session.contains("prefix: \"sidebar-session\","));
+        assert!(sidebar_session.contains("self.render_sidebar_status_column("));
         assert!(
-            sidebar_session
-                .contains("let session_has_error = display_state == AgentSessionState::Error")
+            sidebar_session.contains("let scheduled_at_ms = self.scheduled_message_at_for_row(")
         );
-        assert!(sidebar_session.contains("sidebar_session_status_indicator(\n                display_state,\n                auto_continue_enabled,\n                cx,\n            )"));
-        assert!(source.contains(".color(if auto_continue_enabled {"));
-        assert!(source.contains("cx.theme().success"));
-        assert!(sidebar_session.contains("let session_status_mark = if session_awaiting_user {"));
-        assert!(sidebar_session.contains("!session_awaiting_user"));
-        assert!(sidebar_session.contains("!has_unread_completion"));
-        assert!(sidebar_session.contains("display_state != AgentSessionState::Idle"));
-        assert!(sidebar_session.contains("!session_awaiting_user && !session_generating"));
-        assert!(sidebar_session.contains(".when(pinned, |this|"));
+        assert!(sidebar_session.contains(".child(status_column)"));
         assert!(sidebar_session.contains("icons/vibex/pin.svg"));
         assert!(sidebar_session.contains(".icon(if pinned {"));
-        assert!(sidebar_session.contains(".when(!self.sidebar_batch_mode, |this|"));
+        assert!(!sidebar_session.contains("sidebar_session_state_label("));
+        assert!(!sidebar_session.contains("session_status_mark_for("));
+        assert!(!sidebar_session.contains("sidebar_status_dot("));
+        assert!(!sidebar_session.contains("format_sidebar_session_time("));
+
+        // One column builder answers for every row: the mark, its label or
+        // time, the marks that are not the session's state, and the yield to a
+        // hover action cluster.
+        let status_column = source
+            .split_once("    fn render_sidebar_status_column(")
+            .and_then(|(_, tail)| tail.split_once("\n    #[allow(clippy::too_many_arguments)]"))
+            .map(|(body, _)| body)
+            .expect("the session status column should remain inspectable");
         assert!(
-            sidebar_session
-                .contains(".when_some(session_status_mark, |this, mark| this.child(mark))")
+            status_column
+                .contains("let awaiting_user = display_state == AgentSessionState::NeedsInput")
+        );
+        assert!(
+            status_column.contains("let generating = display_state == AgentSessionState::Running")
+        );
+        assert!(
+            status_column.contains("let has_error = display_state == AgentSessionState::Error")
+        );
+        assert!(source.contains(".color(if auto_continue_enabled {"));
+        assert!(source.contains("cx.theme().success"));
+        assert!(status_column.contains("let status_mark = if awaiting_user {"));
+        assert!(status_column.contains("sidebar_attention_icon("));
+        assert!(status_column.contains("strings.sidebar_needs_input"));
+        assert!(status_column.contains("!has_unread_completion"));
+        assert!(status_column.contains("display_state != AgentSessionState::Idle"));
+        assert!(status_column.contains("!pinned && !awaiting_user && !generating"));
+        assert!(status_column.contains("state_label.is_none()"));
+        assert!(status_column.contains("|this| this.child(time_label)"));
+        assert!(status_column.contains(".when_some(status_mark, |this, mark| this.child(mark))"));
+        assert!(
+            status_column.contains("this.group_hover(&hover_group, |style| style.invisible())")
+        );
+        assert!(status_column.contains("format!(\"{prefix}-status-{session_id}\")"));
+        // Every mark the column mounts keeps an id scoped to the row that paints
+        // it: the debug selector, the paused icon, the attention glyph, the
+        // activity mark and the unread dot.
+        assert_eq!(
+            status_column.matches("format!(\"{prefix}-").count(),
+            5,
+            "the column's ids should all be scoped to the row that paints them"
         );
         // The pin mark owns the trailing slot of the status column: a pinned
         // session reports its own state in the lane to the mark's left, and the
-        // column yields to the hover action cluster in every row.
-        let status_column = sidebar_session
-            .split_once(".w(px(SIDEBAR_STATUS_COLUMN_WIDTH))")
-            .and_then(|(_, tail)| tail.split_once(".when(self.sidebar_batch_mode, |this| {"))
-            .map(|(column, _)| column)
-            .expect("the session status column should remain inspectable");
+        // unread and failure dots sit left of the pin too.
         let status_mark = status_column
-            .find(".when_some(session_status_mark, |this, mark| this.child(mark))")
+            .find(".when_some(status_mark, |this, mark| this.child(mark))")
             .expect("the status column should draw the session state mark");
         let pin_mark = status_column
             .find(".when(pinned, |this| {")
@@ -91228,27 +91264,10 @@ mod tests {
         assert!(pin_mark > status_mark);
         assert!(status_column[pin_mark..].contains("icons/vibex/pin.svg"));
         assert!(status_column[..pin_mark].contains(".when(has_unread_completion, |this| {"));
-        assert!(status_column[..pin_mark].contains(".when(session_has_error, |this| {"));
-        assert!(sidebar_session.contains("sidebar_attention_icon("));
-        assert!(sidebar_session.contains("strings.sidebar_needs_input"));
-        assert!(!sidebar_session.contains("Icon::new(IconName::LoaderCircle)"));
-        assert!(!sidebar_session.contains("sidebar-session-error-{session_id_string}"));
-        assert!(!sidebar_session.contains(".child(strings.sidebar_state_error)"));
-        assert!(sidebar_session.contains("} else if !has_unread_completion\n            && !session_has_error\n            && display_state != AgentSessionState::Idle"));
-        assert!(sidebar_session.contains(
-            "&& !session_has_error\n                                            && !auto_continue_paused,\n                                        |this| this.child(time_label)"
-        ));
-        assert!(sidebar_session.contains(
-            ".when(session_has_error, |this| {\n                                this.child(sidebar_status_dot(cx.theme().danger))"
-        ));
+        assert!(status_column[..pin_mark].contains(".when(has_error, |this| {"));
         assert!(
-            sidebar_session.contains("this.group_hover(&hover_group, |style| style.invisible())")
+            status_column[..pin_mark].contains(".child(sidebar_status_dot(cx.theme().danger))")
         );
-        assert!(sidebar_session.contains("sidebar-session-actions-{session_id_string}"));
-        assert!(sidebar_session.contains(".group_hover(&hover_group, |style| style.visible())"));
-        assert!(sidebar_session.contains(
-            "state_label.is_none()\n                                            && !has_unread_completion\n                                            && !session_has_error\n                                            && !auto_continue_paused"
-        ));
     }
 
     /// The running cue reaches the session title: a row whose Agent is
@@ -92906,8 +92925,15 @@ mod tests {
         assert!(sidebar.contains("PopupMenuItem::new(auto_continue_label"));
         assert!(sidebar.contains(".checked(auto_continue_enabled)"));
         assert!(sidebar.contains("this.set_auto_continue_enabled("));
-        assert!(sidebar.contains("icons/vibex/pause.svg"));
-        assert!(sidebar.contains("auto_continue_paused"));
+        assert!(sidebar.contains("auto_continue_paused,"));
+        // The paused mark belongs to the status column every row paints.
+        let status_column = source
+            .split_once("    fn render_sidebar_status_column(")
+            .and_then(|(_, tail)| tail.split_once("\n    #[allow(clippy::too_many_arguments)]"))
+            .map(|(body, _)| body)
+            .expect("the session status column should remain inspectable");
+        assert!(status_column.contains("icons/vibex/pause.svg"));
+        assert!(status_column.contains(".when(auto_continue_paused, |this| {"));
 
         let project = source
             .split_once("    fn render_sidebar_project(")
@@ -96643,11 +96669,20 @@ mod tests {
         assert!(pane.contains("TIMELINE_SHIMMER_SPREAD"));
         assert!(pane.contains("session_status_mark_for("));
         assert!(pane.contains("sidebar_attention_icon("));
-        // The tab resolves the row's state, optimistic dispatch and parked
-        // requests included.
-        assert!(pane.contains("sidebar_session_display_state("));
-        assert!(pane.contains(".pending_user_request_ids"));
+        // The tab resolves the row's state through the one projection, so the
+        // optimistic dispatch and the parked requests reach it too.
+        assert!(pane.contains("self.sidebar_session_row_state(session)"));
         assert!(!pane.contains("sidebar_session_status_color("));
+
+        let projection = source
+            .split_once("    fn sidebar_session_row_state(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The hour a row reports for a queued send")
+            })
+            .map(|(body, _)| body)
+            .expect("the shared row projection should remain inspectable");
+        assert!(projection.contains(".pending_user_request_ids"));
+        assert!(projection.contains("sidebar_session_display_state(session.state,"));
 
         let mark = source
             .split_once("fn session_status_mark_for(")
@@ -96655,8 +96690,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the shared status mark should remain inspectable");
         assert!(mark.contains("ActivityIndicator::sidebar(id)"));
+        // The rows that list a session all draw it through the column builder,
+        // which is the only caller left of the mark.
         assert!(source.contains(
-            "session_status_mark_for(\"sidebar-session-activity\", state, auto_continue_enabled, cx)"
+            "session_status_mark_for(\n                format!(\"{prefix}-activity-{session_id}\"),"
         ));
         assert!(pane.contains("session-group-tab-title-{session_id}"));
     }
@@ -100608,7 +100645,9 @@ mod tests {
         );
         let aggregate = source
             .split_once("fn sidebar_aggregate_status_indicator(")
-            .and_then(|(_, tail)| tail.split_once("\nfn sidebar_session_status_indicator("))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// The compact state mark for one listed session")
+            })
             .map(|(body, _)| body)
             .expect("aggregate status renderer should remain inspectable");
         assert!(aggregate.contains("cx.theme().sidebar_foreground.opacity(0.28)"));
@@ -101729,16 +101768,17 @@ mod tests {
         assert!(resolver.contains("&& !self.sidebar_session_is_delegated_child(session_id)"));
     }
 
-    /// A delegated row reports its session's state the way a session row does.
+    /// A delegated row is a session row, so it paints a session's status.
     ///
-    /// The two rows are one lane apart, so the child's status column draws the
-    /// row builder's own mark — spinner, attention glyph, dot — resolved from
-    /// the child's live snapshot through the row's own projection. The
-    /// ownership node's task phase answers only for a child the registry cannot
-    /// describe, and its wording never reaches the column: a label there kept
-    /// naming a failure the session no longer had.
+    /// The child has no column of its own: it hands the shared builder the same
+    /// description a navigation row hands it — the session's resolved state,
+    /// its last message, the queued send it may be waiting for — read from the
+    /// live snapshot the runtime streams for the child. Nothing the ownership
+    /// node carries stands in for the session: its task phase moves when the
+    /// delegation record does, not when the session does. Unread is the one mark
+    /// a child leaves to the row above it.
     #[test]
-    fn delegated_rows_report_their_session_state_with_the_row_mark() {
+    fn delegated_rows_paint_the_session_status_column_they_share_with_every_row() {
         let source = include_str!("app.rs");
 
         let child_row = source
@@ -101748,42 +101788,27 @@ mod tests {
             })
             .map(|(body, _)| body)
             .expect("the child session row should remain inspectable");
-        assert!(child_row.contains("delegation_row_display_state("));
         assert!(child_row.contains("self.registered_session(&session_id)"));
-        assert!(child_row.contains("self.pending_agent_turn_session_ids.contains(&session_id)"));
-        assert!(child_row.contains("self.pending_user_request_ids.contains_key(&session_id)"));
-        assert!(child_row.contains("if display_state == AgentSessionState::NeedsInput"));
-        assert!(child_row.contains("sidebar_attention_icon("));
-        assert!(child_row.contains("session_status_mark_for("));
-        assert!(child_row.contains("format!(\"sidebar-delegated-activity-{session_id}\")"));
-        assert!(child_row.contains("self.auto_continue_enabled_for(&session_id)"));
+        assert!(child_row.contains("self.sidebar_session_row_state(session)"));
+        assert!(child_row.contains("self.render_sidebar_status_column("));
+        assert!(child_row.contains("prefix: \"sidebar-delegated\","));
+        assert!(child_row.contains("auto_continue_enabled: self.auto_continue_enabled_for"));
+        assert!(child_row.contains("last_message_at_ms: session.last_message_at_ms"));
+        assert!(child_row.contains("scheduled_at_ms: self.scheduled_message_at_for_row("));
+        assert!(child_row.contains("has_unread_completion: false"));
+        assert!(child_row.contains(".when_some(status_column, |row, column| row.child(column))"));
+        // The row paints no part of the column itself: a mark, a label or a dot
+        // built here would be the second scheme this row must not have.
+        assert!(!child_row.contains("session_status_mark_for("));
+        assert!(!child_row.contains("sidebar_attention_icon("));
+        assert!(!child_row.contains("sidebar_status_dot("));
+        assert!(!child_row.contains("sidebar_session_state_label("));
+        assert!(!child_row.contains("SIDEBAR_STATUS_COLUMN_WIDTH"));
         assert!(!child_row.contains("delegation_node_status("));
-
-        // The mark owns the column: no state wording is painted beside it.
-        let status_column = child_row
-            .split_once(".w(px(SIDEBAR_STATUS_COLUMN_WIDTH))")
-            .map(|(_, column)| column)
-            .expect("the delegated status column should remain inspectable");
-        assert!(status_column.contains(".child(status_mark)"));
-        assert!(!status_column.contains(".truncate()"));
-        assert!(!status_column.contains("status_text"));
-
-        // The fallback reads the node, and the snapshot branch folds in the
-        // session row's own dispatch and parked-request projection.
-        let projection = source
-            .split_once("fn delegation_row_display_state(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n/// One column of the ownership tree's connector.")
-            })
-            .map(|(body, _)| body)
-            .expect("the delegated row projection should remain inspectable");
-        assert!(projection.contains("sidebar_session_display_state(session.state, turn_pending)"));
-        assert!(projection.contains("delegation_node_awaits_user(node)"));
-        assert!(projection.contains("|| delegation_node_state(node),"));
-        assert!(
-            source
-                .contains("fn delegation_node_state(node: &SessionTreeNode) -> AgentSessionState")
-        );
+        // Nothing in the tree describes a session's status twice: the row hands
+        // the shared builder the same description every other row hands it.
+        assert!(!child_row.contains("let status_mark"));
+        assert!(!child_row.contains("let time_label"));
     }
 
     /// A session group is a row the user can file like any other.
