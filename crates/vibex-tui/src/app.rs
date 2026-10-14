@@ -4936,8 +4936,11 @@ impl App {
     /// held on one frame while the runtime starts up reads as a frozen client.
     /// The composing page's mark loops while it waits, quiet stretch included,
     /// because the clock between passes is what brings the light round again;
-    /// a question waiting on the reader pulses. Everything else holds still,
-    /// which is what keeps an idle session at zero frames.
+    /// a question waiting on the reader pulses; the session list turns a ring
+    /// for every row whose session is still working; a page waiting on its own
+    /// write, and the dock's rows for the work a finished turn left behind,
+    /// turn their own spinners. Everything else holds still, which is what keeps
+    /// an idle session at zero frames.
     pub fn is_animating(&self) -> bool {
         self.transcript_animating()
             || self.turn_reads_running()
