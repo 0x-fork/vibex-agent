@@ -5367,21 +5367,24 @@ impl ManagementCenter {
         cx.notify();
     }
 
-    /// Offers or releases the Model one picker row names.
+    /// Points the settings pane at the Model one picker row names, offering
+    /// that Model when the draft does not hold it yet.
     ///
-    /// The row is the checkbox, so its click toggles the declaration and then
-    /// points the settings pane at the row: the pane would otherwise keep
-    /// describing whichever Model was opened last while the header named this
-    /// one.
-    fn toggle_profile_candidate_row(
+    /// A row click only ever offers: releasing a Model is the checkbox's own
+    /// command, so a click that lands on an already-offered row opens its
+    /// settings instead of dropping a declaration the user did not aim at. The
+    /// pane follows every row click, because it would otherwise keep describing
+    /// whichever Model was opened last while the header named this one.
+    fn open_profile_candidate_row(
         &mut self,
         row: &ProfileCandidateRow,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.profile_model_selection = Some(row.id.clone());
-        let selected = !row.is_configured();
-        self.select_profile_candidate(row, selected, window, cx);
+        // Choosing an already-declared Model is a no-op on the draft itself, so
+        // the configured case re-points the pane without touching the row.
+        self.select_profile_candidate(row, true, window, cx);
     }
 
     /// The picker's rows: what the endpoint advertised, plus every configured
@@ -13390,10 +13393,12 @@ impl ManagementCenter {
     /// the Model, the body that opens its settings, and the delete command that
     /// takes it back out of the draft.
     ///
-    /// The row is the checkbox, so a click anywhere on the strip offers or
-    /// releases the Model instead of asking for a second click in the settings
-    /// pane. That pane still follows the click, because the row it names is the
-    /// one whose declaration the click just created or released.
+    /// A click anywhere on the strip offers the Model and opens its settings,
+    /// instead of asking for a second click in the settings pane. It never
+    /// releases one: only the checkbox unchecks, so a stray click on a Model
+    /// already added cannot drop its declaration. The settings pane follows
+    /// every click, because the row it names is the one the click just offered
+    /// or opened.
     fn render_profile_candidate_row(
         &self,
         row: &ProfileCandidateRow,
@@ -13458,17 +13463,21 @@ impl ManagementCenter {
             })
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.toggle_profile_candidate_row(&clicked, window, cx);
+                this.open_profile_candidate_row(&clicked, window, cx);
             }))
             .child(
-                // The checkbox answers the same question the row does, so it
-                // takes the click itself instead of letting the row toggle the
-                // Model a second time.
+                // The checkbox answers the same question the row does, and it
+                // is the one control that can release a Model: the click it
+                // takes is the click the row must not read as a removal.
                 div()
                     .id(SharedString::from(format!(
                         "provider-candidate-check-{}",
                         row.id
                     )))
+                    .debug_selector({
+                        let check_id = row_id.clone();
+                        move || format!("provider-candidate-check-{check_id}")
+                    })
                     .on_click(|_, _, cx| cx.stop_propagation())
                     .child(
                         Checkbox::new(SharedString::from(format!("provider-candidate-{}", row.id)))
@@ -27868,8 +27877,8 @@ mod tests {
         assert!(row.size.width > px(0.0) && row.size.height > px(0.0));
     }
 
-    /// The whole row is the checkbox, so one click offers the Model instead of
-    /// opening a pane that asks for a second one.
+    /// A row click offers the Model and opens its settings, while the checkbox
+    /// stays the only control that can release an offered Model.
     #[gpui::test]
     fn clicking_the_edge_of_a_picker_row_offers_that_model(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
@@ -27936,14 +27945,15 @@ mod tests {
             "gpt-5-mini"
         );
 
-        // Clicking the same row again releases it, because the row is a toggle
-        // rather than a command that only ever adds.
+        // Clicking the row again only re-opens it: an offered Model keeps its
+        // declaration, because releasing one is the checkbox's own command
+        // rather than something a click on the strip can do by accident.
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
         });
         let row = cx
             .debug_bounds("provider-candidate-row-gpt-5-mini")
-            .expect("the released row must stay listed");
+            .expect("the offered row must stay listed");
         cx.simulate_click(
             gpui::point(row.origin.x + px(2.0), row.center().y),
             gpui::Modifiers::none(),
@@ -27951,8 +27961,36 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             center.read_with(cx, |center, _| center.profile_configured_models.len()),
+            2,
+            "a second click on the row must not release the Model it offered"
+        );
+        assert_eq!(
+            center.read_with(cx, |center, _| center.profile_model_selection.clone()),
+            Some("gpt-5-mini".to_string()),
+            "the row the click names stays the one the settings pane shows"
+        );
+
+        // The checkbox is the control that unchecks, so clicking the indicator
+        // itself still releases the Model.
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let check = cx
+            .debug_bounds("provider-candidate-check-gpt-5-mini")
+            .expect("the picker must lay the checkbox out");
+        cx.simulate_click(check.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            center.read_with(cx, |center, _| center.profile_configured_models.len()),
             1,
-            "a second click on the row releases the Model it offered"
+            "a click on the checkbox releases the Model it offered"
+        );
+        assert!(
+            center.read_with(cx, |center, _| !center
+                .profile_configured_models
+                .iter()
+                .any(|model| model.id == "gpt-5-mini")),
+            "the released Model leaves the draft"
         );
     }
 
