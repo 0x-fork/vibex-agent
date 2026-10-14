@@ -2262,13 +2262,13 @@ fn a_match_is_a_regular_expression() {
 
 #[test]
 fn a_scrolled_transcript_pins_the_prompt_it_belongs_to() {
-    let mut app = app(120, 40);
+    let mut app = app(100, 24);
     let mut blocks = vec![seeded_block(
         "prompt-0",
         vibex_desktop_model::TimelineRowKind::UserMessage,
-        "PINNED QUESTION about the upload path",
+        "PINNED QUESTION about the upload path, worded long enough to wrap over a row of its own",
     )];
-    for index in 0..12 {
+    for index in 0..16 {
         blocks.push(seeded_block(
             &format!("reply-{index}"),
             vibex_desktop_model::TimelineRowKind::AgentMessage,
@@ -2277,11 +2277,18 @@ fn a_scrolled_transcript_pins_the_prompt_it_belongs_to() {
     }
     app.transcript.set_blocks(blocks);
     app.navigate_to(Page::Agent);
-    // Scroll past the question without expanding it.
+    // Scroll past the question without expanding it. The fixture is taller than
+    // the band, so the offset is one the transcript can really hold rather than
+    // a clamp back to the top.
     app.scroll.follow = false;
-    app.scroll.offset = 8;
-    let lines = render(&mut app, 120, 40);
+    app.scroll.offset = 10;
+    let lines = render(&mut app, 100, 24);
     let screen = text(&lines);
+    let copies = lines
+        .iter()
+        .filter(|line| line.contains("PINNED QUESTION"))
+        .count();
+    assert_eq!(copies, 1, "the prompt is drawn {copies} times:\n{screen}");
     let pinned_row = lines
         .iter()
         .position(|line| line.contains("PINNED QUESTION"))
@@ -2294,14 +2301,81 @@ fn a_scrolled_transcript_pins_the_prompt_it_belongs_to() {
     );
 
     // Scrolled to the very top, the question is inline and nothing is pinned a
-    // second time.
+    // second time: one copy, and it is a row of the transcript.
     app.scroll.offset = 0;
-    let lines = render(&mut app, 120, 40);
-    let pinned_row = lines
+    let lines = render(&mut app, 100, 24);
+    let screen = text(&lines);
+    let copies = lines
+        .iter()
+        .filter(|line| line.contains("PINNED QUESTION"))
+        .count();
+    assert_eq!(copies, 1, "the question is drawn twice:\n{screen}");
+    let inline_row = lines
         .iter()
         .position(|line| line.contains("PINNED QUESTION"))
         .expect("the question is visible inline");
-    assert!(pinned_row >= 3, "the question must not be drawn twice");
+    assert!(inline_row >= 3, "the question must not hang above the band");
+}
+
+#[test]
+fn a_prompt_is_drawn_once_at_every_scroll_position() {
+    let mut tall = app(100, 24);
+    let mut blocks = vec![seeded_block(
+        "prompt-0",
+        vibex_desktop_model::TimelineRowKind::UserMessage,
+        "PINNED QUESTION about the upload path, worded long enough to wrap over a row of its own",
+    )];
+    for index in 0..16 {
+        blocks.push(seeded_block(
+            &format!("reply-{index}"),
+            vibex_desktop_model::TimelineRowKind::AgentMessage,
+            "an answer long enough to occupy a row or two of the transcript",
+        ));
+    }
+    tall.transcript.set_blocks(blocks);
+    tall.navigate_to(Page::Agent);
+    tall.scroll.follow = false;
+    for offset in 0..40 {
+        tall.scroll.offset = offset;
+        let lines = render(&mut tall, 100, 24);
+        let copies = lines
+            .iter()
+            .filter(|line| line.contains("PINNED QUESTION"))
+            .count();
+        assert!(
+            copies <= 1,
+            "at offset {offset} the prompt is drawn {copies} times:\n{}",
+            text(&lines)
+        );
+    }
+
+    // Following the tail is the other way the window is positioned, and a
+    // prompt still inside it belongs to the transcript alone.
+    let mut tail = app(64, 20);
+    tail.transcript.set_blocks(vec![
+        seeded_block(
+            "prompt-0",
+            vibex_desktop_model::TimelineRowKind::UserMessage,
+            "PINNED QUESTION about the upload path, worded long enough to wrap over a row of its own",
+        ),
+        seeded_block(
+            "reply-0",
+            vibex_desktop_model::TimelineRowKind::AgentMessage,
+            "an answer long enough to occupy a row or two",
+        ),
+    ]);
+    tail.navigate_to(Page::Agent);
+    let lines = render(&mut tail, 64, 20);
+    let copies = lines
+        .iter()
+        .filter(|line| line.contains("PINNED QUESTION"))
+        .count();
+    assert_eq!(
+        copies,
+        1,
+        "a prompt still on screen was pinned over itself:\n{}",
+        text(&lines)
+    );
 }
 
 #[test]
@@ -10481,31 +10555,4 @@ fn a_picture_capable_terminal_draws_the_desktops_own_icons() {
         "the row's buttons are not clickable: {:?}",
         app.regions.row_actions
     );
-}
-
-#[test]
-fn scratch_sticky_follow_probe() {
-    for replies in [0usize, 1, 2, 3, 4] {
-        let mut app = app(64, 20);
-        let mut blocks = vec![seeded_block(
-            "prompt-0",
-            vibex_desktop_model::TimelineRowKind::UserMessage,
-            "PINNED one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen",
-        )];
-        for index in 0..replies {
-            blocks.push(seeded_block(
-                &format!("reply-{index}"),
-                vibex_desktop_model::TimelineRowKind::AgentMessage,
-                "an answer long enough to occupy a row or two",
-            ));
-        }
-        app.transcript.set_blocks(blocks);
-        app.navigate_to(Page::Agent);
-        println!("=== replies {replies} ===");
-        let lines = render(&mut app, 64, 20);
-        println!("  follow={} offset={} recorded={} band={}", app.scroll.follow, app.scroll.offset, app.transcript.scroll_offset(), app.transcript_band_rows);
-        for (index, line) in lines.iter().enumerate() {
-            println!("  {index:2} |{line}");
-        }
-    }
 }

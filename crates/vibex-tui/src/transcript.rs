@@ -1916,43 +1916,51 @@ impl Transcript {
     /// Only the reader's own messages pin. An Agent message is not a landmark:
     /// it is the thing being read, and pinning it would cover the content the
     /// header is supposed to head. The header draws the real prompt block,
-    /// truncated to its pinned height, and it is pushed off by the next prompt
-    /// rather than overlapped, so the transcript below is never hidden.
+    /// truncated to its pinned height, and it is cut at the first row the body
+    /// below still owns: the prompt is drawn once, as a header for the rows that
+    /// have scrolled past and as a row of the transcript for the rows that have
+    /// not, whether or not the reader is following the tail.
     ///
-    /// `viewport` is the height the transcript *would* have without a header;
-    /// the caller passes a conservatively small value so the decision cannot
-    /// oscillate between two frames.
+    /// `band` is the height the transcript band is drawn in, header included.
     pub fn sticky_header(
         &mut self,
         scroll: ScrollState,
-        viewport: usize,
+        band: usize,
         theme: &TuiTheme,
         strings: Strings,
     ) -> Option<StickyHeader> {
+        // A header is chrome above the transcript, not instead of it: whatever
+        // it draws, the band keeps room for the body underneath.
+        let viewport = band.saturating_sub(MAX_STICKY_ROWS + STICKY_GAP_ROWS);
         if viewport < 3 || self.blocks.is_empty() {
             return None;
         }
         if scroll.follow {
-            // One screen plus a pinned header's worth: the prompt that is about
-            // to be pinned sits just above the viewport, and a header can only
-            // be clipped from a block that has been measured.
-            self.measure_tail(viewport + MAX_STICKY_ROWS + STICKY_GAP_ROWS, theme, strings);
+            // The prompt that is about to be pinned sits just above the
+            // viewport, and a header can only be clipped from a block that has
+            // been measured.
+            self.measure_tail(band, theme, strings);
         }
         self.ensure_layout();
         let total = self.offsets.last().copied().unwrap_or(0);
-        let offset = if scroll.follow {
-            total.saturating_sub(viewport)
+        // The first row the body shows when no header is in the way. A header
+        // takes its rows off the top of the band, so the row the body actually
+        // starts on is this one or lower — never higher — which is what makes
+        // this line the safe place to cut the header at, whatever the header
+        // itself turns out to be.
+        let window_top = if scroll.follow {
+            total.saturating_sub(band)
         } else {
-            scroll.offset.min(total.saturating_sub(1))
+            scroll.offset.min(total.saturating_sub(band))
         };
-        if offset == 0 {
+        if window_top == 0 {
             return None;
         }
         // The last prompt the reader has scrolled past.
         let mut candidate = None;
         for index in 0..self.blocks.len() {
             let start = self.offsets.get(index).copied().unwrap_or(0);
-            if start >= offset {
+            if start >= window_top {
                 break;
             }
             if self.blocks[index].kind == TimelineRowKind::UserMessage && self.is_sticky(index) {
@@ -1965,40 +1973,16 @@ impl Transcript {
         let start = self.offsets.get(index).copied().unwrap_or(0);
         // The header shrinks one row per row scrolled past, but never below the
         // height it would have inline-truncated to, so the question stays
-        // readable however far the reader has scrolled.
-        let scroll_past = offset.saturating_sub(start);
+        // readable however far the reader has scrolled — and never past the rows
+        // that have actually left the window, because those still inside it are
+        // drawn by the transcript below.
+        let scroll_past = window_top.saturating_sub(start);
         let floor = full_height.clamp(1, MAX_STICKY_ROWS);
-        let mut height = full_height
+        let height = full_height
             .saturating_sub(scroll_past)
             .max(floor)
-            .min(viewport.saturating_sub(1));
-        if height == 0 {
-            return None;
-        }
-        let mut clip_top = 0usize;
-        // The next prompt pushes this one off, from the bottom up.
-        for next in index + 1..self.blocks.len() {
-            let next_start = self.offsets.get(next).copied().unwrap_or(0);
-            if next_start <= offset {
-                continue;
-            }
-            if self.blocks[next].kind != TimelineRowKind::UserMessage || !self.is_sticky(next) {
-                continue;
-            }
-            let naive = next_start - offset;
-            if naive <= height + STICKY_GAP_ROWS {
-                let visible = naive.saturating_sub(1);
-                if visible == 0 {
-                    return None;
-                }
-                // The pushed header reveals its bottom rows, clipped from the
-                // truncated header rather than from the whole prompt.
-                let pushed_height = full_height.min(height);
-                clip_top = pushed_height.saturating_sub(visible);
-                height = visible;
-            }
-            break;
-        }
+            .min(viewport.saturating_sub(1))
+            .min(scroll_past);
         let rendered = self.rendered.get(&index)?.clone();
         // The block's own trailing blank rows are the separator before the next
         // block, not content: a header clipped down to them would reserve a row
@@ -2022,13 +2006,8 @@ impl Transcript {
         if content_rows == 0 {
             return None;
         }
-        let clip_top = clip_top.min(content_rows - 1);
-        let end = (clip_top + height).min(content_rows);
-        let lines = rendered
-            .lines
-            .get(clip_top.min(end)..end)
-            .unwrap_or_default()
-            .to_vec();
+        let end = height.min(content_rows);
+        let lines = rendered.lines.get(..end).unwrap_or_default().to_vec();
         if lines.is_empty() {
             return None;
         }
@@ -4026,6 +4005,64 @@ mod tests {
             header.is_none(),
             "an expanded prompt is already fully visible"
         );
+    }
+
+    #[test]
+    fn a_pinned_prompt_is_never_drawn_twice() {
+        let mut transcript = Transcript::new();
+        transcript.configure(40, &theme());
+        let mut blocks = vec![block(
+            "prompt",
+            TimelineRowKind::UserMessage,
+            "a question long enough to wrap over several rows of its own band and keep going",
+        )];
+        for index in 0..8 {
+            blocks.push(block(
+                &format!("reply-{index}"),
+                TimelineRowKind::AgentMessage,
+                "an answer that is long enough to push the question off screen",
+            ));
+        }
+        transcript.set_blocks(blocks);
+        let palette = theme();
+        let strings = strings();
+        let band = 12;
+        // The lowest line a window of this height can start on: the header must
+        // stay above it however far the reader scrolls, because every row from
+        // there down is one the transcript below draws itself.
+        let window_floor = transcript.bottom_offset(band, &palette, strings);
+        assert!(window_floor > 0, "the fixture must be taller than its band");
+        let mut pinned = 0usize;
+        for offset in 0..window_floor + band {
+            let header = transcript.sticky_header(
+                ScrollState {
+                    offset,
+                    follow: false,
+                    selected: None,
+                },
+                band,
+                &palette,
+                strings,
+            );
+            let Some(header) = header else { continue };
+            pinned += 1;
+            let start = transcript.line_of_block(header.block);
+            let window_top = offset.min(window_floor);
+            assert!(
+                start + header.lines.len() <= window_top,
+                "at offset {offset} the pinned prompt reaches row {} of a window that starts at {window_top}",
+                start + header.lines.len()
+            );
+        }
+        assert!(pinned > 0, "the fixture must pin its prompt somewhere");
+
+        // The same rule while the reader follows the tail: the body is anchored
+        // to the end, so the header holds the rows that end has left behind.
+        let header = transcript
+            .sticky_header(ScrollState::default(), band, &palette, strings)
+            .expect("the prompt has scrolled away from the tail");
+        let start = transcript.line_of_block(header.block);
+        assert!(start + header.lines.len() <= window_floor);
     }
 
     #[test]

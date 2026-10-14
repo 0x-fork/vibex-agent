@@ -822,16 +822,10 @@ fn render_scrollback(
     let mut scroll = app.scroll;
     scroll.selected = Some(selected);
     // A pinned prompt header takes its rows off the top before the transcript
-    // is positioned. The header decision is made against a conservatively
-    // small viewport so it cannot oscillate between two frames.
-    let header = app.transcript.sticky_header(
-        scroll,
-        height.saturating_sub(
-            crate::transcript::MAX_STICKY_ROWS + crate::transcript::STICKY_GAP_ROWS,
-        ),
-        theme,
-        strings,
-    );
+    // is positioned. It only claims rows the body below has already let go of,
+    // so the prompt is drawn once whether it hangs above the window or sits
+    // inside it.
+    let header = app.transcript.sticky_header(scroll, height, theme, strings);
     let (content, height) = match &header {
         Some(header) => {
             let reserved = header.reserved_rows().min(usize::from(content.height));
