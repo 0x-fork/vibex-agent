@@ -44,6 +44,11 @@ unicode-segmentation.workspace = true
 unicode-width.workspace = true
 url.workspace = true
 vibex-backend = { path = "../vibex-backend" }
+# The Agent and model brand marks, and the rasterizer that turns a mark into the
+# PNG a terminal's image protocol takes. Shared with the desktop and the phone so
+# the same Agent wears the same mark everywhere; the identity table itself is
+# what the mark columns are drawn from.
+vibex-brands = { path = "../vibex-brands", features = ["raster"] }
 vibex-core = { path = "../core" }
 vibex-desktop-model = { path = "../desktop-model" }
 vibex-terminal-ui = { path = "../vibex-terminal-ui" }

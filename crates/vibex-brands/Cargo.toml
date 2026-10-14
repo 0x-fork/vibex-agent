@@ -1,0 +1,22 @@
+[package]
+name = "vibex-brands"
+version = "0.1.0-rc.7"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent and model brand marks, shared by every Vibex client"
+
+[features]
+# SVG rasterization into pixels. Off by default so a client that only needs the
+# identity table — one with its own SVG renderer — does not link a rasterizer.
+raster = ["dep:resvg", "dep:image"]
+
+[dependencies]
+# The workspace's own feature set, deliberately: two marks in the pack draw their
+# glyph as SVG text, so a reduced set would render them as their paths alone and
+# the same Agent would wear a different mark here than on the desktop. The
+# terminals this serves are Unix-ish hosts that already have a font stack, and
+# nothing here links a window server, a database or a browser.
+resvg = { workspace = true, optional = true }
+image = { workspace = true, features = ["png"], optional = true }

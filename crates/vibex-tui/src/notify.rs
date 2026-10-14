@@ -1370,6 +1370,7 @@ impl App {
         let mut control = self.take_terminal_notifications();
         control.extend_from_slice(&self.picture.take_escapes());
         control.extend_from_slice(&self.pairing_qr.take_escapes());
+        control.extend_from_slice(&self.agent_logos.take_escapes());
         control
     }
 

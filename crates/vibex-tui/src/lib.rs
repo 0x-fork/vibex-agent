@@ -42,6 +42,7 @@
 //! ```
 
 pub mod action;
+pub mod agent_logo;
 pub mod app;
 pub mod attachment;
 pub mod auto_continue;

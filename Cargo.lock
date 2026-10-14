@@ -9819,6 +9819,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibex-brands"
+version = "0.1.0-rc.7"
+dependencies = [
+ "image",
+ "resvg 0.46.0",
+]
+
+[[package]]
 name = "vibex-browser"
 version = "0.1.0-rc.7"
 dependencies = [
@@ -10320,6 +10328,7 @@ dependencies = [
  "unicode-width",
  "url",
  "vibex-backend",
+ "vibex-brands",
  "vibex-core",
  "vibex-desktop-model",
  "vibex-git",

@@ -1140,6 +1140,12 @@ pub struct App {
     /// The code the pairing page put on the terminal, and the escapes the run
     /// loop still has to write for it. See [`crate::pairing_qr`].
     pub pairing_qr: crate::pairing_qr::PairingQr,
+    /// The Agent brand marks the session list put on the terminal, and the
+    /// escapes the run loop still has to write for them. See
+    /// [`crate::agent_logo`]: a terminal that speaks an image protocol draws a
+    /// real mark where one will not, and every other terminal keeps the Agent's
+    /// name.
+    pub agent_logos: crate::agent_logo::AgentLogos,
     /// A transient message above the composer, dismissed on the next key.
     pub banner: Option<Banner>,
     /// When the running turn started, for the elapsed-time readout.
@@ -1746,6 +1752,7 @@ impl App {
             terminal_images: crate::terminal_image::ImageSupport::detect(),
             picture: crate::preview::PlacedPicture::default(),
             pairing_qr: crate::pairing_qr::PairingQr::default(),
+            agent_logos: crate::agent_logo::AgentLogos::default(),
             banner: None,
             turn_started: None,
             turn_readout: crate::turn::TurnReadout::default(),
@@ -6706,6 +6713,38 @@ impl App {
             return label;
         }
         session.agent_id.to_string()
+    }
+
+    /// The string an Agent's brand mark is matched against.
+    ///
+    /// The same parts, in the same order, as the desktop joins them — the id,
+    /// the display label, the command and the preset — because the mark has to
+    /// come out the same in both clients. The management record is the only
+    /// place the command and preset live, so an Agent the client has not loaded
+    /// falls back to the id and label it does have.
+    pub fn agent_identity(&self, agent_id: &vibex_core::AgentId, label: &str) -> String {
+        let id = agent_id.as_str();
+        let agent = self
+            .management_data
+            .agents
+            .iter()
+            .find(|agent| agent.id.as_str() == id);
+        let command = agent
+            .and_then(|agent| agent.command.as_ref())
+            .map(|command| command.command.clone())
+            .unwrap_or_default();
+        let preset = agent
+            .and_then(|agent| agent.params.get("preset"))
+            .and_then(|preset| preset.as_str())
+            .unwrap_or_default();
+        vibex_brands::identity(&[id, label, command.as_str(), preset])
+    }
+
+    /// [`App::agent_identity`] for a session, whose label comes from the
+    /// catalogue the session list is drawn against.
+    pub fn session_agent_identity(&self, session: &AgentSession) -> String {
+        let label = self.session_agent_label(session);
+        self.agent_identity(&session.agent_id, &label)
     }
 
     /// Whether the session list marks this session as having something new.

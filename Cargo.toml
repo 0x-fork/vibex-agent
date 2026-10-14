@@ -26,6 +26,7 @@ members = [
   "crates/remote",
   "crates/terminal",
   "crates/vibex-backend",
+  "crates/vibex-brands",
   "crates/vibex-remote-client",
   "crates/vibex-ui",
   "crates/vibex-terminal-ui",
