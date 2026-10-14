@@ -330,7 +330,7 @@ impl Seat {
         // A bare code carries no certificate, so the claim used the loopback
         // plain-HTTP bootstrap path and the seat keeps that shape.
         let pinned: Option<String> = None;
-        let seat = Self::from_bundle(&bundle, pinned.clone(), &home)?;
+        let seat = Self::from_bundle(&bundle, pinned.clone(), &home).await?;
         save_bundle_credential(&home, &bundle, pinned.as_deref())?;
         Ok(seat)
     }
@@ -373,6 +373,7 @@ impl Seat {
             stored.server_kind,
             home,
         )
+        .await
         .map(Some)
     }
 
@@ -468,14 +469,14 @@ impl Seat {
                     continue;
                 }
             };
-            let seat = Self::from_bundle(&bundle, pin.clone(), &home)?;
+            let seat = Self::from_bundle(&bundle, pin.clone(), &home).await?;
             save_bundle_credential(&home, &bundle, pin.as_deref())?;
             return Ok(seat);
         }
         Err(last)
     }
 
-    fn from_bundle(
+    async fn from_bundle(
         bundle: &vibex_remote_client::PairingCodeClientBundle,
         pinned: Option<String>,
         home: &Path,
@@ -499,10 +500,20 @@ impl Seat {
         remote.client_id = "vibex-tui".to_string();
         remote.client_type = RemoteClientType::Native;
         remote.allow_insecure_local_dev = !is_tls;
-        Self::from_remote_config(remote, pin, bundle.server_kind, home)
+        Self::from_remote_config(remote, pin, bundle.server_kind, home).await
     }
 
-    fn from_remote_config(
+    /// Build the remote seat and attach it.
+    ///
+    /// The connection is opened here rather than left to the interface. A
+    /// facade nobody connected answers every read with
+    /// `remote_reselection_canceled`, which reaches the reader as an empty
+    /// runtime catalogue and an empty session list — "Agent setup: unavailable"
+    /// — instead of as a connection problem. Attaching at resolution turns that
+    /// into one honest error before the interface is drawn, and every caller
+    /// (`vibex`, `vibex-server tui`, `vibex-desktop tui`) gets a seat that is
+    /// ready to run.
+    async fn from_remote_config(
         remote: RemoteClientConfig,
         pinned: Option<String>,
         runtime_kind: vibex_core::RemoteServerKind,
@@ -515,7 +526,7 @@ impl Seat {
         let transport = AutoRemoteTransport::new(AutoRemoteTransportConfig {
             remote,
             direct_candidates: vec![DirectCandidate {
-                url: base_url,
+                url: base_url.clone(),
                 label: "local-authority".to_string(),
                 priority: 0,
                 tls_certificate_der: pinned.clone(),
@@ -525,7 +536,15 @@ impl Seat {
         .map_err(|error| SeatError::Environment {
             detail: format!("could not build the transport: {}", error.message),
         })?;
-        let facade = Arc::new(WebRemoteBackend::from_auto(transport)).facade();
+        let backend = WebRemoteBackend::from_auto(transport);
+        backend
+            .connect()
+            .await
+            .map_err(|error| SeatError::Unreachable {
+                url: base_url,
+                detail: error.message,
+            })?;
+        let facade = Arc::new(backend).facade();
         Ok(Self {
             kind: SeatKind::Remote,
             runtime_kind,
@@ -1024,5 +1043,95 @@ mod tests {
         let candidates = local_candidates(HomeFlavour::Server);
         assert_eq!(candidates.len(), 1);
         assert!(!candidates[0].pinned);
+    }
+
+    /// A remote seat has to be attached before the interface gets it.
+    ///
+    /// A facade nobody connected answers every read with
+    /// `remote_reselection_canceled`, which the interface renders as an empty
+    /// runtime catalogue ("Agent setup: unavailable") and an empty session list
+    /// rather than as a connection problem: the client looks like it works and
+    /// shows nothing. This walks the whole path — pin, claim, build, attach —
+    /// against a real pinned listener.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_remote_seat_arrives_connected() {
+        use vibex_remote::{
+            RemoteDispatcher, RemoteGateway, RemoteGatewayConfig, RemoteTrustService,
+        };
+
+        let directory = tempfile::tempdir().expect("temp home");
+        let home = directory.path();
+        let db_path = home.join("vibex.db");
+        let dispatcher =
+            RemoteDispatcher::new(vibex_remote::RemoteServiceConfig::loopback_disabled());
+        let gateway = RemoteGateway::new(
+            RemoteGatewayConfig::loopback_enabled("127.0.0.1:0"),
+            dispatcher,
+            &db_path,
+            home.join("relay/desktop-identity.json"),
+        );
+        let listener = gateway
+            .start_local_client_gateway(0)
+            .await
+            .expect("the loopback listener starts");
+        let endpoint = format!("https://127.0.0.1:{}", listener.bound_addr.port());
+
+        let mut connection = vibex_db::open_database(&db_path).expect("open the database");
+        vibex_db::apply_migrations(&mut connection).expect("migrate");
+        let response = RemoteTrustService::create_pairing_code(
+            &connection,
+            RemoteCreatePairingCodeRequest {
+                permission_level: RemoteDevicePermissionLevel::FullControl,
+                ttl_ms: Some(120_000),
+            },
+        )
+        .expect("mint a pairing code");
+        let bundle = claim_pairing_code_with_identity_and_certificate(
+            endpoint,
+            response.pairing_code.clone(),
+            "Vibex TUI",
+            false,
+            Some(listener.tls_certificate_base64.clone()),
+            None,
+        )
+        .await
+        .expect("claim over the pinned route");
+
+        let seat = Seat::from_bundle(&bundle, Some(listener.tls_certificate_base64.clone()), home)
+            .await
+            .expect("a reachable runtime produces a seat");
+
+        assert_eq!(seat.kind, SeatKind::Remote);
+        assert!(
+            !seat.facade.capabilities().schema_version.is_empty(),
+            "the seat must arrive attached; an unattached facade reads as an \
+             unavailable runtime rather than as a connection problem"
+        );
+        gateway.stop().await.expect("stop the Gateway");
+    }
+
+    /// An unreachable endpoint is a seat error, not a seat that fails later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_remote_seat_reports_the_endpoint() {
+        // Nothing listens here, so the attach has to fail loudly instead of
+        // handing the interface a facade whose every read fails far from the
+        // cause.
+        let mut remote = RemoteClientConfig::new("http://127.0.0.1:1", auth_proof());
+        remote.allow_insecure_local_dev = true;
+        remote.client_type = RemoteClientType::Native;
+        let error = match Seat::from_remote_config(
+            remote,
+            None,
+            vibex_core::RemoteServerKind::Unknown,
+            Path::new("/data/vibex"),
+        )
+        .await
+        {
+            Ok(_) => panic!("an unreachable runtime cannot produce a seat"),
+            Err(error) => error,
+        };
+        let text = error.to_string();
+        assert!(matches!(error, SeatError::Unreachable { .. }), "{text}");
+        assert!(text.contains("127.0.0.1:1"), "{text}");
     }
 }
