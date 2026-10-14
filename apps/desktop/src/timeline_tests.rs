@@ -1946,7 +1946,9 @@ impl Render for CachedClickChild {
             .w_full()
             .h(px(40.0))
             .hover(|style| style.opacity(0.5))
-            .on_mouse_down(MouseButton::Left, move |_, _, _| clicks.set(clicks.get() + 1))
+            .on_mouse_down(MouseButton::Left, move |_, _, _| {
+                clicks.set(clicks.get() + 1)
+            })
     }
 }
 
@@ -2020,4 +2022,120 @@ fn a_click_and_a_hover_reach_an_element_inside_a_cached_view(cx: &mut TestAppCon
             "a click inside a cached view must reach its listener (cached={cached}, hover-through-cache={hovered_through_cache})"
         );
     }
+}
+
+/// The spike behind [`timeline_group_body`]: an expanded group's body lays out
+/// only the rows the viewport shows, so a session that ran for hours stops
+/// paying for the rows nobody can see.
+///
+/// The number this asserts is the one the measurement needs: the body must stop
+/// building every row, and the rows it does build must be the band the viewport
+/// is over — not the leading rows of the group.
+#[gpui::test]
+fn an_expanded_group_body_builds_only_the_rows_the_viewport_shows(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    const TOOL_ROWS: usize = 240;
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let workbench = cx.new(|cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            ui_state.session.enhanced_command_execution_display = false;
+            ui_state.session.turn_preview_rail = false;
+            let mut workbench =
+                VibexWorkbench::with_initial_state(None, ui_state, None, window, cx);
+            workbench.agent_loading = false;
+            workbench.selected_session_id = Some(session_id.clone());
+            workbench.view_session_id = Some(session_id.clone());
+            let mut items = vec![live_timeline_item(
+                1,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Check the workspace".into(),
+                    ..Default::default()
+                }),
+            )];
+            for tool in 0..TOOL_ROWS {
+                items.push(progress_tool(items.len() as i64 + 1, tool));
+            }
+            workbench.timeline.replace_authoritative(session_id, items);
+            workbench.rebuild_timeline_sizes();
+            // Open the single group the run projects before the first frame, so
+            // the disclosure starts settled and its body is on screen.
+            let group_id = workbench
+                .conversation_turns_cache
+                .iter()
+                .find_map(|turn| {
+                    turn.process_activity_groups_with_commands_and_file_operations
+                        .first()
+                        .map(|group| group.id.clone())
+                })
+                .expect("the tool run projects one activity group");
+            workbench.timeline_command_expansion.insert(group_id, true);
+            workbench.request_timeline_scroll_to_latest();
+            workbench
+        });
+        LiveTimelineProbe { workbench }
+    });
+    let workbench = view.read_with(cx, |view, _| view.workbench.clone());
+
+    let mut built = Vec::new();
+    for _ in 0..4 {
+        workbench.update(cx, |workbench, cx| {
+            workbench.timeline_group_rows_built.clear();
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let frame = workbench.read_with(cx, |workbench, _| {
+            workbench.timeline_group_rows_built.clone()
+        });
+        if !frame.is_empty() {
+            built = frame;
+        }
+    }
+    let group_rows = workbench.read_with(cx, |workbench, _| {
+        workbench
+            .conversation_turns_cache
+            .iter()
+            .find_map(|turn| {
+                turn.process_activity_groups_with_commands_and_file_operations
+                    .first()
+                    .map(|group| group.end_row - group.start_row)
+            })
+            .unwrap_or_default()
+    });
+    assert!(
+        group_rows > 100,
+        "the fixture should project a long run, got {group_rows} rows"
+    );
+    // One update can draw twice — the first correction of the row table notifies
+    // the workbench and the test harness draws the dirty window again — so the
+    // rows the window chose are what the assertions read, not the call count.
+    built.sort_unstable();
+    built.dedup();
+    assert!(
+        !built.is_empty(),
+        "the settled body must build the rows the viewport shows"
+    );
+    assert!(
+        built.len() < group_rows / 2,
+        "the windowed body built {} of {group_rows} rows: {built:?}",
+        built.len()
+    );
+    let first = built.iter().copied().min().unwrap_or_default();
+    let last = built.iter().copied().max().unwrap_or_default();
+    assert_eq!(
+        built.len(),
+        last - first + 1,
+        "the body builds one contiguous window: {built:?}"
+    );
+    // The fixture follows the newest output, so the window must sit at the end
+    // of the group rather than on its leading rows.
+    assert_eq!(
+        last + 1,
+        group_rows,
+        "the window should reach the last row, built {built:?}"
+    );
 }

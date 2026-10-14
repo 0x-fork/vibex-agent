@@ -23,6 +23,8 @@ use message_schedule::{MessageSchedule, MessageScheduleEditor, MessageScheduleTa
 mod timeline_activity;
 #[path = "timeline_disclosure.rs"]
 mod timeline_disclosure;
+#[path = "timeline_group_body.rs"]
+mod timeline_group_body;
 #[path = "timeline_loading.rs"]
 mod timeline_loading;
 #[path = "timeline_tool_detail.rs"]
@@ -659,6 +661,11 @@ const TIMELINE_PROCESS_RUN_OVERSCAN_PX: f32 = 640.0;
 /// Units a turn lays out in flow rather than windowing. Below this the run
 /// costs less to build outright than to place unit by unit.
 const TIMELINE_PROCESS_RUN_FLOW_LIMIT: usize = 16;
+/// Rows an expanded process group must hold before its body windows them.
+///
+/// A short group costs less to build outright than to place row by row, the
+/// same trade [`TIMELINE_PROCESS_RUN_FLOW_LIMIT`] makes one level up.
+const TIMELINE_GROUP_ROW_WINDOW_MIN_ROWS: usize = 24;
 /// The gap the response column puts between two process units.
 const TIMELINE_PROCESS_UNIT_GAP: f32 = 12.0;
 const TIMELINE_TURN_FILE_CHANGES_CACHE_LIMIT: usize = 256;
@@ -2572,6 +2579,22 @@ fn agent_timeline_poll_interval(base_ms: u64, idle_poll_count: u16) -> Duration 
             .saturating_mul(multiplier)
             .min(AGENT_TIMELINE_IDLE_POLL_MAX_MS.max(base_ms)),
     )
+}
+
+/// Whether an expanded process group's body windows its rows.
+///
+/// SPIKE knob, read once: `VIBEX_TIMELINE_GROUP_WINDOW=0` restores the inline
+/// body, so one build can measure both sides of the change through the
+/// developer FPS HUD's draw phases. The switch disappears with the spike — see
+/// [`timeline_group_body`].
+fn timeline_group_body_windowing() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("VIBEX_TIMELINE_GROUP_WINDOW").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
 }
 
 fn agent_turn_completion_is_active(
@@ -4494,6 +4517,17 @@ pub struct SessionView {
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
     timeline_turn_layout_signature_cache: BTreeMap<String, (u64, u64)>,
     timeline_process_unit_heights: BTreeMap<String, TimelineProcessUnitHeight>,
+    /// Measured heights of the rows inside an expanded process group, keyed by
+    /// row id. SPIKE: windowing the group body keeps the rows it did not build,
+    /// and this is the table the next frame places them from. See
+    /// [`timeline_group_body`].
+    timeline_group_row_heights: BTreeMap<String, TimelineGroupRowHeight>,
+    /// SPIKE: the group-body rows the last frames built, in build order.
+    ///
+    /// Records which rows the window chose, so a test can assert the body
+    /// stopped building every row and still builds the ones the viewport shows.
+    #[cfg(test)]
+    timeline_group_rows_built: Vec<usize>,
     timeline_disclosure_animating: bool,
     timeline_load_updates: std::rc::Weak<RefCell<timeline_loading::TimelineLoadUpdates>>,
     timeline_layout_width: Option<f32>,
@@ -4639,6 +4673,9 @@ impl SessionView {
             timeline_estimated_turn_heights: BTreeMap::new(),
             timeline_turn_layout_signature_cache: BTreeMap::new(),
             timeline_process_unit_heights: BTreeMap::new(),
+            timeline_group_row_heights: BTreeMap::new(),
+            #[cfg(test)]
+            timeline_group_rows_built: Vec::new(),
             timeline_disclosure_animating: false,
             timeline_load_updates: Default::default(),
             timeline_layout_width: None,
@@ -4747,6 +4784,7 @@ impl SessionView {
         self.timeline_estimated_turn_heights.clear();
         self.timeline_turn_layout_signature_cache.clear();
         self.timeline_process_unit_heights.clear();
+        self.timeline_group_row_heights.clear();
         self.timeline_pending_turn_heights.clear();
         self.conversation_turns_cache = Rc::new(Vec::new());
         self.conversation_turns_cache_key = None;
@@ -5202,6 +5240,22 @@ fn timeline_process_activity_groups_for_display(
     } else {
         &turn.process_activity_groups_with_commands_and_file_operations
     }
+}
+
+/// The rows one expanded process group's body stands for.
+///
+/// A group's own range is the projection's, not the unit's: the unit spans the
+/// same rows today, but a body built during prepaint only has the group's id, so
+/// this is the lookup that keeps it from re-deriving the whole unit walk.
+fn timeline_group_body_rows<'a>(
+    turn: &'a TimelineConversationTurn,
+    group_id: &str,
+    enhanced_command_display: bool,
+) -> Option<&'a [TimelineRow]> {
+    let group = timeline_process_activity_groups_for_display(turn, enhanced_command_display)
+        .iter()
+        .find(|group| group.id == group_id)?;
+    turn.process_rows.get(group.start_row..group.end_row)
 }
 
 struct SidebarProjectionCache {
@@ -23521,6 +23575,7 @@ impl VibexWorkbench {
         self.timeline_estimated_turn_heights.clear();
         self.timeline_turn_layout_signature_cache.clear();
         self.timeline_process_unit_heights.clear();
+        self.timeline_group_row_heights.clear();
         self.timeline_row_sizes = Rc::new(Vec::new());
         // A height prepaint parked for this view was measured against the layout
         // being dropped, so replaying it would restore the old extent.
@@ -23773,6 +23828,7 @@ impl VibexWorkbench {
         self.timeline_estimated_turn_heights.clear();
         self.timeline_turn_layout_signature_cache.clear();
         self.timeline_process_unit_heights.clear();
+        self.timeline_group_row_heights.clear();
         // The row table is derived from the measurements just cleared. Drop it
         // so a caller that cannot rebuild immediately still cannot reuse stale
         // heights against a different turn projection; the next render rebuilds
@@ -23805,6 +23861,7 @@ impl VibexWorkbench {
         {
             for row in &turn.process_rows {
                 self.timeline_process_unit_heights.remove(&row.id);
+                self.timeline_group_row_heights.remove(&row.id);
             }
             for group in timeline_process_activity_groups_for_display(
                 &turn,
@@ -29794,7 +29851,8 @@ impl VibexWorkbench {
         // Recorded as painted by the view that is rendering right now, so a
         // retained unit view can observe the surfaces its own rows own without
         // guessing their ids.
-        self.timeline_painted_markdown_surfaces.insert(id.to_string());
+        self.timeline_painted_markdown_surfaces
+            .insert(id.to_string());
         let query = search.map(|highlight| highlight.query.clone());
         let active = search.is_some_and(|highlight| highlight.active);
         let owner = self.markdown_surface_owner();
@@ -57398,33 +57456,262 @@ impl VibexWorkbench {
             .flex_none()
             .child(header);
         if progress > 0.0 {
-            let children = rows
-                .iter()
-                .enumerate()
-                .map(|(index, row)| {
-                    let continues = Some(index + 1 < rows.len());
-                    if row.kind == TimelineRowKind::FileOperation
-                        && self.ui_state.session.enhanced_file_operation_display
-                    {
-                        self.render_file_operation_entry(row, continues, turn_live, window, cx)
-                    } else {
-                        self.render_process_activity_entry(row, continues, turn_live, window, cx)
-                    }
-                })
-                .collect::<Vec<_>>();
-            body = body.child(timeline_disclosure_body(
-                format!("activity-body:{}", group.id),
-                progress,
+            // A pending reveal points at one row of the group and scrolls to
+            // it, and the spike's window has no pin: while one is pending the
+            // body stays inline so the row it names still exists. The real
+            // element pins the row instead, the way [`TimelineProcessRun`] pins
+            // a unit.
+            let pending_reveal = self.pending_permission_reveal_item_id.is_some()
+                || self.pending_session_search_reveal_item_id.is_some();
+            let body_element = if timeline_group_body_windowing()
+                && !pending_reveal
+                && rows.len() > TIMELINE_GROUP_ROW_WINDOW_MIN_ROWS
+            {
+                // SPIKE: build only the rows the viewport shows. See
+                // [`timeline_group_body`] for what the real element still owes.
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_none()
+                    .py_0p5()
+                    .child(self.windowed_group_body(turn, group, rows, turn_live, window, cx))
+                    .into_any_element()
+            } else {
+                let children = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(index, row)| {
+                        #[cfg(test)]
+                        self.timeline_group_rows_built.push(index);
+                        self.render_group_body_row(row, index, rows.len(), turn_live, window, cx)
+                    })
+                    .collect::<Vec<_>>();
                 v_flex()
                     .w_full()
                     .min_w_0()
                     .flex_none()
                     .py_0p5()
                     .children(children)
-                    .into_any_element(),
+                    .into_any_element()
+            };
+            body = body.child(timeline_disclosure_body(
+                format!("activity-body:{}", group.id),
+                progress,
+                body_element,
             ));
         }
         body.into_any_element()
+    }
+
+    /// One row of an expanded process group's body, as both bodies paint it.
+    fn render_group_body_row(
+        &mut self,
+        row: &TimelineRow,
+        index: usize,
+        row_count: usize,
+        turn_live: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let continues = Some(index + 1 < row_count);
+        if row.kind == TimelineRowKind::FileOperation
+            && self.ui_state.session.enhanced_file_operation_display
+        {
+            self.render_file_operation_entry(row, continues, turn_live, window, cx)
+        } else {
+            self.render_process_activity_entry(row, continues, turn_live, window, cx)
+        }
+    }
+
+    /// The windowed body of a long, expanded process group.
+    ///
+    /// SPIKE. The rows are built during the body's own prepaint — after this
+    /// render has returned, exactly like [`TimelineProcessRun`]'s units — so the
+    /// builder re-enters the workbench to reach each row's current state, and
+    /// the recorder feeds the heights it measured back into the row table.
+    fn windowed_group_body(
+        &mut self,
+        turn: &TimelineConversationTurn,
+        group: &TimelineProcessActivityGroup,
+        rows: &[TimelineRow],
+        turn_live: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (origins, total_height) = self.timeline_group_row_origins(rows);
+        let entity = cx.weak_entity();
+        let session_id = self.timeline.session_id.clone();
+        let turn_id = turn.id.clone();
+        let group_id = group.id.clone();
+
+        let build_entity = entity.clone();
+        let build_session = session_id.clone();
+        let build_turn = turn_id.clone();
+        let build_group = group_id.clone();
+        let build_row = Box::new(move |index: usize, window: &mut Window, cx: &mut App| {
+            build_entity
+                .update(cx, |this, cx| {
+                    this.with_session_view_for_render(build_session.as_ref(), |this| {
+                        let Some(turn) = this.timeline_turn_by_id(&build_turn) else {
+                            return Empty.into_any_element();
+                        };
+                        let enhanced = this.ui_state.session.enhanced_command_execution_display;
+                        let Some(rows) = timeline_group_body_rows(&turn, &build_group, enhanced)
+                        else {
+                            return Empty.into_any_element();
+                        };
+                        let Some(row) = rows.get(index) else {
+                            return Empty.into_any_element();
+                        };
+                        #[cfg(test)]
+                        this.timeline_group_rows_built.push(index);
+                        this.render_group_body_row(row, index, rows.len(), turn_live, window, cx)
+                    })
+                })
+                .unwrap_or_else(|_| Empty.into_any_element())
+        });
+
+        let record_entity = entity;
+        let record_turn = turn_id;
+        let record_group = group_id;
+        let record_row_count = rows.len();
+        let record = Box::new(move |measurements: &[(usize, f32)], cx: &mut App| {
+            let _ = record_entity.update(cx, |this, cx| {
+                let Some(turn) = this.timeline_turn_by_id(&record_turn) else {
+                    return;
+                };
+                let enhanced = this.ui_state.session.enhanced_command_execution_display;
+                let Some(rows) = timeline_group_body_rows(&turn, &record_group, enhanced) else {
+                    return;
+                };
+                // A projection that changed shape under the frame belongs to the
+                // next one; its indices no longer address these measurements.
+                if rows.len() != record_row_count {
+                    return;
+                }
+                this.record_timeline_group_row_heights(rows, measurements, cx);
+            });
+        });
+
+        timeline_group_body::timeline_group_body(origins, total_height, build_row, record)
+    }
+
+    /// The turn projection a body built during prepaint belongs to.
+    ///
+    /// The body is built after the frame's render has returned, so it resolves
+    /// the turn from the frame's own projection rather than holding the whole
+    /// turn alive for as long as the element is mounted.
+    fn timeline_turn_by_id(&self, turn_id: &str) -> Option<Rc<TimelineConversationTurn>> {
+        if let Some(turn) = self
+            .conversation_turns_render_cache
+            .borrow()
+            .iter()
+            .find(|turn| turn.id == turn_id)
+            .cloned()
+        {
+            return Some(turn);
+        }
+        self.conversation_turns_cache
+            .iter()
+            .find(|turn| turn.id == turn_id)
+            .cloned()
+    }
+
+    /// The height one row of an expanded group is placed at this frame.
+    ///
+    /// A measurement beats the estimator, and the estimate stands until the row
+    /// has been laid out once. A streamed row never shrinks inside one content
+    /// box: incomplete Markdown lays out shorter between parses, and the body
+    /// reserves the total, so following a dip would pull every row below it up
+    /// and the outer list with them.
+    fn timeline_group_row_height(&mut self, row: &TimelineRow, width: Option<f32>) -> f32 {
+        let expanded = self.ui_state.session.enhanced_command_execution_display
+            && self
+                .timeline_command_expansion
+                .get(&row.id)
+                .copied()
+                .unwrap_or(false);
+        if let Some(current) = self.timeline_group_row_heights.get(&row.id)
+            && current.last_sequence == row.last_sequence
+            && current.expanded == expanded
+            && same_timeline_layout_width(current.layout_width, width)
+        {
+            return current.height;
+        }
+        let estimate = self.estimated_timeline_row_height_projected(row, false);
+        let height = match self.timeline_group_row_heights.get(&row.id) {
+            Some(current) if row.streaming => estimate.max(current.height),
+            _ => estimate,
+        };
+        self.timeline_group_row_heights.insert(
+            row.id.clone(),
+            TimelineGroupRowHeight {
+                last_sequence: row.last_sequence,
+                expanded,
+                layout_width: width,
+                height,
+            },
+        );
+        height
+    }
+
+    /// The origin of every row of an expanded group, and the height they take.
+    fn timeline_group_row_origins(&mut self, rows: &[TimelineRow]) -> (Rc<Vec<Pixels>>, Pixels) {
+        let width = self.timeline_layout_width;
+        let mut origins = Vec::with_capacity(rows.len());
+        let mut origin = px(0.0);
+        for row in rows {
+            origins.push(origin);
+            origin += px(self.timeline_group_row_height(row, width).max(1.0));
+        }
+        (Rc::new(origins), origin)
+    }
+
+    /// Records what the windowed body measured, so the rows it did not build
+    /// this frame keep a real height instead of an estimate.
+    fn record_timeline_group_row_heights(
+        &mut self,
+        rows: &[TimelineRow],
+        measurements: &[(usize, f32)],
+        cx: &mut Context<Self>,
+    ) {
+        let width = self.timeline_layout_width;
+        let enhanced = self.ui_state.session.enhanced_command_execution_display;
+        let mut changed = false;
+        for (index, measured) in measurements {
+            let Some(row) = rows.get(*index) else {
+                continue;
+            };
+            if !measured.is_finite() || *measured <= 0.0 {
+                continue;
+            }
+            let measured = measured.ceil().max(1.0);
+            let expanded = enhanced
+                && self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false);
+            let current = self.timeline_group_row_heights.get(&row.id).copied();
+            let height = match current {
+                Some(current) if row.streaming => current.height.max(measured),
+                _ => measured,
+            };
+            let moved = current.is_none_or(|current| (current.height - height).abs() >= 1.0);
+            self.timeline_group_row_heights.insert(
+                row.id.clone(),
+                TimelineGroupRowHeight {
+                    last_sequence: row.last_sequence,
+                    expanded,
+                    layout_width: width,
+                    height,
+                },
+            );
+            changed |= moved;
+        }
+        if changed {
+            cx.notify();
+        }
     }
 
     fn render_process_activity_line(
@@ -66579,6 +66866,25 @@ struct TimelineProcessUnitHeight {
     /// a layout seed across revisions, and its next measurement may shrink.
     layout_invalidated: bool,
     /// The measured height.
+    height: f32,
+}
+
+/// What one row of an expanded process group was last known to take.
+///
+/// SPIKE: the row analogue of [`TimelineProcessUnitHeight`], and deliberately
+/// simpler — the real element settles row heights with the same rules the unit
+/// table does. A row is stamped with the revision of its content and with the
+/// disclosure it paints, so a streamed delta or a toggle re-estimates it, and
+/// with the width it was measured in, so a resize does too.
+#[derive(Debug, Clone, Copy)]
+struct TimelineGroupRowHeight {
+    /// `TimelineRow::last_sequence` the height belongs to.
+    last_sequence: i64,
+    /// Whether the row's own disclosure was open when it was measured.
+    expanded: bool,
+    /// Layout width the height belongs to, while one is known.
+    layout_width: Option<f32>,
+    /// The height itself.
     height: f32,
 }
 
@@ -101841,7 +102147,11 @@ mod tests {
             .map(|(body, _)| body)
             .expect("timeline turn renderer should remain inspectable");
 
-        assert!(renderer.contains("let leading_turn_incomplete = is_first && self.timeline_starts_mid_turn;"));
+        assert!(
+            renderer.contains(
+                "let leading_turn_incomplete = is_first && self.timeline_starts_mid_turn;"
+            )
+        );
         assert!(renderer.contains("strings.agent_turn_loading.to_string()"));
         // A turn whose start is loaded still reports what it worked for.
         assert!(renderer.contains("format!(\"{} {duration}\", strings.agent_worked_for)"));
