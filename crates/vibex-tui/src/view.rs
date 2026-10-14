@@ -47,7 +47,7 @@ const MAX_COMPOSER_DRAFT_ROWS: usize = 8;
 /// The transcript draws the reader's own message behind the same cell, so the
 /// width is asked for rather than repeated: the two surfaces are one object at
 /// two moments, and an edge of two different widths would say otherwise.
-const BOX_EDGE_COLUMNS: u16 = crate::transcript::BOX_EDGE as u16;
+const BOX_EDGE_COLUMNS: u16 = crate::transcript::BOX_EDGE_WIDTH as u16;
 
 /// Which seat the client is attached by. Decided by the composition root, not
 /// by the library.

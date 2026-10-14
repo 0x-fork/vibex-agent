@@ -329,14 +329,6 @@ pub struct RenderedBlock {
     pub lines: Vec<Line<'static>>,
     pub plain: Vec<String>,
     pub height: usize,
-    /// The rows of `plain` drawn as the body of the reader's own box, when
-    /// there are any.
-    ///
-    /// That box spends a cell of padding in front of its text that no other row
-    /// has, and a pointer counts cells from the edge of the band while `plain`
-    /// holds only the text: the range is what reads a pointer column on one of
-    /// those rows as a column of its text.
-    pub boxed_body: Option<std::ops::Range<usize>>,
     /// The picture the block wants the terminal to hold over one of its rows.
     pub mark: Option<RowMark>,
 }
@@ -2172,21 +2164,14 @@ impl Transcript {
                         rendered
                     }
                 };
-                for (offset, line) in rendered.plain.iter().enumerate().skip(skip).take(take) {
-                    let boxed = rendered
-                        .boxed_body
-                        .as_ref()
-                        .is_some_and(|body| body.contains(&offset));
+                for line in rendered.plain.iter().skip(skip).take(take) {
                     lines.push(PlainLine {
                         text: line.clone(),
-                        // A row the reader's own box draws sits its body behind
-                        // its edge and its padding, one cell further in than any
-                        // other row does.
-                        chrome: if boxed {
-                            chrome::PAD_LEFT + BOX_EDGE + BOX_INSET
-                        } else {
-                            chrome::PAD_LEFT
-                        },
+                        // Every row puts its text behind the same chrome. A
+                        // boxed block's own edge and padding are the marker
+                        // column and the pad column, the two cells no row's text
+                        // ever occupies, so the box needs no column of its own.
+                        chrome: chrome::PAD_LEFT,
                     });
                 }
             }
@@ -2578,13 +2563,6 @@ const CLOCK_GAP: usize = 2;
 /// cell the session list leaves after its own age column.
 const CLOCK_EDGE: usize = 1;
 
-/// Columns the reader's own box spends on the edge that marks it.
-///
-/// One cell, on the left of the band: the same cell the composer draws its own
-/// edge in, so the message and the box it was typed into are recognisably the
-/// same object at two moments.
-pub(crate) const BOX_EDGE: usize = 1;
-
 /// The edge drawn down the left of the reader's own surfaces.
 ///
 /// The transcript's message band and the composer's writing surface are one
@@ -2593,6 +2571,14 @@ pub(crate) const BOX_EDGE: usize = 1;
 /// vocabulary already draws, in the green every shipped theme resolves
 /// `chart-2` to. It is the one rail on the page that belongs to the reader
 /// rather than to the Agent.
+///
+/// A box spends a cell it already has on it rather than a new one: the message
+/// draws the edge in the column every block spends on its marker, the composer
+/// where its own band starts, so the two land in the same column of the page.
+/// The padding cell behind it is the same cell on both — the margin every block
+/// spends, which the composer insets its draft by as well — and the prompt mark
+/// and the words under it therefore start on one column whether the reader is
+/// reading what they wrote or writing what they will.
 pub(crate) fn box_edge(theme: &TuiTheme) -> Span<'static> {
     Span::styled(
         crate::glyphs::accent_bar(crate::glyphs::GlyphTier::of(theme)).to_string(),
@@ -2600,12 +2586,14 @@ pub(crate) fn box_edge(theme: &TuiTheme) -> Span<'static> {
     )
 }
 
-/// Columns the reader's own message keeps clear inside its band, on each side.
+/// Columns the reader's own box spends on the edge that marks it.
 ///
-/// One cell, the same the composer insets its draft by. The message and the box
-/// it was typed in are the same surface: text that touched the edge of one
-/// would make them read as two different objects.
-const BOX_INSET: usize = 1;
+/// One cell, on the left of the band: the same cell the composer draws its own
+/// edge in, so the message and the box it was typed into are recognisably the
+/// same object at two moments. The edge is drawn from the theme, so the *width*
+/// is the only thing a layout can be told in advance — and every rail glyph the
+/// vocabulary draws is one column, which is what makes this a constant.
+pub(crate) const BOX_EDGE_WIDTH: usize = 1;
 
 /// Empty rows the reader's own message keeps above and below its text.
 ///
@@ -2650,11 +2638,12 @@ fn clock_columns(block: &Block, strings: Strings) -> usize {
 /// on the width or the last settled line and the first live one would break in
 /// different places.
 pub fn body_width_for(block: &Block, width: usize, strings: Strings) -> usize {
-    // The reader's own message pays for its box — the edge that marks it, the
-    // padding cell the text is inset by, then the prompt mark — and a message of
-    // either kind pays for the clock, whatever its label needs.
+    // The reader's own message pays for its prompt mark. Its edge and the
+    // padding cell behind it are the columns every block spends on its marker
+    // and its margin, which are already outside this width; a message of either
+    // kind pays for the clock, whatever its label needs.
     let boxed = if band_fills_row(block) {
-        BOX_EDGE + BOX_INSET + 2
+        crate::glyphs::PROMPT_ARROW_WIDTH
     } else {
         0
     };
@@ -2728,7 +2717,8 @@ fn band_fills_row(block: &Block) -> bool {
 /// It is a row of the box rather than a gap between blocks, which is why it
 /// carries the edge, the band to the content edge and the pointer, and why it
 /// keeps an empty plain line — the copy of a message is the message, not its
-/// padding.
+/// padding. The row holds nothing but that padding, so the box's own cell is the
+/// first thing after the chrome and the band fills the rest.
 fn band_row(
     row: usize,
     live: bool,
@@ -2738,16 +2728,32 @@ fn band_row(
     theme: &TuiTheme,
 ) -> Line<'static> {
     let band = Style::default().bg(theme.roles.surface_raised);
-    let mut spans = vec![box_edge(theme), Span::raw(" ".repeat(BOX_INSET))];
+    let mut spans = Vec::new();
     close_body_row(
         &mut spans,
-        BOX_EDGE + BOX_INSET,
+        0,
         content_width,
         Some(band),
         None,
         Style::default(),
     );
-    row_line(row_marker(row, live, pointer, phase, theme), spans).style(band)
+    row_line(box_marker(row, live, pointer, phase, theme), spans).style(band)
+}
+
+/// The marker cell of one row of a boxed block.
+///
+/// A boxed block spends the column every block spends on its marker: the reader's
+/// own message is marked by its edge, so the box costs the message no width and
+/// the edge lands in the column the composer draws its own in — with the cell of
+/// padding behind it that every block spends on its margin, the prompt mark and
+/// the words under it start on the composer's own column. The cursor's bar is the
+/// same cell, so the row the reader is on is marked by the pointer rather than by
+/// the rule — one column, one mark.
+fn box_marker(row: usize, live: bool, pointer: bool, phase: u32, theme: &TuiTheme) -> Span<'static> {
+    if pointer || live {
+        return row_marker(row, live, pointer, phase, theme);
+    }
+    box_edge(theme)
 }
 
 /// Whether a block kind is a dense, foldable work item.
@@ -3135,7 +3141,6 @@ fn render_block_inner(
 ) -> RenderedBlock {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut plain: Vec<String> = Vec::new();
-    let mut boxed_body: Option<std::ops::Range<usize>> = None;
 
     if block.is_hidden() {
         // Folded into the run above; contributes nothing but is still counted
@@ -3453,11 +3458,11 @@ fn render_block_inner(
             None => Style::default().fg(theme.roles.gray_dim),
         };
         // The reader's own message carries the box the composer does: the edge
-        // that marks it, then a cell of padding on every side. A band that
-        // hugged its text would read as a highlight behind a sentence rather
-        // than as the thing they wrote into.
-        let inset = band.map_or(0, |_| BOX_INSET);
-        let edge = band.map_or(0, |_| BOX_EDGE);
+        // that marks it in the column every block spends on its marker, then the
+        // padding cell every block spends on its margin — the same two cells the
+        // composer puts in front of its draft. A band that hugged its text would
+        // read as a highlight behind a sentence rather than as the thing they
+        // wrote into.
         let mut block_row = 0usize;
         if band.is_some() {
             for _ in 0..BOX_PAD_ROWS {
@@ -3473,7 +3478,6 @@ fn render_block_inner(
                 block_row += 1;
             }
         }
-        let body_start = lines.len();
         for (index, (line, text)) in rendered.lines.into_iter().zip(rendered.plain).enumerate() {
             let mut styled = line;
             if !matches!(block.kind, TimelineRowKind::Error) {
@@ -3500,22 +3504,14 @@ fn render_block_inner(
                 spans.insert(0, Span::raw("  "));
                 text = format!("  {text}");
             }
-            if inset > 0 {
-                // The band's own left padding, outside the message's text: the
-                // prompt mark sits one cell in from the edge of the box.
-                spans.insert(0, Span::raw(" ".repeat(inset)));
-            }
-            if edge > 0 {
-                // The edge that marks the box, outside its padding: the two
-                // surfaces the reader owns wear it in the same column.
-                spans.insert(0, box_edge(theme));
-            }
             // Neither the band nor the clock is text, so neither enters
             // `plain`: what a reader drags out of the transcript is the message
-            // they wrote, without the chrome that framed it.
+            // they wrote, without the chrome that framed it. The box's own edge
+            // and padding are that chrome, which is why the text is measured
+            // from where it starts rather than from the edge of the band.
             close_body_row(
                 &mut spans,
-                display_width(&text) + inset + edge,
+                display_width(&text),
                 content_width,
                 band,
                 (index == 0).then_some(clock.as_deref()).flatten(),
@@ -3528,11 +3524,14 @@ fn render_block_inner(
             // body's first row is cell one whatever padding the block drew
             // above it.
             let pointer = selected && block_row == 0 && !live && !furniture_holds_cursor;
-            let mut row = row_line(
-                row_marker(block_row + 1, live, pointer, phase, theme),
-                spans,
-            )
-            .style(row_style);
+            // A boxed block is marked by its edge in the marker column, and by
+            // the pointer on the one row the cursor is on: one column, one mark.
+            let marker = if band.is_some() {
+                box_marker(block_row + 1, live, pointer, phase, theme)
+            } else {
+                row_marker(block_row + 1, live, pointer, phase, theme)
+            };
+            let mut row = row_line(marker, spans).style(row_style);
             if block_row == 0 && pointer {
                 row = row.style(Style::default().bg(theme.roles.surface_highlight));
             }
@@ -3541,10 +3540,6 @@ fn render_block_inner(
             block_row += 1;
         }
         if band.is_some() {
-            // The body of the box is the one run of rows drawn a cell further
-            // in than every other row: its own padding, which is chrome like
-            // the marker and never part of the text.
-            boxed_body = Some(body_start..lines.len());
             for _ in 0..BOX_PAD_ROWS {
                 lines.push(band_row(
                     block_row,
@@ -3630,7 +3625,6 @@ fn render_block_inner(
         height: lines.len(),
         lines,
         plain,
-        boxed_body,
         mark,
     }
 }
@@ -5345,10 +5339,12 @@ mod density_tests {
         let edge = crate::glyphs::accent_bar(crate::glyphs::GlyphTier::of(&theme));
         // The box's own rows, its padding included: the edge is the box, not the
         // text, so a message short enough to fit one row still wears it top to
-        // bottom.
+        // bottom. It is drawn in the column every block spends on its marker —
+        // the column the composer draws its own edge in, which is what makes the
+        // message and the box it was typed into one surface at two moments.
         let box_rows = rendered.height - chrome::GAP;
         for (index, line) in rendered.lines.iter().take(box_rows).enumerate() {
-            let (glyph, style) = cell_at(line, chrome::PAD_LEFT);
+            let (glyph, style) = cell_at(line, 0);
             assert_eq!(glyph, edge, "row {index} of the box has no edge");
             assert_eq!(
                 style.fg,
@@ -5356,12 +5352,13 @@ mod density_tests {
                 "row {index} of the edge is not the reader's green"
             );
         }
-        // Everything the box holds sits behind the edge and the padding cell the
-        // composer insets its draft by, as one column of chrome.
+        // The box holds nothing of its own: the padding cell behind the edge is
+        // the margin every block spends, so the prompt mark and the words under
+        // it start on the composer's own column.
         let body = line_text(&rendered.lines[BOX_PAD_ROWS]);
         let prompt = prompt_glyph(&theme);
         assert!(
-            body.starts_with(&format!("  {edge} {prompt} a question")),
+            body.starts_with(&format!("{edge} {prompt} a question")),
             "{body:?}"
         );
         // The copy of the box's rows leaves the chrome behind: a reader who
@@ -5395,7 +5392,7 @@ mod density_tests {
         assert_eq!(clock_label(&unstamped, strings()), None);
         assert_eq!(
             body_width_for(&unstamped, 60, strings()),
-            chrome::content_width(60) - BOX_EDGE - BOX_INSET - 2
+            chrome::content_width(60) - crate::glyphs::PROMPT_ARROW_WIDTH
         );
         let rendered = render_block(&unstamped, &theme(), 60, strings());
         assert!(rendered.lines[0].width() < 60);
