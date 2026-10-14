@@ -77,6 +77,7 @@ impl vibex_backend::AgentBackend for TeamAgent {
                 has_older: false,
                 has_newer: false,
                 starts_at_turn_start: true,
+                leading_turn_start: None,
             })
         })
     }

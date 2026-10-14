@@ -2342,6 +2342,7 @@ mod tests {
                         has_older: start > 0,
                         has_newer: true,
                         starts_at_turn_start: true,
+                        leading_turn_start: None,
                         items: page,
                     });
                 }
@@ -2360,6 +2361,7 @@ mod tests {
                     has_older: false,
                     has_newer: total_after > page.len(),
                     starts_at_turn_start: true,
+                    leading_turn_start: None,
                     items: page,
                 })
             })
@@ -2722,6 +2724,7 @@ mod tests {
             has_older: false,
             has_newer: false,
             starts_at_turn_start: true,
+            leading_turn_start: None,
         };
         assert!(
             controller
@@ -2755,6 +2758,7 @@ mod tests {
             has_older: true,
             has_newer: true,
             starts_at_turn_start: true,
+            leading_turn_start: None,
         };
         assert!(controller.apply_timeline_before(&ticket, Ok(page)).unwrap());
         assert!(!controller.state.timeline_has_older);
@@ -2864,6 +2868,7 @@ mod tests {
             has_older: false,
             has_newer: true,
             starts_at_turn_start: true,
+            leading_turn_start: None,
         };
         assert!(controller.apply_timeline_before(&ticket, Ok(page)).unwrap());
 
@@ -2897,6 +2902,7 @@ mod tests {
             has_older: false,
             has_newer: true,
             starts_at_turn_start: true,
+            leading_turn_start: None,
         };
         assert!(!controller.apply_timeline_before(&ticket, Ok(page)).unwrap());
     }

@@ -4809,6 +4809,7 @@ mod tests {
             has_older: true,
             has_newer: true,
             starts_at_turn_start: true,
+            leading_turn_start: None,
         };
         apply_message(
             &mut app,

@@ -5,7 +5,7 @@ use vibex_core::{
     AgentDelegationId, AgentMessagePhase, AgentSession, AgentSessionState,
     ElicitationRequestStatus, GoalAction, GoalChangeKind, GoalSnapshot, PermissionRequestStatus,
     PlanStepPayload, PlanStepStatus, RetryPhase, TimelineItem, TimelineItemKind, TimelinePayload,
-    ToolCallStatus, VibexSessionId, unix_timestamp_ms,
+    TimelineTurnStart, ToolCallStatus, VibexSessionId, unix_timestamp_ms,
 };
 
 use crate::{ReasoningDisplayMode, SidebarState};
@@ -542,6 +542,32 @@ pub fn timeline_conversation_turns_with_reasoning_mode(
     pending_turn_active: bool,
     reasoning_display_mode: ReasoningDisplayMode,
 ) -> Vec<TimelineConversationTurn> {
+    timeline_conversation_turns_with_leading_turn_start(
+        items,
+        session_state,
+        pending_turn_active,
+        reasoning_display_mode,
+        None,
+    )
+}
+
+/// Projects conversation turns, dating the leading one from the read that cut
+/// the window rather than from the rows that survived the cut.
+///
+/// A window is cut from its newest end, so the turn it opens inside holds only
+/// that turn's tail: the projection's own anchor — the turn's user item, or its
+/// first response item — is below the window, and a header built from whatever
+/// row did survive the cut would count from the middle of the turn and move
+/// every time a page landed. `leading_turn_start` is that turn's own first row,
+/// as the read that produced the window found it; it is `None` when the window
+/// opens on a turn boundary, which is the ordinary case.
+pub fn timeline_conversation_turns_with_leading_turn_start(
+    items: &[TimelineItem],
+    session_state: Option<AgentSessionState>,
+    pending_turn_active: bool,
+    reasoning_display_mode: ReasoningDisplayMode,
+    leading_turn_start: Option<TimelineTurnStart>,
+) -> Vec<TimelineConversationTurn> {
     let visible_items = items
         .iter()
         .filter(|item| item.kind != TimelineItemKind::SystemNotice)
@@ -718,6 +744,19 @@ pub fn timeline_conversation_turns_with_reasoning_mode(
             }
         })
         .collect::<Vec<_>>();
+
+    // The leading turn has no opening row to count from — that is what a window
+    // cut inside a turn means — so its header is dated from the read that cut
+    // it. Only the first turn can be that one, and only while it is missing its
+    // own first row; once the rows below the window are read back in, the row
+    // itself supplies the same anchor, so the number does not move.
+    if let Some(head) = leading_turn_start
+        && let Some(leading) = turns.first_mut()
+        && leading.user_row.is_none()
+        && head.timestamp_ms > 0
+    {
+        leading.started_at_ms = leading.started_at_ms.min(head.timestamp_ms);
+    }
 
     let last_turn = turns.last();
     let should_show_pending_turn = session_state == Some(AgentSessionState::Running)
@@ -2568,6 +2607,90 @@ mod tests {
         assert_eq!(rows[2].kind, TimelineRowKind::Reasoning);
         assert!(!rows[2].streaming);
         assert!(turns[0].live_status.is_none());
+    }
+
+    /// A window cut inside a turn dates that turn from the read, not from the
+    /// row that happened to survive the cut.
+    #[test]
+    fn a_leading_turn_without_its_first_row_is_dated_by_the_read() {
+        let items = [
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "long question".into(),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "working".into(),
+                    is_final: false,
+                }),
+            ),
+            item(
+                3,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "still working".into(),
+                    is_final: false,
+                }),
+            ),
+            item(
+                4,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "next question".into(),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+            ),
+            item(
+                5,
+                None,
+                TimelinePayload::AgentMessage(AgentMessagePayload {
+                    text: "answer".into(),
+                    is_final: true,
+                }),
+            ),
+        ];
+        // The budget ran out inside the first turn, so the window holds only its
+        // tail; the read that cut it reports where that turn begins.
+        let window = &items[1..];
+        let head = TimelineTurnStart {
+            sequence: 1,
+            timestamp_ms: 1,
+        };
+        let placed = timeline_conversation_turns_with_leading_turn_start(
+            window,
+            Some(AgentSessionState::Idle),
+            false,
+            ReasoningDisplayMode::Timeline,
+            Some(head),
+        );
+        assert!(placed[0].user_row.is_none());
+        assert_eq!(
+            placed[0].started_at_ms, head.timestamp_ms,
+            "the header counts from the turn's own first row"
+        );
+        // The turn above it carries its own opening row and is left alone.
+        assert!(placed[1].user_row.is_some());
+        assert_eq!(placed[1].started_at_ms, 4);
+
+        // Without the read's anchor the same window can only count from the row
+        // it holds — which is the number that moved as pages landed.
+        let unplaced = timeline_conversation_turns_with_leading_turn_start(
+            window,
+            Some(AgentSessionState::Idle),
+            false,
+            ReasoningDisplayMode::Timeline,
+            None,
+        );
+        assert_eq!(unplaced[0].started_at_ms, 2);
+        assert!(unplaced[0].started_at_ms > head.timestamp_ms);
     }
 
     #[test]

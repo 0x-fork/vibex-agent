@@ -1,7 +1,8 @@
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 use vibex_core::{
-    AgentSessionState, TimelineItem, TimelineLiveEvent, VibexError, VibexResult, VibexSessionId,
+    AgentSessionState, TimelineItem, TimelineLiveEvent, TimelineTurnStart, VibexError, VibexResult,
+    VibexSessionId,
 };
 use vibex_desktop_model::{
     ReasoningDisplayMode, TimelineConversationTurn, TimelineModel, TimelineRow,
@@ -29,6 +30,12 @@ pub(super) struct PreparedTimeline {
     /// leading end, so only the read that produced a window can say whether that
     /// window opens on a turn boundary.
     timeline_starts_mid_turn: bool,
+    /// Where the turn the window opens inside begins, when it opens inside one.
+    ///
+    /// The same rule: a resumed load keeps the prefix's own leading end, so the
+    /// anchor either comes with the window that was read or is the one the
+    /// prefix was installed with.
+    leading_turn_start: Option<TimelineTurnStart>,
 }
 
 /// Only the request owns this buffer. Its weak view reference expires on
@@ -88,7 +95,10 @@ impl PreparedTimeline {
         pending: bool,
         reasoning: ReasoningDisplayMode,
     ) -> VibexResult<Self> {
-        Self::prepare_with_older(session_id, items, false, false, state, pending, reasoning).await
+        Self::prepare_with_older(
+            session_id, items, false, false, None, state, pending, reasoning,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -97,13 +107,18 @@ impl PreparedTimeline {
         items: Vec<TimelineItem>,
         timeline_has_older: bool,
         timeline_starts_mid_turn: bool,
+        leading_turn_start: Option<TimelineTurnStart>,
         state: Option<AgentSessionState>,
         pending: bool,
         reasoning: ReasoningDisplayMode,
     ) -> VibexResult<Self> {
         tokio::task::spawn_blocking(move || {
             let mut timeline = TimelineModel::default();
-            timeline.replace_authoritative(session_id, items);
+            timeline.replace_authoritative_with_leading_turn_start(
+                session_id,
+                items,
+                leading_turn_start,
+            );
             let turns = timeline.conversation_turns_with_reasoning_mode(state, pending, reasoning);
             Self {
                 timeline,
@@ -113,6 +128,7 @@ impl PreparedTimeline {
                 reasoning,
                 timeline_has_older,
                 timeline_starts_mid_turn,
+                leading_turn_start,
             }
         })
         .await
@@ -190,6 +206,9 @@ impl VibexWorkbench {
         } else {
             self.timeline.needs_authoritative_refetch =
                 prepared.timeline.needs_authoritative_refetch;
+            // The rows did not move, so the same leading end is described by
+            // whichever read last looked at it.
+            self.timeline.leading_turn_start = prepared.leading_turn_start;
         }
         self.timeline_has_older = prepared.timeline_has_older;
         self.reconcile_optimistic_user_message();

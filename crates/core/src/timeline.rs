@@ -1482,6 +1482,33 @@ pub struct TimelinePage {
     /// turn a page opens in is the one a client has to be careful about.
     #[serde(default = "timeline_page_starts_at_turn_start_default")]
     pub starts_at_turn_start: bool,
+    /// Where the turn this page opens inside begins, when it opens inside one.
+    ///
+    /// [`Self::starts_at_turn_start`] only says the oldest row is not a turn
+    /// boundary. This says which turn it is inside and when that turn began,
+    /// which is the anchor its header counts from: the page's own oldest row is
+    /// somewhere in the middle of that turn, so a reader that only had the rows
+    /// would date the turn from a row that is not its start — and move the
+    /// number once the older rows arrive.
+    ///
+    /// The pair travels with the page because only the read that produced the
+    /// page knows it, and it is one indexed probe where the page was cut
+    /// anyway. It is `None` for a page that opens on a turn boundary, and for a
+    /// peer too old to report one.
+    #[serde(default)]
+    pub leading_turn_start: Option<TimelineTurnStart>,
+}
+
+/// The first row of the turn a page opens inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineTurnStart {
+    /// The sequence the turn begins at.
+    pub sequence: i64,
+    /// When the turn began, read from that row exactly as the turn projection
+    /// reads it, so a header built from this and a header built from the row
+    /// itself agree.
+    pub timestamp_ms: i64,
 }
 
 /// Assume a boundary when a peer does not report one.

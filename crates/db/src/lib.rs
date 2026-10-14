@@ -47,9 +47,9 @@ use vibex_core::{
     ScheduledTaskStatus, ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix, SkillCreateRequest,
     SkillId, SkillProviderMatrix, SkillStatus, TerminalId, TerminalSession, TimelineItem,
     TimelineItemId, TimelineItemKind, TimelinePage, TimelinePayload, TimelinePayloadDepth,
-    TimelineRedactionState, TimelineSource, TurnExecutionAttribution, VibexError, VibexExecutionId,
-    VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode, WorkspaceRecord,
-    agent_id_for_provider_kind, legacy_status_for_phase, phase_for_legacy_status,
+    TimelineRedactionState, TimelineSource, TimelineTurnStart, TurnExecutionAttribution,
+    VibexError, VibexExecutionId, VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode,
+    WorkspaceRecord, agent_id_for_provider_kind, legacy_status_for_phase, phase_for_legacy_status,
     unix_timestamp_ms,
 };
 
@@ -9020,6 +9020,7 @@ impl TimelineRepository {
             false
         };
 
+        let starts_at_turn_start = page_starts_at_turn_start(conn, session_id, start_sequence)?;
         Ok(TimelinePage {
             session_id: session_id.clone(),
             items,
@@ -9027,7 +9028,13 @@ impl TimelineRepository {
             end_sequence,
             has_older,
             has_newer,
-            starts_at_turn_start: page_starts_at_turn_start(conn, session_id, start_sequence)?,
+            starts_at_turn_start,
+            leading_turn_start: page_leading_turn_start(
+                conn,
+                session_id,
+                starts_at_turn_start,
+                start_sequence,
+            )?,
         })
     }
 
@@ -9147,6 +9154,7 @@ impl TimelineRepository {
             false
         };
 
+        let starts_at_turn_start = page_starts_at_turn_start(conn, session_id, start_sequence)?;
         Ok(TimelinePage {
             session_id: session_id.clone(),
             items,
@@ -9154,7 +9162,13 @@ impl TimelineRepository {
             end_sequence,
             has_older,
             has_newer,
-            starts_at_turn_start: page_starts_at_turn_start(conn, session_id, start_sequence)?,
+            starts_at_turn_start,
+            leading_turn_start: page_leading_turn_start(
+                conn,
+                session_id,
+                starts_at_turn_start,
+                start_sequence,
+            )?,
         })
     }
 
@@ -9420,6 +9434,7 @@ impl TimelineRepository {
             None => false,
         };
 
+        let starts_at_turn_start = page_starts_at_turn_start(conn, session_id, start_sequence)?;
         Ok(TimelinePage {
             session_id: session_id.clone(),
             items,
@@ -9427,7 +9442,13 @@ impl TimelineRepository {
             end_sequence,
             has_older,
             has_newer,
-            starts_at_turn_start: page_starts_at_turn_start(conn, session_id, start_sequence)?,
+            starts_at_turn_start,
+            leading_turn_start: page_leading_turn_start(
+                conn,
+                session_id,
+                starts_at_turn_start,
+                start_sequence,
+            )?,
         })
     }
 
@@ -16188,6 +16209,94 @@ fn page_starts_at_turn_start(
     ))
 }
 
+/// The first row of the turn a page opens inside, when it opens inside one.
+///
+/// The counterpart of [`page_starts_at_turn_start`]: that one answers whether
+/// the page's oldest row is a turn boundary, this one answers where the turn it
+/// landed in begins. Both read the same rule — a turn starts at a user message,
+/// and the session's first row begins the first turn whatever it carries — so a
+/// header built from this and a header built from the turn's own rows agree.
+///
+/// It is one indexed probe on the page's leading edge, and it is what keeps a
+/// reader that opened mid-turn from dating that turn by a row in the middle of
+/// it: the rows below the page are still read on demand, but the anchor they
+/// would have supplied comes along with the page that cut them off.
+fn page_leading_turn_start(
+    conn: &Connection,
+    session_id: &VibexSessionId,
+    starts_at_turn_start: bool,
+    start_sequence: Option<i64>,
+) -> VibexResult<Option<TimelineTurnStart>> {
+    // A page that opens on a boundary has nothing to say here, and an empty one
+    // has no turn to place.
+    if starts_at_turn_start {
+        return Ok(None);
+    }
+    let Some(start_sequence) = start_sequence else {
+        return Ok(None);
+    };
+    let user_message = enum_to_db(&TimelineItemKind::UserMessage)?;
+    let head = conn
+        .query_row(
+            "
+            SELECT sequence, timestamp_ms
+            FROM agent_timeline_items
+            WHERE session_id = ?1 AND kind = ?2 AND sequence <= ?3
+            ORDER BY sequence DESC
+            LIMIT 1
+            ",
+            params![session_id.as_str(), user_message, start_sequence],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(storage_err(
+            "timeline_turn_head_failed",
+            "failed to inspect the turn a timeline page opens in",
+        ))?;
+    let (sequence, timestamp_ms) = match head {
+        Some(head) => head,
+        // No user message at or below the page, so the page opens inside the
+        // session's first turn. That turn begins at the session's first visible
+        // row: notice rows are not part of a turn, which is the same filter the
+        // turn projection applies.
+        None => match conn
+            .query_row(
+                "
+                SELECT sequence, timestamp_ms
+                FROM agent_timeline_items
+                WHERE session_id = ?1 AND kind <> ?2 AND sequence <= ?3
+                ORDER BY sequence ASC
+                LIMIT 1
+                ",
+                params![
+                    session_id.as_str(),
+                    enum_to_db(&TimelineItemKind::SystemNotice)?,
+                    start_sequence
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(storage_err(
+                "timeline_turn_head_failed",
+                "failed to inspect the first turn a timeline page opens in",
+            ))? {
+            Some(head) => head,
+            // A page with no row at all has no turn to place.
+            None => return Ok(None),
+        },
+    };
+    // An item without a usable timestamp cannot anchor a header: the projection
+    // falls back to the current time for it, which no stored row reproduces.
+    // Reporting nothing keeps the reader on the state it was already in.
+    if timestamp_ms <= 0 {
+        return Ok(None);
+    }
+    Ok(Some(TimelineTurnStart {
+        sequence,
+        timestamp_ms,
+    }))
+}
+
 /// The sequences that begin a conversational turn within `(after, through]`,
 /// newest first.
 fn timeline_turn_starts(
@@ -22553,7 +22662,7 @@ mod tests {
         apply_migrations(&mut conn).unwrap();
         let (_project, workspace) = WorkspaceRepository::ensure(
             &conn,
-            &format!("/tmp/vibex-db-{label}"),
+            format!("/tmp/vibex-db-{label}"),
             WorkspaceMode::CurrentCheckout,
         )
         .unwrap();
@@ -22745,6 +22854,115 @@ mod tests {
             .position(|item| item.sequence == starts[1])
             .expect("turn two's first row is in the page");
         assert_eq!(finished, BackwardPageCut::FinishTurn { index: index + 1 });
+
+        cleanup_db(temp);
+    }
+
+    /// A page that opens inside a turn says where that turn begins.
+    ///
+    /// The page's own oldest row cannot: it is somewhere in the middle of the
+    /// turn, and a header built from it would count from a row that is not the
+    /// start and move once the turn's first row is read back in.
+    #[test]
+    fn a_page_that_opens_inside_a_turn_carries_that_turns_start() {
+        let (conn, session_id, starts, temp) =
+            turn_boundary_fixture("timeline-page-leading-turn-head", &[(50, true), (2, true)]);
+
+        // A read that ends just below turn two's opening row cuts turn one in
+        // half: it cannot say where turn one began from its own rows.
+        let inside =
+            TimelineRepository::fetch_before(&conn, &session_id, Some(starts[1]), 4).unwrap();
+        assert!(!inside.starts_at_turn_start);
+        let head = inside
+            .leading_turn_start
+            .expect("a page cut inside a turn knows where that turn begins");
+        assert_eq!(head.sequence, starts[0]);
+        let question = TimelineRepository::fetch_item(&conn, &session_id, starts[0])
+            .unwrap()
+            .expect("the turn's first row is still stored");
+        assert_eq!(
+            head.timestamp_ms, question.timestamp_ms,
+            "the anchor must be the time the turn's own row carries"
+        );
+
+        // The whole turn is not carried, only its placement: the rows below the
+        // page are still a reader gesture away.
+        assert_eq!(inside.items.len(), 4);
+
+        // A page whose oldest row opens a turn needs no anchor: the row itself
+        // is one.
+        let aligned =
+            TimelineRepository::fetch_after(&conn, &session_id, Some(starts[1] - 1), 2).unwrap();
+        assert!(aligned.starts_at_turn_start);
+        assert!(aligned.leading_turn_start.is_none());
+
+        // So does a page that reaches the session's first row.
+        let first = TimelineRepository::fetch_after(&conn, &session_id, Some(0), 100).unwrap();
+        assert_eq!(first.start_sequence, Some(starts[0]));
+        assert!(first.starts_at_turn_start);
+        assert!(first.leading_turn_start.is_none());
+
+        cleanup_db(temp);
+    }
+
+    /// The session's first turn begins at its first visible row.
+    ///
+    /// A turn normally starts at a user message, but a session that opens on
+    /// notices has none to point at, and the projection anchors that turn on
+    /// the first row after them.
+    #[test]
+    fn a_page_inside_the_first_turn_anchors_on_its_first_visible_row() {
+        let (mut conn, session_id, _starts, temp) =
+            turn_boundary_fixture("timeline-page-first-turn-head", &[]);
+        let notice = TimelineRepository::append(
+            &mut conn,
+            &session_id,
+            TimelineSource::System,
+            TimelinePayload::SystemNotice(SystemNoticePayload {
+                level: SystemNoticeLevel::Info,
+                message: "starting up".to_string(),
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        let mut appended = Vec::new();
+        for row in 0..6 {
+            appended.push(
+                TimelineRepository::append(
+                    &mut conn,
+                    &session_id,
+                    TimelineSource::Agent,
+                    TimelinePayload::AgentMessage(AgentMessagePayload {
+                        text: format!("unprompted row {row}"),
+                        is_final: row == 5,
+                    }),
+                    None,
+                    None,
+                    TimelineRedactionState::None,
+                )
+                .unwrap(),
+            );
+        }
+
+        let inside = TimelineRepository::fetch_before(
+            &conn,
+            &session_id,
+            appended.last().map(|item| item.sequence),
+            2,
+        )
+        .unwrap();
+        assert!(!inside.starts_at_turn_start);
+        let head = inside
+            .leading_turn_start
+            .expect("the first turn's start is reachable");
+        assert_eq!(
+            head.sequence, appended[0].sequence,
+            "notices are not part of a turn, so the anchor is the first row after them"
+        );
+        assert_eq!(head.timestamp_ms, appended[0].timestamp_ms);
+        assert!(head.sequence > notice.sequence);
 
         cleanup_db(temp);
     }

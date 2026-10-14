@@ -8585,6 +8585,7 @@ mod tests {
             has_older: false,
             has_newer: true,
             starts_at_turn_start: true,
+            leading_turn_start: None,
         };
         assert!(
             app.agent

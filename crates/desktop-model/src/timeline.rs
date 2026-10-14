@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use vibex_core::{
     AgentSessionState, ElicitationRequestStatus, PermissionRequestStatus, TimelineItem,
-    TimelineItemKind, TimelineLiveEvent, TimelinePayload, VibexSessionId,
+    TimelineItemKind, TimelineLiveEvent, TimelinePayload, TimelineTurnStart, VibexSessionId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +23,14 @@ pub struct TimelineModel {
     pub items: Vec<TimelineItem>,
     pub authoritative_end_sequence: Option<i64>,
     pub needs_authoritative_refetch: bool,
+    /// Where the turn the window opens inside begins, when it opens inside one.
+    ///
+    /// The window's oldest row is then a row in the middle of that turn, so the
+    /// projection cannot date it from its own items; this is the anchor the read
+    /// that cut the window carried. `None` when the window opens on a turn
+    /// boundary, and when the authority did not report one.
+    #[serde(default)]
+    pub leading_turn_start: Option<TimelineTurnStart>,
     /// Monotonic counter bumped on every `items` mutation; lets callers cache
     /// derived projections (rows/turns) and invalidate cheaply. Not part of the
     /// serialized contract.
@@ -36,6 +44,20 @@ impl TimelineModel {
         session_id: VibexSessionId,
         items: impl IntoIterator<Item = TimelineItem>,
     ) {
+        self.replace_authoritative_with_leading_turn_start(session_id, items, None);
+    }
+
+    /// Installs a window, including where the turn it opens inside begins.
+    ///
+    /// The anchor is part of the window rather than of the rows: a caller that
+    /// replaces the items without one is saying the window opens on a boundary
+    /// it can read for itself.
+    pub fn replace_authoritative_with_leading_turn_start(
+        &mut self,
+        session_id: VibexSessionId,
+        items: impl IntoIterator<Item = TimelineItem>,
+        leading_turn_start: Option<TimelineTurnStart>,
+    ) {
         let normalized_items = normalize_items(session_id.clone(), items);
         let content_changed =
             self.session_id.as_ref() != Some(&session_id) || self.items != normalized_items;
@@ -45,6 +67,7 @@ impl TimelineModel {
         }
         self.authoritative_end_sequence = self.items.last().map(|item| item.sequence);
         self.needs_authoritative_refetch = false;
+        self.leading_turn_start = leading_turn_start;
         if content_changed {
             self.revision = self.revision.wrapping_add(1);
         }
@@ -132,11 +155,12 @@ impl TimelineModel {
         pending_turn_active: bool,
         reasoning_display_mode: crate::ReasoningDisplayMode,
     ) -> Vec<crate::TimelineConversationTurn> {
-        crate::timeline_conversation_turns_with_reasoning_mode(
+        crate::timeline_conversation_turns_with_leading_turn_start(
             &self.items,
             session_state,
             pending_turn_active,
             reasoning_display_mode,
+            self.leading_turn_start,
         )
     }
 

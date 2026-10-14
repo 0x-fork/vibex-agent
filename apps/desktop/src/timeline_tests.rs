@@ -1,5 +1,6 @@
 use super::*;
 use gpui::{Modifiers, TestAppContext, VisualTestContext};
+use vibex_core::TimelineTurnStart;
 
 struct LiveTimelineProbe {
     workbench: Entity<VibexWorkbench>,
@@ -1752,6 +1753,7 @@ fn a_history_page_a_switch_superseded_returns_its_slot(cx: &mut TestAppContext) 
                 has_older: false,
                 has_newer: false,
                 starts_at_turn_start: true,
+                leading_turn_start: None,
             }),
         );
     });
@@ -1874,6 +1876,32 @@ fn a_turn_that_is_still_arriving_reads_as_loading(cx: &mut TestAppContext) {
         )
     });
     assert_eq!(loaded, (false, true));
+
+    // The read that cut the window can still place the turn it opened inside.
+    // The header then counts from the turn's own first row instead of from the
+    // row the budget stopped at: the label is for a turn nothing can place, not
+    // for rows that have not been read back yet.
+    workbench.update(cx, |workbench, _| {
+        workbench.timeline_starts_mid_turn = true;
+        workbench.timeline.leading_turn_start = Some(TimelineTurnStart {
+            sequence: 1,
+            timestamp_ms: 1,
+        });
+        workbench.conversation_turns_cache_key = None;
+    });
+    let _ = draw_live_timeline_frames(&workbench, cx, 2);
+    let placed = workbench.read_with(cx, |workbench, _| {
+        let leading = workbench
+            .conversation_turns_cache
+            .first()
+            .expect("the arriving turn is the cached leading turn");
+        (leading.user_row.is_none(), leading.started_at_ms)
+    });
+    assert_eq!(
+        placed,
+        (true, 1),
+        "the leading turn is dated from the read that cut the window"
+    );
 }
 
 /// The boundary comes from the read that produced the page, not from what the
@@ -1885,29 +1913,54 @@ fn an_older_page_moves_the_views_leading_end(cx: &mut TestAppContext) {
     let (workbench, cx) = live_tool_timeline(cx, true);
     let generation = workbench.update(cx, |workbench, _| workbench.session_generation);
     let items = workbench.read_with(cx, |workbench, _| workbench.timeline.items.clone());
-    let page = |starts_at_turn_start: bool| TimelinePage {
-        session_id: session_a.clone(),
-        items: items.clone(),
-        start_sequence: items.first().map(|item| item.sequence),
-        end_sequence: items.last().map(|item| item.sequence),
-        has_older: true,
-        has_newer: false,
-        starts_at_turn_start,
-    };
+    let page =
+        |starts_at_turn_start: bool, leading_turn_start: Option<TimelineTurnStart>| TimelinePage {
+            session_id: session_a.clone(),
+            items: items.clone(),
+            start_sequence: items.first().map(|item| item.sequence),
+            end_sequence: items.last().map(|item| item.sequence),
+            has_older: true,
+            has_newer: false,
+            starts_at_turn_start,
+            leading_turn_start,
+        };
     // The page's items all sit below the cursor it was read for.
     let cursor = items.last().map(|item| item.sequence).unwrap_or(0) + 1;
+    let head = TimelineTurnStart {
+        sequence: 1,
+        timestamp_ms: 1,
+    };
     workbench.update(cx, |workbench, _| {
-        workbench.finish_older_timeline_load(&session_a, cursor, generation, Ok(page(false)));
+        workbench.finish_older_timeline_load(
+            &session_a,
+            cursor,
+            generation,
+            Ok(page(false, Some(head))),
+        );
     });
-    assert!(
-        workbench.read_with(cx, |workbench, _| workbench.timeline_starts_mid_turn),
-        "a page that opens inside a turn leaves the leading turn unfinished"
+    let leading = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_starts_mid_turn,
+            workbench.timeline.leading_turn_start,
+        )
+    });
+    assert_eq!(
+        leading,
+        (true, Some(head)),
+        "a page that opens inside a turn carries where that turn begins"
     );
     workbench.update(cx, |workbench, _| {
-        workbench.finish_older_timeline_load(&session_a, cursor, generation, Ok(page(true)));
+        workbench.finish_older_timeline_load(&session_a, cursor, generation, Ok(page(true, None)));
     });
-    assert!(
-        !workbench.read_with(cx, |workbench, _| workbench.timeline_starts_mid_turn),
+    let landed = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_starts_mid_turn,
+            workbench.timeline.leading_turn_start,
+        )
+    });
+    assert_eq!(
+        landed,
+        (false, None),
         "a page that opens on a boundary finishes the turn above it"
     );
 }

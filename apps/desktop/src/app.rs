@@ -135,10 +135,10 @@ use vibex_core::{
     SessionTreeNode, SetDesiredAgentSessionRuntimeRequest, SteerAgentMessageRequest,
     SteerMessageOutcome, TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus,
     TerminalSwitchShellRequest, TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage,
-    TimelinePayload, TimelineRedactionState, TimelineSource, UserMessageDelivery,
-    UserMessagePayload, VIBEX_USE_MAX_MENTIONS, VibexSessionId, VibexUseMention,
-    VibexUsePresentationCapability, VibexUseUnavailableReason, WorkspaceMode, WorkspaceRecord,
-    agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
+    TimelinePayload, TimelineRedactionState, TimelineSource, TimelineTurnStart,
+    UserMessageDelivery, UserMessagePayload, VIBEX_USE_MAX_MENTIONS, VibexSessionId,
+    VibexUseMention, VibexUsePresentationCapability, VibexUseUnavailableReason, WorkspaceMode,
+    WorkspaceRecord, agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
     managed_worktree_name_slug, normalize_agent_session_title, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
@@ -171,8 +171,8 @@ use vibex_desktop_model::{
     sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
     sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
     sidebar_root_items, split_share, timeline_agent_message_count_after_sequence,
-    timeline_conversation_turns, timeline_conversation_turns_with_reasoning_mode,
-    timeline_row_delegation,
+    timeline_conversation_turns, timeline_conversation_turns_with_leading_turn_start,
+    timeline_conversation_turns_with_reasoning_mode, timeline_row_delegation,
 };
 use vibex_desktop_runtime::DriverState;
 use vibex_desktop_runtime::{
@@ -5382,6 +5382,9 @@ struct ConversationTurnsCacheKey {
     pending_edit: Option<(VibexSessionId, i64, i64)>,
     optimistic_message: Option<(VibexSessionId, String, i64)>,
     reasoning_display_mode: ReasoningDisplayMode,
+    /// Where the window's leading turn begins, when a read placed it. A read
+    /// that lands one changes the projection without moving a single item.
+    leading_turn_start: Option<TimelineTurnStart>,
 }
 
 fn conversation_turn_start_index(
@@ -5427,6 +5430,10 @@ fn refresh_conversation_turns_cache_incrementally(
         || next_key.optimistic_message.is_some()
         || previous_key.item_count > next_key.item_count
         || next_key.item_count != timeline.items.len()
+        // A prefix kept from the cache still carries the projection it was
+        // built with, so a read that moved the leading turn's anchor has to
+        // rebuild rather than splice.
+        || previous_key.leading_turn_start != next_key.leading_turn_start
     {
         return false;
     }
@@ -5453,11 +5460,18 @@ fn refresh_conversation_turns_cache_incrementally(
     else {
         return false;
     };
-    let suffix = timeline_conversation_turns_with_reasoning_mode(
+    let suffix = timeline_conversation_turns_with_leading_turn_start(
         &timeline.items[start_index..],
         next_key.session_state,
         next_key.agent_turn_pending,
         next_key.reasoning_display_mode,
+        // Only a suffix that begins at the window's own leading turn has a
+        // missing opening row to place; a later turn starts inside the suffix.
+        if turn_index == 0 {
+            next_key.leading_turn_start
+        } else {
+            None
+        },
     );
     let Some(first_suffix) = suffix.first() else {
         return false;
@@ -9266,6 +9280,7 @@ impl VibexWorkbench {
             return;
         }
         let added_history = !page.items.is_empty();
+        let leading_turn_start = page.leading_turn_start;
         self.capture_timeline_scroll_anchor();
         let mut merged = page
             .items
@@ -9274,8 +9289,11 @@ impl VibexWorkbench {
             .collect::<Vec<_>>();
         merged.sort_by_key(|item| item.sequence);
         merged.dedup_by_key(|item| item.sequence);
-        self.timeline
-            .replace_authoritative(session_id.clone(), merged);
+        self.timeline.replace_authoritative_with_leading_turn_start(
+            session_id.clone(),
+            merged,
+            leading_turn_start,
+        );
         self.timeline_has_older = page.has_older && added_history;
         self.timeline_starts_mid_turn = !page.starts_at_turn_start;
         self.timeline_item_index.get_mut().invalidate();
@@ -21920,11 +21938,12 @@ impl VibexWorkbench {
             .as_ref()
             .and_then(|edit| edit.projected_items(&self.timeline))
         {
-            return timeline_conversation_turns_with_reasoning_mode(
+            return timeline_conversation_turns_with_leading_turn_start(
                 &items,
                 Some(AgentSessionState::Running),
                 true,
                 self.ui_state.session.reasoning_display_mode,
+                self.timeline.leading_turn_start,
             );
         }
         if let Some(items) = optimistic_user_message_for_view(
@@ -21934,11 +21953,12 @@ impl VibexWorkbench {
         )
         .and_then(|message| message.projected_items(&self.timeline))
         {
-            return timeline_conversation_turns_with_reasoning_mode(
+            return timeline_conversation_turns_with_leading_turn_start(
                 &items,
                 self.live_agent_session_state(),
                 self.live_turn_pending(),
                 self.ui_state.session.reasoning_display_mode,
+                self.timeline.leading_turn_start,
             );
         }
         self.timeline.conversation_turns_with_reasoning_mode(
@@ -21967,6 +21987,7 @@ impl VibexWorkbench {
             )
             .map(OptimisticUserMessage::cache_key),
             reasoning_display_mode: self.ui_state.session.reasoning_display_mode,
+            leading_turn_start: self.timeline.leading_turn_start,
         }
     }
 
@@ -22316,45 +22337,61 @@ impl VibexWorkbench {
         // end — and whether that end sits inside a turn — is whatever the view
         // had. Only the window a read fetches can move it.
         let resumed_starts_mid_turn = self.timeline_starts_mid_turn;
+        let resumed_leading_turn_start = self.timeline.leading_turn_start;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let (items, timeline_has_older, timeline_starts_mid_turn) = match resume {
-                Some(resume) => {
-                    match fetch_timeline_tail_via_backend(
-                        backend.clone(),
-                        request_session_id.clone(),
-                        resume.after_sequence,
-                    )
-                    .await?
-                    {
-                        Some(tail) => (
-                            resume.prefix.into_iter().chain(tail).collect(),
-                            resume.timeline_has_older,
-                            resumed_starts_mid_turn,
-                        ),
-                        None => {
-                            let page = fetch_timeline_window_via_backend(
-                                backend,
-                                request_session_id.clone(),
-                            )
-                            .await?;
-                            let starts_mid_turn = !page.starts_at_turn_start;
-                            (page.items, page.has_older, starts_mid_turn)
+            let (items, timeline_has_older, timeline_starts_mid_turn, leading_turn_start) =
+                match resume {
+                    Some(resume) => {
+                        match fetch_timeline_tail_via_backend(
+                            backend.clone(),
+                            request_session_id.clone(),
+                            resume.after_sequence,
+                        )
+                        .await?
+                        {
+                            Some(tail) => (
+                                resume.prefix.into_iter().chain(tail).collect(),
+                                resume.timeline_has_older,
+                                resumed_starts_mid_turn,
+                                resumed_leading_turn_start,
+                            ),
+                            None => {
+                                let page = fetch_timeline_window_via_backend(
+                                    backend,
+                                    request_session_id.clone(),
+                                )
+                                .await?;
+                                let starts_mid_turn = !page.starts_at_turn_start;
+                                let leading_turn_start = page.leading_turn_start;
+                                (
+                                    page.items,
+                                    page.has_older,
+                                    starts_mid_turn,
+                                    leading_turn_start,
+                                )
+                            }
                         }
                     }
-                }
-                None => {
-                    let page =
-                        fetch_timeline_window_via_backend(backend, request_session_id.clone())
-                            .await?;
-                    let starts_mid_turn = !page.starts_at_turn_start;
-                    (page.items, page.has_older, starts_mid_turn)
-                }
-            };
+                    None => {
+                        let page =
+                            fetch_timeline_window_via_backend(backend, request_session_id.clone())
+                                .await?;
+                        let starts_mid_turn = !page.starts_at_turn_start;
+                        let leading_turn_start = page.leading_turn_start;
+                        (
+                            page.items,
+                            page.has_older,
+                            starts_mid_turn,
+                            leading_turn_start,
+                        )
+                    }
+                };
             PreparedTimeline::prepare_with_older(
                 request_session_id,
                 items,
                 timeline_has_older,
                 timeline_starts_mid_turn,
+                leading_turn_start,
                 state,
                 pending,
                 reasoning,
@@ -22445,43 +22482,61 @@ impl VibexWorkbench {
         // end — and whether that end sits inside a turn — is whatever the view
         // had. Only the window a read fetches can move it.
         let resumed_starts_mid_turn = self.timeline_starts_mid_turn;
+        let resumed_leading_turn_start = self.timeline.leading_turn_start;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let (items, timeline_has_older, timeline_starts_mid_turn) = match resume {
-                Some(resume) => {
-                    match fetch_timeline_tail(
-                        runtime.clone(),
-                        request_session_id.clone(),
-                        resume.after_sequence,
-                    )
-                    .await?
-                    {
-                        Some(tail) => (
-                            resume.prefix.into_iter().chain(tail).collect(),
-                            resume.timeline_has_older,
-                            resumed_starts_mid_turn,
-                        ),
-                        // Nothing above the prefix is worth patching, so open
-                        // the session again rather than replay the history
-                        // between where the view stopped and where it is.
-                        None => {
-                            let page =
-                                fetch_timeline_window(runtime, request_session_id.clone()).await?;
-                            let starts_mid_turn = !page.starts_at_turn_start;
-                            (page.items, page.has_older, starts_mid_turn)
+            let (items, timeline_has_older, timeline_starts_mid_turn, leading_turn_start) =
+                match resume {
+                    Some(resume) => {
+                        match fetch_timeline_tail(
+                            runtime.clone(),
+                            request_session_id.clone(),
+                            resume.after_sequence,
+                        )
+                        .await?
+                        {
+                            Some(tail) => (
+                                resume.prefix.into_iter().chain(tail).collect(),
+                                resume.timeline_has_older,
+                                resumed_starts_mid_turn,
+                                resumed_leading_turn_start,
+                            ),
+                            // Nothing above the prefix is worth patching, so open
+                            // the session again rather than replay the history
+                            // between where the view stopped and where it is.
+                            None => {
+                                let page =
+                                    fetch_timeline_window(runtime, request_session_id.clone())
+                                        .await?;
+                                let starts_mid_turn = !page.starts_at_turn_start;
+                                let leading_turn_start = page.leading_turn_start;
+                                (
+                                    page.items,
+                                    page.has_older,
+                                    starts_mid_turn,
+                                    leading_turn_start,
+                                )
+                            }
                         }
                     }
-                }
-                None => {
-                    let page = fetch_timeline_window(runtime, request_session_id.clone()).await?;
-                    let starts_mid_turn = !page.starts_at_turn_start;
-                    (page.items, page.has_older, starts_mid_turn)
-                }
-            };
+                    None => {
+                        let page =
+                            fetch_timeline_window(runtime, request_session_id.clone()).await?;
+                        let starts_mid_turn = !page.starts_at_turn_start;
+                        let leading_turn_start = page.leading_turn_start;
+                        (
+                            page.items,
+                            page.has_older,
+                            starts_mid_turn,
+                            leading_turn_start,
+                        )
+                    }
+                };
             PreparedTimeline::prepare_with_older(
                 request_session_id,
                 items,
                 timeline_has_older,
                 timeline_starts_mid_turn,
+                leading_turn_start,
                 state,
                 pending,
                 reasoning,
@@ -54096,9 +54151,11 @@ impl VibexWorkbench {
         // A turn whose first row is not loaded yet is still arriving: the rows
         // the next read adds are older than the ones on screen, so its start
         // time — and the duration built from it — would move under the reader.
-        // It reads as loading until the turn's own first row is here, which is
-        // when the duration means something.
-        let leading_turn_incomplete = is_first && self.timeline_starts_mid_turn;
+        // It reads as loading until the turn's own first row is here. A window
+        // that was cut inside a turn carries where that row is, so it keeps the
+        // header still without pulling the turn's tail in first.
+        let leading_turn_incomplete =
+            is_first && self.timeline_starts_mid_turn && self.timeline.leading_turn_start.is_none();
         let duration = format_compact_duration(
             turn.started_at_ms,
             timeline_turn_duration_end(timeline_turn_finished(turn), turn.ended_at_ms),
@@ -82970,6 +83027,7 @@ mod tests {
             pending_edit: None,
             optimistic_message: None,
             reasoning_display_mode: ReasoningDisplayMode::LatestAtBottom,
+            leading_turn_start: None,
         };
         let session_id = timeline.session_id.clone().unwrap();
         let item = timeline_item_with_payload(
@@ -82997,6 +83055,7 @@ mod tests {
             pending_edit: None,
             optimistic_message: None,
             reasoning_display_mode: ReasoningDisplayMode::LatestAtBottom,
+            leading_turn_start: None,
         };
 
         assert!(refresh_conversation_turns_cache_incrementally(
@@ -102452,7 +102511,9 @@ mod tests {
     ///
     /// The rows a later read adds to it are older than the ones on screen, so
     /// the number would move under the reader every time a page landed — the
-    /// loading label holds the header still until the turn's start is here.
+    /// loading label holds the header still until the turn's start is here,
+    /// which is a window cut on a turn boundary, or a window whose read reported
+    /// the start it was cut above.
     #[test]
     fn a_turn_that_is_still_arriving_shows_its_loading_label() {
         let source = include_str!("app.rs");
@@ -102462,11 +102523,9 @@ mod tests {
             .map(|(body, _)| body)
             .expect("timeline turn renderer should remain inspectable");
 
-        assert!(
-            renderer.contains(
-                "let leading_turn_incomplete = is_first && self.timeline_starts_mid_turn;"
-            )
-        );
+        assert!(renderer.contains("let leading_turn_incomplete ="));
+        assert!(renderer.contains("is_first && self.timeline_starts_mid_turn"));
+        assert!(renderer.contains("&& self.timeline.leading_turn_start.is_none();"));
         assert!(renderer.contains("strings.agent_turn_loading.to_string()"));
         // A turn whose start is loaded still reports what it worked for.
         assert!(renderer.contains("format!(\"{} {duration}\", strings.agent_worked_for)"));
@@ -103477,6 +103536,7 @@ mod tests {
             has_older: false,
             has_newer: true,
             starts_at_turn_start: true,
+            leading_turn_start: None,
         };
 
         assert_eq!(
