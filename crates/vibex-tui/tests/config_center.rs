@@ -2547,21 +2547,31 @@ fn an_agents_account_is_read_as_one_list() {
         app.management_data.agent_auth_catalog.as_ref(),
         app.strings,
     );
-    // Two methods, then the verbs a signed-in account with a logout offers:
-    // refresh, verify, refresh models and sign out.
-    assert_eq!(rows.len(), 6, "the panel lost a line: {rows:#?}");
-    assert!(rows[0].action.is_some(), "a usable method was not offered");
+    // A page for the credentials the method names, two methods, then the verbs
+    // a signed-in account with a logout offers: refresh, verify, refresh models
+    // and sign out.
+    assert_eq!(rows.len(), 7, "the panel lost a line: {rows:#?}");
+    assert_eq!(rows[0].label, "Get credentials", "the method names a page");
+    let sign_in = rows
+        .iter()
+        .find(|row| row.label == "Sign in with ChatGPT")
+        .expect("the usable method");
+    assert!(sign_in.action.is_some(), "a usable method was not offered");
     assert!(
-        rows[1].action.is_none(),
-        "a method needing a provider profile was offered as usable"
-    );
-    assert!(
-        rows[0]
+        sign_in
             .detail
             .iter()
             .any(|(label, state)| label == "API key" && state == "set"),
         "the method's variables were not listed with what is already set: {:#?}",
-        rows[0].detail
+        sign_in.detail
+    );
+    let shared = rows
+        .iter()
+        .find(|row| row.label == "Use the model provider configuration")
+        .expect("the method that needs a profile");
+    assert!(
+        shared.action.is_none(),
+        "a method needing a provider profile was offered as usable"
     );
 
     // `Enter` on the verify line asks the Agent's own runtime.
@@ -2569,7 +2579,7 @@ fn an_agents_account_is_read_as_one_list() {
         view: vibex_tui::config_center::AgentAuthView {
             agent_id: "codex".to_string(),
             title: "Codex".to_string(),
-            selected: 3,
+            selected: 4,
             loading: false,
             notice: None,
         },
@@ -2580,5 +2590,130 @@ fn an_agents_account_is_read_as_one_list() {
             assert_eq!(agent_id.as_str(), "codex");
         }
         other => panic!("the verify line produced {other:?}"),
+    }
+}
+
+/// A method's variables are collected before the sign-in is asked for.
+///
+/// The runtime never hands a stored value back, so the fields open empty and say
+/// what is already set instead: a blank field keeps what is there, which is why
+/// taking one away is a switch of its own rather than an empty answer. The two
+/// calls travel as one press because the sign-in reads the environment the
+/// values are stored in.
+#[test]
+fn signing_in_collects_what_the_method_needs() {
+    let mut app = loaded(140, 40);
+    app.capabilities.agent = vibex_backend::DomainCapabilities::available([
+        vibex_backend::BackendOperation::AgentAuthRead,
+    ]);
+    app.management_data.agent_auth_catalog = Some(agent_auth_catalog());
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+    app.overlay = Some(Overlay::AgentAuth {
+        view: vibex_tui::config_center::AgentAuthView {
+            agent_id: "codex".to_string(),
+            title: "Codex".to_string(),
+            selected: 1,
+            loading: false,
+            notice: None,
+        },
+    });
+
+    // `Enter` on the method opens the form its variables describe.
+    let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    assert!(outcome.effects.is_empty(), "the form ran something");
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the method opened no form");
+    };
+    let field = form.field("value:OPENAI_API_KEY").expect("the key field");
+    assert!(field.secret, "a secret variable was offered in the clear");
+    assert_eq!(field.value, "", "a stored value was echoed into the form");
+    assert_eq!(field.hint.as_deref(), Some("set"));
+    // The variable is already stored, so taking it away is offered too.
+    assert!(
+        form.field("clear:OPENAI_API_KEY").is_some(),
+        "clearing a stored value was not offered"
+    );
+
+    // Typing a key and signing in writes both calls as one press.
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        form.field_mut("value:OPENAI_API_KEY").unwrap().value = "sk-new".to_string();
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::AuthenticateAgentMethod {
+                method_id, values, ..
+            } = mutation
+            else {
+                panic!("the sign-in was not a sign-in: {mutation:?}");
+            };
+            assert_eq!(method_id, "chatgpt");
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].name, "OPENAI_API_KEY");
+            assert_eq!(values[0].value.as_deref(), Some("sk-new"));
+            assert!(values[0].secret);
+            assert!(!values[0].clear);
+        }
+        other => panic!("the sign-in produced {other:?}"),
+    }
+
+    // The clear switch is what takes a stored value away, and it sends no value
+    // with it.
+    app.config_center.pending.clear();
+    app.overlay = Some(Overlay::Form {
+        form: vibex_tui::config_center::agent_auth_method_form(
+            "codex",
+            "chatgpt",
+            "Sign in with ChatGPT",
+            &app.management_data
+                .agent_auth_catalog
+                .as_ref()
+                .unwrap()
+                .methods[0]
+                .environment,
+            app.strings,
+        ),
+    });
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        form.field_mut("clear:OPENAI_API_KEY").unwrap().value = "on".to_string();
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::AuthenticateAgentMethod { values, .. } = mutation
+            else {
+                panic!("the clear was not a sign-in: {mutation:?}");
+            };
+            assert!(values[0].clear, "the stored value was not cleared");
+            assert!(values[0].value.is_none(), "a cleared value carried one");
+        }
+        other => panic!("the clear produced {other:?}"),
+    }
+}
+
+/// The credential page a method names is one press from the panel.
+#[test]
+fn a_methods_credential_page_is_opened_by_its_own_line() {
+    let mut app = loaded(140, 40);
+    app.capabilities.agent = vibex_backend::DomainCapabilities::available([
+        vibex_backend::BackendOperation::AgentAuthRead,
+    ]);
+    app.management_data.agent_auth_catalog = Some(agent_auth_catalog());
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+    app.overlay = Some(Overlay::AgentAuth {
+        view: vibex_tui::config_center::AgentAuthView {
+            agent_id: "codex".to_string(),
+            title: "Codex".to_string(),
+            selected: 0,
+            loading: false,
+            notice: None,
+        },
+    });
+    let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::OpenUrl { url }] => {
+            assert_eq!(url, "https://example.test/keys");
+        }
+        other => panic!("the credential line produced {other:?}"),
     }
 }

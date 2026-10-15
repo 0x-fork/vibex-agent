@@ -2204,6 +2204,11 @@ pub enum FormPurpose {
     NewProviderProfile {
         source: Option<Box<vibex_core::ProviderProfile>>,
     },
+    /// One Agent's sign-in method, and the variables it collects.
+    AgentAuthMethod {
+        agent_id: String,
+        method_id: String,
+    },
     /// The settings of one Model inside a profile.
     ProviderModel {
         agent_id: String,
@@ -3490,6 +3495,109 @@ pub enum AgentAuthAction {
     Verify,
     RefreshModels,
     SignOut,
+    /// Open the page the method named for getting credentials.
+    Credentials {
+        url: String,
+    },
+}
+
+/// The form one sign-in method asks for.
+///
+/// The runtime never hands a stored value back, so the fields open empty and
+/// say what is already set instead: a blank field preserves what is there,
+/// which is why taking one away is a switch of its own rather than an empty
+/// answer.
+pub fn agent_auth_method_form(
+    agent_id: &str,
+    method_id: &str,
+    method_name: &str,
+    environment: &[vibex_core::AgentAuthEnvironmentVariable],
+    strings: Strings,
+) -> ConfigForm {
+    let mut fields = Vec::new();
+    for variable in environment {
+        let label = variable
+            .label
+            .clone()
+            .unwrap_or_else(|| variable.name.clone());
+        let state = if variable.configured {
+            strings.config_auth_configured()
+        } else if variable.optional {
+            strings.config_auth_optional()
+        } else {
+            strings.config_form_required()
+        };
+        let mut field = FormField::text(format!("value:{}", variable.name), label, String::new())
+            .hint(state.to_string());
+        if variable.secret {
+            field = field.secret();
+        }
+        fields.push(field);
+        // Only a variable the profile already owns can be taken away; a switch
+        // on one that holds nothing would be a switch that does nothing.
+        if variable.configured {
+            fields.push(FormField::toggle(
+                format!("clear:{}", variable.name),
+                format!(
+                    "{} · {}",
+                    strings.config_action_clear_secret(),
+                    variable.name
+                ),
+                false,
+            ));
+        }
+    }
+    ConfigForm::new(
+        FormPurpose::AgentAuthMethod {
+            agent_id: agent_id.to_string(),
+            method_id: method_id.to_string(),
+        },
+        format!("{} · {}", strings.config_action_sign_in(), method_name),
+        fields,
+    )
+}
+
+/// The values one sign-in form collected.
+///
+/// A field left blank is `None` rather than an empty string: the runtime reads
+/// that as "keep what is stored", and an empty string as a value the reader
+/// meant to be empty.
+pub fn agent_auth_method_values(
+    form: &ConfigForm,
+    environment: &[vibex_core::AgentAuthEnvironmentVariable],
+    strings: Strings,
+) -> Result<Vec<vibex_core::AgentAuthEnvironmentValue>, &'static str> {
+    let mut values = Vec::new();
+    for variable in environment {
+        let typed = form.optional(&format!("value:{}", variable.name));
+        let clear = form
+            .value(&format!("clear:{}", variable.name))
+            .is_some_and(|value| value == "on");
+        if clear {
+            values.push(vibex_core::AgentAuthEnvironmentValue {
+                name: variable.name.clone(),
+                value: None,
+                secret: variable.secret,
+                optional: variable.optional,
+                clear: true,
+            });
+            continue;
+        }
+        if typed.is_none() && !variable.optional && !variable.configured {
+            // A required variable with nothing stored and nothing typed is the
+            // one thing the authority would refuse, so it is refused here with
+            // the field named rather than after a round trip.
+            return Err(strings.config_auth_missing_value());
+        }
+        values.push(vibex_core::AgentAuthEnvironmentValue {
+            name: variable.name.clone(),
+            value: typed,
+            secret: variable.secret,
+            optional: variable.optional,
+            clear: false,
+        });
+    }
+    Ok(values)
 }
 
 /// The account panel's lines.
@@ -3539,6 +3647,19 @@ pub fn agent_auth_rows(
                 strings.config_form_required()
             };
             detail.push((label, state.to_string()));
+        }
+        // A method that names where its credentials come from gets a line for
+        // that page: a reader who does not have a key yet is one press from the
+        // place that issues one.
+        if let Some(url) = method.credential_link.clone() {
+            rows.push(AgentAuthRow {
+                action: Some(AgentAuthAction::Credentials { url }),
+                label: strings.config_auth_action_credentials().to_string(),
+                chip: String::new(),
+                tone: ConfigTone::Muted,
+                detail: vec![(String::new(), method.name.clone())],
+                hint: None,
+            });
         }
         rows.push(AgentAuthRow {
             action: (!needs_profile).then(|| AgentAuthAction::Method {

@@ -2059,6 +2059,7 @@ impl App {
                     }
                     return Outcome::quiet();
                 };
+                let agent_id_str = view.agent_id.clone();
                 self.overlay = Some(Overlay::AgentAuth { view });
                 match action {
                     AgentAuthAction::RefreshMethods => {
@@ -2070,10 +2071,29 @@ impl App {
                     AgentAuthAction::RefreshModels => {
                         Outcome::effects(vec![Effect::RefreshAgentAuthModels { agent_id }])
                     }
-                    // Signing in and signing out are the next two steps: one
-                    // collects what the method needs, the other shows what the
-                    // sign-out would end before it does it.
-                    AgentAuthAction::Method { .. } | AgentAuthAction::SignOut => Outcome::quiet(),
+                    // A method opens the form that collects what it needs; the
+                    // environment variables are the only thing between the
+                    // reader and the Agent's own runtime.
+                    AgentAuthAction::Method {
+                        method_id,
+                        environment,
+                        ..
+                    } => {
+                        let form = crate::config_center::agent_auth_method_form(
+                            &agent_id_str,
+                            &method_id,
+                            &row.label,
+                            &environment,
+                            self.strings,
+                        );
+                        self.overlay = Some(Overlay::Form { form });
+                        Outcome::effects(vec![])
+                    }
+                    AgentAuthAction::Credentials { url } => {
+                        Outcome::effects(vec![Effect::OpenUrl { url }])
+                    }
+                    // Signing out shows what it would end before it does it.
+                    AgentAuthAction::SignOut => Outcome::quiet(),
                 }
             }
             Intent::CloseOverlay | Intent::Back => {
@@ -3228,6 +3248,11 @@ impl App {
         use crate::app::ConfigMutation;
         use crate::config_center::FormPurpose;
         let strings = self.strings;
+        // A sign-in form has no record to name and no name field; it is the
+        // method's own variables and nothing else.
+        if let FormPurpose::AgentAuthMethod { .. } = &form.purpose {
+            return self.agent_auth_method_mutation(form);
+        }
         let name = form.value("name").unwrap_or_default();
         match &form.purpose {
             FormPurpose::McpServer { server_id } => {
@@ -3478,6 +3503,9 @@ impl App {
                     provider_options: None,
                 })
             }
+            // Reached only through the sign-in hook above, which handles this
+            // purpose before the record match.
+            FormPurpose::AgentAuthMethod { .. } => Err("unknown record"),
             FormPurpose::NewProviderProfile { source } => {
                 let Some(agent_id) = form
                     .value("agent")
@@ -3727,6 +3755,38 @@ impl App {
                 })
             }
         }
+    }
+
+    /// The write a sign-in form describes.
+    fn agent_auth_method_mutation(
+        &mut self,
+        form: &crate::config_center::ConfigForm,
+    ) -> Result<crate::app::ConfigMutation, &'static str> {
+        let crate::config_center::FormPurpose::AgentAuthMethod {
+            agent_id,
+            method_id,
+        } = &form.purpose
+        else {
+            return Err("unknown record");
+        };
+        let strings = self.strings;
+        let Some(catalog) = self.management_data.agent_auth_catalog.as_ref() else {
+            return Err("unknown record");
+        };
+        let Some(method) = catalog
+            .methods
+            .iter()
+            .find(|method| method.id == *method_id)
+        else {
+            return Err("unknown record");
+        };
+        let values =
+            crate::config_center::agent_auth_method_values(form, &method.environment, strings)?;
+        Ok(crate::app::ConfigMutation::AuthenticateAgentMethod {
+            agent_id: parse_config_id(agent_id)?,
+            method_id: method_id.clone(),
+            values,
+        })
     }
 
     /// Mark a write in flight and ask the worker for it.

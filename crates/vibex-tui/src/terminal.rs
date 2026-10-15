@@ -265,6 +265,53 @@ pub fn run_child(program: &str, arguments: &[String]) -> BackendResult<i32> {
     Ok(status.code().unwrap_or(-1))
 }
 
+/// Hand a URL to whatever this desktop uses to open links.
+///
+/// The child is not waited on: a browser outlives the key press that asked for
+/// it, and a client that blocked on one would freeze until the reader closed a
+/// window it never opened.
+///
+/// Only `http` and `https` are handed over. Everything else — a `file:`, a
+/// `javascript:`, or something with no scheme at all — reaches the opener as a
+/// path or a flag, which is how a "link" becomes a way to run something.
+pub fn open_url(url: &str) -> BackendResult<()> {
+    let url = url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(BackendError::failed(
+            "tui_open_url_refused",
+            format!("{url} is not a link this client will open"),
+        ));
+    }
+    let (program, arguments): (&str, Vec<String>) = if cfg!(target_os = "macos") {
+        ("open", vec![url.to_string()])
+    } else if cfg!(target_os = "windows") {
+        (
+            "cmd",
+            vec![
+                "/C".to_string(),
+                "start".to_string(),
+                String::new(),
+                url.to_string(),
+            ],
+        )
+    } else {
+        ("xdg-open", vec![url.to_string()])
+    };
+    std::process::Command::new(program)
+        .args(&arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| {
+            BackendError::failed(
+                "tui_open_url_failed",
+                format!("could not open {url}: {error}"),
+            )
+        })
+}
+
 /// Open `$EDITOR` (or `$VISUAL`) on `body` and return the edited text.
 pub fn edit_in_editor(title: &str, body: &str) -> BackendResult<Option<String>> {
     let editor = std::env::var("VISUAL")

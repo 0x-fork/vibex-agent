@@ -669,6 +669,14 @@ impl Dispatch {
                         message: format!("{} {}", result.files.len(), "files"),
                     })
             }
+            M::AuthenticateAgentMethod {
+                agent_id,
+                method_id,
+                values,
+            } => {
+                self.authenticate_agent_method(agent_id, method_id, values)
+                    .await
+            }
             M::ImportNativeProfile { item_id, sources } => {
                 let Ok(import_item_id) = vibex_core::RequestId::parse(item_id) else {
                     return self.failure_for(
@@ -1638,6 +1646,10 @@ impl Dispatch {
                     .await;
                 self.send(AppMessage::ProviderProfile(result));
             }
+            Effect::OpenUrl { url } => match crate::terminal::open_url(&url) {
+                Ok(()) => {}
+                Err(error) => self.failure("open_url", error),
+            },
             Effect::LoadAgentAuthCatalog { agent_id } => {
                 // The context is seeded first: a runtime that has never been
                 // asked holds none, and the methods are advertised against one.
@@ -2431,6 +2443,86 @@ impl Dispatch {
 
     /// Build a profile update that only changes the display name, preserving
     /// the Agent binding the authority requires.
+    /// Sign in with one of an Agent's methods.
+    ///
+    /// What the method collects is stored first: the sign-in reads the
+    /// profile's own environment, so a key the reader just typed has to be in it
+    /// before the Agent's bridge is launched.
+    async fn authenticate_agent_method(
+        &self,
+        agent_id: vibex_core::AgentId,
+        method_id: String,
+        values: Vec<vibex_core::AgentAuthEnvironmentValue>,
+    ) -> BackendResult<crate::app::MutationOutcome> {
+        let Some((context_id, revision)) = self.default_auth_context(&agent_id).await else {
+            return Err(BackendError::failed(
+                "agent_auth_context_unknown",
+                "this Agent holds no account to sign in to",
+            ));
+        };
+        // What the method collects is stored first: the sign-in reads
+        // the profile's environment, and a key the reader just typed
+        // has to be in it before the bridge is launched.
+        if !values.is_empty() {
+            let profile_id = self.default_profile_for(&agent_id).await;
+            let Some(profile_id) = profile_id else {
+                return Err(BackendError::failed(
+                    "agent_auth_profile_unknown",
+                    "this Agent has no provider profile to store the values in",
+                ));
+            };
+            let request = vibex_backend::MutationRequest::new(
+                vibex_core::AgentAuthEnvironmentUpdateRequest {
+                    agent_id: agent_id.clone(),
+                    provider_profile_id: profile_id,
+                    method_id: method_id.clone(),
+                    values,
+                },
+            );
+            self.facade
+                .agent()
+                .update_agent_auth_environment(request)
+                .await?;
+        }
+        let request =
+            vibex_backend::MutationRequest::new(vibex_core::AgentAuthContextAuthenticateRequest {
+                operation_id: vibex_core::AgentAuthenticationOperationId::new(),
+                auth_context_id: context_id,
+                expected_context_revision: revision,
+                method_id,
+            });
+        match self
+            .facade
+            .agent()
+            .authenticate_agent_context(request)
+            .await
+        {
+            Ok(result) => Ok(crate::app::MutationOutcome::Auth {
+                methods: 0,
+                account: result.context.account_hint.clone(),
+                authenticated: result.context.status
+                    == vibex_core::AgentAuthContextStatus::Authenticated,
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The Agent's default provider profile, which is where a sign-in method's
+    /// collected values are stored.
+    async fn default_profile_for(
+        &self,
+        agent_id: &vibex_core::AgentId,
+    ) -> Option<vibex_core::ProviderProfileId> {
+        self.facade
+            .management()
+            .list_profiles()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|profile| profile.agent_id == *agent_id)
+            .map(|profile| profile.id)
+    }
+
     /// The Agent's default account context and its revision, when it holds one.
     async fn default_auth_context(
         &self,

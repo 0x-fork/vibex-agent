@@ -8539,6 +8539,12 @@ pub enum ConfigMutation {
     RollbackAgent {
         agent_id: vibex_core::AgentId,
     },
+    /// Sign in with one of an Agent's methods, storing what it collects first.
+    AuthenticateAgentMethod {
+        agent_id: vibex_core::AgentId,
+        method_id: String,
+        values: Vec<vibex_core::AgentAuthEnvironmentValue>,
+    },
     // ---- provider profiles ----------------------------------------------
     /// Make a profile that does not exist yet.
     CreateProviderProfile(Box<vibex_core::AgentModelProviderProfileCreateRequest>),
@@ -8663,6 +8669,7 @@ impl ConfigMutation {
             | Self::RollbackAgent { agent_id } => agent_id.as_str().to_string(),
             Self::UpdateProviderProfile { profile_id, .. }
             | Self::DeleteProviderProfile { profile_id, .. } => profile_id.as_str().to_string(),
+            Self::AuthenticateAgentMethod { agent_id, .. } => agent_id.as_str().to_string(),
             Self::CreateProviderProfile(_) => "provider:new".to_string(),
             Self::ApplyNativeExport { export_id } | Self::RollbackNativeExport { export_id } => {
                 export_id.clone()
@@ -8700,6 +8707,7 @@ impl ConfigMutation {
             Self::RefreshAgentSnapshot { .. } => "agent_probe",
             Self::CheckAgentUpdate { .. } => "agent_update_check",
             Self::RollbackAgent { .. } => "agent_rollback",
+            Self::AuthenticateAgentMethod { .. } => "agent_auth_sign_in",
             Self::CreateProviderProfile(_) => "provider_profile_create",
             Self::ApplyNativeExport { .. } => "provider_native_export_apply",
             Self::RollbackNativeExport { .. } => "provider_native_export_rollback",
@@ -8749,6 +8757,7 @@ impl ConfigMutation {
             Self::RefreshAgentSnapshot { .. } => Verb::RefreshSnapshot,
             Self::CheckAgentUpdate { .. } => Verb::CheckUpdate,
             Self::RollbackAgent { .. } => Verb::Rollback,
+            Self::AuthenticateAgentMethod { .. } => Verb::SignIn,
             Self::CreateProviderProfile(_) => Verb::Create,
             Self::ApplyNativeExport { .. } => Verb::Save,
             Self::RollbackNativeExport { .. } => Verb::Rollback,
@@ -9105,6 +9114,10 @@ pub enum Effect {
     DiscoverSources {
         module: crate::config_center::ConfigModule,
     },
+    /// Hand a URL to the desktop's own opener.
+    OpenUrl {
+        url: String,
+    },
     /// Read one Agent's account: the methods it advertises, and the context it
     /// holds.
     LoadAgentAuthCatalog {
@@ -9210,6 +9223,7 @@ impl Effect {
             Effect::PreviewNativeImport { .. } => "provider_native_import",
             Effect::PreviewNativeExport { .. } => "provider_native_export",
             Effect::LoadAgentAuthCatalog { .. } => "agent_auth_catalog",
+            Effect::OpenUrl { .. } => "open_url",
             Effect::VerifyAgentAuth { .. } => "agent_auth_verify",
             Effect::RefreshAgentAuthModels { .. } => "agent_auth_models",
             Effect::NativeExportHistory { .. } => "provider_native_export_history",
