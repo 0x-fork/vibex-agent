@@ -5025,6 +5025,19 @@ impl MobileApp {
         }
     }
 
+    /// The line a row owes the reader about the branch it is hiding.
+    ///
+    /// A branch reports while its rows are off screen, and stops the moment it
+    /// is unfolded: the counts describe the fold, not the session, so a row that
+    /// has shown its children has nothing left to say about them.
+    fn delegated_branch_summary(&self, session_id: &str) -> Option<MobileBranchSummary> {
+        if self.delegated_expanded.contains(session_id) {
+            return None;
+        }
+        let node = self.delegated_nodes.get(session_id)?;
+        mobile_hidden_branch_summary(node.active_descendants, node.blocked_descendants)
+    }
+
     /// Remembers the live snapshots a tree page carried for the sessions it
     /// named. The page is the only source for a child's own state: the root
     /// session list the phone syncs leaves owned children out.
@@ -21980,13 +21993,40 @@ impl MobileApp {
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| this.toggle_sidebar_group(toggle_id.clone(), cx)),
             )
-            .child(Self::sidebar_icon_slot(
-                svg()
-                    .path("icons/layers.svg")
-                    .size(px(theme::SIDEBAR_PROJECT_LOGO_SIZE))
-                    .text_color(theme::accent_purple())
-                    .into_any_element(),
-            ))
+            // The desktop leads a group with its disclosure and the marks of
+            // the Agents inside it, so the fold and the membership are what the
+            // row says first; the phone follows, and falls back to its own mark
+            // for a group whose members it cannot name.
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(
+                        svg()
+                            .path(if row.collapsed {
+                                "icons/chevron-right.svg"
+                            } else {
+                                "icons/chevron-down.svg"
+                            })
+                            .size(px(12.0))
+                            .flex_shrink_0()
+                            .text_color(theme::sidebar_foreground(0.78)),
+                    )
+                    .when_some(
+                        self.group_member_identities(&group_id),
+                        |lead, identities| lead.child(sidebar_group_avatars(&identities)),
+                    )
+                    .when(self.group_member_identities(&group_id).is_none(), |lead| {
+                        lead.child(
+                            svg()
+                                .path("icons/layers.svg")
+                                .size(px(theme::SIDEBAR_PROJECT_LOGO_SIZE))
+                                .text_color(theme::accent_purple()),
+                        )
+                    }),
+            )
             .child(
                 div()
                     .flex_1()
@@ -22044,21 +22084,30 @@ impl MobileApp {
                         .text_color(theme::accent_yellow()),
                 )
             })
-            // The expander is the row's last control, after the marks it stands
-            // beside: the whole row toggles the group, so the chevron reports the
-            // state rather than owning the tap.
-            .child(
-                svg()
-                    .path(if row.collapsed {
-                        "icons/chevron-right.svg"
-                    } else {
-                        "icons/chevron-down.svg"
-                    })
-                    .size(px(12.0))
-                    .flex_shrink_0()
-                    .text_color(theme::sidebar_foreground(0.78)),
-            )
             .into_any_element()
+    }
+
+    /// The Agents inside a group, in the order the group lists them.
+    ///
+    /// One mark per Agent rather than per member: a group of five sessions run
+    /// by two Agents is two marks, which is what the desktop's stack shows.
+    fn group_member_identities(&self, group_id: &str) -> Option<Vec<String>> {
+        let group = self.sidebar_view.organization.group(group_id)?;
+        let mut identities = Vec::new();
+        for member_id in &group.member_session_ids {
+            let Some(session) = sidebar_row_session(
+                self.sessions(),
+                &self.delegated_sessions,
+                member_id.as_str(),
+            ) else {
+                continue;
+            };
+            let identity = session.agent_id.as_str().to_string();
+            if !identities.contains(&identity) {
+                identities.push(identity);
+            }
+        }
+        (!identities.is_empty()).then_some(identities)
     }
 
     fn render_sidebar_project_row(
@@ -22418,14 +22467,33 @@ impl MobileApp {
     /// through, and the branch's last child stops its trunk at the elbow. The
     /// siblings come from the page the row was built from, and the node the page
     /// named is what says whose child it is.
-    fn delegated_branch_continues(&self, session_id: &str) -> Option<bool> {
-        let node = self.delegated_nodes.get(session_id)?;
-        let parent = node.parent_session_ref.as_ref()?;
-        let siblings = self.delegated_children.get(parent.id.as_str())?;
-        Some(branch_continues(
-            &node.session_ref,
-            siblings.last().map(|sibling| &sibling.session_ref),
-        ))
+    /// One guide column per ancestor level, outermost first.
+    ///
+    /// A delegated session can hang several levels down, and the desktop draws
+    /// the whole path: one column per ancestor, each reporting whether that
+    /// level's branch runs on past this row. The walk stops where the phone's
+    /// tree stops, and at the desktop's own ceiling.
+    fn delegated_guide_columns(&self, session_id: &str) -> Vec<bool> {
+        let mut columns = Vec::new();
+        let mut current = self.delegated_nodes.get(session_id);
+        for _ in 0..16 {
+            let Some(node) = current else {
+                break;
+            };
+            let Some(parent) = node.parent_session_ref.as_ref() else {
+                break;
+            };
+            columns.push(branch_continues(
+                &node.session_ref,
+                self.delegated_children
+                    .get(parent.id.as_str())
+                    .and_then(|siblings| siblings.last())
+                    .map(|sibling| &sibling.session_ref),
+            ));
+            current = self.delegated_nodes.get(parent.id.as_str());
+        }
+        columns.reverse();
+        columns
     }
 
     fn render_sidebar_session_row(
@@ -22464,6 +22532,10 @@ impl MobileApp {
             row.auto_continue_paused,
             scheduled_at_ms.is_some(),
         );
+        // A branch that is holding its rows back owes the reader a line about
+        // what it holds: the counts come from the ownership node, and they are
+        // the only sign that the fold is hiding someone who is waiting.
+        let branch_summary = self.delegated_branch_summary(session_id.as_str());
         // A session that exists only to wait for a queued send is named by that
         // send until it goes out, which is what keeps the manager's `<agent>
         // session` placeholder off the row while it waits.
@@ -22500,9 +22572,9 @@ impl MobileApp {
         // A delegated row hangs off the row above it on the desktop's guide:
         // the branch is drawn, not padded, so the parent's Agent logo reads as
         // the point the line leaves from.
-        let branch = delegated_child
-            .then(|| self.delegated_branch_continues(session_id.as_str()))
-            .flatten();
+        let branch_columns = delegated_child
+            .then(|| self.delegated_guide_columns(session_id.as_str()))
+            .unwrap_or_default();
         // A session that owns others offers them here rather than at its leading
         // edge: that edge belongs to the Agent logo, which is the column the
         // branch above hangs from. The desktop reveals the toggle on hover and
@@ -22571,8 +22643,20 @@ impl MobileApp {
                     }
                 }),
             )
-            .when_some(branch, |body, continues| {
-                body.child(sidebar_branch_guide(session_id.as_str(), continues))
+            .children({
+                let columns = branch_columns.len();
+                branch_columns
+                    .into_iter()
+                    .enumerate()
+                    .map(|(level, continues)| {
+                        sidebar_branch_guide(
+                            session_id.as_str(),
+                            level,
+                            continues,
+                            level + 1 == columns,
+                        )
+                    })
+                    .collect::<Vec<_>>()
             })
             .child(
                 div()
@@ -22630,21 +22714,49 @@ impl MobileApp {
                     .when(!self.sidebar_batch_mode, |title| {
                         title.child(sidebar_agent_logo(&agent_identity, is_selected))
                     })
+                    // The title column carries the branch's own line under the
+                    // name, the way the desktop's does: a folded branch reports
+                    // the sessions it is holding back without being unfolded.
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_size(theme::font_sidebar_row())
-                            .when(is_selected, |title| title.font_weight(FontWeight::SEMIBOLD))
-                            .text_color(if is_selected {
-                                theme::sidebar_foreground(1.0)
-                            } else {
-                                theme::sidebar_session_title()
-                            })
-                            .child(row_title),
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(theme::font_sidebar_row())
+                                    .when(is_selected, |title| {
+                                        title.font_weight(FontWeight::SEMIBOLD)
+                                    })
+                                    .text_color(if is_selected {
+                                        theme::sidebar_foreground(1.0)
+                                    } else {
+                                        theme::sidebar_session_title()
+                                    })
+                                    .child(row_title),
+                            )
+                            .when_some(branch_summary, |column, summary| {
+                                column.child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_size(theme::font_sidebar_meta())
+                                        .text_color(if summary.asks_for_user {
+                                            theme::accent_yellow()
+                                        } else {
+                                            theme::sidebar_session_meta()
+                                        })
+                                        .child(summary.line),
+                                )
+                            }),
                     ),
             )
             .when_some(disclosure, |row, disclosure| row.child(disclosure))
@@ -30391,6 +30503,138 @@ fn mobile_join_session_group_label(group_name: &str) -> String {
     }
 }
 
+/// The line a row paints under its name about the branch it is hiding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MobileBranchSummary {
+    line: String,
+    /// Whether one of the counts is a session parked on the reader.
+    asks_for_user: bool,
+}
+
+/// The line a folded branch owes the reader, in the desktop's own words.
+///
+/// The counts describe the session's subtree and not the row they hang under,
+/// so a bare "0 running · 1 waiting" beside an idle row would read as that row's
+/// own state: only the counts that carry information are painted, and the one
+/// that waits says who it waits on. The waiting count leads, because it is the
+/// one that asks the reader to act.
+fn mobile_hidden_branch_summary(
+    active_descendants: usize,
+    blocked_descendants: usize,
+) -> Option<MobileBranchSummary> {
+    let mut parts = Vec::new();
+    if blocked_descendants > 0 {
+        parts.push(format!(
+            "{blocked_descendants} {}",
+            locale::text("waiting for you", "等待用户", "等待使用者")
+        ));
+    }
+    if active_descendants > 0 {
+        parts.push(format!(
+            "{active_descendants} {}",
+            locale::text("running", "运行中", "執行中")
+        ));
+    }
+    let counts = parts.join(" · ");
+    (!counts.is_empty()).then(|| MobileBranchSummary {
+        line: match locale::current() {
+            // English has no room for a leading label and needs none: "waiting
+            // for you" already says whose branch is being counted.
+            Locale::En => counts,
+            Locale::ZhCn => format!("子会话：{counts}"),
+            Locale::ZhTw => format!("子會話：{counts}"),
+        },
+        asks_for_user: blocked_descendants > 0,
+    })
+}
+
+/// How many marks a group's stack shows before it counts the rest.
+const MOBILE_GROUP_AVATAR_LIMIT: usize = 5;
+
+/// The marks of the Agents inside a group, stacked the way the desktop stacks
+/// them: one overlapping chip per Agent, and a count of the ones that did not
+/// fit. A group whose members the phone cannot name draws no stack at all,
+/// which is why the caller falls back to its own mark.
+fn sidebar_group_avatars(identities: &[String]) -> gpui::AnyElement {
+    let shown = identities.len().min(MOBILE_GROUP_AVATAR_LIMIT);
+    let hidden = identities.len().saturating_sub(MOBILE_GROUP_AVATAR_LIMIT);
+    let mut stack = div().flex_shrink_0().flex().items_center();
+    for (index, identity) in identities.iter().take(shown).enumerate() {
+        stack = stack.child(
+            div()
+                .when(index > 0, |chip| chip.ml(px(-6.0)))
+                .size(px(16.0))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(theme::bg_card())
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(agent_brand_icon(
+                    identity,
+                    px(14.0),
+                    theme::sidebar_foreground(0.80),
+                )),
+        );
+    }
+    if hidden > 0 {
+        stack = stack.child(
+            div()
+                .ml(px(2.0))
+                .flex_shrink_0()
+                .text_size(theme::font_micro())
+                .text_color(theme::sidebar_text_muted())
+                .child(format!("+{hidden}")),
+        );
+    }
+    stack.into_any_element()
+}
+
+/// The line a row paints under its name about the branch it is hiding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MobileBranchSummary {
+    line: String,
+    /// Whether one of the counts is a session parked on the reader.
+    asks_for_user: bool,
+}
+
+/// The line a folded branch owes the reader, in the desktop's own words.
+///
+/// The counts describe the session's subtree and not the row they hang under,
+/// so a bare "0 running · 1 waiting" beside an idle row would read as that row's
+/// own state: only the counts that carry information are painted, and the one
+/// that waits says who it waits on. The waiting count leads, because it is the
+/// one that asks the reader to act.
+fn mobile_hidden_branch_summary(
+    active_descendants: usize,
+    blocked_descendants: usize,
+) -> Option<MobileBranchSummary> {
+    let mut parts = Vec::new();
+    if blocked_descendants > 0 {
+        parts.push(format!(
+            "{blocked_descendants} {}",
+            locale::text("waiting for you", "等待用户", "等待使用者")
+        ));
+    }
+    if active_descendants > 0 {
+        parts.push(format!(
+            "{active_descendants} {}",
+            locale::text("running", "运行中", "執行中")
+        ));
+    }
+    let counts = parts.join(" · ");
+    (!counts.is_empty()).then(|| MobileBranchSummary {
+        line: match locale::current() {
+            // English has no room for a leading label and needs none: "waiting
+            // for you" already says whose branch is being counted.
+            Locale::En => counts,
+            Locale::ZhCn => format!("子会话：{counts}"),
+            Locale::ZhTw => format!("子會話：{counts}"),
+        },
+        asks_for_user: blocked_descendants > 0,
+    })
+}
+
 /// The live session behind a row.
 ///
 /// The ordinary list answers for the sessions the phone syncs, and a tree page
@@ -30569,9 +30813,19 @@ fn branch_continues(
 /// The row names the line's two halves the way the desktop's guide does, so a
 /// test can ask the painted layout where the branch actually landed instead of
 /// re-deriving it from the constants.
-fn sidebar_branch_guide(session_id: &str, continues: bool) -> gpui::AnyElement {
+fn sidebar_branch_guide(
+    session_id: &str,
+    level: usize,
+    continues: bool,
+    elbow: bool,
+) -> gpui::AnyElement {
     let trunk = theme::sidebar_tree_guide();
     let row_height = f32::from(theme::sidebar_row_height());
+    // The trunk reaches one pixel past each edge of the row it is drawn in.
+    // Consecutive rows are adjacent, so a line that stopped on the boundary
+    // would leave a hairline break between two rows of the same branch; the
+    // elbow still turns at the row's own middle.
+    let reach = 1.0;
     div()
         .relative()
         .flex_shrink_0()
@@ -30580,33 +30834,35 @@ fn sidebar_branch_guide(session_id: &str, continues: bool) -> gpui::AnyElement {
         .child(
             div()
                 .debug_selector({
-                    let selector = format!("mobile-delegated-trunk-{session_id}");
+                    let selector = format!("mobile-delegated-trunk-{session_id}-{level}");
                     move || selector.clone()
                 })
                 .absolute()
                 .left(px(theme::SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET))
-                .top_0()
+                .top(px(-reach))
                 .w(px(1.0))
                 .h(px(if continues {
-                    row_height
+                    row_height + reach * 2.0
                 } else {
-                    row_height / 2.0
+                    row_height / 2.0 + reach
                 }))
                 .bg(trunk),
         )
-        .child(
-            div()
-                .debug_selector({
-                    let selector = format!("mobile-delegated-elbow-{session_id}");
-                    move || selector.clone()
-                })
-                .absolute()
-                .left(px(theme::SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET))
-                .top(px(row_height / 2.0))
-                .w(px(theme::SIDEBAR_DELEGATED_GUIDE_ELBOW_WIDTH))
-                .h(px(1.0))
-                .bg(trunk),
-        )
+        .when(elbow, |column| {
+            column.child(
+                div()
+                    .debug_selector({
+                        let selector = format!("mobile-delegated-elbow-{session_id}-{level}");
+                        move || selector.clone()
+                    })
+                    .absolute()
+                    .left(px(theme::SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET))
+                    .top(px(row_height / 2.0))
+                    .w(px(theme::SIDEBAR_DELEGATED_GUIDE_ELBOW_WIDTH))
+                    .h(px(1.0))
+                    .bg(trunk),
+            )
+        })
         .into_any_element()
 }
 
@@ -32402,8 +32658,11 @@ mod tests {
     fn a_delegated_session_hangs_off_a_drawn_branch() {
         let source = include_str!("app.rs");
         let row = renderer_source(source, "render_sidebar_session_row");
-        assert!(row.contains(".when_some(branch, |body, continues| {"));
-        assert!(row.contains("body.child(sidebar_branch_guide(session_id.as_str(), continues))"));
+        assert!(row.contains("self.delegated_guide_columns(session_id.as_str())"));
+        assert!(
+            row.contains("sidebar_branch_guide(") && row.contains("level + 1 == columns"),
+            "one column per ancestor level, with the elbow on the innermost"
+        );
         assert!(
             row.contains(".when_some(disclosure, |row, disclosure| row.child(disclosure))"),
             "the branch's disclosure belongs after the title, not before the mark"
@@ -32474,7 +32733,7 @@ mod tests {
                 .child(row("probe-parent-row", None))
                 .child(row(
                     "mobile-probe-child-row",
-                    Some(sidebar_branch_guide("probe", false)),
+                    Some(sidebar_branch_guide("probe", 0, false, true)),
                 ))
         }
     }
@@ -32500,10 +32759,10 @@ mod tests {
             .debug_bounds("mobile-probe-child-row")
             .expect("the child's row");
         let trunk = cx
-            .debug_bounds("mobile-delegated-trunk-probe")
+            .debug_bounds("mobile-delegated-trunk-probe-0")
             .expect("the trunk");
         let elbow = cx
-            .debug_bounds("mobile-delegated-elbow-probe")
+            .debug_bounds("mobile-delegated-elbow-probe-0")
             .expect("the elbow");
 
         // The trunk leaves the row above it at that row's Agent mark center, and
@@ -32524,8 +32783,9 @@ mod tests {
             row.origin.y + row.size.height / 2.0
         ));
         // The last child's trunk stops at its elbow instead of running on into
-        // whatever row the list draws next.
-        assert!(lands_on(trunk.origin.y, row.origin.y));
+        // whatever row the list draws next — and it reaches a pixel past the
+        // row's own top edge, so the row above it and this one are one line.
+        assert!(lands_on(trunk.origin.y, row.origin.y - px(1.0)));
         assert!(lands_on(trunk.origin.y + trunk.size.height, elbow.origin.y));
     }
 
@@ -37312,6 +37572,71 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             reschedule.contains("unix_timestamp_ms() + seconds * 1_000"),
             "and moving it counts from now, the way the desktop's countdown does"
+        );
+    }
+
+    /// A folded branch says what it is holding back, in the desktop's words.
+    #[test]
+    fn a_folded_branch_says_what_it_hides() {
+        let waiting =
+            mobile_hidden_branch_summary(2, 1).expect("a branch with a waiting session speaks");
+        assert!(waiting.asks_for_user);
+        // The Chinese line carries a leading label, so what the test can ask is
+        // the order the two counts come in, not where the line begins.
+        let waiting_at = waiting.line.find('1').expect("the waiting count is named");
+        let running_at = waiting.line.find('2').expect("and so is the running one");
+        assert!(
+            waiting_at < running_at,
+            "the count that asks the reader to act leads"
+        );
+
+        let busy =
+            mobile_hidden_branch_summary(3, 0).expect("a branch with running sessions speaks");
+        assert!(!busy.asks_for_user);
+        assert!(busy.line.contains('3'));
+
+        assert_eq!(
+            mobile_hidden_branch_summary(0, 0),
+            None,
+            "a branch with nothing to report says nothing"
+        );
+    }
+
+    /// A group row leads with its fold and the Agents inside it.
+    #[test]
+    fn a_group_row_leads_with_its_fold_and_its_members() {
+        let source = include_str!("app.rs");
+        let row = renderer_source(source, "render_sidebar_group_row");
+        assert!(
+            row.contains("sidebar_group_avatars(&identities)"),
+            "the members are stacked where the desktop stacks them"
+        );
+        assert!(
+            row.contains("\"icons/chevron-right.svg\""),
+            "the fold leads"
+        );
+        assert!(
+            row.contains("\"icons/layers.svg\""),
+            "and a group whose members cannot be named keeps its own mark"
+        );
+        assert!(
+            !row.contains("The expander is the row's last control"),
+            "the chevron is no longer the row's trailing element"
+        );
+
+        // A free function, so the source is taken from its own signature.
+        let stack = source
+            .split_once("fn sidebar_group_avatars(")
+            .map(|(_, tail)| {
+                tail.split_once("\n/// The live session behind a row.")
+                    .map_or(tail, |(body, _)| body)
+            })
+            .expect("the stack should stay inspectable");
+        assert!(stack.contains("MOBILE_GROUP_AVATAR_LIMIT"));
+        assert!(stack.contains("format!(\"+{hidden}\")"));
+        assert!(
+            stack.contains("chip.ml(px(-6.0))"),
+            "the marks overlap, the way a stack reads"
         );
     }
 
