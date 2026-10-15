@@ -172,6 +172,8 @@ pub enum AppMessage {
     ProviderProfile(BackendResult<vibex_core::ProviderProfile>),
     /// One Agent's profile order, as the authority holds it.
     ProviderOrder(BackendResult<Vec<vibex_core::AgentModelProviderDisplayOrderEntry>>),
+    /// What other CLI tools on this machine hold.
+    NativeImport(BackendResult<vibex_core::ProviderNativeImportPreview>),
     ProviderTest(BackendResult<vibex_core::AgentModelProviderProfileTestResult>),
     ProviderModels(BackendResult<Vec<vibex_core::ProviderConfiguredModel>>),
     Agents(BackendResult<Vec<vibex_core::AgentSnapshotEntry>>),
@@ -602,6 +604,29 @@ impl Dispatch {
                     .rollback_managed_agent(request)
                     .await
                     .map(|state| install_outcome(&state))
+            }
+            M::ImportNativeProfile { item_id, sources } => {
+                let Ok(import_item_id) = vibex_core::RequestId::parse(item_id) else {
+                    return self.failure_for(
+                        "provider_native_import_run",
+                        None,
+                        BackendError::failed(
+                            "provider_native_import_item_unknown",
+                            "the import candidate is no longer listed",
+                        ),
+                    );
+                };
+                let request = MutationRequest::new(vibex_core::ProviderNativeImportCreateRequest {
+                    preview_request: vibex_core::ProviderNativeImportPreviewRequest { sources },
+                    import_item_id,
+                });
+                self.facade
+                    .management()
+                    .create_profile_from_import(request)
+                    .await
+                    .map(|result| crate::app::MutationOutcome::Installed {
+                        version: Some(result.profile.display_name.clone()),
+                    })
             }
             M::SetProviderOrder { agent_id, profiles } => {
                 let request =
@@ -1548,6 +1573,15 @@ impl Dispatch {
                     .agent_model_provider_profile_detail(request)
                     .await;
                 self.send(AppMessage::ProviderProfile(result));
+            }
+            Effect::PreviewNativeImport { sources } => {
+                let request = vibex_core::ProviderNativeImportPreviewRequest { sources };
+                let result = self
+                    .facade
+                    .management()
+                    .preview_native_import(request)
+                    .await;
+                self.send(AppMessage::NativeImport(result));
             }
             Effect::LoadProviderOrder { agent_id } => {
                 let request = vibex_core::AgentModelProviderDisplayOrderListRequest { agent_id };

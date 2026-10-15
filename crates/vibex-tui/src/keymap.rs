@@ -1327,6 +1327,20 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     ),
     // `m` opens the Models of the highlighted profile. It is the one thing in
     // the centre that is a list inside a record rather than a record of its own.
+    // `i` reads what other CLI tools already hold. The Providers area is where
+    // a profile comes from, so the verb lives on the same surface.
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char('i')),
+        Intent::ConfigImport,
+        |strings| Intent::ConfigImport.label(strings),
+    ),
+    binding(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('r')),
+        Intent::ConfigImportRefresh,
+        |strings| Intent::ConfigImportRefresh.label(strings),
+    ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('m')),

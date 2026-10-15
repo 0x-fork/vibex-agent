@@ -8291,6 +8291,101 @@ fn render_entry_actions(
     frame.render_widget(Paragraph::new(lines), layout.content);
 }
 
+/// What other CLI tools hold, offered to import.
+///
+/// The picker is the area's rather than a record's: a reader looks for settings
+/// to import before there is a profile to hang them on.
+fn render_native_import(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    view: &crate::config_center::NativeImportView,
+    theme: &TuiTheme,
+) {
+    let strings = app.strings;
+    let chrome = modal_chrome(
+        app,
+        strings.config_import_title(),
+        ModalSizing::new(64, 96, 40, 2, 2, 1, 1),
+        vec![
+            ModalHint::new("↑↓", strings.hint_nav()),
+            ModalHint::new("Enter", strings.config_action_import()),
+            ModalHint::new("r", strings.config_action_refresh()),
+            ModalHint::new("Esc", strings.close()),
+        ],
+    );
+    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
+        return;
+    };
+    let rows = crate::config_center::native_import_rows(
+        app.management_data.native_import.as_ref(),
+        strings,
+    );
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("  {}", strings.config_import_hint()),
+        Style::default().fg(theme.roles.gray_dim),
+    )));
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {}",
+                if view.loading {
+                    strings.config_import_loading()
+                } else {
+                    strings.config_import_empty()
+                }
+            ),
+            Style::default().fg(theme.roles.gray_dim),
+        )));
+    }
+    let window = usize::from(layout.content.height).saturating_sub(1);
+    let selected = view.selected.min(rows.len().saturating_sub(1));
+    let first = selected.saturating_sub(window.saturating_sub(1) / 2);
+    for (offset, row) in rows.iter().skip(first).take(window.max(1)).enumerate() {
+        let index = first + offset;
+        let is_selected = index == selected;
+        let base = if is_selected {
+            Style::default()
+                .fg(theme.roles.foreground)
+                .bg(theme.roles.surface_highlight)
+                .add_modifier(Modifier::BOLD)
+        } else if row.importable {
+            Style::default().fg(theme.roles.foreground)
+        } else {
+            Style::default().fg(theme.roles.gray)
+        };
+        let mut spans = vec![
+            Span::styled(
+                if is_selected { "▌" } else { " " },
+                Style::default().fg(theme.roles.accent_user),
+            ),
+            Span::styled(
+                format!(" {:<13}", row.chip),
+                chip_style(row.tone, theme).patch(base),
+            ),
+            Span::styled(config_cell(&row.label, 26), base),
+            Span::styled(
+                format!("{:<10}", row.source),
+                Style::default().fg(theme.roles.gray_bright),
+            ),
+            Span::styled(
+                row.agent.clone(),
+                Style::default().fg(theme.roles.gray_bright),
+            ),
+        ];
+        spans.push(Span::raw("  "));
+        if let Some((_, value)) = row.detail.first() {
+            spans.push(Span::styled(
+                value.clone(),
+                Style::default().fg(theme.roles.gray_dim),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), layout.content);
+}
+
 /// The Models one profile offers.
 ///
 /// The list is the one thing in the centre that is a part of a record rather
@@ -8707,6 +8802,7 @@ fn render_overlay(
             );
         }
         Overlay::Models { view } => render_models(frame, area, app, view, theme),
+        Overlay::NativeImport { view } => render_native_import(frame, area, app, view, theme),
         Overlay::Approval { selected } => render_approval(frame, area, app, *selected, theme),
         // The question card is not a box over the page: it is drawn in the
         // composer's band, which the frame paints before it gets here.

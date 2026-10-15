@@ -1137,13 +1137,15 @@ impl App {
             // The form's own key, reaching here only when no form is open.
             Intent::ConfigFormCopy => Outcome::quiet(),
             Intent::ConfigModels => self.open_model_editor(),
+            Intent::ConfigImport => self.open_native_import(),
             // The Model editor's own keys, reaching here only when no overlay is
             // open to receive them.
             Intent::ConfigModelToggle
             | Intent::ConfigModelAdd
             | Intent::ConfigModelRemove
             | Intent::ConfigModelFetch
-            | Intent::ConfigModelEdit => Outcome::quiet(),
+            | Intent::ConfigModelEdit
+            | Intent::ConfigImportRefresh => Outcome::quiet(),
             Intent::ConfigRegistryFilter => self.step_registry_narrowing(RegistryStep::Transport),
             Intent::ConfigRegistrySort => self.step_registry_narrowing(RegistryStep::Sort),
             Intent::ConfigRegistryPagePrevious => self.step_registry_page(-1),
@@ -1992,6 +1994,88 @@ impl App {
                 Outcome::effects(vec![])
             }
             None => Outcome::quiet(),
+        }
+    }
+
+    /// `i`: what other CLI tools on this machine already hold.
+    ///
+    /// The Providers area is where a profile comes from, so the verb lives
+    /// there and the picker it opens is the area's, not a record's.
+    fn open_native_import(&mut self) -> Outcome {
+        use crate::config_center::ConfigSection;
+        if self.config_center.section != ConfigSection::Providers {
+            return Outcome::quiet();
+        }
+        self.overlay = Some(Overlay::NativeImport {
+            view: crate::config_center::NativeImportView::default(),
+        });
+        Outcome::effects(vec![Effect::PreviewNativeImport {
+            sources: crate::config_center::native_import_sources(),
+        }])
+    }
+
+    /// The keys of the import picker.
+    fn perform_native_import(
+        &mut self,
+        intent: Intent,
+        mut view: crate::config_center::NativeImportView,
+    ) -> Outcome {
+        let rows = crate::config_center::native_import_rows(
+            self.management_data.native_import.as_ref(),
+            self.strings,
+        );
+        let last = rows.len().saturating_sub(1);
+        let selected = view.selected.min(last);
+        match intent {
+            Intent::SelectPrevious | Intent::ScrollPageUp => {
+                view.selected = selected.saturating_sub(1);
+                self.overlay = Some(Overlay::NativeImport { view });
+                Outcome::effects(vec![])
+            }
+            Intent::SelectNext | Intent::ScrollPageDown => {
+                view.selected = (selected + 1).min(last);
+                self.overlay = Some(Overlay::NativeImport { view });
+                Outcome::effects(vec![])
+            }
+            // `Enter` is the overlay's confirm, which is the same key the
+            // config centre's other menus use to run what is highlighted.
+            Intent::ConfirmOverlay => {
+                let Some(row) = rows.get(selected) else {
+                    return Outcome::quiet();
+                };
+                if !row.importable {
+                    // The authority named why this one cannot be read; sending
+                    // it anyway would turn a diagnostic into a failure.
+                    if let Some((_, message)) = row.detail.last() {
+                        self.toast(Toast::warning(message.clone()));
+                    }
+                    return Outcome::quiet();
+                }
+                self.overlay = Some(Overlay::NativeImport { view });
+                Outcome::effects(vec![Effect::ConfigMutation {
+                    mutation: crate::app::ConfigMutation::ImportNativeProfile {
+                        item_id: row.item_id.clone(),
+                        sources: crate::config_center::native_import_sources(),
+                    },
+                    record: row.item_id.clone(),
+                }])
+            }
+            Intent::ConfigImportRefresh => {
+                view.loading = true;
+                view.notice = None;
+                self.overlay = Some(Overlay::NativeImport { view });
+                Outcome::effects(vec![Effect::PreviewNativeImport {
+                    sources: crate::config_center::native_import_sources(),
+                }])
+            }
+            Intent::CloseOverlay | Intent::Back => {
+                self.overlay = None;
+                Outcome::effects(vec![])
+            }
+            _ => {
+                self.overlay = Some(Overlay::NativeImport { view });
+                Outcome::quiet()
+            }
         }
     }
 
@@ -3807,6 +3891,7 @@ impl App {
                 _ => Outcome::quiet(),
             },
             Overlay::Models { view } => self.perform_models(intent, view),
+            Overlay::NativeImport { view } => self.perform_native_import(intent, view),
             Overlay::Approval { selected } => match intent {
                 Intent::ApprovalApprove
                 | Intent::ApprovalDeny

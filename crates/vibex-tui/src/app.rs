@@ -212,6 +212,10 @@ pub enum Overlay {
     Models {
         view: crate::config_center::ModelListView,
     },
+    /// What other CLI tools on this machine already hold, offered to import.
+    NativeImport {
+        view: crate::config_center::NativeImportView,
+    },
     /// A multi-field editor for one configuration record.
     ///
     /// A form rather than a prompt because an MCP server is not a name: it has
@@ -659,6 +663,8 @@ pub struct ManagementData {
     pub audit: Vec<vibex_core::RemoteAuditRecord>,
     pub profiles: Vec<vibex_core::ProviderProfileSummary>,
     pub providers: Vec<vibex_core::ProviderProfileSummary>,
+    /// What the last native-settings scan found.
+    pub native_import: Option<vibex_core::ProviderNativeImportPreview>,
     /// The order the reader arranged the profiles in, per Agent.
     pub provider_order: Vec<vibex_core::AgentModelProviderDisplayOrderEntry>,
     /// The last profile configuration this client read in full.
@@ -8525,6 +8531,11 @@ pub enum ConfigMutation {
     // ---- provider profiles ----------------------------------------------
     /// Make a profile that does not exist yet.
     CreateProviderProfile(Box<vibex_core::AgentModelProviderProfileCreateRequest>),
+    /// Make a profile out of one item another CLI tool holds.
+    ImportNativeProfile {
+        item_id: String,
+        sources: Vec<vibex_core::ProviderNativeImportSource>,
+    },
     /// Arrange one Agent's profiles in a new order, first to last.
     SetProviderOrder {
         agent_id: vibex_core::AgentId,
@@ -8634,6 +8645,7 @@ impl ConfigMutation {
             Self::UpdateProviderProfile { profile_id, .. }
             | Self::DeleteProviderProfile { profile_id, .. } => profile_id.as_str().to_string(),
             Self::CreateProviderProfile(_) => "provider:new".to_string(),
+            Self::ImportNativeProfile { item_id, .. } => item_id.clone(),
             Self::SetProviderOrder { agent_id, .. } => agent_id.as_str().to_string(),
             Self::CreateMcpServer(_) => "mcp:new".to_string(),
             Self::UpdateMcpServer(request) => request.mcp_server_id.as_str().to_string(),
@@ -8667,6 +8679,7 @@ impl ConfigMutation {
             Self::CheckAgentUpdate { .. } => "agent_update_check",
             Self::RollbackAgent { .. } => "agent_rollback",
             Self::CreateProviderProfile(_) => "provider_profile_create",
+            Self::ImportNativeProfile { .. } => "provider_native_import_run",
             Self::SetProviderOrder { .. } => "provider_order_set",
             Self::UpdateProviderProfile { .. } => "provider_profile",
             Self::DeleteProviderProfile { .. } => "provider_profile_delete",
@@ -8713,6 +8726,7 @@ impl ConfigMutation {
             Self::CheckAgentUpdate { .. } => Verb::CheckUpdate,
             Self::RollbackAgent { .. } => Verb::Rollback,
             Self::CreateProviderProfile(_) => Verb::Create,
+            Self::ImportNativeProfile { .. } => Verb::Import,
             Self::SetProviderOrder { .. } => Verb::Save,
             Self::UpdateProviderProfile { .. } => Verb::Save,
             Self::DeleteProviderProfile { .. } => Verb::Delete,
@@ -9065,6 +9079,10 @@ pub enum Effect {
     DiscoverSources {
         module: crate::config_center::ConfigModule,
     },
+    /// Read what other CLI tools on this machine hold, ready to import.
+    PreviewNativeImport {
+        sources: Vec<vibex_core::ProviderNativeImportSource>,
+    },
     /// Read the order one Agent's profiles are arranged in.
     LoadProviderOrder {
         agent_id: vibex_core::AgentId,
@@ -9140,6 +9158,7 @@ impl Effect {
             Effect::SearchRegistry { .. } => "config_registry",
             Effect::LoadProviderProfile { .. } => "provider_profile_detail",
             Effect::LoadProviderOrder { .. } => "provider_order",
+            Effect::PreviewNativeImport { .. } => "provider_native_import",
             Effect::OpenSession { .. } => "open_session",
             Effect::RefreshTimeline => "timeline",
             Effect::LoadOlder { .. } => "older_timeline",

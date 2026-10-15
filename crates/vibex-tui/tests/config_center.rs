@@ -2229,3 +2229,118 @@ fn an_endpoint_an_agent_pins_is_not_the_readers_to_change() {
     };
     assert!(form.editing.is_none(), "a pinned field opened an editor");
 }
+
+/// One native-settings scan, as the authority answers it.
+fn native_import_preview() -> vibex_core::ProviderNativeImportPreview {
+    serde_json::from_value(serde_json::json!({
+        "previewId": "request_import",
+        "sources": ["codex", "cc_switch"],
+        "files": [],
+        "items": [
+            {
+                "importItemId": "request_one",
+                "source": "codex",
+                "providerKind": "codex",
+                "agentId": "codex",
+                "displayName": "Work account",
+                "baseUrl": "https://api.example/v1",
+                "defaultModel": "gpt-5",
+                "configuredModels": [],
+                "providerOptions": {"schemaVersion": 1, "entries": []},
+                "secretReferences": [],
+                "status": "importable",
+                "redactedFields": [],
+                "diagnostics": []
+            },
+            {
+                "importItemId": "request_two",
+                "source": "cc_switch",
+                "providerKind": "claude",
+                "displayName": "Broken account",
+                "configuredModels": [],
+                "providerOptions": {"schemaVersion": 1, "entries": []},
+                "secretReferences": [],
+                "status": "blocked_by_parse_error",
+                "redactedFields": [],
+                "diagnostics": [{"code": "parse_error", "message": "the file could not be read", "source": "cc_switch", "fileKind": null, "redactedDetails": []}]
+            }
+        ],
+        "diagnostics": [],
+        "createdAtMs": 1
+    }))
+    .expect("native import fixture")
+}
+
+/// The import picker is the Providers area's verb, and its rows are the scan.
+///
+/// A reader looks for settings to import before there is a profile to hang them
+/// on, so the verb belongs to the area rather than to a record — and a candidate
+/// the authority could not read is offered as a row that explains itself instead
+/// of a press that fails.
+#[test]
+fn native_settings_are_offered_for_import() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigImport);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::PreviewNativeImport { sources }] => assert_eq!(
+            sources.len(),
+            3,
+            "the picker did not ask about the CLI tools a reader is likely to have"
+        ),
+        other => panic!("the import asked nothing: {other:?}"),
+    }
+    assert!(
+        matches!(app.overlay, Some(Overlay::NativeImport { .. })),
+        "the picker did not open"
+    );
+
+    // The scan answers with two candidates: one importable, one the authority
+    // could not read.
+    app.management_data.native_import = Some(native_import_preview());
+    let rows = vibex_tui::config_center::native_import_rows(
+        app.management_data.native_import.as_ref(),
+        app.strings,
+    );
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].importable);
+    assert!(!rows[1].importable, "an unreadable candidate was offered");
+
+    // Importing the first one names it and the sources it came from.
+    let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::ImportNativeProfile { item_id, sources } = mutation
+            else {
+                panic!("the import was not an import: {mutation:?}");
+            };
+            assert_eq!(item_id, "request_one");
+            assert_eq!(sources.len(), 3);
+        }
+        other => panic!("the import produced {other:?}"),
+    }
+
+    // And pressing it on the unreadable one writes nothing.
+    app.config_center.pending.clear();
+    app.overlay = Some(Overlay::NativeImport {
+        view: vibex_tui::config_center::NativeImportView {
+            selected: 1,
+            loading: false,
+            notice: None,
+        },
+    });
+    let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    assert!(
+        outcome.effects.is_empty(),
+        "an unreadable candidate was sent"
+    );
+    assert!(app.toast.is_some(), "the picker refused without saying why");
+
+    // The verb belongs to the Providers area: elsewhere it does nothing.
+    app.overlay = None;
+    app.show_config_module(ConfigModule::Mcp, None);
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigImport);
+    assert!(outcome.effects.is_empty(), "another area imported settings");
+}

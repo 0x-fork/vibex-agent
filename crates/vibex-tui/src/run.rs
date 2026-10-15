@@ -2493,6 +2493,24 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
+        AppMessage::NativeImport(result) => match result {
+            Ok(preview) => {
+                app.management_data.native_import = Some(preview);
+                // The answer fills the picker the reader already has open, so
+                // their place in it is kept rather than reset.
+                app.overlay = Some(Overlay::NativeImport {
+                    view: settled_native_import_view(&app.overlay),
+                });
+            }
+            Err(error) => {
+                app.toast(Toast::danger(error.message));
+                if matches!(app.overlay, Some(Overlay::NativeImport { .. })) {
+                    app.overlay = Some(Overlay::NativeImport {
+                        view: settled_native_import_view(&app.overlay),
+                    });
+                }
+            }
+        },
         AppMessage::ProviderOrder(result) => match result {
             Ok(entries) => {
                 // The read is per Agent and answers with that Agent's whole
@@ -2880,6 +2898,21 @@ pub fn prompt_for(app: &mut App, title: String, field: PromptField) {
         value: String::new(),
         target: None,
     });
+}
+
+/// The import picker with its scan finished, keeping the reader's place.
+fn settled_native_import_view(overlay: &Option<Overlay>) -> crate::config_center::NativeImportView {
+    match overlay {
+        Some(Overlay::NativeImport { view }) => crate::config_center::NativeImportView {
+            loading: false,
+            selected: view.selected,
+            notice: view.notice.clone(),
+        },
+        _ => crate::config_center::NativeImportView {
+            loading: false,
+            ..Default::default()
+        },
+    }
 }
 
 /// Set the seat that the status bar reports.

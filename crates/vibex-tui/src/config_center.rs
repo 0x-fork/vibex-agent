@@ -3366,6 +3366,118 @@ pub const fn wire_api_label(wire_api: vibex_core::ProviderModelWireApi) -> &'sta
     }
 }
 
+/// What other CLI tools hold, as the import picker draws it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeImportRow {
+    pub item_id: String,
+    pub label: String,
+    pub source: String,
+    pub agent: String,
+    pub chip: String,
+    pub tone: ConfigTone,
+    /// Whether this one can be imported at all.
+    pub importable: bool,
+    pub detail: Vec<(String, String)>,
+}
+
+/// The imports one preview offers, in the order it listed them.
+pub fn native_import_rows(
+    preview: Option<&vibex_core::ProviderNativeImportPreview>,
+    strings: Strings,
+) -> Vec<NativeImportRow> {
+    let Some(preview) = preview else {
+        return Vec::new();
+    };
+    preview
+        .items
+        .iter()
+        .map(|item| {
+            let (chip, tone, importable) = match item.status {
+                vibex_core::ProviderNativeImportItemStatus::Importable => {
+                    (strings.config_state_available(), ConfigTone::Ok, true)
+                }
+                vibex_core::ProviderNativeImportItemStatus::NeedsSecretSetup => {
+                    (strings.config_state_needs_secret(), ConfigTone::Warn, true)
+                }
+                vibex_core::ProviderNativeImportItemStatus::Partial => {
+                    (strings.config_state_partial(), ConfigTone::Warn, true)
+                }
+                vibex_core::ProviderNativeImportItemStatus::BlockedByParseError => {
+                    (strings.config_state_blocked(), ConfigTone::Bad, false)
+                }
+            };
+            let mut detail = Vec::new();
+            if let Some(base_url) = &item.base_url {
+                detail.push((strings.config_field_url().to_string(), base_url.clone()));
+            }
+            if let Some(model) = &item.default_model {
+                detail.push((strings.config_field_model().to_string(), model.clone()));
+            }
+            for diagnostic in &item.diagnostics {
+                detail.push((
+                    strings.config_field_description().to_string(),
+                    diagnostic.message.clone(),
+                ));
+            }
+            NativeImportRow {
+                item_id: item.import_item_id.as_str().to_string(),
+                label: item.display_name.clone(),
+                source: import_source_label(item.source, strings).to_string(),
+                agent: item
+                    .agent_id
+                    .as_ref()
+                    .map(|agent| agent.as_str().to_string())
+                    .unwrap_or_default(),
+                chip: chip.to_string(),
+                tone,
+                importable,
+                detail,
+            }
+        })
+        .collect()
+}
+
+/// What a native source is called on screen.
+pub const fn import_source_label(
+    source: vibex_core::ProviderNativeImportSource,
+    strings: Strings,
+) -> &'static str {
+    use vibex_core::ProviderNativeImportSource as Source;
+    match source {
+        Source::Codex => strings.config_import_source_codex(),
+        Source::Claude => strings.config_import_source_claude(),
+        Source::CcSwitch => strings.config_import_source_cc_switch(),
+    }
+}
+
+/// The sources the import picker asks about.
+///
+/// The same three the desktop asks for: the two CLI tools whose own settings a
+/// reader is most likely to have, and the switch tool that holds both.
+pub fn native_import_sources() -> Vec<vibex_core::ProviderNativeImportSource> {
+    use vibex_core::ProviderNativeImportSource as Source;
+    vec![Source::Codex, Source::Claude, Source::CcSwitch]
+}
+
+/// Which import the picker is on, and what it last said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeImportView {
+    pub selected: usize,
+    /// Whether the scan that fills the list is still running.
+    pub loading: bool,
+    pub notice: Option<(String, ConfigTone)>,
+}
+
+impl Default for NativeImportView {
+    fn default() -> Self {
+        Self {
+            selected: 0,
+            loading: true,
+            notice: None,
+        }
+    }
+}
+
 /// Which profile's Models the editor is on.
 ///
 /// The rows are projected from the records every frame rather than held here: a
