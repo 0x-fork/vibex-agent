@@ -31805,6 +31805,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:vibex-brands@0.1.0-rc.7:ce284250f9f249a9",
+      "name": "vibex-brands",
+      "version": "0.1.0-rc.7",
+      "licenses": [
+        {
+          "expression": "AGPL-3.0-or-later"
+        }
+      ],
+      "purl": "pkg:cargo/vibex-brands@0.1.0-rc.7",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "path:crates/vibex-brands"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "AGPL-3.0-or-later"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/vibex-ai/vibex"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:vibex-browser@0.1.0-rc.7:df2965b12b4b9031",
       "name": "vibex-browser",
       "version": "0.1.0-rc.7",
@@ -39138,7 +39174,7 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-mobile-native-icons:4af6d4773e1b878b",
+      "bom-ref": "asset:vibex-mobile-native-icons:6dea024b39b5d65a",
       "name": "Vibex native mobile Lucide controls",
       "version": "0.1.0-rc.7",
       "licenses": [
@@ -39149,7 +39185,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "4af6d4773e1b878b72eee77d09eb644c5f80d12313dcf749a873d2859e71d57b"
+          "content": "6dea024b39b5d65abe4366f865f7d1b0c1779124efc3fec5a8170b2e56cdf182"
         }
       ],
       "externalReferences": [
@@ -39169,7 +39205,7 @@
         },
         {
           "name": "vibex:file-count",
-          "value": "35"
+          "value": "36"
         },
         {
           "name": "vibex:selected-license",
@@ -39577,7 +39613,7 @@
       "dependsOn": []
     },
     {
-      "ref": "asset:vibex-mobile-native-icons:4af6d4773e1b878b",
+      "ref": "asset:vibex-mobile-native-icons:6dea024b39b5d65a",
       "dependsOn": []
     },
     {
@@ -46752,6 +46788,13 @@
       ]
     },
     {
+      "ref": "cargo:vibex-brands@0.1.0-rc.7:ce284250f9f249a9",
+      "dependsOn": [
+        "cargo:image@0.25.10:c19b7c6f923b580a",
+        "cargo:resvg@0.46.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:vibex-browser@0.1.0-rc.7:df2965b12b4b9031",
       "dependsOn": [
         "cargo:async-trait@0.1.89:c19b7c6f923b580a",
@@ -47149,6 +47192,7 @@
         "cargo:unicode-width@0.2.2:c19b7c6f923b580a",
         "cargo:url@2.5.8:c19b7c6f923b580a",
         "cargo:vibex-backend@0.1.0-rc.7:14559522eff35735",
+        "cargo:vibex-brands@0.1.0-rc.7:ce284250f9f249a9",
         "cargo:vibex-core@0.1.0-rc.7:a1f32ad3e304847a",
         "cargo:vibex-desktop-model@0.1.0-rc.7:3eccb8226f5ee757",
         "cargo:vibex-terminal-ui@0.1.0-rc.7:81e25774d4aead5f",
@@ -47160,7 +47204,7 @@
       "dependsOn": [
         "asset:vibex-mobile-application-icons:b690a33c976cf781",
         "asset:vibex-mobile-brand-marks:84a77e160e305979",
-        "asset:vibex-mobile-native-icons:4af6d4773e1b878b",
+        "asset:vibex-mobile-native-icons:6dea024b39b5d65a",
         "cargo:gpui-component@0.7.3:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:markdown@1.0.0:c19b7c6f923b580a",

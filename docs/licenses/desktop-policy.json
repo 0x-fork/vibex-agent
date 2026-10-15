@@ -266,8 +266,8 @@
       "extensions": [
         ".svg"
       ],
-      "expectedFileCount": 35,
-      "treeSha256": "4af6d4773e1b878b72eee77d09eb644c5f80d12313dcf749a873d2859e71d57b",
+      "expectedFileCount": 36,
+      "treeSha256": "6dea024b39b5d65abe4366f865f7d1b0c1779124efc3fec5a8170b2e56cdf182",
       "licenseExpression": "ISC",
       "source": "https://github.com/lucide-icons/lucide",
       "licenseEvidence": "The native mobile toolbar controls are derived from Lucide SVG paths and redistributed under the Lucide ISC license."
