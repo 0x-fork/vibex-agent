@@ -79188,10 +79188,10 @@ impl FoundationSettings {
         let mut display_rows = vec![setting_row(
             locale::text("Lossless frames", "无损画面", "無損畫面"),
             locale::text(
-                "Stream the page as PNG instead of JPEG. Text is sharper, and the stream is larger \
-                 and slower; the panel's HD button switches the same setting.",
-                "以 PNG 而不是 JPEG 传输页面。文字更清晰，但画面更大、更慢；面板上的 HD 按钮切换的是同一个设置。",
-                "以 PNG 而不是 JPEG 傳輸頁面。文字更清晰，但畫面更大、更慢；面板上的 HD 按鈕切換的是同一個設定。",
+                "Text is sharper, and the stream is larger and slower; the panel's HD button \
+                 switches the same setting.",
+                "文字更清晰，但画面更大、更慢；面板上的 HD 按钮切换的是同一个设置。",
+                "文字更清晰，但畫面更大、更慢；面板上的 HD 按鈕切換的是同一個設定。",
             ),
             Switch::new("browser-lossless-frames")
                 .small()

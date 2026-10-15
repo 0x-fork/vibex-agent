@@ -2368,19 +2368,27 @@ impl BrowserSurface {
             .child({
                 // The stream is JPEG 80 by default; text-heavy pages are the
                 // reason the toggle exists. The label is the mode in force, so
-                // the button says what the picture is doing rather than what
-                // pressing it would do.
+                // the button says what the picture is doing while the tooltip
+                // says what pressing it would do.
                 let high = self.capture_quality == BrowserCaptureQuality::High;
                 Button::new("browser-quality")
                     .label(if high { "HD" } else { "SD" })
                     .ghost()
                     .xsmall()
                     .toggled(high)
-                    .tooltip(locale::text(
-                        "Lossless PNG frames; larger and slower than the default",
-                        "无损 PNG 画面；比默认更清晰，但更大更慢",
-                        "無損 PNG 畫面；比預設更清晰，但更大更慢",
-                    ))
+                    .tooltip(if high {
+                        locale::text(
+                            "Switch to smooth quality",
+                            "切换到流畅画质",
+                            "切換到流暢畫質",
+                        )
+                    } else {
+                        locale::text(
+                            "Switch to lossless quality",
+                            "切换到无损画质",
+                            "切換到無損畫質",
+                        )
+                    })
                     .on_click(cx.listener(|this, _, _, cx| {
                         let next = if this.capture_quality == BrowserCaptureQuality::High {
                             BrowserCaptureQuality::Standard
