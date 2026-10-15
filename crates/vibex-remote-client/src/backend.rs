@@ -7109,6 +7109,10 @@ fn remote_capabilities_for_grant(
                     permits(RemoteActionClass::ReadProject),
                 ),
                 (
+                    BackendOperation::WorkspaceTemporarySessionRoot,
+                    permits(RemoteActionClass::ReadProject),
+                ),
+                (
                     BackendOperation::WorkspaceBrowseDirectories,
                     permits(RemoteActionClass::ReadProject),
                 ),

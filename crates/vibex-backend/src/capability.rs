@@ -34,6 +34,11 @@ pub enum BackendOperation {
     AgentSidebarOrganizationMutate,
     WorkspaceList,
     WorkspaceOpen,
+    /// The backend can resolve a root for a session that has no project, which
+    /// is what lets a client start one without pointing at a checkout. It is an
+    /// authority-side answer: the directory belongs to the machine that runs
+    /// the Agent, and the client only learns the path.
+    WorkspaceTemporarySessionRoot,
     /// The backend can list directories of the authority host, which is what
     /// lets a paired client pick a project root that exists where the Agent
     /// runs. Native backends browse locally instead and do not report it.
@@ -256,6 +261,7 @@ impl BackendCapabilitySnapshot {
             workspace: DomainCapabilities::available([
                 WorkspaceList,
                 WorkspaceOpen,
+                WorkspaceTemporarySessionRoot,
                 WorkspaceDelete,
             ]),
             file: DomainCapabilities::available([

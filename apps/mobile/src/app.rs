@@ -94,6 +94,17 @@ use gpui_component::shimmer::ShimmerText;
 use gpui_component::{Disableable as _, StyledExt as _};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
+/// How long a released press still counts as the hold that just fired.
+///
+/// A hold opens a sheet over the pill, so the release usually lands on the
+/// sheet rather than the pill; this window covers the frame where it does not.
+const LONG_PRESS_ECHO_MS: u64 = 600;
+/// How long a sheet takes to rise into place.
+const SHEET_ENTRANCE_MS: u64 = 160;
+/// How far below its resting place a sheet starts, in logical pixels.
+const SHEET_ENTRANCE_RISE: f32 = 24.0;
+/// How long the new-session page's introduction takes to fade in.
+const PAGE_ENTRANCE_MS: u64 = 200;
 /// How close to the top the reader has to be for older history to be fetched.
 ///
 /// One and a half screens: the page is already there when the reader arrives,
@@ -495,6 +506,8 @@ enum NewSessionPicker {
     /// and picking a project re-scopes the list underneath it on the spot
     /// instead of closing and making the reader open the second list.
     Location,
+    /// The branch a new worktree is cut from.
+    BaseRef,
 }
 
 /// One row of a new-session choice list.
@@ -1645,6 +1658,30 @@ pub struct MobileApp {
     /// start without — the Agent and the permission — on its control row, and
     /// this sheet is where they are changed and where the rest lives.
     new_session_options_open: bool,
+    /// The base branch a new worktree is cut from.
+    ///
+    /// `None` until Git has answered: the branches that matter are the ones
+    /// beside the authority's repository, so the phone cannot guess one.
+    new_session_base_ref: Option<String>,
+    /// The base branches Git offers for the chosen origin workspace.
+    new_session_base_refs: Vec<String>,
+    /// The workspace `new_session_base_refs` was read for.
+    ///
+    /// The list belongs to one origin: branches read for another checkout are
+    /// not branches this worktree can be cut from, so a stale list is dropped
+    /// rather than shown against the new origin.
+    new_session_base_refs_origin: Option<String>,
+    /// Whether a base-ref read is in flight.
+    new_session_base_refs_loading: bool,
+    /// Whether the session is created without a project.
+    ///
+    /// A temporary session runs in a root the authority hands out, which is how
+    /// a phone starts a session for a thought that does not belong to any
+    /// checkout yet. It is a choice on the location sheet rather than a project
+    /// of its own: the session it creates is an ordinary one.
+    new_session_temporary: bool,
+    /// When a hold last answered a press, so its release is not a tap as well.
+    long_press_at: Option<std::time::Instant>,
     /// Whether the composer's attach menu is up.
     composer_attach_menu_open: bool,
     /// Which field the attach menu is filling. The new-session page has its own
@@ -2341,6 +2378,37 @@ fn settings_danger_note(
         .into_any_element()
 }
 
+/// What a pill on a prompt card does.
+///
+/// The tap opens the surface the pill names. A hold is the shortcut to the
+/// sheet behind it: the card carries two decisions, and holding one pill opens
+/// the other's sheet, which saves a reader who already knows what they came to
+/// change a close and a second tap.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComposerChipAction {
+    /// The model that answers: tap opens the model list, hold opens the session
+    /// settings.
+    NewSessionModel,
+    /// The permission the session runs under: tap opens the session settings,
+    /// hold opens the model list.
+    NewSessionPermission,
+    /// The project and workspace pair: both open the location sheet.
+    NewSessionScope,
+    /// The checkout or worktree: both switch the mode.
+    NewSessionLocation,
+    /// The model of an open session: both open its runtime sheet.
+    SessionModel,
+}
+
+/// A hold that means something other than the tap.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LongPressTarget {
+    /// Holding the model pill opens the session settings sheet.
+    NewSessionSettings,
+    /// Holding the permission pill opens the model sheet.
+    NewSessionModels,
+}
+
 /// One pill inside a prompt card's control row.
 ///
 /// The pill is what the reader sees, the row is what the reader aims at: a chip
@@ -2354,11 +2422,18 @@ fn composer_chip(
     icon: gpui::AnyElement,
     value: String,
     warn: bool,
-    handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
+    action: ComposerChipAction,
+    cx: &mut Context<MobileApp>,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
+    let hold = match action {
+        ComposerChipAction::NewSessionModel => Some(LongPressTarget::NewSessionSettings),
+        ComposerChipAction::NewSessionPermission => Some(LongPressTarget::NewSessionModels),
+        _ => None,
+    };
+    let chip = div()
         .id(id)
         .debug_selector(move || id.to_string())
+        .relative()
         .h(px(theme::TOUCH_TARGET))
         .min_w_0()
         .flex()
@@ -2366,7 +2441,18 @@ fn composer_chip(
         .cursor_pointer()
         .aria_label(value.clone())
         .active(|style| style.opacity(0.7))
-        .on_mouse_up(MouseButton::Left, handler)
+        // The release is the tap unless a hold already answered it: the finger
+        // that held this pill has been served, and serving it twice would close
+        // the sheet it just opened.
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |this, _, window, cx| {
+                if this.take_long_press_echo() {
+                    return;
+                }
+                this.activate_composer_chip(action, window, cx);
+            }),
+        )
         .child(
             div()
                 .h(px(theme::CHIP_HEIGHT))
@@ -2393,7 +2479,36 @@ fn composer_chip(
                         })
                         .child(value),
                 ),
+        );
+    let Some(target) = hold else {
+        return chip;
+    };
+    // The hold is claimed where the pill is: the listener resolves the gesture
+    // against this chip's own bounds, so a press anywhere else is never its.
+    let entity = cx.weak_entity();
+    chip.child(
+        gpui::canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                window.on_mouse_event({
+                    let entity = entity.clone();
+                    move |event: &LongPressEvent,
+                          phase: DispatchPhase,
+                          window: &mut Window,
+                          cx: &mut gpui::App| {
+                        if phase != DispatchPhase::Bubble || !bounds.contains(&event.position) {
+                            return;
+                        }
+                        let _ = entity.update(cx, |this, cx| {
+                            this.on_composer_chip_long_press(target, window, cx)
+                        });
+                    }
+                });
+            },
         )
+        .absolute()
+        .inset_0(),
+    )
 }
 
 /// A bare icon control in a prompt card's control row: something the reader
@@ -3021,6 +3136,12 @@ impl MobileApp {
             runtime_options_open: false,
             new_session_picker: None,
             new_session_options_open: false,
+            new_session_base_ref: None,
+            new_session_base_refs: Vec::new(),
+            new_session_base_refs_origin: None,
+            new_session_base_refs_loading: false,
+            new_session_temporary: false,
+            long_press_at: None,
             composer_attach_menu_open: false,
             attach_menu_target: AttachmentTarget::Composer,
             new_session_attachments: Vec::new(),
@@ -5840,11 +5961,25 @@ impl MobileApp {
     }
 
     fn supports_new_session_worktree(&self) -> bool {
+        // A temporary session has no origin checkout, so there is no branch for
+        // a worktree to be cut from: the mode is not offered at all rather than
+        // offered and refused when the create is submitted.
+        !self.new_session_temporary
+            && self.backend.as_ref().is_some_and(|backend| {
+                backend
+                    .capability_snapshot()
+                    .git
+                    .supports(BackendOperation::GitWorktreeCreate)
+            })
+    }
+
+    /// Whether the authority can hand out a root for a session with no project.
+    fn supports_new_session_temporary_root(&self) -> bool {
         self.backend.as_ref().is_some_and(|backend| {
             backend
                 .capability_snapshot()
-                .git
-                .supports(BackendOperation::GitWorktreeCreate)
+                .workspace
+                .supports(BackendOperation::WorkspaceTemporarySessionRoot)
         })
     }
 
@@ -5959,6 +6094,10 @@ impl MobileApp {
                 });
         }
         self.apply_project_new_session_preference();
+        // The page can open straight into a new worktree, and then the base
+        // branches are what the reader needs before they can start: reading them
+        // here is what keeps the first frame of the page complete.
+        self.sync_new_session_base_refs_for_origin(cx);
         self.pending_input_writes
             .push((InputField::NewSessionTitle, String::new()));
         self.pending_input_writes
@@ -6036,18 +6175,23 @@ impl MobileApp {
                             .map(|summary| summary.workspace.root_path.clone())
                     })
             });
-        let Some(workspace_root) = workspace_root else {
+        // A temporary session has no project to resolve a root from: the
+        // authority hands one out when the create is submitted, which is why the
+        // root is filled in inside the task below rather than here.
+        let temporary = self.new_session_temporary;
+        let workspace_root = workspace_root.unwrap_or_default();
+        if !temporary && workspace_root.is_empty() {
             self.fail(BackendError::failed(
                 "mobile_workspace_required",
                 locale::text(
-                    "Choose a project with an open workspace first.",
-                    "请先选择一个已打开工作区的项目。",
-                    "請先選擇一個已開啟工作區的專案。",
+                    "Choose a project with an open workspace first, or start a temporary session.",
+                    "请先选择一个已打开工作区的项目，或改用临时会话。",
+                    "請先選擇一個已開啟工作區的專案，或改用臨時工作階段。",
                 ),
             ));
             cx.notify();
             return;
-        };
+        }
         let title = self
             .new_session_title_input
             .read(cx)
@@ -6134,15 +6278,20 @@ impl MobileApp {
                 cx.notify();
                 return;
             };
-            let base_ref = self
-                .new_session_workspace_id
-                .as_deref()
-                .and_then(|id| {
-                    self.workspace_summaries
-                        .iter()
-                        .find(|summary| summary.workspace.id.as_str() == id)
-                })
-                .and_then(|summary| summary.git_branch.clone());
+            // The reader's choice first, then what Git reported as the base for
+            // this workspace, and only then the branch the origin happens to be
+            // on: the request carries the line the worktree is cut from, so the
+            // page never leaves it to chance.
+            let base_ref = self.new_session_base_ref.clone().or_else(|| {
+                self.new_session_workspace_id
+                    .as_deref()
+                    .and_then(|id| {
+                        self.workspace_summaries
+                            .iter()
+                            .find(|summary| summary.workspace.id.as_str() == id)
+                    })
+                    .and_then(|summary| summary.git_branch.clone())
+            });
             Some(GitWorktreeCreateRequest {
                 workspace_id: origin_workspace_id.clone(),
                 branch_name: format!("vibex/{}", vibex_core::managed_worktree_name_slug(&name)),
@@ -6167,6 +6316,13 @@ impl MobileApp {
                         .await?;
                     (created.workspace.root_path, created.workspace.mode)
                 }
+                // A session with no project runs in the directory the authority
+                // keeps for exactly that: the root belongs to the machine that
+                // runs the Agent, so it is asked for rather than assumed.
+                None if temporary => (
+                    backend.ensure_temporary_session_root().await?,
+                    WorkspaceMode::CurrentCheckout,
+                ),
                 None => (workspace_root, workspace_mode),
             };
             let request = MutationRequest::new(CreateAgentSessionRequest {
@@ -9049,6 +9205,8 @@ impl MobileApp {
             self.new_session_folder_id = None;
             self.new_session_picker = None;
             self.new_session_options_open = false;
+            self.forget_new_session_base_refs();
+            self.new_session_temporary = false;
         }
         self.overlay = None;
         self.overlay_parents.clear();
@@ -9283,6 +9441,8 @@ impl MobileApp {
             self.new_session_folder_id = None;
             self.new_session_picker = None;
             self.new_session_options_open = false;
+            self.forget_new_session_base_refs();
+            self.new_session_temporary = false;
             // The first message's files and references belong to the page that
             // was just closed, not to the next one, and so do the worktree's
             // name and path: the next session is a different piece of work.
@@ -19773,7 +19933,8 @@ impl MobileApp {
                                     ),
                                     model_label,
                                     !runtime_summary.available,
-                                    cx.listener(Self::open_runtime_options),
+                                    ComposerChipAction::SessionModel,
+                                    cx,
                                 )
                                 .flex_1()
                                 .min_w_0(),
@@ -24668,6 +24829,7 @@ impl MobileApp {
     /// otherwise.
     fn select_new_session_project(&mut self, project_id: &str, cx: &mut Context<Self>) {
         self.new_session_project_id = Some(project_id.to_string());
+        self.new_session_temporary = false;
         self.new_session_workspace_id = self
             .workspace_summaries
             .iter()
@@ -24691,6 +24853,7 @@ impl MobileApp {
             self.new_session_workspace_mode = WorkspaceMode::CurrentCheckout;
         }
         self.apply_project_new_session_preference();
+        self.sync_new_session_base_refs_for_origin(cx);
         cx.notify();
     }
 
@@ -24704,8 +24867,24 @@ impl MobileApp {
             return;
         };
         self.new_session_workspace_id = Some(workspace_id.to_string());
+        // A workspace is the opposite answer to a temporary root: choosing one
+        // is how the reader leaves the no-project choice behind.
+        self.new_session_temporary = false;
         self.new_session_workspace_mode = self.normalize_new_session_workspace_mode(mode);
+        self.sync_new_session_base_refs_for_origin(cx);
         cx.notify();
+    }
+
+    /// Drops a base-branch read, so the next worktree starts from a fresh one.
+    ///
+    /// The list and the choice belong to one origin workspace and to one visit
+    /// to the page: leaving either behind would let a new worktree be cut from
+    /// a branch of a repository the reader is no longer pointing at.
+    fn forget_new_session_base_refs(&mut self) {
+        self.new_session_base_ref = None;
+        self.new_session_base_refs.clear();
+        self.new_session_base_refs_origin = None;
+        self.new_session_base_refs_loading = false;
     }
 
     /// Opens one of the new-session chips as a list along the bottom edge.
@@ -24713,6 +24892,119 @@ impl MobileApp {
         self.new_session_picker = Some(picker);
         self.push_back_screen(BackScreen::NewSessionPicker);
         cx.notify();
+    }
+
+    /// Reads the base branches a new worktree can be cut from.
+    ///
+    /// Git answers for the authority's repository, not for the phone: the
+    /// branches that matter are the ones beside the checkout the worktree is
+    /// created from, so this is a read against the chosen origin and the
+    /// answer is kept with the origin it was read for.
+    fn refresh_new_session_base_refs(&mut self, cx: &mut Context<Self>) {
+        let origin = self.new_session_workspace_id.clone();
+        let supported = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .git
+                .supports(BackendOperation::GitWorktreeRead)
+        });
+        let Some(workspace_id) = origin
+            .as_deref()
+            .filter(|_| supported)
+            .and_then(|id| vibex_core::WorkspaceId::parse(id).ok())
+        else {
+            // Nothing to read against: the row falls back to the origin's own
+            // branch, which is what the create request uses when unset.
+            self.new_session_base_ref = None;
+            self.new_session_base_refs.clear();
+            self.new_session_base_refs_origin = None;
+            self.new_session_base_refs_loading = false;
+            cx.notify();
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.new_session_base_refs_loading = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.git_worktree_eligibility(workspace_id).await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.new_session_base_refs_loading = false;
+                // A read that landed after the origin moved on describes a
+                // checkout the page is no longer pointing at.
+                if this.new_session_workspace_id != origin {
+                    cx.notify();
+                    return;
+                }
+                match outcome {
+                    Ok(eligibility) => {
+                        this.new_session_base_refs_origin = origin;
+                        this.new_session_base_refs = eligibility.selectable_base_refs.clone();
+                        if this.new_session_base_ref.as_ref().is_some_and(|chosen| {
+                            !eligibility.selectable_base_refs.contains(chosen)
+                        }) {
+                            this.new_session_base_ref = None;
+                        }
+                        if this.new_session_base_ref.is_none() {
+                            this.new_session_base_ref = eligibility.default_base_ref.clone();
+                        }
+                    }
+                    Err(error) => {
+                        this.new_session_base_ref = None;
+                        this.new_session_base_refs.clear();
+                        this.new_session_base_refs_origin = None;
+                        this.fail(error);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    fn choose_new_session_base_ref(&mut self, base_ref: String, cx: &mut Context<Self>) {
+        self.new_session_base_ref = Some(base_ref);
+        self.new_session_picker = None;
+        cx.notify();
+    }
+
+    /// Starts the session in the authority's temporary root instead of a project.
+    ///
+    /// The root is resolved when the session is created: a path read now could
+    /// be stale by the time it is used, and the choice the reader is making here
+    /// is "no project", not a directory.
+    fn choose_new_session_temporary(&mut self, cx: &mut Context<Self>) {
+        self.new_session_temporary = true;
+        self.new_session_project_id = None;
+        self.new_session_workspace_id = None;
+        self.new_session_folder_id = None;
+        self.new_session_workspace_mode = WorkspaceMode::CurrentCheckout;
+        self.forget_new_session_base_refs();
+        self.new_session_picker = None;
+        cx.notify();
+    }
+
+    /// Reads the branches when the page already starts in a new worktree.
+    ///
+    /// Called wherever the origin can change: the worktree is cut from the
+    /// workspace the reader picked, so a new origin means a new set of base
+    /// branches.
+    fn sync_new_session_base_refs_for_origin(&mut self, cx: &mut Context<Self>) {
+        if self.normalize_new_session_workspace_mode(self.new_session_workspace_mode)
+            != WorkspaceMode::VibexWorktree
+        {
+            return;
+        }
+        if self.new_session_base_refs_origin == self.new_session_workspace_id
+            && !self.new_session_base_refs.is_empty()
+        {
+            return;
+        }
+        self.refresh_new_session_base_refs(cx);
     }
 
     fn close_new_session_picker(
@@ -24754,6 +25046,7 @@ impl MobileApp {
             return;
         }
         self.new_session_workspace_mode = mode;
+        self.sync_new_session_base_refs_for_origin(cx);
         cx.notify();
     }
 
@@ -25246,9 +25539,355 @@ impl MobileApp {
     /// sees where they are about to start without opening a second sheet. The
     /// project row stays open on purpose — the answer below it is the point.
     fn render_new_session_picker_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        if self.new_session_picker.is_none() {
-            return div().into_any_element();
+        match self.new_session_picker {
+            Some(NewSessionPicker::Location) => self.render_new_session_location_sheet(cx),
+            Some(NewSessionPicker::BaseRef) => self.render_new_session_base_ref_sheet(cx),
+            None => div().into_any_element(),
         }
+    }
+
+    /// The base branches a new worktree can be cut from.
+    ///
+    /// A list rather than a cycle: a repository has more branches than a chip
+    /// can walk through, and the answer is a name the reader recognises rather
+    /// than the next one in line.
+    fn render_new_session_base_ref_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let chosen = self.new_session_base_ref.clone();
+        let rows = self
+            .new_session_base_refs
+            .iter()
+            .map(|base_ref| {
+                let selected = chosen.as_deref() == Some(base_ref.as_str());
+                let value = base_ref.clone();
+                let label = base_ref.clone();
+                div()
+                    .id(format!("new-session-base-ref:{base_ref}"))
+                    .flex_shrink_0()
+                    .min_h(px(theme::TOUCH_TARGET))
+                    .px(px(theme::SPACING_LG))
+                    .py(px(theme::SPACING_SM))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_MD))
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .when(selected, |row| row.bg(theme::sidebar_selected_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.choose_new_session_base_ref(value.clone(), cx)
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(theme::font_body())
+                            .text_color(theme::text_primary())
+                            .child(label),
+                    )
+                    .when(selected, |row| {
+                        row.child(
+                            svg()
+                                .path("icons/check.svg")
+                                .size(px(theme::ICON_SM))
+                                .text_color(theme::accent_green()),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        let body = if !rows.is_empty() {
+            div()
+                .id("new-session-base-ref-rows")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .restrict_scroll_to_axis()
+                .flex()
+                .flex_col()
+                .pb(px(theme::SPACING_SM))
+                .children(rows)
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_h_0()
+                .px(px(theme::SPACING_LG))
+                .py(px(theme::SPACING_MD))
+                .child(
+                    div()
+                        .text_size(theme::font_caption())
+                        .text_color(theme::text_muted())
+                        .child(if self.new_session_base_refs_loading {
+                            locale::text(
+                                "Reading the branches…",
+                                "正在读取分支…",
+                                "正在讀取分支…",
+                            )
+                        } else {
+                            locale::text(
+                                "Git did not report any base branch for this workspace, so the worktree starts from the branch it is on.",
+                                "Git 未报告该工作区的可选基线，Worktree 将从其当前分支创建。",
+                                "Git 未回報此工作區的可選基線，Worktree 將從其目前分支建立。",
+                            )
+                        }),
+                )
+                .into_any_element()
+        };
+
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.45))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.dismiss_new_session_picker(cx)),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "mobile-new-session-base-ref".to_string())
+                    .w_full()
+                    .max_h(gpui::relative(0.6))
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w_full()
+                            .pt(px(theme::SPACING_SM))
+                            .flex()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .w(px(36.0))
+                                    .h(px(4.0))
+                                    .rounded_full()
+                                    .bg(theme::border_default()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .h(px(theme::TOUCH_TARGET))
+                            .pl(px(theme::SPACING_LG))
+                            .pr(px(theme::SPACING_SM))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(theme::font_heading())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_primary())
+                                    .child(locale::text("Base branch", "基线分支", "基線分支")),
+                            )
+                            .child(
+                                div()
+                                    .id("new-session-base-ref-close")
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .aria_label(locale::common("Close"))
+                                    .cursor_pointer()
+                                    .active(|style| style.opacity(0.6))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::close_new_session_picker),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/x.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_secondary()),
+                                    ),
+                            ),
+                    )
+                    .child(body)
+                    .relative()
+                    .with_animation(
+                        "mobile-new-session-base-ref-sheet",
+                        Animation::new(Duration::from_millis(SHEET_ENTRANCE_MS)),
+                        |sheet, delta| {
+                            sheet
+                                .opacity(delta)
+                                .top(px((1.0 - delta) * SHEET_ENTRANCE_RISE))
+                        },
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Performs what a pill's tap stands for.
+    ///
+    /// The page names the action and this resolves it, so the pill itself stays
+    /// a piece of drawing and every surface it can open is still opened from the
+    /// page that owns it.
+    fn activate_composer_chip(
+        &mut self,
+        action: ComposerChipAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            ComposerChipAction::NewSessionModel => {
+                self.open_new_session_runtime_options(&noop_mouse_up(), window, cx)
+            }
+            ComposerChipAction::NewSessionPermission => {
+                self.open_new_session_options(&noop_mouse_up(), window, cx)
+            }
+            ComposerChipAction::NewSessionScope => {
+                self.open_new_session_picker(NewSessionPicker::Location, cx)
+            }
+            ComposerChipAction::NewSessionLocation => {
+                let next = if self
+                    .normalize_new_session_workspace_mode(self.new_session_workspace_mode)
+                    == WorkspaceMode::VibexWorktree
+                {
+                    WorkspaceMode::CurrentCheckout
+                } else {
+                    WorkspaceMode::VibexWorktree
+                };
+                self.toggle_new_session_workspace_mode(next, &noop_mouse_up(), window, cx)
+            }
+            ComposerChipAction::SessionModel => {
+                self.open_runtime_options(&noop_mouse_up(), window, cx)
+            }
+        }
+    }
+
+    /// The shortcut behind a pill: the sheet the tap did not open.
+    fn on_composer_chip_long_press(
+        &mut self,
+        target: LongPressTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.long_press_at = Some(std::time::Instant::now());
+        match target {
+            LongPressTarget::NewSessionSettings => {
+                self.open_new_session_options(&noop_mouse_up(), window, cx)
+            }
+            LongPressTarget::NewSessionModels => {
+                self.open_new_session_runtime_options(&noop_mouse_up(), window, cx)
+            }
+        }
+    }
+
+    /// Whether a hold just answered the press being released.
+    ///
+    /// The release after a hold is not also a tap: it is the same finger, and
+    /// the sheet it opened is already on screen. A release that never arrives —
+    /// the hold's sheet took it — costs nothing, because the answer expires with
+    /// the window rather than staying set.
+    fn take_long_press_echo(&mut self) -> bool {
+        let echo = self
+            .long_press_at
+            .is_some_and(|at| at.elapsed() < Duration::from_millis(LONG_PRESS_ECHO_MS));
+        self.long_press_at = None;
+        echo
+    }
+
+    /// The row that starts a session without a project.
+    ///
+    /// It is offered only where the authority can hand out the root: the phone
+    /// cannot make a directory on the machine that runs the Agent, so the entry
+    /// has to know whether that machine will make one.
+    fn render_new_session_temporary_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let supported = self.supports_new_session_temporary_root();
+        let selected = self.new_session_temporary;
+        div()
+            .id("new-session-temporary")
+            .flex_shrink_0()
+            .min_h(px(theme::TOUCH_TARGET))
+            .px(px(theme::SPACING_LG))
+            .py(px(theme::SPACING_SM))
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_MD))
+            .when(selected, |row| row.bg(theme::sidebar_selected_bg()))
+            .when(supported, |row| {
+                row.cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.choose_new_session_temporary(cx)),
+                    )
+            })
+            .when(!supported, |row| row.opacity(0.45))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(theme::font_body())
+                            .text_color(theme::text_primary())
+                            .child(locale::text(
+                                "Temporary session",
+                                "临时会话",
+                                "臨時工作階段",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_muted())
+                            .child(if supported {
+                                locale::text(
+                                    "Starts in the desktop's own scratch directory",
+                                    "在桌面端的临时目录中启动，不加入任何项目",
+                                    "在桌面版的臨時目錄中啟動，不加入任何專案",
+                                )
+                            } else {
+                                locale::text(
+                                    "This runtime cannot start a session without a project",
+                                    "该运行时不支持无项目的临时会话",
+                                    "此執行環境不支援無專案的臨時工作階段",
+                                )
+                            }),
+                    ),
+            )
+            .when(selected, |row| {
+                row.child(
+                    svg()
+                        .path("icons/check.svg")
+                        .size(px(theme::ICON_SM))
+                        .text_color(theme::accent_green()),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The project and the workspace the session will start in.
+    fn render_new_session_location_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let project_id = self.new_session_project_id.clone();
         let workspace_id = self.new_session_workspace_id.clone();
 
@@ -25517,7 +26156,27 @@ impl MobileApp {
                                 "工作区",
                                 "工作區",
                             )))
-                            .children(workspace_rows),
+                            .children(workspace_rows)
+                            // The answer for a session that belongs to no
+                            // checkout yet. It sits under both lists because it
+                            // is the alternative to the two of them, not one
+                            // more row inside either.
+                            .child(runtime_section_heading(locale::text(
+                                "Without a project",
+                                "不使用项目",
+                                "不使用專案",
+                            )))
+                            .child(self.render_new_session_temporary_row(cx))
+                            .relative()
+                            .with_animation(
+                                "mobile-new-session-picker-sheet",
+                                Animation::new(Duration::from_millis(SHEET_ENTRANCE_MS)),
+                                |sheet, delta| {
+                                    sheet
+                                        .opacity(delta)
+                                        .top(px((1.0 - delta) * SHEET_ENTRANCE_RISE))
+                                },
+                            ),
                     ),
             )
             .into_any_element()
@@ -25534,16 +26193,24 @@ impl MobileApp {
     /// panel draws the same split, which is the point: the phone used to open on
     /// a stack of cards and a button at the far end of the screen.
     fn render_new_session(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let project_label = self
-            .new_session_project_id
-            .as_deref()
-            .and_then(|id| {
-                self.sidebar_projects()
-                    .into_iter()
-                    .find(|project| project.id == id)
-            })
-            .map(|project| project.label)
-            .unwrap_or_else(|| locale::text("Choose project", "选择项目", "選擇專案").to_string());
+        // The chip names the answer rather than the question: a temporary
+        // session has no project, and saying so is more use than leaving the
+        // chip on "Choose project" while the session is ready to start.
+        let project_label = if self.new_session_temporary {
+            locale::text("Temporary session", "临时会话", "臨時工作階段").to_string()
+        } else {
+            self.new_session_project_id
+                .as_deref()
+                .and_then(|id| {
+                    self.sidebar_projects()
+                        .into_iter()
+                        .find(|project| project.id == id)
+                })
+                .map(|project| project.label)
+                .unwrap_or_else(|| {
+                    locale::text("Choose project", "选择项目", "選擇專案").to_string()
+                })
+        };
         let workspace_display = self
             .new_session_workspace_id
             .as_deref()
@@ -25693,25 +26360,44 @@ impl MobileApp {
                             .items_center()
                             .justify_center()
                             .when(!busy, |hero| {
-                                hero.child(self.render_pairing_brand())
-                                    .child(
-                                        div()
-                                            .text_size(theme::font_title())
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme::text_primary())
-                                            .child(locale::text(
-                                                "Start something new",
-                                                "开始新的工作",
-                                                "開始新的工作",
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .mt(px(theme::SPACING_SM))
-                                            .text_size(theme::font_caption())
-                                            .text_color(theme::text_muted())
-                                            .child(format!("{project_label} · {location_label}")),
-                                    )
+                                // The introduction fades in rather than
+                                // appearing whole: the page opens over the list
+                                // behind it, and the fade is what makes that
+                                // read as a page arriving.
+                                hero.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .with_animation(
+                                            "mobile-new-session-intro",
+                                            Animation::new(Duration::from_millis(PAGE_ENTRANCE_MS)),
+                                            |intro, delta| intro.opacity(delta),
+                                        )
+                                        .child(self.render_pairing_brand())
+                                        .child(
+                                            div()
+                                                .text_size(theme::font_title())
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(theme::text_primary())
+                                                .child(locale::text(
+                                                    "Start something new",
+                                                    "开始新的工作",
+                                                    "開始新的工作",
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .mt(px(theme::SPACING_SM))
+                                                .text_size(theme::font_caption())
+                                                .text_color(theme::text_muted())
+                                                .child(if self.new_session_temporary {
+                                                    project_label.clone()
+                                                } else {
+                                                    format!("{project_label} · {location_label}")
+                                                }),
+                                        ),
+                                )
                             }),
                     )
                     // ── the message, and what it will run on ────────────────
@@ -25793,11 +26479,8 @@ impl MobileApp {
                                                     ),
                                                     model_label,
                                                     !runtime_ready,
-                                                    cx.listener(|this, event, window, cx| {
-                                                        this.open_new_session_runtime_options(
-                                                            event, window, cx,
-                                                        )
-                                                    }),
+                                                    ComposerChipAction::NewSessionModel,
+                                                    cx,
                                                 )
                                                 .flex_1()
                                                 .min_w_0(),
@@ -25811,7 +26494,8 @@ impl MobileApp {
                                                     .into_any_element(),
                                                 mode_label,
                                                 false,
-                                                cx.listener(Self::open_new_session_options),
+                                                ComposerChipAction::NewSessionPermission,
+                                                cx,
                                             ))
                                             .child(composer_send_button(
                                                 "mobile-new-session-submit",
@@ -25837,14 +26521,15 @@ impl MobileApp {
                                             .size(px(theme::ICON_SM))
                                             .text_color(theme::text_muted())
                                             .into_any_element(),
-                                        format!("{project_label} · {workspace_display}"),
-                                        self.new_session_project_id.is_none(),
-                                        cx.listener(|this, _, _, cx| {
-                                            this.open_new_session_picker(
-                                                NewSessionPicker::Location,
-                                                cx,
-                                            )
-                                        }),
+                                        if self.new_session_temporary {
+                                            project_label.clone()
+                                        } else {
+                                            format!("{project_label} · {workspace_display}")
+                                        },
+                                        !self.new_session_temporary
+                                            && self.new_session_project_id.is_none(),
+                                        ComposerChipAction::NewSessionScope,
+                                        cx,
                                     ))
                                     .child(composer_chip(
                                         "mobile-new-session-location",
@@ -25859,16 +26544,8 @@ impl MobileApp {
                                             .into_any_element(),
                                         location_label.clone(),
                                         !worktree_supported,
-                                        cx.listener(move |this, event, window, cx| {
-                                            let next = if mode == WorkspaceMode::VibexWorktree {
-                                                WorkspaceMode::CurrentCheckout
-                                            } else {
-                                                WorkspaceMode::VibexWorktree
-                                            };
-                                            this.toggle_new_session_workspace_mode(
-                                                next, event, window, cx,
-                                            )
-                                        }),
+                                        ComposerChipAction::NewSessionLocation,
+                                        cx,
                                     )),
                             )
                             // ── the worktree the session will start in ──────
@@ -26005,6 +26682,65 @@ impl MobileApp {
                                     .size(px(theme::ICON_SM))
                                     .text_color(theme::text_secondary()),
                             ),
+                    ),
+            )
+            // The line the worktree is cut from. It is a choice rather than a
+            // fact about the origin, so it reads as one: the row names the
+            // branch and opens the list Git reported for this workspace.
+            .child(
+                div()
+                    .id("new-session-base-ref")
+                    .h(px(theme::TOUCH_TARGET))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .bg(theme::bg_card_dim())
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .when(!busy, |row| {
+                        row.cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.open_new_session_picker(NewSessionPicker::BaseRef, cx)
+                                }),
+                            )
+                    })
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_muted())
+                            .child(locale::text("Base", "基线", "基線")),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(theme::font_caption())
+                            .text_color(theme::text_primary())
+                            .child(match self.new_session_base_ref.as_deref() {
+                                Some(base_ref) => base_ref.to_string(),
+                                None if self.new_session_base_refs_loading => {
+                                    locale::text("Reading…", "读取中…", "讀取中…").to_string()
+                                }
+                                None => locale::text(
+                                    "The branch this workspace is on",
+                                    "使用当前分支",
+                                    "使用目前分支",
+                                )
+                                .to_string(),
+                            }),
+                    )
+                    .child(
+                        svg()
+                            .path("icons/chevron-down.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::text_muted()),
                     ),
             )
             .child(
@@ -26328,7 +27064,17 @@ impl MobileApp {
                                     ),
                             ),
                     )
-                    .child(body),
+                    .child(body)
+                    .relative()
+                    .with_animation(
+                        "mobile-new-session-options-sheet",
+                        Animation::new(Duration::from_millis(SHEET_ENTRANCE_MS)),
+                        |sheet, delta| {
+                            sheet
+                                .opacity(delta)
+                                .top(px((1.0 - delta) * SHEET_ENTRANCE_RISE))
+                        },
+                    ),
             )
             .into_any_element()
     }
