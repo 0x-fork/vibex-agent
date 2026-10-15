@@ -45,6 +45,7 @@ const ICONS: &[&str] = &[
     "icons/folder-open.svg",
     "icons/triangle-alert.svg",
     "icons/circle-question-mark.svg",
+    "icons/pause.svg",
     "icons/copy.svg",
     "icons/git-branch.svg",
     "icons/wifi-outlined.svg",
@@ -519,6 +520,9 @@ impl AssetSource for MobileAssets {
             "icons/circle-question-mark.svg" => Some(include_bytes!(
                 "../../desktop/assets/icons/circle-question-mark.svg"
             )),
+            // The suspension mark is the desktop's own glyph too, so a session
+            // the reader stopped wears the same pause on either shell.
+            "icons/pause.svg" => Some(include_bytes!("../../desktop/assets/icons/pause.svg")),
             "icons/copy.svg" => Some(include_bytes!("../assets/icons/copy.svg")),
             "icons/wifi-outlined.svg" => Some(include_bytes!(
                 "../../desktop/assets/icons/wifi-outlined.svg"

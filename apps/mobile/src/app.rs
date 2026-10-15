@@ -30,7 +30,7 @@ use vibex_backend::{
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandEntry, AgentCommandExecuteRequest,
     AgentCommandExecutionBehavior, AgentCommandSourceKind, AgentCommandTrigger, AgentId,
-    AgentListRequest, AgentSessionState, AgentTimelineDisplaySettings,
+    AgentListRequest, AgentSession, AgentSessionState, AgentTimelineDisplaySettings,
     AgentTimelineReasoningDisplayMode, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     ElicitationFieldKind, ElicitationResolutionAction, ForkAgentSessionRequest,
     GitWorktreeCreateRequest, GoalPhase, GoalSnapshot, HumanDelegationRequest, MessageAttachment,
@@ -1535,6 +1535,11 @@ pub struct MobileApp {
     new_session_open: bool,
     new_session_project_id: Option<String>,
     new_session_workspace_id: Option<String>,
+    /// The folder a new session started from a folder row is filed under once
+    /// the runtime has answered with its id. The desktop writes the placement
+    /// before its sidebar reconciles; a remote client cannot, so it remembers
+    /// where the draft belongs and files it on the way back.
+    new_session_folder_id: Option<String>,
     new_session_workspace_mode: WorkspaceMode,
     new_session_runtime: Option<SessionRuntimeSelection>,
     new_session_title_input: Entity<InputState>,
@@ -2809,6 +2814,7 @@ impl MobileApp {
             new_session_open: false,
             new_session_project_id: None,
             new_session_workspace_id: None,
+            new_session_folder_id: None,
             new_session_workspace_mode: WorkspaceMode::CurrentCheckout,
             new_session_runtime: None,
             new_session_title_input: cx.new(|cx| {
@@ -5578,6 +5584,89 @@ impl MobileApp {
         self.apply_project_new_session_preference();
     }
 
+    /// Starts a session from a folder row's new-chat action.
+    ///
+    /// The folder decides where the draft begins: its own Worktree when it is
+    /// scoped to one, otherwise its project — whose own preference then picks
+    /// between the checkout and a fresh Worktree, exactly as the project row's
+    /// "+" does. The folder itself is recorded separately, because a remote
+    /// client cannot file the session until the runtime has answered with it.
+    fn create_session_in_folder(
+        &mut self,
+        row: &SidebarRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let folder_id = row.id().to_string();
+        let Some(folder) = self.sidebar_view.organization.folder(&folder_id) else {
+            return;
+        };
+        let project_id = folder.project_id.clone();
+        let workspace_id = folder.workspace_id.clone();
+        // A folder scoped to one Worktree starts its drafts in that Worktree;
+        // one that is not scoped to any starts them in the project.
+        match workspace_id {
+            Some(workspace_id)
+                if self
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.id.as_str() == workspace_id) =>
+            {
+                self.create_session_in_workspace(workspace_id, window, cx);
+            }
+            Some(_) => return,
+            None => {
+                let Some(project_id) = project_id else {
+                    return;
+                };
+                self.create_session_in_project(project_id, window, cx);
+            }
+        }
+        self.new_session_folder_id = Some(folder_id);
+    }
+
+    /// Files a session started from a folder row under that folder.
+    ///
+    /// The placement travels as the same mutation a drag onto the folder row
+    /// sends. A folder scoped to one Worktree only lists that Worktree's
+    /// sessions, so a draft that ended up elsewhere is left where it started
+    /// rather than being filed where the sidebar would never show it.
+    fn file_new_session_in_folder(&mut self, session: &AgentSession, cx: &mut Context<Self>) {
+        let Some(folder_id) = self.new_session_folder_id.take() else {
+            return;
+        };
+        let Some(folder) = self.sidebar_view.organization.folder(&folder_id) else {
+            return;
+        };
+        if folder
+            .workspace_id
+            .as_deref()
+            .is_some_and(|workspace_id| workspace_id != session.workspace_id.as_str())
+        {
+            return;
+        }
+        let Some(project_id) = folder.project_id.clone() else {
+            return;
+        };
+        // Unguarded on purpose: the session was created a moment ago, so the
+        // revision this client holds may predate it, and a guarded write would
+        // be refused for being stale rather than for being wrong.
+        self.send_sidebar_mutation(
+            RemoteSidebarOrganizationMutation::MoveItems {
+                items: vec![sidebar_item_ref(&SidebarOrganizationItem::Session(
+                    session.id.as_str().to_string(),
+                ))],
+                anchor: Some(sidebar_item_ref(&SidebarOrganizationItem::Folder(
+                    folder_id,
+                ))),
+                position: RemoteSidebarDropPosition::Into,
+                project_id: Some(project_id),
+            },
+            false,
+            cx,
+        );
+    }
+
     fn create_session_in_workspace(
         &mut self,
         workspace_id: String,
@@ -5976,6 +6065,7 @@ impl MobileApp {
                         this.new_session_armed_mentions.clear();
                         this.dismiss_overlay(None, cx);
                         this.refresh_sessions(cx);
+                        this.file_new_session_in_folder(&session, cx);
                         let session_id = session.id.clone();
                         this.open_session(session_id, cx);
                         if let Some(Err(error)) = prompt_result {
@@ -7396,6 +7486,7 @@ impl MobileApp {
                     session_id: Some(child_id),
                     unread: false,
                     auto_continue: false,
+                    auto_continue_paused: false,
                     delegated_child: true,
                 });
             }
@@ -7982,6 +8073,7 @@ impl MobileApp {
         self.new_session_open = false;
         self.new_session_project_id = None;
         self.new_session_workspace_id = None;
+        self.new_session_folder_id = None;
         self.new_session_runtime = None;
         self.new_session_picker = None;
         self.sidebar_projects_initialized = false;
@@ -8741,6 +8833,7 @@ impl MobileApp {
             self.runtime_options_open = false;
             self.new_session_project_id = None;
             self.new_session_workspace_id = None;
+            self.new_session_folder_id = None;
             self.new_session_picker = None;
         }
         self.overlay = None;
@@ -8970,6 +9063,7 @@ impl MobileApp {
             self.runtime_options_open = false;
             self.new_session_project_id = None;
             self.new_session_workspace_id = None;
+            self.new_session_folder_id = None;
             self.new_session_picker = None;
             // The first message's files and references belong to the page that
             // was just closed, not to the next one, and so do the worktree's
@@ -13724,6 +13818,21 @@ impl MobileApp {
                 );
             }
             SidebarRowKind::Folder => {
+                // The desktop's folder row offers a new chat in the folder from
+                // a hover button the phone cannot have, so the sheet carries the
+                // command instead: the same draft, started in the folder's own
+                // Worktree (or its project) and filed under the folder once the
+                // runtime answers.
+                let new_session_row = row.clone();
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-folder-new-session",
+                    mobile_new_session_in_folder_label(&row.label),
+                    false,
+                    Box::new(move |this, window, cx| {
+                        this.create_session_in_folder(&new_session_row, window, cx);
+                    }),
+                );
                 let rename_id = row.id().to_string();
                 sheet = entry(
                     sheet,
@@ -21620,35 +21729,18 @@ impl MobileApp {
             .state
             .or_else(|| session.map(|session| session.state))
             .unwrap_or(AgentSessionState::Idle);
-        let generating = matches!(
+        // What the trailing column holds, resolved in one place. Every rule here
+        // is a question about the whole column rather than about one mark — the
+        // label and the hour share a slot, the pin takes the column, and a row
+        // that reports something else does not also report an hour — so they are
+        // answered together and pinned by the tests at the bottom of this file.
+        let column = sidebar_session_column(
             session_state,
-            AgentSessionState::Running | AgentSessionState::Initializing
+            row.pinned,
+            row.unread,
+            row.selected,
+            row.auto_continue_paused,
         );
-        let needs_approval = session_state == AgentSessionState::NeedsInput;
-        let has_error = session_state == AgentSessionState::Error;
-        // A session that is still starting up, or one that has been filed away,
-        // wears its state in words: neither a pulse nor a dot says which of the
-        // two it is, and the phone has no tooltip to carry the difference. A
-        // pinned row keeps only its pin, which is the whole slot the desktop
-        // yields to it.
-        let state_label = sidebar_session_state_label(session_state).filter(|_| !row.pinned);
-        // A pinned row keeps its pin *and* its state: the pin is drawn after
-        // the state mark rather than in place of it. Losing the state to the
-        // pin hid exactly the rows the user cared enough to pin.
-        let show_status = !needs_approval
-            && !row.unread
-            && !has_error
-            && session_state != AgentSessionState::Idle;
-        // The label and the timestamp share one slot: a row reports its state in
-        // words when it has them, and the hour only when it does not. Waiting on
-        // the user and working are answered by their marks, so neither takes a
-        // timestamp with it, and a pinned row answers with its pin alone.
-        let show_time = !row.pinned
-            && !needs_approval
-            && !generating
-            && !row.unread
-            && !has_error
-            && state_label.is_none();
         let open_session_id = session_id.clone();
         let batch_session_id = session_id.clone();
         let delegated_child = row.delegated_child;
@@ -21837,26 +21929,32 @@ impl MobileApp {
                     .text_size(theme::font_sidebar_meta())
                     .text_color(theme::sidebar_session_meta())
                     // The desktop's own order, so a mark and whatever stands
-                    // beside it read as one statement: the state first, then the
-                    // words or the hour it carries, then the dots that qualify
-                    // it, and the pin in the trailing slot it owns.
-                    .when(show_status, |right| {
+                    // beside it read as one statement: the suspension first, then
+                    // the state, then the words or the hour it carries, then the
+                    // dots that qualify it, and the pin in the slot it owns.
+                    .when(column.show_paused, |right| {
+                        right.child(sidebar_pause_mark(ElementId::from(format!(
+                            "mobile-sidebar-paused-{}",
+                            row.id()
+                        ))))
+                    })
+                    .when(column.show_status, |right| {
                         right.child(sidebar_session_status_indicator(
                             session_state,
                             row.auto_continue,
                             ElementId::from(format!("mobile-sidebar-mark-{}", row.id())),
                         ))
                     })
-                    .when(needs_approval, |right| {
+                    .when(column.show_attention, |right| {
                         right.child(sidebar_attention_glyph(ElementId::from(format!(
                             "mobile-sidebar-attention-{}",
                             row.id()
                         ))))
                     })
-                    .when_some(state_label, |right, label| {
+                    .when_some(column.label, |right, label| {
                         right.child(sidebar_session_state_pill(label))
                     })
-                    .when(show_time, |right| {
+                    .when(column.show_time, |right| {
                         right.child(
                             div()
                                 .overflow_hidden()
@@ -21868,7 +21966,7 @@ impl MobileApp {
                                 ),
                         )
                     })
-                    .when(row.unread, |right| {
+                    .when(column.show_unread, |right| {
                         right.child(
                             div()
                                 .size(px(theme::SIDEBAR_UNREAD_DOT))
@@ -21880,7 +21978,7 @@ impl MobileApp {
                                 .bg(theme::primary()),
                         )
                     })
-                    .when(has_error, |right| {
+                    .when(column.show_error, |right| {
                         right.child(sidebar_status_dot(theme::accent_red()))
                     })
                     .when(row.pinned, |right| {
@@ -28385,6 +28483,19 @@ fn runtime_feature_input(input: &Entity<InputState>) -> gpui::Div {
         .child(Input::new(input).appearance(false))
 }
 
+/// The label a folder row's new-chat entry wears, in the desktop's own words.
+///
+/// The desktop names the destination because a folder row's "+" starts a
+/// session somewhere the reader cannot see from the row itself: inside that
+/// folder, in whichever project or Worktree owns it.
+fn mobile_new_session_in_folder_label(folder_name: &str) -> String {
+    match locale::current() {
+        Locale::En => format!("New chat in folder {folder_name}"),
+        Locale::ZhCn => format!("在「{folder_name}」文件夹中新建会话"),
+        Locale::ZhTw => format!("在「{folder_name}」資料夾中建立會話"),
+    }
+}
+
 fn sidebar_item_ref(item: &SidebarOrganizationItem) -> RemoteSidebarItemRef {
     let (kind, id) = match item {
         SidebarOrganizationItem::Folder(id) => (RemoteSidebarItemKind::Folder, id),
@@ -28769,6 +28880,107 @@ fn sidebar_session_state_pill(label: &'static str) -> gpui::AnyElement {
         .text_color(theme::sidebar_text_muted())
         .child(label)
         .into_any_element()
+}
+
+/// The auto continue suspension, at the head of the state column.
+///
+/// The desktop hangs a pause mark on a session whose auto continue the reader
+/// (or their own stop) suspended, and the phone had no way to say so: a paused
+/// session read as a plainly idle one, which is the one thing it is not. The
+/// tooltip the desktop explains it with rides on the accessible name here.
+fn sidebar_pause_mark(id: ElementId) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .size(px(16.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .aria_label(
+            locale::text("Auto continue paused", "自动继续已暂停", "自動繼續已暫停").to_string(),
+        )
+        .child(
+            svg()
+                .path("icons/pause.svg")
+                .size(px(14.0))
+                .flex_shrink_0()
+                .text_color(theme::sidebar_text_muted()),
+        )
+        .into_any_element()
+}
+
+/// What one session row's trailing column holds.
+///
+/// The column is one slot shared by several answers, so the marks are resolved
+/// together rather than one `when` at a time: whether the hour is drawn depends
+/// on the state, the pin, the unread dot, and the suspension, and a rule that
+/// lives beside its neighbours cannot drift from them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SidebarSessionColumn {
+    /// The working pulse, the archived dot, or the closed dot.
+    show_status: bool,
+    /// The question mark: the Agent parked on the user.
+    show_attention: bool,
+    /// The state in words, when a mark cannot carry it.
+    label: Option<&'static str>,
+    /// The hour, in the slot the words would take.
+    show_time: bool,
+    show_unread: bool,
+    show_error: bool,
+    /// The auto continue suspension.
+    show_paused: bool,
+}
+
+/// Resolves a session row's trailing column the way the desktop's does.
+///
+/// `pinned` is the row the reader keeps at the top, which yields the slot to its
+/// pin; `selected` is the session the reader has open, which the desktop never
+/// marks unread; and `auto_continue_paused` is a session whose automatic
+/// continuation was suspended, which is not the same thing as an idle one.
+fn sidebar_session_column(
+    state: AgentSessionState,
+    pinned: bool,
+    unread: bool,
+    selected: bool,
+    auto_continue_paused: bool,
+) -> SidebarSessionColumn {
+    let awaiting_user = state == AgentSessionState::NeedsInput;
+    let has_error = state == AgentSessionState::Error;
+    let working = matches!(
+        state,
+        AgentSessionState::Running | AgentSessionState::Initializing
+    );
+    // The desktop never marks the session the reader has open as unread: the
+    // completion has been read by the fact of the row being open.
+    let has_unread_completion = unread && !selected;
+    // A session that is still starting up, or one that has been filed away,
+    // wears its state in words: neither a pulse nor a dot says which of the two
+    // it is. A pinned row keeps only its pin, which is the whole slot the
+    // desktop yields to it.
+    let label = sidebar_session_state_label(state).filter(|_| !pinned);
+    SidebarSessionColumn {
+        // The mark answers every state but the three that own one: the question
+        // mark, the unread dot, and the danger dot.
+        show_status: !awaiting_user
+            && !has_unread_completion
+            && !has_error
+            && state != AgentSessionState::Idle,
+        show_attention: awaiting_user,
+        label,
+        // The words and the hour share the slot, and a row that is working,
+        // waiting on the reader, unread, failed, suspended, or pinned does not
+        // also report an hour.
+        show_time: !pinned
+            && !awaiting_user
+            && !working
+            && !has_unread_completion
+            && !has_error
+            && !auto_continue_paused
+            && label.is_none(),
+        show_unread: has_unread_completion,
+        show_error: has_error,
+        show_paused: auto_continue_paused,
+    }
 }
 
 /// How far a row's own content stops short of the list edge, so the trailing
@@ -33720,6 +33932,7 @@ fn session_opened(cx: &mut Context<Self>) {
             session_id: None,
             unread: false,
             auto_continue: false,
+            auto_continue_paused: false,
             delegated_child: false,
         };
         let open_menu = |app: &Entity<MobileApp>, cx: &mut gpui::VisualTestContext| {
@@ -34557,6 +34770,99 @@ fn session_opened(cx: &mut Context<Self>) {
         assert_eq!(
             theme::SIDEBAR_CARD_INSET + sidebar_trailing_menu_inset(true),
             strip
+        );
+    }
+
+    /// The pinned row answers with its pin, and nothing else in the column.
+    ///
+    /// The desktop yields the whole column to the pin, and the phone followed
+    /// the timestamp rule but not this one: a pinned session kept showing the
+    /// hour it was pinned for.
+    #[test]
+    fn a_pinned_row_reports_its_pin_alone() {
+        let idle = sidebar_session_column(AgentSessionState::Idle, true, false, false, false);
+        assert!(!idle.show_time, "a pinned row keeps no timestamp");
+        assert_eq!(idle.label, None);
+
+        let starting =
+            sidebar_session_column(AgentSessionState::Initializing, true, false, false, false);
+        assert_eq!(
+            starting.label, None,
+            "the pin owns the slot the state words would take"
+        );
+        assert!(starting.show_status, "the state mark still reports");
+    }
+
+    /// The session the reader has open is never marked unread.
+    #[test]
+    fn an_open_session_is_never_marked_unread() {
+        let closed = sidebar_session_column(AgentSessionState::Idle, false, true, false, false);
+        assert!(closed.show_unread);
+        assert!(!closed.show_time, "the unread dot takes the hour's slot");
+
+        let open = sidebar_session_column(AgentSessionState::Idle, false, true, true, false);
+        assert!(
+            !open.show_unread,
+            "an open session has been read by the fact of being open"
+        );
+        assert!(open.show_time, "and it reports its hour like any idle row");
+    }
+
+    /// A suspended session shows the pause mark instead of an hour.
+    #[test]
+    fn a_suspended_session_reports_the_pause_and_no_hour() {
+        let paused = sidebar_session_column(AgentSessionState::Idle, false, false, false, true);
+        assert!(paused.show_paused);
+        assert!(
+            !paused.show_time,
+            "a suspended row is not waiting on the clock"
+        );
+
+        let working = sidebar_session_column(AgentSessionState::Running, false, false, false, true);
+        assert!(
+            working.show_status && working.show_paused,
+            "a working session that is suspended reports both"
+        );
+
+        let plain = sidebar_session_column(AgentSessionState::Idle, false, false, false, false);
+        assert!(!plain.show_paused);
+        assert!(plain.show_time);
+    }
+
+    /// The two states a mark cannot carry take the hour's slot; the rest do not.
+    #[test]
+    fn the_states_with_words_take_the_hour_slot() {
+        for state in [AgentSessionState::Initializing, AgentSessionState::Archived] {
+            let column = sidebar_session_column(state, false, false, false, false);
+            assert!(column.label.is_some(), "{state:?} wears its state in words");
+            assert!(!column.show_time, "{state:?} does not also report an hour");
+            assert!(column.show_status, "{state:?} keeps its mark too");
+        }
+
+        // A closed session has a mark and an hour, which is what tells it apart
+        // from an archived one.
+        let closed = sidebar_session_column(AgentSessionState::Closed, false, false, false, false);
+        assert_eq!(closed.label, None);
+        assert!(closed.show_status && closed.show_time);
+
+        // The two states that own a mark report nothing else.
+        let waiting =
+            sidebar_session_column(AgentSessionState::NeedsInput, false, false, false, false);
+        assert!(waiting.show_attention);
+        assert!(!waiting.show_status && !waiting.show_time && waiting.label.is_none());
+
+        let failed = sidebar_session_column(AgentSessionState::Error, false, false, false, false);
+        assert!(failed.show_error);
+        assert!(!failed.show_status && !failed.show_time && failed.label.is_none());
+    }
+
+    /// A folder row's new-chat entry names the folder it starts in.
+    #[test]
+    fn the_new_chat_entry_names_its_folder() {
+        let label = mobile_new_session_in_folder_label("vibex");
+        assert!(
+            label.contains("vibex"),
+            "the entry has to say where the draft goes: {label}"
         );
     }
 }
