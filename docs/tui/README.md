@@ -717,10 +717,13 @@ copies the selection again if the clipboard was clobbered.
 
 A request the Agent is blocked on — an approval, or a question from a tool like
 `ask_user_question` — is a card that opens itself the moment it arrives, the way
-the desktop draws the same card inline in the timeline. `Esc` puts it down for
-now: it stays counted in the status band and on its transcript row, and `Enter`
-on that row asks for it again. The card does not open over a draft being typed;
-it waits until the reader leaves the Composer.
+the desktop draws the same card inline in the timeline. Nothing has to be found
+first: it opens over the Composer too, because a question that waits to be
+looked for is a question the Agent stays blocked on. Nothing of the reader's is
+lost to it — a draft being written stays exactly where it was, still visible
+under the card — and `Esc` puts the card down for now: it stays counted in the
+status band and on its transcript row, `Enter` on that row asks for it again,
+and the keyboard goes straight back to the draft.
 
 An approval card answers with `a` to allow, `d` to deny, `Ctrl+A` to allow for
 the rest of the session, and a digit for one of the options the request

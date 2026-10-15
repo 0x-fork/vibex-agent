@@ -560,18 +560,29 @@ fn a_letter_is_an_answer_in_a_text_field_and_a_shortcut_on_a_list() {
 }
 
 #[test]
-fn a_reader_mid_sentence_keeps_the_keyboard_until_they_leave_the_composer() {
-    // The desktop's card does not take the reader's focus, and neither does
-    // this one: a modal that opened over a half-written message would turn the
-    // next words they type into an answer. The band keeps counting, and the
-    // card is there the moment they step out of the draft.
+fn the_card_opens_over_the_composer_and_gives_it_back_on_escape() {
+    // The card is not something the reader has to go and find: it opens the
+    // moment the question arrives, the Composer's keyboard included, because a
+    // question that waits to be looked for is a question the Agent stays
+    // blocked on. Nothing of the reader's is lost to it — the draft stays where
+    // it was, and `Esc` hands the keyboard straight back.
     let mut app = app_with_question(vec![text_field("q", "Why?", true)], 100, 30);
     app.focus = vibex_tui::app::Focus::Composer;
-    assert!(!app.sync_pending_question());
-    assert!(app.overlay.is_none());
-    app.focus = vibex_tui::app::Focus::Main;
+    app.composer.set_text("a message I was writing");
     assert!(app.sync_pending_question());
     assert!(matches!(app.overlay, Some(Overlay::Elicitation { .. })));
+    // The question is what the card is about, and the draft is still there
+    // under it — nothing the reader wrote was taken away to ask.
+    let screen = screen(&mut app, 100, 30);
+    assert!(screen.contains("Why?"), "{screen}");
+    assert!(screen.contains("a message I was writing"), "{screen}");
+
+    app.perform(Intent::CloseOverlay);
+    assert!(app.overlay.is_none());
+    assert_eq!(app.composer.text(), "a message I was writing");
+    assert_eq!(app.focus, vibex_tui::app::Focus::Composer);
+    // And it stays down: `Esc` means later, not "ask me again next frame".
+    assert!(!app.sync_pending_question());
 }
 
 #[test]

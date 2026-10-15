@@ -4261,14 +4261,14 @@ impl App {
     /// The desktop draws the approval card and the elicitation form inline in
     /// the timeline, so both are visible without a gesture. The transcript here
     /// is a block list with no controls in it, so the same card is a modal that
-    /// opens itself the first time a request appears on the page the reader
-    /// owns. A question already offered — or put down with `Esc` — is left
-    /// alone; `Enter` on its transcript row asks for it again.
+    /// opens itself the moment a request appears on the page the reader owns —
+    /// the Composer's keyboard included: a question that waited for the reader
+    /// to go looking for it is a question the Agent stays blocked on.
     ///
-    /// A reader mid-sentence keeps the keyboard: the desktop's card does not
-    /// take their focus either, and a modal that opened over a half-written
-    /// message would turn the next words they type into an answer. The card
-    /// waits for them to leave the composer, and the band goes on counting.
+    /// Nothing of the reader's is lost to it. A draft being written stays in
+    /// the Composer exactly as it was, and `Esc` puts the card down and hands
+    /// the keyboard straight back to it. A question already offered — or put
+    /// down — is left alone; `Enter` on its transcript row asks for it again.
     ///
     /// Returns whether the frame changed.
     pub fn sync_pending_question(&mut self) -> bool {
@@ -4286,7 +4286,7 @@ impl App {
             }
             _ => {}
         }
-        if self.overlay.is_some() || !self.page_owns_session() || self.focus == Focus::Composer {
+        if self.overlay.is_some() || !self.page_owns_session() {
             return false;
         }
         // Both projections are read once: they walk the timeline, and this runs

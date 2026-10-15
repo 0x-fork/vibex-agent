@@ -127,9 +127,12 @@ without fetching a record before creation has completed.
   controls in it, so the card is a modal that offers itself. A request already
   offered, or put down with `Esc`, is not offered again: `Enter` on its pending
   transcript row is the way back, and the status band keeps counting it.
-- The card waits while the Composer holds the keyboard. A reader mid-message
-  keeps their keystrokes; the card opens when they leave the draft. Answers
-  cannot be typed into by a reader who was writing something else.
+- The card opens the moment the request appears, the Composer's keyboard
+  included: the reader must not have to navigate to the question before it can
+  be answered. Nothing of the reader's is lost to it — a draft stays in the
+  Composer, still drawn under the card — and `Esc` puts the card down and
+  returns the keyboard to whatever held it. Closing the card never clears,
+  submits, or edits the draft.
 - The elicitation form pins the request it opened on and drafts answers per
   request. A second question arriving while the reader is filling the first in
   cannot swap the fields under their cursor, and what was typed for one request
@@ -161,7 +164,7 @@ without fetching a record before creation has completed.
 | Text transitions are disabled | Show updated labels immediately and do not replay them when re-enabled. |
 | A placeholder snapshot arrives for a session created here | The row keeps the reader's message until a title that is not the placeholder arrives. |
 | A title the authority supplies lands, then a placeholder snapshot follows | The authority's title stands; the reader's recorded name is not consulted again. |
-| A question arrives while the reader is typing a message | Keep the composer's keyboard; open the card once they leave the draft. |
+| A question arrives while the reader is typing a message | Open the card over the Composer; leave the draft untouched and give the keyboard back on `Esc`. |
 | A second question arrives while the form is open | The open form keeps its request and its answers; the next one opens after this is answered. |
 | A required field is blank when the form is submitted | Keep the form open and report it; send no resolution. |
 | The reader presses `Esc` on a card | Put it down and do not reopen it on a later frame; the band and the row keep counting it. |
@@ -197,13 +200,14 @@ without fetching a record before creation has completed.
   repaint. Cover existing-session runtime switches with the picker open/closed,
   the disabled setting, and transitions cleared when changing composer targets.
 - `tests/elicitation.rs` drives the card through public intents and effects and
-  asserts on the drawn frame. Cover: a pending request opening itself, `Esc`
-  keeping it down, `Enter` on its transcript row bringing it back, the Composer
-  keeping the keyboard, walking fields and options, choosing an option by arrow
-  and by digit, ticking a multi-select, flipping a boolean, typing and rubbing
-  out an answer, a blank required field keeping the form open, `Ctrl+D`
-  declining with no answers, a second question taking the first one's place,
-  and an approval opening the same way.
+  asserts on the drawn frame. Cover: a pending request opening itself, opening
+  over the Composer with the draft left intact and the keyboard handed back on
+  `Esc`, `Esc` keeping it down, `Enter` on its transcript row bringing it back,
+  walking fields and options, choosing an option by arrow and by digit, ticking
+  a multi-select, flipping a boolean, typing and rubbing out an answer, a blank
+  required field keeping the form open, `Ctrl+D` declining with no answers, a
+  second question taking the first one's place, and an approval opening the
+  same way.
 - PTY scenarios own temporary interface, runtime-preference, and keymap files.
   Pinning `LC_ALL` alone is insufficient because remembered locale settings
   outrank environment detection.
