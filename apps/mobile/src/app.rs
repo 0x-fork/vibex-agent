@@ -700,12 +700,12 @@ struct SidebarRowMenu {
     row: SidebarRow,
 }
 
+/// What an entry of a bottom sheet does when tapped. Boxed so a sheet can build
+/// its entries uniformly, whatever opened it.
+type SheetAction = Box<dyn Fn(&mut MobileApp, &mut Window, &mut Context<MobileApp>)>;
+
 /// A folder name being entered. Folder ids are minted by the Desktop, so the
 /// phone only carries the name and where the folder should land.
-/// What a row-menu entry does when tapped. Boxed so the sheet can build its
-/// entries uniformly regardless of which row kind opened it.
-type SidebarMenuAction = Box<dyn Fn(&mut MobileApp, &mut Window, &mut Context<MobileApp>)>;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SidebarNamePrompt {
     CreateFolder {
@@ -7494,17 +7494,19 @@ impl MobileApp {
         cx.notify();
     }
 
-    /// Picks the row body up for a move.
+    /// The row body a press at `position` landed on, if it landed on one.
     ///
-    /// This runs from the long-press recognizer, not from the touch's scroll
-    /// stream: the platform reports a pan only once the finger has already
-    /// travelled past its slop, so a stationary press never reached the old
-    /// arming path at all. By the time this is called the press has already
-    /// been held, so the drag starts immediately. Trailing buttons remain
-    /// normal tap targets and never start a drag underneath themselves.
-    fn begin_sidebar_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+    /// Rows are a uniform height and the list records its own frame, so a touch
+    /// resolves to a row without per-row bounds. A press that lands on the
+    /// trailing controls, arrives while the drawer is searching or selecting,
+    /// or falls outside the list has no row body to act on.
+    fn sidebar_row_body_at(
+        &self,
+        position: Point<Pixels>,
+        cx: &Context<Self>,
+    ) -> Option<(usize, SidebarRow)> {
         if self.sidebar_search_open || self.sidebar_batch_mode {
-            return;
+            return None;
         }
         let (list_top, list_right) = self.sidebar_list_frame.get();
         let rows = self.mobile_sidebar_rows(self.sidebar_search_input.read(cx).value().as_ref());
@@ -7516,10 +7518,30 @@ impl MobileApp {
             f32::from(theme::sidebar_row_height()),
         );
         if row_position < 0.0 {
-            return;
+            return None;
         }
         let index = row_position.floor() as usize;
-        let Some(row) = rows.get(index).cloned() else {
+        let row = rows.get(index).cloned()?;
+        if press_is_on_trailing_actions(
+            f32::from(position.x),
+            list_right,
+            self.sidebar_drag_action_width(&row),
+        ) {
+            return None;
+        }
+        Some((index, row))
+    }
+
+    /// Picks the row body up for a move.
+    ///
+    /// This runs from the long-press recognizer, not from the touch's scroll
+    /// stream: the platform reports a pan only once the finger has already
+    /// travelled past its slop, so a stationary press never reached the old
+    /// arming path at all. By the time this is called the press has already
+    /// been held, so the drag starts immediately. Trailing buttons remain
+    /// normal tap targets and never start a drag underneath themselves.
+    fn begin_sidebar_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some((index, row)) = self.sidebar_row_body_at(position, cx) else {
             return;
         };
         if row.kind == SidebarRowKind::EmptyWorkspace || row.delegated_child {
@@ -7534,13 +7556,6 @@ impl MobileApp {
         if !can_organize {
             return;
         }
-        if press_is_on_trailing_actions(
-            f32::from(position.x),
-            list_right,
-            self.sidebar_drag_action_width(&row),
-        ) {
-            return;
-        }
         self.sidebar_drag = Some(SidebarDrag {
             index,
             row,
@@ -7549,12 +7564,64 @@ impl MobileApp {
         cx.notify();
     }
 
-    /// A long press picks a row up; the recognizer keeps reporting that same
-    /// touch as it travels, which is the drag that moves the row. A plain pan
-    /// never reaches here, so scrolling the list can never start a move.
-    fn on_sidebar_row_long_press(&mut self, event: &LongPressEvent, cx: &mut Context<Self>) {
+    /// Opens the row's own actions for a press that landed on the row body,
+    /// the way the row's trailing menu control does, and reports whether it
+    /// did.
+    ///
+    /// A phone press is a target the size of a fingertip, and the trailing
+    /// control is a 34pt glyph at the very edge of a drawer that is itself at
+    /// the edge of the screen: a project, folder, or session row answers the
+    /// press anywhere along its body instead. The press is claimed as a long
+    /// press, so the release that ends it is not replayed as the tap that would
+    /// dismiss the sheet it just opened.
+    fn open_sidebar_row_menu_from_press(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((_, row)) = self.sidebar_row_body_at(position, cx) else {
+            return false;
+        };
+        let can_organize = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentSidebarOrganizationMutate)
+        });
+        // Worktrees and groups keep the press for a move: reordering them is
+        // the whole of what the drag is for, and a worktree row's own actions
+        // stay behind its trailing control.
+        if !matches!(
+            row.kind,
+            SidebarRowKind::Project | SidebarRowKind::Folder | SidebarRowKind::Session
+        ) || !self.sidebar_row_shows_menu(&row, can_organize)
+        {
+            return false;
+        }
+        self.sidebar_row_menu = Some(SidebarRowMenu { row });
+        window.prevent_default();
+        cx.stop_propagation();
+        cx.notify();
+        true
+    }
+
+    /// A long press either opens a row's own actions or picks the row up; the
+    /// recognizer keeps reporting that same touch as it travels, which is the
+    /// drag that moves a row it picked up. A plain pan never reaches here, so
+    /// scrolling the list can never start a move.
+    fn on_sidebar_row_long_press(
+        &mut self,
+        event: &LongPressEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event.phase {
-            TouchPhase::Started => self.begin_sidebar_drag(event.position, cx),
+            TouchPhase::Started => {
+                if !self.open_sidebar_row_menu_from_press(event.position, window, cx) {
+                    self.begin_sidebar_drag(event.position, cx);
+                }
+            }
             TouchPhase::Moved => {
                 if self.sidebar_drag.is_some() {
                     self.advance_sidebar_drag(event.position, cx);
@@ -8777,6 +8844,13 @@ impl MobileApp {
         // A connection attempt can outlive the transport RPC budget (30s/120s)
         // with every button on the page disabled. Back has to be able to leave
         // it, otherwise the screen is a dead end for the whole timeout.
+        // A row's own actions are a sheet over the whole page, so back closes
+        // them before it reaches the drawer they were opened from.
+        if self.sidebar_row_menu.is_some() {
+            self.sidebar_row_menu = None;
+            cx.notify();
+            return;
+        }
         if self.sidebar_batch_delete_confirmation {
             self.sidebar_batch_delete_confirmation = false;
             cx.notify();
@@ -11930,49 +12004,13 @@ impl MobileApp {
         trailing: Option<gpui::AnyElement>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        div()
-            .h(px(theme::DRAWER_HEADER_HEIGHT))
-            .flex_shrink_0()
-            .border_b_1()
-            .border_color(theme::border_subtle())
-            .pl(px(theme::SPACING_MD))
-            .pr(px(theme::SPACING_XS))
-            .flex()
-            .items_center()
-            .gap(px(theme::SPACING_SM))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(theme::font_heading())
-                    .text_color(theme::text_primary())
-                    .child(title),
-            )
-            .children(trailing)
-            .child(
-                div()
-                    .id("pairing-sheet-close")
-                    .aria_label(locale::common("Close"))
-                    .size(px(theme::TOUCH_TARGET))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .active(|style| style.opacity(0.65))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.dismiss_pairing_panel(cx)),
-                    )
-                    .child(
-                        svg()
-                            .path("icons/x.svg")
-                            .size(px(theme::ICON_SM))
-                            .text_color(theme::text_muted()),
-                    ),
-            )
-            .into_any_element()
+        bottom_sheet_header(
+            title,
+            "pairing-sheet-close",
+            trailing,
+            Box::new(|this, _, cx| this.dismiss_pairing_panel(cx)),
+            cx,
+        )
     }
 
     /// The three ways to reach a runtime, in one row at the foot of the page.
@@ -12819,7 +12857,7 @@ impl MobileApp {
                     root.child(backdrop).child(drawer)
                 })
                 .when_some(row_menu, |root, menu| {
-                    root.child(self.render_sidebar_row_menu(&menu, cx))
+                    root.child(self.render_sidebar_row_menu(&menu, window, cx))
                 })
                 .when_some(name_prompt, |root, prompt| {
                     root.child(self.render_folder_name_prompt(&prompt, cx))
@@ -13495,39 +13533,25 @@ impl MobileApp {
 
     /// Row actions that are too rare to sit permanently on a touch row. What
     /// the sheet offers depends on what the row is.
+    ///
+    /// The entries come up from the bottom edge, the way the pairing fallbacks
+    /// do: the sheet is opened from the drawer, which is already against the
+    /// left edge with the finger near the foot of the screen, so a panel that
+    /// rises from that edge is where the thumb already is — and its header
+    /// names the row the entries belong to.
     fn render_sidebar_row_menu(
         &self,
         menu: &SidebarRowMenu,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let row = menu.row.clone();
-        let mut sheet = div()
-            .w_full()
-            .max_w(px(360.0))
-            .rounded(px(theme::RADIUS_CARD))
-            .border_1()
-            .border_color(theme::border_default())
-            .bg(theme::bg_card())
-            .p_2()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_size(theme::font_caption())
-                    .text_color(theme::text_muted())
-                    .child(row.label.clone()),
-            );
+        let mut sheet = div().p_2().flex().flex_col().gap(px(2.0));
         let entry = |sheet: gpui::Div,
                      id: &'static str,
                      label: String,
                      destructive: bool,
-                     action: SidebarMenuAction| {
+                     action: SheetAction| {
             sheet.child(
                 div()
                     .id(id)
@@ -14024,14 +14048,15 @@ impl MobileApp {
         }
 
         div()
+            .id("mobile-sidebar-row-menu")
+            .debug_selector(|| "mobile-sidebar-row-menu".to_string())
             .absolute()
             .inset_0()
             .occlude()
             .bg(theme::backdrop(0.72))
-            .p_4()
             .flex()
-            .items_center()
-            .justify_center()
+            .flex_col()
+            .justify_end()
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -14039,7 +14064,41 @@ impl MobileApp {
                     cx.notify();
                 }),
             )
-            .child(sheet)
+            .child(
+                div()
+                    .id("mobile-sidebar-row-menu-sheet")
+                    .debug_selector(|| "mobile-sidebar-row-menu-sheet".to_string())
+                    .w_full()
+                    .max_h(bottom_sheet_max_height(window))
+                    .flex()
+                    .flex_col()
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .overflow_hidden()
+                    // The sheet owns its own taps: only the scrim dismisses it.
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(bottom_sheet_header(
+                        row.label.as_str(),
+                        "mobile-sidebar-row-menu-close",
+                        None,
+                        Box::new(|this, _, cx| {
+                            this.sidebar_row_menu = None;
+                            cx.notify();
+                        }),
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .id("mobile-sidebar-row-menu-body")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .restrict_scroll_to_axis()
+                            .child(sheet),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -22674,18 +22733,19 @@ impl MobileApp {
                                         ));
                                     },
                                     move |bounds, _, window, _| {
-                                        // A row is picked up by a long press,
-                                        // and the platform keeps reporting that
-                                        // same touch as it travels. Registering
-                                        // the listener from the list's own paint
-                                        // pass is what makes the gesture the
-                                        // list's to claim: a press anywhere else
-                                        // is never a row move.
+                                        // A row answers a long press on its
+                                        // body — with its own actions, or by
+                                        // being picked up when the platform
+                                        // keeps reporting that same touch as it
+                                        // travels. Registering the listener from
+                                        // the list's own paint pass is what
+                                        // makes the gesture the list's to claim:
+                                        // a press anywhere else is never a row's.
                                         window.on_mouse_event({
                                             let entity = long_press_entity.clone();
                                             move |event: &LongPressEvent,
                                                   phase: DispatchPhase,
-                                                  _: &mut Window,
+                                                  window: &mut Window,
                                                   cx: &mut gpui::App| {
                                                 if phase != DispatchPhase::Bubble
                                                     || !bounds.contains(&event.position)
@@ -22693,7 +22753,9 @@ impl MobileApp {
                                                     return;
                                                 }
                                                 let _ = entity.update(cx, |this, cx| {
-                                                    this.on_sidebar_row_long_press(event, cx)
+                                                    this.on_sidebar_row_long_press(
+                                                        event, window, cx,
+                                                    )
                                                 });
                                             }
                                         });
@@ -23531,7 +23593,7 @@ impl Render for MobileApp {
                 .pl(insets.left)
                 .child(match visible_mode {
                     RootMode::Pairing => self
-                        .render_pairing(pairing_sheet_max_height(window), window, cx)
+                        .render_pairing(bottom_sheet_max_height(window), window, cx)
                         .into_any_element(),
                     RootMode::Connecting => self.render_connecting(window, cx).into_any_element(),
                     RootMode::Workspace => self
@@ -23546,12 +23608,14 @@ impl Render for MobileApp {
     }
 }
 
-/// How tall a pairing sheet may grow before its body scrolls instead.
+/// How tall a sheet that rises from the bottom edge may grow before its body
+/// scrolls instead.
 ///
-/// A sheet never takes the whole page: the wordmark above it and the entries
-/// it explains stay in sight behind the scrim.
-fn pairing_sheet_max_height(window: &Window) -> Pixels {
-    px(f32::from(window.viewport_size().height) * PAIRING_SHEET_HEIGHT_RATIO)
+/// A sheet never takes the whole page: whatever it explains — the wordmark and
+/// the entries above a pairing fallback, the rows around a sidebar row's own
+/// actions — stays in sight behind the scrim.
+fn bottom_sheet_max_height(window: &Window) -> Pixels {
+    px(f32::from(window.viewport_size().height) * BOTTOM_SHEET_HEIGHT_RATIO)
 }
 
 /// How much of the page the saved-runtime list may take before it scrolls.
@@ -26816,7 +26880,7 @@ impl MobileApp {
         match overlay {
             MobileOverlay::Team => self.render_team(cx),
             MobileOverlay::Pairing => self
-                .render_pairing(pairing_sheet_max_height(window), window, cx)
+                .render_pairing(bottom_sheet_max_height(window), window, cx)
                 .into_any_element(),
             MobileOverlay::HostDetail => self.render_host_detail(cx),
             MobileOverlay::HostActions => self.render_host_actions_sheet(cx),
@@ -28736,11 +28800,12 @@ const PAIRING_PAGE_TOP_PAD: f32 = 88.0;
 /// first screen's wordmark line.
 const PAIRING_SWITCHER_TOP_PAD: f32 = 56.0;
 
-/// The share of the page a pairing sheet may cover before its body scrolls.
+/// The share of the page a sheet that rises from the bottom edge may cover
+/// before its body scrolls.
 ///
-/// A sheet always leaves the wordmark and the entries above it in sight, so the
-/// screen never becomes a sheet with nothing behind it.
-const PAIRING_SHEET_HEIGHT_RATIO: f32 = 0.62;
+/// A sheet always leaves the page it explains in sight, so the screen never
+/// becomes a sheet with nothing behind it.
+const BOTTOM_SHEET_HEIGHT_RATIO: f32 = 0.62;
 
 /// How tall one saved-runtime row is: a touch target with the room its state
 /// dot, its name and its own actions control need.
@@ -28844,6 +28909,68 @@ fn pairing_action_button(
                 .text_color(content_color)
                 .child(label),
         )
+}
+
+/// The header every sheet that comes up from the bottom edge carries: what the
+/// sheet is, whatever its own state needs beside that, and the one control that
+/// closes it.
+///
+/// The pairing fallbacks and the sidebar's row menu are the same object seen
+/// from two pages — the ways on from where the finger already is — so they wear
+/// one header instead of two that drift apart.
+fn bottom_sheet_header(
+    title: &str,
+    close_id: &'static str,
+    trailing: Option<gpui::AnyElement>,
+    close: SheetAction,
+    cx: &mut Context<MobileApp>,
+) -> gpui::AnyElement {
+    div()
+        .h(px(theme::DRAWER_HEADER_HEIGHT))
+        .flex_shrink_0()
+        .border_b_1()
+        .border_color(theme::border_subtle())
+        .pl(px(theme::SPACING_MD))
+        .pr(px(theme::SPACING_XS))
+        .flex()
+        .items_center()
+        .gap(px(theme::SPACING_SM))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(theme::font_heading())
+                .text_color(theme::text_primary())
+                .child(title.to_string()),
+        )
+        .children(trailing)
+        .child(
+            div()
+                .id(close_id)
+                .aria_label(locale::common("Close"))
+                .size(px(theme::TOUCH_TARGET))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .active(|style| style.opacity(0.65))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        close(this, window, cx);
+                    }),
+                )
+                .child(
+                    svg()
+                        .path("icons/x.svg")
+                        .size(px(theme::ICON_SM))
+                        .text_color(theme::text_muted()),
+                ),
+        )
+        .into_any_element()
 }
 
 /// A state action in a pairing sheet header, beside its close control: retry a
@@ -32012,7 +32139,7 @@ mod tests {
         let sheet = cx
             .debug_bounds("pairing-sheet")
             .expect("the find sheet should stay laid out");
-        let cap = cx.update(|window, _| pairing_sheet_max_height(window));
+        let cap = cx.update(|window, _| bottom_sheet_max_height(window));
         assert!(
             sheet.size.height <= cap,
             "the sheet should stop at its cap: {:?} vs {cap:?}",
@@ -33482,13 +33609,14 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(source.contains("self.selection_menu.clone()"));
     }
 
-    /// A row is picked up by a long press, and the platform reports a touch as
-    /// a pan only once the finger has travelled past its slop — so arming from
+    /// A row answers a long press itself, and the platform reports a touch as a
+    /// pan only once the finger has travelled past its slop — so arming from
     /// the scroll stream could never fire for the stationary press the gesture
-    /// is. The list has to listen for the long press itself, and the drag has
-    /// to be driven by that same touch as it moves.
+    /// is. The list has to listen for the long press from its own paint pass,
+    /// open the pressed row's own actions where the row has them, and drive the
+    /// move for the rows that keep the gesture from that same touch.
     #[test]
-    fn the_sidebar_drag_is_armed_by_a_long_press() {
+    fn a_sidebar_row_answers_a_long_press_itself() {
         let source = include_str!("app.rs");
         let drawer = source
             .split_once("fn render_drawer")
@@ -33504,6 +33632,32 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             drawer.contains(".on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))"),
             "a pan over the list is a scroll, never the start of a row move"
+        );
+
+        // A project, folder, or session row answers the press with its own
+        // actions, anywhere along the row: the trailing control is a 34pt glyph
+        // at the edge of the screen, and a fingertip is not.
+        let opener = source
+            .split_once("fn open_sidebar_row_menu_from_press")
+            .map(|(_, tail)| tail.split_once("\n    fn ").map_or(tail, |(body, _)| body))
+            .expect("the press-to-actions path should stay inspectable");
+        assert!(opener.contains("self.sidebar_row_body_at(position, cx)"));
+        assert!(opener.contains("self.sidebar_row_shows_menu(&row, can_organize)"));
+        assert!(opener.contains("self.sidebar_row_menu = Some(SidebarRowMenu { row })"));
+        for kind in [
+            "SidebarRowKind::Project",
+            "SidebarRowKind::Folder",
+            "SidebarRowKind::Session",
+        ] {
+            assert!(
+                opener.contains(kind),
+                "{kind} rows should answer a press with their own actions"
+            );
+        }
+        assert!(
+            opener.contains("window.prevent_default()"),
+            "the sheet appears under the finger that opened it, so the release \
+             must not be replayed as the tap that would dismiss it"
         );
 
         // Both drag steps take the touch position the long press reports: a
@@ -33524,10 +33678,127 @@ fn session_opened(cx: &mut Context<Self>) {
             .split_once("fn on_sidebar_row_long_press")
             .map(|(_, tail)| tail.split_once("\n    fn ").map_or(tail, |(body, _)| body))
             .expect("the long-press handler should stay inspectable");
+        assert!(
+            handler.contains("self.open_sidebar_row_menu_from_press(event.position, window, cx)")
+        );
         assert!(handler.contains("self.begin_sidebar_drag(event.position, cx)"));
         assert!(handler.contains("self.advance_sidebar_drag(event.position, cx)"));
         assert!(handler.contains("self.finish_sidebar_drag(false, cx)"));
         assert!(handler.contains("self.finish_sidebar_drag(true, cx)"));
+    }
+
+    /// The row's own actions come up from the bottom edge, the way the pairing
+    /// fallbacks do, and the scrim around them is what dismisses them.
+    ///
+    /// A sheet that took the middle of the page would sit under the finger that
+    /// opened it and cover the row it belongs to; one whose own body dismissed
+    /// it would close on the first entry the reader tried to tap.
+    #[gpui::test]
+    fn the_sidebar_row_menu_rises_from_the_bottom_edge(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app
+        });
+        cx.run_until_parked();
+        let row = SidebarRow {
+            item: SidebarOrganizationItem::Project("project-1".to_string()),
+            kind: SidebarRowKind::Project,
+            depth: 0,
+            indent: 0.0,
+            label: "Vibex".to_string(),
+            project_id: Some("project-1".to_string()),
+            workspace_id: None,
+            detail: None,
+            child_count: 2,
+            collapsed: false,
+            pinned: false,
+            selected: false,
+            state: None,
+            session_id: None,
+            unread: false,
+            auto_continue: false,
+            delegated_child: false,
+        };
+        let open_menu = |app: &Entity<MobileApp>, cx: &mut gpui::VisualTestContext| {
+            app.update(cx, |app, cx| {
+                app.sidebar_row_menu = Some(SidebarRowMenu { row: row.clone() });
+                cx.notify();
+            });
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        };
+
+        open_menu(&app, cx);
+        let sheet = cx
+            .debug_bounds("mobile-sidebar-row-menu-sheet")
+            .expect("the row's actions should be laid out");
+        let (page, cap) =
+            cx.update(|window, _| (window.viewport_size(), bottom_sheet_max_height(window)));
+        assert!(
+            sheet.size.height <= cap,
+            "the sheet should stop at its cap: {:?} vs {cap:?}",
+            sheet.size
+        );
+        assert!(
+            sheet.origin.y + sheet.size.height >= page.height - px(1.0),
+            "the sheet should sit against the bottom edge: {sheet:?} of {page:?}"
+        );
+        assert!(
+            sheet.size.height > px(theme::DRAWER_HEADER_HEIGHT + theme::TOUCH_TARGET),
+            "the sheet is its header and the entries under it: {:?}",
+            sheet.size
+        );
+
+        // The sheet owns its own taps: only the scrim around it dismisses it.
+        // The tap lands in the header, beside the close control.
+        cx.simulate_click(
+            point(
+                sheet.center().x,
+                sheet.origin.y + px(theme::DRAWER_HEADER_HEIGHT / 2.0),
+            ),
+            gpui::Modifiers::none(),
+        );
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.sidebar_row_menu.is_some()),
+            "a tap on the sheet itself must not dismiss it"
+        );
+
+        cx.simulate_click(
+            point(sheet.center().x, sheet.origin.y - px(4.0)),
+            gpui::Modifiers::none(),
+        );
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.sidebar_row_menu.is_none())
+                && cx.debug_bounds("mobile-sidebar-row-menu-sheet").is_none(),
+            "the scrim should dismiss the sheet"
+        );
+
+        // The header's own control is the other way out. It is the square at
+        // the header's trailing edge: the header pads its right side by the
+        // small spacing and gives the control a whole touch target.
+        open_menu(&app, cx);
+        let close = point(
+            sheet.origin.x + sheet.size.width - px(theme::SPACING_XS + theme::TOUCH_TARGET / 2.0),
+            sheet.origin.y + px(theme::DRAWER_HEADER_HEIGHT / 2.0),
+        );
+        cx.simulate_click(close, gpui::Modifiers::none());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.sidebar_row_menu.is_none()),
+            "the header's close control should dismiss the sheet"
+        );
     }
 
     fn host_bundle(server_id: &str, display_name: &str) -> MobileCredentialBundle {
