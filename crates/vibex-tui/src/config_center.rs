@@ -3739,6 +3739,10 @@ pub struct AgentAuthView {
     pub selected: usize,
     /// Whether the catalogue is still being read.
     pub loading: bool,
+    /// Whether the sign-out has been asked about and is waiting for its answer.
+    /// The impact is read out before the second press, because a sign-out that
+    /// also ends the reader's sessions is not a decision to make blind.
+    pub confirming_sign_out: bool,
     pub notice: Option<(String, ConfigTone)>,
 }
 

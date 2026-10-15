@@ -8392,6 +8392,29 @@ fn render_agent_auth(
         }
         lines.push(Line::from(spans));
     }
+    // The sign-out question is drawn where the reader's eyes already are, with
+    // the count the authority would hold them to.
+    if view.confirming_sign_out {
+        let count = app
+            .management_data
+            .agent_auth_logout
+            .as_ref()
+            .map(|preview| preview.affected_session_ids.len())
+            .unwrap_or(0);
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {}",
+                strings
+                    .config_auth_sign_out_impact()
+                    .replace("{count}", &count.to_string())
+            ),
+            chip_style(crate::config_center::ConfigTone::Warn, theme),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", strings.config_auth_sign_out_confirm()),
+            Style::default().fg(theme.roles.gray_bright),
+        )));
+    }
     if let Some((notice, tone)) = &view.notice {
         lines.push(Line::from(Span::styled(
             format!("  {notice}"),

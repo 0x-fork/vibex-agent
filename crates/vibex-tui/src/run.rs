@@ -2493,6 +2493,17 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
+        AppMessage::AgentAuthLogoutPreview(result) => match result {
+            Ok(preview) => {
+                app.management_data.agent_auth_logout = Some(*preview);
+            }
+            Err(error) => {
+                app.toast(Toast::danger(error.message));
+                if let Some(Overlay::AgentAuth { view }) = app.overlay.as_mut() {
+                    view.confirming_sign_out = false;
+                }
+            }
+        },
         AppMessage::AgentAuthCatalog(result) => {
             let agent_id = match &result {
                 Ok(catalog) => catalog.agent_id.as_str().to_string(),

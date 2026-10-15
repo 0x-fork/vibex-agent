@@ -2581,6 +2581,7 @@ fn an_agents_account_is_read_as_one_list() {
             title: "Codex".to_string(),
             selected: 4,
             loading: false,
+            confirming_sign_out: false,
             notice: None,
         },
     });
@@ -2614,6 +2615,7 @@ fn signing_in_collects_what_the_method_needs() {
             title: "Codex".to_string(),
             selected: 1,
             loading: false,
+            confirming_sign_out: false,
             notice: None,
         },
     });
@@ -2660,18 +2662,22 @@ fn signing_in_collects_what_the_method_needs() {
     // The clear switch is what takes a stored value away, and it sends no value
     // with it.
     app.config_center.pending.clear();
+    let environment = app
+        .management_data
+        .agent_auth_catalog
+        .as_ref()
+        .expect("the catalogue")
+        .methods[0]
+        .environment
+        .clone();
+    let strings = app.strings;
     app.overlay = Some(Overlay::Form {
         form: vibex_tui::config_center::agent_auth_method_form(
             "codex",
             "chatgpt",
             "Sign in with ChatGPT",
-            &app.management_data
-                .agent_auth_catalog
-                .as_ref()
-                .unwrap()
-                .methods[0]
-                .environment,
-            app.strings,
+            &environment,
+            strings,
         ),
     });
     if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
@@ -2706,6 +2712,7 @@ fn a_methods_credential_page_is_opened_by_its_own_line() {
             title: "Codex".to_string(),
             selected: 0,
             loading: false,
+            confirming_sign_out: false,
             notice: None,
         },
     });
@@ -2716,4 +2723,105 @@ fn a_methods_credential_page_is_opened_by_its_own_line() {
         }
         other => panic!("the credential line produced {other:?}"),
     }
+}
+
+/// Signing out is asked about first, with what it would end.
+///
+/// A sign-out ends sessions that use the account, so the first press reads the
+/// impact out and the second is the answer. The authority refuses a count that
+/// no longer matches, which is what makes the preview a decision rather than a
+/// formality — and `Esc` gives up the question before it gives up the panel.
+#[test]
+fn signing_out_is_asked_about_with_what_it_ends() {
+    let mut app = loaded(140, 40);
+    app.capabilities.agent = vibex_backend::DomainCapabilities::available([
+        vibex_backend::BackendOperation::AgentAuthRead,
+        vibex_backend::BackendOperation::AgentAuthManage,
+    ]);
+    app.management_data.agent_auth_catalog = Some(agent_auth_catalog());
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+    app.overlay = Some(Overlay::AgentAuth {
+        view: vibex_tui::config_center::AgentAuthView {
+            agent_id: "codex".to_string(),
+            title: "Codex".to_string(),
+            // The sign-out line, which a signed-in account with a logout has.
+            selected: 6,
+            loading: false,
+            confirming_sign_out: false,
+            notice: None,
+        },
+    });
+
+    // The first press asks what it would end rather than signing out.
+    let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::PreviewAgentAuthLogout { agent_id }] => {
+            assert_eq!(agent_id.as_str(), "codex");
+        }
+        other => panic!("the sign-out did not ask first: {other:?}"),
+    }
+    assert!(
+        matches!(
+            &app.overlay,
+            Some(Overlay::AgentAuth { view }) if view.confirming_sign_out
+        ),
+        "the question was not marked on the panel"
+    );
+
+    // The answer carries the impact the reader was shown.
+    app.management_data.agent_auth_logout = Some(
+        serde_json::from_value(serde_json::json!({
+            "context": {
+                "id": "agent_auth_context_codex",
+                "agentId": "codex",
+                "status": "authenticated",
+                "revision": 7,
+                "createdAtMs": 1,
+                "updatedAtMs": 1
+            },
+            "affectedSessionIds": ["session_one", "session_two"]
+        }))
+        .expect("logout preview fixture"),
+    );
+    let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::LogoutAgentAuthContext {
+                auth_context_id,
+                expected_context_revision,
+                confirmed_affected_session_count,
+            } = mutation
+            else {
+                panic!("the sign-out was not a sign-out: {mutation:?}");
+            };
+            assert_eq!(auth_context_id, "agent_auth_context_codex");
+            assert_eq!(*expected_context_revision, 7);
+            assert_eq!(
+                *confirmed_affected_session_count, 2,
+                "the count the reader saw is not the count they confirmed"
+            );
+        }
+        other => panic!("the sign-out produced {other:?}"),
+    }
+
+    // `Esc` gives up the question, not the panel.
+    app.config_center.pending.clear();
+    app.overlay = Some(Overlay::AgentAuth {
+        view: vibex_tui::config_center::AgentAuthView {
+            agent_id: "codex".to_string(),
+            title: "Codex".to_string(),
+            selected: 6,
+            loading: false,
+            confirming_sign_out: true,
+            notice: None,
+        },
+    });
+    app.perform(vibex_tui::action::Intent::Back);
+    assert!(
+        matches!(
+            &app.overlay,
+            Some(Overlay::AgentAuth { view }) if !view.confirming_sign_out
+        ),
+        "the first Esc closed the panel instead of the question"
+    );
 }

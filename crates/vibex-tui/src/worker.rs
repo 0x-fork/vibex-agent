@@ -180,6 +180,8 @@ pub enum AppMessage {
     NativeExportHistory(BackendResult<Vec<vibex_core::ProviderNativeExportRecordSummary>>),
     /// One Agent's account, and the ways in it advertises.
     AgentAuthCatalog(BackendResult<Box<vibex_core::AgentAuthCatalog>>),
+    /// What signing out of one Agent's account would end.
+    AgentAuthLogoutPreview(BackendResult<Box<vibex_core::AgentAuthContextLogoutPreview>>),
     ProviderTest(BackendResult<vibex_core::AgentModelProviderProfileTestResult>),
     ProviderModels(BackendResult<Vec<vibex_core::ProviderConfiguredModel>>),
     Agents(BackendResult<Vec<vibex_core::AgentSnapshotEntry>>),
@@ -668,6 +670,18 @@ impl Dispatch {
                         warned: false,
                         message: format!("{} {}", result.files.len(), "files"),
                     })
+            }
+            M::LogoutAgentAuthContext {
+                auth_context_id,
+                expected_context_revision,
+                confirmed_affected_session_count,
+            } => {
+                self.logout_agent_auth_context(
+                    auth_context_id,
+                    expected_context_revision,
+                    confirmed_affected_session_count,
+                )
+                .await
             }
             M::AuthenticateAgentMethod {
                 agent_id,
@@ -1650,6 +1664,25 @@ impl Dispatch {
                 Ok(()) => {}
                 Err(error) => self.failure("open_url", error),
             },
+            Effect::PreviewAgentAuthLogout { agent_id } => {
+                let Some((context_id, _)) = self.default_auth_context(&agent_id).await else {
+                    self.failure_for(
+                        "agent_auth_logout_preview",
+                        Some(agent_id.as_str().to_string()),
+                        BackendError::failed(
+                            "agent_auth_context_unknown",
+                            "this Agent holds no account to sign out of",
+                        ),
+                    );
+                    return;
+                };
+                let result = self
+                    .facade
+                    .agent()
+                    .preview_agent_auth_logout(context_id)
+                    .await;
+                self.send(AppMessage::AgentAuthLogoutPreview(result.map(Box::new)));
+            }
             Effect::LoadAgentAuthCatalog { agent_id } => {
                 // The context is seeded first: a runtime that has never been
                 // asked holds none, and the methods are advertised against one.
@@ -2443,6 +2476,35 @@ impl Dispatch {
 
     /// Build a profile update that only changes the display name, preserving
     /// the Agent binding the authority requires.
+    /// Sign out of one Agent's account, having been shown what it ends.
+    async fn logout_agent_auth_context(
+        &self,
+        auth_context_id: String,
+        expected_context_revision: i64,
+        confirmed_affected_session_count: usize,
+    ) -> BackendResult<crate::app::MutationOutcome> {
+        let auth_context_id = match vibex_core::AgentAuthContextId::parse(auth_context_id) {
+            Ok(id) => id,
+            Err(_) => {
+                return Err(BackendError::failed(
+                    "agent_auth_context_unknown",
+                    "this Agent holds no account to sign out of",
+                ));
+            }
+        };
+        let request =
+            vibex_backend::MutationRequest::new(vibex_core::AgentAuthContextLogoutRequest {
+                auth_context_id,
+                expected_context_revision,
+                confirmed_affected_session_count,
+            });
+        self.facade
+            .agent()
+            .logout_agent_auth_context(request)
+            .await
+            .map(|_| crate::app::MutationOutcome::Plain)
+    }
+
     /// Sign in with one of an Agent's methods.
     ///
     /// What the method collects is stored first: the sign-in reads the

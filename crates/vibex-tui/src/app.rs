@@ -676,6 +676,8 @@ pub struct ManagementData {
     pub native_import: Option<vibex_core::ProviderNativeImportPreview>,
     /// The order the reader arranged the profiles in, per Agent.
     pub provider_order: Vec<vibex_core::AgentModelProviderDisplayOrderEntry>,
+    /// What signing out of one Agent's account would end.
+    pub agent_auth_logout: Option<vibex_core::AgentAuthContextLogoutPreview>,
     /// The last Agent account catalogue this client read.
     pub agent_auth_catalog: Option<vibex_core::AgentAuthCatalog>,
     /// The last profile configuration this client read in full.
@@ -8539,6 +8541,15 @@ pub enum ConfigMutation {
     RollbackAgent {
         agent_id: vibex_core::AgentId,
     },
+    /// Sign out of one Agent's account, having shown what it ends.
+    LogoutAgentAuthContext {
+        auth_context_id: String,
+        expected_context_revision: i64,
+        /// The impact the reader was shown. The authority refuses a count that
+        /// no longer matches, which is what makes the preview a decision rather
+        /// than a formality.
+        confirmed_affected_session_count: usize,
+    },
     /// Sign in with one of an Agent's methods, storing what it collects first.
     AuthenticateAgentMethod {
         agent_id: vibex_core::AgentId,
@@ -8670,6 +8681,9 @@ impl ConfigMutation {
             Self::UpdateProviderProfile { profile_id, .. }
             | Self::DeleteProviderProfile { profile_id, .. } => profile_id.as_str().to_string(),
             Self::AuthenticateAgentMethod { agent_id, .. } => agent_id.as_str().to_string(),
+            Self::LogoutAgentAuthContext {
+                auth_context_id, ..
+            } => auth_context_id.clone(),
             Self::CreateProviderProfile(_) => "provider:new".to_string(),
             Self::ApplyNativeExport { export_id } | Self::RollbackNativeExport { export_id } => {
                 export_id.clone()
@@ -8708,6 +8722,7 @@ impl ConfigMutation {
             Self::CheckAgentUpdate { .. } => "agent_update_check",
             Self::RollbackAgent { .. } => "agent_rollback",
             Self::AuthenticateAgentMethod { .. } => "agent_auth_sign_in",
+            Self::LogoutAgentAuthContext { .. } => "agent_auth_sign_out",
             Self::CreateProviderProfile(_) => "provider_profile_create",
             Self::ApplyNativeExport { .. } => "provider_native_export_apply",
             Self::RollbackNativeExport { .. } => "provider_native_export_rollback",
@@ -8758,6 +8773,7 @@ impl ConfigMutation {
             Self::CheckAgentUpdate { .. } => Verb::CheckUpdate,
             Self::RollbackAgent { .. } => Verb::Rollback,
             Self::AuthenticateAgentMethod { .. } => Verb::SignIn,
+            Self::LogoutAgentAuthContext { .. } => Verb::SignOut,
             Self::CreateProviderProfile(_) => Verb::Create,
             Self::ApplyNativeExport { .. } => Verb::Save,
             Self::RollbackNativeExport { .. } => Verb::Rollback,
@@ -9118,6 +9134,10 @@ pub enum Effect {
     OpenUrl {
         url: String,
     },
+    /// Ask what signing out of one Agent's account would end.
+    PreviewAgentAuthLogout {
+        agent_id: vibex_core::AgentId,
+    },
     /// Read one Agent's account: the methods it advertises, and the context it
     /// holds.
     LoadAgentAuthCatalog {
@@ -9223,6 +9243,7 @@ impl Effect {
             Effect::PreviewNativeImport { .. } => "provider_native_import",
             Effect::PreviewNativeExport { .. } => "provider_native_export",
             Effect::LoadAgentAuthCatalog { .. } => "agent_auth_catalog",
+            Effect::PreviewAgentAuthLogout { .. } => "agent_auth_logout_preview",
             Effect::OpenUrl { .. } => "open_url",
             Effect::VerifyAgentAuth { .. } => "agent_auth_verify",
             Effect::RefreshAgentAuthModels { .. } => "agent_auth_models",

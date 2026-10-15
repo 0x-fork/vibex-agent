@@ -2009,6 +2009,7 @@ impl App {
                 title: subject.clone(),
                 selected: 0,
                 loading: true,
+                confirming_sign_out: false,
                 notice: None,
             },
         });
@@ -2060,6 +2061,7 @@ impl App {
                     return Outcome::quiet();
                 };
                 let agent_id_str = view.agent_id.clone();
+                let confirming_sign_out = view.confirming_sign_out;
                 self.overlay = Some(Overlay::AgentAuth { view });
                 match action {
                     AgentAuthAction::RefreshMethods => {
@@ -2092,8 +2094,36 @@ impl App {
                     AgentAuthAction::Credentials { url } => {
                         Outcome::effects(vec![Effect::OpenUrl { url }])
                     }
-                    // Signing out shows what it would end before it does it.
-                    AgentAuthAction::SignOut => Outcome::quiet(),
+                    // Signing out is asked about first: a sign-out that also
+                    // ends the reader's sessions is not a decision to make
+                    // blind, and the authority refuses a count that no longer
+                    // matches, which is what makes the preview a decision
+                    // rather than a formality.
+                    AgentAuthAction::SignOut => {
+                        if !confirming_sign_out {
+                            // The panel is already the overlay on screen, so the
+                            // question is marked on it rather than on a copy.
+                            if let Some(Overlay::AgentAuth { view }) = self.overlay.as_mut() {
+                                view.confirming_sign_out = true;
+                            }
+                            return Outcome::effects(vec![Effect::PreviewAgentAuthLogout {
+                                agent_id,
+                            }]);
+                        }
+                        let Some(preview) = self.management_data.agent_auth_logout.clone() else {
+                            return Outcome::quiet();
+                        };
+                        Outcome::effects(vec![Effect::ConfigMutation {
+                            mutation: crate::app::ConfigMutation::LogoutAgentAuthContext {
+                                auth_context_id: preview.context.id.as_str().to_string(),
+                                expected_context_revision: preview.context.revision,
+                                confirmed_affected_session_count: preview
+                                    .affected_session_ids
+                                    .len(),
+                            },
+                            record: preview.context.agent_id.as_str().to_string(),
+                        }])
+                    }
                 }
             }
             Intent::CloseOverlay | Intent::Back => {
@@ -2469,7 +2499,7 @@ impl App {
                 });
                 Outcome::effects(vec![])
             }
-            Intent::CloseOverlay | Intent::Back | Intent::ConfirmOverlay => {
+            Intent::CloseOverlay | Intent::Back => {
                 self.overlay = None;
                 Outcome::effects(vec![])
             }
@@ -4038,6 +4068,13 @@ impl App {
                     self.pending_config_action = None;
                 }
                 self.overlay = match self.overlay.take() {
+                    // The account panel's sign-out question is one level inside
+                    // it: `Esc` gives up the question before it gives up the
+                    // panel, the way every other two-step in this client works.
+                    Some(Overlay::AgentAuth { mut view }) if view.confirming_sign_out => {
+                        view.confirming_sign_out = false;
+                        Some(Overlay::AgentAuth { view })
+                    }
                     Some(Overlay::RunOptionValues { row, .. }) => Some(Overlay::RuntimePicker {
                         view: RuntimePickerView::Options,
                         selected: row,

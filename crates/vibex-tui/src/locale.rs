@@ -965,6 +965,8 @@ strings! {
     config_auth_needs_profile => { "needs a provider profile", "需要模型服务配置", "需要模型服務設定" },
     config_auth_external => { "the Agent's own sign-in", "由 Agent 自行登录", "由 Agent 自行登入" },
     config_auth_missing_value => { "A required value is missing", "缺少必填的值", "缺少必填的值" },
+    config_auth_sign_out_impact => { "Signing out also affects {count} session(s) that use this account.", "退出登录还会影响 {count} 个使用此账号的会话。", "登出還會影響 {count} 個使用此帳號的工作階段。" },
+    config_auth_sign_out_confirm => { "Enter again to sign out · Esc keeps it", "再按 Enter 退出登录 · Esc 保留", "再按 Enter 登出 · Esc 保留" },
     config_hint_fixed_endpoint => { "this Agent always calls {url}; the address cannot be changed", "此 Agent 固定调用 {url}，地址不可更改", "此 Agent 固定呼叫 {url}，位址不可變更" },
     config_result_workspace_default => { "workspace default", "工作区默认", "工作區預設" },
     config_result_global_default => { "global default", "全局默认", "全域預設" },
