@@ -1583,7 +1583,7 @@ impl Dispatch {
                     Err(error) => self.failure_for("rename_profile", Some(record), error),
                 }
             }
-            Effect::SelectProfile { profile_id } => {
+            Effect::SelectProfile { profile_id, scope } => {
                 let record = profile_id.as_str().to_string();
                 let Some(agent_id) = self.agent_for_profile(&profile_id).await else {
                     self.failure_for(
@@ -1600,15 +1600,55 @@ impl Dispatch {
                     MutationRequest::new(vibex_backend::ManagementProfileSelectionRequest {
                         agent_id,
                         provider_profile_id: profile_id.clone(),
-                        scope: None,
+                        scope: scope.clone(),
                     });
+                // Whether the default landed on a workspace or on everything is
+                // half the answer, and the reader cannot see the other half.
+                let workspace = scope.as_ref().is_some_and(|scope| {
+                    scope.kind != vibex_core::ProviderDefaultScopeKind::Global
+                });
                 match self.facade.management().select_profile(request).await {
                     Ok(_) => self.ok_with(
                         "select_profile",
                         Some(record),
-                        crate::app::MutationOutcome::Plain,
+                        crate::app::MutationOutcome::DefaultScope { workspace },
                     ),
                     Err(error) => self.failure_for("select_profile", Some(record), error),
+                }
+            }
+            Effect::ClearProviderSecret { profile_id } => {
+                let record = profile_id.as_str().to_string();
+                let Some(agent_id) = self.agent_for_profile(&profile_id).await else {
+                    self.failure_for(
+                        "provider_secret_clear",
+                        Some(record),
+                        BackendError::failed(
+                            "provider_profile_unknown",
+                            "the selected profile has no owning Agent",
+                        ),
+                    );
+                    return;
+                };
+                let request = MutationRequest::new(
+                    vibex_core::AgentModelProviderProfileSecretValueUpdateRequest {
+                        agent_id,
+                        provider_profile_id: profile_id,
+                        value: None,
+                        clear: true,
+                    },
+                );
+                match self
+                    .facade
+                    .management()
+                    .mutate_agent_model_provider_profile_secret(request)
+                    .await
+                {
+                    Ok(_) => self.ok_with(
+                        "provider_secret_clear",
+                        Some(record),
+                        crate::app::MutationOutcome::Plain,
+                    ),
+                    Err(error) => self.failure_for("provider_secret_clear", Some(record), error),
                 }
             }
             Effect::WriteProviderSecret { profile_id, secret } => {

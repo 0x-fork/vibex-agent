@@ -7941,7 +7941,11 @@ fn render_config_form(
         let marker = if selected { "▸" } else { " " };
         let changed = if field.changed() { "•" } else { " " };
         let value = field.displayed();
-        let value_style = if editing {
+        let value_style = if field.locked {
+            // A pinned value is not the reader's to change, so it is drawn as
+            // something read rather than something written.
+            Style::default().fg(theme.roles.gray_bright)
+        } else if editing {
             Style::default()
                 .fg(theme.roles.foreground)
                 .bg(theme.roles.surface_highlight)
@@ -7951,6 +7955,7 @@ fn render_config_form(
             Style::default().fg(theme.roles.foreground)
         };
         let chevron = match field.kind {
+            _ if field.locked => "locked",
             crate::config_center::FormFieldKind::Choice { .. } => "‹ ›",
             crate::config_center::FormFieldKind::Toggle => "on/off",
             _ => "",

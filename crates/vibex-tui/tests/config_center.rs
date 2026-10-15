@@ -2152,3 +2152,80 @@ fn a_provider_option_the_runtime_could_not_read_is_refused_or_completed() {
         other => panic!("the save produced {other:?}"),
     }
 }
+
+/// A key can be taken away, not only replaced.
+///
+/// Writing a credential was the only verb; a reader who wanted the profile to
+/// hold none had no way to say so, and the field that holds one cannot be
+/// cleared by writing an empty value because an empty value is not a key.
+#[test]
+fn a_profile_key_can_be_cleared() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    let outcome = app.run_config_action_by_key("provider_first", ConfigAction::ClearSecret);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ClearProviderSecret { profile_id }] => {
+            assert_eq!(profile_id.as_str(), "provider_first");
+        }
+        other => panic!("clearing produced {other:?}"),
+    }
+}
+
+/// The endpoint an Agent pins is shown and written, but not editable.
+///
+/// Some Agents reach a fixed service whatever a profile says. Letting the reader
+/// type another address would ask for something the authority refuses, so the
+/// field carries the address it will actually call and refuses to open an
+/// editor, saying why on its own line.
+#[test]
+fn an_endpoint_an_agent_pins_is_not_the_readers_to_change() {
+    let mut app = loaded(140, 40);
+    // The pin comes from the runtime's own projection descriptors, so the test
+    // asks which Agent has one rather than writing down a name that a manifest
+    // change would move.
+    let pinned_agent = vibex_core::model_provider_configurable_agent_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|agent_id| vibex_tui::config_center::fixed_endpoint_for(agent_id).is_some());
+    let Some(pinned_agent) = pinned_agent else {
+        // No Agent pins its endpoint in this build, so there is nothing to pin.
+        return;
+    };
+    let url = vibex_tui::config_center::fixed_endpoint_for(&pinned_agent).unwrap();
+
+    let mut profile = provider_profile("provider_first", "First");
+    profile.agent_id = pinned_agent.clone();
+    app.management_data.providers = vec![profile];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    app.perform(vibex_tui::action::Intent::EditSelectedEntry);
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the editor did not open");
+    };
+    let field = form.field("base_url").expect("the endpoint field");
+    assert!(field.locked, "the pinned endpoint was offered as editable");
+    assert_eq!(field.value, url, "the pinned endpoint was not shown");
+    assert!(
+        field
+            .hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains(&url)),
+        "the form did not say why the address cannot be changed"
+    );
+
+    // `Enter` on it does not open an editor.
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        form.selected = form
+            .fields
+            .iter()
+            .position(|field| field.key == "base_url")
+            .expect("the endpoint field is in the form");
+    }
+    app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the form closed");
+    };
+    assert!(form.editing.is_none(), "a pinned field opened an editor");
+}

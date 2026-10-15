@@ -1664,12 +1664,22 @@ impl App {
                     return Outcome::quiet();
                 };
                 let subject = self.config_row_subject(key);
+                // A default is either for the checkout this client is working in
+                // or for everything; the reader is told which, and a client that
+                // knows its workspace asks for that one.
+                let scope = self.composer_workspace_id().map(|workspace_id| {
+                    vibex_core::ProviderProfileDefaultScope {
+                        kind: vibex_core::ProviderDefaultScopeKind::Workspace,
+                        project_id: None,
+                        workspace_id: Some(workspace_id),
+                    }
+                });
                 self.guard_record(
                     BackendOperation::ManagementProfileSelect,
                     key,
                     subject,
                     crate::config_center::ConfigVerb::Activate,
-                    Effect::SelectProfile { profile_id },
+                    Effect::SelectProfile { profile_id, scope },
                 )
             }
             // A copy starts in the form rather than being written straight out:
@@ -1686,6 +1696,21 @@ impl App {
                     return Outcome::quiet();
                 };
                 self.open_provider(agent_id, profile_id, crate::app::ProviderOpen::Duplicate)
+            }
+            (ConfigSection::Providers, ConfigAction::ClearSecret) => {
+                let Some(profile_id) = self.provider_id(key) else {
+                    return Outcome::quiet();
+                };
+                // The same path the write takes: neither is gated on the
+                // client's capability snapshot, and a runtime that refuses the
+                // write answers for itself.
+                let subject = self.config_row_subject(key);
+                self.begin_record_work(
+                    key.to_string(),
+                    subject,
+                    crate::config_center::ConfigVerb::Delete,
+                    vec![Effect::ClearProviderSecret { profile_id }],
+                )
             }
             (ConfigSection::Providers, ConfigAction::Secret) => {
                 // The profile the key is for travels with the prompt: the list
@@ -2797,12 +2822,25 @@ impl App {
     }
 
     fn step_form_value(&mut self, delta: isize) -> Outcome {
+        let strings = self.strings;
         let Some(Overlay::Form { form }) = self.overlay.as_mut() else {
             return Outcome::quiet();
         };
         let index = form.selected;
-        if let Some(field) = form.fields.get_mut(index) {
-            field.step(delta);
+        let stepped = match form.fields.get_mut(index) {
+            Some(field) => field.step(delta),
+            None => false,
+        };
+        // The Agent is a choice and the endpoint is pinned to it, so the pin
+        // follows the choice: a field locked for the Agent the form opened on
+        // must not stay locked after the reader moves to another one.
+        if stepped
+            && form
+                .fields
+                .get(index)
+                .is_some_and(|field| field.key == "agent")
+        {
+            crate::config_center::reaim_base_url_field(form, strings);
         }
         Outcome::effects(vec![])
     }
@@ -2811,6 +2849,15 @@ impl App {
         let Some(field) = form.selected_field() else {
             return Outcome::quiet();
         };
+        // A pinned value is the Agent's, not the reader's: the form says so on
+        // the field's own line rather than opening an editor whose answer the
+        // authority would refuse.
+        if field.locked {
+            if let Some(hint) = field.hint.clone() {
+                self.toast(Toast::info(hint));
+            }
+            return Outcome::quiet();
+        }
         // A closed set or a switch has no text to type: `Enter` moves it.
         if !matches!(
             field.kind,

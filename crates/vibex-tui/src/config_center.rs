@@ -243,6 +243,8 @@ pub enum ConfigAction {
     Activate,
     /// Write a new credential for a profile.
     Secret,
+    /// Forget the credential a profile holds.
+    ClearSecret,
     Test,
     FetchModels,
     Validate,
@@ -273,6 +275,7 @@ impl ConfigAction {
             Self::Logout => strings.config_action_sign_out(),
             Self::Activate => strings.config_action_activate(),
             Self::Secret => strings.config_action_secret(),
+            Self::ClearSecret => strings.config_action_clear_secret(),
             Self::Test => strings.config_action_test(),
             Self::FetchModels => strings.config_action_fetch_models(),
             Self::Validate => strings.config_action_validate(),
@@ -718,6 +721,14 @@ impl PendingWrite {
             Outcome::Models { count } => {
                 Some(format!("{count} {}", strings.config_result_models()))
             }
+            Outcome::DefaultScope { workspace } => Some(
+                if *workspace {
+                    strings.config_result_workspace_default()
+                } else {
+                    strings.config_result_global_default()
+                }
+                .to_string(),
+            ),
             Outcome::Verdict {
                 passed,
                 warned,
@@ -1567,6 +1578,7 @@ fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                 ConfigAction::Activate,
                 ConfigAction::Edit,
                 ConfigAction::Duplicate,
+                ConfigAction::ClearSecret,
                 ConfigAction::MoveUp,
                 ConfigAction::MoveDown,
                 ConfigAction::Secret,
@@ -1987,6 +1999,12 @@ pub struct FormField {
     pub origin: String,
     pub kind: FormFieldKind,
     pub hint: Option<String>,
+    /// Whether the value is the reader's to change.
+    ///
+    /// A locked field is shown and written but not edited: the Agent it belongs
+    /// to pins the value, and a form that let the reader type another one would
+    /// be asking for something the authority refuses.
+    pub locked: bool,
     /// Whether the value is a secret, drawn masked and never echoed.
     ///
     /// A requirement the registry marked secret is one the reader is pasting a
@@ -2005,6 +2023,7 @@ impl FormField {
             value,
             kind: FormFieldKind::Text,
             hint: None,
+            locked: false,
             secret: false,
         }
     }
@@ -2022,6 +2041,7 @@ impl FormField {
             value,
             kind: FormFieldKind::Multiline,
             hint: None,
+            locked: false,
             secret: false,
         }
     }
@@ -2057,6 +2077,7 @@ impl FormField {
             value: value.to_string(),
             kind: FormFieldKind::Choice { options, labels },
             hint: None,
+            locked: false,
             secret: false,
         }
     }
@@ -2070,12 +2091,19 @@ impl FormField {
             value,
             kind: FormFieldKind::Toggle,
             hint: None,
+            locked: false,
             secret: false,
         }
     }
 
     fn hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
+        self
+    }
+
+    /// Pin the value: shown and written, but not editable.
+    fn locked(mut self) -> Self {
+        self.locked = true;
         self
     }
 
@@ -2688,8 +2716,10 @@ pub fn provider_form(
     // The endpoint is not in the summary, so it is shown when this client has
     // read the profile and left empty when it has not: the field writes what it
     // holds, and an empty one leaves what is stored alone.
-    let base_url = detail
-        .and_then(|detail| detail.base_url.clone())
+    let pinned = fixed_endpoint_for(&profile.agent_id);
+    let base_url = pinned
+        .clone()
+        .or_else(|| detail.and_then(|detail| detail.base_url.clone()))
         .unwrap_or_default();
     let options = detail
         .map(|detail| ProviderOptionsDraft::read(&detail.provider_options))
@@ -2700,8 +2730,7 @@ pub fn provider_form(
             strings.config_form_name(),
             profile.display_name.clone(),
         ),
-        FormField::text("base_url", strings.config_field_url(), base_url)
-            .hint(strings.config_hint_endpoint()),
+        base_url_field(base_url, pinned.as_deref(), strings),
         FormField::text(
             "default_model",
             strings.config_field_model(),
@@ -2770,6 +2799,11 @@ pub fn provider_create_form(
         .filter(|id| options.iter().any(|option| option == id))
         .or_else(|| options.first().cloned())
         .unwrap_or_default();
+    let pinned = options
+        .iter()
+        .find(|option| *option == &selected)
+        .and_then(|id| vibex_core::AgentId::parse(id.clone()).ok())
+        .and_then(|agent_id| fixed_endpoint_for(&agent_id));
     let name = source
         .map(|profile| format!("{} {}", profile.display_name, strings.config_copy_suffix()))
         .unwrap_or_default();
@@ -2799,18 +2833,14 @@ pub fn provider_create_form(
                 .and_then(|profile| profile.account_alias.clone())
                 .unwrap_or_default(),
         ),
-        FormField::text(
-            "base_url",
-            strings.config_field_url(),
-            detail
-                .and_then(|detail| detail.base_url.clone())
+        base_url_field(
+            pinned
+                .clone()
+                .or_else(|| detail.and_then(|detail| detail.base_url.clone()))
                 .unwrap_or_default(),
-        )
-        .hint(if detail.is_some() {
-            strings.config_hint_endpoint()
-        } else {
-            strings.config_hint_provider_url()
-        }),
+            pinned.as_deref(),
+            strings,
+        ),
         FormField::text(
             "default_model",
             strings.config_field_model(),
@@ -3350,6 +3380,74 @@ pub struct ModelListView {
     pub title: String,
     pub selected: usize,
     pub notice: Option<(String, ConfigTone)>,
+}
+
+/// The address an Agent always calls, when its projection pins the endpoint.
+///
+/// Some Agents reach a fixed service whatever a profile says — their bridge
+/// reads the address from its own environment — so the projection reports the
+/// address rather than letting a profile name one the request never carries.
+pub fn fixed_endpoint_for(agent_id: &vibex_core::AgentId) -> Option<String> {
+    vibex_core::catalog_projection_descriptors()
+        .ok()?
+        .into_iter()
+        .find(|descriptor| descriptor.route.agent_id == *agent_id)
+        .and_then(|descriptor| match descriptor.provider_control {
+            vibex_core::AgentProviderControl::FixedEndpoint { base_url } => Some(base_url),
+            _ => None,
+        })
+}
+
+/// The reason a pinned address cannot be changed, for the field's hint.
+fn fixed_endpoint_hint(url: &str, strings: Strings) -> String {
+    strings.config_hint_fixed_endpoint().replace("{url}", url)
+}
+
+/// The endpoint field: editable, or pinned to the address its Agent calls.
+pub fn base_url_field(value: String, pinned: Option<&str>, strings: Strings) -> FormField {
+    match pinned {
+        Some(url) => FormField::text("base_url", strings.config_field_url(), url.to_string())
+            .hint(fixed_endpoint_hint(url, strings))
+            .locked(),
+        None => FormField::text("base_url", strings.config_field_url(), value)
+            .hint(strings.config_hint_endpoint()),
+    }
+}
+
+/// Re-evaluate the endpoint field for the Agent the form now names.
+///
+/// The Agent is a choice, so the pin follows it: a form that locked the field
+/// for the Agent it opened on would keep the lock after the reader moved to
+/// another one.
+pub fn reaim_base_url_field(form: &mut ConfigForm, strings: Strings) {
+    let Some(agent) = form.value("agent") else {
+        return;
+    };
+    let Ok(agent_id) = vibex_core::AgentId::parse(agent) else {
+        return;
+    };
+    let pinned = fixed_endpoint_for(&agent_id);
+    let Some(field) = form.field_mut("base_url") else {
+        return;
+    };
+    match pinned {
+        Some(url) => {
+            field.value = url.clone();
+            field.origin = url.clone();
+            field.hint = Some(fixed_endpoint_hint(&url, strings));
+            field.locked = true;
+        }
+        None => {
+            // Unpinning gives the reader a blank field rather than the address
+            // the last Agent pinned: the field is theirs again.
+            if field.locked {
+                field.value = String::new();
+                field.origin = String::new();
+            }
+            field.hint = Some(strings.config_hint_endpoint().to_string());
+            field.locked = false;
+        }
+    }
 }
 
 /// The Provider option that carries the publisher's website.

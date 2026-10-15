@@ -8763,6 +8763,8 @@ pub enum MutationOutcome {
     },
     /// A model catalogue was read.
     Models { count: usize },
+    /// A default was set, and at which scope it applies.
+    DefaultScope { workspace: bool },
     /// A validation ran. `passed` is the verdict and `warned` keeps the middle
     /// answer — a warning is neither a clean pass nor a failure.
     Verdict {
@@ -8984,10 +8986,19 @@ pub enum Effect {
     ListProfiles,
     SelectProfile {
         profile_id: vibex_core::ProviderProfileId,
+        /// The scope this default applies to. `None` is the authority's global
+        /// scope; a client that knows which workspace it is working in says so,
+        /// because a default that silently applied everywhere is not the same
+        /// decision as one for this checkout.
+        scope: Option<vibex_core::ProviderProfileDefaultScope>,
     },
     WriteProviderSecret {
         profile_id: vibex_core::ProviderProfileId,
         secret: String,
+    },
+    /// Forget the key a profile holds.
+    ClearProviderSecret {
+        profile_id: vibex_core::ProviderProfileId,
     },
     TestProviderProfile {
         profile_id: vibex_core::ProviderProfileId,
@@ -9163,6 +9174,7 @@ impl Effect {
             Effect::ListProfiles => "profiles",
             Effect::SelectProfile { .. } => "select_profile",
             Effect::WriteProviderSecret { .. } => "provider_secret",
+            Effect::ClearProviderSecret { .. } => "provider_secret_clear",
             Effect::TestProviderProfile { .. } => "provider_test",
             Effect::FetchProviderModels { .. } => "provider_models",
             Effect::ListAgents => "agents",
