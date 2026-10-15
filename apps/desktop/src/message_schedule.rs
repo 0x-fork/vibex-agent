@@ -1284,6 +1284,7 @@ fn published_scheduled_send(message: &ComposerQueueMessage) -> Option<SidebarSch
         session_id: message.session_id.as_str().to_string(),
         message_id: message.id,
         text: message.text.clone(),
+        attachments: message.attachments.clone(),
         scheduled_at_ms: message.scheduled_at_ms?,
     })
 }

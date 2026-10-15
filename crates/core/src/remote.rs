@@ -3,7 +3,6 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::FetchTimelineItemRequest;
 use crate::agent::{
     AgentSession, AgentSessionSummary, AgentTimelineDisplaySettings, ContinueAgentTurnRequest,
     CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
@@ -106,6 +105,7 @@ use crate::terminal::{
 use crate::time::unix_timestamp_ms;
 use crate::timeline::{TimelineItem, TimelinePage};
 use crate::workspace::{OpenWorkspaceRequest, ProjectWorkspaceSummary};
+use crate::{FetchTimelineItemRequest, MessageAttachment};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -4719,6 +4719,12 @@ pub struct RemoteScheduledSend {
     /// What the message says, so a row can borrow the words as the session's
     /// name and a session page can show what is waiting.
     pub text: String,
+    /// What it will send with it. A row that borrows the message's words as the
+    /// session's name reads these too: a message whose text is empty is named by
+    /// its first attachment on the holder, and a client that could not see them
+    /// would name the session differently from the shell that queued it.
+    #[serde(default)]
+    pub attachments: Vec<MessageAttachment>,
     pub scheduled_at_ms: i64,
 }
 

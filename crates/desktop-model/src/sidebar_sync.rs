@@ -8,10 +8,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use vibex_core::{
-    RemoteSessionGroup, RemoteSidebarDropPosition, RemoteSidebarFolder, RemoteSidebarHierarchyMode,
-    RemoteSidebarItemKind, RemoteSidebarItemRef, RemoteSidebarNewSessionLocation,
-    RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationSnapshot, RemoteSidebarPlacement,
-    RemoteSidebarProjectAppearance,
+    MessageAttachment, RemoteSessionGroup, RemoteSidebarDropPosition, RemoteSidebarFolder,
+    RemoteSidebarHierarchyMode, RemoteSidebarItemKind, RemoteSidebarItemRef,
+    RemoteSidebarNewSessionLocation, RemoteSidebarOrganizationMutation,
+    RemoteSidebarOrganizationSnapshot, RemoteSidebarPlacement, RemoteSidebarProjectAppearance,
 };
 
 use crate::{
@@ -64,6 +64,10 @@ pub struct SidebarScheduledSend {
     /// addresses.
     pub message_id: u64,
     pub text: String,
+    /// What the message will send with it. The row's title rule reads these the
+    /// way the holder does: a message named by its first attachment has to be
+    /// named the same on both shells.
+    pub attachments: Vec<MessageAttachment>,
     pub scheduled_at_ms: i64,
 }
 
@@ -264,6 +268,7 @@ impl SidebarOrganizationView {
                     session_id: send.session_id.clone(),
                     message_id: send.message_id,
                     text: send.text.clone(),
+                    attachments: send.attachments.clone(),
                     scheduled_at_ms: send.scheduled_at_ms,
                 })
                 .collect(),
@@ -385,6 +390,7 @@ impl SidebarOrganizationView {
                     session_id: send.session_id.clone(),
                     message_id: send.message_id,
                     text: send.text.clone(),
+                    attachments: send.attachments.clone(),
                     scheduled_at_ms: send.scheduled_at_ms,
                 })
                 .collect(),
@@ -447,6 +453,7 @@ impl SidebarOrganizationView {
                         session_id: entry.session_id.clone(),
                         message_id: entry.id,
                         text: entry.text.clone(),
+                        attachments: entry.attachments.clone(),
                         scheduled_at_ms: entry.scheduled_at_ms?,
                     })
                 })
@@ -2121,12 +2128,14 @@ mod tests {
                     session_id: "session-a".to_string(),
                     message_id: 4,
                     text: "send this at nine".to_string(),
+                    attachments: Vec::new(),
                     scheduled_at_ms: 1_800_000_000_000,
                 },
                 SidebarScheduledSend {
                     session_id: "session-b".to_string(),
                     message_id: 5,
                     text: "and this tomorrow".to_string(),
+                    attachments: Vec::new(),
                     scheduled_at_ms: 1_800_000_060_000,
                 },
             ],

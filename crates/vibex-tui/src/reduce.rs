@@ -11501,6 +11501,7 @@ mod tests {
                 session_id: session_id.as_str().to_string(),
                 message_id,
                 text: text.to_string(),
+                attachments: Vec::new(),
                 scheduled_at_ms,
             }],
             ..Default::default()
