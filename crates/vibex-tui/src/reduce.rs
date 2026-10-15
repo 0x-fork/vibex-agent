@@ -1136,6 +1136,13 @@ impl App {
             Intent::ConfigFormSave => Outcome::quiet(),
             // The form's own key, reaching here only when no form is open.
             Intent::ConfigFormCopy => Outcome::quiet(),
+            Intent::ConfigModels => self.open_model_editor(),
+            // The Model editor's own keys, reaching here only when no overlay is
+            // open to receive them.
+            Intent::ConfigModelToggle
+            | Intent::ConfigModelAdd
+            | Intent::ConfigModelRemove
+            | Intent::ConfigModelFetch => Outcome::quiet(),
             Intent::ConfigRegistryFilter => self.step_registry_narrowing(RegistryStep::Transport),
             Intent::ConfigRegistrySort => self.step_registry_narrowing(RegistryStep::Sort),
             Intent::ConfigRegistryPagePrevious => self.step_registry_page(-1),
@@ -1941,6 +1948,178 @@ impl App {
             }
             None => Outcome::quiet(),
         }
+    }
+
+    /// `m`: the Models of the profile the cursor is on.
+    ///
+    /// A Model is not a record of its own — it belongs to a profile and has no
+    /// life without one — so the list opens over the record rather than beside
+    /// it, and every press writes through the profile it belongs to.
+    fn open_model_editor(&mut self) -> Outcome {
+        use crate::config_center::ConfigSection;
+        if self.config_center.section != ConfigSection::Providers {
+            return Outcome::quiet();
+        }
+        let Some(row) = self.selected_config_row() else {
+            return Outcome::quiet();
+        };
+        let Some(profile) = self.provider(&row.key).cloned() else {
+            return Outcome::quiet();
+        };
+        self.overlay = Some(Overlay::Models {
+            view: crate::config_center::ModelListView {
+                agent_id: profile.agent_id.as_str().to_string(),
+                profile_id: profile.id.as_str().to_string(),
+                title: profile.display_name.clone(),
+                selected: 0,
+                notice: None,
+            },
+        });
+        Outcome::effects(vec![])
+    }
+
+    fn provider(&self, key: &str) -> Option<&vibex_core::ProviderProfileSummary> {
+        self.management_data
+            .providers
+            .iter()
+            .find(|profile| profile.id.as_str() == key)
+    }
+
+    /// The rows a Model editor draws, projected from the records it edits.
+    fn model_rows(
+        &self,
+        view: &crate::config_center::ModelListView,
+    ) -> Vec<crate::config_center::ModelRow> {
+        match self.provider(&view.profile_id) {
+            Some(profile) => crate::config_center::model_rows(
+                profile,
+                &self.management_data.provider_models,
+                self.strings,
+            ),
+            None => Vec::new(),
+        }
+    }
+
+    /// The keys of the Model editor.
+    fn perform_models(
+        &mut self,
+        intent: Intent,
+        mut view: crate::config_center::ModelListView,
+    ) -> Outcome {
+        let rows = self.model_rows(&view);
+        let last = rows.len().saturating_sub(1);
+        let selected = view.selected.min(last);
+        match intent {
+            Intent::SelectPrevious | Intent::ScrollPageUp => {
+                view.selected = selected.saturating_sub(1);
+                view.notice = None;
+                self.overlay = Some(Overlay::Models { view });
+                Outcome::effects(vec![])
+            }
+            Intent::SelectNext | Intent::ScrollPageDown => {
+                view.selected = (selected + 1).min(last);
+                view.notice = None;
+                self.overlay = Some(Overlay::Models { view });
+                Outcome::effects(vec![])
+            }
+            // A Model the endpoint listed but the profile does not declare is
+            // offered by this press rather than being a row that cannot be
+            // acted on: the catalogue is a menu, not a report.
+            Intent::ConfigModelToggle => {
+                let Some(row) = rows.get(selected) else {
+                    return Outcome::quiet();
+                };
+                let models = self.models_with(&view, |models| {
+                    match models.iter_mut().find(|model| model.id == row.id) {
+                        Some(model) => model.enabled = !row.enabled,
+                        None => models.push(vibex_core::ProviderConfiguredModel {
+                            id: row.id.clone(),
+                            display_name: None,
+                            enabled: true,
+                            wire_api: None,
+                            capabilities: vibex_core::ProviderModelCapabilities::default(),
+                        }),
+                    }
+                });
+                self.write_models(view, models)
+            }
+            Intent::ConfigModelRemove => {
+                let Some(row) = rows.get(selected) else {
+                    return Outcome::quiet();
+                };
+                if !row.declared {
+                    return Outcome::quiet();
+                }
+                let models =
+                    self.models_with(&view, |models| models.retain(|model| model.id != row.id));
+                self.write_models(view, models)
+            }
+            Intent::ConfigModelFetch => {
+                let Ok(profile_id) = parse_config_id(&view.profile_id) else {
+                    return Outcome::quiet();
+                };
+                self.overlay = Some(Overlay::Models { view });
+                Outcome::effects(vec![Effect::FetchProviderModels { profile_id }])
+            }
+            Intent::ConfigModelAdd => {
+                self.overlay = Some(Overlay::Prompt {
+                    title: self.strings.config_form_add_model().to_string(),
+                    field: PromptField::NewModelId,
+                    value: String::new(),
+                    target: Some(view.profile_id.clone()),
+                });
+                Outcome::effects(vec![])
+            }
+            Intent::CloseOverlay | Intent::Back | Intent::ConfirmOverlay => {
+                self.overlay = None;
+                Outcome::effects(vec![])
+            }
+            _ => {
+                self.overlay = Some(Overlay::Models { view });
+                Outcome::quiet()
+            }
+        }
+    }
+
+    /// The profile's Model list with one change applied to it.
+    fn models_with(
+        &self,
+        view: &crate::config_center::ModelListView,
+        change: impl FnOnce(&mut Vec<vibex_core::ProviderConfiguredModel>),
+    ) -> Vec<vibex_core::ProviderConfiguredModel> {
+        let mut models = self
+            .provider(&view.profile_id)
+            .map(|profile| profile.configured_models.clone())
+            .unwrap_or_default();
+        change(&mut models);
+        models
+    }
+
+    /// Write a profile's Model list through the profile it belongs to.
+    fn write_models(
+        &mut self,
+        view: crate::config_center::ModelListView,
+        models: Vec<vibex_core::ProviderConfiguredModel>,
+    ) -> Outcome {
+        let (Ok(agent_id), Ok(profile_id)) = (
+            parse_config_id(&view.agent_id),
+            parse_config_id(&view.profile_id),
+        ) else {
+            return Outcome::quiet();
+        };
+        let outcome =
+            self.begin_config_mutation(crate::app::ConfigMutation::UpdateProviderProfile {
+                agent_id,
+                profile_id,
+                display_name: None,
+                base_url: None,
+                default_model: None,
+                configured_models: Some(models),
+            });
+        // The editor stays where it was: a write is not a reason to take the
+        // list away from the reader, and the re-read lands behind it.
+        self.overlay = Some(Overlay::Models { view });
+        outcome
     }
 
     /// The form that makes a profile, given the Agent it may belong to.
@@ -2783,6 +2962,7 @@ impl App {
                     display_name: Some(name),
                     base_url: form.optional("base_url"),
                     default_model: form.optional("default_model"),
+                    configured_models: None,
                 })
             }
             FormPurpose::McpMatrix { server_id } => {
@@ -3310,6 +3490,7 @@ impl App {
                 }
                 _ => Outcome::quiet(),
             },
+            Overlay::Models { view } => self.perform_models(intent, view),
             Overlay::Approval { selected } => match intent {
                 Intent::ApprovalApprove
                 | Intent::ApprovalDeny
@@ -3763,6 +3944,38 @@ impl App {
                     Err(error) => self.toast(Toast::warning(error)),
                 }
                 Outcome::effects(vec![])
+            }
+            PromptField::NewModelId => {
+                let Some(profile_id) = target.clone() else {
+                    return Outcome::quiet();
+                };
+                if trimmed.is_empty() {
+                    self.toast(Toast::warning(
+                        self.strings.config_form_error_model().to_string(),
+                    ));
+                    return Outcome::quiet();
+                }
+                let Some(profile) = self.provider(&profile_id).cloned() else {
+                    return Outcome::quiet();
+                };
+                let mut models = profile.configured_models.clone();
+                if !models.iter().any(|model| model.id == trimmed) {
+                    models.push(vibex_core::ProviderConfiguredModel {
+                        id: trimmed,
+                        display_name: None,
+                        enabled: true,
+                        wire_api: None,
+                        capabilities: vibex_core::ProviderModelCapabilities::default(),
+                    });
+                }
+                let view = crate::config_center::ModelListView {
+                    agent_id: profile.agent_id.as_str().to_string(),
+                    profile_id,
+                    title: profile.display_name.clone(),
+                    selected: 0,
+                    notice: None,
+                };
+                self.write_models(view, models)
             }
             PromptField::ProviderSecret => {
                 // The profile the reader pressed on, named by the prompt itself

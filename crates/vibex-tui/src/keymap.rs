@@ -1325,6 +1325,42 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::ConfigFormCopy,
         |strings| Intent::ConfigFormCopy.label(strings),
     ),
+    // `m` opens the Models of the highlighted profile. It is the one thing in
+    // the centre that is a list inside a record rather than a record of its own.
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char('m')),
+        Intent::ConfigModels,
+        |strings| Intent::ConfigModels.label(strings),
+    ),
+    // The Model editor's own keys. They are not `Space`, `a` and `d`: those
+    // chords already belong to the approval card and to the elicitation card,
+    // and a chord dispatches one intent, so sharing them would silently disable
+    // one of the two surfaces.
+    binding(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('o')),
+        Intent::ConfigModelToggle,
+        |strings| Intent::ConfigModelToggle.label(strings),
+    ),
+    binding(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('i')),
+        Intent::ConfigModelAdd,
+        |strings| Intent::ConfigModelAdd.label(strings),
+    ),
+    binding(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('x')),
+        Intent::ConfigModelRemove,
+        |strings| Intent::ConfigModelRemove.label(strings),
+    ),
+    binding(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('f')),
+        Intent::ConfigModelFetch,
+        |strings| Intent::ConfigModelFetch.label(strings),
+    ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('t')),

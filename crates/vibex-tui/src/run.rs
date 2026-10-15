@@ -2495,16 +2495,16 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         },
         AppMessage::ProviderModels(result) => match result {
             Ok(models) => {
-                let body = models
-                    .iter()
-                    .map(|model| model.id.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                app.overlay = Some(Overlay::TextView {
-                    title: app.strings.management_fetch_models().to_string(),
-                    body,
-                    scroll: 0,
-                });
+                // The catalogue is kept rather than printed: the Model editor
+                // unions it with what the profile declares, so an entry the
+                // profile does not offer yet becomes a row the reader can turn
+                // on instead of a line in a report they have to retype.
+                let count = models.len();
+                app.management_data.provider_models = models;
+                app.toast(Toast::success(format!(
+                    "{count} {}",
+                    app.strings.config_result_models()
+                )));
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },

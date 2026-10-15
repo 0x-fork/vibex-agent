@@ -208,6 +208,10 @@ pub enum Overlay {
         value: String,
         target: Option<String>,
     },
+    /// The Models one profile offers, as a list inside the record it belongs to.
+    Models {
+        view: crate::config_center::ModelListView,
+    },
     /// A multi-field editor for one configuration record.
     ///
     /// A form rather than a prompt because an MCP server is not a name: it has
@@ -381,6 +385,8 @@ pub enum PromptField {
     ImagePath,
     /// A run option the Agent publishes as free text rather than as a list.
     RunOptionValue,
+    /// A Model id the reader is adding to a profile by hand.
+    NewModelId,
     /// The name of a folder a heading is about to hold.
     NewFolderName,
     /// The new name of a folder the reader made.
@@ -640,6 +646,10 @@ pub struct ManagementData {
     pub audit: Vec<vibex_core::RemoteAuditRecord>,
     pub profiles: Vec<vibex_core::ProviderProfileSummary>,
     pub providers: Vec<vibex_core::ProviderProfileSummary>,
+    /// The last Model catalogue an endpoint answered with. It is what the Model
+    /// editor unions with the profile's own declarations, so a Model the profile
+    /// does not offer yet is still one the reader can turn on.
+    pub provider_models: Vec<vibex_core::ProviderConfiguredModel>,
     pub agents: Vec<vibex_core::AgentSnapshotEntry>,
     pub agent_auth: Vec<vibex_core::AgentAuthContext>,
     pub mcp: Vec<vibex_core::McpServer>,
@@ -8496,6 +8506,8 @@ pub enum ConfigMutation {
         display_name: Option<String>,
         base_url: Option<String>,
         default_model: Option<String>,
+        /// The Models the profile offers, when that is what changed.
+        configured_models: Option<Vec<vibex_core::ProviderConfiguredModel>>,
     },
     DeleteProviderProfile {
         agent_id: vibex_core::AgentId,

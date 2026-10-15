@@ -1566,3 +1566,146 @@ fn duplicating_a_profile_opens_a_form_that_asks_for_what_it_cannot_copy() {
         "the copy invented an endpoint it cannot read"
     );
 }
+
+/// The Models a profile offers are edited as a list inside the record.
+///
+/// A profile declares the Models it offers and an endpoint answers with the ones
+/// it serves, and those are two different things: an entry the endpoint lists and
+/// the profile does not offer yet is a row the reader can turn on rather than a
+/// line in a report. Every press writes through the profile it belongs to, so the
+/// list is never a draft that a re-read can contradict.
+#[test]
+fn a_profiles_models_are_edited_through_the_profile() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.management_data.provider_models = vec![
+        vibex_core::ProviderConfiguredModel {
+            id: "gpt-5".to_string(),
+            display_name: None,
+            enabled: true,
+            wire_api: None,
+            capabilities: vibex_core::ProviderModelCapabilities::default(),
+        },
+        vibex_core::ProviderConfiguredModel {
+            id: "gpt-5-mini".to_string(),
+            display_name: Some("Mini".to_string()),
+            enabled: true,
+            wire_api: None,
+            capabilities: vibex_core::ProviderModelCapabilities::default(),
+        },
+    ];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    app.perform(vibex_tui::action::Intent::ConfigModels);
+    let Some(Overlay::Models { view }) = app.overlay.clone() else {
+        panic!("`m` opened no Model list");
+    };
+    assert_eq!(view.profile_id, "provider_first");
+
+    // The declared Model comes first, and the catalogue entry the profile does
+    // not offer is offered as an available row after it.
+    let outcome = app.perform(vibex_tui::action::Intent::SelectNext);
+    assert!(
+        outcome.effects.is_empty(),
+        "moving the cursor wrote something"
+    );
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigModelToggle);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::UpdateProviderProfile {
+                configured_models: Some(models),
+                ..
+            } = mutation
+            else {
+                panic!("the toggle was not a Model write: {mutation:?}");
+            };
+            assert_eq!(
+                models
+                    .iter()
+                    .map(|model| (model.id.as_str(), model.enabled))
+                    .collect::<Vec<_>>(),
+                vec![("gpt-5", true), ("gpt-5-mini", true)],
+                "turning on a catalogue entry did not declare it"
+            );
+        }
+        other => panic!("the toggle produced {other:?}"),
+    }
+    // And the editor stays open over the write.
+    assert!(matches!(app.overlay, Some(Overlay::Models { .. })));
+
+    // A record carries one write at a time, so the next press waits for this
+    // one to land. There is no worker here to answer it, so the test retires it
+    // the way an answer would.
+    app.config_center.pending.clear();
+
+    // `d` takes a declared Model out.
+    app.overlay = Some(Overlay::Models {
+        view: vibex_tui::config_center::ModelListView {
+            agent_id: "codex".to_string(),
+            profile_id: "provider_first".to_string(),
+            title: "First".to_string(),
+            selected: 0,
+            notice: None,
+        },
+    });
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigModelRemove);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::UpdateProviderProfile {
+                configured_models: Some(models),
+                ..
+            } = mutation
+            else {
+                panic!("the removal was not a Model write: {mutation:?}");
+            };
+            assert!(models.is_empty(), "the Model was not taken out: {models:?}");
+        }
+        other => panic!("the removal produced {other:?}"),
+    }
+
+    // `f` asks the endpoint, and it is the profile that is asked about.
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigModelFetch);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::FetchProviderModels { profile_id }] => {
+            assert_eq!(profile_id.as_str(), "provider_first");
+        }
+        other => panic!("the fetch produced {other:?}"),
+    }
+}
+
+/// Adding a Model by hand names the profile it belongs to.
+#[test]
+fn a_model_typed_by_hand_is_added_to_the_profile_it_was_asked_for() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+    app.perform(vibex_tui::action::Intent::ConfigModels);
+    app.perform(vibex_tui::action::Intent::ConfigModelAdd);
+
+    let Some(Overlay::Prompt { field, target, .. }) = app.overlay.clone() else {
+        panic!("`a` opened no prompt");
+    };
+    assert_eq!(field, vibex_tui::app::PromptField::NewModelId);
+    assert_eq!(target.as_deref(), Some("provider_first"));
+
+    if let Some(Overlay::Prompt { value, .. }) = app.overlay.as_mut() {
+        *value = "  gpt-6  ".to_string();
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::UpdateProviderProfile {
+                configured_models: Some(models),
+                ..
+            } = mutation
+            else {
+                panic!("the add was not a Model write: {mutation:?}");
+            };
+            assert_eq!(models.len(), 2, "the typed Model was not added: {models:?}");
+            assert_eq!(models[1].id, "gpt-6", "the id was not trimmed");
+        }
+        other => panic!("the add produced {other:?}"),
+    }
+    // The reader is put back where they were: the list they were editing.
+    assert!(matches!(app.overlay, Some(Overlay::Models { .. })));
+}

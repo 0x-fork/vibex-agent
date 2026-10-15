@@ -2931,3 +2931,135 @@ pub fn mcp_market_install_form(
     )
     .preview(mcp_candidate_command_line(&candidate))
 }
+
+/// One Model as the profile editor lists it.
+///
+/// The list is the union of what the profile declares and what the endpoint last
+/// answered with, because those are two different things: a catalogue entry the
+/// profile does not offer is a Model the reader might want to turn on, and a
+/// declared Model the catalogue has forgotten is one they may still be using.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRow {
+    pub id: String,
+    pub label: String,
+    /// Whether the profile offers it to the Agent.
+    pub enabled: bool,
+    /// Whether the profile declares it at all. A Model that only the catalogue
+    /// knows is offered but not yet part of the profile.
+    pub declared: bool,
+    /// Short facts for the row's second line.
+    pub detail: Vec<(String, String)>,
+}
+
+impl ModelRow {
+    /// What the row is called, in the reader's language.
+    pub fn chip(&self, strings: Strings) -> (&'static str, ConfigTone) {
+        match (self.declared, self.enabled) {
+            (false, _) => (strings.config_state_available(), ConfigTone::Muted),
+            (true, true) => (strings.config_state_enabled(), ConfigTone::Ok),
+            (true, false) => (strings.config_state_disabled(), ConfigTone::Muted),
+        }
+    }
+}
+
+/// The Models one profile offers, declared first and catalogue-only after.
+pub fn model_rows(
+    profile: &vibex_core::ProviderProfileSummary,
+    catalogue: &[vibex_core::ProviderConfiguredModel],
+    strings: Strings,
+) -> Vec<ModelRow> {
+    let mut rows = Vec::new();
+    for model in &profile.configured_models {
+        let known = catalogue.iter().find(|entry| entry.id == model.id);
+        rows.push(ModelRow {
+            id: model.id.clone(),
+            label: model
+                .display_name
+                .clone()
+                .or_else(|| known.and_then(|entry| entry.display_name.clone()))
+                .unwrap_or_else(|| model.id.clone()),
+            enabled: model.enabled,
+            declared: true,
+            detail: model_detail(model.wire_api, &model.capabilities, strings),
+        });
+    }
+    for entry in catalogue {
+        if profile
+            .configured_models
+            .iter()
+            .any(|model| model.id == entry.id)
+        {
+            continue;
+        }
+        rows.push(ModelRow {
+            id: entry.id.clone(),
+            label: entry
+                .display_name
+                .clone()
+                .unwrap_or_else(|| entry.id.clone()),
+            enabled: false,
+            declared: false,
+            detail: model_detail(entry.wire_api, &entry.capabilities, strings),
+        });
+    }
+    rows
+}
+
+/// What a Model's second line says: the wire protocol it is called over and the
+/// limits it declares, when it declares any.
+fn model_detail(
+    wire_api: Option<vibex_core::ProviderModelWireApi>,
+    capabilities: &vibex_core::ProviderModelCapabilities,
+    strings: Strings,
+) -> Vec<(String, String)> {
+    let mut detail = Vec::new();
+    if let Some(wire_api) = wire_api {
+        detail.push((
+            strings.config_field_wire_api().to_string(),
+            wire_api_label(wire_api).to_string(),
+        ));
+    }
+    if let Some(tokens) = capabilities.context_tokens {
+        detail.push((
+            strings.config_field_context_tokens().to_string(),
+            tokens.to_string(),
+        ));
+    }
+    if let Some(tokens) = capabilities.output_tokens {
+        detail.push((
+            strings.config_field_output_tokens().to_string(),
+            tokens.to_string(),
+        ));
+    }
+    detail
+}
+
+/// What one wire protocol is called on screen.
+pub const fn wire_api_label(wire_api: vibex_core::ProviderModelWireApi) -> &'static str {
+    use vibex_core::ProviderModelWireApi as Api;
+    match wire_api {
+        Api::OpenaiResponses => "openai_responses",
+        Api::OpenaiChatCompletions => "openai_chat_completions",
+        Api::AnthropicMessages => "anthropic_messages",
+        Api::MistralConversations => "mistral_conversations",
+        Api::GoogleGenerativeAi => "google_generative_ai",
+        Api::GoogleVertex => "google_vertex",
+        Api::AwsBedrockConverse => "aws_bedrock_converse",
+    }
+}
+
+/// Which profile's Models the editor is on.
+///
+/// The rows are projected from the records every frame rather than held here: a
+/// Model is written through the authority and comes back as a re-read, and an
+/// editor holding its own copy would drift from the profile it is editing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelListView {
+    pub agent_id: String,
+    pub profile_id: String,
+    /// The profile as the editor last named it, for the title and for the edit
+    /// that follows a re-read.
+    pub title: String,
+    pub selected: usize,
+    pub notice: Option<(String, ConfigTone)>,
+}

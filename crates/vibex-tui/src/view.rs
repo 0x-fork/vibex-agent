@@ -8286,6 +8286,113 @@ fn render_entry_actions(
     frame.render_widget(Paragraph::new(lines), layout.content);
 }
 
+/// The Models one profile offers.
+///
+/// The list is the one thing in the centre that is a part of a record rather
+/// than a record, so it is drawn over the table rather than in it: what the
+/// reader is editing is the profile underneath, and every press writes through
+/// that profile.
+fn render_models(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    view: &crate::config_center::ModelListView,
+    theme: &TuiTheme,
+) {
+    let strings = app.strings;
+    let title = format!("{} · {}", strings.config_models_title(), view.title);
+    let chrome = modal_chrome(
+        app,
+        &title,
+        ModalSizing::new(60, 96, 40, 2, 2, 1, 1),
+        vec![
+            ModalHint::new("↑↓", strings.hint_nav()),
+            ModalHint::new("o", strings.config_action_toggle()),
+            ModalHint::new("f", strings.config_action_fetch_models()),
+            ModalHint::new("i", strings.config_action_new()),
+            ModalHint::new("x", strings.config_action_delete()),
+            ModalHint::new("Esc", strings.close()),
+        ],
+    );
+    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
+        return;
+    };
+    let rows = match app
+        .management_data
+        .providers
+        .iter()
+        .find(|profile| profile.id.as_str() == view.profile_id)
+    {
+        Some(profile) => {
+            crate::config_center::model_rows(profile, &app.management_data.provider_models, strings)
+        }
+        None => Vec::new(),
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("  {}", strings.config_models_hint()),
+        Style::default().fg(theme.roles.gray_dim),
+    )));
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", strings.config_models_empty()),
+            Style::default().fg(theme.roles.gray_dim),
+        )));
+    }
+    let window = usize::from(layout.content.height).saturating_sub(1);
+    let selected = view.selected.min(rows.len().saturating_sub(1));
+    let first = selected.saturating_sub(window.saturating_sub(1) / 2);
+    for (offset, row) in rows.iter().skip(first).take(window.max(1)).enumerate() {
+        let index = first + offset;
+        let is_selected = index == selected;
+        let base = if is_selected {
+            Style::default()
+                .fg(theme.roles.foreground)
+                .bg(theme.roles.surface_highlight)
+                .add_modifier(Modifier::BOLD)
+        } else if row.declared {
+            Style::default().fg(theme.roles.foreground)
+        } else {
+            Style::default().fg(theme.roles.gray)
+        };
+        let (chip, tone) = row.chip(strings);
+        let mut spans = vec![
+            Span::styled(
+                if is_selected { "▌" } else { " " },
+                Style::default().fg(theme.roles.accent_user),
+            ),
+            Span::styled(
+                format!(" {:<14}", chip),
+                chip_style(tone, theme).patch(base),
+            ),
+            Span::styled(config_cell(&row.label, 28), base),
+        ];
+        for (label, value) in &row.detail {
+            spans.push(Span::styled(
+                format!("{label} {value}  "),
+                Style::default().fg(theme.roles.gray_bright),
+            ));
+        }
+        if !row.declared {
+            spans.push(Span::styled(
+                strings.config_models_undeclared().to_string(),
+                Style::default().fg(theme.roles.gray_dim),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), layout.content);
+    if let (Some((notice, tone)), Some(footer)) = (&view.notice, layout.footer) {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {notice}"),
+                chip_style(*tone, theme),
+            ))),
+            footer,
+        );
+    }
+}
+
 /// The action menu for one project or folder.
 ///
 /// Built from the heading rather than from a fixed list, so a verb a heading
@@ -8594,6 +8701,7 @@ fn render_overlay(
                 layout.content,
             );
         }
+        Overlay::Models { view } => render_models(frame, area, app, view, theme),
         Overlay::Approval { selected } => render_approval(frame, area, app, *selected, theme),
         // The question card is not a box over the page: it is drawn in the
         // composer's band, which the frame paints before it gets here.

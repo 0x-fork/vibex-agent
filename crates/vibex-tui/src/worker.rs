@@ -613,6 +613,7 @@ impl Dispatch {
                 display_name,
                 base_url,
                 default_model,
+                configured_models,
             } => {
                 let request =
                     MutationRequest::new(vibex_core::AgentModelProviderProfileUpdateRequest {
@@ -625,7 +626,7 @@ impl Dispatch {
                         default_model,
                         small_model: None,
                         large_model: None,
-                        configured_models: None,
+                        configured_models,
                         reasoning_effort: None,
                         sandbox_defaults: None,
                         network_defaults: None,
