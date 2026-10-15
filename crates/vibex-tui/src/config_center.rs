@@ -2448,7 +2448,7 @@ pub fn mcp_form(server: Option<&vibex_core::McpServer>, strings: Strings) -> Con
                 .unwrap_or_default(),
         ),
         FormField::multiline("headers", strings.config_field_headers(), headers)
-            .hint(strings.config_hint_headers()),
+            .hint(strings.config_hint_request_headers()),
         FormField::text(
             "description",
             strings.config_field_description(),
@@ -2691,6 +2691,9 @@ pub fn provider_form(
     let base_url = detail
         .and_then(|detail| detail.base_url.clone())
         .unwrap_or_default();
+    let options = detail
+        .map(|detail| ProviderOptionsDraft::read(&detail.provider_options))
+        .unwrap_or_default();
     let fields = vec![
         FormField::text(
             "name",
@@ -2704,6 +2707,30 @@ pub fn provider_form(
             strings.config_field_model(),
             profile.default_model.clone().unwrap_or_default(),
         ),
+        FormField::text("website", strings.config_field_website(), options.website)
+            .hint(strings.config_hint_endpoint()),
+        FormField::multiline(
+            "headers",
+            strings.config_field_request_headers(),
+            options
+                .headers
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", value.displayed()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .hint(strings.config_hint_headers()),
+        FormField::multiline(
+            "protocol_urls",
+            strings.config_field_protocol_urls(),
+            options
+                .protocol_urls
+                .iter()
+                .map(|(wire, url)| format!("{}={url}", wire_api_label(*wire)))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .hint(strings.config_hint_protocol_urls()),
     ];
     ConfigForm::new(
         FormPurpose::ProviderProfile {
@@ -3227,6 +3254,74 @@ pub fn provider_model_form(
     )
 }
 
+/// The options the form's three fields describe, as a draft.
+///
+/// The header field is the one place a value may be a variable, so it is the one
+/// place the parse can fail on something the reader typed: a `{{name}}` that is
+/// not a variable the runtime knows is refused rather than sent as a header
+/// whose value is the literal text of a placeholder.
+pub fn provider_options_draft(
+    form: &ConfigForm,
+    strings: Strings,
+) -> Result<ProviderOptionsDraft, &'static str> {
+    let mut draft = ProviderOptionsDraft {
+        website: form.value("website").unwrap_or_default(),
+        ..ProviderOptionsDraft::default()
+    };
+    for line in form.value("headers").unwrap_or_default().lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(strings.config_form_error_header());
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() {
+            return Err(strings.config_form_error_header());
+        }
+        let value = match value
+            .strip_prefix("{{")
+            .and_then(|rest| rest.strip_suffix("}}"))
+        {
+            Some(id) => {
+                let id = id.trim();
+                let Some(variable) = vibex_core::ModelProviderHeaderVariable::ALL
+                    .into_iter()
+                    .find(|variable| variable.id() == id)
+                else {
+                    return Err(strings.config_form_error_header_variable());
+                };
+                ProviderHeaderValue::Variable(variable)
+            }
+            None => ProviderHeaderValue::Literal(value.to_string()),
+        };
+        if draft
+            .headers
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
+        {
+            return Err(strings.config_form_error_header_duplicate());
+        }
+        draft.headers.push((name.to_string(), value));
+    }
+    for line in form.value("protocol_urls").unwrap_or_default().lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((wire, url)) = line.split_once('=') else {
+            return Err(strings.config_form_error_protocol_url());
+        };
+        let Some(wire) = wire_api_from_value(wire.trim()) else {
+            return Err(strings.config_form_error_protocol_url());
+        };
+        draft.protocol_urls.push((wire, url.trim().to_string()));
+    }
+    Ok(draft)
+}
+
 /// What one wire protocol is called on screen.
 pub const fn wire_api_label(wire_api: vibex_core::ProviderModelWireApi) -> &'static str {
     use vibex_core::ProviderModelWireApi as Api;
@@ -3255,4 +3350,188 @@ pub struct ModelListView {
     pub title: String,
     pub selected: usize,
     pub notice: Option<(String, ConfigTone)>,
+}
+
+/// The Provider option that carries the publisher's website.
+const PROVIDER_OPTION_WEBSITE: &str = "ccSwitchWebsiteUrl";
+/// The Provider option that carries the reader's request headers.
+///
+/// A JSON object keyed by header name: a string is a literal value, and
+/// `{"variable": "session_id"}` is a value the runtime fills from the session
+/// serving the Agent process.
+const PROVIDER_OPTION_HEADERS: &str = "headerOverrideJson";
+/// The prefix of the option that carries one protocol's own request address.
+const PROVIDER_OPTION_PROTOCOL_URL: &str = "protocolBaseUrl.";
+
+/// What the provider form makes of the options it edits.
+///
+/// The options are a key/value bag the profile shares with other writers —
+/// where the profile was imported from, which switch app type it came from —
+/// so the form owns three keys and leaves every other entry exactly as it
+/// found it. A field that wrote the whole bag would delete a record it never
+/// showed the reader.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderOptionsDraft {
+    /// The publisher's website, as typed.
+    pub website: String,
+    /// Request headers, one `Name: value` per line. A value of `{{id}}` is a
+    /// variable the runtime fills from the session; anything else is literal.
+    pub headers: Vec<(String, ProviderHeaderValue)>,
+    /// One address per protocol, as typed: `wire https://…` per line.
+    pub protocol_urls: Vec<(vibex_core::ProviderModelWireApi, String)>,
+}
+
+/// One request header's value, in the shape the override stores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderHeaderValue {
+    Literal(String),
+    Variable(vibex_core::ModelProviderHeaderVariable),
+}
+
+impl ProviderHeaderValue {
+    /// The value as the form shows it.
+    pub fn displayed(&self) -> String {
+        match self {
+            Self::Literal(value) => value.clone(),
+            Self::Variable(variable) => format!("{{{{{}}}}}", variable.id()),
+        }
+    }
+}
+
+impl ProviderOptionsDraft {
+    /// What the form makes of a profile's options.
+    ///
+    /// Anything that is not the shape this editor writes is skipped rather than
+    /// guessed at, so a hand-edited option never turns into a header the reader
+    /// never configured — and because the draft is applied back over the
+    /// profile's own options, a skipped entry is left exactly as it was.
+    pub fn read(options: &vibex_core::ProviderOptions) -> Self {
+        let mut draft = Self::default();
+        for entry in &options.entries {
+            if entry.key == PROVIDER_OPTION_WEBSITE {
+                draft.website = entry.value.clone();
+            } else if entry.key == PROVIDER_OPTION_HEADERS {
+                draft.headers = parse_header_override(&entry.value);
+            } else if let Some(wire) = entry
+                .key
+                .strip_prefix(PROVIDER_OPTION_PROTOCOL_URL)
+                .and_then(wire_api_from_value)
+            {
+                draft.protocol_urls.push((wire, entry.value.clone()));
+            }
+        }
+        draft
+    }
+
+    /// The options a profile holds, with the three keys this form owns replaced
+    /// and every other entry left where it was.
+    pub fn apply(&self, options: &vibex_core::ProviderOptions) -> vibex_core::ProviderOptions {
+        let owned = |key: &str| {
+            key == PROVIDER_OPTION_WEBSITE
+                || key == PROVIDER_OPTION_HEADERS
+                || key.starts_with(PROVIDER_OPTION_PROTOCOL_URL)
+        };
+        let mut entries = options
+            .entries
+            .iter()
+            .filter(|entry| !owned(&entry.key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !self.website.trim().is_empty() {
+            entries.push(vibex_core::ProviderBindingMetadata {
+                key: PROVIDER_OPTION_WEBSITE.to_string(),
+                value: self.website.trim().to_string(),
+            });
+        }
+        if !self.headers.is_empty() {
+            entries.push(vibex_core::ProviderBindingMetadata {
+                key: PROVIDER_OPTION_HEADERS.to_string(),
+                value: write_header_override(&self.headers),
+            });
+        }
+        for (wire, url) in &self.protocol_urls {
+            if url.trim().is_empty() {
+                continue;
+            }
+            entries.push(vibex_core::ProviderBindingMetadata {
+                key: format!("{PROVIDER_OPTION_PROTOCOL_URL}{}", wire_api_label(*wire)),
+                value: url.trim().to_string(),
+            });
+        }
+        vibex_core::ProviderOptions {
+            schema_version: options.schema_version,
+            entries,
+        }
+    }
+
+    /// Whether any of the addresses names a gateway that wants a session header.
+    ///
+    /// One subscription gateway routes by a request header carrying the session,
+    /// and a profile pointed at it that does not send one reaches the wrong
+    /// bucket. The editor adds the header rather than leaving the reader to find
+    /// out from the gateway's answer.
+    pub fn wants_session_header(&self, base_url: Option<&str>) -> bool {
+        let zen = |url: &str| url.contains("opencode.ai/zen/go");
+        base_url.is_some_and(zen) || self.protocol_urls.iter().any(|(_, url)| zen(url))
+    }
+
+    /// Add the session header, when it is not already declared.
+    pub fn with_session_header(&mut self) {
+        let name = "x-opencode-session";
+        if self
+            .headers
+            .iter()
+            .any(|(header, _)| header.eq_ignore_ascii_case(name))
+        {
+            return;
+        }
+        self.headers.push((
+            name.to_string(),
+            ProviderHeaderValue::Variable(vibex_core::ModelProviderHeaderVariable::SessionId),
+        ));
+    }
+}
+
+/// Read the header override, skipping anything that is not the shape it writes.
+fn parse_header_override(raw: &str) -> Vec<(String, ProviderHeaderValue)> {
+    let Some(object) = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return Vec::new();
+    };
+    object
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let value = match value {
+                serde_json::Value::String(value) => ProviderHeaderValue::Literal(value),
+                serde_json::Value::Object(object) => {
+                    let id = object.get("variable")?.as_str()?;
+                    let variable = vibex_core::ModelProviderHeaderVariable::ALL
+                        .into_iter()
+                        .find(|variable| variable.id() == id)?;
+                    ProviderHeaderValue::Variable(variable)
+                }
+                _ => return None,
+            };
+            Some((name, value))
+        })
+        .collect()
+}
+
+/// Write the header override in the shape the runtime reads.
+fn write_header_override(headers: &[(String, ProviderHeaderValue)]) -> String {
+    let mut object = serde_json::Map::new();
+    for (name, value) in headers {
+        object.insert(
+            name.clone(),
+            match value {
+                ProviderHeaderValue::Literal(value) => serde_json::Value::String(value.clone()),
+                ProviderHeaderValue::Variable(variable) => {
+                    serde_json::json!({ "variable": variable.id() })
+                }
+            },
+        );
+    }
+    serde_json::Value::Object(object).to_string()
 }

@@ -1565,7 +1565,12 @@ fn provider_profile_detail() -> vibex_core::ProviderProfile {
         },
         "providerOptions": {
             "schemaVersion": 1,
-            "entries": [{"key": "ccSwitchWebsiteUrl", "value": "https://example.test"}]
+            "entries": [
+                {"key": "ccSwitchWebsiteUrl", "value": "https://example.test"},
+                {"key": "nativeSource", "value": "cc-switch"},
+                {"key": "headerOverrideJson", "value": "{\"X-Trace\":\"on\",\"x-opencode-session\":{\"variable\":\"session_id\"}}"},
+                {"key": "protocolBaseUrl.anthropic_messages", "value": "https://anthropic.example/v1"}
+            ]
         },
         "secrets": [],
         "createdAtMs": 1,
@@ -1633,12 +1638,14 @@ fn a_copy_is_written_from_the_whole_profile() {
                 panic!("the copy was not a creation: {mutation:?}");
             };
             assert_eq!(request.base_url.as_deref(), Some("https://api.example/v1"));
-            assert_eq!(
+            assert!(
                 request
                     .provider_options
                     .as_ref()
-                    .map(|options| options.entries.len()),
-                Some(1),
+                    .is_some_and(|options| options
+                        .entries
+                        .iter()
+                        .any(|entry| entry.key == "nativeSource")),
                 "the request options were dropped by the copy"
             );
             assert!(
@@ -2009,4 +2016,139 @@ fn reading_the_providers_area_reads_the_arrangement_too() {
         "the arrangement was read {reads} times for one Agent: {:#?}",
         outcome.effects
     );
+}
+
+/// The provider's options are edited over the bag the profile shares.
+///
+/// The options are a key/value bag other writers also use — where the profile
+/// was imported from, which switch app type it came from — so the form owns
+/// three keys and leaves every other entry exactly as it found it. A field that
+/// wrote the whole bag would delete a record it never showed the reader.
+#[test]
+fn a_providers_options_are_edited_over_the_bag_it_shares() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.management_data.provider_detail = Some(provider_profile_detail());
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    app.perform(vibex_tui::action::Intent::EditSelectedEntry);
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the editor did not open");
+    };
+    assert_eq!(
+        form.value("website").as_deref(),
+        Some("https://example.test")
+    );
+    assert_eq!(
+        form.value("headers").as_deref(),
+        Some("X-Trace: on\nx-opencode-session: {{session_id}}"),
+        "the headers were not read back in the shape they are written"
+    );
+    assert_eq!(
+        form.value("protocol_urls").as_deref(),
+        Some("anthropic_messages=https://anthropic.example/v1")
+    );
+
+    // The reader adds a header and a second protocol address.
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        form.field_mut("headers").unwrap().value =
+            "X-Trace: on\nx-opencode-session: {{session_id}}\nX-Team: vibex".to_string();
+        form.field_mut("protocol_urls").unwrap().value =
+            "anthropic_messages=https://anthropic.example/v1\nopenai_responses=https://openai.example/v1"
+                .to_string();
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::UpdateProviderProfile {
+                provider_options: Some(options),
+                ..
+            } = mutation
+            else {
+                panic!("the save wrote no options: {mutation:?}");
+            };
+            let entry = |key: &str| {
+                options
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key == key)
+                    .map(|entry| entry.value.as_str())
+            };
+            assert_eq!(entry("ccSwitchWebsiteUrl"), Some("https://example.test"));
+            assert_eq!(
+                entry("nativeSource"),
+                Some("cc-switch"),
+                "a key the form does not own was deleted"
+            );
+            assert_eq!(
+                entry("protocolBaseUrl.openai_responses"),
+                Some("https://openai.example/v1")
+            );
+            // The variable stays a variable and the literal stays a literal.
+            let headers: serde_json::Value =
+                serde_json::from_str(entry("headerOverrideJson").expect("headers")).unwrap();
+            assert_eq!(headers["X-Trace"], serde_json::json!("on"));
+            assert_eq!(headers["X-Team"], serde_json::json!("vibex"));
+            assert_eq!(
+                headers["x-opencode-session"],
+                serde_json::json!({"variable": "session_id"})
+            );
+        }
+        other => panic!("the save produced {other:?}"),
+    }
+}
+
+/// A header whose value is a fillable variable has to name one the runtime
+/// fills, and a gateway address turns the session header on by itself.
+#[test]
+fn a_provider_option_the_runtime_could_not_read_is_refused_or_completed() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.management_data.provider_detail = Some(provider_profile_detail());
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    // A variable the runtime does not fill is refused rather than sent as the
+    // literal text of a placeholder.
+    app.perform(vibex_tui::action::Intent::EditSelectedEntry);
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        form.field_mut("headers").unwrap().value = "X-Trace: {{session}}".to_string();
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    assert!(outcome.effects.is_empty(), "a bad variable was written");
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the form closed on an invalid save");
+    };
+    assert!(form.error.is_some(), "no reason was given");
+
+    // An address that routes by the session gets the header that gateway reads,
+    // without the reader having to know it exists.
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        form.field_mut("headers").unwrap().value.clear();
+        form.field_mut("base_url").unwrap().value = "https://opencode.ai/zen/go/v1".to_string();
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::UpdateProviderProfile {
+                provider_options: Some(options),
+                ..
+            } = mutation
+            else {
+                panic!("the save wrote no options: {mutation:?}");
+            };
+            let headers = options
+                .entries
+                .iter()
+                .find(|entry| entry.key == "headerOverrideJson")
+                .map(|entry| entry.value.clone())
+                .expect("the session header was not added");
+            let headers: serde_json::Value = serde_json::from_str(&headers).unwrap();
+            assert_eq!(
+                headers["x-opencode-session"],
+                serde_json::json!({"variable": "session_id"}),
+                "the gateway's session header was not enabled"
+            );
+        }
+        other => panic!("the save produced {other:?}"),
+    }
 }

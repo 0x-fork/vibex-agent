@@ -8538,6 +8538,9 @@ pub enum ConfigMutation {
         default_model: Option<String>,
         /// The Models the profile offers, when that is what changed.
         configured_models: Option<Vec<vibex_core::ProviderConfiguredModel>>,
+        /// The whole option bag, written over the profile's own so the keys the
+        /// form does not own survive.
+        provider_options: Option<Box<vibex_core::ProviderOptions>>,
     },
     DeleteProviderProfile {
         agent_id: vibex_core::AgentId,

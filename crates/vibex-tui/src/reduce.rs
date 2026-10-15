@@ -2163,6 +2163,7 @@ impl App {
                 base_url: None,
                 default_model: None,
                 configured_models: Some(models),
+                provider_options: None,
             });
         // The editor stays where it was: a write is not a reason to take the
         // list away from the reader, and the re-read lands behind it.
@@ -2868,7 +2869,7 @@ impl App {
 
     /// Turn a filled-in form into the request it describes.
     fn form_mutation(
-        &self,
+        &mut self,
         form: &crate::config_center::ConfigForm,
     ) -> Result<crate::app::ConfigMutation, &'static str> {
         use crate::app::ConfigMutation;
@@ -3121,6 +3122,7 @@ impl App {
                     base_url: None,
                     default_model: None,
                     configured_models: Some(models),
+                    provider_options: None,
                 })
             }
             FormPurpose::NewProviderProfile { source } => {
@@ -3196,13 +3198,40 @@ impl App {
                 if name.is_empty() {
                     return Err(strings.config_form_error_name());
                 }
+                let profile_id: vibex_core::ProviderProfileId = parse_config_id(profile_id)?;
+                let mut draft = crate::config_center::provider_options_draft(form, strings)?;
+                // A profile pointed at a subscription gateway that routes by the
+                // session sends the header that gateway reads, rather than
+                // leaving the reader to find out from the gateway's answer.
+                let mut noticed = false;
+                if draft.wants_session_header(form.optional("base_url").as_deref()) {
+                    let before = draft.headers.len();
+                    draft.with_session_header();
+                    noticed = draft.headers.len() != before;
+                }
+                // The options are a bag the profile shares with other writers,
+                // so the form's three keys are replaced over what the profile
+                // holds and every other entry is left where it was. When the
+                // profile could not be read there is nothing to preserve, and
+                // the form is what the reader has.
+                let stored = self
+                    .provider_detail(profile_id.as_str())
+                    .map(|detail| detail.provider_options.clone())
+                    .unwrap_or_else(vibex_core::ProviderOptions::empty);
+                let provider_options = draft.apply(&stored);
+                if noticed {
+                    self.toast(Toast::info(
+                        self.strings.config_result_session_header().to_string(),
+                    ));
+                }
                 Ok(ConfigMutation::UpdateProviderProfile {
                     agent_id: parse_config_id(agent_id)?,
-                    profile_id: parse_config_id(profile_id)?,
+                    profile_id,
                     display_name: Some(name),
                     base_url: form.optional("base_url"),
                     default_model: form.optional("default_model"),
                     configured_models: None,
+                    provider_options: Some(Box::new(provider_options)),
                 })
             }
             FormPurpose::McpMatrix { server_id } => {

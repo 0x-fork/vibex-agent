@@ -637,6 +637,7 @@ impl Dispatch {
                 base_url,
                 default_model,
                 configured_models,
+                provider_options,
             } => {
                 let request =
                     MutationRequest::new(vibex_core::AgentModelProviderProfileUpdateRequest {
@@ -654,7 +655,7 @@ impl Dispatch {
                         sandbox_defaults: None,
                         network_defaults: None,
                         permission_defaults: None,
-                        provider_options: None,
+                        provider_options: provider_options.map(|options| *options),
                     });
                 self.facade
                     .management()
