@@ -599,6 +599,14 @@ impl Dispatch {
                     .await
                     .map(|state| install_outcome(&state))
             }
+            M::CreateProviderProfile(request) => {
+                let request = MutationRequest::new(*request);
+                self.facade
+                    .management()
+                    .create_agent_model_provider_profile(request)
+                    .await
+                    .map(|_| Outcome::Plain)
+            }
             M::UpdateProviderProfile {
                 agent_id,
                 profile_id,

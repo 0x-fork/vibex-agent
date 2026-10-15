@@ -938,7 +938,13 @@ fn provider_profile(id: &str, name: &str) -> vibex_core::ProviderProfileSummary 
         "kind": "codex",
         "displayName": name,
         "status": "enabled",
-        "configuredModels": [],
+        "accountAlias": "work",
+        "defaultModel": "gpt-5",
+        "configuredModels": [{
+            "id": "gpt-5",
+            "enabled": true,
+            "capabilities": {}
+        }],
         "secretSetupState": "missing",
         "updatedAtMs": 1
     }))
@@ -1468,4 +1474,95 @@ fn a_widening_registry_is_asked_again_without_a_key() {
     for _ in 0..vibex_tui::config_center::REGISTRY_POLL_TICKS * 2 {
         assert!(!asked(&mut app), "the installed list was polled");
     }
+}
+
+/// A profile can be made from nothing, which no other record in the centre can.
+///
+/// The reader picks the Agent the profile belongs to — the authority mints the
+/// id and derives the kind from that Agent — names it, and lists the Models it
+/// offers. The Agents offered are the ones the runtime says can hold a provider
+/// configuration, so the form cannot ask for something the save would refuse.
+#[test]
+fn a_provider_profile_can_be_made_from_nothing() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    app.perform(vibex_tui::action::Intent::ConfigEntryCreate);
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("`n` on the Providers area opened no form");
+    };
+    assert_eq!(
+        form.purpose,
+        vibex_tui::config_center::FormPurpose::NewProviderProfile
+    );
+    assert!(
+        !form.value("agent").unwrap_or_default().is_empty(),
+        "the form did not offer an Agent to belong to"
+    );
+    assert_eq!(form.value("models").as_deref(), Some(""));
+
+    // The reader names it and lists two Models.
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        form.field_mut("name").unwrap().value = "Work account".to_string();
+        form.field_mut("base_url").unwrap().value = "https://api.example/v1".to_string();
+        form.field_mut("models").unwrap().value = "gpt-5\ngpt-5-mini".to_string();
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::CreateProviderProfile(request) = mutation else {
+                panic!("the save was not a creation: {mutation:?}");
+            };
+            assert_eq!(request.display_name, "Work account");
+            assert_eq!(request.base_url.as_deref(), Some("https://api.example/v1"));
+            assert_eq!(
+                request
+                    .configured_models
+                    .iter()
+                    .map(|model| (model.id.as_str(), model.enabled))
+                    .collect::<Vec<_>>(),
+                vec![("gpt-5", true), ("gpt-5-mini", true)],
+                "the listed Models are not what would be written"
+            );
+        }
+        other => panic!("the save produced {other:?}"),
+    }
+
+    // A profile with no name is refused before anything is sent.
+    app.overlay = None;
+    app.perform(vibex_tui::action::Intent::ConfigEntryCreate);
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        form.field_mut("name").unwrap().value.clear();
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    assert!(outcome.effects.is_empty(), "a nameless profile was written");
+}
+
+/// A copy starts in the form, carrying what this client can see and asking for
+/// the rest.
+///
+/// Profiles are read as the summary the authority publishes, which has the name,
+/// the account and the Models but no endpoint. Writing the copy straight out
+/// would produce a profile that launches nowhere, so the endpoint is asked for
+/// rather than invented.
+#[test]
+fn duplicating_a_profile_opens_a_form_that_asks_for_what_it_cannot_copy() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    let outcome = app.run_config_action_by_key("provider_first", ConfigAction::Duplicate);
+    assert!(outcome.effects.is_empty(), "the copy was written unasked");
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the copy opened no form");
+    };
+    assert_eq!(form.value("name").as_deref(), Some("First copy"));
+    assert_eq!(form.value("account_alias").as_deref(), Some("work"));
+    assert_eq!(form.value("models").as_deref(), Some("gpt-5"));
+    assert_eq!(
+        form.value("base_url").as_deref(),
+        Some(""),
+        "the copy invented an endpoint it cannot read"
+    );
 }

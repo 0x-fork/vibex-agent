@@ -246,6 +246,8 @@ pub enum ConfigAction {
     Test,
     FetchModels,
     Validate,
+    /// Make a second profile with the same settings under a new name.
+    Duplicate,
     /// Choose which Agents receive a resource.
     Matrix,
     /// Import a discovered resource.
@@ -272,6 +274,7 @@ impl ConfigAction {
             Self::Validate => strings.config_action_validate(),
             Self::Matrix => strings.config_action_matrix(),
             Self::Import => strings.config_action_import(),
+            Self::Duplicate => strings.config_action_duplicate(),
         }
     }
 
@@ -1545,6 +1548,7 @@ fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
             .actions(&[
                 ConfigAction::Activate,
                 ConfigAction::Edit,
+                ConfigAction::Duplicate,
                 ConfigAction::Secret,
                 ConfigAction::Test,
                 ConfigAction::FetchModels,
@@ -1940,10 +1944,12 @@ pub enum FormFieldKind {
     Multiline,
     /// A closed set: `←`/`→` and a click cycle it.
     Choice {
-        /// Wire values, in order.
-        options: Vec<&'static str>,
+        /// Wire values, in order. Owned rather than static because a set can
+        /// come from the runtime — the Agents a profile can belong to are read,
+        /// not written down here.
+        options: Vec<String>,
         /// What each option is called on screen, aligned with `options`.
-        labels: Vec<&'static str>,
+        labels: Vec<String>,
     },
     /// Two states.
     Toggle,
@@ -2005,7 +2011,24 @@ impl FormField {
         label: impl Into<String>,
         options: Vec<&'static str>,
         labels: Vec<&'static str>,
-        value: &'static str,
+        value: &str,
+    ) -> Self {
+        Self::choice_owned(
+            key,
+            label,
+            options.into_iter().map(str::to_string).collect(),
+            labels.into_iter().map(str::to_string).collect(),
+            value,
+        )
+    }
+
+    /// The same, for a set the runtime supplied.
+    fn choice_owned(
+        key: impl Into<String>,
+        label: impl Into<String>,
+        options: Vec<String>,
+        labels: Vec<String>,
+        value: &str,
     ) -> Self {
         Self {
             key: key.into(),
@@ -2071,7 +2094,7 @@ impl FormField {
                 }
                 let index = options
                     .iter()
-                    .position(|option| *option == self.value)
+                    .position(|option| option == &self.value)
                     .unwrap_or(0) as isize;
                 let next = (index + delta).rem_euclid(options.len() as isize) as usize;
                 self.value = options[next].to_string();
@@ -2094,9 +2117,8 @@ impl FormField {
                     .unwrap_or(0);
                 labels
                     .get(index)
-                    .copied()
-                    .unwrap_or(self.value.as_str())
-                    .to_string()
+                    .cloned()
+                    .unwrap_or_else(|| self.value.clone())
             }
             FormFieldKind::Toggle => if self.is_on() { "on" } else { "off" }.to_string(),
             _ => self.value.clone(),
@@ -2124,6 +2146,11 @@ pub enum FormPurpose {
         agent_id: String,
         profile_id: String,
     },
+    /// A profile that does not exist yet.
+    ///
+    /// Nothing is carried but the Agent the reader chose and the values they
+    /// typed: the authority mints the id, so there is no record to name.
+    NewProviderProfile,
     /// Which Agents receive one MCP server or Skill.
     McpMatrix {
         server_id: String,
@@ -2151,6 +2178,7 @@ impl FormPurpose {
             Self::McpServer { server_id: None }
                 | Self::Skill { skill_id: None }
                 | Self::Prompt { prompt_id: None }
+                | Self::NewProviderProfile
         )
     }
 }
@@ -2642,6 +2670,81 @@ pub fn provider_form(profile: &vibex_core::ProviderProfileSummary, strings: Stri
             profile_id: profile.id.as_str().to_string(),
         },
         strings.config_form_edit_provider(),
+        fields,
+    )
+}
+
+/// The form that creates a profile, or starts a copy of one.
+///
+/// A copy opens here rather than being written straight out. This client reads
+/// profiles through the summary the authority publishes, and that summary
+/// carries the name, the account and the Models but not the endpoint or the
+/// request headers: a duplicate written from the summary alone would be a
+/// profile that launches nowhere, so the reader is shown what the copy starts
+/// with and asked for the rest rather than handed a record that is quietly
+/// missing half of what it was copied from.
+pub fn provider_create_form(
+    agents: &[vibex_core::AgentSnapshotEntry],
+    source: Option<&vibex_core::ProviderProfileSummary>,
+    strings: Strings,
+) -> ConfigForm {
+    let options = agents
+        .iter()
+        .map(|agent| agent.id.as_str().to_string())
+        .collect::<Vec<_>>();
+    let labels = agents
+        .iter()
+        .map(|agent| agent.label.clone())
+        .collect::<Vec<_>>();
+    let selected = source
+        .map(|profile| profile.agent_id.as_str().to_string())
+        .filter(|id| options.iter().any(|option| option == id))
+        .or_else(|| options.first().cloned())
+        .unwrap_or_default();
+    let name = source
+        .map(|profile| format!("{} {}", profile.display_name, strings.config_copy_suffix()))
+        .unwrap_or_default();
+    let models = source
+        .map(|profile| {
+            profile
+                .configured_models
+                .iter()
+                .map(|model| model.id.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let fields = vec![
+        FormField::choice_owned(
+            "agent",
+            strings.config_field_agent(),
+            options,
+            labels,
+            &selected,
+        ),
+        FormField::text("name", strings.config_form_name(), name),
+        FormField::text(
+            "account_alias",
+            strings.config_field_account(),
+            source
+                .and_then(|profile| profile.account_alias.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::text("base_url", strings.config_field_url(), String::new())
+            .hint(strings.config_hint_provider_url()),
+        FormField::text(
+            "default_model",
+            strings.config_field_model(),
+            source
+                .and_then(|profile| profile.default_model.clone())
+                .unwrap_or_default(),
+        ),
+        FormField::multiline("models", strings.config_field_models(), models)
+            .hint(strings.config_hint_models()),
+    ];
+    ConfigForm::new(
+        FormPurpose::NewProviderProfile,
+        strings.config_form_new_provider(),
         fields,
     )
 }

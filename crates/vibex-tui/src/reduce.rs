@@ -1646,6 +1646,24 @@ impl App {
                     Effect::SelectProfile { profile_id },
                 )
             }
+            // A copy starts in the form rather than being written straight out:
+            // this client reads profiles as summaries, and a summary has no
+            // endpoint to copy. The reader is shown what the copy carries and
+            // asked for the rest.
+            (ConfigSection::Providers, ConfigAction::Duplicate) => {
+                let Some(profile_id) = self.provider_id(key) else {
+                    return Outcome::quiet();
+                };
+                let source = self
+                    .management_data
+                    .providers
+                    .iter()
+                    .find(|profile| profile.id == profile_id)
+                    .cloned();
+                let form = self.provider_create_form(source.as_ref(), self.strings);
+                self.overlay = Some(Overlay::Form { form });
+                Outcome::effects(vec![])
+            }
             (ConfigSection::Providers, ConfigAction::Secret) => {
                 // The profile the key is for travels with the prompt: the list
                 // can be re-read while the reader is typing, and the row the
@@ -1905,7 +1923,14 @@ impl App {
                             .find(|profile| profile.id.as_str() == key)
                     })
                     .cloned();
-                profile.map(|profile| crate::config_center::provider_form(&profile, strings))
+                match profile {
+                    Some(profile) => Some(crate::config_center::provider_form(&profile, strings)),
+                    // `n` on the Providers area has no record to open, so it
+                    // opens the blank form: a profile is the one record in the
+                    // centre the reader can make from nothing.
+                    None if key.is_none() => Some(self.provider_create_form(None, strings)),
+                    None => None,
+                }
             }
             _ => None,
         };
@@ -1916,6 +1941,28 @@ impl App {
             }
             None => Outcome::quiet(),
         }
+    }
+
+    /// The form that makes a profile, given the Agent it may belong to.
+    ///
+    /// The Agents offered are the ones the runtime says can hold a provider
+    /// configuration, intersected with the ones this client has been told
+    /// about: offering an Agent that cannot hold one would be a form whose save
+    /// the authority refuses.
+    fn provider_create_form(
+        &self,
+        source: Option<&vibex_core::ProviderProfileSummary>,
+        strings: crate::locale::Strings,
+    ) -> crate::config_center::ConfigForm {
+        let configurable = vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
+        let agents = self
+            .management_data
+            .agents
+            .iter()
+            .filter(|agent| configurable.contains(&agent.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        crate::config_center::provider_create_form(&agents, source, strings)
     }
 
     /// The per-Agent matrix of one MCP server or Skill.
@@ -2674,6 +2721,54 @@ impl App {
                         },
                     ))),
                 }
+            }
+            FormPurpose::NewProviderProfile => {
+                let Some(agent_id) = form
+                    .value("agent")
+                    .filter(|id| !id.is_empty())
+                    .and_then(|id| parse_config_id(&id).ok())
+                else {
+                    return Err(strings.config_form_error_agent());
+                };
+                if name.is_empty() {
+                    return Err(strings.config_form_error_name());
+                }
+                // The Models the reader listed are offered as they are written:
+                // a wire protocol, a reasoning declaration and a token limit
+                // are per-Model settings, and a new profile has none of them
+                // until its Models are edited one at a time.
+                let configured_models = form
+                    .value("models")
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(|id| vibex_core::ProviderConfiguredModel {
+                        id: id.to_string(),
+                        display_name: None,
+                        enabled: true,
+                        wire_api: None,
+                        capabilities: vibex_core::ProviderModelCapabilities::default(),
+                    })
+                    .collect::<Vec<_>>();
+                Ok(ConfigMutation::CreateProviderProfile(Box::new(
+                    vibex_core::AgentModelProviderProfileCreateRequest {
+                        agent_id,
+                        display_name: name,
+                        account_alias: form.optional("account_alias"),
+                        base_url: form.optional("base_url"),
+                        default_model: form.optional("default_model"),
+                        small_model: None,
+                        large_model: None,
+                        configured_models,
+                        reasoning_effort: None,
+                        sandbox_defaults: None,
+                        network_defaults: None,
+                        permission_defaults: None,
+                        provider_options: None,
+                        secret_references: Vec::new(),
+                    },
+                )))
             }
             FormPurpose::ProviderProfile {
                 agent_id,

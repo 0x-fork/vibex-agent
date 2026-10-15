@@ -8488,6 +8488,8 @@ pub enum ConfigMutation {
         agent_id: vibex_core::AgentId,
     },
     // ---- provider profiles ----------------------------------------------
+    /// Make a profile that does not exist yet.
+    CreateProviderProfile(Box<vibex_core::AgentModelProviderProfileCreateRequest>),
     UpdateProviderProfile {
         agent_id: vibex_core::AgentId,
         profile_id: vibex_core::ProviderProfileId,
@@ -8586,6 +8588,7 @@ impl ConfigMutation {
             | Self::RollbackAgent { agent_id } => agent_id.as_str().to_string(),
             Self::UpdateProviderProfile { profile_id, .. }
             | Self::DeleteProviderProfile { profile_id, .. } => profile_id.as_str().to_string(),
+            Self::CreateProviderProfile(_) => "provider:new".to_string(),
             Self::CreateMcpServer(_) => "mcp:new".to_string(),
             Self::UpdateMcpServer(request) => request.mcp_server_id.as_str().to_string(),
             Self::DeleteMcpServer { server_id }
@@ -8617,6 +8620,7 @@ impl ConfigMutation {
             Self::RefreshAgentSnapshot { .. } => "agent_probe",
             Self::CheckAgentUpdate { .. } => "agent_update_check",
             Self::RollbackAgent { .. } => "agent_rollback",
+            Self::CreateProviderProfile(_) => "provider_profile_create",
             Self::UpdateProviderProfile { .. } => "provider_profile",
             Self::DeleteProviderProfile { .. } => "provider_profile_delete",
             Self::CreateMcpServer(_) => "mcp_create",
@@ -8661,6 +8665,7 @@ impl ConfigMutation {
             Self::RefreshAgentSnapshot { .. } => Verb::RefreshSnapshot,
             Self::CheckAgentUpdate { .. } => Verb::CheckUpdate,
             Self::RollbackAgent { .. } => Verb::Rollback,
+            Self::CreateProviderProfile(_) => Verb::Create,
             Self::UpdateProviderProfile { .. } => Verb::Save,
             Self::DeleteProviderProfile { .. } => Verb::Delete,
             Self::CreateMcpServer(_) | Self::CreateSkill(_) | Self::CreatePrompt(_) => Verb::Create,
