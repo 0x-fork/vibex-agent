@@ -1607,6 +1607,14 @@ pub struct MobileApp {
     /// their members from these: a member's own node is what says whether its
     /// task is running, waiting, or done.
     delegated_nodes: BTreeMap<String, vibex_core::SessionTreeNode>,
+    /// The live snapshot of every session the tree has named, by session id.
+    ///
+    /// A tree page carries this metadata for the nodes it lists — the root
+    /// session list omits owned children, so the page is the only place the
+    /// phone can learn what a child is doing. The ownership node itself is a
+    /// record of the delegation, not of the session, which is why the row reads
+    /// its state and its hour from here.
+    delegated_sessions: BTreeMap<String, AgentSession>,
     /// The parents whose children are on screen.
     delegated_expanded: BTreeSet<String>,
     /// The parents whose children are being fetched.
@@ -2996,6 +3004,7 @@ impl MobileApp {
             delegated_children: BTreeMap::new(),
             delegated_parents: BTreeSet::new(),
             delegated_nodes: BTreeMap::new(),
+            delegated_sessions: BTreeMap::new(),
             delegated_expanded: BTreeSet::new(),
             delegated_loading: BTreeSet::new(),
             sidebar_list_frame: Rc::new(Cell::new((0.0, 0.0))),
@@ -4859,6 +4868,7 @@ impl MobileApp {
             let _ = entity.update(cx, |this, cx| {
                 if let Ok(page) = outcome {
                     this.record_delegated_nodes(&page.nodes);
+                    this.record_delegated_sessions(&page.registry);
                     this.delegated_parents = page
                         .nodes
                         .iter()
@@ -4887,6 +4897,16 @@ impl MobileApp {
                 self.delegated_nodes
                     .insert(id.as_str().to_string(), node.clone());
             }
+        }
+    }
+
+    /// Remembers the live snapshots a tree page carried for the sessions it
+    /// named. The page is the only source for a child's own state: the root
+    /// session list the phone syncs leaves owned children out.
+    fn record_delegated_sessions(&mut self, sessions: &[AgentSession]) {
+        for session in sessions {
+            self.delegated_sessions
+                .insert(session.id.as_str().to_string(), session.clone());
         }
     }
 
@@ -4927,6 +4947,7 @@ impl MobileApp {
                 match outcome {
                     Ok(page) => {
                         this.record_delegated_nodes(&page.nodes);
+                        this.record_delegated_sessions(&page.registry);
                         this.delegated_children.insert(session_id, page.nodes);
                     }
                     Err(error) => {
@@ -7612,11 +7633,21 @@ impl MobileApp {
                         .as_ref()
                         .and_then(|controller| controller.state.selected_session_id.as_ref())
                         .is_some_and(|selected| selected == &child_id),
+                    // The row's own state is left to the renderer, which
+                    // resolves the live session a tree page carried; what the
+                    // page cannot say is whether auto continue is on for the
+                    // child, which the sidebar view carries for every session.
                     state: None,
-                    session_id: Some(child_id),
                     unread: false,
-                    auto_continue: false,
-                    auto_continue_paused: false,
+                    auto_continue: self
+                        .sidebar_view
+                        .auto_continue_session_ids
+                        .contains(child_id.as_str()),
+                    auto_continue_paused: self
+                        .sidebar_view
+                        .auto_continue_paused_session_ids
+                        .contains(child_id.as_str()),
+                    session_id: Some(child_id),
                     delegated_child: true,
                 });
             }
@@ -8193,6 +8224,15 @@ impl MobileApp {
         self.workspace_sync_queued = false;
         self.sidebar_sync_busy = false;
         self.sidebar_sync_queued = false;
+        // The tree belongs to whichever desktop is paired, so the ownership
+        // records and the snapshots they carried leave with the view: a child
+        // row must not report the desktop the phone has just left.
+        self.delegated_nodes.clear();
+        self.delegated_sessions.clear();
+        self.delegated_children.clear();
+        self.delegated_parents.clear();
+        self.delegated_expanded.clear();
+        self.delegated_loading.clear();
         self.sidebar_drag = None;
         self.sidebar_batch_mode = false;
         self.sidebar_batch_delete_confirmation = false;
@@ -22119,9 +22159,10 @@ impl MobileApp {
             return div().into_any_element();
         };
         let sessions = self.sessions();
-        let session = sessions.iter().find(|session| session.id == session_id);
         // A delegated child is not in the ordinary list — the tree is where it
-        // is named — so its row is drawn from what the row itself carries.
+        // is named — so the row falls back to the snapshot the tree page
+        // carried for it, which is what lets it report a state and an hour.
+        let session = sidebar_row_session(sessions, &self.delegated_sessions, session_id.as_str());
         if session.is_none() && !row.delegated_child {
             return div().into_any_element();
         }
@@ -29374,6 +29415,22 @@ fn mobile_join_session_group_label(group_name: &str) -> String {
     }
 }
 
+/// The live session behind a row.
+///
+/// The ordinary list answers for the sessions the phone syncs, and a tree page
+/// answers for the owned children that list leaves out — so a delegated row
+/// reads its state and its hour from the same place every other row does.
+fn sidebar_row_session<'a>(
+    sessions: &'a [AgentSession],
+    delegated: &'a BTreeMap<String, AgentSession>,
+    session_id: &str,
+) -> Option<&'a AgentSession> {
+    sessions
+        .iter()
+        .find(|session| session.id.as_str() == session_id)
+        .or_else(|| delegated.get(session_id))
+}
+
 fn sidebar_item_ref(item: &SidebarOrganizationItem) -> RemoteSidebarItemRef {
     let (kind, id) = match item {
         SidebarOrganizationItem::Folder(id) => (RemoteSidebarItemKind::Folder, id),
@@ -36066,6 +36123,83 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             sheet.contains("SetSessionAutoContinuePaused"),
             "which lifts the suspension on the authority"
+        );
+    }
+
+    /// A delegated row reads its live session from the tree page that named it.
+    ///
+    /// The root session list the phone syncs leaves owned children out, so the
+    /// row used to report nothing at all — no state, no hour — for the sessions
+    /// the ownership tree had just told it about.
+    #[test]
+    fn a_delegated_row_reads_the_session_its_tree_page_carried() {
+        fn session(id: &str, state: AgentSessionState) -> AgentSession {
+            AgentSession {
+                id: VibexSessionId::parse(id).expect("valid session id"),
+                title: id.to_string(),
+                project_id: vibex_core::ProjectId::parse("project_a").expect("valid project"),
+                workspace_id: vibex_core::WorkspaceId::parse("workspace_a")
+                    .expect("valid workspace"),
+                workspace_root: "/tmp/a".to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                agent_id: AgentId::parse("claude").expect("valid agent id"),
+                state,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                last_message_at_ms: 0,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            }
+        }
+
+        let listed = session("session_listed", AgentSessionState::Running);
+        let child = session("session_child", AgentSessionState::NeedsInput);
+        let sessions = vec![listed];
+        let delegated = BTreeMap::from([("session_child".to_string(), child)]);
+
+        assert_eq!(
+            sidebar_row_session(&sessions, &delegated, "session_listed").map(|s| s.state),
+            Some(AgentSessionState::Running),
+            "the ordinary list answers for the sessions the phone syncs"
+        );
+        assert_eq!(
+            sidebar_row_session(&sessions, &delegated, "session_child").map(|s| s.state),
+            Some(AgentSessionState::NeedsInput),
+            "a child the root list omits is answered by its tree page"
+        );
+        assert!(sidebar_row_session(&sessions, &delegated, "session_gone").is_none());
+    }
+
+    /// Both tree reads keep the metadata they carried, and a host switch drops
+    /// it with the tree.
+    #[test]
+    fn a_tree_page_carries_the_state_of_the_children_it_names() {
+        let source = include_str!("app.rs");
+        // Read the production source only: the needle below is a literal in
+        // this test too, and counting the test's own copy would make the
+        // assertion about itself. The test module is the last one; the file
+        // carries `#[cfg(test)]` helpers long before it, so the split is taken
+        // from the module itself.
+        let production = source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .expect("the crate has a test module")
+            .0;
+        assert_eq!(
+            production
+                .matches("record_delegated_sessions(&page.registry)")
+                .count(),
+            2,
+            "the root refresh and the child fetch both record what they carried"
+        );
+        let reset = renderer_source(source, "reset_sidebar_ui");
+        assert!(
+            reset.contains("self.delegated_sessions.clear()"),
+            "a host switch takes the tree's snapshots with it"
+        );
+        assert!(
+            reset.contains("self.delegated_nodes.clear()"),
+            "and the records the snapshots belong to"
         );
     }
 
