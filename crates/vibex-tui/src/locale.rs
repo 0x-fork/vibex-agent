@@ -1564,13 +1564,13 @@ strings! {
     // ---- command palette / overlays --------------------------------------
     palette_title => { "Command palette", "命令面板", "命令面板" },
     palette_placeholder => { "Type a command…", "输入命令…", "輸入命令…" },
-    // The headings, in the order the palette draws them: where the reader is,
-    // the devices they trust, the client itself, and — on a session's page
-    // alone — the conversation.
-    palette_group_view => { "View", "视图", "檢視" },
+    // The headings, in the order the palette draws them: where the reader can
+    // go, the devices they trust, the client itself, and — on a session's page
+    // alone — the sessions those verbs act on.
+    palette_group_view => { "Feature view", "功能视图", "功能檢視" },
     palette_group_pairing => { "Remote pairing", "远程配对", "遠端配對" },
     palette_group_app => { "App", "应用", "應用" },
-    palette_group_session => { "Session", "会话", "工作階段" },
+    palette_group_session => { "Session list", "会话列表", "工作階段清單" },
     palette_group_workbench => { "Workbench", "工作台", "工作台" },
     // The palette's own names and one-line explanations. They are longer than
     // the key bar's labels because the palette is read as a menu rather than

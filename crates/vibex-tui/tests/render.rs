@@ -4452,9 +4452,12 @@ fn the_palette_groups_commands_under_their_headings() {
     enter_session(&mut app, "session_palette01");
     app.perform(Intent::OpenCommandPalette);
     let screen = text(&render(&mut app, 120, 40));
-    assert!(screen.contains("View"), "no group headings:\n{screen}");
     assert!(
-        screen.contains("Workbench") || screen.contains("Session"),
+        screen.contains("Feature view"),
+        "no group headings:\n{screen}"
+    );
+    assert!(
+        screen.contains("Workbench") || screen.contains("Session list"),
         "{screen}"
     );
 
@@ -4508,21 +4511,24 @@ fn the_palette_groups_commands_under_their_headings() {
         .map(|above| line_text(above).trim().to_string())
         .expect("no heading above the command");
     assert_eq!(
-        heading, "View",
-        "the command is not drawn under `View`:\n{screen}"
+        heading, "Feature view",
+        "the command is not drawn under `Feature view`:\n{screen}"
     );
     assert_eq!(
-        headings.iter().filter(|heading| *heading == "View").count(),
+        headings
+            .iter()
+            .filter(|heading| *heading == "Feature view")
+            .count(),
         1,
-        "the `View` section is drawn twice:\n{screen}"
+        "the `Feature view` section is drawn twice:\n{screen}"
     );
 }
 
-/// The sections read top-down in the order the reader asked for: where they
-/// are, the devices they trust, the client itself, and the conversation. The
-/// headings are compared in Chinese because that is where the renamed device
-/// section has to be legible, and the frame is rendered on a session's page so
-/// that the conversation's own section is on offer with the rest.
+/// The sections read top-down in the order the reader asked for: where they can
+/// go, the devices they trust, the client itself, and the sessions those verbs
+/// act on. The headings are compared in Chinese because that is where the
+/// renamed sections have to be legible, and the frame is rendered on a session's
+/// page so that the session list's own section is on offer with the rest.
 #[test]
 fn the_palette_files_its_sections_in_reading_order() {
     use vibex_tui::view::PaletteGroup;
@@ -4558,7 +4564,7 @@ fn the_palette_files_its_sections_in_reading_order() {
         .into_iter()
         .map(|heading| heading.replace(' ', ""))
         .collect::<Vec<_>>();
-    let expected = ["视图", "远程配对", "应用", "会话"];
+    let expected = ["功能视图", "远程配对", "应用", "会话列表"];
     assert!(drawn.len() >= 2, "the palette drew no sections: {drawn:?}");
     assert!(
         drawn.len() <= expected.len(),
@@ -4649,7 +4655,7 @@ fn the_palette_withholds_its_session_section_where_no_session_is_shown() {
         assert!(
             !palette_headings(&mut app, 120, 40)
                 .iter()
-                .any(|heading| heading == "Session"),
+                .any(|heading| heading == "Session list"),
             "{page:?} drew the session heading with nothing under it"
         );
     }
@@ -4667,7 +4673,7 @@ fn the_palette_withholds_its_session_section_where_no_session_is_shown() {
     assert!(
         palette_headings(&mut app, 120, 40)
             .iter()
-            .any(|heading| heading == "Session"),
+            .any(|heading| heading == "Session list"),
         "the session's page did not draw the session heading"
     );
 }

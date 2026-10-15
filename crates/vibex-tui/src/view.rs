@@ -277,7 +277,8 @@ pub const PALETTE: &[PaletteEntry] = &[
 /// The heading a palette command is filed under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PaletteGroup {
-    /// The reader's own place in the client: which page is in front of them.
+    /// Where the reader can go: the pages of the client, and the shape of the
+    /// one in front of them.
     View,
     /// Pairing a device and managing the ones already paired. The two are one
     /// subject — a device arrives by pairing and is revoked from the same
@@ -287,7 +288,9 @@ pub enum PaletteGroup {
     /// The client itself: the runtime a session runs on, the keys it answers
     /// to, the picture on screen.
     App,
-    /// One conversation: creating, renaming, forking, archiving, deleting.
+    /// The session list's own verbs: creating, renaming, forking, archiving,
+    /// deleting. They act on the row the list has selected, which is why the
+    /// section is named for the list rather than for one conversation.
     Session,
     /// The transcript the reader is reading.
     Workbench,
