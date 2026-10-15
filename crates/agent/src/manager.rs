@@ -3843,12 +3843,24 @@ impl AgentManager {
             );
             return Err(err);
         }
+        // The turn boundary is the matching `running` -> `idle`/`needs_input`
+        // transition for the admission publish above, and it is equally
+        // invisible to clients that only follow session snapshots. Publish it
+        // before the housekeeping below: collapsing a large turn's streamed
+        // rows costs as much as the provider's chunking made it, and a client
+        // told of the settle only after that scan finishes keeps painting a
+        // turn the authority has already ended as running — for a minute or
+        // more on a long turn.
+        if let Some(settled) = SessionRepository::get(&conn, &session.id)? {
+            self.publish_root_session_update(&conn, settled);
+        }
         // The turn is over, so its streamed rows have served their purpose:
         // they carried the answer to the live stream chunk by chunk, and the
         // projection folds them back into one row anyway. Collapsing them here
         // keeps the durable timeline proportional to the conversation instead
         // of to how finely the provider happened to chunk it. A failure only
-        // costs a larger history, so it must never fail the turn.
+        // costs a larger history, so it must never fail the turn — and it can
+        // no longer delay the turn boundary, which was published above.
         if let (Some(first), Some(last)) = (
             appended.iter().map(|item| item.sequence).min(),
             appended.iter().map(|item| item.sequence).max(),
@@ -3859,12 +3871,6 @@ impl AgentManager {
                 first - 1,
                 last,
             );
-        }
-        // The turn boundary is the matching `running` -> `idle`/`needs_input`
-        // transition for the admission publish above, and it is equally
-        // invisible to clients that only follow session snapshots.
-        if let Some(settled) = SessionRepository::get(&conn, &session.id)? {
-            self.publish_root_session_update(&conn, settled);
         }
         if turn_completed
             && next_state == AgentSessionState::Idle

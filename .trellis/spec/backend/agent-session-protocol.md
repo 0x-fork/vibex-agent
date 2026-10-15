@@ -2836,6 +2836,13 @@ AgentManager::execute_command(AgentCommandExecuteRequest) -> AgentCommandExecute
 - A caller that reads `idle` or `error` but loses the conditional update race
   must receive `conflict/agent_turn_already_running`; it must not append a
   user message, startup notice, provider event, or begin ACP Adapter work.
+- A turn's settle publishes the session snapshot immediately after the state
+  write. Collapsing the turn's streamed rows is housekeeping and runs after the
+  publish: it costs as much as the provider's chunking made it (tens of
+  thousands of rows on a long turn), and a client that only learns of the
+  settle once it finishes keeps painting a turn the authority already ended as
+  running. The compaction stays best-effort and must never fail the turn — nor
+  delay its boundary.
 - `TimelineRepository::append` owns sequence allocation and insertion inside
   one write transaction. Callers must not precompute sequence numbers or append
   timeline rows with ad hoc SQL.
