@@ -9858,6 +9858,72 @@ fn the_session_list_marks_state_and_auto_continue_without_words() {
     );
 }
 
+/// The ring drawn on the list row whose title is `title`, and the colour of it.
+fn session_row_ring(
+    buffer: &ratatui::buffer::Buffer,
+    title: &str,
+) -> (String, ratatui::style::Color) {
+    let lines = buffer_lines(buffer, buffer.area.width, buffer.area.height);
+    let row = lines
+        .iter()
+        .position(|line| line.contains(title))
+        .unwrap_or_else(|| panic!("no row for {title:?}:\n{}", lines.join("\n")));
+    let frames = vibex_tui::glyphs::activity_ring_frames(vibex_tui::glyphs::GlyphTier::Full);
+    for column in 0..buffer.area.width {
+        let cell = buffer
+            .cell((column, row as u16))
+            .expect("the row is inside the buffer");
+        if frames.contains(&cell.symbol()) {
+            return (cell.symbol().to_string(), cell.fg);
+        }
+    }
+    panic!("no ring on the row for {title:?}:\n{}", lines.join("\n"));
+}
+
+/// The list's ring is the desktop sidebar's mark, so it wears the desktop's own
+/// colours: the theme's primary while a working session continues nothing, and
+/// the success green once auto-continue is on.
+///
+/// The transcript's running rail is a different mark on a different surface, and
+/// its hue must not leak into this one: the desktop pairs `theme().primary` with
+/// `theme().success` on the sidebar, and a list drawing the blue rail instead
+/// would make two sessions that work alike look unlike. It is also the reported
+/// bug — a cancelled auto-continue left the reader with a blue ring.
+#[test]
+fn the_session_list_rings_a_working_row_in_the_desktops_own_colours() {
+    use vibex_core::AgentSessionState;
+
+    let mut working = seeded_session("session_rings0001", "still working");
+    working.state = AgentSessionState::Running;
+    let mut app = app(110, 24);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![working.clone()]))
+        .expect("sessions apply");
+    let primary = app.theme.roles.accent;
+    let rail = app.theme.roles.accent_running;
+    let success = app.theme.roles.accent_success;
+
+    let (glyph, colour) = session_row_ring(&render_buffer(&mut app, 110, 24), "still working");
+    assert_eq!(
+        colour, primary,
+        "the working row does not turn its ring in the theme's primary: {glyph}"
+    );
+    assert_ne!(
+        colour, rail,
+        "the transcript's running hue is on the list's ring: {glyph}"
+    );
+
+    // Auto-continue is the one thing that recolours the ring, and the desktop
+    // says it in its own green.
+    app.auto_continue.set_enabled(&working.id, true);
+    let (glyph, colour) = session_row_ring(&render_buffer(&mut app, 110, 24), "still working");
+    assert_eq!(
+        colour, success,
+        "a session continuing itself does not wear the success green: {glyph}"
+    );
+}
+
 /// The page says what the sessions are doing before the reader reads a single
 /// row, and keeps the one action a session list needs on the line below it.
 #[test]

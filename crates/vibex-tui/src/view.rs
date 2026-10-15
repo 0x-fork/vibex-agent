@@ -2165,9 +2165,15 @@ fn session_status_column(
         // The ring turns only while the Agent is being asked to work, and it is
         // the one mark that moves: a session continuing itself wears it in the
         // success colour, which is how the desktop says auto-continue without a
-        // word. A session that is over — archived, or closed — wears the quiet
-        // dot instead, which is the mark the desktop gives it. Which states turn
-        // the ring lives with the list
+        // word. A session that is *not* continuing itself wears the theme's
+        // primary — white in the shipped dark themes — because that is the
+        // desktop's own pairing: `theme().primary` while the reader has
+        // auto-continue off, `theme().success` while it is on. The running rail
+        // (`accent_running`) is a transcript hue, not the sidebar's mark, and a
+        // blue ring beside the list's green one would say the two working
+        // sessions differ in a way the desktop does not. A session that is over
+        // — archived, or closed — wears the quiet dot instead, which is the mark
+        // the desktop gives it. Which states turn the ring lives with the list
         // ([`crate::sessions::session_state_turns_ring`]), because the clock
         // that steps it has to ask the same question.
         if crate::sessions::session_state_turns_ring(state) {
@@ -2177,7 +2183,7 @@ fn session_status_column(
             let color = if app.auto_continue.is_enabled(&session.id) {
                 theme.roles.accent_success
             } else {
-                theme.roles.accent_running
+                theme.roles.accent
             };
             push(&mut spans, frame, color);
         } else if matches!(
