@@ -8667,6 +8667,19 @@ pub struct VibexWorkbench {
     update_action_task: Option<Task<()>>,
     /// The staged RC-data import that the settings page requested.
     rc_import_task: Option<Task<()>>,
+    /// The session whose Agent raised each elicitation request, keyed by
+    /// request id.
+    ///
+    /// A form belongs to the session that asked the question, not to the view
+    /// that happened to paint it, so pruning needs to be able to tell "this
+    /// session is gone" from "this session is simply not on screen".
+    elicitation_form_sessions: BTreeMap<String, VibexSessionId>,
+    /// Live text fields of the elicitation forms, keyed by
+    /// [`Self::elicitation_input_key`].
+    ///
+    /// The textarea is the only copy of what the user has typed, so the entity
+    /// is owned here — outside every [`SessionView`] — and a form keeps its
+    /// entity until its request is settled or its session goes away.
     elicitation_inputs: BTreeMap<String, Entity<InputState>>,
     elicitation_drafts: BTreeMap<String, ElicitationFormDraft>,
     composer_submission_locators: Vec<ComposerSubmissionLocator>,
@@ -10378,6 +10391,7 @@ impl VibexWorkbench {
             update_status_task: None,
             update_action_task: None,
             rc_import_task: None,
+            elicitation_form_sessions: BTreeMap::new(),
             elicitation_inputs: BTreeMap::new(),
             elicitation_drafts: BTreeMap::new(),
             composer_submission_locators: Vec::new(),
@@ -31628,27 +31642,86 @@ impl VibexWorkbench {
         format!("{request_id}:{field_id}")
     }
 
-    fn prune_elicitation_forms(&mut self) {
-        let mut pending = BTreeSet::new();
-        for item in &self.timeline.items {
-            match &item.payload {
-                TimelinePayload::ElicitationRequest(request)
-                    if request.status == vibex_core::ElicitationRequestStatus::Pending =>
-                {
-                    pending.insert(request.id.to_string());
-                }
-                TimelinePayload::ElicitationResolution(resolution) => {
-                    pending.remove(resolution.request_id.as_str());
-                }
-                _ => {}
-            }
-        }
+    /// Drops the elicitation form state of the given sessions.
+    ///
+    /// Called when sessions are removed, for the same reason composer drafts
+    /// are: state parked for a conversation that no longer exists can never be
+    /// shown again.
+    fn forget_elicitation_forms(&mut self, session_ids: &BTreeSet<String>) {
+        self.elicitation_form_sessions
+            .retain(|_, session_id| !session_ids.contains(session_id.as_str()));
+        let sessions = &self.elicitation_form_sessions;
         self.elicitation_drafts
-            .retain(|request_id, _| pending.contains(request_id));
+            .retain(|request_id, _| sessions.contains_key(request_id));
         self.elicitation_inputs.retain(|key, _| {
             key.split_once(':')
-                .is_some_and(|(request_id, _)| pending.contains(request_id))
+                .is_some_and(|(request_id, _)| sessions.contains_key(request_id))
         });
+    }
+
+    /// Drops elicitation form state that can no longer be answered.
+    ///
+    /// A form belongs to the session whose Agent asked the question, not to the
+    /// timeline that happens to be borrowed for rendering. Switching sessions —
+    /// or rendering a session group pane whose view is not the focused one —
+    /// therefore leaves every pending form alone: the chosen options and the
+    /// typed text are an answer the user has not sent yet, and losing them on
+    /// navigation is exactly the bug this guards. A form is dropped only when
+    /// its request is settled (a resolution for it is visible in the borrowed
+    /// timeline) or when its session is gone.
+    fn prune_elicitation_forms(&mut self, cx: &App) {
+        let mut settled = BTreeSet::new();
+        for item in &self.timeline.items {
+            if let TimelinePayload::ElicitationResolution(resolution) = &item.payload {
+                settled.insert(resolution.request_id.to_string());
+            }
+        }
+        // Mirrors [`Self::registered_session`]: a delegated child that only
+        // lives in the tree still owns the forms raised in its timeline.
+        let live_sessions = self
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str().to_string())
+            .chain(self.delegated_sessions.keys().cloned())
+            .chain(self.delegated_tree.keys().cloned())
+            .collect::<BTreeSet<_>>();
+        self.elicitation_form_sessions.retain(|request_id, session_id| {
+            !settled.contains(request_id) && live_sessions.contains(session_id.as_str())
+        });
+        let sessions = &self.elicitation_form_sessions;
+        self.elicitation_drafts
+            .retain(|request_id, _| sessions.contains_key(request_id));
+        self.elicitation_inputs.retain(|key, _| {
+            key.split_once(':')
+                .is_some_and(|(request_id, _)| sessions.contains_key(request_id))
+        });
+        self.remember_elicitation_typing(cx);
+    }
+
+    /// Copies live textarea values into their drafts.
+    ///
+    /// The textarea holds what the user typed; the draft is what survives a
+    /// view swap. Mirroring the two on every focused render keeps the draft
+    /// truthful, so an input that is rebuilt for any reason — or a resolution
+    /// that is validated later — reads the text the user actually wrote
+    /// instead of the value the form was created with.
+    fn remember_elicitation_typing(&mut self, cx: &App) {
+        let typing = self
+            .elicitation_inputs
+            .iter()
+            .map(|(key, input)| (key.clone(), input.read(cx).value()))
+            .collect::<Vec<_>>();
+        for (key, value) in typing {
+            let Some((request_id, field_id)) = key.split_once(':') else {
+                continue;
+            };
+            let Some(draft) = self.elicitation_drafts.get_mut(request_id) else {
+                continue;
+            };
+            if draft.text(field_id) != Some(value.as_ref()) {
+                draft.set_text(field_id.to_string(), value.as_ref().to_string());
+            }
+        }
     }
 
     fn ensure_elicitation_form(
@@ -31657,6 +31730,9 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.elicitation_form_sessions
+            .entry(request.id.to_string())
+            .or_insert_with(|| request.session_id.clone());
         self.elicitation_drafts
             .entry(request.id.to_string())
             .or_insert_with(|| ElicitationFormDraft::from_request(request));
@@ -35773,6 +35849,9 @@ impl VibexWorkbench {
             .retain(|session_id, _| !session_ids.contains(session_id));
         self.composer_drafts
             .retain(|session_id| !session_ids.contains(session_id));
+        // A half-filled elicitation belongs to the session that asked for it, so
+        // the teardown takes the form with the row.
+        self.forget_elicitation_forms(&session_ids);
         // A message queued for a session that no longer exists has nowhere to
         // go, and persisting it would only bring it back on the next launch.
         if self
@@ -44190,7 +44269,7 @@ impl VibexWorkbench {
             self.timeline.session_id = Some(pane_session_id.clone());
         }
         if focused {
-            self.prune_elicitation_forms();
+            self.prune_elicitation_forms(cx);
         }
         let conversation = self.render_agent_workbench_for(false, window, cx);
         // The find bar belongs to the focused pane alone: it searches the
@@ -51971,11 +52050,11 @@ impl VibexWorkbench {
         // [`timeline_activity::observe_live_label_frame`].
         timeline_activity::observe_live_label_frame(window, cx);
         if include_composer {
-            // Elicitation drafts are keyed by request id and shared across the
-            // workbench, so only the focused view may prune them. A pane that
-            // borrowed another session's timeline must not drop the answers the
-            // user is typing into the focused one.
-            self.prune_elicitation_forms();
+            // Elicitation forms are keyed by request id and owned by the session
+            // that asked the question, so the focused view only settles its own
+            // requests here; the answers being typed into another session's form
+            // are deliberately out of its reach.
+            self.prune_elicitation_forms(cx);
         }
         // Replay the row heights prepaint measured for *this* session before the
         // extent is rebuilt, so a pane's own measurements land in its own view.
@@ -94299,6 +94378,186 @@ mod tests {
             Some(ElicitationResolutionAction::Decline)
         );
         assert!(elicitation_answer_summaries(&request, None).is_empty());
+    }
+
+    /// A half-filled elicitation belongs to the session that asked for it.
+    ///
+    /// Switching sessions swaps the borrowed timeline. The options the user
+    /// picked and the text they typed are an answer they have not sent yet, so
+    /// they must still be there when the session comes back; only a resolution
+    /// for the request, or the session going away, may clear the form.
+    #[gpui::test]
+    fn elicitation_forms_outlive_the_session_view_that_painted_them(cx: &mut TestAppContext) {
+        struct ElicitationFormProbe {
+            workbench: Entity<VibexWorkbench>,
+        }
+
+        impl Render for ElicitationFormProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let (probe, cx) = cx.add_window_view(|window, cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            let workbench =
+                cx.new(|cx| VibexWorkbench::with_initial_state(None, ui_state, None, window, cx));
+            ElicitationFormProbe { workbench }
+        });
+        let workbench = probe.read_with(cx, |probe, _| probe.workbench.clone());
+
+        let session = |session_id: &str| AgentSession {
+            id: VibexSessionId::parse(session_id).expect("session id"),
+            title: session_id.into(),
+            project_id: ProjectId::new(),
+            workspace_id: WorkspaceId::new(),
+            workspace_root: "/tmp/vibex-elicitation-form".into(),
+            workspace_mode: WorkspaceMode::CurrentCheckout,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            last_message_at_ms: 2,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        let session_id = VibexSessionId::parse("session_elicitation_form_a").expect("session id");
+        let other_session_id =
+            VibexSessionId::parse("session_elicitation_form_b").expect("session id");
+        let request = ElicitationRequest {
+            id: RequestId::new(),
+            session_id: session_id.clone(),
+            provider_request_id: None,
+            tool_call_id: None,
+            message: "Which state model should the right rail use?".into(),
+            title: None,
+            description: None,
+            fields: vec![
+                ElicitationField {
+                    id: "approach".into(),
+                    title: "Approach".into(),
+                    description: None,
+                    required: false,
+                    kind: ElicitationFieldKind::Text {
+                        min_length: None,
+                        max_length: None,
+                        pattern: None,
+                        format: None,
+                        default: None,
+                        options: vec![vibex_core::ElicitationOption {
+                            value: "global".into(),
+                            title: "Global GPUI state".into(),
+                            description: None,
+                        }],
+                    },
+                },
+                ElicitationField {
+                    id: "notes".into(),
+                    title: "Notes".into(),
+                    description: None,
+                    required: false,
+                    kind: ElicitationFieldKind::Text {
+                        min_length: None,
+                        max_length: None,
+                        pattern: None,
+                        format: None,
+                        default: None,
+                        options: Vec::new(),
+                    },
+                },
+            ],
+            status: vibex_core::ElicitationRequestStatus::Pending,
+            requested_at_ms: 1,
+        };
+        let notes_key = VibexWorkbench::elicitation_input_key(request.id.as_str(), "notes");
+
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.sessions.push(session("session_elicitation_form_a"));
+            workbench.sessions.push(session("session_elicitation_form_b"));
+            workbench.timeline.replace_authoritative(
+                session_id.clone(),
+                [timeline_item_with_payload(
+                    &session_id,
+                    1,
+                    TimelineSource::Provider,
+                    TimelinePayload::ElicitationRequest(request.clone()),
+                )],
+            );
+            workbench.ensure_elicitation_form(&request, window, cx);
+            workbench
+                .elicitation_drafts
+                .get_mut(request.id.as_str())
+                .expect("draft")
+                .select_option("approach", "global");
+            let notes = workbench
+                .elicitation_inputs
+                .get(&notes_key)
+                .cloned()
+                .expect("text field input");
+            notes.update(cx, |notes, cx| {
+                notes.set_value("the rail stays compact", window, cx)
+            });
+
+            // Borrowing another session's timeline is what a switch leaves
+            // behind; the form must not be mistaken for a vanished request.
+            workbench.timeline.replace_authoritative(
+                other_session_id.clone(),
+                std::iter::empty::<TimelineItem>(),
+            );
+            workbench.prune_elicitation_forms(cx);
+            let draft = workbench
+                .elicitation_drafts
+                .get(request.id.as_str())
+                .expect("a pending form survives the view that painted it");
+            assert_eq!(draft.text("approach"), Some("global"));
+            assert_eq!(
+                draft.text("notes"),
+                Some("the rail stays compact"),
+                "typing is mirrored into the draft that outlives the textarea"
+            );
+            assert!(workbench.elicitation_inputs.contains_key(&notes_key));
+
+            // A resolution seen in the request's own timeline settles it.
+            workbench.timeline.replace_authoritative(
+                session_id.clone(),
+                [
+                    timeline_item_with_payload(
+                        &session_id,
+                        1,
+                        TimelineSource::Provider,
+                        TimelinePayload::ElicitationRequest(request.clone()),
+                    ),
+                    timeline_item_with_payload(
+                        &session_id,
+                        2,
+                        TimelineSource::User,
+                        TimelinePayload::ElicitationResolution(
+                            vibex_core::ElicitationResolution {
+                                request_id: request.id.clone(),
+                                session_id: session_id.clone(),
+                                action: ElicitationResolutionAction::Accept,
+                                answers: BTreeMap::new(),
+                                responder_device_id: None,
+                                resolved_at_ms: 2,
+                            },
+                        ),
+                    ),
+                ],
+            );
+            workbench.prune_elicitation_forms(cx);
+            assert!(!workbench.elicitation_drafts.contains_key(request.id.as_str()));
+            assert!(!workbench.elicitation_inputs.contains_key(&notes_key));
+
+            // A form of a session that has gone away goes with it.
+            workbench.ensure_elicitation_form(&request, window, cx);
+            assert!(workbench.elicitation_drafts.contains_key(request.id.as_str()));
+            workbench.sessions.retain(|session| session.id != session_id);
+            workbench.prune_elicitation_forms(cx);
+            assert!(!workbench.elicitation_drafts.contains_key(request.id.as_str()));
+        });
     }
 
     #[test]
