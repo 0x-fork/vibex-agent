@@ -3459,6 +3459,168 @@ pub fn native_import_sources() -> Vec<vibex_core::ProviderNativeImportSource> {
     vec![Source::Codex, Source::Claude, Source::CcSwitch]
 }
 
+/// One line of the Agent account panel: a way in, or something to do with the
+/// account the Agent holds.
+///
+/// They are one list because they are one decision — "what can I do about this
+/// account" — and a second key for the verbs would be a second thing to learn
+/// for the same question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentAuthRow {
+    /// What `Enter` runs. `None` for a method that cannot be used as reported.
+    pub action: Option<AgentAuthAction>,
+    pub label: String,
+    pub chip: String,
+    pub tone: ConfigTone,
+    pub detail: Vec<(String, String)>,
+    pub hint: Option<String>,
+}
+
+/// What one line of the account panel does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentAuthAction {
+    /// Sign in with this method.
+    Method {
+        method_id: String,
+        kind: vibex_core::AgentAuthMethodKind,
+        /// The variables the method collects, in the order it declares them.
+        environment: Vec<vibex_core::AgentAuthEnvironmentVariable>,
+    },
+    RefreshMethods,
+    Verify,
+    RefreshModels,
+    SignOut,
+}
+
+/// The account panel's lines.
+pub fn agent_auth_rows(
+    catalog: Option<&vibex_core::AgentAuthCatalog>,
+    strings: Strings,
+) -> Vec<AgentAuthRow> {
+    let Some(catalog) = catalog else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for method in &catalog.methods {
+        // A method that needs a provider profile is one this client cannot
+        // finish: the profile is chosen in the Providers area, so the row says
+        // so rather than opening a form whose answer the authority refuses.
+        let needs_profile =
+            method.effect == vibex_core::AgentAuthMethodEffect::RequiresProviderProfile;
+        let (chip, tone) = if needs_profile {
+            (strings.config_auth_needs_profile(), ConfigTone::Muted)
+        } else {
+            match method.kind {
+                vibex_core::AgentAuthMethodKind::Agent => {
+                    (strings.config_auth_method_agent(), ConfigTone::Ok)
+                }
+                vibex_core::AgentAuthMethodKind::Terminal => {
+                    (strings.config_auth_method_terminal(), ConfigTone::Ok)
+                }
+                vibex_core::AgentAuthMethodKind::Environment => {
+                    (strings.config_auth_method_environment(), ConfigTone::Muted)
+                }
+            }
+        };
+        let mut detail = Vec::new();
+        if let Some(description) = &method.description {
+            detail.push((String::new(), description.clone()));
+        }
+        for variable in &method.environment {
+            let label = variable
+                .label
+                .clone()
+                .unwrap_or_else(|| variable.name.clone());
+            let state = if variable.configured {
+                strings.config_auth_configured()
+            } else if variable.optional {
+                strings.config_auth_optional()
+            } else {
+                strings.config_form_required()
+            };
+            detail.push((label, state.to_string()));
+        }
+        rows.push(AgentAuthRow {
+            action: (!needs_profile).then(|| AgentAuthAction::Method {
+                method_id: method.id.clone(),
+                kind: method.kind,
+                environment: method.environment.clone(),
+            }),
+            label: method.name.clone(),
+            chip: chip.to_string(),
+            tone,
+            detail,
+            hint: method.credential_link.clone(),
+        });
+    }
+    rows.push(AgentAuthRow {
+        action: Some(AgentAuthAction::RefreshMethods),
+        label: strings.config_auth_action_refresh().to_string(),
+        chip: String::new(),
+        tone: ConfigTone::Muted,
+        detail: Vec::new(),
+        hint: None,
+    });
+    rows.push(AgentAuthRow {
+        action: Some(AgentAuthAction::Verify),
+        label: strings.config_auth_action_verify().to_string(),
+        chip: String::new(),
+        tone: ConfigTone::Muted,
+        detail: Vec::new(),
+        hint: None,
+    });
+    // The verbs are offered only where they mean something: refreshing a model
+    // catalogue needs an account, and signing out needs a runtime that can.
+    if catalog.status == vibex_core::AgentAuthStatus::Authenticated {
+        rows.push(AgentAuthRow {
+            action: Some(AgentAuthAction::RefreshModels),
+            label: strings.config_auth_action_models().to_string(),
+            chip: String::new(),
+            tone: ConfigTone::Muted,
+            detail: Vec::new(),
+            hint: None,
+        });
+    }
+    if catalog.supports_logout {
+        rows.push(AgentAuthRow {
+            action: Some(AgentAuthAction::SignOut),
+            label: strings.config_auth_action_sign_out().to_string(),
+            chip: String::new(),
+            tone: ConfigTone::Warn,
+            detail: Vec::new(),
+            hint: None,
+        });
+    }
+    rows
+}
+
+/// What the account panel says about the account itself.
+pub fn agent_auth_status(
+    catalog: Option<&vibex_core::AgentAuthCatalog>,
+    strings: Strings,
+) -> (&'static str, ConfigTone) {
+    match catalog.map(|catalog| catalog.status) {
+        Some(vibex_core::AgentAuthStatus::Authenticated) => {
+            (strings.config_auth_signed_in(), ConfigTone::Ok)
+        }
+        Some(vibex_core::AgentAuthStatus::AuthenticationRequired) => {
+            (strings.config_auth_required(), ConfigTone::Warn)
+        }
+        _ => (strings.config_auth_unknown(), ConfigTone::Muted),
+    }
+}
+
+/// Which Agent's account the panel is on, and what it last said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentAuthView {
+    pub agent_id: String,
+    pub title: String,
+    pub selected: usize,
+    /// Whether the catalogue is still being read.
+    pub loading: bool,
+    pub notice: Option<(String, ConfigTone)>,
+}
+
 /// Where a native export writes, in the order the picker cycles them.
 ///
 /// The first is the Agent the profile itself runs, which is the only answer

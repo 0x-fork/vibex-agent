@@ -8291,6 +8291,116 @@ fn render_entry_actions(
     frame.render_widget(Paragraph::new(lines), layout.content);
 }
 
+/// One Agent's account: the ways in, and what can be done with what it holds.
+///
+/// The status is the first line because it is the question the reader came
+/// with; everything under it is a line `Enter` can run.
+fn render_agent_auth(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    view: &crate::config_center::AgentAuthView,
+    theme: &TuiTheme,
+) {
+    use crate::config_center as cc;
+    let strings = app.strings;
+    let title = format!("{} · {}", strings.config_auth_title(), view.title);
+    let chrome = modal_chrome(
+        app,
+        &title,
+        ModalSizing::new(64, 96, 40, 2, 2, 1, 1),
+        vec![
+            ModalHint::new("↑↓", strings.hint_nav()),
+            ModalHint::new("Enter", strings.hint_run()),
+            ModalHint::new("Esc", strings.close()),
+        ],
+    );
+    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
+        return;
+    };
+    let catalog = app.management_data.agent_auth_catalog.as_ref();
+    let (status, tone) = cc::agent_auth_status(catalog, strings);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!(" {status} "),
+            chip_style(tone, theme).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!("  {}", strings.config_auth_hint()),
+        Style::default().fg(theme.roles.gray_dim),
+    )));
+    let rows = cc::agent_auth_rows(catalog, strings);
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {}",
+                if view.loading {
+                    strings.config_auth_loading()
+                } else {
+                    strings.config_auth_no_methods()
+                }
+            ),
+            Style::default().fg(theme.roles.gray_dim),
+        )));
+    }
+    let window = usize::from(layout.content.height).saturating_sub(3);
+    let selected = view.selected.min(rows.len().saturating_sub(1));
+    let first = selected.saturating_sub(window.saturating_sub(1) / 2);
+    for (offset, row) in rows.iter().skip(first).take(window.max(1)).enumerate() {
+        let index = first + offset;
+        let is_selected = index == selected;
+        let usable = row.action.is_some();
+        let base = if is_selected {
+            Style::default()
+                .fg(theme.roles.foreground)
+                .bg(theme.roles.surface_highlight)
+                .add_modifier(Modifier::BOLD)
+        } else if usable {
+            Style::default().fg(theme.roles.foreground)
+        } else {
+            Style::default().fg(theme.roles.gray)
+        };
+        let mut spans = vec![
+            Span::styled(
+                if is_selected { "▌" } else { " " },
+                Style::default().fg(theme.roles.accent_user),
+            ),
+            Span::styled(
+                format!(" {:<22}", row.chip),
+                chip_style(row.tone, theme).patch(base),
+            ),
+            Span::styled(config_cell(&row.label, 26), base),
+        ];
+        if let Some((label, value)) = row.detail.first() {
+            spans.push(Span::styled(
+                if label.is_empty() {
+                    value.clone()
+                } else {
+                    format!("{label} · {value}")
+                },
+                Style::default().fg(theme.roles.gray_bright),
+            ));
+        }
+        if let Some(hint) = &row.hint {
+            spans.push(Span::styled(
+                format!("  {hint}"),
+                Style::default().fg(theme.roles.gray_dim),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    if let Some((notice, tone)) = &view.notice {
+        lines.push(Line::from(Span::styled(
+            format!("  {notice}"),
+            chip_style(*tone, theme),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), layout.content);
+}
+
 /// One profile, offered to another tool's own settings.
 ///
 /// The picker shows the question — which target, which contents — and then the
@@ -8916,6 +9026,7 @@ fn render_overlay(
         Overlay::Models { view } => render_models(frame, area, app, view, theme),
         Overlay::NativeImport { view } => render_native_import(frame, area, app, view, theme),
         Overlay::NativeExport { view } => render_native_export(frame, area, app, view, theme),
+        Overlay::AgentAuth { view } => render_agent_auth(frame, area, app, view, theme),
         Overlay::Approval { selected } => render_approval(frame, area, app, *selected, theme),
         // The question card is not a box over the page: it is drawn in the
         // composer's band, which the frame paints before it gets here.

@@ -731,6 +731,9 @@ fn every_agent_verb_says_what_it_is_doing_on_the_row_it_was_pressed_on() {
             "{action:?} named the wrong record"
         );
 
+        // A verb that opens a surface covers the row it was pressed on, and the
+        // marker underneath is what the reader finds when they close it.
+        app.overlay = None;
         let screen = text(&mut app, 140, 40);
         assert!(
             screen.contains(verb.running(app.strings)),
@@ -2468,4 +2471,114 @@ fn the_export_verb_belongs_to_a_profile() {
         outcome.effects.is_empty() && app.overlay.is_none(),
         "another area exported settings"
     );
+}
+
+/// One Agent's account catalogue, as the authority answers it.
+fn agent_auth_catalog() -> vibex_core::AgentAuthCatalog {
+    serde_json::from_value(serde_json::json!({
+        "agentId": "codex",
+        "methods": [
+            {
+                "id": "chatgpt",
+                "name": "Sign in with ChatGPT",
+                "description": "Opens a browser",
+                "kind": "agent",
+                "effect": "writes_agent_state_home",
+                "environment": [{
+                    "name": "OPENAI_API_KEY",
+                    "label": "API key",
+                    "secret": true,
+                    "optional": false,
+                    "configured": true
+                }],
+                "credentialLink": "https://example.test/keys"
+            },
+            {
+                "id": "shared-profile",
+                "name": "Use the model provider configuration",
+                "kind": "environment",
+                "effect": "requires_provider_profile",
+                "environment": []
+            }
+        ],
+        "supportsLogout": true,
+        "status": "authenticated",
+        "refreshedAtMs": 1
+    }))
+    .expect("auth catalog fixture")
+}
+
+/// The account panel is one list: the ways in, and what can be done with the
+/// account the Agent holds.
+///
+/// A method the authority reports as needing a provider profile is one this
+/// client cannot finish — the profile is chosen in the Providers area — so it is
+/// a line that explains itself rather than a form whose answer would be refused.
+#[test]
+fn an_agents_account_is_read_as_one_list() {
+    let mut app = loaded(140, 40);
+    // The account is the agent domain's, and a client that never saw the
+    // authority advertise it refuses to open the panel at all.
+    app.capabilities.agent = vibex_backend::DomainCapabilities::available([
+        vibex_backend::BackendOperation::AgentAuthRead,
+    ]);
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+
+    let outcome = app.run_config_action_by_key("codex", ConfigAction::Auth);
+    assert!(
+        matches!(app.overlay, Some(Overlay::AgentAuth { .. })),
+        "the account panel did not open"
+    );
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::LoadAgentAuthCatalog { agent_id }] => {
+            assert_eq!(agent_id.as_str(), "codex");
+        }
+        other => panic!("the panel read nothing: {other:?}"),
+    }
+
+    app.management_data.agent_auth_catalog = Some(agent_auth_catalog());
+    let (status, _) = vibex_tui::config_center::agent_auth_status(
+        app.management_data.agent_auth_catalog.as_ref(),
+        app.strings,
+    );
+    assert_eq!(status, "Signed in");
+
+    let rows = vibex_tui::config_center::agent_auth_rows(
+        app.management_data.agent_auth_catalog.as_ref(),
+        app.strings,
+    );
+    // Two methods, then the verbs a signed-in account with a logout offers:
+    // refresh, verify, refresh models and sign out.
+    assert_eq!(rows.len(), 6, "the panel lost a line: {rows:#?}");
+    assert!(rows[0].action.is_some(), "a usable method was not offered");
+    assert!(
+        rows[1].action.is_none(),
+        "a method needing a provider profile was offered as usable"
+    );
+    assert!(
+        rows[0]
+            .detail
+            .iter()
+            .any(|(label, state)| label == "API key" && state == "set"),
+        "the method's variables were not listed with what is already set: {:#?}",
+        rows[0].detail
+    );
+
+    // `Enter` on the verify line asks the Agent's own runtime.
+    app.overlay = Some(Overlay::AgentAuth {
+        view: vibex_tui::config_center::AgentAuthView {
+            agent_id: "codex".to_string(),
+            title: "Codex".to_string(),
+            selected: 3,
+            loading: false,
+            notice: None,
+        },
+    });
+    let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::VerifyAgentAuth { agent_id }] => {
+            assert_eq!(agent_id.as_str(), "codex");
+        }
+        other => panic!("the verify line produced {other:?}"),
+    }
 }

@@ -2493,6 +2493,34 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
+        AppMessage::AgentAuthCatalog(result) => {
+            let agent_id = match &result {
+                Ok(catalog) => catalog.agent_id.as_str().to_string(),
+                Err(_) => match &app.overlay {
+                    Some(Overlay::AgentAuth { view }) => view.agent_id.clone(),
+                    _ => String::new(),
+                },
+            };
+            match result {
+                Ok(catalog) => {
+                    app.management_data.agent_auth_catalog = Some(*catalog);
+                    if let Some(Overlay::AgentAuth { view }) = app.overlay.as_mut() {
+                        view.loading = false;
+                        view.notice = None;
+                    }
+                }
+                Err(error) => {
+                    app.toast(Toast::danger(error.message.clone()));
+                    if let Some(Overlay::AgentAuth { view }) = app.overlay.as_mut() {
+                        view.loading = false;
+                        view.notice = Some((error.message, crate::config_center::ConfigTone::Bad));
+                    }
+                }
+            }
+            // The row wore a working marker while the panel opened; the answer
+            // is what takes it off.
+            app.config_center.finish_pending(&agent_id);
+        }
         AppMessage::NativeExport(result) => match result {
             Ok(preview) => {
                 if let Some(Overlay::NativeExport { view }) = app.overlay.as_mut() {

@@ -1638,22 +1638,7 @@ impl App {
                     Effect::UninstallAgent { agent_id },
                 )
             }
-            (ConfigSection::Agents, ConfigAction::Auth) => {
-                let Some(agent_id) = self.agent_id(key) else {
-                    return Outcome::quiet();
-                };
-                let subject = self.config_row_subject(key);
-                self.guard_record(
-                    BackendOperation::AgentAuthRead,
-                    key,
-                    subject,
-                    crate::config_center::ConfigVerb::SignIn,
-                    Effect::ListAgentAuth {
-                        agent_id,
-                        open: true,
-                    },
-                )
-            }
+            (ConfigSection::Agents, ConfigAction::Auth) => self.open_agent_auth(key),
             (ConfigSection::Agents, ConfigAction::Logout) => {
                 let Some(agent_id) = self.agent_id(key) else {
                     return Outcome::quiet();
@@ -2000,6 +1985,105 @@ impl App {
                 Outcome::effects(vec![])
             }
             None => Outcome::quiet(),
+        }
+    }
+
+    /// The `Auth` verb on an Agent: open the account panel and read it.
+    ///
+    /// The panel is a list of lines rather than a set of keys: the ways in, and
+    /// the things that can be done with the account the Agent holds, are one
+    /// decision, and `Enter` on a line is the whole vocabulary.
+    fn open_agent_auth(&mut self, key: &str) -> Outcome {
+        let Some(agent_id) = self.agent_id(key) else {
+            return Outcome::quiet();
+        };
+        // The grant is checked before the panel opens: a surface that opened
+        // and then refused would be a surface the reader cannot use.
+        if let Some(outcome) = self.unavailable_outcome(BackendOperation::AgentAuthRead) {
+            return outcome;
+        }
+        let subject = self.config_row_subject(key);
+        self.overlay = Some(Overlay::AgentAuth {
+            view: crate::config_center::AgentAuthView {
+                agent_id: agent_id.as_str().to_string(),
+                title: subject.clone(),
+                selected: 0,
+                loading: true,
+                notice: None,
+            },
+        });
+        self.begin_record_work(
+            key.to_string(),
+            subject,
+            crate::config_center::ConfigVerb::SignIn,
+            vec![Effect::LoadAgentAuthCatalog { agent_id }],
+        )
+    }
+
+    /// The keys of the account panel.
+    fn perform_agent_auth(
+        &mut self,
+        intent: Intent,
+        mut view: crate::config_center::AgentAuthView,
+    ) -> Outcome {
+        use crate::config_center::AgentAuthAction;
+        let rows = crate::config_center::agent_auth_rows(
+            self.management_data.agent_auth_catalog.as_ref(),
+            self.strings,
+        );
+        let last = rows.len().saturating_sub(1);
+        let selected = view.selected.min(last);
+        let Ok(agent_id) = parse_config_id::<vibex_core::AgentId>(&view.agent_id) else {
+            return Outcome::quiet();
+        };
+        match intent {
+            Intent::SelectPrevious | Intent::ScrollPageUp => {
+                view.selected = selected.saturating_sub(1);
+                self.overlay = Some(Overlay::AgentAuth { view });
+                Outcome::effects(vec![])
+            }
+            Intent::SelectNext | Intent::ScrollPageDown => {
+                view.selected = (selected + 1).min(last);
+                self.overlay = Some(Overlay::AgentAuth { view });
+                Outcome::effects(vec![])
+            }
+            Intent::ConfirmOverlay => {
+                let Some(row) = rows.get(selected) else {
+                    return Outcome::quiet();
+                };
+                let Some(action) = row.action.clone() else {
+                    // The line says why it cannot be used; pressing it repeats
+                    // that rather than sending a request that would fail.
+                    if let Some(hint) = row.detail.first() {
+                        self.toast(Toast::info(hint.1.clone()));
+                    }
+                    return Outcome::quiet();
+                };
+                self.overlay = Some(Overlay::AgentAuth { view });
+                match action {
+                    AgentAuthAction::RefreshMethods => {
+                        Outcome::effects(vec![Effect::LoadAgentAuthCatalog { agent_id }])
+                    }
+                    AgentAuthAction::Verify => {
+                        Outcome::effects(vec![Effect::VerifyAgentAuth { agent_id }])
+                    }
+                    AgentAuthAction::RefreshModels => {
+                        Outcome::effects(vec![Effect::RefreshAgentAuthModels { agent_id }])
+                    }
+                    // Signing in and signing out are the next two steps: one
+                    // collects what the method needs, the other shows what the
+                    // sign-out would end before it does it.
+                    AgentAuthAction::Method { .. } | AgentAuthAction::SignOut => Outcome::quiet(),
+                }
+            }
+            Intent::CloseOverlay | Intent::Back => {
+                self.overlay = None;
+                Outcome::effects(vec![])
+            }
+            _ => {
+                self.overlay = Some(Overlay::AgentAuth { view });
+                Outcome::quiet()
+            }
         }
     }
 
@@ -4031,6 +4115,7 @@ impl App {
             Overlay::Models { view } => self.perform_models(intent, view),
             Overlay::NativeImport { view } => self.perform_native_import(intent, view),
             Overlay::NativeExport { view } => self.perform_native_export(intent, *view),
+            Overlay::AgentAuth { view } => self.perform_agent_auth(intent, view),
             Overlay::Approval { selected } => match intent {
                 Intent::ApprovalApprove
                 | Intent::ApprovalDeny

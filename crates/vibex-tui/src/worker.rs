@@ -178,6 +178,8 @@ pub enum AppMessage {
     NativeExport(BackendResult<Box<vibex_core::ProviderNativeExportPreview>>),
     /// What has been exported for one profile.
     NativeExportHistory(BackendResult<Vec<vibex_core::ProviderNativeExportRecordSummary>>),
+    /// One Agent's account, and the ways in it advertises.
+    AgentAuthCatalog(BackendResult<Box<vibex_core::AgentAuthCatalog>>),
     ProviderTest(BackendResult<vibex_core::AgentModelProviderProfileTestResult>),
     ProviderModels(BackendResult<Vec<vibex_core::ProviderConfiguredModel>>),
     Agents(BackendResult<Vec<vibex_core::AgentSnapshotEntry>>),
@@ -1636,6 +1638,100 @@ impl Dispatch {
                     .await;
                 self.send(AppMessage::ProviderProfile(result));
             }
+            Effect::LoadAgentAuthCatalog { agent_id } => {
+                // The context is seeded first: a runtime that has never been
+                // asked holds none, and the methods are advertised against one.
+                let result = match self
+                    .facade
+                    .agent()
+                    .ensure_default_agent_auth_context(vibex_backend::MutationRequest::new(
+                        agent_id.clone(),
+                    ))
+                    .await
+                {
+                    Ok(_) => self
+                        .facade
+                        .agent()
+                        .list_agent_auth_methods(agent_id)
+                        .await
+                        .map(Box::new),
+                    Err(error) => Err(error),
+                };
+                self.send(AppMessage::AgentAuthCatalog(result));
+            }
+            Effect::VerifyAgentAuth { agent_id } => {
+                let record = agent_id.as_str().to_string();
+                let context = self.default_auth_context(&agent_id).await;
+                let Some((context_id, revision)) = context else {
+                    self.failure_for(
+                        "agent_auth_verify",
+                        Some(record),
+                        BackendError::failed(
+                            "agent_auth_context_unknown",
+                            "this Agent holds no account to verify",
+                        ),
+                    );
+                    return;
+                };
+                let request = vibex_backend::MutationRequest::new(
+                    vibex_core::AgentAuthContextVerifyRequest {
+                        auth_context_id: context_id,
+                        expected_context_revision: revision,
+                        // A plain verification completes no operation: the
+                        // interactive flow that does is the terminal's, and it
+                        // names its own operation when it lands.
+                        operation_id: None,
+                    },
+                );
+                match self.facade.agent().verify_agent_auth_context(request).await {
+                    Ok(result) => self.ok_with(
+                        "agent_auth_verify",
+                        Some(record),
+                        crate::app::MutationOutcome::Auth {
+                            methods: 0,
+                            account: Some(result.context.account_hint.clone().unwrap_or_default()),
+                            authenticated: result.context.status
+                                == vibex_core::AgentAuthContextStatus::Authenticated,
+                        },
+                    ),
+                    Err(error) => self.failure_for("agent_auth_verify", Some(record), error),
+                }
+            }
+            Effect::RefreshAgentAuthModels { agent_id } => {
+                let record = agent_id.as_str().to_string();
+                let context = self.default_auth_context(&agent_id).await;
+                let Some((context_id, revision)) = context else {
+                    self.failure_for(
+                        "agent_auth_models",
+                        Some(record),
+                        BackendError::failed(
+                            "agent_auth_context_unknown",
+                            "this Agent holds no account to read a catalogue for",
+                        ),
+                    );
+                    return;
+                };
+                let request = vibex_backend::MutationRequest::new(
+                    vibex_core::AgentAuthContextRefreshModelsRequest {
+                        auth_context_id: context_id,
+                        expected_context_revision: revision,
+                    },
+                );
+                match self.facade.agent().refresh_agent_auth_models(request).await {
+                    Ok(result) => self.ok_with(
+                        "agent_auth_models",
+                        Some(record),
+                        crate::app::MutationOutcome::Models {
+                            count: result
+                                .model_catalog
+                                .as_ref()
+                                .map(|catalog| catalog.models.len())
+                                .unwrap_or(0),
+                        },
+                    ),
+                    Err(error) => self.failure_for("agent_auth_models", Some(record), error),
+                }
+            }
             Effect::PreviewNativeExport {
                 profile_id,
                 source,
@@ -2335,6 +2431,18 @@ impl Dispatch {
 
     /// Build a profile update that only changes the display name, preserving
     /// the Agent binding the authority requires.
+    /// The Agent's default account context and its revision, when it holds one.
+    async fn default_auth_context(
+        &self,
+        agent_id: &vibex_core::AgentId,
+    ) -> Option<(vibex_core::AgentAuthContextId, i64)> {
+        let contexts = self.facade.agent().list_agent_auth_contexts().await.ok()?;
+        contexts
+            .into_iter()
+            .find(|context| context.agent_id == *agent_id)
+            .map(|context| (context.id, context.revision))
+    }
+
     async fn profile_update(
         &self,
         profile_id: vibex_core::ProviderProfileId,

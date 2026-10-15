@@ -220,6 +220,11 @@ pub enum Overlay {
     NativeExport {
         view: Box<crate::config_center::NativeExportView>,
     },
+    /// One Agent's account: the ways in it advertises, and what can be done
+    /// with the account it holds.
+    AgentAuth {
+        view: crate::config_center::AgentAuthView,
+    },
     /// A multi-field editor for one configuration record.
     ///
     /// A form rather than a prompt because an MCP server is not a name: it has
@@ -671,6 +676,8 @@ pub struct ManagementData {
     pub native_import: Option<vibex_core::ProviderNativeImportPreview>,
     /// The order the reader arranged the profiles in, per Agent.
     pub provider_order: Vec<vibex_core::AgentModelProviderDisplayOrderEntry>,
+    /// The last Agent account catalogue this client read.
+    pub agent_auth_catalog: Option<vibex_core::AgentAuthCatalog>,
     /// The last profile configuration this client read in full.
     ///
     /// The list answers with the summary the authority publishes, which leaves
@@ -9098,6 +9105,19 @@ pub enum Effect {
     DiscoverSources {
         module: crate::config_center::ConfigModule,
     },
+    /// Read one Agent's account: the methods it advertises, and the context it
+    /// holds.
+    LoadAgentAuthCatalog {
+        agent_id: vibex_core::AgentId,
+    },
+    /// Ask an Agent's own runtime to verify the account it holds.
+    VerifyAgentAuth {
+        agent_id: vibex_core::AgentId,
+    },
+    /// Read the model catalogue the Agent's account can reach.
+    RefreshAgentAuthModels {
+        agent_id: vibex_core::AgentId,
+    },
     /// Write a preview. `persist` records the plan so it can be applied.
     PreviewNativeExport {
         profile_id: vibex_core::ProviderProfileId,
@@ -9189,6 +9209,9 @@ impl Effect {
             Effect::LoadProviderOrder { .. } => "provider_order",
             Effect::PreviewNativeImport { .. } => "provider_native_import",
             Effect::PreviewNativeExport { .. } => "provider_native_export",
+            Effect::LoadAgentAuthCatalog { .. } => "agent_auth_catalog",
+            Effect::VerifyAgentAuth { .. } => "agent_auth_verify",
+            Effect::RefreshAgentAuthModels { .. } => "agent_auth_models",
             Effect::NativeExportHistory { .. } => "provider_native_export_history",
             Effect::OpenSession { .. } => "open_session",
             Effect::RefreshTimeline => "timeline",
