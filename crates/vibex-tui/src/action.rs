@@ -220,6 +220,10 @@ intents! {
     ConfigEntryCreate => { scope: Management, id: "config_entry_create", label: label_config_entry_create, help: help_config_entry_create },
     ConfigEntryDelete => { scope: Management, id: "config_entry_delete", label: label_config_entry_delete, help: help_config_entry_delete },
     ConfigFormSave => { scope: Overlay, id: "config_form_save", label: label_config_form_save, help: help_config_form_save },
+    ConfigRegistryFilter => { scope: Management, id: "config_registry_filter", label: label_config_registry_filter, help: help_config_registry_filter },
+    ConfigRegistrySort => { scope: Management, id: "config_registry_sort", label: label_config_registry_sort, help: help_config_registry_sort },
+    ConfigRegistryPagePrevious => { scope: Management, id: "config_registry_page_previous", label: label_config_registry_page_previous, help: help_config_registry_page_previous },
+    ConfigRegistryPageNext => { scope: Management, id: "config_registry_page_next", label: label_config_registry_page_next, help: help_config_registry_page_next },
     GotoDevices => { scope: Global, id: "goto_devices", label: label_goto_devices, help: help_goto_devices },
 
     // ---- providers ------------------------------------------------------

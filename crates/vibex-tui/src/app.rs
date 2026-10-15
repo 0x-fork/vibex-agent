@@ -667,10 +667,9 @@ pub struct ManagementData {
 /// again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MarketNote {
-    /// Entries the table is showing.
-    pub shown: usize,
-    /// Entries across the whole index that matched the query, when the registry
-    /// reports one. The Skill market pages by cursor and reports no total.
+    /// Entries the registry holds for this question, when it reports one. What
+    /// is on screen is counted from the rows themselves, so a page the client
+    /// cut is described by what it cut rather than by what it fetched.
     pub matched: Option<usize>,
     /// Whether the runtime had walked the registry to its last page. `false`
     /// means the list is a window that is still widening.
@@ -1506,6 +1505,9 @@ pub struct FrameRegions {
     pub config_tabs: Vec<(ratatui::layout::Rect, crate::config_center::ConfigModule)>,
     pub config_sections: Vec<(ratatui::layout::Rect, crate::config_center::ConfigSection)>,
     pub config_buttons: Vec<(ratatui::layout::Rect, crate::config_center::ConfigAction)>,
+    /// The registry bar's own controls: the two narrowings and the two page
+    /// arrows. Each asks the registry the same question its key would.
+    pub config_registry: Vec<(ratatui::layout::Rect, crate::config_center::RegistryControl)>,
     /// The devices page's tab strip and its rows. A tab switches halves; a row
     /// takes the cursor, and a second press on a pairing row opens it.
     pub device_tabs: Vec<(ratatui::layout::Rect, crate::device_center::DeviceTab)>,
@@ -1542,6 +1544,7 @@ impl FrameRegions {
         self.config_tabs.clear();
         self.config_sections.clear();
         self.config_buttons.clear();
+        self.config_registry.clear();
         self.device_tabs.clear();
         self.device_rows.clear();
         self.completion_tabs.clear();
@@ -3556,6 +3559,9 @@ impl App {
         {
             return Some(self.show_config_section(section));
         }
+        if let Some(outcome) = self.click_config_registry(column, row) {
+            return Some(outcome);
+        }
         let action = self
             .regions
             .config_buttons
@@ -3563,6 +3569,42 @@ impl App {
             .find(|(rect, _)| App::rect_contains(*rect, column, row))
             .map(|(_, action)| *action)?;
         Some(self.run_selected_config_action(action))
+    }
+
+    /// A press on one of the registry bar's own controls.
+    ///
+    /// The bar is the page's question made visible, so pressing a control asks
+    /// it again the same way the key would: there is one handler per question,
+    /// and the pointer and the keyboard both reach it.
+    pub fn click_config_registry(
+        &mut self,
+        column: u16,
+        row: u16,
+    ) -> Option<crate::reduce::Outcome> {
+        use crate::config_center::RegistryControl;
+        let control = self
+            .regions
+            .config_registry
+            .iter()
+            .find(|(rect, _)| App::rect_contains(*rect, column, row))
+            .map(|(_, control)| *control)?;
+        let intent = match control {
+            RegistryControl::Transport => crate::action::Intent::ConfigRegistryFilter,
+            RegistryControl::Sort => crate::action::Intent::ConfigRegistrySort,
+            RegistryControl::PagePrevious => crate::action::Intent::ConfigRegistryPagePrevious,
+            RegistryControl::PageNext => crate::action::Intent::ConfigRegistryPageNext,
+        };
+        Some(self.perform(intent))
+    }
+
+    /// Put the page the reader is on back inside the answer that just arrived.
+    pub fn clamp_registry_page(&mut self) {
+        let pages = self.config_center.registry_pages(&self.management_data);
+        self.config_center.registry.page = self
+            .config_center
+            .registry
+            .page
+            .min(pages.saturating_sub(1));
     }
 
     /// A press on a record row: the first selects, the second opens the menu.
@@ -8461,9 +8503,6 @@ pub enum ConfigMutation {
     ImportMcpServer {
         selection: Box<vibex_core::McpServerImportSelection>,
     },
-    SearchMcpMarket {
-        query: String,
-    },
     InstallMcpMarketEntry {
         entry_id: String,
         candidate: Box<vibex_core::McpServerCreateRequest>,
@@ -8495,9 +8534,6 @@ pub enum ConfigMutation {
     DiscoverSkillSources,
     ImportSkill {
         selection: Box<vibex_core::SkillImportSelection>,
-    },
-    SearchSkillMarket {
-        query: String,
     },
     InstallSkillMarketEntry {
         entry_id: String,
@@ -8538,7 +8574,6 @@ impl ConfigMutation {
             | Self::SetMcpAgentMatrix { server_id, .. } => server_id.as_str().to_string(),
             Self::DiscoverMcpSources => "mcp:sources".to_string(),
             Self::ImportMcpServer { selection } => selection.discovery_id.clone(),
-            Self::SearchMcpMarket { .. } => "mcp:market".to_string(),
             Self::InstallMcpMarketEntry { entry_id, .. } => entry_id.clone(),
             Self::ValidateMcpMarketEntry { entry_id, .. } => entry_id.clone(),
             Self::CreateSkill(_) => "skill:new".to_string(),
@@ -8548,7 +8583,6 @@ impl ConfigMutation {
             | Self::SetSkillAgentMatrix { skill_id, .. } => skill_id.as_str().to_string(),
             Self::DiscoverSkillSources => "skill:sources".to_string(),
             Self::ImportSkill { selection } => selection.discovery_id.clone(),
-            Self::SearchSkillMarket { .. } => "skill:market".to_string(),
             Self::InstallSkillMarketEntry { entry_id, .. } => entry_id.clone(),
             Self::CreatePrompt(_) => "prompt:new".to_string(),
             Self::UpdatePrompt(request) => request.prompt_id.as_str().to_string(),
@@ -8573,7 +8607,6 @@ impl ConfigMutation {
             Self::SetMcpAgentMatrix { .. } => "mcp_matrix",
             Self::DiscoverMcpSources => "mcp_discover",
             Self::ImportMcpServer { .. } => "mcp_import",
-            Self::SearchMcpMarket { .. } => "mcp_market",
             Self::InstallMcpMarketEntry { .. } => "mcp_install",
             Self::ValidateMcpMarketEntry { .. } => "mcp_market_validate",
             Self::CreateSkill(_) => "skill_create",
@@ -8583,7 +8616,6 @@ impl ConfigMutation {
             Self::SetSkillAgentMatrix { .. } => "skill_matrix",
             Self::DiscoverSkillSources => "skill_discover",
             Self::ImportSkill { .. } => "skill_import",
-            Self::SearchSkillMarket { .. } => "skill_market",
             Self::InstallSkillMarketEntry { .. } => "skill_install",
             Self::CreatePrompt(_) => "prompt_create",
             Self::UpdatePrompt(_) => "prompt_update",
@@ -8624,7 +8656,6 @@ impl ConfigMutation {
             Self::SetMcpAgentMatrix { .. } | Self::SetSkillAgentMatrix { .. } => Verb::SetAgents,
             Self::DiscoverMcpSources | Self::DiscoverSkillSources => Verb::Discover,
             Self::ImportMcpServer { .. } | Self::ImportSkill { .. } => Verb::Import,
-            Self::SearchMcpMarket { .. } | Self::SearchSkillMarket { .. } => Verb::Search,
             Self::InstallMcpMarketEntry { .. } | Self::InstallSkillMarketEntry { .. } => {
                 Verb::InstallFromRegistry
             }
@@ -8952,9 +8983,15 @@ pub enum Effect {
         module: crate::config_center::ConfigModule,
     },
     /// Search a module's registry.
+    ///
+    /// The question travels whole — the text, the narrowing and the page —
+    /// because the answer is only about the question that was asked: a page
+    /// that arrived for another narrowing describes a list the reader never
+    /// asked to see.
     SearchRegistry {
         module: crate::config_center::ConfigModule,
         query: String,
+        registry: crate::config_center::RegistryQuery,
     },
     /// Rename a provider profile.
     RenameProfile {

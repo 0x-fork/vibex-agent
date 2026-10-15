@@ -25,6 +25,20 @@ use crate::app::ManagementData;
 use crate::keymap::Scope;
 use crate::locale::Strings;
 
+/// How many registry entries one page holds.
+///
+/// The authority cuts the MCP page with it and the client cuts the Skill one,
+/// so both sides of the same table agree on what a page is.
+pub const MARKET_PAGE_SIZE: usize = 20;
+
+/// How many Skill entries one read fetches.
+///
+/// The Skill index pages by an opaque cursor and reports no total, so the client
+/// takes one window and cuts its own pages out of it — three pages of
+/// [`MARKET_PAGE_SIZE`], which is enough to browse with and few enough that a
+/// reader who never turns a page pays for one read.
+pub const SKILL_MARKET_FETCH_LIMIT: usize = MARKET_PAGE_SIZE * 3;
+
 /// The four modules the configuration centre is organised into.
 ///
 /// The order is the desktop's: the Agent is what everything else attaches to,
@@ -439,6 +453,186 @@ pub struct ConfigCenter {
     /// Records with a write in flight, so a press cannot be queued twice, the
     /// row can say it is working, and the answer can name what it was about.
     pub pending: BTreeMap<String, PendingWrite>,
+    /// Which page of which registry the reader is looking at.
+    ///
+    /// A registry is not a list: it answers the page it was asked for, so the
+    /// question the centre put to it has to be remembered somewhere that
+    /// outlives the answer. It is reset with the area, for the same reason the
+    /// filter is: a page number carried into another registry would name a page
+    /// that registry never had.
+    pub registry: RegistryQuery,
+}
+
+/// One control on the registry bar, as a press on it means.
+///
+/// The bar draws the question the page was asked with, so each control is a way
+/// of asking it again: the pointer and the keyboard reach the same handler
+/// rather than two copies of "what does this chip do".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryControl {
+    /// Cycle the transport family an MCP page is narrowed to.
+    Transport,
+    /// Cycle the ranking a Skill page is asked for.
+    Sort,
+    /// Show the page before this one.
+    PagePrevious,
+    /// Show the page after this one.
+    PageNext,
+}
+
+/// Which page of a registry, narrowed how.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryQuery {
+    /// The transport family an MCP page is narrowed to. `None` is every family.
+    pub transport: Option<McpServerTransportFilter>,
+    /// The ranking a Skill page is asked for.
+    pub sort: SkillMarketSortKind,
+    /// Zero-based page, within whichever addressing the registry uses.
+    pub page: usize,
+}
+
+impl Default for RegistryQuery {
+    fn default() -> Self {
+        Self {
+            transport: None,
+            // The registry's own ranking, which is what a browse view that has
+            // expressed no preference is asking for.
+            sort: SkillMarketSortKind::Recommended,
+            page: 0,
+        }
+    }
+}
+
+impl RegistryQuery {
+    /// Move to the next page, or back to the one before it, without running off
+    /// either end. Answers whether the page moved.
+    pub fn step_page(&mut self, delta: isize, pages: usize) -> bool {
+        let last = pages.saturating_sub(1);
+        let next = self.page.saturating_add_signed(delta).min(last);
+        if next == self.page {
+            return false;
+        }
+        self.page = next;
+        true
+    }
+
+    /// Narrow the registry to the next transport family, wrapping back through
+    /// "every family". A narrowing is a new question, so it starts at the first
+    /// page of its own answer.
+    pub fn cycle_transport(&mut self) {
+        self.transport = match self.transport {
+            None => Some(McpServerTransportFilter::Local),
+            Some(filter) => filter.next(),
+        };
+        self.page = 0;
+    }
+
+    /// Ask for the next ranking, wrapping. Like the transport, a ranking is a
+    /// new question.
+    pub fn cycle_sort(&mut self) {
+        self.sort = self.sort.next();
+        self.page = 0;
+    }
+
+    /// The transport filter as the request carries it: the wire type is the
+    /// registry's, and `None` already means "every family" on both sides.
+    pub fn transport_filter(self) -> Option<vibex_core::McpMarketTransportFilter> {
+        self.transport.map(|transport| match transport {
+            McpServerTransportFilter::Local => vibex_core::McpMarketTransportFilter::Local,
+            McpServerTransportFilter::Remote => vibex_core::McpMarketTransportFilter::Remote,
+        })
+    }
+}
+
+/// Which transport family an MCP page is narrowed to, as the centre's own
+/// vocabulary rather than the registry's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpServerTransportFilter {
+    /// A server Vibex runs as a local process.
+    Local,
+    /// A server Vibex connects to over the network.
+    Remote,
+}
+
+impl McpServerTransportFilter {
+    /// The families in the order the control cycles them, with "every family"
+    /// first.
+    pub const ALL: [Option<Self>; 3] = [None, Some(Self::Local), Some(Self::Remote)];
+
+    pub const fn label(self, strings: Strings) -> &'static str {
+        match self {
+            Self::Local => strings.config_registry_transport_local(),
+            Self::Remote => strings.config_registry_transport_remote(),
+        }
+    }
+
+    /// The next family in the cycle, wrapping through "every family".
+    pub fn next(self) -> Option<Self> {
+        let all = Self::ALL;
+        let index = all
+            .iter()
+            .position(|entry| *entry == Some(self))
+            .unwrap_or(0);
+        all[(index + 1) % all.len()]
+    }
+}
+
+/// The ranking a Skill page is asked for, as the centre's own vocabulary.
+///
+/// The discriminants are the cycle order [`Self::next`] walks, so they are part
+/// of the type rather than an accident of declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillMarketSortKind {
+    Recommended = 0,
+    Downloads = 1,
+    Stars = 2,
+    Installs = 3,
+    Updated = 4,
+    Newest = 5,
+    Trending = 6,
+}
+
+impl SkillMarketSortKind {
+    pub const ALL: [Self; 7] = [
+        Self::Recommended,
+        Self::Downloads,
+        Self::Stars,
+        Self::Installs,
+        Self::Updated,
+        Self::Newest,
+        Self::Trending,
+    ];
+
+    pub const fn label(self, strings: Strings) -> &'static str {
+        match self {
+            Self::Recommended => strings.config_registry_sort_recommended(),
+            Self::Downloads => strings.config_registry_sort_downloads(),
+            Self::Stars => strings.config_registry_sort_stars(),
+            Self::Installs => strings.config_registry_sort_installs(),
+            Self::Updated => strings.config_registry_sort_updated(),
+            Self::Newest => strings.config_registry_sort_newest(),
+            Self::Trending => strings.config_registry_sort_trending(),
+        }
+    }
+
+    /// The next ranking in the cycle, wrapping.
+    pub const fn next(self) -> Self {
+        Self::ALL[(self as usize + 1) % Self::ALL.len()]
+    }
+
+    /// The registry's own name for this ranking. The vocabulary is closed on
+    /// both sides, so this is a translation rather than a formatting.
+    pub const fn wire(self) -> vibex_core::SkillMarketSort {
+        match self {
+            Self::Recommended => vibex_core::SkillMarketSort::Recommended,
+            Self::Downloads => vibex_core::SkillMarketSort::Downloads,
+            Self::Stars => vibex_core::SkillMarketSort::Stars,
+            Self::Installs => vibex_core::SkillMarketSort::Installs,
+            Self::Updated => vibex_core::SkillMarketSort::Updated,
+            Self::Newest => vibex_core::SkillMarketSort::Newest,
+            Self::Trending => vibex_core::SkillMarketSort::Trending,
+        }
+    }
 }
 
 /// The key a form's write is filed under.
@@ -672,6 +866,7 @@ impl Default for ConfigCenter {
             pinned: BTreeMap::new(),
             notice: None,
             pending: BTreeMap::new(),
+            registry: RegistryQuery::default(),
         }
     }
 }
@@ -690,6 +885,9 @@ impl ConfigCenter {
         if self.module != module || self.section != section {
             self.notice = None;
             self.detail_scroll = 0;
+            // A page number is a fact about one registry's answer, so it does
+            // not travel: the next module opens on its own first page.
+            self.registry = RegistryQuery::default();
         }
         self.module = module;
         self.section = section;
@@ -704,6 +902,7 @@ impl ConfigCenter {
             self.filtering = false;
             self.detail_scroll = 0;
             self.notice = None;
+            self.registry = RegistryQuery::default();
         }
         self.section = section;
     }
@@ -771,12 +970,46 @@ impl ConfigCenter {
         }
     }
 
-    /// The rows the table draws: the area's records, filtered.
+    /// The rows the table draws: the area's records, filtered, and — for a
+    /// registry that hands its whole window over at once — the page of them the
+    /// reader asked for.
     pub fn visible(&self, data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
         let needle = self.filter.trim();
-        self.rows(data, strings)
+        let rows = self
+            .rows(data, strings)
             .into_iter()
             .filter(|row| row.matches(needle))
+            .collect::<Vec<_>>();
+        self.page_slice(rows)
+    }
+
+    /// How many pages the registry on screen has, at least one.
+    ///
+    /// The two registries answer differently and the count has to follow: MCP
+    /// is asked for one page at a time and reports how many entries matched in
+    /// all, while the Skill index hands over one window and pages by cursor, so
+    /// its pages are cut here out of what was fetched.
+    pub fn registry_pages(&self, data: &ManagementData) -> usize {
+        if self.section != ConfigSection::Catalog {
+            return 1;
+        }
+        let total = match self.module {
+            ConfigModule::Mcp => data.market_note.and_then(|note| note.matched).unwrap_or(0),
+            _ => data.skill_market.len(),
+        };
+        total.div_ceil(MARKET_PAGE_SIZE).max(1)
+    }
+
+    /// The page of `rows` the reader is on, for a registry the client pages
+    /// itself. A registry the authority pages arrives already cut.
+    fn page_slice(&self, rows: Vec<ConfigRow>) -> Vec<ConfigRow> {
+        if self.section != ConfigSection::Catalog || self.module == ConfigModule::Mcp {
+            return rows;
+        }
+        let start = self.registry.page * MARKET_PAGE_SIZE;
+        rows.into_iter()
+            .skip(start)
+            .take(MARKET_PAGE_SIZE)
             .collect()
     }
 

@@ -968,6 +968,22 @@ fn market_entry(id: &str) -> vibex_core::McpMarketEntry {
     .expect("market fixture")
 }
 
+/// One installable Skill, as the Skill index lists it.
+fn skill_market_entry(id: &str) -> vibex_core::SkillMarketEntry {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "slug": id,
+        "ownerHandle": "example",
+        "name": "Trace reader",
+        "summary": "Read a trace",
+        "version": "1.0.0",
+        "installs": 3,
+        "stars": 1,
+        "downloads": 9
+    }))
+    .expect("skill market fixture")
+}
+
 /// The action the menu offers, chosen the way the reader chooses it.
 fn choose_action(app: &mut App, action: ConfigAction) {
     let Some(Overlay::EntryActions { mut entry }) = app.overlay.clone() else {
@@ -1128,17 +1144,19 @@ fn the_matrix_form_enables_an_agent_the_record_did_not_hold() {
     }
 }
 
-/// A registry page says how much of the registry it is.
+/// A registry page says how much of the registry it is, and lets the reader ask
+/// for another one.
 ///
 /// Forty rows of a catalogue the runtime is still walking must not read as the
-/// whole of it. The line belongs to the registry areas only: the installed
-/// areas have no page behind them.
+/// whole of it, and the two narrowings the registries offer have to be reachable
+/// — a control drawn with no key behind it is a promise the page does not keep.
+/// The line belongs to the registry areas only: the installed areas have no
+/// catalogue behind them.
 #[test]
 fn a_registry_page_says_how_much_of_the_registry_it_covers() {
     let mut app = loaded(140, 40);
     app.management_data.mcp_market = vec![market_entry("registry_trace")];
     app.management_data.market_note = Some(vibex_tui::app::MarketNote {
-        shown: 1,
         matched: Some(312),
         exhausted: false,
     });
@@ -1152,9 +1170,134 @@ fn a_registry_page_says_how_much_of_the_registry_it_covers() {
         screen.contains("still indexing"),
         "the page claimed to be the whole registry:\n{screen}"
     );
+    // The bar names the question the page was asked with.
+    assert!(screen.contains("Transport"), "{screen}");
+    assert!(screen.contains("All"), "{screen}");
+    // 312 matches at 20 a page is sixteen pages, and the reader is on the first.
+    assert!(screen.contains("1/16"), "{screen}");
 
     // The installed area has no catalogue behind it, so it has no such line.
+    // The marker is the page indicator rather than the word "Transport": that
+    // word is also the name of one of this table's own columns.
     app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Servers));
     let screen = text(&mut app, 140, 40);
     assert!(!screen.contains("registry entries"), "{screen}");
+    assert!(!screen.contains("1/16"), "{screen}");
+}
+
+/// `t` narrows the MCP page and `s` ranks the Skill one, each from the first
+/// page and by asking the registry again.
+#[test]
+fn the_registry_narrowings_ask_the_registry_again() {
+    let mut app = loaded(140, 40);
+    app.management_data.mcp_market = vec![market_entry("registry_trace")];
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Catalog));
+
+    // MCP is narrowed by transport, and the cycle runs All → Local → Remote.
+    app.perform(vibex_tui::action::Intent::ConfigRegistryFilter);
+    assert_eq!(
+        app.config_center.registry.transport,
+        Some(vibex_tui::config_center::McpServerTransportFilter::Local)
+    );
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigRegistryFilter);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::SearchRegistry { registry, .. }] => assert_eq!(
+            registry.transport_filter(),
+            Some(vibex_core::McpMarketTransportFilter::Remote)
+        ),
+        other => panic!("the narrowing did not ask again: {other:?}"),
+    }
+    app.perform(vibex_tui::action::Intent::ConfigRegistryFilter);
+    assert_eq!(app.config_center.registry.transport, None);
+
+    // The transport key means nothing to the Skill index, which is narrowed by
+    // ranking instead.
+    app.show_config_module(ConfigModule::Skills, Some(ConfigSection::Catalog));
+    app.perform(vibex_tui::action::Intent::ConfigRegistryFilter);
+    assert_eq!(app.config_center.registry.transport, None);
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigRegistrySort);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::SearchRegistry { registry, .. }] => assert_eq!(
+            registry.sort.wire(),
+            vibex_core::SkillMarketSort::Downloads,
+            "the ranking did not move"
+        ),
+        other => panic!("the ranking did not ask again: {other:?}"),
+    }
+}
+
+/// Moving a page moves the question, and the cursor comes with it.
+#[test]
+fn the_registry_pages_step_within_what_the_registry_answered() {
+    let mut app = loaded(140, 40);
+    app.management_data.mcp_market = vec![market_entry("registry_trace")];
+    app.management_data.market_note = Some(vibex_tui::app::MarketNote {
+        matched: Some(312),
+        exhausted: false,
+    });
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Catalog));
+    app.config_center.set_cursor(3);
+
+    // MCP is paged by the authority, so the next page is a read.
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigRegistryPageNext);
+    assert_eq!(app.config_center.registry.page, 1);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::SearchRegistry { registry, .. }] => {
+            assert_eq!(registry.page, 1);
+        }
+        other => panic!("the page turn did not read: {other:?}"),
+    }
+    // The cursor belongs to the page it was chosen on.
+    assert_eq!(app.config_center.cursor(10), 0);
+
+    // And the first page has nothing before it.
+    app.perform(vibex_tui::action::Intent::ConfigRegistryPagePrevious);
+    assert_eq!(app.config_center.registry.page, 0);
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigRegistryPagePrevious);
+    assert!(outcome.effects.is_empty(), "the page ran off the front");
+    assert_eq!(app.config_center.registry.page, 0);
+}
+
+/// The Skill index hands one window over, so its pages are cut here.
+#[test]
+fn the_skill_registry_pages_the_window_it_was_handed() {
+    let mut app = loaded(140, 40);
+    app.management_data.skill_market = (0..45)
+        .map(|index| skill_market_entry(&format!("skill_{index}")))
+        .collect();
+    app.management_data.market_note = Some(vibex_tui::app::MarketNote {
+        matched: Some(45),
+        exhausted: true,
+    });
+    app.show_config_module(ConfigModule::Skills, Some(ConfigSection::Catalog));
+
+    // Three pages of twenty, twenty and five.
+    assert_eq!(app.config_center.registry_pages(&app.management_data), 3);
+    assert_eq!(
+        app.config_center
+            .visible(&app.management_data, app.strings)
+            .len(),
+        20
+    );
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigRegistryPageNext);
+    assert!(
+        outcome.effects.is_empty(),
+        "a page the client cuts is a redraw, not a read"
+    );
+    assert_eq!(
+        app.config_center
+            .visible(&app.management_data, app.strings)
+            .len(),
+        20
+    );
+    app.perform(vibex_tui::action::Intent::ConfigRegistryPageNext);
+    assert_eq!(
+        app.config_center
+            .visible(&app.management_data, app.strings)
+            .len(),
+        5
+    );
+    // The last page is the last one.
+    app.perform(vibex_tui::action::Intent::ConfigRegistryPageNext);
+    assert_eq!(app.config_center.registry.page, 2);
 }

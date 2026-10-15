@@ -461,22 +461,35 @@ impl Dispatch {
     }
 
     /// Search one registry and hand the page back.
-    async fn search_registry(&mut self, module: crate::config_center::ConfigModule, query: String) {
-        use crate::config_center::ConfigModule;
+    ///
+    /// The two registries page differently and the request follows each: MCP is
+    /// addressed by offset and asked for exactly the page the reader is on,
+    /// while the Skill index answers a cursor it hands back and reports no
+    /// total, so one window is fetched and the client cuts the pages out of it.
+    async fn search_registry(
+        &mut self,
+        module: crate::config_center::ConfigModule,
+        query: String,
+        registry: crate::config_center::RegistryQuery,
+    ) {
+        use crate::config_center::{ConfigModule, MARKET_PAGE_SIZE, SKILL_MARKET_FETCH_LIMIT};
         let message = match module {
             ConfigModule::Mcp => {
+                let offset = registry.page.saturating_mul(MARKET_PAGE_SIZE);
                 let request = vibex_core::McpMarketSearchRequest {
                     query: (!query.trim().is_empty()).then_some(query),
-                    limit: Some(40),
-                    offset: None,
-                    transport: None,
-                    extend: None,
+                    limit: Some(MARKET_PAGE_SIZE as u32),
+                    offset: Some(offset as u32),
+                    transport: registry.transport_filter(),
+                    // Past the first page the index has to be walked further
+                    // before it can answer, or the page would be cut out of a
+                    // window that is known to be too small for it.
+                    extend: Some(registry.page > 0),
                 };
                 match self.facade.management().search_mcp_market(request).await {
                     Ok(response) => AppMessage::Registry {
                         module,
                         note: Some(crate::app::MarketNote {
-                            shown: response.entries.len(),
                             matched: Some(response.total_matches),
                             exhausted: response.catalog_exhausted,
                         }),
@@ -494,19 +507,18 @@ impl Dispatch {
             _ => {
                 let request = vibex_core::SkillMarketSearchRequest {
                     query: (!query.trim().is_empty()).then_some(query),
-                    limit: Some(40),
+                    limit: Some(SKILL_MARKET_FETCH_LIMIT as u32),
                     cursor: None,
-                    sort: None,
+                    sort: Some(registry.sort.wire()),
                 };
                 match self.facade.management().search_skill_market(request).await {
                     Ok(response) => AppMessage::Registry {
                         module,
                         note: Some(crate::app::MarketNote {
-                            shown: response.entries.len(),
-                            // The Skill index pages by cursor and reports no
-                            // total, so the line counts what is on screen and
-                            // stops there rather than inventing a denominator.
-                            matched: None,
+                            // The window is the denominator: the index reports
+                            // no total, so the line counts what was handed over
+                            // rather than inventing one.
+                            matched: Some(response.entries.len()),
                             exhausted: !response.has_more,
                         }),
                         mcp: Ok(Vec::new()),
@@ -711,32 +723,6 @@ impl Dispatch {
                     .await
                     .map(|_| Outcome::Plain)
             }
-            M::SearchMcpMarket { query } => {
-                let request = vibex_core::McpMarketSearchRequest {
-                    query: (!query.trim().is_empty()).then_some(query),
-                    limit: Some(40),
-                    offset: None,
-                    transport: None,
-                    extend: None,
-                };
-                let result = self.facade.management().search_mcp_market(request).await;
-                match result {
-                    Ok(response) => {
-                        self.send(AppMessage::Registry {
-                            module: crate::config_center::ConfigModule::Mcp,
-                            note: Some(crate::app::MarketNote {
-                                shown: response.entries.len(),
-                                matched: Some(response.total_matches),
-                                exhausted: response.catalog_exhausted,
-                            }),
-                            mcp: Ok(response.entries),
-                            skill: None,
-                        });
-                        Ok(Outcome::Plain)
-                    }
-                    Err(error) => Err(error),
-                }
-            }
             M::InstallMcpMarketEntry {
                 entry_id,
                 candidate,
@@ -858,31 +844,6 @@ impl Dispatch {
                     .import_skills(request)
                     .await
                     .map(|_| Outcome::Plain)
-            }
-            M::SearchSkillMarket { query } => {
-                let request = vibex_core::SkillMarketSearchRequest {
-                    query: (!query.trim().is_empty()).then_some(query),
-                    limit: Some(40),
-                    cursor: None,
-                    sort: None,
-                };
-                let result = self.facade.management().search_skill_market(request).await;
-                match result {
-                    Ok(response) => {
-                        self.send(AppMessage::Registry {
-                            module: crate::config_center::ConfigModule::Skills,
-                            note: Some(crate::app::MarketNote {
-                                shown: response.entries.len(),
-                                matched: None,
-                                exhausted: !response.has_more,
-                            }),
-                            mcp: Ok(Vec::new()),
-                            skill: Some(Ok(response.entries)),
-                        });
-                        Ok(Outcome::Plain)
-                    }
-                    Err(error) => Err(error),
-                }
             }
             M::InstallSkillMarketEntry {
                 entry_id,
@@ -1835,8 +1796,12 @@ impl Dispatch {
                     }
                 }
             }
-            Effect::SearchRegistry { module, query } => {
-                self.search_registry(module, query).await;
+            Effect::SearchRegistry {
+                module,
+                query,
+                registry,
+            } => {
+                self.search_registry(module, query, registry).await;
             }
             Effect::ListMcp => {
                 let result = self.facade.management().mcp_servers().await;

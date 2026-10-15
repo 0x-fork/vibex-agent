@@ -2584,6 +2584,11 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 }
             }
             app.management_data.market_note = note;
+            // A registry that answered with fewer pages than the reader is on —
+            // a search that matched less, a window that shrank — leaves the
+            // page pointing past the end of its own answer, so it is put back
+            // inside what came back rather than left showing nothing.
+            app.clamp_registry_page();
         }
         AppMessage::ConfigReload => {
             let outcome = app.refresh_config_area();

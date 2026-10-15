@@ -1134,6 +1134,10 @@ impl App {
                 self.begin_entry_form(row)
             }
             Intent::ConfigFormSave => Outcome::quiet(),
+            Intent::ConfigRegistryFilter => self.step_registry_narrowing(RegistryStep::Transport),
+            Intent::ConfigRegistrySort => self.step_registry_narrowing(RegistryStep::Sort),
+            Intent::ConfigRegistryPagePrevious => self.step_registry_page(-1),
+            Intent::ConfigRegistryPageNext => self.step_registry_page(1),
             Intent::GotoDevices => {
                 self.navigate_to(Page::Devices);
                 Outcome::effects(vec![Effect::ListDevices])
@@ -1202,9 +1206,53 @@ impl App {
             (module, ConfigSection::Catalog) => vec![Effect::SearchRegistry {
                 module,
                 query: self.config_center.filter.clone(),
+                registry: self.config_center.registry,
             }],
             (module, ConfigSection::Sources) => vec![Effect::DiscoverSources { module }],
         }
+    }
+
+    /// `t` and `s`: ask the registry a narrower question.
+    ///
+    /// Only the registry on screen has either control, so a key that means
+    /// nothing here does nothing, rather than changing a setting the reader
+    /// cannot see. A narrowing is a new question, so it is read again from its
+    /// first page.
+    fn step_registry_narrowing(&mut self, step: RegistryStep) -> Outcome {
+        use crate::config_center::{ConfigModule, ConfigSection};
+        if self.config_center.section != ConfigSection::Catalog {
+            return Outcome::quiet();
+        }
+        let mcp = self.config_center.module == ConfigModule::Mcp;
+        match step {
+            RegistryStep::Transport if mcp => self.config_center.registry.cycle_transport(),
+            RegistryStep::Sort if !mcp => self.config_center.registry.cycle_sort(),
+            _ => return Outcome::quiet(),
+        }
+        self.config_center.set_cursor(0);
+        Outcome::effects(self.config_section_effects())
+    }
+
+    /// `,` and `.`: show the page before or after this one.
+    ///
+    /// MCP is asked for one page at a time, so moving is a read; the Skill
+    /// index hands over one window which is cut here, so moving is a redraw.
+    fn step_registry_page(&mut self, delta: isize) -> Outcome {
+        use crate::config_center::{ConfigModule, ConfigSection};
+        if self.config_center.section != ConfigSection::Catalog {
+            return Outcome::quiet();
+        }
+        let pages = self.config_center.registry_pages(&self.management_data);
+        if !self.config_center.registry.step_page(delta, pages) {
+            return Outcome::quiet();
+        }
+        // The cursor belongs to the page it was chosen on: the next page starts
+        // at its own first row rather than at an index the last page left.
+        self.config_center.set_cursor(0);
+        if self.config_center.module == ConfigModule::Mcp {
+            return Outcome::effects(self.config_section_effects());
+        }
+        Outcome::effects(vec![])
     }
 
     /// The action button of a project or folder row: everything that heading can
@@ -6565,6 +6613,17 @@ fn mcp_market_candidate(entry: &vibex_core::McpMarketEntry) -> vibex_core::McpSe
         secret_references: Vec::new(),
         provider_matrix: Vec::new(),
     }
+}
+
+/// Which narrowing of a registry one press asked for.
+///
+/// The two registries are narrowed differently — MCP by transport family, Skills
+/// by ranking — so the key that cycles one says which control it is aiming at
+/// rather than the reducer guessing from the module twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryStep {
+    Transport,
+    Sort,
 }
 
 /// `KEY=value` (or `Name: value`) per line, as the forms ask for them.

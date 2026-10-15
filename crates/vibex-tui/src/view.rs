@@ -5612,6 +5612,14 @@ fn render_config_table(
         }
         lines.push(Line::from(spans));
     }
+    // The registry's own line: the question the page was asked with, and how
+    // much of the registry it covers. It sits above the columns because it is
+    // about the whole page rather than about any record on it, and every
+    // control on it is published so the pointer asks the same question the key
+    // does.
+    if let Some(spans) = render_registry_bar(area, app, rows.len(), theme, strings) {
+        lines.push(Line::from(spans));
+    }
     let body_top = lines.len() as u16;
     if rows.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -5627,17 +5635,8 @@ fn render_config_table(
             Style::default().fg(theme.roles.gray_dim),
         )));
     }
-    // The last row of the table belongs to the registry when one is on screen:
-    // forty rows of a catalogue the runtime is still walking must not read as
-    // the whole of it, and the sentence is about the page rather than about any
-    // record on it, so it sits under them rather than in the detail pane.
-    let note = registry_note(app, strings);
-    let reserved = u16::from(note.is_some());
     let selected = app.config_center.cursor(rows.len());
-    let window = area
-        .height
-        .saturating_sub(body_top)
-        .saturating_sub(reserved) as usize;
+    let window = area.height.saturating_sub(body_top) as usize;
     let first = selected.saturating_sub(window.saturating_sub(1) / 2);
     for (offset, row) in rows.iter().skip(first).take(window.max(1)).enumerate() {
         let index = first + offset;
@@ -5720,38 +5719,148 @@ fn render_config_table(
         first_row: first,
         heights: Vec::new(),
     });
-    let note_row = Rect {
-        y: area.y + area.height.saturating_sub(1),
-        height: 1,
-        ..area
-    };
     frame.render_widget(Paragraph::new(lines), area);
-    if let Some(note) = note {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(
-                    " {}",
-                    truncate_to_width(&note, usize::from(area.width).saturating_sub(1), "…")
-                ),
-                Style::default().fg(theme.roles.gray_dim),
-            ))),
-            note_row,
-        );
-    }
 }
 
-/// What the registry said about the page the table is showing, when the area on
-/// screen is one of the registries.
+/// The registry bar: which question the page was asked with, and how much of the
+/// registry it covers.
 ///
-/// It is drawn from the numbers rather than stored as a sentence so the three
-/// languages can spell it, and it is only shown where it means something: the
-/// installed areas have no page and no catalogue behind them.
-fn registry_note(app: &App, strings: Strings) -> Option<String> {
-    if app.config_center.section != crate::config_center::ConfigSection::Catalog {
+/// Drawn only where it means something — the installed areas have no page and no
+/// catalogue behind them — and returns the row it drew so the table can count it
+/// as one of its own lines.
+fn render_registry_bar(
+    area: Rect,
+    app: &mut App,
+    shown: usize,
+    theme: &TuiTheme,
+    strings: Strings,
+) -> Option<Vec<Span<'static>>> {
+    use crate::config_center::{ConfigModule, ConfigSection, RegistryControl};
+    if app.config_center.section != ConfigSection::Catalog {
         return None;
     }
+    let registry = app.config_center.registry;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut x = area.x;
+    // One chip per narrowing: it reads as the value it is on, and a press moves
+    // it on, which is the same thing `t` and `s` do.
+    let (name, value, control) = match app.config_center.module {
+        ConfigModule::Mcp => (
+            crate::action::Intent::ConfigRegistryFilter.label(strings),
+            registry
+                .transport
+                .map(|transport| transport.label(strings))
+                .unwrap_or(strings.config_registry_transport_all()),
+            RegistryControl::Transport,
+        ),
+        _ => (
+            crate::action::Intent::ConfigRegistrySort.label(strings),
+            registry.sort.label(strings),
+            RegistryControl::Sort,
+        ),
+    };
+    push_registry_segment(&mut spans, &mut x, area.y, app, name, None, false, theme);
+    push_registry_segment(
+        &mut spans,
+        &mut x,
+        area.y,
+        app,
+        value,
+        Some(control),
+        true,
+        theme,
+    );
+    let pages = app.config_center.registry_pages(&app.management_data);
+    push_registry_segment(
+        &mut spans,
+        &mut x,
+        area.y,
+        app,
+        "‹",
+        Some(RegistryControl::PagePrevious),
+        registry.page > 0,
+        theme,
+    );
+    push_registry_segment(
+        &mut spans,
+        &mut x,
+        area.y,
+        app,
+        &format!("{}/{}", registry.page + 1, pages),
+        None,
+        false,
+        theme,
+    );
+    push_registry_segment(
+        &mut spans,
+        &mut x,
+        area.y,
+        app,
+        "›",
+        Some(RegistryControl::PageNext),
+        registry.page + 1 < pages,
+        theme,
+    );
+    if let Some(note) = registry_note(app, shown, strings) {
+        let room = usize::from(area.width.saturating_sub(x.saturating_sub(area.x)));
+        let text = truncate_to_width(&note, room.saturating_sub(3), "…");
+        if !text.is_empty() {
+            spans.push(Span::styled("   ", Style::default()));
+            spans.push(Span::styled(
+                text,
+                Style::default().fg(theme.roles.gray_dim),
+            ));
+        }
+    }
+    Some(spans)
+}
+
+/// One control or label on the registry bar, drawn where it landed and — when it
+/// is a control — published so a press on it reaches the same handler the key
+/// does.
+#[allow(clippy::too_many_arguments)]
+fn push_registry_segment(
+    spans: &mut Vec<Span<'static>>,
+    x: &mut u16,
+    y: u16,
+    app: &mut App,
+    text: &str,
+    control: Option<crate::config_center::RegistryControl>,
+    lit: bool,
+    theme: &TuiTheme,
+) {
+    let label = format!(" {text} ");
+    let width = display_width(&label) as u16;
+    if let Some(control) = control {
+        app.regions.config_registry.push((
+            Rect {
+                x: *x,
+                y,
+                width,
+                height: 1,
+            },
+            control,
+        ));
+    }
+    let style = if lit {
+        Style::default()
+            .fg(theme.roles.foreground)
+            .bg(theme.roles.surface_highlight)
+    } else {
+        Style::default().fg(theme.roles.gray_bright)
+    };
+    spans.push(Span::styled(label, style));
+    spans.push(Span::raw(" "));
+    *x = x.saturating_add(width + 1);
+}
+
+/// What the registry said about the page the table is showing.
+///
+/// It is drawn from the numbers rather than stored as a sentence so the three
+/// languages can spell it, and what is on screen is the rows themselves: a page
+/// the client cut is described by what it cut rather than by what it fetched.
+fn registry_note(app: &App, shown: usize, strings: Strings) -> Option<String> {
     let note = app.management_data.market_note.as_ref()?;
-    let shown = note.shown;
     let mut line = match note.matched {
         Some(matched) => format!(
             "{} {shown} {} {matched} {}",

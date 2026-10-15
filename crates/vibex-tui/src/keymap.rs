@@ -1310,6 +1310,36 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::ReloadManagement,
         |strings| Intent::ReloadManagement.label(strings),
     ),
+    // The registry's own controls. `t` and `s` cycle the two narrowings a
+    // registry offers — a transport family for MCP, a ranking for Skills — and
+    // the page keys walk the pages of whichever one is on screen. They are
+    // letters rather than chords because a reader browsing a catalogue presses
+    // them repeatedly, and `,`/`.` are the pair the rest of this client already
+    // uses for "the one before" and "the one after".
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char('t')),
+        Intent::ConfigRegistryFilter,
+        |strings| Intent::ConfigRegistryFilter.label(strings),
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char('s')),
+        Intent::ConfigRegistrySort,
+        |strings| Intent::ConfigRegistrySort.label(strings),
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char(',')),
+        Intent::ConfigRegistryPagePrevious,
+        |strings| Intent::ConfigRegistryPagePrevious.label(strings),
+    ),
+    binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char('.')),
+        Intent::ConfigRegistryPageNext,
+        |strings| Intent::ConfigRegistryPageNext.label(strings),
+    ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('[')),
