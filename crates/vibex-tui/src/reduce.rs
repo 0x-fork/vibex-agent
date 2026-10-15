@@ -1197,7 +1197,7 @@ impl App {
     /// the import areas are read on demand, because a search costs a network
     /// round trip and a reader who never opens the registry should never pay
     /// for one.
-    fn config_section_effects(&mut self) -> Vec<Effect> {
+    pub fn config_section_effects(&mut self) -> Vec<Effect> {
         use crate::config_center::ConfigSection;
         match (self.config_center.module, self.config_center.section) {
             (_, ConfigSection::Agents) => vec![Effect::ListAgents],

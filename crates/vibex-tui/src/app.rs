@@ -5298,6 +5298,22 @@ impl App {
         if poll {
             effects.push(Effect::LanPairingStatus);
         }
+        // An MCP page whose index is still being walked is asked again on a slow
+        // clock, for the same reason the pairing window is: the fact changes on
+        // the runtime's own time and nothing arrives to say so. The Skill index
+        // is not polled — its cursor says whether another page exists, not
+        // whether the one on screen is still growing.
+        let widening = self.page.is_configuration_centre()
+            && self.config_center.module == crate::config_center::ConfigModule::Mcp
+            && self.config_center.section == crate::config_center::ConfigSection::Catalog
+            && self
+                .management_data
+                .market_note
+                .is_some_and(|note| !note.exhausted);
+        if self.config_center.poll_registry(widening) {
+            effects.extend(self.config_section_effects());
+            dirty = true;
+        }
         crate::reduce::Outcome {
             effects,
             dirty: dirty || moved || counting || poll,

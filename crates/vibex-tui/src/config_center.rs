@@ -39,6 +39,16 @@ pub const MARKET_PAGE_SIZE: usize = 20;
 /// reader who never turns a page pays for one read.
 pub const SKILL_MARKET_FETCH_LIMIT: usize = MARKET_PAGE_SIZE * 3;
 
+/// How many ticks apart a registry whose index is still widening is asked again.
+///
+/// The index is walked by the runtime on its own clock and nothing arrives to
+/// say it grew, so a page that says "still indexing" has to keep asking or the
+/// sentence becomes a claim the client stopped checking. Twelve ticks is about
+/// two and a half seconds at the idle tick — slow enough that the poll is not
+/// the client's own traffic, quick enough that a reader watching the list sees
+/// it fill.
+pub const REGISTRY_POLL_TICKS: u8 = 12;
+
 /// The four modules the configuration centre is organised into.
 ///
 /// The order is the desktop's: the Agent is what everything else attaches to,
@@ -453,6 +463,9 @@ pub struct ConfigCenter {
     /// Records with a write in flight, so a press cannot be queued twice, the
     /// row can say it is working, and the answer can name what it was about.
     pub pending: BTreeMap<String, PendingWrite>,
+    /// Ticks left before a still-widening registry is asked again. Zero when
+    /// nothing is being polled, which is also where the clock starts.
+    pub registry_poll_ticks: u8,
     /// Which page of which registry the reader is looking at.
     ///
     /// A registry is not a list: it answers the page it was asked for, so the
@@ -867,6 +880,7 @@ impl Default for ConfigCenter {
             notice: None,
             pending: BTreeMap::new(),
             registry: RegistryQuery::default(),
+            registry_poll_ticks: 0,
         }
     }
 }
@@ -981,6 +995,30 @@ impl ConfigCenter {
             .filter(|row| row.matches(needle))
             .collect::<Vec<_>>();
         self.page_slice(rows)
+    }
+
+    /// Count one tick towards asking the registry again.
+    ///
+    /// Answers whether the question is due. The clock only runs while the index
+    /// is still widening: a finished index, a page that is not a registry, and a
+    /// reader who has left the area all stop it, and the next page they open
+    /// starts the clock over rather than inheriting a count from the last one.
+    pub fn poll_registry(&mut self, still_widening: bool) -> bool {
+        if !still_widening {
+            self.registry_poll_ticks = 0;
+            return false;
+        }
+        if self.registry_poll_ticks == 0 {
+            // The page has just been read: the clock starts now.
+            self.registry_poll_ticks = REGISTRY_POLL_TICKS;
+            return false;
+        }
+        if self.registry_poll_ticks > 1 {
+            self.registry_poll_ticks -= 1;
+            return false;
+        }
+        self.registry_poll_ticks = REGISTRY_POLL_TICKS;
+        true
     }
 
     /// How many pages the registry on screen has, at least one.

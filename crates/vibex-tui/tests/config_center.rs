@@ -1409,3 +1409,63 @@ fn a_form_hands_over_the_command_it_is_about_to_save() {
         "a plain record editor copied something"
     );
 }
+
+/// A registry whose index is still widening is asked again on its own clock.
+///
+/// The runtime walks the registry on its own time and nothing arrives to say it
+/// grew, so a page that says "still indexing" and then never asks again is a
+/// sentence the client stopped checking. A finished index, and an area that is
+/// not a registry, stop the clock.
+#[test]
+fn a_widening_registry_is_asked_again_without_a_key() {
+    let mut app = loaded(140, 40);
+    app.management_data.mcp_market = vec![market_entry("registry_trace")];
+    app.management_data.market_note = Some(vibex_tui::app::MarketNote {
+        matched: Some(312),
+        exhausted: false,
+    });
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Catalog));
+
+    let asked = |app: &mut App| {
+        app.tick().effects.iter().any(|effect| {
+            matches!(
+                effect,
+                vibex_tui::app::Effect::SearchRegistry { module, .. }
+                    if *module == ConfigModule::Mcp
+            )
+        })
+    };
+
+    // The clock starts on the page that was just read rather than re-reading it.
+    assert!(
+        !asked(&mut app),
+        "the page was read again the moment it opened"
+    );
+    let mut fired = 0;
+    for _ in 0..vibex_tui::config_center::REGISTRY_POLL_TICKS * 2 {
+        if asked(&mut app) {
+            fired += 1;
+        }
+    }
+    assert_eq!(fired, 2, "the registry was not asked on its own clock");
+
+    // A finished index stops the clock.
+    app.management_data.market_note = Some(vibex_tui::app::MarketNote {
+        matched: Some(312),
+        exhausted: true,
+    });
+    app.config_center.registry_poll_ticks = 0;
+    for _ in 0..vibex_tui::config_center::REGISTRY_POLL_TICKS * 2 {
+        assert!(!asked(&mut app), "a finished index was polled anyway");
+    }
+
+    // So does leaving the registry.
+    app.management_data.market_note = Some(vibex_tui::app::MarketNote {
+        matched: Some(312),
+        exhausted: false,
+    });
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Servers));
+    for _ in 0..vibex_tui::config_center::REGISTRY_POLL_TICKS * 2 {
+        assert!(!asked(&mut app), "the installed list was polled");
+    }
+}
