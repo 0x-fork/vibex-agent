@@ -4376,6 +4376,85 @@ impl AgentManager {
         Ok(item)
     }
 
+    /// Answers every user-input request a cancelled turn left open.
+    ///
+    /// An interrupt cancels the Agent's native callbacks, but that only
+    /// silences the child process: the durable request rows stay `Pending`.
+    /// The turn that is still unwinding then re-reads them and re-parks the
+    /// session in `NeedsInput` right after [`Self::interrupt`] settled it to
+    /// `Idle`, and every client keeps painting a card nothing can answer.
+    /// Recording the abandoned resolutions here — and publishing them as
+    /// timeline items — lets each surface drop the request from the same event
+    /// that cancelled it.
+    ///
+    /// A request the reader answered concurrently is left alone: it already has
+    /// a resolution, and the interrupt must not overwrite it or fail over a
+    /// race it did not lose.
+    fn cancel_pending_user_input_requests(
+        &self,
+        conn: &mut DbConnection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<()> {
+        let resolved_at_ms = unix_timestamp_ms();
+        for request in PermissionRepository::pending_for_session(conn, session_id)? {
+            if let Some(current) = PermissionRepository::get_request(conn, &request.id)?
+                && current.status != vibex_core::PermissionRequestStatus::Pending
+            {
+                continue;
+            }
+            let resolution = vibex_core::PermissionResolution {
+                request_id: request.id.clone(),
+                session_id: session_id.clone(),
+                // `PermissionResponseKind` has no cancelled variant; denying is
+                // the honest "this was never approved" answer, and the note
+                // records that it was the interrupt rather than the reader.
+                response: vibex_core::PermissionResponseKind::Deny,
+                responder_device_id: None,
+                provider_resolution_id: None,
+                note: Some("interrupted".to_string()),
+                resolved_at_ms,
+            };
+            PermissionRepository::resolve(conn, &resolution)?;
+            self.append_timeline_item(
+                conn,
+                session_id,
+                TimelineSource::System,
+                TimelinePayload::PermissionResolution(resolution),
+                None,
+                None,
+                TimelineRedactionState::None,
+            )?;
+        }
+        for request in ElicitationRepository::pending_for_session(conn, session_id)? {
+            let resolution = vibex_core::ElicitationResolution {
+                request_id: request.id.clone(),
+                session_id: session_id.clone(),
+                action: vibex_core::ElicitationResolutionAction::Cancel,
+                answers: Default::default(),
+                responder_device_id: None,
+                resolved_at_ms,
+            };
+            // The elicitation write is a pending-only compare-and-set, so a
+            // reader who submitted an answer between the list and this write
+            // already owns the resolution; skip rather than clobber it.
+            match ElicitationRepository::resolve(conn, &resolution) {
+                Ok(()) => {}
+                Err(error) if error.code == "elicitation_request_not_pending" => continue,
+                Err(error) => return Err(error),
+            }
+            self.append_timeline_item(
+                conn,
+                session_id,
+                TimelineSource::System,
+                TimelinePayload::ElicitationResolution(resolution),
+                None,
+                None,
+                TimelineRedactionState::None,
+            )?;
+        }
+        Ok(())
+    }
+
     pub async fn interrupt(&self, session_id: &VibexSessionId) -> VibexResult<()> {
         let mut conn = self.open_migrated()?;
         let session = SessionRepository::get(&conn, session_id)?.ok_or_else(|| {
@@ -4439,7 +4518,16 @@ impl AgentManager {
                 capabilities,
             })
             .await?;
-        SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle)
+        // The provider stopped, so any card it was parked on can no longer be
+        // answered. Clearing the rows before the state settles is what stops
+        // the unwinding turn from re-parking the session in `NeedsInput` from
+        // the same abandoned requests.
+        self.cancel_pending_user_input_requests(&mut conn, &session.id)?;
+        SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle)?;
+        if let Some(settled) = SessionRepository::get(&conn, &session.id)? {
+            self.publish_root_session_update(&conn, settled);
+        }
+        Ok(())
     }
 
     /// Whether the session's current activation advertised native steering.
@@ -6895,6 +6983,7 @@ mod tests {
             let mut capabilities =
                 ProviderCapabilities::conservative(ProviderKind::Acp, "mid-turn-permission-test");
             capabilities.permission_requests = true;
+            capabilities.interrupt = true;
             capabilities
         }
 
@@ -6935,6 +7024,12 @@ mod tests {
             &self,
             _request: ProviderPermissionResolution,
         ) -> VibexResult<()> {
+            Ok(())
+        }
+
+        async fn interrupt(&self, _handle: ProviderSessionHandle) -> VibexResult<()> {
+            // The ACP layer drains its native callbacks here; the test observes
+            // the durable side, which is what every client reads.
             Ok(())
         }
     }
@@ -8437,6 +8532,227 @@ mod tests {
             AgentSessionState::Idle,
             "the completed turn settles the session once it stops streaming"
         );
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    /// Interrupting a card-parked session must answer that card for good.
+    ///
+    /// This is the reported stuck row: the reader ignores an ask-user form,
+    /// interrupts, and continues. The ACP layer cancelled the native callback
+    /// but nothing recorded a resolution, so the still-unwinding turn re-read
+    /// the `Pending` row and re-parked the session in `NeedsInput` right after
+    /// the interrupt settled it. The row stayed on `?` even though the session
+    /// had moved on. The interrupt must resolve the abandoned request durably
+    /// so every client drops it.
+    #[tokio::test]
+    async fn interrupting_a_parked_session_resolves_its_abandoned_request() {
+        let db_path = temp_db_path("interrupt-parked-permission");
+        let workspace_root = temp_workspace_path("interrupt-parked-permission");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let mut manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        ProviderProfileRepository::ensure_local_defaults(&conn).unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let agent_id = AgentId::parse("interrupt-parked-permission-agent").unwrap();
+        let adapter_id = AcpAdapterId::parse("interrupt-parked-permission-acp").unwrap();
+        let provider_profile_id =
+            ProviderProfileId::parse(ProviderKind::Acp.local_default_profile_id().to_string())
+                .unwrap();
+        let session = insert_session(
+            &conn,
+            "interrupt parked permission",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Idle,
+        );
+        let selection = SessionRuntimeSelection::provider(
+            agent_id.clone(),
+            provider_profile_id.clone(),
+            "interrupt-parked-permission-model",
+        );
+        let mut runtime_config = SessionRuntimeConfigState {
+            preferred_model: selection.model_id().map(str::to_string),
+            effective_model: selection.model_id().map(str::to_string),
+            ..SessionRuntimeConfigState::default()
+        };
+        runtime_config.mark_generation_if_converged(0);
+        let now = unix_timestamp_ms();
+        let binding = RuntimeBinding {
+            binding_id: RuntimeBindingId::new(),
+            session_id: session.id.clone(),
+            agent_id: agent_id.clone(),
+            transport_kind: TransportKind::Acp,
+            auth_source: selection.auth_source.clone(),
+            auth_source_revision: 1,
+            adapter_id: adapter_id.clone(),
+            adapter_version: "1.0.0".to_string(),
+            adapter_compatibility_identity: "interrupt-parked-permission-acp@1".to_string(),
+            native_session_id: Some("native-interrupt-parked-permission".to_string()),
+            native_state_home_id: NativeStateHomeId::new(),
+            provider_resume_identity: None,
+            process_spawn_fingerprint: "interrupt-parked-permission".to_string(),
+            session_runtime_config_state: runtime_config,
+            capability_snapshot: None,
+            restore_compatibility_key: None,
+            last_context_sequence: 0,
+            last_summary_sequence: 0,
+            context_bridge_version: 0,
+            activation_generation: 0,
+            binding_state: BindingState::Current,
+            created_by_switch_id: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        AgentSessionRuntimeRepository::initialize_runtime_selection(
+            &mut conn, &binding, &selection,
+        )
+        .unwrap();
+        let permission = PermissionRequest {
+            id: vibex_core::RequestId::new(),
+            session_id: session.id.clone(),
+            project_id: Some(project.id.clone()),
+            workspace_id: Some(workspace.id.clone()),
+            provider_request_id: Some("acp-permission-interrupt".to_string()),
+            risk_category: PermissionRiskCategory::Network,
+            title: "Agent wants to visit github.com".to_string(),
+            details: Vec::new(),
+            allowed_responses: vec![
+                PermissionResponseKind::Approve,
+                PermissionResponseKind::Deny,
+            ],
+            response_options: Vec::new(),
+            status: PermissionRequestStatus::Pending,
+            requested_at_ms: now,
+            expires_at_ms: None,
+        };
+        drop(conn);
+
+        let provider = Arc::new(MidTurnPermissionProvider {
+            identity: ProviderTurnExecutionIdentity {
+                binding_id: binding.binding_id.clone(),
+                activation_generation: binding.activation_generation,
+                model_id: Some(selection.model_id().unwrap().to_string()),
+            },
+            armed: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        manager
+            .register_runtime(
+                AgentRuntimeRouteKey {
+                    agent_id: agent_id.clone(),
+                    transport_kind: TransportKind::Acp,
+                    adapter_id,
+                },
+                provider.clone(),
+            )
+            .unwrap();
+
+        let manager = Arc::new(manager);
+        let turn_manager = Arc::clone(&manager);
+        let turn_session_id = session.id.clone();
+        let turn_selection = selection.clone();
+        let turn_provider = Arc::clone(&provider);
+        let turn = tokio::spawn(async move {
+            turn_manager
+                .run_agent_turn(
+                    AgentTurnRequest {
+                        mentions: Vec::new(),
+                        session_id: turn_session_id,
+                        required_runtime: Some(turn_selection),
+                        text: "look this up".to_string(),
+                        attachments: Vec::new(),
+                        reasoning_effort: None,
+                        correlation_id: None,
+                        delivery: UserMessageDelivery::Prompt,
+                        prompt_context: None,
+                        provenance: vibex_core::MessageProvenance::HumanInput,
+                    },
+                    AgentTurnDisplayPolicy::USER_AUTHORED,
+                    ContextBridgeTurnBehavior::ConsumePending,
+                    None,
+                    move |_provider, _handle, _request| {
+                        let provider = Arc::clone(&turn_provider);
+                        async move {
+                            provider.armed.notify_one();
+                            provider.release.notified().await;
+                            Ok(ProviderTurnResult {
+                                stop_reason: None,
+                                events: vec![ProviderEvent::agent(TimelinePayload::AgentMessage(
+                                    vibex_core::AgentMessagePayload {
+                                        text: "looked it up".to_string(),
+                                        is_final: true,
+                                    },
+                                ))],
+                                binding_update: None,
+                                completed: true,
+                            })
+                        }
+                    },
+                )
+                .await
+        });
+        provider.armed.notified().await;
+        manager
+            .record_permission_request(permission.clone())
+            .await
+            .unwrap();
+
+        // The reader ignores the form and interrupts. The row must stop asking.
+        manager.interrupt(&session.id).await.unwrap();
+
+        let conn = manager.open_migrated().unwrap();
+        assert_eq!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionState::Idle
+        );
+        assert!(
+            PermissionRepository::pending_for_session(&conn, &session.id)
+                .unwrap()
+                .is_empty(),
+            "the interrupt must answer the request it cancelled"
+        );
+        let last = TimelineRepository::latest_sequence(&conn, &session.id).unwrap();
+        let timeline = TimelineRepository::fetch_range(&conn, &session.id, 1, last).unwrap();
+        assert!(
+            timeline.iter().any(|item| matches!(
+                &item.payload,
+                TimelinePayload::PermissionResolution(resolution)
+                    if resolution.request_id == permission.id
+                        && resolution.response == PermissionResponseKind::Deny
+            )),
+            "the cancelled request must leave a resolution every client can read"
+        );
+        drop(conn);
+
+        // The turn that was still unwinding must not re-park the session from
+        // the request it can no longer answer.
+        provider.release.notify_one();
+        turn.await.unwrap().unwrap();
+
+        let conn = manager.open_migrated().unwrap();
+        assert_eq!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionState::Idle,
+            "the finished turn must settle to Idle instead of re-parking on a cancelled card"
+        );
+        assert!(
+            PermissionRepository::pending_for_session(&conn, &session.id)
+                .unwrap()
+                .is_empty()
+        );
+        drop(conn);
 
         cleanup_db(&db_path);
         let _ = fs::remove_dir_all(workspace_root);

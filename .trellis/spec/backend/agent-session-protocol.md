@@ -1110,6 +1110,27 @@ PermissionRepository::pending_for_session(VibexSessionId)
 - Turn interrupt, session close, process shutdown, process exit, or missing
   active turn sink must drain pending ACP permissions with a cancelled response
   where the child process is still reachable.
+- Draining the native callbacks is not enough for an interrupt: the durable
+  request rows must be resolved in the same step. Cancelling only the JSON-RPC
+  callback leaves `permission_requests` / `elicitation_requests` rows `Pending`,
+  so the provider turn that is still unwinding re-reads them at its own
+  boundary and re-parks the session in `needs_input` immediately after the
+  interrupt set it to `idle`. The row then keeps asking for an answer no surface
+  can give, because no resolution item ever reaches a client. `interrupt`
+  therefore resolves each still-pending request for the session — denying
+  permissions with note `interrupted`, cancelling elicitations — and appends and
+  publishes the matching `PermissionResolution` / `ElicitationResolution`
+  timeline item before it settles the state. A request the reader answered
+  concurrently already has a resolution and is skipped rather than clobbered.
+- A client-side pending-request index is a live-stream projection and can
+  outlive the card it describes, because a drain path can cancel the native
+  callback without a resolution item ever reaching a lagged client. A row may
+  report `needs_input` from that index only while the persisted state can still
+  be parked on it (`needs_input`, or `running` for a card that arrived mid-turn);
+  once the session settled, failed, or closed, the persisted state wins. The
+  index is also scoped to the live turn: a new prompt supersedes whatever the
+  previous turn left unanswered, while a `steer` joins the running turn and
+  supersedes nothing.
 
 ### 4. Validation & Error Matrix
 

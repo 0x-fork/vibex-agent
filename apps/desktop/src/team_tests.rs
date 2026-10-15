@@ -1233,11 +1233,28 @@ fn a_row_reports_the_state_its_session_projection_resolves(cx: &mut TestAppConte
             .pending_user_request_ids
             .insert(child.clone(), BTreeSet::new());
     });
+    // A card that arrives mid-turn is the one case the live index must decide:
+    // the turn keeps streaming, so the persisted state is still `Running`, and
+    // the row has to ask for the answer rather than spin.
+    let mut parked_on_card = stopped.clone();
+    parked_on_card.state = AgentSessionState::Running;
+    assert_eq!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .sidebar_session_row_state(&parked_on_card)),
+        AgentSessionState::NeedsInput,
+        "a request parked on the user is not progress"
+    );
+    // Once the session settles, the index entry is stale by definition — an
+    // interrupted card is cancelled without a resolution item — so the row
+    // reports the persisted state instead of asking about a card that is gone.
+    workbench.update(cx, |workbench, _| {
+        workbench.pending_agent_turn_session_ids.remove(&child);
+    });
     assert_eq!(
         workbench.read_with(cx, |workbench, _| workbench
             .sidebar_session_row_state(&stopped)),
-        AgentSessionState::NeedsInput,
-        "a request parked on the user is not progress"
+        AgentSessionState::Idle,
+        "a settled session cannot still be parked on an abandoned card"
     );
 }
 

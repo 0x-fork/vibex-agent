@@ -5668,12 +5668,36 @@ fn mark_agent_session_read(
     unread_session_ids.remove(session_id.as_str())
 }
 
+/// Whether a session's row should still ask the reader for an answer.
+///
+/// The index of unresolved requests is built from the live stream, so it can
+/// outlive the card it describes: an interrupt cancels the Agent's native
+/// callback without appending a resolution item, and the request stays
+/// `Pending` in the transcript. The persisted state is the tie-breaker. A
+/// session parked on the user reads `NeedsInput`, and a card that arrives
+/// while the provider turn is still streaming leaves the state `Running`; only
+/// those two states can still be waiting on an answer. A session that settled,
+/// failed, or closed has moved past the card whatever the stream said, and its
+/// row must report that instead of asking forever.
+fn session_awaits_user_input(
+    state: AgentSessionState,
+    pending_user_request_ids: &BTreeMap<String, BTreeSet<String>>,
+    session_id: &str,
+) -> bool {
+    state == AgentSessionState::NeedsInput
+        || (state == AgentSessionState::Running
+            && pending_user_request_ids.contains_key(session_id))
+}
+
 /// Tracks the approval and input requests a session is still waiting on.
 ///
 /// The request timeline item arrives while the provider turn is still open, so
 /// it is the earliest reliable signal that the Agent stopped working and needs
 /// the user. Resolutions arrive as their own items; a session leaves the index
-/// only once every request it was asked has been answered.
+/// once every request it was asked has been answered. A new prompt also
+/// supersedes whatever the previous turn left unanswered: the user typed past
+/// the card, so the request can no longer be the row's live question. A steer
+/// joins the turn already running and does not supersede anything.
 fn update_pending_user_requests(
     pending: &mut BTreeMap<String, BTreeSet<String>>,
     events: &[TimelineLiveEvent],
@@ -5715,6 +5739,11 @@ fn update_pending_user_requests(
                     resolution.request_id.as_str(),
                 );
             }
+            TimelinePayload::UserMessage(message)
+                if message.delivery != vibex_core::UserMessageDelivery::Steer =>
+            {
+                changed |= pending.remove(session_id).is_some();
+            }
             _ => {}
         }
     }
@@ -5738,12 +5767,17 @@ fn resolve_pending_user_request(
 
 /// Replaces one session's entry from an authoritative timeline, so a lagged
 /// stream cannot leave a resolved request looking unanswered.
+///
+/// The entry is scoped to the live turn: an authoritative read is the client's
+/// chance to drop a request an earlier turn left behind, which the live stream
+/// alone cannot do because the runtime cancels an abandoned callback without
+/// appending a resolution item.
 fn reset_pending_user_requests(
     pending: &mut BTreeMap<String, BTreeSet<String>>,
     session_id: &VibexSessionId,
     items: &[TimelineItem],
 ) {
-    let requests = vibex_desktop_model::pending_permission_ids(items);
+    let requests = vibex_desktop_model::live_turn_pending_permission_ids(items);
     if requests.is_empty() {
         pending.remove(session_id.as_str());
     } else {
@@ -42946,9 +42980,11 @@ impl VibexWorkbench {
                 AgentSessionState::Error => summary.failed += 1,
                 _ => {}
             }
-            awaiting_user |= self
-                .pending_user_request_ids
-                .contains_key(member_id.as_str());
+            awaiting_user |= session_awaits_user_input(
+                session.state,
+                &self.pending_user_request_ids,
+                member_id.as_str(),
+            );
             has_unread_completion |= self
                 .unread_agent_completion_session_ids
                 .contains(member_id.as_str());
@@ -46496,9 +46532,11 @@ impl VibexWorkbench {
         });
         let awaiting_user = self.sessions.iter().any(|session| {
             session.deleted_at_ms.is_none()
-                && self
-                    .pending_user_request_ids
-                    .contains_key(session.id.as_str())
+                && session_awaits_user_input(
+                    session.state,
+                    &self.pending_user_request_ids,
+                    session.id.as_str(),
+                )
                 && session_belongs_to_workspace(session)
         });
         // A locally dispatched turn keeps the workspace busy while its runtime
@@ -46878,12 +46916,18 @@ impl VibexWorkbench {
     /// outranks both the optimistic local dispatch and the still-open provider
     /// turn: the Agent is parked on the user, so the row asks for the answer
     /// instead of spinning.
+    ///
+    /// The request index is a live-stream projection and can outlive its card —
+    /// an interrupt cancels the native callback without recording a resolution
+    /// — so it only takes the mark while the session can still be parked on it.
+    /// Once the session settles, fails, or closes, the persisted state wins and
+    /// the row stops asking about a request that has no surface left.
     fn sidebar_session_row_state(&self, session: &AgentSession) -> AgentSessionState {
-        let awaiting_user = session.state == AgentSessionState::NeedsInput
-            || self
-                .pending_user_request_ids
-                .contains_key(session.id.as_str());
-        if awaiting_user {
+        if session_awaits_user_input(
+            session.state,
+            &self.pending_user_request_ids,
+            session.id.as_str(),
+        ) {
             AgentSessionState::NeedsInput
         } else {
             sidebar_session_display_state(session.state, self.session_turn_pending(&session.id))
@@ -83645,6 +83689,115 @@ mod tests {
         assert!(!update_pending_user_requests(
             &mut pending,
             &[resolution_event(&second_request_id, 4)]
+        ));
+    }
+
+    /// A prompt the reader sends past a card supersedes it.
+    ///
+    /// The row must stop asking for an answer the reader already typed over.
+    /// A steer is not a new prompt, so it leaves the live card in place.
+    #[test]
+    fn a_new_prompt_clears_the_previous_turns_unanswered_request() {
+        let session_id = VibexSessionId::new();
+        let request_id = RequestId::new();
+        let request_event = TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: 1,
+            item: timeline_item_with_payload(
+                &session_id,
+                1,
+                TimelineSource::Provider,
+                TimelinePayload::ElicitationRequest(vibex_core::ElicitationRequest {
+                    id: request_id.clone(),
+                    session_id: session_id.clone(),
+                    provider_request_id: None,
+                    tool_call_id: None,
+                    message: "Which environment?".into(),
+                    title: None,
+                    description: None,
+                    fields: Vec::new(),
+                    status: vibex_core::ElicitationRequestStatus::Pending,
+                    requested_at_ms: 1,
+                }),
+            ),
+        };
+        let prompt_event = |sequence: i64, delivery: UserMessageDelivery| TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence,
+            item: timeline_item_with_payload(
+                &session_id,
+                sequence,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "keep going".into(),
+                    attachments: Vec::new(),
+                    delivery,
+                    ..Default::default()
+                }),
+            ),
+        };
+
+        let mut pending = BTreeMap::new();
+        assert!(update_pending_user_requests(
+            &mut pending,
+            std::slice::from_ref(&request_event)
+        ));
+        assert!(pending.contains_key(session_id.as_str()));
+
+        assert!(!update_pending_user_requests(
+            &mut pending,
+            &[prompt_event(2, UserMessageDelivery::Steer)]
+        ));
+        assert!(
+            pending.contains_key(session_id.as_str()),
+            "a steer joins the running turn and does not supersede its card"
+        );
+
+        assert!(update_pending_user_requests(
+            &mut pending,
+            &[prompt_event(3, UserMessageDelivery::Prompt)]
+        ));
+        assert!(
+            pending.is_empty(),
+            "a new prompt is the reader moving past the card"
+        );
+    }
+
+    /// The persisted state breaks a tie the live index cannot resolve.
+    #[test]
+    fn an_unanswerable_request_does_not_pin_a_settled_row_to_needs_input() {
+        let session_id = VibexSessionId::new();
+        let mut pending = BTreeMap::new();
+        pending.insert(
+            session_id.as_str().to_string(),
+            BTreeSet::from(["request_abandoned".to_string()]),
+        );
+
+        assert!(session_awaits_user_input(
+            AgentSessionState::NeedsInput,
+            &pending,
+            session_id.as_str()
+        ));
+        assert!(session_awaits_user_input(
+            AgentSessionState::Running,
+            &pending,
+            session_id.as_str()
+        ));
+        for settled in [
+            AgentSessionState::Idle,
+            AgentSessionState::Error,
+            AgentSessionState::Closed,
+            AgentSessionState::Archived,
+        ] {
+            assert!(
+                !session_awaits_user_input(settled, &pending, session_id.as_str()),
+                "a {settled:?} session cannot still be parked on a card"
+            );
+        }
+        assert!(!session_awaits_user_input(
+            AgentSessionState::Idle,
+            &BTreeMap::new(),
+            session_id.as_str()
         ));
     }
 

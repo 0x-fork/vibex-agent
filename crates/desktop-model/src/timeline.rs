@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use vibex_core::{
     AgentSessionState, ElicitationRequestStatus, PermissionRequestStatus, TimelineItem,
-    TimelineItemKind, TimelineLiveEvent, TimelinePayload, TimelineTurnStart, VibexSessionId,
+    TimelineItemKind, TimelineLiveEvent, TimelinePayload, TimelineTurnStart, UserMessageDelivery,
+    VibexSessionId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +197,56 @@ pub fn timeline_turns(items: &[TimelineItem]) -> Vec<TimelineTurn> {
         .into_iter()
         .map(Into::into)
         .collect()
+}
+
+/// The user-input requests the live turn is still waiting on.
+///
+/// This is the question a sidebar row asks — is the Agent parked on me right
+/// now — so it is scoped to the turn the session is in, not to the whole
+/// conversation. A request a finished turn left unanswered is not news once a
+/// later prompt has claimed the session: an interrupt in particular cancels the
+/// native callback without appending a resolution, so the request item stays
+/// `Pending` in the transcript forever. Re-counting it from the whole timeline
+/// is what kept a row pinned to a card no surface could answer.
+///
+/// A `Steer` message joins the turn that was already running, so it does not
+/// open a new one; every other user message does. A window that opens
+/// mid-conversation without a turn boundary keeps every request it holds, since
+/// there is no later prompt in it to supersede them.
+pub fn live_turn_pending_permission_ids(items: &[TimelineItem]) -> BTreeSet<String> {
+    let start = items
+        .iter()
+        .rposition(|item| {
+            matches!(
+                &item.payload,
+                TimelinePayload::UserMessage(message)
+                    if message.delivery != UserMessageDelivery::Steer
+            )
+        })
+        .unwrap_or(0);
+    let mut pending = BTreeSet::new();
+    for item in &items[start..] {
+        match &item.payload {
+            TimelinePayload::PermissionRequest(request)
+                if request.status == PermissionRequestStatus::Pending =>
+            {
+                pending.insert(request.id.to_string());
+            }
+            TimelinePayload::PermissionResolution(resolution) => {
+                pending.remove(resolution.request_id.as_str());
+            }
+            TimelinePayload::ElicitationRequest(request)
+                if request.status == ElicitationRequestStatus::Pending =>
+            {
+                pending.insert(request.id.to_string());
+            }
+            TimelinePayload::ElicitationResolution(resolution) => {
+                pending.remove(resolution.request_id.as_str());
+            }
+            _ => {}
+        }
+    }
+    pending
 }
 
 pub(crate) struct TimelineTurnRef<'a> {
@@ -655,5 +706,88 @@ mod tests {
             item: stale,
         }));
         assert_eq!(model.items.len(), 2);
+    }
+
+    /// An abandoned card from a finished turn must not outlive it.
+    ///
+    /// This is the desktop half of the stuck `?` row: the runtime cancels an
+    /// interrupted request without appending a resolution, so the request item
+    /// stays `Pending` forever. Counting only the live turn's requests is what
+    /// lets a later prompt — or an authoritative reload — clear it.
+    #[test]
+    fn live_turn_pending_ids_ignore_an_earlier_turns_abandoned_request() {
+        let session = VibexSessionId::parse("session_current").unwrap();
+        let abandoned = vibex_core::RequestId::parse("request_abandoned").unwrap();
+        let current = vibex_core::RequestId::parse("request_current").unwrap();
+        let permission_request = |id: &vibex_core::RequestId| {
+            TimelinePayload::PermissionRequest(vibex_core::PermissionRequest {
+                id: id.clone(),
+                session_id: session.clone(),
+                project_id: None,
+                workspace_id: None,
+                provider_request_id: None,
+                risk_category: vibex_core::PermissionRiskCategory::Command,
+                title: "Run command?".into(),
+                details: Vec::new(),
+                allowed_responses: vec![vibex_core::PermissionResponseKind::Approve],
+                response_options: Vec::new(),
+                status: PermissionRequestStatus::Pending,
+                requested_at_ms: 1,
+                expires_at_ms: None,
+            })
+        };
+        let prompt = |text: &str, delivery| {
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: text.into(),
+                attachments: Vec::new(),
+                delivery,
+                ..Default::default()
+            })
+        };
+        let mut items = vec![
+            item(&session, 1, prompt("first", UserMessageDelivery::Prompt)),
+            item(&session, 2, permission_request(&abandoned)),
+            item(&session, 3, prompt("second", UserMessageDelivery::Prompt)),
+            item(&session, 4, permission_request(&current)),
+        ];
+        assert_eq!(
+            live_turn_pending_permission_ids(&items),
+            BTreeSet::from([current.to_string()]),
+            "a new prompt supersedes the request the previous turn left behind"
+        );
+
+        // A steer joins the running turn, so the card asked before the steer is
+        // still the live question.
+        let steered = vec![
+            item(&session, 1, prompt("first", UserMessageDelivery::Prompt)),
+            item(&session, 2, permission_request(&abandoned)),
+            item(&session, 3, prompt("aside", UserMessageDelivery::Steer)),
+        ];
+        assert_eq!(
+            live_turn_pending_permission_ids(&steered),
+            BTreeSet::from([abandoned.to_string()])
+        );
+
+        // A resolution inside the live turn still clears its own request.
+        items.push(item(
+            &session,
+            5,
+            TimelinePayload::PermissionResolution(vibex_core::PermissionResolution {
+                request_id: current.clone(),
+                session_id: session.clone(),
+                response: vibex_core::PermissionResponseKind::Deny,
+                responder_device_id: None,
+                provider_resolution_id: None,
+                note: None,
+                resolved_at_ms: 5,
+            }),
+        ));
+        assert!(live_turn_pending_permission_ids(&items).is_empty());
+
+        // A window with no turn boundary keeps the requests it opened with.
+        assert_eq!(
+            live_turn_pending_permission_ids(&[item(&session, 2, permission_request(&abandoned))]),
+            BTreeSet::from([abandoned.to_string()])
+        );
     }
 }
