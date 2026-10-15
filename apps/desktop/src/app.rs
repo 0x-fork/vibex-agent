@@ -31801,9 +31801,10 @@ impl VibexWorkbench {
             .chain(self.delegated_sessions.keys().cloned())
             .chain(self.delegated_tree.keys().cloned())
             .collect::<BTreeSet<_>>();
-        self.elicitation_form_sessions.retain(|request_id, session_id| {
-            !settled.contains(request_id) && live_sessions.contains(session_id.as_str())
-        });
+        self.elicitation_form_sessions
+            .retain(|request_id, session_id| {
+                !settled.contains(request_id) && live_sessions.contains(session_id.as_str())
+            });
         let sessions = &self.elicitation_form_sessions;
         self.elicitation_drafts
             .retain(|request_id, _| sessions.contains_key(request_id));
@@ -94601,8 +94602,12 @@ mod tests {
         let notes_key = VibexWorkbench::elicitation_input_key(request.id.as_str(), "notes");
 
         workbench.update_in(cx, |workbench, window, cx| {
-            workbench.sessions.push(session("session_elicitation_form_a"));
-            workbench.sessions.push(session("session_elicitation_form_b"));
+            workbench
+                .sessions
+                .push(session("session_elicitation_form_a"));
+            workbench
+                .sessions
+                .push(session("session_elicitation_form_b"));
             workbench.timeline.replace_authoritative(
                 session_id.clone(),
                 [timeline_item_with_payload(
@@ -94660,29 +94665,41 @@ mod tests {
                         &session_id,
                         2,
                         TimelineSource::User,
-                        TimelinePayload::ElicitationResolution(
-                            vibex_core::ElicitationResolution {
-                                request_id: request.id.clone(),
-                                session_id: session_id.clone(),
-                                action: ElicitationResolutionAction::Accept,
-                                answers: BTreeMap::new(),
-                                responder_device_id: None,
-                                resolved_at_ms: 2,
-                            },
-                        ),
+                        TimelinePayload::ElicitationResolution(vibex_core::ElicitationResolution {
+                            request_id: request.id.clone(),
+                            session_id: session_id.clone(),
+                            action: ElicitationResolutionAction::Accept,
+                            answers: BTreeMap::new(),
+                            responder_device_id: None,
+                            resolved_at_ms: 2,
+                        }),
                     ),
                 ],
             );
             workbench.prune_elicitation_forms(cx);
-            assert!(!workbench.elicitation_drafts.contains_key(request.id.as_str()));
+            assert!(
+                !workbench
+                    .elicitation_drafts
+                    .contains_key(request.id.as_str())
+            );
             assert!(!workbench.elicitation_inputs.contains_key(&notes_key));
 
             // A form of a session that has gone away goes with it.
             workbench.ensure_elicitation_form(&request, window, cx);
-            assert!(workbench.elicitation_drafts.contains_key(request.id.as_str()));
-            workbench.sessions.retain(|session| session.id != session_id);
+            assert!(
+                workbench
+                    .elicitation_drafts
+                    .contains_key(request.id.as_str())
+            );
+            workbench
+                .sessions
+                .retain(|session| session.id != session_id);
             workbench.prune_elicitation_forms(cx);
-            assert!(!workbench.elicitation_drafts.contains_key(request.id.as_str()));
+            assert!(
+                !workbench
+                    .elicitation_drafts
+                    .contains_key(request.id.as_str())
+            );
         });
     }
 
