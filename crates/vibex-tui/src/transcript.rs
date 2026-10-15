@@ -911,6 +911,13 @@ impl Transcript {
             let visible = head.expanded;
             grouped.push(head);
             for (offset, mut member) in run.into_iter().enumerate() {
+                // The head took the run's fold, and with it the title above the
+                // section. The row the head was minted from is a member now, and
+                // a member left carrying `is_head` draws the turn's name a
+                // second time — directly under the head that already says it.
+                if let Some(fold) = member.fold.as_mut() {
+                    fold.is_head = false;
+                }
                 member.group = GroupRole::Member {
                     visible,
                     last: offset + 1 == members,
@@ -5746,6 +5753,71 @@ mod density_tests {
             text.iter()
                 .any(|line| line.contains("Worked for 12s") && line.contains('▸')),
             "a shut fold is a title with a closed mark: {text:?}"
+        );
+    }
+
+    /// A run of work is opened by its group head, and the head carries the
+    /// turn's fold so a shut section cannot leave the run on screen. The row
+    /// the head was minted from is one of the run's members, and a member that
+    /// kept `is_head` drew the turn's title a second time under the head that
+    /// already draws it.
+    #[test]
+    fn a_grouped_run_draws_its_turns_title_once() {
+        let mut blocks = Vec::new();
+        for index in 0..3 {
+            let mut work = item(
+                &format!("t{index}"),
+                TimelineRowKind::ToolCall,
+                "ran",
+                false,
+            );
+            work.fold = Some(TurnFold {
+                turn_id: "turn-1".into(),
+                label: "12s".into(),
+                expanded: true,
+                is_conclusion: false,
+                is_head: index == 0,
+                agent_identity: None,
+            });
+            blocks.push(work);
+        }
+        let mut answer = item("t9", TimelineRowKind::AgentMessage, "the answer", false);
+        answer.collapsible = false;
+        answer.fold = Some(TurnFold {
+            turn_id: "turn-1".into(),
+            label: "12s".into(),
+            expanded: true,
+            is_conclusion: true,
+            is_head: false,
+            agent_identity: None,
+        });
+        blocks.push(answer);
+
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        transcript.set_blocks(blocks);
+        assert!(
+            transcript.blocks()[0].group.is_head(),
+            "the three rows are one group"
+        );
+        // The group opens onto its members, which is when the run's own rows
+        // are on screen at all.
+        assert!(transcript.toggle_block(0));
+        transcript.advance_disclosures(Instant::now() + DISCLOSURE_DURATION);
+        let lines = transcript.visible_lines(ScrollState::default(), 20, &theme(), strings());
+        let text = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        // The section's title carries the open disclosure; the rule that closes
+        // it carries the fold mark, so only the first is counted here.
+        let titles = text
+            .iter()
+            .filter(|line| line.contains('▾') && line.contains("Worked for 12s"))
+            .count();
+        assert_eq!(
+            titles, 1,
+            "the turn's title is drawn more than once: {text:?}"
         );
     }
 
