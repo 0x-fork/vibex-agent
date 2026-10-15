@@ -14,7 +14,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
 use vibex_ui::shell::ShellKind;
 
@@ -4630,9 +4630,11 @@ fn render_history_search(
         width: anchor.width,
         height,
     };
-    // Same plane as the completion drawer above: the two are the same chrome,
-    // and `Clear` alone would leave this one on the terminal's own background.
+    // Same plane and the same two widgets as the completion drawer above: the
+    // two are the same chrome, and this one covers the transcript behind it for
+    // the same reason.
     let surface = Style::default().bg(theme.roles.surface_raised);
+    frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(surface), area);
     let rule_style = Style::default().fg(theme.roles.gray_dim);
     // Top rule, titled and with the match count right-aligned on it.
@@ -4832,10 +4834,13 @@ fn render_completion(
         height,
     };
     // The drawer is a surface of its own, on the same plane as the composer it
-    // is pulled out of. `Clear` alone would leave every cell the rows do not
-    // cover painted on the terminal's own background — the one colour a themed
-    // interface cannot choose, and a different one from the box below it.
+    // is pulled out of. It is cleared *and* painted: the style alone would leave
+    // every glyph the rows do not cover in place — the transcript behind the
+    // drawer stayed readable through the gaps between them — and `Clear` alone
+    // would leave the cells on the terminal's own background, the one colour a
+    // themed interface cannot choose.
     let surface = Style::default().bg(theme.roles.surface_raised);
+    frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(surface), area);
 
     let rule_style = Style::default().fg(theme.roles.gray_dim);

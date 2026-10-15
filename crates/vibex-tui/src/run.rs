@@ -5780,6 +5780,111 @@ mod tests {
     }
 
     #[test]
+    fn the_completion_drawer_hides_the_transcript_it_covers() {
+        // Regression: the drawer painted its surface with a style, and a style
+        // does not erase the glyphs already in the cells it patches. The
+        // transcript underneath stayed readable through every gap between the
+        // rows, so the drawer looked like it was drawn on glass.
+        let mut app = isolation_app();
+        app.resize(100, 30);
+        app.navigate_to(Page::Agent);
+        let id = vibex_core::VibexSessionId::new();
+        app.agent.state.selected_session_id = Some(id.clone());
+        app.agent.state.timeline.replace_authoritative(
+            id.clone(),
+            (1..=24)
+                .map(|sequence| {
+                    // Tall enough to overflow the band: a transcript that fits
+                    // its rows is drawn from the top and never reaches the
+                    // drawer, which hangs off the bottom of the band.
+                    let text = format!("BLEEDMARKER {sequence} ").repeat(6);
+                    let payload = if sequence % 2 == 0 {
+                        vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                            text,
+                            ..Default::default()
+                        })
+                    } else {
+                        vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                            text,
+                            is_final: true,
+                        })
+                    };
+                    conversation_item(&id, sequence, payload)
+                })
+                .collect::<Vec<_>>(),
+        );
+        app.sync_transcript();
+        app.focus = crate::app::Focus::Composer;
+
+        let rows = |app: &mut App| -> Vec<String> {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|frame| crate::view::render(frame, app))
+                .expect("the frame draws");
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height)
+                .map(|row| {
+                    (0..buffer.area.width)
+                        .map(|column| {
+                            buffer
+                                .cell((column, row))
+                                .map(|cell| cell.symbol())
+                                .unwrap_or(" ")
+                        })
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        // The drawer hangs off the composer band, which the drawer does not
+        // move: the rows it covers are known before it is opened.
+        let covered = rows(&mut app);
+        let band = app
+            .regions
+            .composer_band
+            .expect("the composer band is drawn");
+        app.composer.set_text("/com");
+        app.refresh_completion();
+        {
+            let menu = app.completion.as_mut().expect("a completion menu");
+            menu.lists.commands = (0..5)
+                .map(|index| crate::composer::Completion {
+                    insert: format!("/command{index} "),
+                    label: format!("command{index}"),
+                    detail: "a command".to_string(),
+                    group: "Command".to_string(),
+                })
+                .collect();
+            menu.loading = false;
+            menu.reseat(menu.query.clone());
+        }
+        let height = app
+            .completion
+            .as_ref()
+            .expect("a completion menu")
+            .visible()
+            .len() as u16
+            + 2;
+        let covered_rows = ((band.y - height)..band.y).collect::<Vec<_>>();
+        assert!(
+            covered_rows
+                .iter()
+                .any(|row| covered[*row as usize].contains("BLEEDMARKER")),
+            "the transcript is not behind the drawer at rows {covered_rows:?} (band {band:?})"
+        );
+
+        let open = rows(&mut app);
+        for row in covered_rows {
+            assert!(
+                !open[row as usize].contains("BLEEDMARKER"),
+                "the transcript shows through the drawer at row {row}: {:?}",
+                open[row as usize]
+            );
+        }
+    }
+
+    #[test]
     fn workspace_callback_cannot_move_a_newer_draft_or_page() {
         use crate::action::Intent;
         let worker = isolation_worker();
