@@ -3057,8 +3057,30 @@ impl App {
         // badging, and they are what an opened session has to clear there. They
         // are stored before the arrangement is judged, because a tree that
         // arranges nothing says nothing about marks either way.
-        let authority_unread = snapshot.unread_session_ids.iter().cloned().collect();
-        let unread_changed = self.authority_unread_sessions != authority_unread;
+        let authority_unread: std::collections::BTreeSet<String> =
+            snapshot.unread_session_ids.iter().cloned().collect();
+        // The client's own mark is an optimistic echo of the write it sends: the
+        // dot is drawn before the authority answers, and `note_activity` keeps
+        // it while the mutation is in flight so an unrelated read racing the
+        // write cannot blink it off. That echo is retired by the same fact that
+        // retires the authority's own — an id the authority has *dropped* since
+        // the last snapshot was read, wherever that read happened. Without this
+        // the row keeps a dot the shared value no longer holds: the Desktop
+        // clears the mark when it opens the session, and the TUI goes on drawing
+        // it because only the authority's set was replaced.
+        //
+        // An id the authority never held is deliberately left alone: that is the
+        // optimistic mark for a write still on the wire, not a stale one.
+        let cleared: Vec<String> = self
+            .authority_unread_sessions
+            .difference(&authority_unread)
+            .cloned()
+            .collect();
+        let mut local_changed = false;
+        for session_id in &cleared {
+            local_changed |= self.unread_sessions.remove(session_id);
+        }
+        let unread_changed = self.authority_unread_sessions != authority_unread || local_changed;
         self.authority_unread_sessions = authority_unread;
         // An arrangement that arranges nothing is dropped rather than adopted,
         // but a snapshot can carry something else a client cannot invent: the

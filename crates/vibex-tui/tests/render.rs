@@ -9578,6 +9578,87 @@ fn an_unread_session_is_marked_until_it_is_opened() {
 }
 
 #[test]
+fn a_desktop_read_takes_the_dot_off_the_row() {
+    // The unread mark is one shared value, so the row has to lose its dot when
+    // the authority says the session was read somewhere else — the Desktop
+    // opening it is the common case. The client's own optimistic mark is drawn
+    // *and* the authority's copy is folded in, so a snapshot that drops the id
+    // has to retire both; keeping only the authority's copy left the dot on a
+    // row every window had already read.
+    let session_id = vibex_core::VibexSessionId::parse("session_sharedread1").unwrap();
+    let other = vibex_core::VibexSessionId::parse("session_sharedread2").unwrap();
+    let answer = vibex_core::TimelineLiveEvent {
+        session_id: session_id.clone(),
+        sequence: 7,
+        item: seeded_item(
+            &session_id,
+            7,
+            vibex_core::TimelineItemKind::AgentMessage,
+            vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: "done".to_string(),
+                is_final: true,
+            }),
+        ),
+    };
+
+    let mut app = app(110, 24);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.navigate_to(Page::Sessions);
+    let mut background = seeded_session("session_sharedread1", "finished elsewhere");
+    background.id = session_id.clone();
+    let mut open = seeded_session("session_sharedread2", "in front of me");
+    open.id = other.clone();
+    app.agent
+        .apply_sessions(Ok(vec![background, open]))
+        .expect("sessions apply");
+    app.agent.state.selected_session_id = Some(other.clone());
+
+    // The completion badges the row optimistically, before the authority has
+    // answered the write.
+    assert!(app.note_activity(&answer));
+    let unread_screen = text(&render(&mut app, 110, 24));
+    let unread_row = unread_screen
+        .lines()
+        .find(|line| line.contains("finished elsewhere"))
+        .unwrap_or_else(|| panic!("no row for the background session:\n{unread_screen}"));
+    assert!(
+        unread_row.trim_end().ends_with('●'),
+        "the completion did not dot the row: {unread_row:?}"
+    );
+
+    // The authority answers the same mark back, so the shared value now holds
+    // the session the client already drew.
+    let marked = vibex_core::RemoteSidebarOrganizationSnapshot {
+        revision: 3,
+        unread_session_ids: vec![session_id.as_str().to_string()],
+        ..Default::default()
+    };
+    app.apply_sidebar_organization(&marked);
+
+    // Then the Desktop opens the session and the authority drops the mark.
+    let read = vibex_core::RemoteSidebarOrganizationSnapshot {
+        revision: 4,
+        unread_session_ids: Vec::new(),
+        ..Default::default()
+    };
+    app.apply_sidebar_organization(&read);
+
+    let read_screen = text(&render(&mut app, 110, 24));
+    let read_row = read_screen
+        .lines()
+        .find(|line| line.contains("finished elsewhere"))
+        .unwrap_or_else(|| panic!("no row for the background session:\n{read_screen}"));
+    assert!(
+        !read_row.contains('●'),
+        "the desktop's read did not take the dot off the row: {read_row:?}"
+    );
+    assert!(
+        !read_screen.contains('●'),
+        "a dot outlived the shared mark:\n{read_screen}"
+    );
+}
+
+#[test]
 fn the_session_list_marks_degrade_to_a_legacy_terminal() {
     // The marks are part of the row's meaning, so they have to survive a
     // console font: single column, and no character it cannot draw.

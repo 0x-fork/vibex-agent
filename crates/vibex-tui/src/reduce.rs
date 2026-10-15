@@ -9366,6 +9366,87 @@ mod tests {
     }
 
     #[test]
+    fn a_session_the_desktop_read_stops_being_unread_here() {
+        // The mark is one shared value, so it has to move in both directions and
+        // in both seats. The client draws its own dot optimistically while its
+        // write is on the wire, but when the Desktop opens the session the
+        // authority drops the mark: the next snapshot is the news, and the row
+        // here has to lose the dot with it. Replacing only the authority's copy
+        // is what left the dot glowing on a session every other window had
+        // already read.
+        let mut app = arranged_app();
+        let session_id = vibex_core::VibexSessionId::parse("session_org000001").unwrap();
+        // A completion for a session nobody is looking at both badges the row
+        // and queues the write back to the authority.
+        assert!(app.note_activity(&final_answer_event(&session_id)));
+        assert!(app.session_is_unread(&session_id));
+
+        // The Desktop reads it, so the authority publishes the mark cleared.
+        let mut read = arranged_snapshot();
+        read.revision = 12;
+        read.unread_session_ids = Vec::new();
+        app.apply_sidebar_organization(&read);
+
+        assert!(
+            !app.session_is_unread(&session_id),
+            "the desktop's read did not clear this client's dot"
+        );
+    }
+
+    #[test]
+    fn an_optimistic_mark_survives_a_read_that_never_held_it() {
+        // The client marks a session unread the moment it sees a completion, and
+        // the write that tells the authority is still on the wire when the next
+        // snapshot of the *arrangement* arrives — one that simply never carried
+        // that id. That is not the authority clearing the mark, so the
+        // optimistic dot must stand until the authority answers the write.
+        let mut app = arranged_app();
+        let session_id = vibex_core::VibexSessionId::parse("session_org000002").unwrap();
+        assert!(app.note_activity(&final_answer_event(&session_id)));
+        assert!(app.session_is_unread(&session_id));
+
+        // A snapshot that does not name the session either way: the write has
+        // not landed yet, so the authority's copy of the marks is simply empty.
+        let mut pending = arranged_snapshot();
+        pending.revision = 12;
+        pending.unread_session_ids = vec!["session_org000001".to_string()];
+        app.apply_sidebar_organization(&pending);
+
+        assert!(
+            app.session_is_unread(&session_id),
+            "a mark still on the wire was dropped by an unrelated read"
+        );
+    }
+
+    /// A finished answer for a session, the shape `note_activity` reads as a
+    /// completion.
+    fn final_answer_event(session_id: &VibexSessionId) -> vibex_core::TimelineLiveEvent {
+        vibex_core::TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: 7,
+            item: vibex_core::TimelineItem {
+                id: vibex_core::TimelineItemId::new(),
+                session_id: session_id.clone(),
+                sequence: 7,
+                timestamp_ms: 7,
+                source: vibex_core::TimelineSource::Agent,
+                kind: vibex_core::TimelineItemKind::AgentMessage,
+                correlation_id: None,
+                provider_correlation_id: None,
+                redaction_state: vibex_core::TimelineRedactionState::None,
+                execution_attribution: None,
+                payload_depth: vibex_core::TimelinePayloadDepth::Detail,
+                payload: vibex_core::TimelinePayload::AgentMessage(
+                    vibex_core::AgentMessagePayload {
+                        text: "done".to_string(),
+                        is_final: true,
+                    },
+                ),
+            },
+        }
+    }
+
+    #[test]
     fn a_pin_is_asked_of_the_authority_that_owns_the_list() {
         let mut app = arranged_app();
         app.set_selection(crate::keymap::Scope::Sessions, 2);

@@ -866,6 +866,15 @@ is never a column count.
     marks have to survive that. A mark is not an edit of the tree, so it carries
     **no expected revision** — a rearrangement on the Desktop between the read
     and the mark must not refuse it or make a read look like a failed tree edit.
+    The client also keeps its own optimistic set (`App::unread_sessions`), drawn
+    the instant a completion arrives so the dot does not wait on the wire. The
+    two sets are ORed for display (`session_is_unread`), so **the optimistic set
+    must be reconciled down as well as up**: when a snapshot drops an id the
+    authority previously held, that id is removed from both sets
+    (`apply_sidebar_organization`). Replacing only the authority's copy is what
+    left the TUI dot glowing after the Desktop opened the session and cleared the
+    shared mark. An id the authority *never* held is left alone — that is a mark
+    whose write is still in flight, not a stale one.
   - *Deleting a session.* A deletion deletes the row, so there is no surviving
     snapshot to broadcast. The manager publishes the removed ids on its own
     channel (`subscribe_session_removals`), the runtime fans them out as
