@@ -1563,6 +1563,10 @@ pub struct MobileApp {
     workspace_action: Option<WorkspaceActionPrompt>,
     workspace_action_busy: bool,
     sidebar_row_menu: Option<SidebarRowMenu>,
+    /// The drawer's own sheet, opened by pressing the section header rather
+    /// than a row: the entries that belong to the sidebar's root scope and not
+    /// to any row in it.
+    sidebar_root_menu: bool,
     sidebar_name_prompt: Option<SidebarNamePrompt>,
     sidebar_name_input: Entity<InputState>,
     /// The Desktop's sidebar tree, mirrored so the phone renders the layout the
@@ -2861,6 +2865,7 @@ impl MobileApp {
             workspace_action: None,
             workspace_action_busy: false,
             sidebar_row_menu: None,
+            sidebar_root_menu: false,
             sidebar_name_prompt: None,
             sidebar_name_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(locale::text(
@@ -8068,6 +8073,7 @@ impl MobileApp {
         self.sidebar_batch_mode = false;
         self.sidebar_batch_delete_confirmation = false;
         self.sidebar_row_menu = None;
+        self.sidebar_root_menu = false;
         self.sidebar_name_prompt = None;
         self.workspace_action = None;
         self.workspace_action_busy = false;
@@ -8489,6 +8495,25 @@ impl MobileApp {
         }
         let (project_id, workspace_id) = scope?;
         (members.len() >= 2).then_some((project_id, workspace_id, members))
+    }
+
+    /// The groups a session could join, in the sidebar's own order.
+    ///
+    /// A group is scoped to one Worktree, so only the groups anchored to the
+    /// session's own Worktree are candidates; the project-wide list a compact
+    /// client renders rows from would offer groups that could never hold it.
+    fn session_group_candidates(
+        &self,
+        project_id: &str,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Vec<(String, String)> {
+        sidebar_session_group_candidates(
+            &self.sidebar_view.organization,
+            project_id,
+            workspace_id,
+            session_id,
+        )
     }
 
     /// Opens the membership editor for one group.
@@ -12101,7 +12126,7 @@ impl MobileApp {
     ) -> gpui::AnyElement {
         bottom_sheet_header(
             title,
-            "pairing-sheet-close",
+            "pairing-sheet-close".to_string(),
             trailing,
             Box::new(|this, _, cx| this.dismiss_pairing_panel(cx)),
             cx,
@@ -12954,6 +12979,9 @@ impl MobileApp {
                 .when_some(row_menu, |root, menu| {
                     root.child(self.render_sidebar_row_menu(&menu, window, cx))
                 })
+                .when(self.sidebar_root_menu, |root| {
+                    root.child(self.render_sidebar_root_menu(window, cx))
+                })
                 .when_some(name_prompt, |root, prompt| {
                     root.child(self.render_folder_name_prompt(&prompt, cx))
                 })
@@ -13642,37 +13670,29 @@ impl MobileApp {
     ) -> gpui::AnyElement {
         let row = menu.row.clone();
         let mut sheet = div().p_2().flex().flex_col().gap(px(2.0));
+        let entry_owned = |sheet: gpui::Div,
+                           id: String,
+                           label: String,
+                           destructive: bool,
+                           action: SheetAction| {
+            sheet.child(sidebar_sheet_entry(id, label, destructive).on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.sidebar_row_menu = None;
+                    action(this, window, cx);
+                }),
+            ))
+        };
+        // The same entry for the rows whose list is built at render time: a
+        // session can be offered one entry per group it could join, so the id
+        // cannot be a literal.
         let entry = |sheet: gpui::Div,
                      id: &'static str,
                      label: String,
                      destructive: bool,
                      action: SheetAction| {
-            sheet.child(
-                div()
-                    .id(id)
-                    .h(px(theme::TOUCH_TARGET))
-                    .px_3()
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .active(|style| style.bg(theme::row_pressed_bg()))
-                    .text_size(theme::font_body())
-                    .text_color(if destructive {
-                        theme::accent_red()
-                    } else {
-                        theme::text_primary()
-                    })
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.sidebar_row_menu = None;
-                            action(this, window, cx);
-                        }),
-                    )
-                    .child(label),
-            )
+            entry_owned(sheet, id.to_string(), label, destructive, action)
         };
 
         match row.kind {
@@ -13757,6 +13777,80 @@ impl MobileApp {
                             }
                         }),
                     );
+                }
+                // A session belongs to at most one group, and a group holds one
+                // Worktree — so the row either offers to leave the group that
+                // holds it, or to join one anchored to the same Worktree.
+                if let Some(session_id) = row.session_id.as_ref() {
+                    let session_id = session_id.as_str().to_string();
+                    match self
+                        .sidebar_view
+                        .organization
+                        .group_of_session(&session_id)
+                        .map(str::to_string)
+                    {
+                        Some(group_id) => {
+                            let members = self
+                                .sidebar_view
+                                .organization
+                                .group(&group_id)
+                                .map(|group| {
+                                    group
+                                        .member_session_ids
+                                        .iter()
+                                        .filter(|member| member.as_str() != session_id)
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            sheet = entry(
+                                sheet,
+                                "mobile-row-menu-leave-group",
+                                locale::text(
+                                    "Remove from session group",
+                                    "移出会话组",
+                                    "移出會話組",
+                                )
+                                .to_string(),
+                                false,
+                                Box::new(move |this, _, cx| {
+                                    this.send_sidebar_mutation(
+                                        RemoteSidebarOrganizationMutation::SetGroupMembers {
+                                            group_id: group_id.clone(),
+                                            session_ids: members.clone(),
+                                        },
+                                        false,
+                                        cx,
+                                    );
+                                }),
+                            );
+                        }
+                        None => {
+                            for (group_id, name) in self.session_group_candidates(
+                                row.project_id.as_deref().unwrap_or_default(),
+                                row.workspace_id.as_deref().unwrap_or_default(),
+                                session_id.as_str(),
+                            ) {
+                                let join_session_id = session_id.clone();
+                                sheet = entry_owned(
+                                    sheet,
+                                    format!("mobile-row-menu-join-group-{group_id}"),
+                                    mobile_join_session_group_label(&name),
+                                    false,
+                                    Box::new(move |this, _, cx| {
+                                        this.send_sidebar_mutation(
+                                            RemoteSidebarOrganizationMutation::SetGroupMembers {
+                                                group_id: group_id.clone(),
+                                                session_ids: vec![join_session_id.clone()],
+                                            },
+                                            false,
+                                            cx,
+                                        );
+                                    }),
+                                );
+                            }
+                        }
+                    }
                 }
                 let fork_session_id = row.session_id.clone();
                 sheet = entry(
@@ -13985,6 +14079,28 @@ impl MobileApp {
                 }
                 let workspace_id_for_rename = workspace_id.clone();
                 let title = row.label.clone();
+                // A folder of the Worktree's own. The desktop keeps this on the
+                // worktree card's hover menu; the phone's sheet is where its
+                // rows carry the commands, and the folder is created inside the
+                // Worktree the row stands for.
+                let folder_project_id = row.project_id.clone();
+                let folder_workspace_id = workspace_id.clone();
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-workspace-new-folder",
+                    locale::text("New folder", "新建文件夹", "新增資料夾").to_string(),
+                    false,
+                    Box::new(move |this, _, cx| {
+                        this.open_folder_name_prompt(
+                            SidebarNamePrompt::CreateFolder {
+                                project_id: folder_project_id.clone(),
+                                workspace_id: Some(folder_workspace_id.clone()),
+                                parent_folder_id: None,
+                            },
+                            cx,
+                        );
+                    }),
+                );
                 sheet = entry(
                     sheet,
                     "mobile-row-menu-workspace-rename",
@@ -14157,9 +14273,85 @@ impl MobileApp {
             }
         }
 
+        self.render_drawer_sheet(
+            row.label.as_str(),
+            "mobile-sidebar-row-menu",
+            Box::new(|this, _, cx| {
+                this.sidebar_row_menu = None;
+                cx.notify();
+            }),
+            sheet,
+            window,
+            cx,
+        )
+    }
+
+    /// The drawer's own entries, opened by pressing the section header.
+    ///
+    /// The root scope is where the folders that group projects live. The desktop
+    /// reaches it by right-clicking empty sidebar space, and a phone has no such
+    /// space, so its header carries the press instead — and only the header's
+    /// label does, because the controls beside it own their own taps.
+    fn render_sidebar_root_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let sheet = div().p_2().flex().flex_col().gap(px(2.0)).child(
+            sidebar_sheet_entry(
+                "mobile-sidebar-root-menu-new-folder".to_string(),
+                locale::text("New folder", "新建文件夹", "新增資料夾").to_string(),
+                false,
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.sidebar_root_menu = false;
+                    this.open_folder_name_prompt(
+                        SidebarNamePrompt::CreateFolder {
+                            project_id: None,
+                            workspace_id: None,
+                            parent_folder_id: None,
+                        },
+                        cx,
+                    );
+                }),
+            ),
+        );
+        self.render_drawer_sheet(
+            locale::text("Sidebar", "侧栏", "側欄"),
+            "mobile-sidebar-root-menu",
+            Box::new(|this, _, cx| {
+                this.sidebar_root_menu = false;
+                cx.notify();
+            }),
+            sheet,
+            window,
+            cx,
+        )
+    }
+
+    /// One bottom sheet over the drawer: the scrim, the panel rising from the
+    /// foot of the screen, and the header naming what its entries belong to.
+    ///
+    /// `close` is what the scrim and the header's own control do; a sheet's
+    /// entries own their taps, so only the scrim dismisses it.
+    fn render_drawer_sheet(
+        &self,
+        title: &str,
+        id_prefix: &str,
+        close: SheetAction,
+        sheet: gpui::Div,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         div()
-            .id("mobile-sidebar-row-menu")
-            .debug_selector(|| "mobile-sidebar-row-menu".to_string())
+            .id(ElementId::from(id_prefix.to_string()))
+            .debug_selector({
+                let selector = id_prefix.to_string();
+                move || selector.clone()
+            })
             .absolute()
             .inset_0()
             .occlude()
@@ -14169,15 +14361,15 @@ impl MobileApp {
             .justify_end()
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.sidebar_row_menu = None;
-                    cx.notify();
-                }),
+                cx.listener(move |this, _, window, cx| close(this, window, cx)),
             )
             .child(
                 div()
-                    .id("mobile-sidebar-row-menu-sheet")
-                    .debug_selector(|| "mobile-sidebar-row-menu-sheet".to_string())
+                    .id(ElementId::from(format!("{id_prefix}-sheet")))
+                    .debug_selector({
+                        let selector = format!("{id_prefix}-sheet");
+                        move || selector.clone()
+                    })
                     .w_full()
                     .max_h(bottom_sheet_max_height(window))
                     .flex()
@@ -14187,21 +14379,21 @@ impl MobileApp {
                     .border_color(theme::border_default())
                     .bg(theme::bg_card())
                     .overflow_hidden()
-                    // The sheet owns its own taps: only the scrim dismisses it.
                     .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(bottom_sheet_header(
-                        row.label.as_str(),
-                        "mobile-sidebar-row-menu-close",
+                        title,
+                        format!("{id_prefix}-close"),
                         None,
-                        Box::new(|this, _, cx| {
+                        Box::new(move |this, _, cx| {
                             this.sidebar_row_menu = None;
+                            this.sidebar_root_menu = false;
                             cx.notify();
                         }),
                         cx,
                     ))
                     .child(
                         div()
-                            .id("mobile-sidebar-row-menu-body")
+                            .id(ElementId::from(format!("{id_prefix}-body")))
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
@@ -22299,12 +22491,46 @@ impl MobileApp {
                             .items_center()
                             .child(
                                 div()
+                                    .relative()
                                     .flex_1()
                                     .min_w_0()
                                     .text_size(theme::font_caption())
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme::sidebar_text_muted())
-                                    .child(locale::common("Projects")),
+                                    .child(locale::common("Projects"))
+                                    // The label answers a long press the way a
+                                    // row does, which is how the root scope's own
+                                    // commands stay reachable without a seventh
+                                    // button in this strip.
+                                    .child({
+                                        let header_entity = cx.weak_entity();
+                                        gpui::canvas(
+                                            move |bounds, _, _| {
+                                                let _ = bounds;
+                                            },
+                                            move |bounds, _, window, _| {
+                                                window.on_mouse_event({
+                                                    let entity = header_entity.clone();
+                                                    move |event: &LongPressEvent,
+                                                          phase: DispatchPhase,
+                                                          _: &mut Window,
+                                                          cx: &mut gpui::App| {
+                                                        if phase != DispatchPhase::Bubble
+                                                            || !bounds.contains(&event.position)
+                                                        {
+                                                            return;
+                                                        }
+                                                        let _ = entity.update(cx, |this, cx| {
+                                                            this.sidebar_root_menu = true;
+                                                            cx.notify();
+                                                        });
+                                                    }
+                                                });
+                                            },
+                                        )
+                                        .absolute()
+                                        .inset_0()
+                                    }),
                             )
                             .child(
                                 div()
@@ -28559,6 +28785,64 @@ fn mobile_new_session_in_folder_label(folder_name: &str) -> String {
     }
 }
 
+/// The groups a session could join, in the sidebar's own order.
+///
+/// A group is scoped to one Worktree, so only the groups anchored to the
+/// session's own Worktree are candidates: offering a group that could never
+/// hold the session would make the entry fail after the reader chose it.
+fn sidebar_session_group_candidates(
+    organization: &vibex_desktop_model::SidebarOrganizationState,
+    project_id: &str,
+    workspace_id: &str,
+    session_id: &str,
+) -> Vec<(String, String)> {
+    if project_id.is_empty() || workspace_id.is_empty() {
+        return Vec::new();
+    }
+    organization
+        .groups_for_project(project_id)
+        .into_iter()
+        .filter(|(_, group)| group.workspace_id == workspace_id && !group.contains(session_id))
+        .map(|(id, group)| (id, group.name.clone()))
+        .collect()
+}
+
+/// One entry of a bottom sheet: a row the finger can land on.
+///
+/// Both sheets build their entries from this, so an entry looks the same
+/// whichever surface opened it.
+fn sidebar_sheet_entry(id: String, label: String, destructive: bool) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(theme::TOUCH_TARGET))
+        .px_3()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .flex()
+        .items_center()
+        .cursor_pointer()
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .text_size(theme::font_body())
+        .text_color(if destructive {
+            theme::accent_red()
+        } else {
+            theme::text_primary()
+        })
+        .child(label)
+}
+
+/// The entry that adds a session to one group.
+///
+/// The desktop reaches this through a submenu of candidate groups; a sheet has
+/// no submenu, so each candidate is its own entry and the group is named in the
+/// label — which is also what tells two entries apart.
+fn mobile_join_session_group_label(group_name: &str) -> String {
+    match locale::current() {
+        Locale::En => format!("Add to {group_name}"),
+        Locale::ZhCn => format!("加入「{group_name}」"),
+        Locale::ZhTw => format!("加入「{group_name}」"),
+    }
+}
+
 fn sidebar_item_ref(item: &SidebarOrganizationItem) -> RemoteSidebarItemRef {
     let (kind, id) = match item {
         SidebarOrganizationItem::Folder(id) => (RemoteSidebarItemKind::Folder, id),
@@ -29195,7 +29479,7 @@ fn pairing_action_button(
 /// one header instead of two that drift apart.
 fn bottom_sheet_header(
     title: &str,
-    close_id: &'static str,
+    close_id: String,
     trailing: Option<gpui::AnyElement>,
     close: SheetAction,
     cx: &mut Context<MobileApp>,
@@ -34918,6 +35202,104 @@ fn session_opened(cx: &mut Context<Self>) {
         let failed = sidebar_session_column(AgentSessionState::Error, false, false, false, false);
         assert!(failed.show_error);
         assert!(!failed.show_status && !failed.show_time && failed.label.is_none());
+    }
+
+    /// Only the groups anchored to a session's own Worktree are offered.
+    #[test]
+    fn a_session_can_only_join_a_group_of_its_own_worktree() {
+        use vibex_desktop_model::SidebarOrganizationState;
+
+        let workspaces = BTreeMap::from([
+            (
+                "session_session-a".to_string(),
+                "workspace_project".to_string(),
+            ),
+            (
+                "session_session-b".to_string(),
+                "workspace_project".to_string(),
+            ),
+            (
+                "session_session-c".to_string(),
+                "workspace_other".to_string(),
+            ),
+        ]);
+        let mut organization = SidebarOrganizationState::default();
+        assert!(organization.create_group(
+            "group-here",
+            "Here",
+            "project_project",
+            "workspace_project",
+            &["session_session-a".to_string()],
+            &workspaces,
+            None,
+        ));
+        assert!(organization.create_group(
+            "group-elsewhere",
+            "Elsewhere",
+            "project_project",
+            "workspace_other",
+            &["session_session-c".to_string()],
+            &workspaces,
+            None,
+        ));
+
+        // A session already in a group is not offered that group again, and a
+        // group of another Worktree is never offered at all.
+        assert_eq!(
+            sidebar_session_group_candidates(
+                &organization,
+                "project_project",
+                "workspace_project",
+                "session_session-b",
+            ),
+            vec![("group-here".to_string(), "Here".to_string())]
+        );
+        assert!(
+            sidebar_session_group_candidates(
+                &organization,
+                "project_project",
+                "workspace_project",
+                "session_session-a",
+            )
+            .is_empty(),
+            "the group that already holds the session is not a candidate"
+        );
+        assert!(
+            sidebar_session_group_candidates(&organization, "", "", "session_session-b").is_empty(),
+            "a row that cannot name its scope offers nothing"
+        );
+    }
+
+    /// The drawer's root sheet is the header's press, not a row's.
+    ///
+    /// The root scope is where the folders that group projects live, and the
+    /// phone reaches it without a seventh button in the section strip.
+    #[test]
+    fn the_section_header_opens_the_root_scope_sheet() {
+        let source = include_str!("app.rs");
+        let header = renderer_source(source, "render_drawer");
+        assert!(
+            header.contains("this.sidebar_root_menu = true"),
+            "the Projects label answers a long press with the root sheet"
+        );
+        assert!(
+            header.contains("LongPressEvent"),
+            "and it answers the platform's long press"
+        );
+
+        let sheet = renderer_source(source, "render_sidebar_root_menu");
+        assert!(
+            sheet.contains("mobile-sidebar-root-menu-new-folder"),
+            "the root sheet offers a new folder"
+        );
+        assert!(
+            sheet.contains("project_id: None"),
+            "a folder made there belongs to the sidebar's root, not to a project"
+        );
+        assert!(
+            sheet.contains("sidebar_sheet_entry("),
+            "and its entry is the same entry every other sheet draws"
+        );
     }
 
     /// A folder row's new-chat entry names the folder it starts in.
