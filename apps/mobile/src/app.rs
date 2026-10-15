@@ -63,6 +63,9 @@ use vibex_ui::{
     ElicitationFormDraft, ElicitationSurfaceModel, ShellKind, locale::Locale,
 };
 
+use crate::bottom_sheet::{
+    BottomSheet, SheetKey, SheetPresentation, SheetPull, bottom_sheet_shell,
+};
 use crate::discovery::{LanDiscoveryCandidate, LanDiscoveryEvent, LanDiscoveryMode};
 use crate::lifecycle::MobileLifecycleEvent;
 use crate::pairing::{
@@ -99,10 +102,6 @@ const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 /// A hold opens a sheet over the pill, so the release usually lands on the
 /// sheet rather than the pill; this window covers the frame where it does not.
 const LONG_PRESS_ECHO_MS: u64 = 600;
-/// How long a sheet takes to rise into place.
-const SHEET_ENTRANCE_MS: u64 = 160;
-/// How far below its resting place a sheet starts, in logical pixels.
-const SHEET_ENTRANCE_RISE: f32 = 24.0;
 /// How long the new-session page's introduction takes to fade in.
 const PAGE_ENTRANCE_MS: u64 = 200;
 /// How close to the top the reader has to be for older history to be fetched.
@@ -1220,6 +1219,32 @@ struct DrawerSnap {
     animation_id: u64,
 }
 
+/// What one of the drawer's own sheets is.
+///
+/// The three travel together — a sheet's key, the name a test finds its panel
+/// by, and the header it wears — so they are handed over as one thing rather
+/// than as three arguments that always appear together.
+struct DrawerSheet<'a> {
+    key: SheetKey,
+    id_prefix: &'a str,
+    title: &'a str,
+}
+
+/// Where the sheets that live inside an overlay page are this frame.
+///
+/// An overlay page renders from `&self`, because the page under it is still
+/// drawing the same frame, so it cannot read the sheet state that says how far
+/// its own panels have risen. The workspace owns that state, so it reads the
+/// frame here and hands it down.
+#[derive(Clone, Default)]
+struct OverlaySheets {
+    pairing: Option<SheetPresentation>,
+    pairing_scroll: ScrollHandle,
+    host_actions: Option<SheetPresentation>,
+    settings_palette: Option<SheetPresentation>,
+    settings_palette_scroll: ScrollHandle,
+}
+
 /// The platform appearance, used to resolve the System preference.
 fn system_appearance_is_dark(cx: &App) -> bool {
     matches!(
@@ -1482,6 +1507,12 @@ pub struct MobileApp {
     drawer_snap: Option<DrawerSnap>,
     drawer_animation_id: u64,
     drawer_snap_task: Option<Task<()>>,
+    /// The sheets that rise from the foot of the screen: their rise, their
+    /// fall, and the finger pulling one back down.
+    sheet: BottomSheet,
+    /// The task that clears a sheet once its fall has landed. Held so the
+    /// timer is not dropped before it fires.
+    sheet_task: Option<Task<()>>,
     /// Timestamp of the last drawer pan event, feeding the release-velocity
     /// estimate that separates deliberate swipes from slow drags.
     drawer_pan_last_at: Option<Instant>,
@@ -1534,7 +1565,6 @@ pub struct MobileApp {
     /// The single manual field: a `vibex://` link or a bare one-time code.
     pairing_code_input: Entity<InputState>,
     pairing_panel: PairingPanel,
-    pairing_scroll: ScrollHandle,
     /// The saved-runtime list on the pairing page, which scrolls once the phone
     /// knows about more runtimes than fit on one screen.
     pairing_runtimes_scroll: ScrollHandle,
@@ -2987,6 +3017,8 @@ impl MobileApp {
             drawer_snap: None,
             drawer_animation_id: 0,
             drawer_snap_task: None,
+            sheet: BottomSheet::default(),
+            sheet_task: None,
             drawer_pan_last_at: None,
             drawer_fling_owned: false,
             overlay_swipe: None,
@@ -3032,7 +3064,6 @@ impl MobileApp {
                 ))
             }),
             pairing_panel: PairingPanel::None,
-            pairing_scroll: ScrollHandle::new(),
             pairing_runtimes_scroll: ScrollHandle::new(),
             host_reachability: BTreeMap::new(),
             reachability_generation: 0,
@@ -3519,8 +3550,7 @@ impl MobileApp {
 
     fn close_composer_attach_menu(&mut self, cx: &mut Context<Self>) {
         if self.composer_attach_menu_open {
-            self.composer_attach_menu_open = false;
-            cx.notify();
+            self.close_sheet(SheetKey::ComposerAttach, cx);
         }
     }
 
@@ -3888,8 +3918,8 @@ impl MobileApp {
     }
 
     fn close_worktree_path_browser(&mut self, cx: &mut Context<Self>) {
-        if self.worktree_path_browser.take().is_some() {
-            cx.notify();
+        if self.worktree_path_browser.is_some() {
+            self.close_sheet(SheetKey::WorktreePaths, cx);
         }
     }
 
@@ -4442,14 +4472,13 @@ impl MobileApp {
             return;
         }
         if self.pairing_panel == PairingPanel::Nearby {
-            self.pairing_panel = PairingPanel::None;
             self.stop_nearby_pairing();
+            self.close_sheet(SheetKey::PairingFallback, cx);
         } else {
             self.pairing_panel = PairingPanel::Nearby;
-            self.reset_pairing_panel_scroll();
             self.begin_nearby_discovery(cx);
+            cx.notify();
         }
-        cx.notify();
     }
 
     /// Opens or closes the manual-entry fallback's sheet.
@@ -4457,13 +4486,12 @@ impl MobileApp {
         if self.pairing_busy {
             return;
         }
-        self.pairing_panel = if self.pairing_panel == PairingPanel::Manual {
-            PairingPanel::None
-        } else {
-            self.stop_nearby_pairing();
-            self.reset_pairing_panel_scroll();
-            PairingPanel::Manual
-        };
+        if self.pairing_panel == PairingPanel::Manual {
+            self.close_sheet(SheetKey::PairingFallback, cx);
+            return;
+        }
+        self.stop_nearby_pairing();
+        self.pairing_panel = PairingPanel::Manual;
         cx.notify();
     }
 
@@ -4478,16 +4506,8 @@ impl MobileApp {
             return;
         }
         crate::platform::hide_keyboard();
-        self.pairing_panel = PairingPanel::None;
         self.stop_nearby_pairing();
-        cx.notify();
-    }
-
-    /// Returns the sheet body to the top. A sheet opened while the previous one
-    /// was scrolled down has to start at its own first line, not halfway
-    /// through it.
-    fn reset_pairing_panel_scroll(&self) {
-        self.pairing_scroll.set_offset(point(px(0.0), px(0.0)));
+        self.close_sheet(SheetKey::PairingFallback, cx);
     }
 
     /// Asks every saved runtime whether it is up, and records the answers.
@@ -9009,8 +9029,7 @@ impl MobileApp {
     }
 
     fn cancel_batch_delete(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.sidebar_batch_delete_confirmation = false;
-        cx.notify();
+        self.close_sheet(SheetKey::BatchDelete, cx);
     }
 
     fn confirm_batch_delete(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -10457,8 +10476,7 @@ impl MobileApp {
 
     fn close_composer_history(&mut self, cx: &mut Context<Self>) {
         if self.composer_history_open {
-            self.composer_history_open = false;
-            cx.notify();
+            self.close_sheet(SheetKey::ComposerHistory, cx);
         }
     }
 
@@ -11913,6 +11931,34 @@ impl MobileApp {
         self.start_drawer_snap(target, Some(window), cx);
     }
 
+    /// Where the sheets that open over a page are this frame.
+    ///
+    /// The pairing page, a runtime's own actions and the palette are all drawn
+    /// by pages that render from `&self`, so the page that owns the state reads
+    /// their frames once and hands them down.
+    fn overlay_sheets(&mut self, window: &Window) -> OverlaySheets {
+        let travel = bottom_sheet_max_height(window);
+        OverlaySheets {
+            pairing: self.sheet.presentation(
+                SheetKey::PairingFallback,
+                self.pairing_panel != PairingPanel::None,
+                travel,
+            ),
+            pairing_scroll: self.sheet.body_scroll(SheetKey::PairingFallback),
+            host_actions: self.sheet.presentation(
+                SheetKey::HostActions,
+                self.overlay == Some(MobileOverlay::HostActions),
+                travel,
+            ),
+            settings_palette: self.sheet.presentation(
+                SheetKey::SettingsPalette,
+                self.settings_palette_open,
+                travel,
+            ),
+            settings_palette_scroll: self.sheet.body_scroll(SheetKey::SettingsPalette),
+        }
+    }
+
     /// The GPUI scroll element updates its handle before bubble listeners run.
     /// Consume the event here so the overlaid timeline cannot scroll in parallel.
     fn consume_drawer_scroll(
@@ -11922,6 +11968,114 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
+    }
+
+    /// A tap on a sheet's scrim: what the finger was doing when it landed is
+    /// what decides whether it dismisses.
+    ///
+    /// The lift that ends a pull can land on the scrim itself once the panel
+    /// has moved out from under the finger, and that is not a tap anyone made.
+    fn tap_sheet_scrim(&mut self, key: SheetKey, cx: &mut Context<Self>) {
+        if self.sheet.pull_just_released(key) {
+            return;
+        }
+        self.close_sheet(key, cx);
+    }
+
+    /// Drives one sheet from the platform's touch pan.
+    ///
+    /// The listener belongs to the panel the finger is on, so a page showing
+    /// two sheets never moves the wrong one.
+    fn pull_sheet(
+        &mut self,
+        key: SheetKey,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pan) = crate::bottom_sheet::sheet_pan(event) else {
+            return;
+        };
+        match self.sheet.pull(key, pan, bottom_sheet_max_height(window)) {
+            SheetPull::Ignored => {}
+            SheetPull::Pulling | SheetPull::Restored => {
+                // The panel owns the gesture now: the list inside the sheet
+                // must not scroll along with the finger that is moving it.
+                cx.stop_propagation();
+                cx.notify();
+            }
+            SheetPull::Dismissed(key) => {
+                cx.stop_propagation();
+                self.lower_sheet(key, cx);
+            }
+        }
+    }
+
+    /// Asks a sheet to close, and lets its panel leave the screen.
+    fn close_sheet(&mut self, key: SheetKey, cx: &mut Context<Self>) {
+        if self.sheet.is_leaving(key) {
+            // The reader asked a second time: the panel stops falling and is
+            // simply gone, rather than making them wait out the animation.
+            self.land_sheet(key, cx);
+            return;
+        }
+        self.lower_sheet(key, cx);
+    }
+
+    /// Starts the panel's fall. The sheet's own flag stays set until the panel
+    /// has landed, which is what keeps its content in the panel as it travels.
+    fn lower_sheet(&mut self, key: SheetKey, cx: &mut Context<Self>) {
+        let flight = self.sheet.lower(key);
+        if flight.is_zero() {
+            self.land_sheet(key, cx);
+            return;
+        }
+        self.sheet_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            cx.background_executor().timer(flight).await;
+            let _ = entity.update(cx, |this, cx| this.land_sheet(key, cx));
+        }));
+        cx.notify();
+    }
+
+    /// Forgets the sheet whose fall has landed.
+    ///
+    /// This is where closing a sheet actually ends: the panel has left the
+    /// screen, so the page's own flag — the thing that says the sheet is up —
+    /// can go. [`BottomSheet::land`] answers `false` for a landing that has
+    /// nothing left to clear, which is what keeps a second close from touching
+    /// a page's state twice.
+    fn land_sheet(&mut self, key: SheetKey, cx: &mut Context<Self>) {
+        if !self.sheet.land(key) {
+            return;
+        }
+        match key {
+            SheetKey::PairingFallback => self.pairing_panel = PairingPanel::None,
+            SheetKey::SidebarRowMenu => self.sidebar_row_menu = None,
+            SheetKey::SidebarRootMenu => self.sidebar_root_menu = false,
+            SheetKey::FolderArchiveMenu => self.sidebar_folder_archive_menu = None,
+            SheetKey::SidebarRescheduleMenu => self.sidebar_reschedule_menu = None,
+            SheetKey::BatchDelete => self.sidebar_batch_delete_confirmation = false,
+            SheetKey::WorktreePaths => self.worktree_path_browser = None,
+            SheetKey::GroupMembers => self.group_members_editor = None,
+            SheetKey::ProjectRemove => self.project_remove_confirmation = None,
+            SheetKey::GoalObjective => self.goal_objective_open = false,
+            // One runtime's own actions are a page of their own, so closing
+            // the sheet is leaving that page.
+            SheetKey::HostActions => self.dismiss_overlay(None, cx),
+            SheetKey::ComposerHistory => self.composer_history_open = false,
+            SheetKey::ComposerAttach => self.composer_attach_menu_open = false,
+            SheetKey::NewSessionPicker => self.new_session_picker = None,
+            SheetKey::NewSessionOptions => self.new_session_options_open = false,
+            SheetKey::SettingsPalette => self.settings_palette_open = false,
+            // The workbench owns its own sheets.
+            SheetKey::FileGoto
+            | SheetKey::GitBranches
+            | SheetKey::GitFilter
+            | SheetKey::WorktreeConfirmation
+            | SheetKey::GitRevert
+            | SheetKey::GitDiff => {}
+        }
+        cx.notify();
     }
 
     fn advance_drawer_pan(
@@ -12038,7 +12192,7 @@ impl MobileApp {
     /// exact place the finger just left.
     fn render_pairing(
         &self,
-        sheet_max_height: Pixels,
+        sheets: OverlaySheets,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -12167,14 +12321,19 @@ impl MobileApp {
                         ),
                 )
             })
-            .child(self.render_pairing_sheet(sheet_max_height, cx))
+            .when_some(sheets.pairing, |page, presentation| {
+                let frame = sheets.clone();
+                page.child(self.render_pairing_sheet(presentation, frame.pairing_scroll, cx))
+            })
             // Last, so a runtime's own surfaces sit above the page that opened
             // them: the rows here are the same runtime list, so the same
             // actions, rename and remove sheets belong to them.
             .when_some(
                 self.overlay
                     .filter(|overlay| overlay.is_available_from_pairing()),
-                |page, overlay| page.child(self.render_mobile_overlay(overlay, window, cx)),
+                |page, overlay| {
+                    page.child(self.render_mobile_overlay(overlay, sheets.clone(), window, cx))
+                },
             )
     }
 
@@ -12410,7 +12569,12 @@ impl MobileApp {
     /// finger brought up, and the keyboard lifts the sheet rather than
     /// reflowing the page under it. The scrim, the back gesture and the sheet's
     /// own header all dismiss it.
-    fn render_pairing_sheet(&self, max_height: Pixels, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_pairing_sheet(
+        &self,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let (header, body) = match self.pairing_panel {
             PairingPanel::None => return div().into_any_element(),
             PairingPanel::Nearby => {
@@ -12449,47 +12613,24 @@ impl MobileApp {
                 self.render_manual_pairing(cx),
             ),
         };
-        div()
-            .id("pairing-sheet-backdrop")
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.72))
-            .flex()
-            .flex_col()
-            .justify_end()
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.dismiss_pairing_panel(cx)),
+        let sheet = div().min_h_0().flex().flex_col().child(header).child(
+            div()
+                .id("pairing-sheet-body")
+                .flex_1()
+                .min_h_0()
+                .track_scroll(&body_scroll)
+                .overflow_y_scroll()
+                .restrict_scroll_to_axis()
+                .child(body),
+        );
+        bottom_sheet_shell("pairing-sheet", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::PairingFallback, cx)),
             )
-            .child(
-                div()
-                    .id("pairing-sheet")
-                    .debug_selector(|| "pairing-sheet".to_string())
-                    .w_full()
-                    .max_h(max_height)
-                    .flex()
-                    .flex_col()
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_card())
-                    .overflow_hidden()
-                    // The sheet owns its own taps: only the scrim around it
-                    // dismisses what it is showing.
-                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(header)
-                    .child(
-                        div()
-                            .id("pairing-sheet-body")
-                            .flex_1()
-                            .min_h_0()
-                            .track_scroll(&self.pairing_scroll)
-                            .overflow_y_scroll()
-                            .restrict_scroll_to_axis()
-                            .child(body),
-                    ),
-            )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::PairingFallback, event, window, cx)
+            }))
+            .content(sheet)
             .into_any_element()
     }
 
@@ -13009,7 +13150,12 @@ impl MobileApp {
             .into_any_element()
     }
 
-    fn render_connecting(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_connecting(
+        &self,
+        sheets: OverlaySheets,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .size_full()
             .relative()
@@ -13128,7 +13274,10 @@ impl MobileApp {
             .when_some(
                 self.overlay
                     .filter(|overlay| overlay.is_available_from_pairing()),
-                |root, overlay| root.child(self.render_mobile_overlay(overlay, window, cx)),
+                |page, overlay| {
+                    let frame = sheets.clone();
+                    page.child(self.render_mobile_overlay(overlay, frame, window, cx))
+                },
             )
     }
 
@@ -13173,12 +13322,78 @@ impl MobileApp {
                 .agent
                 .supports(BackendOperation::AgentCreateSession)
         });
+        // A sheet's own flag stays set while its panel is falling, so each gate
+        // asks the sheet where that panel is rather than only whether the page
+        // still wants it. The presentations are read here, before the element
+        // tree is built, because the state behind them is the page's.
+        let sheet_travel = bottom_sheet_max_height(window);
+        let batch_delete_sheet = self.sheet.presentation(
+            SheetKey::BatchDelete,
+            self.sidebar_batch_delete_confirmation,
+            sheet_travel,
+        );
+        let project_remove_sheet = self.sheet.presentation(
+            SheetKey::ProjectRemove,
+            self.project_remove_confirmation.is_some(),
+            sheet_travel,
+        );
+        let composer_attach_sheet = self.sheet.presentation(
+            SheetKey::ComposerAttach,
+            self.composer_attach_menu_open,
+            sheet_travel,
+        );
+        let composer_history_sheet = self.sheet.presentation(
+            SheetKey::ComposerHistory,
+            self.composer_history_open,
+            sheet_travel,
+        );
+        let composer_history_scroll = self.sheet.body_scroll(SheetKey::ComposerHistory);
+        let row_menu_sheet = self.sheet.presentation(
+            SheetKey::SidebarRowMenu,
+            self.sidebar_row_menu.is_some(),
+            sheet_travel,
+        );
+        let row_menu_scroll = self.sheet.body_scroll(SheetKey::SidebarRowMenu);
+        let root_menu_sheet = self.sheet.presentation(
+            SheetKey::SidebarRootMenu,
+            self.sidebar_root_menu,
+            sheet_travel,
+        );
+        let root_menu_scroll = self.sheet.body_scroll(SheetKey::SidebarRootMenu);
+        let folder_archive_sheet = self.sheet.presentation(
+            SheetKey::FolderArchiveMenu,
+            self.sidebar_folder_archive_menu.is_some(),
+            sheet_travel,
+        );
+        let folder_archive_scroll = self.sheet.body_scroll(SheetKey::FolderArchiveMenu);
+        let reschedule_sheet = self.sheet.presentation(
+            SheetKey::SidebarRescheduleMenu,
+            self.sidebar_reschedule_menu.is_some(),
+            sheet_travel,
+        );
+        let reschedule_scroll = self.sheet.body_scroll(SheetKey::SidebarRescheduleMenu);
+        let picker_sheet = self.sheet.presentation(
+            SheetKey::NewSessionPicker,
+            self.new_session_picker.is_some(),
+            sheet_travel,
+        );
+        let picker_scroll = self.sheet.body_scroll(SheetKey::NewSessionPicker);
+        let new_session_options_sheet = self.sheet.presentation(
+            SheetKey::NewSessionOptions,
+            self.new_session_options_open,
+            sheet_travel,
+        );
+        let options_scroll = self.sheet.body_scroll(SheetKey::NewSessionOptions);
+        let overlay_sheets = self.overlay_sheets(window);
 
         crate::scroll_capture::capture_scroll_wheel(
             "mobile-workspace-scroll",
             div()
                 .size_full()
                 .relative()
+                // The page paints its own surface so a drawer sliding over it
+                // cannot repaint the middle of the phone with its own tone.
+                .bg(conversation_surface())
                 .track_focus(&self.root_focus)
                 .on_action(cx.listener(Self::handle_navigate_back))
                 .child(
@@ -13353,22 +13568,45 @@ impl MobileApp {
                     };
                     root.child(backdrop).child(drawer)
                 })
-                .when_some(row_menu, |root, menu| {
-                    root.child(self.render_sidebar_row_menu(&menu, window, cx))
+                .when_some(row_menu, |root, menu| match row_menu_sheet {
+                    Some(presentation) => root.child(self.render_sidebar_row_menu(
+                        &menu,
+                        presentation,
+                        row_menu_scroll.clone(),
+                        cx,
+                    )),
+                    None => root,
                 })
-                .when(self.sidebar_root_menu, |root| {
-                    root.child(self.render_sidebar_root_menu(window, cx))
+                .when_some(root_menu_sheet, |root, presentation| {
+                    root.child(self.render_sidebar_root_menu(
+                        presentation,
+                        root_menu_scroll.clone(),
+                        cx,
+                    ))
                 })
                 .when_some(
                     self.sidebar_folder_archive_menu.clone(),
-                    |root, folder_id| {
-                        root.child(self.render_folder_archive_menu(&folder_id, window, cx))
+                    |root, folder_id| match folder_archive_sheet {
+                        Some(presentation) => root.child(self.render_folder_archive_menu(
+                            &folder_id,
+                            presentation,
+                            folder_archive_scroll.clone(),
+                            cx,
+                        )),
+                        None => root,
                     },
                 )
                 .when_some(
                     self.sidebar_reschedule_menu.clone(),
-                    |root, (session_id, message_id)| {
-                        root.child(self.render_reschedule_menu(&session_id, message_id, window, cx))
+                    |root, (session_id, message_id)| match reschedule_sheet {
+                        Some(presentation) => root.child(self.render_reschedule_menu(
+                            &session_id,
+                            message_id,
+                            presentation,
+                            reschedule_scroll.clone(),
+                            cx,
+                        )),
+                        None => root,
                     },
                 )
                 .when_some(name_prompt, |root, prompt| {
@@ -13380,35 +13618,56 @@ impl MobileApp {
                 .when_some(self.workspace_action.as_ref(), |root, prompt| {
                     root.child(self.render_workspace_action_prompt(prompt, cx))
                 })
-                .when(self.sidebar_batch_delete_confirmation, |root| {
-                    root.child(self.render_batch_delete_confirmation(cx))
+                .when_some(batch_delete_sheet, |root, presentation| {
+                    root.child(self.render_batch_delete_confirmation(presentation, cx))
                 })
                 // Ordering is z-order in GPUI. The runtime sheet is opened
                 // from the new-session page (which is itself an overlay), so it
                 // has to be painted after the overlay or it lands underneath
                 // the page that asked for it.
                 .when_some(overlay, |root, overlay| {
-                    root.child(self.render_mobile_overlay(overlay, window, cx))
+                    root.child(self.render_mobile_overlay(overlay, overlay_sheets, window, cx))
                 })
                 .when(self.runtime_options_open, |root| {
                     root.child(self.render_runtime_options_sheet(cx))
                 })
-                .when_some(self.new_session_picker, |root, _| {
-                    root.child(self.render_new_session_picker_sheet(cx))
+                .when(
+                    self.new_session_picker.is_some(),
+                    |root| match picker_sheet {
+                        Some(presentation) => root.child(self.render_new_session_picker_sheet(
+                            presentation,
+                            picker_scroll.clone(),
+                            cx,
+                        )),
+                        None => root,
+                    },
+                )
+                .when_some(new_session_options_sheet, |root, presentation| {
+                    root.child(self.render_new_session_options_sheet(
+                        presentation,
+                        options_scroll.clone(),
+                        cx,
+                    ))
                 })
-                .when(self.new_session_options_open, |root| {
-                    root.child(self.render_new_session_options_sheet(cx))
+                .when_some(composer_attach_sheet, |root, presentation| {
+                    root.child(self.render_composer_attach_sheet(presentation, cx))
                 })
-                .when(self.composer_attach_menu_open, |root| {
-                    root.child(self.render_composer_attach_sheet(cx))
-                })
-                .when(self.composer_history_open, |root| {
-                    root.child(self.render_composer_history_sheet(cx))
+                .when_some(composer_history_sheet, |root, presentation| {
+                    root.child(self.render_composer_history_sheet(
+                        presentation,
+                        composer_history_scroll,
+                        cx,
+                    ))
                 })
                 .when_some(
                     self.project_remove_confirmation.clone(),
-                    |root, project_id| {
-                        root.child(self.render_project_remove_confirmation(&project_id, cx))
+                    |root, project_id| match project_remove_sheet {
+                        Some(presentation) => root.child(self.render_project_remove_confirmation(
+                            &project_id,
+                            presentation,
+                            cx,
+                        )),
+                        None => root,
                     },
                 )
                 .when(self.timeline_file_diff.is_some(), |root| {
@@ -14057,7 +14316,8 @@ impl MobileApp {
     fn render_sidebar_row_menu(
         &self,
         menu: &SidebarRowMenu,
-        window: &Window,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let row = menu.row.clone();
@@ -14072,7 +14332,7 @@ impl MobileApp {
                     MouseButton::Left,
                     cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.sidebar_row_menu = None;
+                        this.close_sheet(SheetKey::SidebarRowMenu, cx);
                         action(this, window, cx);
                     }),
                 ),
@@ -14763,14 +15023,14 @@ impl MobileApp {
         }
 
         self.render_drawer_sheet(
-            row.label.as_str(),
-            "mobile-sidebar-row-menu",
-            Box::new(|this, _, cx| {
-                this.sidebar_row_menu = None;
-                cx.notify();
-            }),
+            DrawerSheet {
+                key: SheetKey::SidebarRowMenu,
+                id_prefix: "mobile-sidebar-row-menu",
+                title: row.label.as_str(),
+            },
+            presentation,
+            body_scroll,
             sheet,
-            window,
             cx,
         )
     }
@@ -14783,7 +15043,8 @@ impl MobileApp {
     /// label does, because the controls beside it own their own taps.
     fn render_sidebar_root_menu(
         &self,
-        window: &Window,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let sheet = div().p_2().flex().flex_col().gap(px(2.0)).child(
@@ -14797,7 +15058,7 @@ impl MobileApp {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
-                    this.sidebar_root_menu = false;
+                    this.close_sheet(SheetKey::SidebarRootMenu, cx);
                     this.open_folder_name_prompt(
                         SidebarNamePrompt::CreateFolder {
                             project_id: None,
@@ -14810,14 +15071,14 @@ impl MobileApp {
             ),
         );
         self.render_drawer_sheet(
-            locale::text("Sidebar", "侧栏", "側欄"),
-            "mobile-sidebar-root-menu",
-            Box::new(|this, _, cx| {
-                this.sidebar_root_menu = false;
-                cx.notify();
-            }),
+            DrawerSheet {
+                key: SheetKey::SidebarRootMenu,
+                id_prefix: "mobile-sidebar-root-menu",
+                title: locale::text("Sidebar", "侧栏", "側欄"),
+            },
+            presentation,
+            body_scroll,
             sheet,
-            window,
             cx,
         )
     }
@@ -14830,7 +15091,8 @@ impl MobileApp {
     fn render_folder_archive_menu(
         &self,
         folder_id: &str,
-        window: &Window,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let current = self
@@ -14857,7 +15119,7 @@ impl MobileApp {
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.sidebar_folder_archive_menu = None;
+                        this.close_sheet(SheetKey::FolderArchiveMenu, cx);
                         this.send_sidebar_mutation(
                             RemoteSidebarOrganizationMutation::SetFolderAutoArchive {
                                 folder_id: folder_id.clone(),
@@ -14871,14 +15133,14 @@ impl MobileApp {
             );
         }
         self.render_drawer_sheet(
-            locale::text("Scheduled archive", "定时归档", "定時封存"),
-            "mobile-folder-archive-menu",
-            Box::new(|this, _, cx| {
-                this.sidebar_folder_archive_menu = None;
-                cx.notify();
-            }),
+            DrawerSheet {
+                key: SheetKey::FolderArchiveMenu,
+                id_prefix: "mobile-folder-archive-menu",
+                title: locale::text("Scheduled archive", "定时归档", "定時封存"),
+            },
+            presentation,
+            body_scroll,
             sheet,
-            window,
             cx,
         )
     }
@@ -14894,7 +15156,8 @@ impl MobileApp {
         &self,
         session_id: &str,
         message_id: u64,
-        window: &Window,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let mut sheet = div().p_2().flex().flex_col().gap(px(2.0));
@@ -14911,7 +15174,7 @@ impl MobileApp {
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.sidebar_reschedule_menu = None;
+                        this.close_sheet(SheetKey::SidebarRescheduleMenu, cx);
                         this.send_sidebar_mutation(
                             RemoteSidebarOrganizationMutation::SetScheduledSend {
                                 session_id: session_id.clone(),
@@ -14926,14 +15189,14 @@ impl MobileApp {
             );
         }
         self.render_drawer_sheet(
-            &locale::text("Send later", "稍后发送", "稍後傳送").to_string(),
-            "mobile-reschedule-menu",
-            Box::new(|this, _, cx| {
-                this.sidebar_reschedule_menu = None;
-                cx.notify();
-            }),
+            DrawerSheet {
+                key: SheetKey::SidebarRescheduleMenu,
+                id_prefix: "mobile-reschedule-menu",
+                title: locale::text("Send later", "稍后发送", "稍後傳送"),
+            },
+            presentation,
+            body_scroll,
             sheet,
-            window,
             cx,
         )
     }
@@ -14941,72 +15204,48 @@ impl MobileApp {
     /// One bottom sheet over the drawer: the scrim, the panel rising from the
     /// foot of the screen, and the header naming what its entries belong to.
     ///
-    /// `close` is what the scrim and the header's own control do; a sheet's
-    /// entries own their taps, so only the scrim dismisses it.
+    /// Its entries own their taps, and its own key is what the scrim, the
+    /// header's control and the finger pulling it down all close.
     fn render_drawer_sheet(
         &self,
-        title: &str,
-        id_prefix: &str,
-        close: SheetAction,
+        drawer: DrawerSheet<'_>,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
         sheet: gpui::Div,
-        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        div()
-            .id(ElementId::from(id_prefix.to_string()))
-            .debug_selector({
-                let selector = id_prefix.to_string();
-                move || selector.clone()
-            })
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.72))
+        let DrawerSheet {
+            key,
+            id_prefix,
+            title,
+        } = drawer;
+        let sheet = div()
+            .min_h_0()
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _, window, cx| close(this, window, cx)),
-            )
+            .child(bottom_sheet_header(
+                title,
+                format!("{id_prefix}-close"),
+                None,
+                Box::new(move |this, _, cx| this.close_sheet(key, cx)),
+                cx,
+            ))
             .child(
                 div()
-                    .id(ElementId::from(format!("{id_prefix}-sheet")))
-                    .debug_selector({
-                        let selector = format!("{id_prefix}-sheet");
-                        move || selector.clone()
-                    })
-                    .w_full()
-                    .max_h(bottom_sheet_max_height(window))
-                    .flex()
-                    .flex_col()
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_card())
-                    .overflow_hidden()
-                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(bottom_sheet_header(
-                        title,
-                        format!("{id_prefix}-close"),
-                        None,
-                        Box::new(move |this, _, cx| {
-                            this.sidebar_row_menu = None;
-                            this.sidebar_root_menu = false;
-                            cx.notify();
-                        }),
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .id(ElementId::from(format!("{id_prefix}-body")))
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .restrict_scroll_to_axis()
-                            .child(sheet),
-                    ),
+                    .id(ElementId::from(format!("{id_prefix}-body")))
+                    .flex_1()
+                    .min_h_0()
+                    .track_scroll(&body_scroll)
+                    .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
+                    .child(sheet),
+            );
+        bottom_sheet_shell(format!("{id_prefix}-sheet"), presentation)
+            .on_dismiss(cx.listener(move |this, _, _, cx| this.tap_sheet_scrim(key, cx)))
+            .on_pan(
+                cx.listener(move |this, event, window, cx| this.pull_sheet(key, event, window, cx)),
             )
+            .content(sheet)
             .into_any_element()
     }
 
@@ -15123,7 +15362,11 @@ impl MobileApp {
 
     /// The batch-delete guard. It names the count and admits that the open
     /// session is included, because the selection can hold both.
-    fn render_batch_delete_confirmation(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_batch_delete_confirmation(
+        &self,
+        presentation: SheetPresentation,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let count = self.sidebar_state.selected_ids.len();
         let deletes_open_session = self
             .controller
@@ -15134,115 +15377,95 @@ impl MobileApp {
                     .selected_ids
                     .contains(session_id.as_str())
             });
-        div()
-            .id("mobile-batch-delete-confirmation")
-            .debug_selector(|| "mobile-batch-delete-confirmation".to_string())
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.62))
+        let body = div()
+            .min_h_0()
+            .p(px(theme::SPACING_LG))
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.sidebar_batch_delete_confirmation = false;
-                    cx.notify();
-                }),
+            .gap(px(theme::SPACING_SM))
+            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .text_size(theme::font_heading())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text_primary())
+                    .child(locale::text(
+                        "Delete the selected sessions?",
+                        "删除所选会话？",
+                        "刪除所選工作階段？",
+                    )),
             )
             .child(
                 div()
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .bg(theme::bg_popover())
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .p(px(theme::SPACING_LG))
-                    .flex()
-                    .flex_col()
-                    .gap(px(theme::SPACING_SM))
-                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .text_size(theme::font_caption())
+                    .text_color(theme::text_muted())
                     .child(
-                        div()
-                            .text_size(theme::font_heading())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_primary())
-                            .child(locale::text(
-                                "Delete the selected sessions?",
-                                "删除所选会话？",
-                                "刪除所選工作階段？",
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme::font_caption())
-                            .text_color(theme::text_muted())
-                            .child(
-                                locale::text("{} sessions", "{} 个会话", "{} 個工作階段")
-                                    .replace("{}", &count.to_string()),
-                            ),
-                    )
-                    .when(deletes_open_session, |sheet| {
-                        sheet.child(
-                            div()
-                                .text_size(theme::font_caption())
-                                .text_color(theme::accent_yellow())
-                                .child(locale::text(
-                                    "This includes the session you are reading.",
-                                    "其中包含你正在阅读的会话。",
-                                    "其中包含你正在閱讀的工作階段。",
-                                )),
-                        )
-                    })
-                    .child(
-                        div()
-                            .mt(px(theme::SPACING_SM))
-                            .flex()
-                            .gap(px(theme::SPACING_SM))
-                            .child(
-                                div()
-                                    .id("batch-delete-cancel")
-                                    .flex_1()
-                                    .h(px(theme::TOUCH_TARGET))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .border_1()
-                                    .border_color(theme::border_default())
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(theme::font_body())
-                                    .text_color(theme::text_secondary())
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::cancel_batch_delete),
-                                    )
-                                    .child(locale::common("Cancel")),
-                            )
-                            .child(
-                                div()
-                                    .id("batch-delete-confirm")
-                                    .flex_1()
-                                    .h(px(theme::TOUCH_TARGET))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .bg(theme::accent_red())
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(theme::font_body())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::bg_primary())
-                                    .cursor_pointer()
-                                    .active(|style| style.opacity(0.8))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::confirm_batch_delete),
-                                    )
-                                    .child(locale::common("Delete")),
-                            ),
+                        locale::text("{} sessions", "{} 个会话", "{} 個工作階段")
+                            .replace("{}", &count.to_string()),
                     ),
             )
+            .when(deletes_open_session, |sheet| {
+                sheet.child(
+                    div()
+                        .text_size(theme::font_caption())
+                        .text_color(theme::accent_yellow())
+                        .child(locale::text(
+                            "This includes the session you are reading.",
+                            "其中包含你正在阅读的会话。",
+                            "其中包含你正在閱讀的工作階段。",
+                        )),
+                )
+            })
+            .child(
+                div()
+                    .mt(px(theme::SPACING_SM))
+                    .flex()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        div()
+                            .id("batch-delete-cancel")
+                            .flex_1()
+                            .h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(theme::font_body())
+                            .text_color(theme::text_secondary())
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_batch_delete))
+                            .child(locale::common("Cancel")),
+                    )
+                    .child(
+                        div()
+                            .id("batch-delete-confirm")
+                            .flex_1()
+                            .h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::accent_red())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(theme::font_body())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::bg_primary())
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.8))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::confirm_batch_delete))
+                            .child(locale::common("Delete")),
+                    ),
+            );
+        bottom_sheet_shell("mobile-batch-delete-confirmation", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::BatchDelete, cx)),
+            )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::BatchDelete, event, window, cx)
+            }))
+            .content(body)
             .into_any_element()
     }
 
@@ -15250,76 +15473,198 @@ impl MobileApp {
     fn render_worktree_path_browser(
         &self,
         browser: &MobileDirectoryBrowser,
+        presentation: SheetPresentation,
+        body: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let parent = browser.parent.clone();
         let current = browser.path.clone();
         let roots = browser.roots.clone();
-        div()
-            .id("mobile-worktree-path-browser")
-            .debug_selector(|| "mobile-worktree-path-browser".to_string())
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.45))
+        let sheet = div()
+            .min_h_0()
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.close_worktree_path_browser(cx)),
-            )
             .child(
                 div()
-                    .w_full()
-                    .max_h(gpui::relative(0.75))
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_card())
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
                     .flex()
-                    .flex_col()
-                    .overflow_hidden()
+                    .items_center()
+                    .gap_2()
                     .child(
                         div()
+                            .id("worktree-path-up")
+                            .size(px(theme::TOUCH_TARGET))
                             .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .when_some(parent.clone(), |button, up| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.load_worktree_directory(Some(up.clone()), cx)
+                                        }),
+                                    )
+                            })
+                            .when(parent.is_none(), |button| button.opacity(0.4))
+                            .child(
+                                svg()
+                                    .path("icons/chevron-left.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .font_family("IBM Plex Mono")
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_secondary())
+                            .child(if current.is_empty() {
+                                locale::common("Loading").to_string()
+                            } else {
+                                current.clone()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("worktree-path-choose")
+                            .flex_shrink_0()
+                            .h(px(32.0))
                             .px_3()
-                            .py_2()
-                            .border_b_1()
-                            .border_color(theme::border_subtle())
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::primary())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(theme::font_caption())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::primary_foreground())
+                            .when(!current.is_empty(), |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.opacity(0.85))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::choose_worktree_directory),
+                                    )
+                            })
+                            .when(current.is_empty(), |button| button.opacity(0.5))
+                            .child(locale::common("Use this folder")),
+                    ),
+            )
+            .when(!roots.is_empty(), |sheet| {
+                sheet.child(
+                    div()
+                        .id("worktree-path-roots")
+                        .flex_shrink_0()
+                        .px_2()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(theme::border_subtle())
+                        .overflow_x_scroll()
+                        .restrict_scroll_to_axis()
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::SPACING_XS))
+                        .children(roots.into_iter().map(|root| {
+                            let label = root.clone();
+                            let target = root.clone();
+                            div()
+                                .id(format!("worktree-path-root:{root}"))
+                                .flex_shrink_0()
+                                .h(px(28.0))
+                                .px_2()
+                                .rounded(px(theme::RADIUS_PILL))
+                                .border_1()
+                                .border_color(theme::border_default())
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .text_size(theme::font_micro())
+                                .text_color(theme::text_secondary())
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.load_worktree_directory(Some(target.clone()), cx)
+                                    }),
+                                )
+                                .child(label)
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .id("worktree-path-list")
+                    .flex_1()
+                    .min_h_0()
+                    .track_scroll(&body)
+                    .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
+                    .flex()
+                    .flex_col()
+                    .p_2()
+                    .when(browser.loading, |list| {
+                        list.child(
+                            div()
+                                .p_3()
+                                .text_size(theme::font_body())
+                                .text_color(theme::text_muted())
+                                .child(locale::common("Loading")),
+                        )
+                    })
+                    .when(!browser.loading && browser.entries.is_empty(), |list| {
+                        list.child(
+                            div()
+                                .p_3()
+                                .text_size(theme::font_body())
+                                .text_color(theme::text_muted())
+                                .child(locale::text(
+                                    "No folders here",
+                                    "这里没有子目录",
+                                    "這裡沒有子目錄",
+                                )),
+                        )
+                    })
+                    .children(browser.entries.iter().map(|(name, path)| {
+                        let label = name.clone();
+                        let target = path.clone();
+                        div()
+                            .id(format!("worktree-path-entry:{path}"))
+                            .w_full()
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .px_3()
+                            .rounded(px(theme::RADIUS_CONTROL))
                             .flex()
                             .items_center()
                             .gap_2()
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.load_worktree_directory(Some(target.clone()), cx)
+                                }),
+                            )
                             .child(
-                                div()
-                                    .id("worktree-path-up")
-                                    .size(px(theme::TOUCH_TARGET))
+                                svg()
+                                    .path("icons/folder.svg")
+                                    .size(px(theme::ICON_SM))
                                     .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .when_some(parent.clone(), |button, up| {
-                                        button
-                                            .cursor_pointer()
-                                            .active(|style| style.bg(theme::row_pressed_bg()))
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.load_worktree_directory(
-                                                        Some(up.clone()),
-                                                        cx,
-                                                    )
-                                                }),
-                                            )
-                                    })
-                                    .when(parent.is_none(), |button| button.opacity(0.4))
-                                    .child(
-                                        svg()
-                                            .path("icons/chevron-left.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_secondary()),
-                                    ),
+                                    .text_color(theme::accent_blue()),
                             )
                             .child(
                                 div()
@@ -15328,158 +15673,20 @@ impl MobileApp {
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .whitespace_nowrap()
-                                    .font_family("IBM Plex Mono")
-                                    .text_size(theme::font_micro())
-                                    .text_color(theme::text_secondary())
-                                    .child(if current.is_empty() {
-                                        locale::common("Loading").to_string()
-                                    } else {
-                                        current.clone()
-                                    }),
+                                    .text_size(theme::font_body())
+                                    .text_color(theme::text_primary())
+                                    .child(label),
                             )
-                            .child(
-                                div()
-                                    .id("worktree-path-choose")
-                                    .flex_shrink_0()
-                                    .h(px(32.0))
-                                    .px_3()
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .bg(theme::primary())
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(theme::font_caption())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::primary_foreground())
-                                    .when(!current.is_empty(), |button| {
-                                        button
-                                            .cursor_pointer()
-                                            .active(|style| style.opacity(0.85))
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::choose_worktree_directory),
-                                            )
-                                    })
-                                    .when(current.is_empty(), |button| button.opacity(0.5))
-                                    .child(locale::common("Use this folder")),
-                            ),
-                    )
-                    .when(!roots.is_empty(), |sheet| {
-                        sheet.child(
-                            div()
-                                .id("worktree-path-roots")
-                                .flex_shrink_0()
-                                .px_2()
-                                .py_1()
-                                .border_b_1()
-                                .border_color(theme::border_subtle())
-                                .overflow_x_scroll()
-                                .restrict_scroll_to_axis()
-                                .flex()
-                                .items_center()
-                                .gap(px(theme::SPACING_XS))
-                                .children(roots.into_iter().map(|root| {
-                                    let label = root.clone();
-                                    let target = root.clone();
-                                    div()
-                                        .id(format!("worktree-path-root:{root}"))
-                                        .flex_shrink_0()
-                                        .h(px(28.0))
-                                        .px_2()
-                                        .rounded(px(theme::RADIUS_PILL))
-                                        .border_1()
-                                        .border_color(theme::border_default())
-                                        .flex()
-                                        .items_center()
-                                        .cursor_pointer()
-                                        .active(|style| style.bg(theme::row_pressed_bg()))
-                                        .text_size(theme::font_micro())
-                                        .text_color(theme::text_secondary())
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.load_worktree_directory(
-                                                    Some(target.clone()),
-                                                    cx,
-                                                )
-                                            }),
-                                        )
-                                        .child(label)
-                                })),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id("worktree-path-list")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .p_2()
-                            .when(browser.loading, |list| {
-                                list.child(
-                                    div()
-                                        .p_3()
-                                        .text_size(theme::font_body())
-                                        .text_color(theme::text_muted())
-                                        .child(locale::common("Loading")),
-                                )
-                            })
-                            .when(!browser.loading && browser.entries.is_empty(), |list| {
-                                list.child(
-                                    div()
-                                        .p_3()
-                                        .text_size(theme::font_body())
-                                        .text_color(theme::text_muted())
-                                        .child(locale::text(
-                                            "No folders here",
-                                            "这里没有子目录",
-                                            "這裡沒有子目錄",
-                                        )),
-                                )
-                            })
-                            .children(browser.entries.iter().map(|(name, path)| {
-                                let label = name.clone();
-                                let target = path.clone();
-                                div()
-                                    .id(format!("worktree-path-entry:{path}"))
-                                    .w_full()
-                                    .min_h(px(theme::TOUCH_TARGET))
-                                    .px_3()
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.load_worktree_directory(Some(target.clone()), cx)
-                                        }),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path("icons/folder.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .flex_shrink_0()
-                                            .text_color(theme::accent_blue()),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .text_size(theme::font_body())
-                                            .text_color(theme::text_primary())
-                                            .child(label),
-                                    )
-                            })),
-                    ),
+                    })),
+            );
+        bottom_sheet_shell("mobile-worktree-path-browser", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::WorktreePaths, cx)),
             )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::WorktreePaths, event, window, cx)
+            }))
+            .content(sheet)
             .into_any_element()
     }
 
@@ -15521,6 +15728,8 @@ impl MobileApp {
     fn render_group_members_sheet(
         &self,
         editor: &MobileGroupMembersEditor,
+        presentation: SheetPresentation,
+        body: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let rows = self
@@ -15579,145 +15788,127 @@ impl MobileApp {
             })
             .collect::<Vec<_>>();
         let empty = rows.is_empty();
-        div()
-            .id("mobile-group-members")
-            .debug_selector(|| "mobile-group-members".to_string())
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.45))
+        let sheet = div()
+            .min_h_0()
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.group_members_editor = None;
-                    cx.notify();
-                }),
-            )
             .child(
                 div()
-                    .w_full()
-                    .max_h(gpui::relative(0.7))
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_card())
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
                     .flex()
-                    .flex_col()
-                    .overflow_hidden()
+                    .items_center()
+                    .justify_between()
                     .child(
                         div()
-                            .flex_shrink_0()
-                            .px_3()
-                            .py_2()
-                            .border_b_1()
-                            .border_color(theme::border_subtle())
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(theme::font_title())
-                                    .text_color(theme::text_primary())
-                                    .child(locale::text("Group members", "分组成员", "群組成員")),
-                            )
-                            .child(
-                                div()
-                                    .id("group-members-close")
-                                    .size(px(theme::TOUCH_TARGET))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.group_members_editor = None;
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path("icons/x.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_secondary()),
-                                    ),
-                            ),
+                            .text_size(theme::font_title())
+                            .text_color(theme::text_primary())
+                            .child(locale::text("Group members", "分组成员", "群組成員")),
                     )
                     .child(
                         div()
-                            .id("group-members-list")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .p_2()
-                            .when(empty, |list| {
-                                list.child(
-                                    div()
-                                        .p_3()
-                                        .text_size(theme::font_body())
-                                        .text_color(theme::text_muted())
-                                        .child(locale::text(
-                                            "No sessions in this worktree",
-                                            "该 Worktree 下没有会话",
-                                            "該 Worktree 下沒有工作階段",
-                                        )),
-                                )
-                            })
-                            .children(rows),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .border_t_1()
-                            .border_color(theme::border_subtle())
-                            .p_2()
+                            .id("group-members-close")
+                            .size(px(theme::TOUCH_TARGET))
                             .flex()
                             .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_size(theme::font_micro())
-                                    .text_color(theme::text_muted())
-                                    .child(locale::text(
-                                        "Unticking every session dissolves the group.",
-                                        "取消全部选择将解散该分组。",
-                                        "取消全部選擇將解散該群組。",
-                                    )),
+                            .justify_center()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.close_sheet(SheetKey::GroupMembers, cx)
+                                }),
                             )
                             .child(
-                                div()
-                                    .id("group-members-save")
-                                    .flex_shrink_0()
-                                    .h(px(theme::TOUCH_TARGET))
-                                    .px(px(theme::SPACING_LG))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .bg(theme::primary())
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(theme::font_caption())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::primary_foreground())
-                                    .cursor_pointer()
-                                    .active(|style| style.opacity(0.85))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.confirm_group_members(cx)
-                                        }),
-                                    )
-                                    .child(locale::common("Save")),
+                                svg()
+                                    .path("icons/x.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
                             ),
                     ),
             )
+            .child(
+                div()
+                    .id("group-members-list")
+                    .flex_1()
+                    .min_h_0()
+                    .track_scroll(&body)
+                    .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
+                    .flex()
+                    .flex_col()
+                    .p_2()
+                    .when(empty, |list| {
+                        list.child(
+                            div()
+                                .p_3()
+                                .text_size(theme::font_body())
+                                .text_color(theme::text_muted())
+                                .child(locale::text(
+                                    "No sessions in this worktree",
+                                    "该 Worktree 下没有会话",
+                                    "該 Worktree 下沒有工作階段",
+                                )),
+                        )
+                    })
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(theme::border_subtle())
+                    .p_2()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_muted())
+                            .child(locale::text(
+                                "Unticking every session dissolves the group.",
+                                "取消全部选择将解散该分组。",
+                                "取消全部選擇將解散該群組。",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("group-members-save")
+                            .flex_shrink_0()
+                            .h(px(theme::TOUCH_TARGET))
+                            .px(px(theme::SPACING_LG))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::primary())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(theme::font_caption())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::primary_foreground())
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.85))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.confirm_group_members(cx)),
+                            )
+                            .child(locale::common("Save")),
+                    ),
+            );
+        bottom_sheet_shell("mobile-group-members", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::GroupMembers, cx)),
+            )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::GroupMembers, event, window, cx)
+            }))
+            .content(sheet)
             .into_any_element()
     }
 
@@ -15725,6 +15916,7 @@ impl MobileApp {
     fn render_project_remove_confirmation(
         &self,
         project_id: &str,
+        presentation: SheetPresentation,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let label = self
@@ -15739,118 +15931,102 @@ impl MobileApp {
             .filter(|session| session.project_id.as_str() == project_id)
             .count();
         let target = project_id.to_string();
-        div()
-            .id("mobile-project-remove-confirmation")
-            .debug_selector(|| "mobile-project-remove-confirmation".to_string())
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.62))
+        let body = div()
+            .min_h_0()
+            .p(px(theme::SPACING_LG))
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.project_remove_confirmation = None;
-                    cx.notify();
-                }),
+            .gap(px(theme::SPACING_SM))
+            .child(
+                div()
+                    .text_size(theme::font_heading())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text_primary())
+                    .child(locale::text(
+                        "Remove this project?",
+                        "移除该项目？",
+                        "移除該專案？",
+                    )),
             )
             .child(
                 div()
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .bg(theme::bg_popover())
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .p(px(theme::SPACING_LG))
-                    .flex()
-                    .flex_col()
-                    .gap(px(theme::SPACING_SM))
-                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .text_size(theme::font_body())
+                    .text_color(theme::text_secondary())
+                    .child(label),
+            )
+            .child(
+                div()
+                    .text_size(theme::font_caption())
+                    .text_color(theme::text_muted())
                     .child(
-                        div()
-                            .text_size(theme::font_heading())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_primary())
-                            .child(locale::text(
-                                "Remove this project?",
-                                "移除该项目？",
-                                "移除該專案？",
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme::font_body())
-                            .text_color(theme::text_secondary())
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme::font_caption())
-                            .text_color(theme::text_muted())
-                            .child(
-                                locale::text(
-                                    "{} sessions leave the workbench with it. Nothing on disk is deleted.",
-                                    "{} 个会话会一并移出工作台，磁盘上的文件不会被删除。",
-                                    "{} 個工作階段會一併移出工作台，磁碟上的檔案不會被刪除。",
-                                )
-                                .replace("{}", &sessions.to_string()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt(px(theme::SPACING_SM))
-                            .flex()
-                            .gap(px(theme::SPACING_SM))
-                            .child(
-                                div()
-                                    .id("project-remove-cancel")
-                                    .flex_1()
-                                    .h(px(theme::TOUCH_TARGET))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .border_1()
-                                    .border_color(theme::border_default())
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(theme::font_body())
-                                    .text_color(theme::text_secondary())
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.project_remove_confirmation = None;
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(locale::common("Cancel")),
-                            )
-                            .child(
-                                div()
-                                    .id("project-remove-confirm")
-                                    .flex_1()
-                                    .h(px(theme::TOUCH_TARGET))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .bg(theme::accent_red())
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(theme::font_body())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::bg_primary())
-                                    .cursor_pointer()
-                                    .active(|style| style.opacity(0.8))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.remove_project(target.clone(), cx)
-                                        }),
-                                    )
-                                    .child(locale::common("Remove")),
-                            ),
+                        locale::text(
+                            "{} sessions leave the workbench with it. Nothing on disk is deleted.",
+                            "{} 个会话会一并移出工作台，磁盘上的文件不会被删除。",
+                            "{} 個工作階段會一併移出工作台，磁碟上的檔案不會被刪除。",
+                        )
+                        .replace("{}", &sessions.to_string()),
                     ),
             )
+            .child(
+                div()
+                    .mt(px(theme::SPACING_SM))
+                    .flex()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        div()
+                            .id("project-remove-cancel")
+                            .flex_1()
+                            .h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(theme::font_body())
+                            .text_color(theme::text_secondary())
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.close_sheet(SheetKey::ProjectRemove, cx)
+                                }),
+                            )
+                            .child(locale::common("Cancel")),
+                    )
+                    .child(
+                        div()
+                            .id("project-remove-confirm")
+                            .flex_1()
+                            .h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::accent_red())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(theme::font_body())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::bg_primary())
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.8))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.remove_project(target.clone(), cx)
+                                }),
+                            )
+                            .child(locale::common("Remove")),
+                    ),
+            );
+        bottom_sheet_shell("mobile-project-remove-confirmation", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::ProjectRemove, cx)),
+            )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::ProjectRemove, event, window, cx)
+            }))
+            .content(body)
             .into_any_element()
     }
 
@@ -20970,8 +21146,7 @@ impl MobileApp {
 
     fn close_goal_objective(&mut self, cx: &mut Context<Self>) {
         if self.goal_objective_open {
-            self.goal_objective_open = false;
-            cx.notify();
+            self.close_sheet(SheetKey::GoalObjective, cx);
         }
     }
 
@@ -20994,97 +21169,85 @@ impl MobileApp {
     }
 
     /// The objective editor: one field, and the control it will issue.
-    fn render_goal_objective_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        div()
-            .id("mobile-goal-objective")
-            .debug_selector(|| "mobile-goal-objective".to_string())
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.45))
+    fn render_goal_objective_sheet(
+        &self,
+        presentation: SheetPresentation,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let body = div()
+            .min_h_0()
+            .p_3()
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.close_goal_objective(cx)),
+            .gap_2()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .text_size(theme::font_title())
+                    .text_color(theme::text_primary())
+                    .child(locale::text("Objective", "目标", "目標")),
             )
             .child(
                 div()
-                    .w_full()
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .border_t_1()
+                    .min_h(px(theme::TOUCH_TARGET))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
                     .border_color(theme::border_default())
-                    .bg(theme::bg_card())
-                    .p_3()
+                    .bg(theme::bg_primary())
+                    .px_2()
+                    .py_1()
                     .flex()
-                    .flex_col()
-                    .gap_2()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .text_size(theme::font_title())
-                            .text_color(theme::text_primary())
-                            .child(locale::text("Objective", "目标", "目標")),
-                    )
-                    .child(
-                        div()
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_default())
-                            .bg(theme::bg_primary())
-                            .px_2()
-                            .py_1()
-                            .flex()
-                            .items_center()
-                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
-                            .child(
-                                Textarea::new(&self.goal_objective_input).appearance(false),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_size(theme::font_micro())
-                                    .text_color(theme::text_muted())
-                                    .child(locale::text(
-                                        "The Agent keeps working toward this until it is done or cleared.",
-                                        "Agent 会持续朝这个目标工作，直到完成或被清除。",
-                                        "Agent 會持續朝這個目標工作，直到完成或被清除。",
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .id("goal-objective-save")
-                                    .flex_shrink_0()
-                                    .h(px(theme::TOUCH_TARGET))
-                                    .px(px(theme::SPACING_LG))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .bg(theme::primary())
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .active(|style| style.opacity(0.85))
-                                    .text_size(theme::font_caption())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::primary_foreground())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.confirm_goal_objective(cx)
-                                        }),
-                                    )
-                                    .child(locale::common("Save")),
-                            ),
-                    ),
+                    .items_center()
+                    .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
+                    .child(Textarea::new(&self.goal_objective_input).appearance(false)),
             )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_muted())
+                            .child(locale::text(
+                                "The Agent keeps working toward this until it is done or cleared.",
+                                "Agent 会持续朝这个目标工作，直到完成或被清除。",
+                                "Agent 會持續朝這個目標工作，直到完成或被清除。",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("goal-objective-save")
+                            .flex_shrink_0()
+                            .h(px(theme::TOUCH_TARGET))
+                            .px(px(theme::SPACING_LG))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::primary())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.85))
+                            .text_size(theme::font_caption())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::primary_foreground())
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.confirm_goal_objective(cx)),
+                            )
+                            .child(locale::common("Save")),
+                    ),
+            );
+        bottom_sheet_shell("mobile-goal-objective", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::GoalObjective, cx)),
+            )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::GoalObjective, event, window, cx)
+            }))
+            .content(body)
             .into_any_element()
     }
 
@@ -22572,9 +22735,11 @@ impl MobileApp {
         // A delegated row hangs off the row above it on the desktop's guide:
         // the branch is drawn, not padded, so the parent's Agent logo reads as
         // the point the line leaves from.
-        let branch_columns = delegated_child
-            .then(|| self.delegated_guide_columns(session_id.as_str()))
-            .unwrap_or_default();
+        let branch_columns = if delegated_child {
+            self.delegated_guide_columns(session_id.as_str())
+        } else {
+            Default::default()
+        };
         // A session that owns others offers them here rather than at its leading
         // edge: that edge belongs to the Agent logo, which is the column the
         // branch above hangs from. The desktop reveals the toggle on hover and
@@ -24075,35 +24240,28 @@ impl MobileApp {
             .cloned()
     }
 
-    fn render_host_actions_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_host_actions_sheet(
+        &self,
+        presentation: SheetPresentation,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let Some(host) = self.host_overlay_entry() else {
             return div().into_any_element();
         };
         let active = self.active_host_id.as_deref() == Some(host.id.as_str());
         let status = self.host_status(&host.id);
         let switch_id = host.id.clone();
-        let mut sheet = div()
-            .w_full()
-            .debug_selector(|| "mobile-runtime-actions-sheet".to_string())
-            .rounded_t(px(theme::RADIUS_CARD))
-            .border_t_1()
-            .border_color(theme::border_default())
-            .bg(theme::bg_card())
-            .p_2()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_size(theme::font_caption())
-                    .text_color(theme::text_muted())
-                    .child(host.display_label()),
-            );
+        let mut sheet = div().min_h_0().p_2().flex().flex_col().gap(px(2.0)).child(
+            div()
+                .px_3()
+                .py_2()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_size(theme::font_caption())
+                .text_color(theme::text_muted())
+                .child(host.display_label()),
+        );
         if active {
             sheet = sheet
                 .child(
@@ -24174,21 +24332,14 @@ impl MobileApp {
                         }),
                     ),
             );
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.72))
-            .flex()
-            .flex_col()
-            .justify_end()
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.dismiss_overlay(None, cx);
-                }),
+        bottom_sheet_shell("mobile-runtime-actions-sheet", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::HostActions, cx)),
             )
-            .child(sheet)
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::HostActions, event, window, cx)
+            }))
+            .content(sheet)
             .into_any_element()
     }
 
@@ -24599,14 +24750,11 @@ impl Render for MobileApp {
         } else {
             self.mode
         };
-        let root_background = match (
+        let overlay_sheets = self.overlay_sheets(window);
+        let root_background = root_surface(
             visible_mode,
             visible_drawer_page(self.drawer_offset, self.drawer_snap),
-        ) {
-            (RootMode::Pairing, _) => theme::bg_primary(),
-            (_, Some(DrawerPage::Sessions) | Some(DrawerPage::Workbench)) => theme::sidebar_bg(),
-            _ => theme::bg_primary(),
-        };
+        );
         // The page under the phone's finger sees a touch pan before the lists
         // inside it consume the gesture, so a rightward swipe can leave a page
         // opened on top of another one. The wrapper forwards layout, so the page
@@ -24624,9 +24772,11 @@ impl Render for MobileApp {
                 .pl(insets.left)
                 .child(match visible_mode {
                     RootMode::Pairing => self
-                        .render_pairing(bottom_sheet_max_height(window), window, cx)
+                        .render_pairing(overlay_sheets, window, cx)
                         .into_any_element(),
-                    RootMode::Connecting => self.render_connecting(window, cx).into_any_element(),
+                    RootMode::Connecting => self
+                        .render_connecting(overlay_sheets.clone(), window, cx)
+                        .into_any_element(),
                     RootMode::Workspace => self
                         .render_workspace(page_width, window, cx)
                         .into_any_element(),
@@ -25294,9 +25444,9 @@ impl MobileApp {
     }
 
     fn dismiss_new_session_picker(&mut self, cx: &mut Context<Self>) {
-        if self.new_session_picker.take().is_some() {
+        if self.new_session_picker.is_some() {
             crate::platform::hide_keyboard();
-            cx.notify();
+            self.close_sheet(SheetKey::NewSessionPicker, cx);
         }
     }
 
@@ -25332,7 +25482,12 @@ impl MobileApp {
     /// A sheet rather than the desktop's up/down keys: a phone has no arrow
     /// keys while the keyboard is up, and a list lets the reader recognise the
     /// sentence they want instead of paging back to it one prompt at a time.
-    fn render_composer_history_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_composer_history_sheet(
+        &self,
+        presentation: SheetPresentation,
+        body: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let history = self.composer_history();
         let total = history.len();
         let shown = self.composer_history_limit.min(total);
@@ -25371,123 +25526,106 @@ impl MobileApp {
                     )
             })
             .collect::<Vec<_>>();
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.45))
+        let sheet = div()
+            .min_h_0()
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.close_composer_history(cx)),
-            )
             .child(
                 div()
-                    .debug_selector(|| "mobile-composer-history-sheet".to_string())
-                    .w_full()
-                    .max_h(gpui::relative(0.7))
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_card())
+                    .flex_shrink_0()
+                    .px(px(theme::SPACING_MD))
+                    .py(px(theme::SPACING_SM))
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
                     .flex()
-                    .flex_col()
-                    .overflow_hidden()
+                    .items_center()
+                    .justify_between()
                     .child(
                         div()
-                            .flex_shrink_0()
-                            .px(px(theme::SPACING_MD))
-                            .py(px(theme::SPACING_SM))
-                            .border_b_1()
-                            .border_color(theme::border_subtle())
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(theme::font_title())
-                                    .text_color(theme::text_primary())
-                                    .child(locale::text(
-                                        "Earlier messages",
-                                        "历史消息",
-                                        "歷史訊息",
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .id("composer-history-close")
-                                    .aria_label(locale::common("Close"))
-                                    .size(px(theme::TOUCH_TARGET))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.close_composer_history(cx)
-                                        }),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path("icons/x.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_secondary()),
-                                    ),
-                            ),
+                            .text_size(theme::font_title())
+                            .text_color(theme::text_primary())
+                            .child(locale::text("Earlier messages", "历史消息", "歷史訊息")),
                     )
                     .child(
                         div()
-                            .id("composer-history-list")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
+                            .id("composer-history-close")
+                            .aria_label(locale::common("Close"))
+                            .size(px(theme::TOUCH_TARGET))
                             .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .p(px(theme::SPACING_SM))
-                            .when(rows.is_empty(), |list| {
-                                list.child(
-                                    div()
-                                        .p(px(theme::SPACING_MD))
-                                        .text_size(theme::font_body())
-                                        .text_color(theme::text_muted())
-                                        .child(locale::text(
-                                            "Nothing has been sent in this session yet.",
-                                            "这个会话还没有发送过消息。",
-                                            "這個工作階段還沒有傳送過訊息。",
-                                        )),
-                                )
-                            })
-                            .children(rows)
-                            .when(shown < total, |list| {
-                                list.child(
-                                    div()
-                                        .id("composer-history-older")
-                                        .w_full()
-                                        .py(px(theme::SPACING_SM))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .cursor_pointer()
-                                        .active(|style| style.bg(theme::row_pressed_bg()))
-                                        .text_size(theme::font_body())
-                                        .text_color(theme::primary())
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.show_older_composer_history(cx)
-                                            }),
-                                        )
-                                        .child(locale::text("Show older", "显示更早", "顯示更早")),
-                                )
-                            }),
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.close_composer_history(cx)),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/x.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            ),
                     ),
             )
+            .child(
+                div()
+                    .id("composer-history-list")
+                    .flex_1()
+                    .min_h_0()
+                    .track_scroll(&body)
+                    .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .p(px(theme::SPACING_SM))
+                    .when(rows.is_empty(), |list| {
+                        list.child(
+                            div()
+                                .p(px(theme::SPACING_MD))
+                                .text_size(theme::font_body())
+                                .text_color(theme::text_muted())
+                                .child(locale::text(
+                                    "Nothing has been sent in this session yet.",
+                                    "这个会话还没有发送过消息。",
+                                    "這個工作階段還沒有傳送過訊息。",
+                                )),
+                        )
+                    })
+                    .children(rows)
+                    .when(shown < total, |list| {
+                        list.child(
+                            div()
+                                .id("composer-history-older")
+                                .w_full()
+                                .py(px(theme::SPACING_SM))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .text_size(theme::font_body())
+                                .text_color(theme::primary())
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.show_older_composer_history(cx)
+                                    }),
+                                )
+                                .child(locale::text("Show older", "显示更早", "顯示更早")),
+                        )
+                    }),
+            );
+        bottom_sheet_shell("mobile-composer-history-sheet", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::ComposerHistory, cx)),
+            )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::ComposerHistory, event, window, cx)
+            }))
+            .content(sheet)
             .into_any_element()
     }
 
@@ -25633,7 +25771,11 @@ impl MobileApp {
     }
 
     /// The composer's attach menu: one image, or any other file.
-    fn render_composer_attach_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_composer_attach_sheet(
+        &self,
+        presentation: SheetPresentation,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let entries = [
             (
                 "attach-photo",
@@ -25665,142 +25807,112 @@ impl MobileApp {
                 crate::attachment::AttachmentKind::File,
             ),
         ];
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.45))
+        let sheet = div()
+            .min_h_0()
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.close_composer_attach_menu(cx)),
-            )
             .child(
                 div()
-                    .debug_selector(|| "mobile-composer-attach-menu".to_string())
-                    .w_full()
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_card())
+                    .flex_shrink_0()
+                    .h(px(theme::TOUCH_TARGET))
+                    .pl(px(theme::SPACING_LG))
+                    .pr(px(theme::SPACING_SM))
                     .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .items_center()
                     .child(
                         div()
-                            .flex_shrink_0()
-                            .w_full()
-                            .pt(px(theme::SPACING_SM))
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(theme::font_heading())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(locale::text("Attach", "添加附件", "新增附件")),
+                    )
+                    .child(
+                        div()
+                            .id("composer-attach-close")
+                            .size(px(theme::TOUCH_TARGET))
                             .flex()
+                            .items_center()
                             .justify_center()
-                            .child(
-                                div()
-                                    .w(px(36.0))
-                                    .h(px(4.0))
-                                    .rounded_full()
-                                    .bg(theme::border_default()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .h(px(theme::TOUCH_TARGET))
-                            .pl(px(theme::SPACING_LG))
-                            .pr(px(theme::SPACING_SM))
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_size(theme::font_heading())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::text_primary())
-                                    .child(locale::text("Attach", "添加附件", "新增附件")),
-                            )
-                            .child(
-                                div()
-                                    .id("composer-attach-close")
-                                    .size(px(theme::TOUCH_TARGET))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .aria_label(locale::common("Close"))
-                                    .cursor_pointer()
-                                    .active(|style| style.opacity(0.6))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.close_composer_attach_menu(cx)
-                                        }),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path("icons/x.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_secondary()),
-                                    ),
-                            ),
-                    )
-                    .children(entries.into_iter().map(|(id, icon, label, detail, kind)| {
-                        div()
-                            .id(id)
-                            .flex_shrink_0()
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .px(px(theme::SPACING_LG))
-                            .py(px(theme::SPACING_SM))
-                            .pb(px(theme::SPACING_MD))
-                            .flex()
-                            .items_center()
-                            .gap(px(theme::SPACING_MD))
+                            .aria_label(locale::common("Close"))
                             .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .active(|style| style.opacity(0.6))
                             .on_mouse_up(
                                 MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.pick_composer_attachment(kind, cx)
+                                cx.listener(|this, _, _, cx| {
+                                    this.close_sheet(SheetKey::ComposerAttach, cx)
                                 }),
                             )
                             .child(
+                                svg()
+                                    .path("icons/x.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            ),
+                    ),
+            )
+            .children(entries.into_iter().map(|(id, icon, label, detail, kind)| {
+                div()
+                    .id(id)
+                    .flex_shrink_0()
+                    .min_h(px(theme::TOUCH_TARGET))
+                    .px(px(theme::SPACING_LG))
+                    .py(px(theme::SPACING_SM))
+                    .pb(px(theme::SPACING_MD))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_MD))
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.pick_composer_attachment(kind, cx)),
+                    )
+                    .child(
+                        div()
+                            .size(px(theme::TOUCH_TARGET))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(theme::bg_card_dim())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                svg()
+                                    .path(icon)
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
                                 div()
-                                    .size(px(theme::TOUCH_TARGET))
-                                    .flex_shrink_0()
-                                    .rounded_full()
-                                    .bg(theme::bg_card_dim())
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        svg()
-                                            .path(icon)
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_secondary()),
-                                    ),
+                                    .text_size(theme::font_body())
+                                    .text_color(theme::text_primary())
+                                    .child(label),
                             )
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .text_size(theme::font_body())
-                                            .text_color(theme::text_primary())
-                                            .child(label),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(theme::font_micro())
-                                            .text_color(theme::text_muted())
-                                            .child(detail),
-                                    ),
-                            )
-                    })),
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_muted())
+                                    .child(detail),
+                            ),
+                    )
+            }));
+        bottom_sheet_shell("mobile-composer-attach-menu", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::ComposerAttach, cx)),
             )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::ComposerAttach, event, window, cx)
+            }))
+            .content(sheet)
             .into_any_element()
     }
 
@@ -25815,10 +25927,19 @@ impl MobileApp {
     /// workspaces under it are re-scoped by the choice above them, so the reader
     /// sees where they are about to start without opening a second sheet. The
     /// project row stays open on purpose — the answer below it is the point.
-    fn render_new_session_picker_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_new_session_picker_sheet(
+        &self,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         match self.new_session_picker {
-            Some(NewSessionPicker::Location) => self.render_new_session_location_sheet(cx),
-            Some(NewSessionPicker::BaseRef) => self.render_new_session_base_ref_sheet(cx),
+            Some(NewSessionPicker::Location) => {
+                self.render_new_session_location_sheet(presentation, body_scroll, cx)
+            }
+            Some(NewSessionPicker::BaseRef) => {
+                self.render_new_session_base_ref_sheet(presentation, body_scroll, cx)
+            }
             None => div().into_any_element(),
         }
     }
@@ -25828,7 +25949,12 @@ impl MobileApp {
     /// A list rather than a cycle: a repository has more branches than a chip
     /// can walk through, and the answer is a name the reader recognises rather
     /// than the next one in line.
-    fn render_new_session_base_ref_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_new_session_base_ref_sheet(
+        &self,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let chosen = self.new_session_base_ref.clone();
         let rows = self
             .new_session_base_refs
@@ -25883,6 +26009,7 @@ impl MobileApp {
                 .id("new-session-base-ref-rows")
                 .flex_1()
                 .min_h_0()
+                .track_scroll(&body_scroll)
                 .overflow_y_scroll()
                 .restrict_scroll_to_axis()
                 .flex()
@@ -25917,98 +26044,59 @@ impl MobileApp {
                 .into_any_element()
         };
 
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.45))
+        let sheet = div()
+            .min_h_0()
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.dismiss_new_session_picker(cx)),
-            )
             .child(
                 div()
-                    .debug_selector(|| "mobile-new-session-base-ref".to_string())
-                    .w_full()
-                    .max_h(gpui::relative(0.6))
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_card())
+                    .flex_shrink_0()
+                    .h(px(theme::TOUCH_TARGET))
+                    .pl(px(theme::SPACING_LG))
+                    .pr(px(theme::SPACING_SM))
                     .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
                     .child(
                         div()
-                            .flex_shrink_0()
-                            .w_full()
-                            .pt(px(theme::SPACING_SM))
-                            .flex()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .w(px(36.0))
-                                    .h(px(4.0))
-                                    .rounded_full()
-                                    .bg(theme::border_default()),
-                            ),
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(theme::font_heading())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(locale::text("Base branch", "基线分支", "基線分支")),
                     )
                     .child(
                         div()
-                            .flex_shrink_0()
-                            .h(px(theme::TOUCH_TARGET))
-                            .pl(px(theme::SPACING_LG))
-                            .pr(px(theme::SPACING_SM))
+                            .id("new-session-base-ref-close")
+                            .size(px(theme::TOUCH_TARGET))
                             .flex()
                             .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_size(theme::font_heading())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::text_primary())
-                                    .child(locale::text("Base branch", "基线分支", "基線分支")),
+                            .justify_center()
+                            .aria_label(locale::common("Close"))
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.6))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::close_new_session_picker),
                             )
                             .child(
-                                div()
-                                    .id("new-session-base-ref-close")
-                                    .size(px(theme::TOUCH_TARGET))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .aria_label(locale::common("Close"))
-                                    .cursor_pointer()
-                                    .active(|style| style.opacity(0.6))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::close_new_session_picker),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path("icons/x.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_secondary()),
-                                    ),
+                                svg()
+                                    .path("icons/x.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
                             ),
-                    )
-                    .child(body)
-                    .relative()
-                    .with_animation(
-                        "mobile-new-session-base-ref-sheet",
-                        Animation::new(Duration::from_millis(SHEET_ENTRANCE_MS)),
-                        |sheet, delta| {
-                            sheet
-                                .opacity(delta)
-                                .top(px((1.0 - delta) * SHEET_ENTRANCE_RISE))
-                        },
                     ),
             )
+            .child(body);
+        bottom_sheet_shell("mobile-new-session-base-ref", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::NewSessionPicker, cx)),
+            )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::NewSessionPicker, event, window, cx)
+            }))
+            .content(sheet)
             .into_any_element()
     }
 
@@ -26164,7 +26252,12 @@ impl MobileApp {
     }
 
     /// The project and the workspace the session will start in.
-    fn render_new_session_location_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_new_session_location_sheet(
+        &self,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let project_id = self.new_session_project_id.clone();
         let workspace_id = self.new_session_workspace_id.clone();
 
@@ -26329,133 +26422,94 @@ impl MobileApp {
             })
             .collect::<Vec<_>>();
 
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.45))
+        let sheet = div()
+            .min_h_0()
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.dismiss_new_session_picker(cx)),
-            )
             .child(
                 div()
-                    .debug_selector(|| "mobile-new-session-picker".to_string())
-                    .w_full()
-                    .max_h(gpui::relative(0.7))
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_card())
+                    .flex_shrink_0()
+                    .h(px(theme::TOUCH_TARGET))
+                    .pl(px(theme::SPACING_LG))
+                    .pr(px(theme::SPACING_SM))
                     .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    // The sheet itself is not the dismiss target.
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
                     .child(
                         div()
-                            .flex_shrink_0()
-                            .w_full()
-                            .pt(px(theme::SPACING_SM))
-                            .flex()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .w(px(36.0))
-                                    .h(px(4.0))
-                                    .rounded_full()
-                                    .bg(theme::border_default()),
-                            ),
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(theme::font_heading())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(locale::text(
+                                "Project and workspace",
+                                "项目与工作区",
+                                "專案與工作區",
+                            )),
                     )
                     .child(
                         div()
-                            .flex_shrink_0()
-                            .h(px(theme::TOUCH_TARGET))
-                            .pl(px(theme::SPACING_LG))
-                            .pr(px(theme::SPACING_SM))
+                            .id("new-session-picker-close")
+                            .size(px(theme::TOUCH_TARGET))
                             .flex()
                             .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_size(theme::font_heading())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::text_primary())
-                                    .child(locale::text(
-                                        "Project and workspace",
-                                        "项目与工作区",
-                                        "專案與工作區",
-                                    )),
+                            .justify_center()
+                            .aria_label(locale::common("Close"))
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.6))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::close_new_session_picker),
                             )
                             .child(
-                                div()
-                                    .id("new-session-picker-close")
-                                    .size(px(theme::TOUCH_TARGET))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .aria_label(locale::common("Close"))
-                                    .cursor_pointer()
-                                    .active(|style| style.opacity(0.6))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::close_new_session_picker),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path("icons/x.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_secondary()),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("new-session-picker-rows")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .restrict_scroll_to_axis()
-                            .flex()
-                            .flex_col()
-                            .pb(px(theme::SPACING_SM))
-                            .child(runtime_section_heading(locale::text(
-                                "Project", "项目", "專案",
-                            )))
-                            .children(project_rows)
-                            .child(runtime_section_heading(locale::text(
-                                "Workspace",
-                                "工作区",
-                                "工作區",
-                            )))
-                            .children(workspace_rows)
-                            // The answer for a session that belongs to no
-                            // checkout yet. It sits under both lists because it
-                            // is the alternative to the two of them, not one
-                            // more row inside either.
-                            .child(runtime_section_heading(locale::text(
-                                "Without a project",
-                                "不使用项目",
-                                "不使用專案",
-                            )))
-                            .child(self.render_new_session_temporary_row(cx))
-                            .relative()
-                            .with_animation(
-                                "mobile-new-session-picker-sheet",
-                                Animation::new(Duration::from_millis(SHEET_ENTRANCE_MS)),
-                                |sheet, delta| {
-                                    sheet
-                                        .opacity(delta)
-                                        .top(px((1.0 - delta) * SHEET_ENTRANCE_RISE))
-                                },
+                                svg()
+                                    .path("icons/x.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
                             ),
                     ),
             )
+            .child(
+                div()
+                    .id("new-session-picker-rows")
+                    .flex_1()
+                    .min_h_0()
+                    .track_scroll(&body_scroll)
+                    .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
+                    .flex()
+                    .flex_col()
+                    .pb(px(theme::SPACING_SM))
+                    .child(runtime_section_heading(locale::text(
+                        "Project", "项目", "專案",
+                    )))
+                    .children(project_rows)
+                    .child(runtime_section_heading(locale::text(
+                        "Workspace",
+                        "工作区",
+                        "工作區",
+                    )))
+                    .children(workspace_rows)
+                    // The answer for a session that belongs to no
+                    // checkout yet. It sits under both lists because it
+                    // is the alternative to the two of them, not one
+                    // more row inside either.
+                    .child(runtime_section_heading(locale::text(
+                        "Without a project",
+                        "不使用项目",
+                        "不使用專案",
+                    )))
+                    .child(self.render_new_session_temporary_row(cx)),
+            );
+        bottom_sheet_shell("mobile-new-session-picker", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::NewSessionPicker, cx)),
+            )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::NewSessionPicker, event, window, cx)
+            }))
+            .content(sheet)
             .into_any_element()
     }
 
@@ -27101,7 +27155,12 @@ impl MobileApp {
     /// depth, and the per-Agent options. Every choice lands on the page's own
     /// draft as it is made — there is no session yet, so there is nothing to
     /// apply it to afterwards.
-    fn render_new_session_options_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_new_session_options_sheet(
+        &self,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         if !self.new_session_options_open {
             return div().into_any_element();
         }
@@ -27135,6 +27194,7 @@ impl MobileApp {
             .id("mobile-new-session-options-body")
             .flex_1()
             .min_h_0()
+            .track_scroll(&body_scroll)
             .overflow_y_scroll()
             .restrict_scroll_to_axis()
             .pb(px(theme::SPACING_LG))
@@ -27254,105 +27314,59 @@ impl MobileApp {
                 );
         }
 
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.45))
+        let sheet = div()
+            .min_h_0()
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.dismiss_new_session_options(cx)),
-            )
             .child(
                 div()
-                    .debug_selector(|| "mobile-new-session-options".to_string())
-                    .w_full()
-                    .max_h(gpui::relative(0.72))
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_card())
+                    .flex_shrink_0()
+                    .h(px(theme::TOUCH_TARGET))
+                    .pl(px(theme::SPACING_LG))
+                    .pr(px(theme::SPACING_SM))
                     .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    // The sheet itself is not the dismiss target.
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
                     .child(
                         div()
-                            .flex_shrink_0()
-                            .w_full()
-                            .pt(px(theme::SPACING_SM))
-                            .flex()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .w(px(36.0))
-                                    .h(px(4.0))
-                                    .rounded_full()
-                                    .bg(theme::border_default()),
-                            ),
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(theme::font_heading())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(locale::text("Session options", "会话选项", "工作階段選項")),
                     )
                     .child(
                         div()
-                            .flex_shrink_0()
-                            .h(px(theme::TOUCH_TARGET))
-                            .pl(px(theme::SPACING_LG))
-                            .pr(px(theme::SPACING_SM))
+                            .id("new-session-options-close")
+                            .size(px(theme::TOUCH_TARGET))
                             .flex()
                             .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_size(theme::font_heading())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::text_primary())
-                                    .child(locale::text(
-                                        "Session options",
-                                        "会话选项",
-                                        "工作階段選項",
-                                    )),
+                            .justify_center()
+                            .aria_label(locale::common("Close"))
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.6))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.dismiss_new_session_options(cx)),
                             )
                             .child(
-                                div()
-                                    .id("new-session-options-close")
-                                    .size(px(theme::TOUCH_TARGET))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .aria_label(locale::common("Close"))
-                                    .cursor_pointer()
-                                    .active(|style| style.opacity(0.6))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.dismiss_new_session_options(cx)
-                                        }),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path("icons/x.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_secondary()),
-                                    ),
+                                svg()
+                                    .path("icons/x.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
                             ),
-                    )
-                    .child(body)
-                    .relative()
-                    .with_animation(
-                        "mobile-new-session-options-sheet",
-                        Animation::new(Duration::from_millis(SHEET_ENTRANCE_MS)),
-                        |sheet, delta| {
-                            sheet
-                                .opacity(delta)
-                                .top(px((1.0 - delta) * SHEET_ENTRANCE_RISE))
-                        },
                     ),
             )
+            .child(body);
+        bottom_sheet_shell("mobile-new-session-options", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::NewSessionOptions, cx)),
+            )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::NewSessionOptions, event, window, cx)
+            }))
+            .content(sheet)
             .into_any_element()
     }
 
@@ -27878,7 +27892,12 @@ impl MobileApp {
             .into_any_element()
     }
 
-    fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_settings(
+        &self,
+        palette_sheet: Option<SheetPresentation>,
+        palette_scroll: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let page = self.settings_page;
         div()
             .absolute()
@@ -27912,8 +27931,8 @@ impl MobileApp {
                         SettingsPage::About => self.render_settings_about(cx),
                     }),
             )
-            .when(self.settings_palette_open, |settings| {
-                settings.child(self.render_settings_palette_sheet(cx))
+            .when_some(palette_sheet, |settings, presentation| {
+                settings.child(self.render_settings_palette_sheet(presentation, palette_scroll, cx))
             })
             .into_any_element()
     }
@@ -28681,7 +28700,12 @@ impl MobileApp {
     }
 
     /// The palette picker: every catalog palette for the current appearance.
-    fn render_settings_palette_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_settings_palette_sheet(
+        &self,
+        presentation: SheetPresentation,
+        body: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let dark = theme::is_dark();
         let mode = theme::mode(dark);
         let selected = theme_selection_id(&self.app_settings.theme_selection, dark)
@@ -28690,146 +28714,135 @@ impl MobileApp {
         let themes = vibex_ui::themes_for(mode)
             .map(|theme| (theme.id.to_string(), theme.name.to_string()))
             .collect::<Vec<_>>();
-        div()
-            .id("mobile-settings-palette")
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.62))
+        let sheet = div()
+            .min_h_0()
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.settings_palette_open = false;
-                    cx.notify();
-                }),
-            )
             .child(
                 div()
-                    .max_h(relative(0.72))
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .bg(theme::bg_popover())
-                    .border_t_1()
-                    .border_color(theme::border_default())
+                    .h(px(theme::DRAWER_HEADER_HEIGHT))
+                    .flex_shrink_0()
+                    .px(px(theme::SPACING_LG))
                     .flex()
-                    .flex_col()
-                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .items_center()
+                    .justify_between()
                     .child(
                         div()
-                            .h(px(theme::DRAWER_HEADER_HEIGHT))
-                            .flex_shrink_0()
-                            .px(px(theme::SPACING_LG))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(theme::font_heading())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::text_primary())
-                                    .child(locale::common("Palette")),
-                            )
-                            .child(
-                                div()
-                                    .text_size(theme::font_caption())
-                                    .text_color(theme::text_muted())
-                                    .child(locale::common(if dark { "Dark" } else { "Light" })),
-                            ),
+                            .text_size(theme::font_heading())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(locale::common("Palette")),
                     )
                     .child(
                         div()
-                            .id("mobile-settings-palette-scroll")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .restrict_scroll_to_axis()
-                            .px(px(theme::SPACING_MD))
-                            .pb(px(theme::SPACING_LG))
-                            .children(themes.into_iter().map(|(id, name)| {
-                                let active = id == selected;
-                                let select_id = id.clone();
-                                div()
-                                    .id(format!("palette:{id}"))
-                                    .h(px(theme::TOUCH_TARGET + 8.0))
-                                    .mb(px(theme::SPACING_XS))
-                                    .px(px(theme::SPACING_MD))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .border_1()
-                                    .border_color(if active {
-                                        theme::primary()
-                                    } else {
-                                        theme::border_subtle()
-                                    })
-                                    .bg(if active {
-                                        theme::sidebar_selected_bg()
-                                    } else {
-                                        theme::bg_card()
-                                    })
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(theme::SPACING_SM))
-                                    .cursor_pointer()
-                                    .aria_label(name.clone())
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, window, cx| {
-                                            let select_id = select_id.clone();
-                                            this.update_theme_selection(
-                                                move |selection| {
-                                                    if dark {
-                                                        selection.select_dark(select_id.clone())
-                                                    } else {
-                                                        selection.select_light(select_id.clone())
-                                                    }
-                                                },
-                                                window,
-                                                cx,
-                                            );
-                                            this.settings_palette_open = false;
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_size(theme::font_body())
-                                            .text_color(theme::text_primary())
-                                            .child(name),
-                                    )
-                                    .when(active, |row| {
-                                        row.child(
-                                            svg()
-                                                .path("icons/check.svg")
-                                                .size(px(theme::ICON_SM))
-                                                .text_color(theme::primary()),
-                                        )
-                                    })
-                            })),
+                            .text_size(theme::font_caption())
+                            .text_color(theme::text_muted())
+                            .child(locale::common(if dark { "Dark" } else { "Light" })),
                     ),
             )
+            .child(
+                div()
+                    .id("mobile-settings-palette-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
+                    .px(px(theme::SPACING_MD))
+                    .pb(px(theme::SPACING_LG))
+                    .track_scroll(&body)
+                    .children(themes.into_iter().map(|(id, name)| {
+                        let active = id == selected;
+                        let select_id = id.clone();
+                        div()
+                            .id(format!("palette:{id}"))
+                            .h(px(theme::TOUCH_TARGET + 8.0))
+                            .mb(px(theme::SPACING_XS))
+                            .px(px(theme::SPACING_MD))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(if active {
+                                theme::primary()
+                            } else {
+                                theme::border_subtle()
+                            })
+                            .bg(if active {
+                                theme::sidebar_selected_bg()
+                            } else {
+                                theme::bg_card()
+                            })
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .cursor_pointer()
+                            .aria_label(name.clone())
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    let select_id = select_id.clone();
+                                    this.update_theme_selection(
+                                        move |selection| {
+                                            if dark {
+                                                selection.select_dark(select_id.clone())
+                                            } else {
+                                                selection.select_light(select_id.clone())
+                                            }
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                    this.close_sheet(SheetKey::SettingsPalette, cx);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(theme::font_body())
+                                    .text_color(theme::text_primary())
+                                    .child(name),
+                            )
+                            .when(active, |row| {
+                                row.child(
+                                    svg()
+                                        .path("icons/check.svg")
+                                        .size(px(theme::ICON_SM))
+                                        .text_color(theme::primary()),
+                                )
+                            })
+                    })),
+            );
+        bottom_sheet_shell("mobile-settings-palette", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::SettingsPalette, cx)),
+            )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::SettingsPalette, event, window, cx)
+            }))
+            .content(sheet)
             .into_any_element()
     }
 
     fn render_mobile_overlay(
         &self,
         overlay: MobileOverlay,
+        sheets: OverlaySheets,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match overlay {
             MobileOverlay::Team => self.render_team(cx),
-            MobileOverlay::Pairing => self
-                .render_pairing(bottom_sheet_max_height(window), window, cx)
-                .into_any_element(),
+            MobileOverlay::Pairing => self.render_pairing(sheets, window, cx).into_any_element(),
             MobileOverlay::HostDetail => self.render_host_detail(cx),
-            MobileOverlay::HostActions => self.render_host_actions_sheet(cx),
+            MobileOverlay::HostActions => match sheets.host_actions {
+                Some(presentation) => self.render_host_actions_sheet(presentation, cx),
+                None => self.render_host_detail(cx),
+            },
             MobileOverlay::HostRename => self.render_host_rename_sheet(cx),
             MobileOverlay::HostRemove => self.render_host_remove_sheet(cx),
-            MobileOverlay::Settings => self.render_settings(cx),
+            MobileOverlay::Settings => {
+                self.render_settings(sheets.settings_palette, sheets.settings_palette_scroll, cx)
+            }
             MobileOverlay::NewProject => self.render_new_project(cx),
             MobileOverlay::NewSession => self.render_new_session(cx),
         }
@@ -29048,6 +29061,29 @@ fn visible_drawer_page(offset: f32, snap: Option<DrawerSnap>) -> Option<DrawerPa
         Some(DrawerPage::Workbench)
     } else {
         None
+    }
+}
+
+/// The surface the conversation page paints for itself, inside the content box.
+///
+/// The page owns this colour instead of letting the root's show through. The
+/// root follows a drawer, so the band the window's insets leave around the
+/// content box reads as part of an open side page; a page that borrowed that
+/// colour would take the drawer's tone over the whole middle of the phone the
+/// moment a swipe began.
+fn conversation_surface() -> Hsla {
+    theme::bg_primary()
+}
+
+/// The root's own surface: everything no page paints over.
+///
+/// In the workspace that is only the band the window's insets leave around the
+/// content box, and a side page takes the band over as soon as one is on
+/// screen. Pairing and connecting have no drawer, so the root is their page.
+fn root_surface(mode: RootMode, drawer: Option<DrawerPage>) -> Hsla {
+    match (mode, drawer) {
+        (RootMode::Pairing, _) | (_, None) => theme::bg_primary(),
+        (_, Some(_)) => theme::sidebar_bg(),
     }
 }
 
@@ -30503,51 +30539,6 @@ fn mobile_join_session_group_label(group_name: &str) -> String {
     }
 }
 
-/// The line a row paints under its name about the branch it is hiding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MobileBranchSummary {
-    line: String,
-    /// Whether one of the counts is a session parked on the reader.
-    asks_for_user: bool,
-}
-
-/// The line a folded branch owes the reader, in the desktop's own words.
-///
-/// The counts describe the session's subtree and not the row they hang under,
-/// so a bare "0 running · 1 waiting" beside an idle row would read as that row's
-/// own state: only the counts that carry information are painted, and the one
-/// that waits says who it waits on. The waiting count leads, because it is the
-/// one that asks the reader to act.
-fn mobile_hidden_branch_summary(
-    active_descendants: usize,
-    blocked_descendants: usize,
-) -> Option<MobileBranchSummary> {
-    let mut parts = Vec::new();
-    if blocked_descendants > 0 {
-        parts.push(format!(
-            "{blocked_descendants} {}",
-            locale::text("waiting for you", "等待用户", "等待使用者")
-        ));
-    }
-    if active_descendants > 0 {
-        parts.push(format!(
-            "{active_descendants} {}",
-            locale::text("running", "运行中", "執行中")
-        ));
-    }
-    let counts = parts.join(" · ");
-    (!counts.is_empty()).then(|| MobileBranchSummary {
-        line: match locale::current() {
-            // English has no room for a leading label and needs none: "waiting
-            // for you" already says whose branch is being counted.
-            Locale::En => counts,
-            Locale::ZhCn => format!("子会话：{counts}"),
-            Locale::ZhTw => format!("子會話：{counts}"),
-        },
-        asks_for_user: blocked_descendants > 0,
-    })
-}
-
 /// How many marks a group's stack shows before it counts the rest.
 const MOBILE_GROUP_AVATAR_LIMIT: usize = 5;
 
@@ -31213,6 +31204,9 @@ fn sidebar_session_column(
             && state != AgentSessionState::Idle,
         show_attention: awaiting_user,
         label,
+        // The words and the hour share the slot, and a row that is working,
+        // waiting on the reader, unread, failed, suspended, or pinned does not
+        // also report an hour.
         // The countdown stands in the slot the hour would take. A row that is
         // still starting up has no hour to report — but a queued send is
         // exactly the case where that slot carries the countdown instead, which
@@ -33629,6 +33623,41 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// Lets a sheet finish leaving.
+    ///
+    /// A sheet keeps its own flag set while its panel falls — that is what
+    /// keeps its content in the panel on the way down — so the page clears the
+    /// flag only once the fall has landed.
+    fn settle_sheet(app: &Entity<MobileApp>, cx: &mut gpui::VisualTestContext) {
+        settle_motion(app, cx, theme::SHEET_FALL_MS + 32);
+    }
+
+    /// Lets a sheet finish rising, so its panel is where the reader sees it
+    /// once it has arrived.
+    fn settle_rise(app: &Entity<MobileApp>, cx: &mut gpui::VisualTestContext) {
+        app.update(cx, |app, cx| {
+            app.sheet.settle_flights();
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
+    /// Runs the clock past one of a sheet's flights and draws the frame it
+    /// lands on.
+    fn settle_motion(app: &Entity<MobileApp>, cx: &mut gpui::VisualTestContext, ms: u64) {
+        cx.executor().advance_clock(Duration::from_millis(ms));
+        app.update(cx, |app, cx| {
+            app.sheet.settle_flights();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
     fn click_mobile_control(cx: &mut gpui::VisualTestContext, selector: &'static str) {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
@@ -33958,6 +33987,7 @@ mod tests {
                     PairingPanel::Manual
                 );
                 cx.simulate_keystrokes("back");
+                settle_sheet(&app, cx);
                 assert_eq!(
                     app.read_with(cx, |app, _| app.pairing_panel),
                     PairingPanel::None
@@ -34043,6 +34073,7 @@ mod tests {
         // The selected backend is idle in this fixture, so its menu offers
         // Cancel. It disconnects explicitly and retains the saved runtimes.
         click_mobile_control(cx, "pairing-runtime-menu-runtime-a");
+        settle_rise(&app, cx);
         click_mobile_control(cx, "mobile-runtime-cancel");
         app.read_with(cx, |app, _| {
             assert_eq!(app.mode, RootMode::Pairing);
@@ -34659,7 +34690,12 @@ mod tests {
             sheet.size
         );
         assert!(
-            app.read_with(cx, |app, _| app.pairing_scroll.max_offset().y) > px(0.0),
+            app.update(cx, |app, _| app
+                .sheet
+                .body_scroll(SheetKey::PairingFallback)
+                .max_offset()
+                .y)
+                > px(0.0),
             "a long result list should scroll inside the sheet"
         );
 
@@ -34667,9 +34703,15 @@ mod tests {
             app.nearby_candidates.clear();
             app.dismiss_pairing_panel(cx);
         });
+        // The panel is still on screen while it falls; it leaves when it lands.
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
+        assert!(
+            cx.debug_bounds("pairing-sheet").is_some(),
+            "a closing sheet is still on screen while it falls"
+        );
+        settle_sheet(&app, cx);
         assert!(
             cx.debug_bounds("pairing-sheet").is_none(),
             "dismissing should take the sheet away"
@@ -35045,10 +35087,10 @@ mod tests {
             "self.render_pairing_runtimes(runtimes_max_height, cx)",
             "self.render_pairing_actions(scan_busy, scan_enabled, cx)",
             "self.render_pairing_stack(",
-            "self.render_pairing_sheet(sheet_max_height, cx)",
+            "self.render_pairing_sheet(presentation, frame.pairing_scroll, cx)",
             // The cards here are a runtime list, so a runtime's own surfaces
             // belong to this page too.
-            "self.render_mobile_overlay(overlay, window, cx)",
+            "self.render_mobile_overlay(overlay, sheets.clone(), window, cx)",
         ] {
             assert!(page.contains(call), "the page should still render {call}");
         }
@@ -35125,13 +35167,14 @@ mod tests {
         );
         assert!(renderer_source(source, "render_pairing_scan_action").contains("scan-pairing-qr"));
 
-        // The sheet is an overlay: it takes no room in the page, so nothing
-        // behind it can be laid out again because it opened.
+        // The sheet is a bottom sheet: the scrim, the panel's rise and the
+        // grabber belong to the shared shell, so what is left here is its own
+        // content, its body's scroll, and the way out.
         let sheet = renderer_source(source, "render_pairing_sheet");
-        assert!(sheet.contains(".absolute()"));
-        assert!(sheet.contains(".occlude()"));
-        assert!(sheet.contains(".justify_end()"));
-        assert!(sheet.contains(".max_h(max_height)"));
+        assert!(sheet.contains("bottom_sheet_shell(\"pairing-sheet\", presentation)"));
+        assert!(sheet.contains(".on_dismiss("));
+        assert!(sheet.contains(".on_pan("));
+        assert!(sheet.contains("track_scroll(&body_scroll)"));
         for panel in ["PairingPanel::Nearby", "PairingPanel::Manual"] {
             assert!(sheet.contains(panel), "the sheet should serve {panel}");
         }
@@ -35192,6 +35235,7 @@ mod tests {
         assert!(cx.debug_bounds("pairing-sheet").is_some());
 
         cx.simulate_keystrokes("back");
+        settle_sheet(&app, cx);
         assert_eq!(
             app.read_with(cx, |app, _| app.pairing_panel),
             PairingPanel::None,
@@ -35772,6 +35816,40 @@ mod tests {
         assert_eq!(drawer_left(DrawerPage::Workbench, -1.0, width), 0.0);
     }
 
+    /// A drawer sliding over the conversation page never repaints it.
+    ///
+    /// This is the reported bug: pulling a side page out turned the whole
+    /// middle of the phone the drawer's colour, because the conversation page
+    /// let the root's background through and the root follows the drawer so
+    /// the band the window's insets leave reads as part of an open side page.
+    /// The page now paints its own surface, so the root's colour only ever
+    /// reaches that band.
+    #[test]
+    fn a_drawer_never_repaints_the_page_it_slides_over() {
+        let source = include_str!("app.rs");
+        let workspace = source
+            .split_once("    fn render_workspace(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_row_menu("))
+            .map(|(body, _)| body)
+            .expect("the workspace page should remain inspectable");
+        assert!(
+            workspace.contains(".bg(conversation_surface())"),
+            "the conversation page paints its own surface, not the root's"
+        );
+        assert_eq!(conversation_surface(), theme::bg_primary());
+        // The band around the page still follows the drawer, from the first
+        // frame of the swipe to the frame that closes it.
+        assert_eq!(
+            root_surface(RootMode::Workspace, Some(DrawerPage::Sessions)),
+            theme::sidebar_bg()
+        );
+        assert_eq!(
+            root_surface(RootMode::Workspace, Some(DrawerPage::Workbench)),
+            theme::sidebar_bg()
+        );
+        assert_eq!(root_surface(RootMode::Workspace, None), theme::bg_primary());
+    }
+
     #[test]
     fn timeline_follow_only_stays_active_near_the_bottom() {
         assert_eq!(timeline_distance_to_bottom(-500.0, 500.0), 0.0);
@@ -36249,6 +36327,7 @@ fn session_opened(cx: &mut Context<Self>) {
         };
 
         open_menu(&app, cx);
+        settle_rise(&app, cx);
         let sheet = cx
             .debug_bounds("mobile-sidebar-row-menu-sheet")
             .expect("the row's actions should be laid out");
@@ -36293,6 +36372,14 @@ fn session_opened(cx: &mut Context<Self>) {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
+        // The panel is still on screen while it falls: the sheet's own flag
+        // stays set until the fall lands, which is what keeps its entries in
+        // the panel on the way down.
+        assert!(
+            cx.debug_bounds("mobile-sidebar-row-menu-sheet").is_some(),
+            "a closing sheet keeps its panel while it falls"
+        );
+        settle_sheet(&app, cx);
         assert!(
             app.read_with(cx, |app, _| app.sidebar_row_menu.is_none())
                 && cx.debug_bounds("mobile-sidebar-row-menu-sheet").is_none(),
@@ -36308,9 +36395,7 @@ fn session_opened(cx: &mut Context<Self>) {
             sheet.origin.y + px(theme::DRAWER_HEADER_HEIGHT / 2.0),
         );
         cx.simulate_click(close, gpui::Modifiers::none());
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
+        settle_sheet(&app, cx);
         assert!(
             app.read_with(cx, |app, _| app.sidebar_row_menu.is_none()),
             "the header's close control should dismiss the sheet"
@@ -37434,9 +37519,9 @@ fn session_opened(cx: &mut Context<Self>) {
         let source = include_str!("app.rs");
         // Read the production source only: the needle below is a literal in
         // this test too, and counting the test's own copy would make the
-        // assertion about itself. The test module is the last one; the file
-        // carries `#[cfg(test)]` helpers long before it, so the split is taken
-        // from the module itself.
+        // assertion about itself.
+        // The test module is the last one; the file carries `#[cfg(test)]`
+        // helpers long before it, so the split is taken from the module itself.
         let production = source
             .rsplit_once("\n#[cfg(test)]\nmod tests {")
             .expect("the crate has a test module")

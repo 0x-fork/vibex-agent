@@ -465,6 +465,12 @@ pub const CARD_WIDTH: f32 = 300.0;
 
 pub const RADIUS_CARD: f32 = 10.0;
 pub const RADIUS_CONTROL: f32 = 8.0;
+/// The top corners of a sheet pulled up from the bottom edge.
+///
+/// Rounder than any card: the sheet's whole top edge is a curve the eye
+/// follows from the scrim up the panel, and it is the arc the grabber sits on.
+/// A card's radius reads as a corner; a sheet's has to read as a lip.
+pub const RADIUS_SHEET: f32 = 22.0;
 /// The prompt card's own radius: rounder than a list card, because it is the
 /// one surface the reader types into rather than reads.
 pub const RADIUS_COMPOSER: f32 = 14.0;
@@ -689,6 +695,45 @@ pub const DRAWER_BACKDROP_OPACITY: f32 = 0.4;
 pub const DRAWER_OPEN_ANIMATION_MS: u64 = 160;
 pub const DRAWER_CLOSE_ANIMATION_MS: u64 = 100;
 
+/// How tall a bottom sheet may rise before its body scrolls instead.
+///
+/// A sheet is a thing laid over the page, not a page of its own: whatever it
+/// explains keeps a band of the screen so the reader never loses their place.
+pub const SHEET_HEIGHT_RATIO: f32 = 0.62;
+/// The scrim behind a sheet at full rise.
+///
+/// One value for every sheet: the sheet is the same object whichever page pulls
+/// it up, and the pages that dimmed harder or softer were reading as different
+/// kinds of surface for no reason the reader could act on.
+pub const SHEET_BACKDROP_OPACITY: f32 = 0.55;
+/// How long a sheet takes to rise from the foot of the screen.
+///
+/// Longer than the drawer's own snap: a panel travels the height of the sheet
+/// itself, and the eye has to be able to follow its top edge all the way up.
+pub const SHEET_RISE_MS: u64 = 280;
+/// How long a sheet takes to leave. A little quicker than the rise, because the
+/// reader has already decided and the panel is going where they pushed it.
+pub const SHEET_FALL_MS: u64 = 220;
+/// The bar at the top of every sheet.
+pub const SHEET_GRABBER_WIDTH: f32 = 44.0;
+pub const SHEET_GRABBER_HEIGHT: f32 = 5.0;
+/// How far a finger must pull the panel before the sheet follows it, so a tap
+/// that wobbles on the way down is still a tap.
+pub const SHEET_PULL_THRESHOLD: f32 = 8.0;
+/// How far the panel must be pulled for the finger's release to dismiss the
+/// sheet. A fixed distance rather than a share of the sheet: what the reader
+/// judges it against is the rows that slid up under the finger.
+pub const SHEET_PULL_DISMISS_TRAVEL: f32 = 96.0;
+/// How fast a released pull must still be moving to dismiss the sheet, in
+/// logical pixels per second: a short flick leaves the same way a long drag
+/// does.
+pub const SHEET_PULL_DISMISS_VELOCITY: f32 = 700.0;
+/// How long after a pull lets go a tap on the scrim is ignored.
+///
+/// The lift that ends a pull can land on the scrim itself once the panel has
+/// moved out from under the finger, and that is not a tap anyone made.
+pub const SHEET_PULL_TAP_GUARD_MS: u64 = 200;
+
 // ---------------------------------------------------------------------------
 // Accessors
 // ---------------------------------------------------------------------------
@@ -737,6 +782,18 @@ pub fn border_subtle() -> Hsla {
 
 pub fn border_input() -> Hsla {
     opaque("input", "background")
+}
+
+/// The bar at the top of a bottom sheet.
+///
+/// Not the border tone: a border is a tenth of a black and vanishes against the
+/// card it is drawn on, while this bar is the one control that says the panel
+/// can be pulled back down. It takes the muted foreground at a share that reads
+/// on both appearances without competing with the sheet's own title.
+pub fn sheet_grabber() -> Hsla {
+    let mut color = tone("muted-foreground");
+    color.a = if is_dark() { 0.55 } else { 0.45 };
+    color
 }
 
 pub fn row_pressed_bg() -> Hsla {

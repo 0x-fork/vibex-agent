@@ -6,7 +6,7 @@ use gpui::{
     Bounds, ClipboardItem, Context, DispatchPhase, Entity, FontWeight, Image, ImageFormat,
     IntoElement, LongPressEvent, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _, Pixels,
     Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchDragEvent,
-    TouchPhase, WeakEntity, Window, canvas, div, img, point, prelude::*, px, relative, rgb, svg,
+    TouchPhase, WeakEntity, Window, canvas, div, img, point, prelude::*, px, rgb, svg,
 };
 use vibex_backend::{
     BackendError, BackendOperation, BackendResult, GitBackend as _, MutationRequest,
@@ -37,6 +37,9 @@ use vibex_ui::{
     TerminalKey, TerminalKeyModifiers, TerminalWorkflowCapabilities, TerminalWorkflowController,
 };
 
+use crate::bottom_sheet::{
+    BottomSheet, SheetKey, SheetPresentation, SheetPull, bottom_sheet_shell,
+};
 use crate::locale;
 use crate::markdown;
 use crate::theme;
@@ -354,6 +357,12 @@ pub struct MobileWorkbench {
     git_branches: Option<Vec<GitBranchSummary>>,
     git_branches_loading: bool,
     git_branch_sheet_open: bool,
+    /// The sheets that rise from the foot of the screen: their rise, their
+    /// fall, and the finger pulling one back down.
+    sheet: BottomSheet,
+    /// The task that clears a sheet once its fall has landed. Held so the
+    /// timer is not dropped before it fires.
+    sheet_task: Option<Task<()>>,
     /// The author filter's sheet. The list comes from the history the model
     /// already holds, so opening it costs nothing.
     git_author_sheet_open: bool,
@@ -488,6 +497,8 @@ impl MobileWorkbench {
             git_branch_sheet_open: false,
             git_author_sheet_open: false,
             git_date_sheet_open: false,
+            sheet: BottomSheet::default(),
+            sheet_task: None,
             terminal_render_sequence: 0,
             terminal_close_confirmation: None,
             terminal_fit_size: None,
@@ -866,8 +877,7 @@ impl MobileWorkbench {
 
     fn close_file_goto(&mut self, cx: &mut Context<Self>) {
         if self.file_goto_open {
-            self.file_goto_open = false;
-            cx.notify();
+            self.close_sheet(SheetKey::FileGoto, cx);
         }
     }
 
@@ -1693,9 +1703,121 @@ impl MobileWorkbench {
     }
 
     fn cancel_worktree_confirmation(&mut self, cx: &mut Context<Self>) {
-        if self.worktree_confirmation.take().is_some() {
-            cx.notify();
+        if self.worktree_confirmation.is_some() {
+            self.close_sheet(SheetKey::WorktreeConfirmation, cx);
         }
+    }
+
+    /// A tap on a sheet's scrim: what the finger was doing when it landed is
+    /// what decides whether it dismisses.
+    ///
+    /// The lift that ends a pull can land on the scrim itself once the panel
+    /// has moved out from under the finger, and that is not a tap anyone made.
+    fn tap_sheet_scrim(&mut self, key: SheetKey, cx: &mut Context<Self>) {
+        if self.sheet.pull_just_released(key) {
+            return;
+        }
+        self.close_sheet(key, cx);
+    }
+
+    /// Drives one sheet from the platform's touch pan.
+    ///
+    /// The listener belongs to the panel the finger is on, so a page showing
+    /// two sheets never moves the wrong one.
+    fn pull_sheet(
+        &mut self,
+        key: SheetKey,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pan) = crate::bottom_sheet::sheet_pan(event) else {
+            return;
+        };
+        match self
+            .sheet
+            .pull(key, pan, crate::bottom_sheet::max_height(window))
+        {
+            SheetPull::Ignored => {}
+            SheetPull::Pulling | SheetPull::Restored => {
+                // The panel owns the gesture now: the list inside the sheet
+                // must not scroll along with the finger that is moving it.
+                cx.stop_propagation();
+                cx.notify();
+            }
+            SheetPull::Dismissed(key) => {
+                cx.stop_propagation();
+                self.lower_sheet(key, cx);
+            }
+        }
+    }
+
+    /// Asks a sheet to close, and lets its panel leave the screen.
+    fn close_sheet(&mut self, key: SheetKey, cx: &mut Context<Self>) {
+        if self.sheet.is_leaving(key) {
+            // The reader asked a second time: the panel stops falling and is
+            // simply gone, rather than making them wait out the animation.
+            self.land_sheet(key, cx);
+            return;
+        }
+        self.lower_sheet(key, cx);
+    }
+
+    /// Starts the panel's fall. The sheet's own flag stays set until the panel
+    /// has landed, which is what keeps its content in the panel as it travels.
+    fn lower_sheet(&mut self, key: SheetKey, cx: &mut Context<Self>) {
+        let flight = self.sheet.lower(key);
+        if flight.is_zero() {
+            self.land_sheet(key, cx);
+            return;
+        }
+        self.sheet_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            cx.background_executor().timer(flight).await;
+            let _ = entity.update(cx, |this, cx| this.land_sheet(key, cx));
+        }));
+        cx.notify();
+    }
+
+    /// Forgets the sheet whose fall has landed.
+    ///
+    /// This is where closing a sheet actually ends: the panel has left the
+    /// screen, so the page's own flag — the thing that says the sheet is up —
+    /// can go. [`BottomSheet::land`] answers `false` for a landing that has
+    /// nothing left to clear, which is what keeps a second close from touching
+    /// a page's state twice.
+    fn land_sheet(&mut self, key: SheetKey, cx: &mut Context<Self>) {
+        if !self.sheet.land(key) {
+            return;
+        }
+        match key {
+            SheetKey::FileGoto => self.file_goto_open = false,
+            SheetKey::GitBranches => self.git_branch_sheet_open = false,
+            SheetKey::GitFilter => {
+                self.git_author_sheet_open = false;
+                self.git_date_sheet_open = false;
+            }
+            SheetKey::WorktreeConfirmation => self.worktree_confirmation = None,
+            SheetKey::GitRevert => self.git_revert_confirmation = None,
+            SheetKey::GitDiff => self.git_diff = None,
+            // The workspace owns the rest.
+            SheetKey::PairingFallback
+            | SheetKey::SidebarRowMenu
+            | SheetKey::SidebarRootMenu
+            | SheetKey::FolderArchiveMenu
+            | SheetKey::SidebarRescheduleMenu
+            | SheetKey::BatchDelete
+            | SheetKey::WorktreePaths
+            | SheetKey::GroupMembers
+            | SheetKey::ProjectRemove
+            | SheetKey::GoalObjective
+            | SheetKey::HostActions
+            | SheetKey::ComposerHistory
+            | SheetKey::ComposerAttach
+            | SheetKey::NewSessionPicker
+            | SheetKey::NewSessionOptions
+            | SheetKey::SettingsPalette => {}
+        }
+        cx.notify();
     }
 
     fn refresh_git(&mut self, cx: &mut Context<Self>) {
@@ -1795,8 +1917,7 @@ impl MobileWorkbench {
 
     fn close_git_branch_sheet(&mut self, cx: &mut Context<Self>) {
         if self.git_branch_sheet_open {
-            self.git_branch_sheet_open = false;
-            cx.notify();
+            self.close_sheet(SheetKey::GitBranches, cx);
         }
     }
 
@@ -1808,13 +1929,12 @@ impl MobileWorkbench {
     fn set_git_history_branch(&mut self, branch: Option<String>, cx: &mut Context<Self>) {
         let mut filter = self.git.state.model.history_filter.clone();
         if filter.ref_name == branch {
-            self.git_branch_sheet_open = false;
-            cx.notify();
+            self.close_sheet(SheetKey::GitBranches, cx);
             return;
         }
         filter.ref_name = branch;
         self.git.state.model.set_history_filter(filter);
-        self.git_branch_sheet_open = false;
+        self.close_sheet(SheetKey::GitBranches, cx);
         self.refresh_git_history(false, cx);
         cx.notify();
     }
@@ -2122,8 +2242,7 @@ impl MobileWorkbench {
 
     fn close_git_author_sheet(&mut self, cx: &mut Context<Self>) {
         if self.git_author_sheet_open {
-            self.git_author_sheet_open = false;
-            cx.notify();
+            self.close_sheet(SheetKey::GitFilter, cx);
         }
     }
 
@@ -2135,13 +2254,12 @@ impl MobileWorkbench {
     fn set_git_history_author(&mut self, author: Option<String>, cx: &mut Context<Self>) {
         let mut filter = self.git.state.model.history_filter.clone();
         if filter.author == author {
-            self.git_author_sheet_open = false;
-            cx.notify();
+            self.close_sheet(SheetKey::GitFilter, cx);
             return;
         }
         filter.author = author;
         self.git.state.model.set_history_filter(filter);
-        self.git_author_sheet_open = false;
+        self.close_sheet(SheetKey::GitFilter, cx);
         self.refresh_git_history(false, cx);
         cx.notify();
     }
@@ -2153,8 +2271,7 @@ impl MobileWorkbench {
 
     fn close_git_date_sheet(&mut self, cx: &mut Context<Self>) {
         if self.git_date_sheet_open {
-            self.git_date_sheet_open = false;
-            cx.notify();
+            self.close_sheet(SheetKey::GitFilter, cx);
         }
     }
 
@@ -2175,7 +2292,7 @@ impl MobileWorkbench {
         filter.authored_after_ms = after;
         filter.authored_before_ms = before;
         self.git.state.model.set_history_filter(filter);
-        self.git_date_sheet_open = false;
+        self.close_sheet(SheetKey::GitFilter, cx);
         self.refresh_git_history(false, cx);
         cx.notify();
     }
@@ -3989,55 +4106,46 @@ impl MobileWorkbench {
     }
 
     /// The go-to-line prompt: a number, and a way to confirm it.
-    fn render_file_goto_prompt(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.45))
+    fn render_file_goto_prompt(
+        &self,
+        presentation: SheetPresentation,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let body = div()
+            .min_h_0()
+            .p_3()
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.close_file_goto(cx)),
+            .gap_2()
+            .child(
+                div()
+                    .text_size(theme::font_title())
+                    .text_color(theme::text_primary())
+                    .child(locale::text("Go to line", "跳转到行", "跳轉到行")),
             )
             .child(
                 div()
-                    .debug_selector(|| "file-goto-prompt".to_string())
-                    .w_full()
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .border_t_1()
+                    .h(px(theme::TOUCH_TARGET))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
                     .border_color(theme::border_default())
-                    .bg(theme::bg_card())
-                    .p_3()
+                    .bg(theme::workbench_panel_bg())
+                    .px_2()
                     .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(theme::font_title())
-                            .text_color(theme::text_primary())
-                            .child(locale::text("Go to line", "跳转到行", "跳轉到行")),
-                    )
-                    .child(
-                        div()
-                            .h(px(theme::TOUCH_TARGET))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_default())
-                            .bg(theme::workbench_panel_bg())
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
-                            .child(input_element(self.file_goto_input.as_ref())),
-                    )
-                    .child(
-                        action_button("file-goto-confirm", locale::common("Go"))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::confirm_file_goto)),
-                    ),
+                    .items_center()
+                    .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
+                    .child(input_element(self.file_goto_input.as_ref())),
             )
+            .child(
+                action_button("file-goto-confirm", locale::common("Go"))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::confirm_file_goto)),
+            );
+        bottom_sheet_shell("file-goto-prompt", presentation)
+            .on_dismiss(cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::FileGoto, cx)))
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::FileGoto, event, window, cx)
+            }))
+            .content(body)
             .into_any_element()
     }
 
@@ -4047,7 +4155,12 @@ impl MobileWorkbench {
     /// and a phone list scrolls, where a popup would have to be a full screen
     /// anyway. The current branch is marked, and "All branches" is the way back
     /// to the whole repository.
-    fn render_git_branch_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_git_branch_sheet(
+        &self,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let selected = self.git.state.model.history_filter.ref_name.clone();
         let loading = self.git_branches_loading && self.git_branches.is_none();
         let mut rows: Vec<(Option<String>, String, Option<String>)> =
@@ -4072,158 +4185,145 @@ impl MobileWorkbench {
                 (!detail.is_empty()).then(|| detail.join(" · ")),
             ));
         }
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.45))
+        let sheet = div()
+            .min_h_0()
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.close_git_branch_sheet(cx)),
-            )
             .child(
                 div()
-                    .debug_selector(|| "mobile-git-branch-sheet".to_string())
-                    .w_full()
-                    .max_h(gpui::relative(0.7))
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_card())
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
                     .flex()
-                    .flex_col()
-                    .overflow_hidden()
+                    .items_center()
+                    .justify_between()
                     .child(
                         div()
-                            .flex_shrink_0()
-                            .px_3()
-                            .py_2()
-                            .border_b_1()
-                            .border_color(theme::border_subtle())
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(theme::font_title())
-                                    .text_color(theme::text_primary())
-                                    .child(locale::text("History branch", "历史分支", "歷史分支")),
-                            )
-                            .child(
-                                div()
-                                    .id("git-branch-sheet-close")
-                                    .size(px(theme::TOUCH_TARGET))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.close_git_branch_sheet(cx)
-                                        }),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path("icons/x.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_secondary()),
-                                    ),
-                            ),
+                            .text_size(theme::font_title())
+                            .text_color(theme::text_primary())
+                            .child(locale::text("History branch", "历史分支", "歷史分支")),
                     )
                     .child(
                         div()
-                            .id("git-branch-list")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
+                            .id("git-branch-sheet-close")
+                            .size(px(theme::TOUCH_TARGET))
                             .flex()
-                            .flex_col()
-                            .p_2()
-                            .when(loading, |list| {
-                                list.child(
-                                    div()
-                                        .p_3()
-                                        .text_size(theme::font_body())
-                                        .text_color(theme::text_muted())
-                                        .child(locale::common("Loading")),
-                                )
-                            })
-                            .children(rows.into_iter().enumerate().map(
-                                |(index, (value, label, detail))| {
-                                    let chosen = value == selected;
-                                    let target = value.clone();
-                                    div()
-                                        .id(("git-branch-row", index))
-                                        .w_full()
-                                        .min_h(px(theme::TOUCH_TARGET))
-                                        .px_3()
-                                        .py_1()
-                                        .rounded(px(theme::RADIUS_CONTROL))
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .cursor_pointer()
-                                        .active(|style| style.bg(theme::row_pressed_bg()))
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.set_git_history_branch(target.clone(), cx)
-                                            }),
-                                        )
-                                        .child(
-                                            svg()
-                                                .path("icons/git-branch.svg")
-                                                .size(px(theme::ICON_SM))
-                                                .flex_shrink_0()
-                                                .text_color(if chosen {
-                                                    theme::primary()
-                                                } else {
-                                                    theme::text_muted()
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .flex_1()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .whitespace_nowrap()
-                                                .text_size(theme::font_body())
-                                                .text_color(if chosen {
-                                                    theme::primary()
-                                                } else {
-                                                    theme::text_primary()
-                                                })
-                                                .child(label),
-                                        )
-                                        .when_some(detail, |row, detail| {
-                                            row.child(
-                                                div()
-                                                    .flex_shrink_0()
-                                                    .text_size(theme::font_micro())
-                                                    .text_color(theme::text_muted())
-                                                    .child(detail),
-                                            )
-                                        })
-                                        .when(chosen, |row| {
-                                            row.child(
-                                                svg()
-                                                    .path("icons/check.svg")
-                                                    .size(px(theme::ICON_SM))
-                                                    .flex_shrink_0()
-                                                    .text_color(theme::primary()),
-                                            )
-                                        })
-                                },
-                            )),
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.close_git_branch_sheet(cx)),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/x.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            ),
                     ),
             )
+            .child(
+                div()
+                    .id("git-branch-list")
+                    .flex_1()
+                    .min_h_0()
+                    .track_scroll(&body_scroll)
+                    .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
+                    .flex()
+                    .flex_col()
+                    .p_2()
+                    .when(loading, |list| {
+                        list.child(
+                            div()
+                                .p_3()
+                                .text_size(theme::font_body())
+                                .text_color(theme::text_muted())
+                                .child(locale::common("Loading")),
+                        )
+                    })
+                    .children(rows.into_iter().enumerate().map(
+                        |(index, (value, label, detail))| {
+                            let chosen = value == selected;
+                            let target = value.clone();
+                            div()
+                                .id(("git-branch-row", index))
+                                .w_full()
+                                .min_h(px(theme::TOUCH_TARGET))
+                                .px_3()
+                                .py_1()
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.set_git_history_branch(target.clone(), cx)
+                                    }),
+                                )
+                                .child(
+                                    svg()
+                                        .path("icons/git-branch.svg")
+                                        .size(px(theme::ICON_SM))
+                                        .flex_shrink_0()
+                                        .text_color(if chosen {
+                                            theme::primary()
+                                        } else {
+                                            theme::text_muted()
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_size(theme::font_body())
+                                        .text_color(if chosen {
+                                            theme::primary()
+                                        } else {
+                                            theme::text_primary()
+                                        })
+                                        .child(label),
+                                )
+                                .when_some(detail, |row, detail| {
+                                    row.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(theme::font_micro())
+                                            .text_color(theme::text_muted())
+                                            .child(detail),
+                                    )
+                                })
+                                .when(chosen, |row| {
+                                    row.child(
+                                        svg()
+                                            .path("icons/check.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .flex_shrink_0()
+                                            .text_color(theme::primary()),
+                                    )
+                                })
+                        },
+                    )),
+            );
+        bottom_sheet_shell("mobile-git-branch-sheet", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::GitBranches, cx)),
+            )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::GitBranches, event, window, cx)
+            }))
+            .content(sheet)
             .into_any_element()
     }
 
@@ -4436,7 +4536,11 @@ impl MobileWorkbench {
     }
 
     /// The plan or preflight a lifecycle action is waiting on.
-    fn render_worktree_confirmation(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_worktree_confirmation(
+        &self,
+        presentation: SheetPresentation,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let Some(confirmation) = self.worktree_confirmation.as_ref() else {
             return div().into_any_element();
         };
@@ -4480,114 +4584,105 @@ impl MobileWorkbench {
             ),
         };
         let merge = matches!(confirmation, WorktreeConfirmation::Merge(_));
-        div()
-            .id("mobile-worktree-confirmation")
-            .debug_selector(|| "mobile-worktree-confirmation".to_string())
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.62))
+        let body = div()
+            .min_h_0()
+            .p(px(theme::SPACING_LG))
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.cancel_worktree_confirmation(cx)),
+            .gap(px(theme::SPACING_SM))
+            .child(
+                div()
+                    .text_size(theme::font_heading())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text_primary())
+                    .child(title),
             )
             .child(
                 div()
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .bg(theme::bg_popover())
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .p(px(theme::SPACING_LG))
-                    .flex()
-                    .flex_col()
-                    .gap(px(theme::SPACING_SM))
-                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .text_size(theme::font_heading())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_primary())
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme::font_caption())
-                            .text_color(theme::text_muted())
-                            .child(detail),
-                    )
-                    .child(
-                        div()
-                            .mt(px(theme::SPACING_SM))
-                            .flex()
-                            .gap(px(theme::SPACING_SM))
-                            .child(
-                                div()
-                                    .id("worktree-confirm-cancel")
-                                    .flex_1()
-                                    .h(px(theme::TOUCH_TARGET))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .border_1()
-                                    .border_color(theme::border_default())
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .text_size(theme::font_body())
-                                    .text_color(theme::text_secondary())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.cancel_worktree_confirmation(cx)
-                                        }),
-                                    )
-                                    .child(locale::common("Cancel")),
-                            )
-                            .child(
-                                div()
-                                    .id("worktree-confirm-action")
-                                    .flex_1()
-                                    .h(px(theme::TOUCH_TARGET))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .bg(if merge {
-                                        theme::primary()
-                                    } else {
-                                        theme::accent_red()
-                                    })
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .active(|style| style.opacity(0.85))
-                                    .text_size(theme::font_body())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(if merge {
-                                        theme::primary_foreground()
-                                    } else {
-                                        theme::bg_primary()
-                                    })
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            if merge {
-                                                this.confirm_worktree_merge(cx)
-                                            } else {
-                                                this.confirm_worktree_discard(cx)
-                                            }
-                                        }),
-                                    )
-                                    .child(confirm_label),
-                            ),
-                    ),
+                    .text_size(theme::font_caption())
+                    .text_color(theme::text_muted())
+                    .child(detail),
             )
+            .child(
+                div()
+                    .mt(px(theme::SPACING_SM))
+                    .flex()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        div()
+                            .id("worktree-confirm-cancel")
+                            .flex_1()
+                            .h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .text_size(theme::font_body())
+                            .text_color(theme::text_secondary())
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.cancel_worktree_confirmation(cx)),
+                            )
+                            .child(locale::common("Cancel")),
+                    )
+                    .child(
+                        div()
+                            .id("worktree-confirm-action")
+                            .flex_1()
+                            .h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(if merge {
+                                theme::primary()
+                            } else {
+                                theme::accent_red()
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.85))
+                            .text_size(theme::font_body())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if merge {
+                                theme::primary_foreground()
+                            } else {
+                                theme::bg_primary()
+                            })
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    if merge {
+                                        this.confirm_worktree_merge(cx)
+                                    } else {
+                                        this.confirm_worktree_discard(cx)
+                                    }
+                                }),
+                            )
+                            .child(confirm_label),
+                    ),
+            );
+        bottom_sheet_shell("mobile-worktree-confirmation", presentation)
+            .on_dismiss(cx.listener(|this, _, _, cx| {
+                this.tap_sheet_scrim(SheetKey::WorktreeConfirmation, cx)
+            }))
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::WorktreeConfirmation, event, window, cx)
+            }))
+            .content(body)
             .into_any_element()
     }
 
     /// The author list the history filter picks from.
-    fn render_git_author_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_git_author_sheet(
+        &self,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let selected = self.git.state.model.history_filter.author.clone();
         let mut rows: Vec<(Option<String>, String)> =
             vec![(None, locale::common("All authors").to_string())];
@@ -4600,17 +4695,26 @@ impl MobileWorkbench {
             rows.push((Some(author.email.clone()), label));
         }
         self.render_git_filter_sheet(
-            "git-author-sheet",
-            locale::text("History author", "历史作者", "歷史作者"),
-            rows,
-            selected,
-            |this, value, cx| this.set_git_history_author(value, cx),
+            GitFilterSheet {
+                debug_id: "git-author-sheet",
+                title: locale::text("History author", "历史作者", "歷史作者"),
+                rows,
+                selected,
+                choose: |this, value, cx| this.set_git_history_author(value, cx),
+            },
+            presentation,
+            body_scroll,
             cx,
         )
     }
 
     /// The date presets the history filter picks from.
-    fn render_git_date_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_git_date_sheet(
+        &self,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let now = vibex_core::unix_timestamp_ms();
         let selected = MobileHistoryWindow::from_bounds(
             self.git.state.model.history_filter.authored_after_ms,
@@ -4625,11 +4729,15 @@ impl MobileWorkbench {
                 .map(|window| (Some(window), window.label().to_string())),
         );
         self.render_git_filter_sheet(
-            "git-date-sheet",
-            locale::text("History date", "历史日期", "歷史日期"),
-            rows,
-            selected,
-            |this, value, cx| this.set_git_history_window(value, cx),
+            GitFilterSheet {
+                debug_id: "git-date-sheet",
+                title: locale::text("History date", "历史日期", "歷史日期"),
+                rows,
+                selected,
+                choose: |this, value, cx| this.set_git_history_window(value, cx),
+            },
+            presentation,
+            body_scroll,
             cx,
         )
     }
@@ -4640,141 +4748,123 @@ impl MobileWorkbench {
     /// shape of list anyway.
     fn render_git_filter_sheet<T: Clone + PartialEq + 'static>(
         &self,
-        debug_id: &'static str,
-        title: &'static str,
-        rows: Vec<(T, String)>,
-        selected: T,
-        choose: impl Fn(&mut Self, T, &mut Context<Self>) + Copy + 'static,
+        filter: GitFilterSheet<T>,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.45))
+        let GitFilterSheet {
+            debug_id,
+            title,
+            rows,
+            selected,
+            choose,
+        } = filter;
+        let sheet = div()
+            .min_h_0()
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.git_author_sheet_open = false;
-                    this.git_date_sheet_open = false;
-                    cx.notify();
-                }),
-            )
             .child(
                 div()
-                    .debug_selector(move || debug_id.to_string())
-                    .w_full()
-                    .max_h(gpui::relative(0.7))
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_card())
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
                     .flex()
-                    .flex_col()
-                    .overflow_hidden()
+                    .items_center()
+                    .justify_between()
                     .child(
                         div()
-                            .flex_shrink_0()
-                            .px_3()
-                            .py_2()
-                            .border_b_1()
-                            .border_color(theme::border_subtle())
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(theme::font_title())
-                                    .text_color(theme::text_primary())
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .id("git-filter-sheet-close")
-                                    .size(px(theme::TOUCH_TARGET))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.git_author_sheet_open = false;
-                                            this.git_date_sheet_open = false;
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path("icons/x.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_secondary()),
-                                    ),
-                            ),
+                            .text_size(theme::font_title())
+                            .text_color(theme::text_primary())
+                            .child(title),
                     )
                     .child(
                         div()
-                            .id("git-filter-list")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
+                            .id("git-filter-sheet-close")
+                            .size(px(theme::TOUCH_TARGET))
                             .flex()
-                            .flex_col()
-                            .p_2()
-                            .children(rows.into_iter().enumerate().map(
-                                |(index, (value, label))| {
-                                    let chosen = value == selected;
-                                    let target = value.clone();
-                                    div()
-                                        .id(("git-filter-row", index))
-                                        .w_full()
-                                        .min_h(px(theme::TOUCH_TARGET))
-                                        .px_3()
-                                        .rounded(px(theme::RADIUS_CONTROL))
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .cursor_pointer()
-                                        .active(|style| style.bg(theme::row_pressed_bg()))
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                choose(this, target.clone(), cx)
-                                            }),
-                                        )
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .flex_1()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .whitespace_nowrap()
-                                                .text_size(theme::font_body())
-                                                .text_color(if chosen {
-                                                    theme::primary()
-                                                } else {
-                                                    theme::text_primary()
-                                                })
-                                                .child(label),
-                                        )
-                                        .when(chosen, |row| {
-                                            row.child(
-                                                svg()
-                                                    .path("icons/check.svg")
-                                                    .size(px(theme::ICON_SM))
-                                                    .flex_shrink_0()
-                                                    .text_color(theme::primary()),
-                                            )
-                                        })
-                                },
-                            )),
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.close_sheet(SheetKey::GitFilter, cx)
+                                }),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/x.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            ),
                     ),
             )
+            .child(
+                div()
+                    .id("git-filter-list")
+                    .flex_1()
+                    .min_h_0()
+                    .track_scroll(&body_scroll)
+                    .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
+                    .flex()
+                    .flex_col()
+                    .p_2()
+                    .children(rows.into_iter().enumerate().map(|(index, (value, label))| {
+                        let chosen = value == selected;
+                        let target = value.clone();
+                        div()
+                            .id(("git-filter-row", index))
+                            .w_full()
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .px_3()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| choose(this, target.clone(), cx)),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(theme::font_body())
+                                    .text_color(if chosen {
+                                        theme::primary()
+                                    } else {
+                                        theme::text_primary()
+                                    })
+                                    .child(label),
+                            )
+                            .when(chosen, |row| {
+                                row.child(
+                                    svg()
+                                        .path("icons/check.svg")
+                                        .size(px(theme::ICON_SM))
+                                        .flex_shrink_0()
+                                        .text_color(theme::primary()),
+                                )
+                            })
+                    })),
+            );
+        bottom_sheet_shell(debug_id, presentation)
+            .on_dismiss(cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::GitFilter, cx)))
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::GitFilter, event, window, cx)
+            }))
+            .content(sheet)
             .into_any_element()
     }
 
@@ -5380,15 +5470,49 @@ impl MobileWorkbench {
             .into_any_element()
     }
 
-    fn render_git(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_git(&mut self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         if self.git_commit_detail.is_some() || self.git_commit_detail_loading {
             return self.render_git_commit_screen(cx);
         }
-        self.render_git_panel(cx)
+        self.render_git_panel(window, cx)
     }
 
-    fn render_git_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_git_panel(&mut self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mode = self.git.state.model.mode;
+        // A sheet's own flag stays set while its panel is falling, so each gate
+        // asks the sheet where that panel is rather than only whether the page
+        // still wants it. The frames are read here, before the element tree is
+        // built, because the state behind them is the panel's.
+        let sheet_travel = crate::bottom_sheet::max_height(window);
+        let revert_sheet = self.sheet.presentation(
+            SheetKey::GitRevert,
+            self.git_revert_confirmation.is_some(),
+            sheet_travel,
+        );
+        let branch_sheet = self.sheet.presentation(
+            SheetKey::GitBranches,
+            self.git_branch_sheet_open,
+            sheet_travel,
+        );
+        let branch_scroll = self.sheet.body_scroll(SheetKey::GitBranches);
+        let filter_sheet = self.sheet.presentation(
+            SheetKey::GitFilter,
+            self.git_author_sheet_open || self.git_date_sheet_open,
+            sheet_travel,
+        );
+        let filter_scroll = self.sheet.body_scroll(SheetKey::GitFilter);
+        let goto_sheet =
+            self.sheet
+                .presentation(SheetKey::FileGoto, self.file_goto_open, sheet_travel);
+        let worktree_sheet = self.sheet.presentation(
+            SheetKey::WorktreeConfirmation,
+            self.worktree_confirmation.is_some(),
+            sheet_travel,
+        );
+        let diff_sheet =
+            self.sheet
+                .presentation(SheetKey::GitDiff, self.git_diff.is_some(), sheet_travel);
+        let diff_scroll = self.sheet.body_scroll(SheetKey::GitDiff);
         let changes_active = mode == GitWorkbenchMode::Changes;
         let history_active = mode == GitWorkbenchMode::History;
         let status = self.git.state.model.status.clone();
@@ -5837,30 +5961,49 @@ impl MobileWorkbench {
             .when(changes_active, |root| {
                 root.child(self.render_git_commit_panel(can_commit, has_selected_paths, cx))
             })
-            .when_some(self.git_revert_confirmation.clone(), |root, paths| {
-                root.child(self.render_git_revert_confirmation(&paths, cx))
-            })
+            .when_some(
+                self.git_revert_confirmation.clone(),
+                |root, paths| match revert_sheet {
+                    Some(presentation) => {
+                        root.child(self.render_git_revert_confirmation(&paths, presentation, cx))
+                    }
+                    None => root,
+                },
+            )
             // The diff is a sheet, not another row at the end of a long tree:
             // it opens where the eye already is, scrolls on its own, and has a
             // visible way out.
-            .when_some(self.git_diff.clone(), |root, diff| {
-                root.child(self.render_git_diff(diff, cx))
+            .when_some(self.git_diff.clone(), |root, diff| match diff_sheet {
+                Some(presentation) => {
+                    root.child(self.render_git_diff(diff, presentation, diff_scroll.clone(), cx))
+                }
+                None => root,
             })
             .when_some(self.render_worktree_card(cx), |root, card| root.child(card))
-            .when(self.git_branch_sheet_open, |root| {
-                root.child(self.render_git_branch_sheet(cx))
+            .when(self.git_branch_sheet_open, |root| match branch_sheet {
+                Some(presentation) => root.child(self.render_git_branch_sheet(
+                    presentation,
+                    branch_scroll.clone(),
+                    cx,
+                )),
+                None => root,
             })
-            .when(self.git_author_sheet_open, |root| {
-                root.child(self.render_git_author_sheet(cx))
+            .when(
+                self.git_author_sheet_open || self.git_date_sheet_open,
+                |root| match filter_sheet {
+                    Some(presentation) => root.child(if self.git_author_sheet_open {
+                        self.render_git_author_sheet(presentation, filter_scroll.clone(), cx)
+                    } else {
+                        self.render_git_date_sheet(presentation, filter_scroll.clone(), cx)
+                    }),
+                    None => root,
+                },
+            )
+            .when_some(goto_sheet, |root, presentation| {
+                root.child(self.render_file_goto_prompt(presentation, cx))
             })
-            .when(self.git_date_sheet_open, |root| {
-                root.child(self.render_git_date_sheet(cx))
-            })
-            .when(self.file_goto_open, |root| {
-                root.child(self.render_file_goto_prompt(cx))
-            })
-            .when(self.worktree_confirmation.is_some(), |root| {
-                root.child(self.render_worktree_confirmation(cx))
+            .when_some(worktree_sheet, |root, presentation| {
+                root.child(self.render_worktree_confirmation(presentation, cx))
             })
             .into_any_element()
     }
@@ -5870,110 +6013,80 @@ impl MobileWorkbench {
     fn render_git_revert_confirmation(
         &self,
         paths: &[String],
+        presentation: SheetPresentation,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let listed = paths.iter().take(4).cloned().collect::<Vec<_>>().join("\n");
-        div()
-            .id("mobile-git-revert-confirmation")
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.62))
+        let body = div()
+            .min_h_0()
+            .p(px(theme::SPACING_LG))
             .flex()
             .flex_col()
-            .justify_end()
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.git_revert_confirmation = None;
-                    cx.notify();
-                }),
+            .gap(px(theme::SPACING_SM))
+            .child(
+                div()
+                    .text_size(theme::font_heading())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text_primary())
+                    .child(locale::text(
+                        "Roll back selected changes?",
+                        "回滚所选更改？",
+                        "回滾所選變更？",
+                    )),
             )
             .child(
                 div()
-                    .rounded_t(px(theme::RADIUS_CARD))
-                    .bg(theme::bg_popover())
-                    .border_t_1()
-                    .border_color(theme::border_default())
-                    .p(px(theme::SPACING_LG))
-                    .flex()
-                    .flex_col()
-                    .gap(px(theme::SPACING_SM))
-                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .text_size(theme::font_heading())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_primary())
-                            .child(
-                                locale::text(
-                                    "Roll back selected changes?",
-                                    "回滚所选更改？",
-                                    "回滾所選變更？",
-                                ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme::font_caption())
-                            .text_color(theme::text_muted())
-                            .child(
-                                locale::text(
-                                    "These files go back to the committed version and local edits are lost.",
-                                    "这些文件会回到已提交版本，本地修改将丢失。",
-                                    "這些檔案會回到已提交版本，本機修改將遺失。",
-                                ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .font_family("IBM Plex Mono")
-                            .text_size(theme::font_micro())
-                            .text_color(theme::text_secondary())
-                            .child(listed),
-                    )
-                    .when(paths.len() > 4, |sheet| {
-                        sheet.child(
-                            div()
-                                .text_size(theme::font_micro())
-                                .text_color(theme::text_muted())
-                                .child(
-                                    locale::text(
-                                        "and more",
-                                        "以及更多",
-                                        "以及更多",
-                                    )
-                                    .to_string()
-                                        + &format!(" ({} total)", paths.len()),
-                                ),
-                        )
-                    })
-                    .child(
-                        div()
-                            .mt(px(theme::SPACING_SM))
-                            .flex()
-                            .gap(px(theme::SPACING_SM))
-                            .child(
-                                action_button("git-revert-cancel", locale::common("Cancel"))
-                                    .flex_1()
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::cancel_revert_git),
-                                    ),
-                            )
-                            .child(
-                                action_button(
-                                    "git-revert-confirm",
-                                    locale::text("Roll back", "回滚", "回滾"),
-                                )
-                                .flex_1()
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(Self::confirm_revert_git),
-                                ),
-                            ),
-                    ),
+                    .text_size(theme::font_caption())
+                    .text_color(theme::text_muted())
+                    .child(locale::text(
+                        "These files go back to the committed version and local edits are lost.",
+                        "这些文件会回到已提交版本，本地修改将丢失。",
+                        "這些檔案會回到已提交版本，本機修改將遺失。",
+                    )),
             )
+            .child(
+                div()
+                    .font_family("IBM Plex Mono")
+                    .text_size(theme::font_micro())
+                    .text_color(theme::text_secondary())
+                    .child(listed),
+            )
+            .when(paths.len() > 4, |sheet| {
+                sheet.child(
+                    div()
+                        .text_size(theme::font_micro())
+                        .text_color(theme::text_muted())
+                        .child(
+                            locale::text("and more", "以及更多", "以及更多").to_string()
+                                + &format!(" ({} total)", paths.len()),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .mt(px(theme::SPACING_SM))
+                    .flex()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        action_button("git-revert-cancel", locale::common("Cancel"))
+                            .flex_1()
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_revert_git)),
+                    )
+                    .child(
+                        action_button(
+                            "git-revert-confirm",
+                            locale::text("Roll back", "回滚", "回滾"),
+                        )
+                        .flex_1()
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::confirm_revert_git)),
+                    ),
+            );
+        bottom_sheet_shell("mobile-git-revert-confirmation", presentation)
+            .on_dismiss(cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::GitRevert, cx)))
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::GitRevert, event, window, cx)
+            }))
+            .content(body)
             .into_any_element()
     }
 
@@ -6520,7 +6633,13 @@ impl MobileWorkbench {
     /// The diff sheet: a header with the path and a way out, then the patch
     /// with the old/new line numbers the desktop shows. Long lines wrap with a
     /// hanging indent so a continuation cannot be mistaken for a new line.
-    fn render_git_diff(&self, diff: GitDiffResponse, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_git_diff(
+        &self,
+        diff: GitDiffResponse,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let limit = self.git_diff_limit.max(GIT_DIFF_PAGE_LINES);
         let mut old_line = 0u32;
         let mut new_line = 0u32;
@@ -6549,18 +6668,8 @@ impl MobileWorkbench {
         let total_lines = diff.diff.lines().count();
         let remaining = total_lines.saturating_sub(limit);
         let path = diff.path.clone();
-        div()
-            .id("mobile-git-diff-sheet")
-            .debug_selector(|| "mobile-git-diff-sheet".to_string())
-            .absolute()
-            .left_0()
-            .right_0()
-            .bottom_0()
-            .max_h(relative(0.62))
-            .rounded_t(px(theme::RADIUS_CARD))
-            .border_t_1()
-            .border_color(theme::border_default())
-            .bg(theme::bg_popover())
+        let sheet = div()
+            .min_h_0()
             .flex()
             .flex_col()
             .child(
@@ -6614,10 +6723,7 @@ impl MobileWorkbench {
                     .child(
                         icon_button("git-diff-close", "icons/x.svg", "Close").on_mouse_up(
                             MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.git_diff = None;
-                                cx.notify();
-                            }),
+                            cx.listener(|this, _, _, cx| this.close_sheet(SheetKey::GitDiff, cx)),
                         ),
                     ),
             )
@@ -6626,7 +6732,7 @@ impl MobileWorkbench {
                     .id("mobile-git-diff-scroll")
                     .flex_1()
                     .min_h_0()
-                    .track_scroll(&self.git_diff_scroll)
+                    .track_scroll(&body_scroll)
                     .overflow_y_scroll()
                     .overflow_x_scroll()
                     .restrict_scroll_to_axis()
@@ -6715,7 +6821,13 @@ impl MobileWorkbench {
                                 )),
                         ),
                 )
-            })
+            });
+        bottom_sheet_shell("mobile-git-diff-sheet", presentation)
+            .on_dismiss(cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::GitDiff, cx)))
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::GitDiff, event, window, cx)
+            }))
+            .content(sheet)
             .into_any_element()
     }
 
@@ -8032,10 +8144,23 @@ impl Render for MobileWorkbench {
             })
             .child(div().flex_1().min_h_0().child(match surface {
                 WorkbenchSurface::Files => self.render_files(cx),
-                WorkbenchSurface::Git => self.render_git(cx),
+                WorkbenchSurface::Git => self.render_git(window, cx),
                 WorkbenchSurface::Terminal => self.render_terminal(cx),
             }))
     }
+}
+
+/// One history filter's list, as one value.
+///
+/// The four travel together — the rows, the one in force, the name a test finds
+/// the sheet by, and what choosing a row does — so they are handed over as one
+/// thing rather than as four arguments that always appear together.
+struct GitFilterSheet<T> {
+    debug_id: &'static str,
+    title: &'static str,
+    rows: Vec<(T, String)>,
+    selected: T,
+    choose: fn(&mut MobileWorkbench, T, &mut Context<MobileWorkbench>),
 }
 
 /// The frame around a one-line kit field the rail owns.

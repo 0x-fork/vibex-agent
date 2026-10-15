@@ -13,6 +13,7 @@ mod app;
 mod assets;
 mod attachment;
 mod background_connection;
+mod bottom_sheet;
 mod device;
 mod discovery;
 mod file_diff;
