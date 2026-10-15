@@ -21376,6 +21376,33 @@ impl MobileApp {
             .into_any_element()
     }
 
+    /// The identity a delegated child's mark is looked up by.
+    ///
+    /// A delegated child is deliberately absent from the ordinary session list —
+    /// the tree is where it lives — so its row has no `AgentSession` to read the
+    /// Agent off and asks the node the row was built from instead. A child the
+    /// tree no longer holds answers with nothing, which draws the bot the
+    /// desktop draws for an Agent it cannot name.
+    fn delegated_child_agent_identity(&self, session_id: &str) -> String {
+        self.delegated_children
+            .values()
+            .flatten()
+            .find(|node| {
+                node.session_ref
+                    .session_id()
+                    .is_some_and(|id| id.as_str() == session_id)
+            })
+            .map_or_else(String::new, |node| {
+                agent_brand_identity(
+                    node.agent_id
+                        .as_ref()
+                        .map(AgentId::as_str)
+                        .unwrap_or_default(),
+                    node.agent_label.as_deref().unwrap_or_default(),
+                )
+            })
+    }
+
     fn render_sidebar_session_row(
         &self,
         row: &SidebarRow,
@@ -21413,6 +21440,21 @@ impl MobileApp {
         let open_session_id = session_id.clone();
         let batch_session_id = session_id.clone();
         let delegated_child = row.delegated_child;
+        // The mark leads the row on both shells, so it is resolved on both the
+        // same way: an ordinary session answers from its own Agent and the name
+        // the runtime lists that Agent under.
+        let agent_identity = session.map_or_else(
+            || self.delegated_child_agent_identity(session_id.as_str()),
+            |session| {
+                agent_brand_identity(
+                    session.agent_id.as_str(),
+                    self.runtime_agent_labels
+                        .get(&session.agent_id)
+                        .map(String::as_str)
+                        .unwrap_or_default(),
+                )
+            },
+        );
         let (row_offset, row_right_margin) = if inside_workspace_card {
             (
                 -theme::SIDEBAR_ICON_SLOT_OVERHANG,
@@ -21539,20 +21581,7 @@ impl MobileApp {
                         },
                     )
                     .when(!self.sidebar_batch_mode, |title| {
-                        title.child(
-                            svg()
-                                .path(agent_icon_path(&session.map_or_else(
-                                    || "unknown".to_string(),
-                                    |session| session.agent_id.to_string(),
-                                )))
-                                .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
-                                .flex_shrink_0()
-                                .text_color(theme::sidebar_foreground(if is_selected {
-                                    0.80
-                                } else {
-                                    0.58
-                                })),
-                        )
+                        title.child(sidebar_agent_logo(&agent_identity, is_selected))
                     })
                     .child(
                         div()
@@ -27723,7 +27752,15 @@ fn model_brand_asset(model_id: &str) -> Option<ModelBrandAsset> {
 }
 
 fn agent_brand_asset(agent_id: &str, label: &str) -> Option<(&'static str, bool)> {
-    agent_brand_identity_asset(&format!("{agent_id} {label}"))
+    agent_brand_identity_asset(&agent_brand_identity(agent_id, label))
+}
+
+/// The identity string a brand mark is looked up by: the Agent's id and the
+/// name the runtime lists it under, joined the way the shared catalogue expects.
+/// An Agent whose id is a bare command still finds its mark through the name
+/// beside it.
+fn agent_brand_identity(agent_id: &str, label: &str) -> String {
+    format!("{agent_id} {label}")
 }
 
 fn agent_brand_identity_asset(identity: &str) -> Option<(&'static str, bool)> {
@@ -27734,16 +27771,11 @@ fn agent_brand_identity_asset(identity: &str) -> Option<(&'static str, bool)> {
         .map(|(_, path, uses_current_color)| (*path, *uses_current_color))
 }
 
-/// Brand icon for an Agent, desktop-style: colored marks render through
-/// `img` to keep their embedded palette; themed marks and the bot fallback
-/// are tinted with `tint`.
-fn runtime_agent_icon(
-    agent_id: &AgentId,
-    label: &str,
-    size: gpui::Pixels,
-    tint: Hsla,
-) -> gpui::AnyElement {
-    match agent_brand_asset(agent_id.as_str(), label) {
+/// Brand icon for an Agent identity, desktop-style: colored marks render
+/// through `img` to keep their embedded palette; themed marks and the bot
+/// fallback are tinted with `tint`.
+fn agent_brand_icon(identity: &str, size: gpui::Pixels, tint: Hsla) -> gpui::AnyElement {
+    match agent_brand_identity_asset(identity) {
         Some((path, false)) => img(path).size(size).flex_shrink_0().into_any_element(),
         Some((path, true)) => svg()
             .path(path)
@@ -27758,6 +27790,18 @@ fn runtime_agent_icon(
             .text_color(tint)
             .into_any_element(),
     }
+}
+
+/// Brand icon for an Agent, desktop-style: colored marks render through
+/// `img` to keep their embedded palette; themed marks and the bot fallback
+/// are tinted with `tint`.
+fn runtime_agent_icon(
+    agent_id: &AgentId,
+    label: &str,
+    size: gpui::Pixels,
+    tint: Hsla,
+) -> gpui::AnyElement {
+    agent_brand_icon(&agent_brand_identity(agent_id.as_str(), label), size, tint)
 }
 
 /// Brand icon for a model id, desktop-style: colored marks render through
@@ -28215,6 +28259,24 @@ fn sidebar_status_dot(color: gpui::Hsla) -> gpui::AnyElement {
         .rounded_full()
         .bg(color)
         .into_any_element()
+}
+
+/// The Agent mark a sidebar session row leads with, in the desktop row's own
+/// treatment.
+///
+/// The desktop's row opens on `sidebar_agent_logo`, and this answers the same
+/// question the same way: a branded mark keeps the palette its brand defines,
+/// while a mark drawn in the current colour is painted in the sidebar
+/// foreground. That foreground is a per-appearance token, and the mark is faded
+/// rather than recoloured, so one opacity ladder reads on the light sidebar and
+/// on the dark one. An Agent no brand answers wears the bot, which is what the
+/// desktop's row shows for a name it cannot place.
+fn sidebar_agent_logo(identity: &str, active: bool) -> gpui::AnyElement {
+    agent_brand_icon(
+        identity,
+        px(theme::SIDEBAR_AGENT_LOGO_SIZE),
+        theme::sidebar_foreground(if active { 0.80 } else { 0.58 }),
+    )
 }
 
 fn sidebar_running_indicator(color: gpui::Hsla) -> gpui::AnyElement {
@@ -29576,6 +29638,57 @@ mod tests {
             Some(("icons/claude.svg", false))
         );
         assert_eq!(model_brand_asset("mystery/model-x"), None);
+    }
+
+    /// The left screen's session row leads with the mark the desktop's sidebar
+    /// row leads with, so the same Agent wears the same face on both shells.
+    ///
+    /// The row used to draw a catalogue path as an alpha mask, which flattened
+    /// every brand to the sidebar's own colour; the mark now resolves through
+    /// the shared brand table and is painted the desktop's way.
+    #[test]
+    fn the_sidebar_session_row_leads_with_the_desktop_agent_mark() {
+        let source = include_str!("app.rs");
+        let row = renderer_source(source, "render_sidebar_session_row");
+        assert!(row.contains("sidebar_agent_logo(&agent_identity, is_selected)"));
+        assert!(
+            !row.contains("agent_icon_path("),
+            "the row must not fall back to the monochrome catalogue mask"
+        );
+
+        // A branded mark keeps the palette baked into it; a mark that paints in
+        // the current colour — and the bot an unplaceable Agent wears — is drawn
+        // in the sidebar foreground, which is a per-appearance token and so
+        // carries the light and dark sidebars alike.
+        let mut colored =
+            agent_brand_icon("claude-code Claude Code", px(14.0), theme::text_primary());
+        assert!(colored.downcast_mut::<gpui::Img>().is_some());
+        let mut themed = agent_brand_icon("codex Codex", px(14.0), theme::text_primary());
+        assert!(themed.downcast_mut::<gpui::Svg>().is_some());
+        let mut unknown = agent_brand_icon("mystery ACP", px(14.0), theme::text_primary());
+        assert!(unknown.downcast_mut::<gpui::Svg>().is_some());
+
+        // The identity a row looks a mark up by is the Agent's id plus the name
+        // the runtime lists it under, so an Agent whose id is a bare command
+        // still finds its brand.
+        assert_eq!(
+            agent_brand_identity("zcode", "ZCode"),
+            "zcode ZCode".to_string()
+        );
+        assert_eq!(
+            agent_brand_identity_asset(&agent_brand_identity("deepseek-harness", "")),
+            Some(("icons/agents/deepseek-harness.svg", false))
+        );
+
+        // The fade is the desktop row's own ladder, and it is taken from the
+        // sidebar foreground token rather than a fixed grey — which is what
+        // makes one ladder read on either appearance.
+        let logo = source
+            .split_once("fn sidebar_agent_logo")
+            .map(|(_, tail)| tail.split_once("\nfn ").map_or(tail, |(body, _)| body))
+            .expect("the sidebar Agent mark should stay inspectable");
+        assert!(logo.contains("theme::sidebar_foreground(if active { 0.80 } else { 0.58 })"));
+        assert!(logo.contains("theme::SIDEBAR_AGENT_LOGO_SIZE"));
     }
 
     /// Every brand path referenced by the model/Agent lookup tables must be
