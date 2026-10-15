@@ -2493,6 +2493,28 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
+        AppMessage::NativeExport(result) => match result {
+            Ok(preview) => {
+                if let Some(Overlay::NativeExport { view }) = app.overlay.as_mut() {
+                    view.preview = Some(preview);
+                    view.notice = None;
+                }
+            }
+            Err(error) => {
+                app.toast(Toast::danger(error.message.clone()));
+                if let Some(Overlay::NativeExport { view }) = app.overlay.as_mut() {
+                    view.notice = Some((error.message, crate::config_center::ConfigTone::Bad));
+                }
+            }
+        },
+        AppMessage::NativeExportHistory(result) => match result {
+            Ok(history) => {
+                if let Some(Overlay::NativeExport { view }) = app.overlay.as_mut() {
+                    view.history = history;
+                }
+            }
+            Err(error) => app.toast(Toast::danger(error.message)),
+        },
         AppMessage::NativeImport(result) => match result {
             Ok(preview) => {
                 app.management_data.native_import = Some(preview);

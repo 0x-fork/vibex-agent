@@ -8291,6 +8291,118 @@ fn render_entry_actions(
     frame.render_widget(Paragraph::new(lines), layout.content);
 }
 
+/// One profile, offered to another tool's own settings.
+///
+/// The picker shows the question — which target, which contents — and then the
+/// plan that question produced: the files it would write and the redacted
+/// difference in each. Apply names the plan on screen rather than re-deriving
+/// one, so what is written is what was read.
+fn render_native_export(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    view: &crate::config_center::NativeExportView,
+    theme: &TuiTheme,
+) {
+    use crate::config_center as cc;
+    let strings = app.strings;
+    let title = format!("{} · {}", strings.config_export_title(), view.title);
+    let chrome = modal_chrome(
+        app,
+        &title,
+        ModalSizing::new(70, 96, 44, 2, 2, 1, 1),
+        vec![
+            ModalHint::new("t", strings.config_export_source_agent()),
+            ModalHint::new("m", strings.config_field_kind()),
+            ModalHint::new("v", strings.config_field_preview()),
+            ModalHint::new("w", strings.config_action_save()),
+            ModalHint::new("b", strings.config_action_rollback()),
+            ModalHint::new("Esc", strings.close()),
+        ],
+    );
+    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
+        return;
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("  {}", strings.config_export_hint()),
+        Style::default().fg(theme.roles.gray_dim),
+    )));
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("{}: ", cc::native_export_source_label(view.source, strings)),
+            Style::default()
+                .fg(theme.roles.foreground)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            cc::native_export_mode_label(view.mode, strings).to_string(),
+            Style::default().fg(theme.roles.text_secondary),
+        ),
+    ]));
+    let files = cc::native_export_file_rows(view.preview.as_deref(), strings);
+    if files.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", strings.config_export_no_preview()),
+            Style::default().fg(theme.roles.gray_dim),
+        )));
+    }
+    for file in &files {
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(format!(" {:<12}", file.chip), chip_style(file.tone, theme)),
+            Span::styled(
+                truncate_to_width(&file.label, 44, "…"),
+                Style::default().fg(theme.roles.foreground),
+            ),
+        ]));
+        for line in file.diff.lines().take(6) {
+            lines.push(Line::from(Span::styled(
+                format!("      {line}"),
+                Style::default().fg(theme.roles.gray_bright),
+            )));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        format!("  {}", strings.config_export_history()),
+        Style::default()
+            .fg(theme.roles.text_secondary)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let history = cc::native_export_record_rows(&view.history, strings);
+    if history.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", strings.config_export_no_history()),
+            Style::default().fg(theme.roles.gray_dim),
+        )));
+    }
+    for record in &history {
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!("{:<14}", record.status),
+                Style::default().fg(if record.rollbackable {
+                    theme.roles.warning
+                } else {
+                    theme.roles.gray_dim
+                }),
+            ),
+            Span::styled(
+                format!("{} · {}", record.source, record.mode),
+                Style::default().fg(theme.roles.gray_bright),
+            ),
+        ]));
+    }
+    if let Some((notice, tone)) = &view.notice {
+        lines.push(Line::from(Span::styled(
+            format!("  {notice}"),
+            chip_style(*tone, theme),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), layout.content);
+}
+
 /// What other CLI tools hold, offered to import.
 ///
 /// The picker is the area's rather than a record's: a reader looks for settings
@@ -8803,6 +8915,7 @@ fn render_overlay(
         }
         Overlay::Models { view } => render_models(frame, area, app, view, theme),
         Overlay::NativeImport { view } => render_native_import(frame, area, app, view, theme),
+        Overlay::NativeExport { view } => render_native_export(frame, area, app, view, theme),
         Overlay::Approval { selected } => render_approval(frame, area, app, *selected, theme),
         // The question card is not a box over the page: it is drawn in the
         // composer's band, which the frame paints before it gets here.

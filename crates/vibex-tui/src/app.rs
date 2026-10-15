@@ -216,6 +216,10 @@ pub enum Overlay {
     NativeImport {
         view: crate::config_center::NativeImportView,
     },
+    /// One profile, offered to another tool's own settings.
+    NativeExport {
+        view: Box<crate::config_center::NativeExportView>,
+    },
     /// A multi-field editor for one configuration record.
     ///
     /// A form rather than a prompt because an MCP server is not a name: it has
@@ -8531,6 +8535,14 @@ pub enum ConfigMutation {
     // ---- provider profiles ----------------------------------------------
     /// Make a profile that does not exist yet.
     CreateProviderProfile(Box<vibex_core::AgentModelProviderProfileCreateRequest>),
+    /// Write a planned export into the target's own files.
+    ApplyNativeExport {
+        export_id: String,
+    },
+    /// Put a written export back the way it was.
+    RollbackNativeExport {
+        export_id: String,
+    },
     /// Make a profile out of one item another CLI tool holds.
     ImportNativeProfile {
         item_id: String,
@@ -8645,6 +8657,9 @@ impl ConfigMutation {
             Self::UpdateProviderProfile { profile_id, .. }
             | Self::DeleteProviderProfile { profile_id, .. } => profile_id.as_str().to_string(),
             Self::CreateProviderProfile(_) => "provider:new".to_string(),
+            Self::ApplyNativeExport { export_id } | Self::RollbackNativeExport { export_id } => {
+                export_id.clone()
+            }
             Self::ImportNativeProfile { item_id, .. } => item_id.clone(),
             Self::SetProviderOrder { agent_id, .. } => agent_id.as_str().to_string(),
             Self::CreateMcpServer(_) => "mcp:new".to_string(),
@@ -8679,6 +8694,8 @@ impl ConfigMutation {
             Self::CheckAgentUpdate { .. } => "agent_update_check",
             Self::RollbackAgent { .. } => "agent_rollback",
             Self::CreateProviderProfile(_) => "provider_profile_create",
+            Self::ApplyNativeExport { .. } => "provider_native_export_apply",
+            Self::RollbackNativeExport { .. } => "provider_native_export_rollback",
             Self::ImportNativeProfile { .. } => "provider_native_import_run",
             Self::SetProviderOrder { .. } => "provider_order_set",
             Self::UpdateProviderProfile { .. } => "provider_profile",
@@ -8726,6 +8743,8 @@ impl ConfigMutation {
             Self::CheckAgentUpdate { .. } => Verb::CheckUpdate,
             Self::RollbackAgent { .. } => Verb::Rollback,
             Self::CreateProviderProfile(_) => Verb::Create,
+            Self::ApplyNativeExport { .. } => Verb::Save,
+            Self::RollbackNativeExport { .. } => Verb::Rollback,
             Self::ImportNativeProfile { .. } => Verb::Import,
             Self::SetProviderOrder { .. } => Verb::Save,
             Self::UpdateProviderProfile { .. } => Verb::Save,
@@ -9079,6 +9098,16 @@ pub enum Effect {
     DiscoverSources {
         module: crate::config_center::ConfigModule,
     },
+    /// Write a preview. `persist` records the plan so it can be applied.
+    PreviewNativeExport {
+        profile_id: vibex_core::ProviderProfileId,
+        source: vibex_core::ProviderNativeExportSource,
+        mode: vibex_core::ProviderNativeExportMode,
+    },
+    /// Read what has been exported for one profile.
+    NativeExportHistory {
+        profile_id: vibex_core::ProviderProfileId,
+    },
     /// Read what other CLI tools on this machine hold, ready to import.
     PreviewNativeImport {
         sources: Vec<vibex_core::ProviderNativeImportSource>,
@@ -9159,6 +9188,8 @@ impl Effect {
             Effect::LoadProviderProfile { .. } => "provider_profile_detail",
             Effect::LoadProviderOrder { .. } => "provider_order",
             Effect::PreviewNativeImport { .. } => "provider_native_import",
+            Effect::PreviewNativeExport { .. } => "provider_native_export",
+            Effect::NativeExportHistory { .. } => "provider_native_export_history",
             Effect::OpenSession { .. } => "open_session",
             Effect::RefreshTimeline => "timeline",
             Effect::LoadOlder { .. } => "older_timeline",

@@ -1336,6 +1336,46 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         |strings| Intent::ConfigImport.label(strings),
     ),
     binding(
+        Scope::Management,
+        Chord::plain(KeyCode::Char('x')),
+        Intent::ConfigExport,
+        |strings| Intent::ConfigExport.label(strings),
+    ),
+    // The export picker's own keys. They avoid the chords the approval and
+    // elicitation cards already own — a chord dispatches one intent, so sharing
+    // one would silently disable a surface — and they are letters rather than
+    // chords because a reader cycling targets presses them repeatedly.
+    binding(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('t')),
+        Intent::ConfigExportSource,
+        |strings| Intent::ConfigExportSource.label(strings),
+    ),
+    binding(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('m')),
+        Intent::ConfigExportMode,
+        |strings| Intent::ConfigExportMode.label(strings),
+    ),
+    binding(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('v')),
+        Intent::ConfigExportPreview,
+        |strings| Intent::ConfigExportPreview.label(strings),
+    ),
+    binding(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('w')),
+        Intent::ConfigExportApply,
+        |strings| Intent::ConfigExportApply.label(strings),
+    ),
+    binding(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('b')),
+        Intent::ConfigExportRollback,
+        |strings| Intent::ConfigExportRollback.label(strings),
+    ),
+    binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Char('r')),
         Intent::ConfigImportRefresh,

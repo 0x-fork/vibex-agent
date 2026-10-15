@@ -174,6 +174,10 @@ pub enum AppMessage {
     ProviderOrder(BackendResult<Vec<vibex_core::AgentModelProviderDisplayOrderEntry>>),
     /// What other CLI tools on this machine hold.
     NativeImport(BackendResult<vibex_core::ProviderNativeImportPreview>),
+    /// What one profile's export would write.
+    NativeExport(BackendResult<Box<vibex_core::ProviderNativeExportPreview>>),
+    /// What has been exported for one profile.
+    NativeExportHistory(BackendResult<Vec<vibex_core::ProviderNativeExportRecordSummary>>),
     ProviderTest(BackendResult<vibex_core::AgentModelProviderProfileTestResult>),
     ProviderModels(BackendResult<Vec<vibex_core::ProviderConfiguredModel>>),
     Agents(BackendResult<Vec<vibex_core::AgentSnapshotEntry>>),
@@ -604,6 +608,64 @@ impl Dispatch {
                     .rollback_managed_agent(request)
                     .await
                     .map(|state| install_outcome(&state))
+            }
+            M::ApplyNativeExport { export_id } => {
+                let Ok(export_id) = vibex_core::RequestId::parse(export_id) else {
+                    return self.failure_for(
+                        "provider_native_export_apply",
+                        None,
+                        BackendError::failed(
+                            "provider_native_export_unknown",
+                            "the export is no longer listed",
+                        ),
+                    );
+                };
+                let request = MutationRequest::new(vibex_core::ProviderNativeExportApplyRequest {
+                    export_id,
+                });
+                self.facade
+                    .management()
+                    .apply_native_export(request)
+                    .await
+                    .map(|result| crate::app::MutationOutcome::Verdict {
+                        passed: matches!(
+                            result.status,
+                            vibex_core::ProviderNativeExportApplyStatus::Applied
+                        ),
+                        warned: matches!(
+                            result.status,
+                            vibex_core::ProviderNativeExportApplyStatus::PartiallyApplied
+                        ),
+                        message: format!("{} {}", result.files.len(), "files"),
+                    })
+            }
+            M::RollbackNativeExport { export_id } => {
+                let Ok(export_id) = vibex_core::RequestId::parse(export_id) else {
+                    return self.failure_for(
+                        "provider_native_export_rollback",
+                        None,
+                        BackendError::failed(
+                            "provider_native_export_unknown",
+                            "the export is no longer listed",
+                        ),
+                    );
+                };
+                let request =
+                    MutationRequest::new(vibex_core::ProviderNativeExportRollbackRequest {
+                        export_id,
+                    });
+                self.facade
+                    .management()
+                    .rollback_native_export(request)
+                    .await
+                    .map(|result| crate::app::MutationOutcome::Verdict {
+                        passed: matches!(
+                            result.status,
+                            vibex_core::ProviderNativeExportRollbackStatus::Restored
+                        ),
+                        warned: false,
+                        message: format!("{} {}", result.files.len(), "files"),
+                    })
             }
             M::ImportNativeProfile { item_id, sources } => {
                 let Ok(import_item_id) = vibex_core::RequestId::parse(item_id) else {
@@ -1573,6 +1635,35 @@ impl Dispatch {
                     .agent_model_provider_profile_detail(request)
                     .await;
                 self.send(AppMessage::ProviderProfile(result));
+            }
+            Effect::PreviewNativeExport {
+                profile_id,
+                source,
+                mode,
+            } => {
+                // A preview is recorded so it can be applied: the plan the
+                // reader is looking at is the plan that would be written, and an
+                // export that was re-derived at apply time could differ from it.
+                let request = vibex_core::ProviderNativeExportPreviewRequest {
+                    provider_profile_id: profile_id,
+                    source,
+                    mode,
+                    persist: true,
+                };
+                let result = self
+                    .facade
+                    .management()
+                    .preview_native_export(request)
+                    .await;
+                self.send(AppMessage::NativeExport(result.map(Box::new)));
+            }
+            Effect::NativeExportHistory { profile_id } => {
+                let request = vibex_core::ProviderNativeExportListRequest {
+                    provider_profile_id: Some(profile_id),
+                    limit: Some(20),
+                };
+                let result = self.facade.management().native_exports(request).await;
+                self.send(AppMessage::NativeExportHistory(result));
             }
             Effect::PreviewNativeImport { sources } => {
                 let request = vibex_core::ProviderNativeImportPreviewRequest { sources };

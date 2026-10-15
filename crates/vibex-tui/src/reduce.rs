@@ -1138,6 +1138,7 @@ impl App {
             Intent::ConfigFormCopy => Outcome::quiet(),
             Intent::ConfigModels => self.open_model_editor(),
             Intent::ConfigImport => self.open_native_import(),
+            Intent::ConfigExport => self.open_native_export(),
             // The Model editor's own keys, reaching here only when no overlay is
             // open to receive them.
             Intent::ConfigModelToggle
@@ -1145,7 +1146,12 @@ impl App {
             | Intent::ConfigModelRemove
             | Intent::ConfigModelFetch
             | Intent::ConfigModelEdit
-            | Intent::ConfigImportRefresh => Outcome::quiet(),
+            | Intent::ConfigImportRefresh
+            | Intent::ConfigExportSource
+            | Intent::ConfigExportMode
+            | Intent::ConfigExportPreview
+            | Intent::ConfigExportApply
+            | Intent::ConfigExportRollback => Outcome::quiet(),
             Intent::ConfigRegistryFilter => self.step_registry_narrowing(RegistryStep::Transport),
             Intent::ConfigRegistrySort => self.step_registry_narrowing(RegistryStep::Sort),
             Intent::ConfigRegistryPagePrevious => self.step_registry_page(-1),
@@ -1994,6 +2000,138 @@ impl App {
                 Outcome::effects(vec![])
             }
             None => Outcome::quiet(),
+        }
+    }
+
+    /// `x`: write this profile into another tool's own settings.
+    ///
+    /// The export belongs to a record — it is one profile that gets written —
+    /// so unlike the import it is offered on the profile the cursor is on.
+    fn open_native_export(&mut self) -> Outcome {
+        use crate::config_center::ConfigSection;
+        if self.config_center.section != ConfigSection::Providers {
+            return Outcome::quiet();
+        }
+        let Some(row) = self.selected_config_row() else {
+            return Outcome::quiet();
+        };
+        let Some(profile) = self.provider(&row.key).cloned() else {
+            return Outcome::quiet();
+        };
+        let profile_id = profile.id.clone();
+        self.overlay = Some(Overlay::NativeExport {
+            view: Box::new(crate::config_center::NativeExportView {
+                agent_id: profile.agent_id.as_str().to_string(),
+                profile_id: profile.id.as_str().to_string(),
+                title: profile.display_name.clone(),
+                source: vibex_core::ProviderNativeExportSource::AgentDefault,
+                mode: vibex_core::ProviderNativeExportMode::ProviderProfile,
+                preview: None,
+                history: Vec::new(),
+                selected: 0,
+                notice: None,
+            }),
+        });
+        Outcome::effects(vec![Effect::NativeExportHistory { profile_id }])
+    }
+
+    /// The keys of the export picker.
+    fn perform_native_export(
+        &mut self,
+        intent: Intent,
+        mut view: crate::config_center::NativeExportView,
+    ) -> Outcome {
+        use crate::config_center as cc;
+        let Ok(profile_id) = parse_config_id::<vibex_core::ProviderProfileId>(&view.profile_id)
+        else {
+            return Outcome::quiet();
+        };
+        match intent {
+            Intent::ConfigExportSource => {
+                view.source = cc::cycle(&cc::native_export_sources(), view.source);
+                // The plan was made for the old question, so it is dropped
+                // rather than applied to a target it does not describe.
+                view.preview = None;
+                self.overlay = Some(Overlay::NativeExport {
+                    view: Box::new(view),
+                });
+                Outcome::effects(vec![])
+            }
+            Intent::ConfigExportMode => {
+                view.mode = cc::cycle(&cc::native_export_modes(), view.mode);
+                view.preview = None;
+                self.overlay = Some(Overlay::NativeExport {
+                    view: Box::new(view),
+                });
+                Outcome::effects(vec![])
+            }
+            Intent::ConfigExportPreview => {
+                let source = view.source;
+                let mode = view.mode;
+                self.overlay = Some(Overlay::NativeExport {
+                    view: Box::new(view),
+                });
+                Outcome::effects(vec![Effect::PreviewNativeExport {
+                    profile_id,
+                    source,
+                    mode,
+                }])
+            }
+            // Applying names the plan the reader is looking at, so a press with
+            // nothing previewed asks for the preview rather than writing a plan
+            // the reader never saw.
+            Intent::ConfigExportApply => match view
+                .preview
+                .as_ref()
+                .map(|preview| preview.export_id.clone())
+            {
+                Some(export_id) => self.begin_record_work(
+                    view.profile_id.clone(),
+                    view.title.clone(),
+                    cc::ConfigVerb::Save,
+                    vec![Effect::ConfigMutation {
+                        mutation: crate::app::ConfigMutation::ApplyNativeExport {
+                            export_id: export_id.as_str().to_string(),
+                        },
+                        record: view.profile_id.clone(),
+                    }],
+                ),
+                None => {
+                    self.overlay = Some(Overlay::NativeExport {
+                        view: Box::new(view),
+                    });
+                    Outcome::quiet()
+                }
+            },
+            Intent::ConfigExportRollback => {
+                let record = view.history.iter().find(|record| {
+                    record.applied_at_ms.is_some() && record.rolled_back_at_ms.is_none()
+                });
+                let Some(record) = record else {
+                    return Outcome::quiet();
+                };
+                let export_id = record.export_id.as_str().to_string();
+                self.overlay = Some(Overlay::NativeExport {
+                    view: Box::new(view),
+                });
+                Outcome::effects(vec![Effect::ConfigMutation {
+                    mutation: crate::app::ConfigMutation::RollbackNativeExport { export_id },
+                    record: self
+                        .selected_config_row()
+                        .map(|row| row.key)
+                        .unwrap_or_default(),
+                }])
+            }
+            Intent::CloseOverlay | Intent::Back => {
+                self.overlay = None;
+                Outcome::effects(vec![])
+            }
+            _ => {
+                self.overlay = Some(Overlay::NativeExport {
+                    view: Box::new(view),
+                });
+                Outcome::quiet()
+            }
         }
     }
 
@@ -3892,6 +4030,7 @@ impl App {
             },
             Overlay::Models { view } => self.perform_models(intent, view),
             Overlay::NativeImport { view } => self.perform_native_import(intent, view),
+            Overlay::NativeExport { view } => self.perform_native_export(intent, *view),
             Overlay::Approval { selected } => match intent {
                 Intent::ApprovalApprove
                 | Intent::ApprovalDeny

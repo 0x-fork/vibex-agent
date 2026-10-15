@@ -2344,3 +2344,128 @@ fn native_settings_are_offered_for_import() {
     let outcome = app.perform(vibex_tui::action::Intent::ConfigImport);
     assert!(outcome.effects.is_empty(), "another area imported settings");
 }
+
+/// One export plan, as the authority answers a preview with.
+fn native_export_preview() -> vibex_core::ProviderNativeExportPreview {
+    serde_json::from_value(serde_json::json!({
+        "exportId": "request_export",
+        "providerProfileId": "provider_first",
+        "source": "agent_default",
+        "mode": "provider_profile",
+        "files": [{
+            "operationId": "request_file",
+            "source": "agent_default",
+            "fileKind": "codex_config_toml",
+            "operationKind": "update_file",
+            "targetPath": "/home/dev/.codex/config.toml",
+            "redactedBefore": "model = \"gpt-4\"",
+            "redactedAfter": "model = \"gpt-5\"",
+            "redactedDiff": "-model = \"gpt-4\"\n+model = \"gpt-5\"",
+            "rollbackPlan": "restore the backup",
+            "diagnostics": [],
+            "status": "ready"
+        }],
+        "diagnostics": [],
+        "createdAtMs": 1
+    }))
+    .expect("native export fixture")
+}
+
+/// A profile can be written into another tool's own settings, and taken back.
+///
+/// The plan is the thing the reader agrees to, so Apply names the plan on screen
+/// rather than deriving a second one: an export re-derived at apply time could
+/// write something the reader never read. Changing the question drops the plan
+/// for the same reason.
+#[test]
+fn a_profile_can_be_exported_to_another_tools_settings() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    // `x` opens the picker and asks what has been exported before.
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigExport);
+    assert!(
+        outcome
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, vibex_tui::app::Effect::NativeExportHistory { .. })),
+        "the picker did not read the history: {:#?}",
+        outcome.effects
+    );
+    let Some(Overlay::NativeExport { view }) = app.overlay.clone() else {
+        panic!("the picker did not open");
+    };
+    assert_eq!(view.profile_id, "provider_first");
+    assert_eq!(
+        view.source,
+        vibex_core::ProviderNativeExportSource::AgentDefault,
+        "the picker did not open on the profile's own Agent"
+    );
+
+    // Applying with nothing previewed asks for the plan instead of writing one.
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigExportApply);
+    assert!(outcome.effects.is_empty(), "an unseen plan was applied");
+
+    // A preview carries the question, and the answer is what Apply names.
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigExportPreview);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::PreviewNativeExport { source, mode, .. }] => {
+            assert_eq!(
+                *source,
+                vibex_core::ProviderNativeExportSource::AgentDefault
+            );
+            assert_eq!(*mode, vibex_core::ProviderNativeExportMode::ProviderProfile);
+        }
+        other => panic!("the preview asked nothing: {other:?}"),
+    }
+    if let Some(Overlay::NativeExport { view }) = app.overlay.as_mut() {
+        view.preview = Some(Box::new(native_export_preview()));
+    }
+
+    // The files the plan would write are listed, with the difference.
+    let files = vibex_tui::config_center::native_export_file_rows(
+        match &app.overlay {
+            Some(Overlay::NativeExport { view }) => view.preview.as_deref(),
+            _ => None,
+        },
+        app.strings,
+    );
+    assert_eq!(files.len(), 1);
+    assert!(files[0].diff.contains("+model = \"gpt-5\""));
+
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigExportApply);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::ApplyNativeExport { export_id } = mutation else {
+                panic!("the apply named something else: {mutation:?}");
+            };
+            assert_eq!(export_id, "request_export");
+        }
+        other => panic!("the apply produced {other:?}"),
+    }
+
+    // Changing the question drops the plan: it describes the old one.
+    app.config_center.pending.clear();
+    app.perform(vibex_tui::action::Intent::ConfigExportSource);
+    let Some(Overlay::NativeExport { view }) = app.overlay.clone() else {
+        panic!("the picker closed");
+    };
+    assert!(view.preview.is_none(), "a plan for another target was kept");
+    assert_ne!(
+        view.source,
+        vibex_core::ProviderNativeExportSource::AgentDefault
+    );
+}
+
+/// The export belongs to a record, so it does nothing away from the profiles.
+#[test]
+fn the_export_verb_belongs_to_a_profile() {
+    let mut app = loaded(140, 40);
+    app.show_config_module(ConfigModule::Mcp, None);
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigExport);
+    assert!(
+        outcome.effects.is_empty() && app.overlay.is_none(),
+        "another area exported settings"
+    );
+}

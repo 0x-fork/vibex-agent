@@ -3459,6 +3459,170 @@ pub fn native_import_sources() -> Vec<vibex_core::ProviderNativeImportSource> {
     vec![Source::Codex, Source::Claude, Source::CcSwitch]
 }
 
+/// Where a native export writes, in the order the picker cycles them.
+///
+/// The first is the Agent the profile itself runs, which is the only answer
+/// that needs a word rather than a name: every other entry is a product, and a
+/// product is called what it is called in every language.
+pub const fn native_export_sources() -> [vibex_core::ProviderNativeExportSource; 14] {
+    use vibex_core::ProviderNativeExportSource as Source;
+    [
+        Source::AgentDefault,
+        Source::Codex,
+        Source::Claude,
+        Source::Cursor,
+        Source::Grok,
+        Source::Gemini,
+        Source::Kimi,
+        Source::OpenCode,
+        Source::QwenCode,
+        Source::Cline,
+        Source::CodeBuddy,
+        Source::Copilot,
+        Source::OpenClaw,
+        Source::Hermes,
+    ]
+}
+
+pub fn native_export_source_label(
+    source: vibex_core::ProviderNativeExportSource,
+    strings: Strings,
+) -> &'static str {
+    use vibex_core::ProviderNativeExportSource as Source;
+    match source {
+        Source::AgentDefault => strings.config_export_source_agent(),
+        Source::Codex => "Codex",
+        Source::Claude => "Claude",
+        Source::Cursor => "Cursor",
+        Source::Grok => "Grok Build",
+        Source::Gemini => "Gemini",
+        Source::Kimi => "Kimi",
+        Source::OpenCode => "OpenCode",
+        Source::QwenCode => "Qwen Code",
+        Source::Cline => "Cline",
+        Source::CodeBuddy => "CodeBuddy",
+        Source::Copilot => "Copilot",
+        Source::OpenClaw => "OpenClaw",
+        Source::Hermes => "Hermes",
+    }
+}
+
+/// What a native export writes, in the order the picker cycles them.
+pub const fn native_export_modes() -> [vibex_core::ProviderNativeExportMode; 5] {
+    use vibex_core::ProviderNativeExportMode as Mode;
+    [
+        Mode::ProviderProfile,
+        Mode::Combined,
+        Mode::Mcp,
+        Mode::Skills,
+        Mode::Prompts,
+    ]
+}
+
+pub fn native_export_mode_label(
+    mode: vibex_core::ProviderNativeExportMode,
+    strings: Strings,
+) -> &'static str {
+    use vibex_core::ProviderNativeExportMode as Mode;
+    match mode {
+        Mode::ProviderProfile => strings.config_export_mode_profile(),
+        Mode::Combined => strings.config_export_mode_combined(),
+        Mode::Mcp => strings.config_export_mode_mcp(),
+        Mode::Skills => strings.config_export_mode_skills(),
+        Mode::Prompts => strings.config_export_mode_prompts(),
+    }
+}
+
+/// The next entry of a cycle, given the list it walks.
+pub fn cycle<T: PartialEq + Copy>(all: &[T], current: T) -> T {
+    let index = all.iter().position(|entry| *entry == current).unwrap_or(0);
+    all[(index + 1) % all.len()]
+}
+
+/// What one export writes and whether it landed, as the picker lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeExportFileRow {
+    pub label: String,
+    pub chip: String,
+    pub tone: ConfigTone,
+    /// The redacted difference the reader is agreeing to.
+    pub diff: String,
+}
+
+/// The files one preview would write.
+pub fn native_export_file_rows(
+    preview: Option<&vibex_core::ProviderNativeExportPreview>,
+    strings: Strings,
+) -> Vec<NativeExportFileRow> {
+    let Some(preview) = preview else {
+        return Vec::new();
+    };
+    preview
+        .files
+        .iter()
+        .map(|file| {
+            use vibex_core::ProviderNativeExportFileStatus as Status;
+            let (chip, tone) = match file.status {
+                Status::Ready => (strings.config_state_available(), ConfigTone::Ok),
+                Status::NoOp => (strings.config_export_unchanged(), ConfigTone::Muted),
+                Status::Blocked => (strings.config_state_blocked(), ConfigTone::Bad),
+                Status::Failed => (strings.config_state_error(), ConfigTone::Bad),
+                Status::Applied => (strings.config_export_applied(), ConfigTone::Ok),
+                Status::Restored => (strings.config_export_rolled_back(), ConfigTone::Muted),
+            };
+            NativeExportFileRow {
+                label: file.target_path.clone(),
+                chip: chip.to_string(),
+                tone,
+                diff: file.redacted_diff.clone(),
+            }
+        })
+        .collect()
+}
+
+/// One line of the export history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeExportRecordRow {
+    pub export_id: String,
+    pub source: String,
+    pub mode: String,
+    pub status: String,
+    /// Whether this one can still be rolled back.
+    pub rollbackable: bool,
+}
+
+pub fn native_export_record_rows(
+    history: &[vibex_core::ProviderNativeExportRecordSummary],
+    strings: Strings,
+) -> Vec<NativeExportRecordRow> {
+    history
+        .iter()
+        .map(|record| NativeExportRecordRow {
+            export_id: record.export_id.as_str().to_string(),
+            source: native_export_source_label(record.source, strings).to_string(),
+            mode: native_export_mode_label(record.mode, strings).to_string(),
+            status: record.status.clone(),
+            rollbackable: record.applied_at_ms.is_some() && record.rolled_back_at_ms.is_none(),
+        })
+        .collect()
+}
+
+/// Which export the picker is on, and what it last answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeExportView {
+    pub agent_id: String,
+    pub profile_id: String,
+    pub title: String,
+    pub source: vibex_core::ProviderNativeExportSource,
+    pub mode: vibex_core::ProviderNativeExportMode,
+    /// The preview the reader asked for, which is what Apply names.
+    pub preview: Option<Box<vibex_core::ProviderNativeExportPreview>>,
+    pub history: Vec<vibex_core::ProviderNativeExportRecordSummary>,
+    /// Which history record the cursor is on.
+    pub selected: usize,
+    pub notice: Option<(String, ConfigTone)>,
+}
+
 /// Which import the picker is on, and what it last said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeImportView {
