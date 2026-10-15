@@ -66,9 +66,9 @@ The status band names the mode, and *Settings → Connection* shows the same wor
 | **Remote mode** | another runtime owns the home, or a link was given | the client is a network peer; steering degrades to interrupt + resend |
 
 If the home is locked and the runtime is not accepting local clients, the client
-prints the endpoints it tried and three ways out: enable *Settings → Remote
-Access → Local clients* in the desktop app, quit the desktop app, or connect to
-another runtime with `vibex connect`.
+prints the endpoints it tried and three ways out: turn on *Settings → General →
+Vibex TUI* in the desktop app, quit the desktop app, or connect to another
+runtime with `vibex connect`.
 
 ## Screen composition
 

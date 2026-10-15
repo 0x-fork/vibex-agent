@@ -10273,7 +10273,10 @@ mod tests {
     #[test]
     fn locked_seat_help_offers_every_way_out() {
         let help = locked_seat_help(strings());
-        assert!(help.contains("Remote Access"));
+        // The switch that serves this client is a General setting now, not a
+        // Remote Access method, so the help has to send the reader there.
+        assert!(help.contains("Settings → General"));
+        assert!(help.contains("Vibex TUI"));
         assert!(help.contains("vibex connect"));
     }
 

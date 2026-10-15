@@ -46,7 +46,7 @@ client is in one of two seats:
 
 Seat selection is visible in the status bar. When the home is locked and the
 runtime is not accepting local clients, the client must print the endpoints it
-tried and the three ways out (enable Remote Access → Local clients, quit the
+tried and the three ways out (turn on Settings → General → Vibex TUI, quit the
 desktop app, or `vibex connect`) rather than a bare connection error.
 
 ### Local bootstrap trust model
@@ -68,8 +68,9 @@ the home. Its trust anchor is **the filesystem**, not the loopback interface:
 
 A desktop serves same-machine clients on its pinned-certificate Gateway narrowed
 to the loopback address, and that listener is **not** part of Remote Access: it
-is up whenever the desktop is. The Direct listener is dialled only as a fallback
-for a desktop that predates the local-client listener.
+is on by default and switched from Settings → General → Vibex TUI. The Direct
+listener is dialled only as a fallback for a desktop that predates the
+local-client listener.
 
 Plain HTTP is only acceptable as an explicit, loopback, bootstrap fallback.
 Pinned TLS is preferred whenever the runtime advertises a certificate, and a

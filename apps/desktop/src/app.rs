@@ -177,9 +177,10 @@ use vibex_desktop_model::{
 use vibex_desktop_runtime::DriverState;
 use vibex_desktop_runtime::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventStream, DesktopRuntime, DesktopRuntimeConfig,
-    DesktopRuntimeFacade, DesktopRuntimeMode, PREVIEW_APP_ID, ProviderConfigChangePhase, RC_APP_ID,
-    STABLE_DESKTOP_APP_ID, SessionGroupPresentationRequest, SidebarOrganizationRequest,
-    StorageCleanupKind, StorageCleanupReport, validate_external_open_url,
+    DesktopRuntimeFacade, DesktopRuntimeMode, LocalClientsSnapshot, PREVIEW_APP_ID,
+    ProviderConfigChangePhase, RC_APP_ID, STABLE_DESKTOP_APP_ID, SessionGroupPresentationRequest,
+    SidebarOrganizationRequest, StorageCleanupKind, StorageCleanupReport,
+    validate_external_open_url,
 };
 use vibex_ui::{
     AgentFileGitController, ElicitationFormDraft, GpuiThemeMode, ManagementWorkflowCapabilities,
@@ -8497,6 +8498,22 @@ enum DelegatedPageLoad {
     Interactive,
     /// The periodic refresh, or a refresh triggered by an arriving event.
     Background,
+}
+
+/// What the settings page knows about same-machine client access.
+///
+/// The listener is a runtime fact rather than a stored preference, so the page
+/// reads it the way the Device page reads the paired registry: when the page is
+/// opened, and again after every switch. The intent and the listener are kept
+/// apart because a port already in use has to read as "asked for, not
+/// listening" instead of as a switch that silently does nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalClientsSettingsState {
+    /// Never read, or the read is in flight.
+    Unloaded,
+    Ready(LocalClientsSnapshot),
+    /// The runtime did not answer, so the page cannot claim either answer.
+    Unavailable,
 }
 
 pub struct VibexWorkbench {
@@ -40410,7 +40427,10 @@ impl VibexWorkbench {
         }
         self.settings_snapshot = Some(self.ui_state.clone());
         self.settings_view.update(cx, |settings, cx| {
-            settings.active_section = SettingsSection::General;
+            // The section activation is what re-reads the runtime facts a page
+            // depends on, so opening on General goes through it rather than
+            // assigning the field and leaving the page showing stale state.
+            settings.activate_settings_section(SettingsSection::General, cx);
             settings.shortcut_note = None;
             settings.search_selected_index = 0;
             settings
@@ -71966,11 +71986,18 @@ fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
         "startup",
         "notification",
         "language",
+        // The same-machine client switch lives on General, so a reader looking
+        // for it by the client it serves is sent there too.
+        "tui",
+        "local client",
+        "terminal client",
         "常规",
         "启动",
         "通知",
         "一般",
         "啟動",
+        "本机客户端",
+        "本機用戶端",
     ]) {
         Some(SettingsSection::General)
     } else if matches(&[
@@ -72127,6 +72154,16 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
             strings.close_to_tray,
             strings.close_to_tray_description,
             &["tray", "close", "托盘", "托盤"],
+        ),
+        settings_search_candidate(
+            SettingsSection::General,
+            locale::text("Vibex TUI", "Vibex TUI", "Vibex TUI"),
+            locale::text(
+                "Let a Vibex TUI on this computer attach to this runtime.",
+                "允许本机上的 Vibex TUI 接入此运行时。",
+                "允許本機上的 Vibex TUI 接入此執行階段。",
+            ),
+            &["tui", "terminal", "local", "terminal client", "終端機"],
         ),
         settings_search_candidate(
             SettingsSection::General,
@@ -73757,6 +73794,14 @@ struct FoundationSettings {
     settings_render_context: SettingsRenderContext,
     storage_usage_state: SettingsStorageUsageState,
     storage_usage_task: Option<Task<()>>,
+    /// Where same-machine client access stands, for the General page.
+    ///
+    /// It is read from the runtime when that page opens rather than stored,
+    /// because the listener is a runtime fact: a port already taken shows up
+    /// here and nowhere else.
+    local_clients_status: LocalClientsSettingsState,
+    /// The read or the write of that listener in flight.
+    local_clients_task: Option<Task<()>>,
     storage_cleanup_task: Option<Task<()>>,
     /// Where the host's browser profiles stand for the import dialog.
     browser_profile_sources: SettingsBrowserProfileSources,
@@ -74215,6 +74260,8 @@ impl FoundationSettings {
                 settings_render_context,
                 storage_usage_state: SettingsStorageUsageState::Unloaded,
                 storage_usage_task: None,
+                local_clients_status: LocalClientsSettingsState::Unloaded,
+                local_clients_task: None,
                 storage_cleanup_task: None,
                 browser_profile_sources: SettingsBrowserProfileSources::Unloaded,
                 browser_profile_scan_task: None,
@@ -74247,6 +74294,9 @@ impl FoundationSettings {
         }
         if section == SettingsSection::Archived {
             self.request_archived_sessions_load(cx);
+        }
+        if section == SettingsSection::General {
+            self.request_local_clients_refresh(cx);
         }
     }
 
@@ -74331,6 +74381,123 @@ impl FoundationSettings {
         let _ = self
             .workbench
             .update(cx, |workbench, cx| workbench.request_update_check(cx));
+    }
+
+    /// Reloads the same-machine client listener once the workbench is off the
+    /// stack.
+    ///
+    /// The page reads the workbench for the runtime that owns the listener, and
+    /// the General section can be activated while that entity is already being
+    /// updated (the command palette switches sections from inside
+    /// `VibexWorkbench::update`). Reading or updating an entity from its own
+    /// update panics, so the hand-off waits for the next effect cycle; the page
+    /// renders its unchecked state one tick longer.
+    fn request_local_clients_refresh(&mut self, cx: &mut Context<Self>) {
+        let settings = cx.entity();
+        cx.defer(move |cx| {
+            settings.update(cx, |settings, cx| settings.read_local_clients(cx));
+        });
+    }
+
+    /// Reads where same-machine client access stands.
+    ///
+    /// The listener is a runtime fact, not a value this page owns, so it is read
+    /// when the page opens and again after every switch instead of being
+    /// rendered from what was last seen. A read is skipped while one is already
+    /// in flight, and a switch's own write answers with the new snapshot, so the
+    /// two never race for the switch's position.
+    fn read_local_clients(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.local_clients_status,
+            LocalClientsSettingsState::Unloaded
+        ) && self.local_clients_task.is_some()
+        {
+            return;
+        }
+        // The switch is about this machine's loopback listener, so it is only
+        // honest while this machine's runtime is the authoritative one. A parked
+        // embedded runtime still owns its listener, but the seat the reader is
+        // in is another machine's, and that machine's answer is not this page's
+        // to change.
+        let runtime = self
+            .workbench
+            .read_with(cx, |workbench, _| {
+                workbench
+                    .remote_client
+                    .is_none()
+                    .then(|| workbench.runtime.clone())
+                    .flatten()
+            })
+            .ok()
+            .flatten();
+        let Some(runtime) = runtime else {
+            self.local_clients_status = LocalClientsSettingsState::Unavailable;
+            return;
+        };
+        let controller = runtime.remote_connectivity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move { controller.snapshot().await });
+        self.local_clients_status = LocalClientsSettingsState::Unloaded;
+        self.local_clients_task = Some(cx.spawn(async move |entity, cx| {
+            let Ok(snapshot) = runner.await else {
+                let _ = entity.update(cx, |this, cx| {
+                    this.local_clients_task = None;
+                    this.local_clients_status = LocalClientsSettingsState::Unavailable;
+                    cx.notify();
+                });
+                return;
+            };
+            let _ = entity.update(cx, |this, cx| {
+                this.local_clients_task = None;
+                this.local_clients_status =
+                    LocalClientsSettingsState::Ready(snapshot.local_clients);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Turns same-machine client access on or off.
+    ///
+    /// The switch is the whole surface: there is no route to publish and no
+    /// probe to run, only a listener whose bind address follows the setting. The
+    /// snapshot that comes back is the answer, so the page renders the listener
+    /// the runtime reports rather than the value that was asked for.
+    fn set_local_clients_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let Some(runtime) = self
+            .workbench
+            .read_with(cx, |workbench, _| {
+                workbench
+                    .remote_client
+                    .is_none()
+                    .then(|| workbench.runtime.clone())
+                    .flatten()
+            })
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let controller = runtime.remote_connectivity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            controller.set_local_clients_enabled(enabled).await
+        });
+        self.local_clients_task = Some(cx.spawn(async move |entity, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.local_clients_task = None;
+                match outcome {
+                    Ok(Ok(snapshot)) => {
+                        this.local_clients_status =
+                            LocalClientsSettingsState::Ready(snapshot.local_clients);
+                    }
+                    // The call is what failed, not the setting: say so rather
+                    // than leaving a switch claiming an answer nobody has.
+                    Ok(Err(_)) | Err(_) => {
+                        this.local_clients_status = LocalClientsSettingsState::Unavailable;
+                    }
+                }
+                cx.notify();
+            });
+        }));
     }
 
     fn start_storage_usage_probe(&mut self, cx: &mut Context<Self>) {
@@ -76260,6 +76427,88 @@ impl FoundationSettings {
             .into_any_element()
     }
 
+    /// The switch that serves a same-machine TUI, with its listener state.
+    ///
+    /// It lives on the General page rather than in the pairing dialog because it
+    /// is not remote access: the listener answers on the loopback address only,
+    /// and a phone never reaches it. The stored intent and the listener are
+    /// reported together so a port already in use reads as "asked for, not
+    /// listening" instead of as a switch that silently does nothing.
+    fn render_local_clients_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (state, state_color, listening, enabled) = match &self.local_clients_status {
+            LocalClientsSettingsState::Unloaded => (
+                locale::text("Checking…", "检查中…", "檢查中…"),
+                cx.theme().muted_foreground,
+                false,
+                false,
+            ),
+            LocalClientsSettingsState::Unavailable => (
+                locale::text("Not available", "不可用", "無法使用"),
+                cx.theme().muted_foreground,
+                false,
+                false,
+            ),
+            LocalClientsSettingsState::Ready(snapshot) => {
+                let (label, color) = local_clients_state_label(snapshot, cx);
+                (label, color, snapshot.listening, snapshot.enabled)
+            }
+        };
+        // The switch keeps its position while a write is in flight, so the page
+        // shows the value the runtime reported until it reports the next one.
+        // It is inert until there is a listener to change: a control that looks
+        // live while no runtime has answered would promise an action the page
+        // cannot take.
+        let actionable = matches!(
+            self.local_clients_status,
+            LocalClientsSettingsState::Ready(_)
+        );
+        let busy = self.local_clients_task.is_some()
+            || self.local_clients_status == LocalClientsSettingsState::Unloaded;
+        let disabled = busy || !actionable;
+
+        let mut control = v_flex()
+            .items_end()
+            .gap_1()
+            .child(
+                Switch::new("settings-local-clients")
+                    .checked(enabled)
+                    .disabled(disabled)
+                    .accessibility_label(locale::text("Vibex TUI", "Vibex TUI", "Vibex TUI"))
+                    .on_click(cx.listener(|this, enabled, _, cx| {
+                        this.set_local_clients_enabled(*enabled, cx)
+                    })),
+            )
+            .child(div().text_xs().text_color(state_color).child(state));
+        if enabled && !listening && !busy {
+            // The switch is on but nothing is listening. Saying so is the whole
+            // reason the intent and the listener are tracked separately.
+            control = control.child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(Icon::new(IconName::TriangleAlert).size(px(13.0)))
+                    .child(locale::text(
+                        "The port may be in use.",
+                        "端口可能已被占用。",
+                        "連接埠可能已被占用。",
+                    )),
+            );
+        }
+        if let LocalClientsSettingsState::Ready(snapshot) = &self.local_clients_status
+            && let Some(bound) = snapshot.bound_addr.filter(|_| snapshot.listening)
+        {
+            control = control.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(SharedString::from(bound.to_string())),
+            );
+        }
+        control.into_any_element()
+    }
+
     fn render_general_page(
         &self,
         desktop_behavior: &DesktopBehaviorUiState,
@@ -76280,6 +76529,7 @@ impl FoundationSettings {
             .checked(desktop_behavior.close_to_tray)
             .tooltip(strings.close_to_tray)
             .on_click(cx.listener(|this, enabled, _, cx| this.set_close_to_tray(*enabled, cx)));
+        let local_clients_control = self.render_local_clients_control(cx);
         let custom_proxy = network_proxy.mode == NetworkProxyMode::Custom;
         let proxy_value = self.proxy_input.read(cx).value().to_string();
         let proxy_error = custom_proxy
@@ -76516,6 +76766,20 @@ impl FoundationSettings {
                             cx,
                         ),
                     ],
+                ),
+                SettingsGroup::new(
+                    locale::text("On this computer", "本机", "本機"),
+                    vec![setting_row(
+                        locale::text("Vibex TUI", "Vibex TUI", "Vibex TUI"),
+                        locale::text(
+                            "Let a Vibex TUI on this computer attach to this runtime. This listener answers on the loopback address only; it is not remote access.",
+                            "允许本机上的 Vibex TUI 接入此运行时。此监听只在环回地址上应答，不属于远程访问。",
+                            "允許本機上的 Vibex TUI 接入此執行階段。此監聽只在環回位址上回應，不屬於遠端存取。",
+                        ),
+                        local_clients_control,
+                        stacked,
+                        cx,
+                    )],
                 ),
             ],
             cx,
@@ -81805,6 +82069,34 @@ pub(crate) fn relative_time_label(at_ms: i64) -> String {
     }
     let days = hours / 24;
     format!("{days} {}", locale::text("d ago", "天前", "天前"))
+}
+
+/// What the same-machine client listener is doing, in the page's own words.
+///
+/// The intent and the listener are separate states on purpose: a switch that is
+/// on while the port is taken has to read as "requested, not listening" rather
+/// than as either healthy or off. The colour is part of the answer because the
+/// three states differ in whether there is anything for the reader to do.
+fn local_clients_state_label(
+    snapshot: &LocalClientsSnapshot,
+    cx: &App,
+) -> (&'static str, gpui::Hsla) {
+    if snapshot.listening {
+        (
+            locale::text("Listening", "监听中", "監聽中"),
+            cx.theme().success,
+        )
+    } else if snapshot.enabled {
+        (
+            locale::text("Unavailable", "不可用", "無法使用"),
+            cx.theme().danger,
+        )
+    } else {
+        (
+            locale::text("Off", "已关闭", "已關閉"),
+            cx.theme().muted_foreground,
+        )
+    }
 }
 
 fn settings_value_chip(text: impl Into<SharedString>) -> Tag {
@@ -98649,6 +98941,63 @@ mod tests {
         assert!(sync_controls.contains("terminal_preferences.shell.clone()"));
         assert!(!sync_controls.contains("self.workbench"));
         assert!(!sync_controls.contains("self.terminal_preferences("));
+    }
+
+    #[test]
+    fn the_tui_listener_is_a_general_setting_and_not_a_pairing_choice() {
+        let source = include_str!("app.rs");
+
+        // The switch is drawn on the General page, labelled by the client it
+        // serves, and its state comes from the runtime rather than from a stored
+        // preference the page could show without asking.
+        let control = source
+            .split_once("    fn render_local_clients_control(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_general_page("))
+            .map(|(body, _)| body)
+            .expect("the local-client control should remain inspectable");
+        assert!(control.contains("settings-local-clients"));
+        assert!(control.contains("set_local_clients_enabled"));
+        assert!(control.contains("LocalClientsSettingsState::Ready(snapshot)"));
+        assert!(control.contains("snapshot.listening"));
+        // A switch that is inert until the runtime has answered, so it never
+        // promises a change the page cannot make.
+        assert!(control.contains("let disabled = busy || !actionable;"));
+
+        let page = source
+            .split_once("    fn render_general_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_appearance_page("))
+            .map(|(body, _)| body)
+            .expect("the General page should remain inspectable");
+        assert!(page.contains("render_local_clients_control"));
+        assert!(page.contains("Vibex TUI"));
+
+        // Activating the section is what re-reads the listener, and the read is
+        // deferred so a palette-driven switch does not update the workbench from
+        // inside its own update.
+        let activation = source
+            .split_once("    fn activate_settings_section(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Reloads the same-machine"))
+            .map(|(body, _)| body)
+            .expect("section activation should remain inspectable");
+        assert!(activation.contains("SettingsSection::General"));
+        assert!(activation.contains("request_local_clients_refresh"));
+
+        let refresh = source
+            .split_once("    fn request_local_clients_refresh(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn read_local_clients("))
+            .map(|(body, _)| body)
+            .expect("the deferred read should remain inspectable");
+        assert!(refresh.contains("cx.defer("));
+        assert!(refresh.contains("read_local_clients"));
+
+        let read = source
+            .split_once("    fn read_local_clients(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Turns same-machine client"))
+            .map(|(body, _)| body)
+            .expect("the reader should remain inspectable");
+        assert!(read.contains("remote_connectivity()"));
+        assert!(read.contains("controller.snapshot().await"));
+        assert!(read.contains("LocalClientsSettingsState::Unavailable"));
     }
 
     #[test]

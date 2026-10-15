@@ -1977,7 +1977,7 @@ fn the_selection_marker_follows_the_scope() {
 #[test]
 fn the_locked_runtime_message_gives_three_ways_out() {
     let message = vibex_tui::view::locked_seat_help(Strings::for_locale(Locale::En));
-    assert!(message.contains("Remote Access"));
+    assert!(message.contains("Settings → General"));
     assert!(message.contains("vibex connect"));
 }
 

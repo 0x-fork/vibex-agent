@@ -1710,9 +1710,9 @@ strings! {
         "另一個 Vibex 執行階段正在使用此 home"
     },
     runtime_locked_body => {
-        "Vibex Desktop is running and is not accepting local clients. Either enable Settings → Remote Access → Direct, quit the desktop app and retry, or connect to a remote runtime with `vibex connect <link>`.",
-        "Vibex 桌面端正在运行且未开放本机客户端。请在桌面端开启 设置 → 远程访问 → Direct，或退出桌面端后重试，或用 `vibex connect <链接>` 连接远程运行时。",
-        "Vibex 桌面端正在執行且未開放本機用戶端。請在桌面端開啟 設定 → 遠端存取 → Direct，或結束桌面端後重試，或用 `vibex connect <連結>` 連線遠端執行階段。"
+        "Vibex Desktop is running and is not accepting local clients. Either turn on Settings → General → Vibex TUI, quit the desktop app and retry, or connect to a remote runtime with `vibex connect <link>`.",
+        "Vibex 桌面端正在运行且未开放本机客户端。请在桌面端开启 设置 → 通用 → Vibex TUI，或退出桌面端后重试，或用 `vibex connect <链接>` 连接远程运行时。",
+        "Vibex 桌面端正在執行且未開放本機用戶端。請在桌面端開啟 設定 → 通用 → Vibex TUI，或結束桌面端後重試，或用 `vibex connect <連結>` 連線遠端執行階段。"
     },
     // How the client is attached, in the reader's words. "Seat" stays the
     // internal name (`SeatKind`); the reader sees a mode, because a seat is

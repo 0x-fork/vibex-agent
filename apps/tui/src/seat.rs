@@ -70,7 +70,7 @@ impl std::fmt::Display for SeatError {
                  Tried: {}\n\
                  Last error: {}\n\n\
                  Either:\n\
-                 \x20 1. open Settings → Remote Access in the desktop app and turn on local clients, then retry\n\
+                 \x20 1. open Settings → General in the desktop app and turn on Vibex TUI, then retry\n\
                  \x20 2. quit the desktop app and retry\n\
                  \x20 3. connect to another runtime with `vibex connect <vibex://…>`",
                 home.display(),
@@ -990,8 +990,8 @@ mod tests {
             detail: "http://127.0.0.1:1428: connection refused".to_string(),
         };
         let text = error.to_string();
-        assert!(text.contains("Remote Access"));
-        assert!(text.contains("turn on local clients"));
+        assert!(text.contains("Settings → General"));
+        assert!(text.contains("turn on Vibex TUI"));
         assert!(text.contains("quit the desktop app"));
         assert!(text.contains("vibex connect"));
         // The doors that were actually tried, so the report is not a guess.
