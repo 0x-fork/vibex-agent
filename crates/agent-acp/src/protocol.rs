@@ -788,6 +788,17 @@ pub(crate) fn build_initialize_params(
         // the feature permanently off rather than merely degraded.
         let mut reserved_meta = serde_json::Map::new();
         reserved_meta.insert("terminal_output".to_string(), json!(terminal_tools));
+        // `terminal-auth` needs the reserved spelling for the same reason
+        // `terminal_output` does, and the two are not interchangeable. OpenCode
+        // gates its terminal login method on
+        // `clientCapabilities._meta["terminal-auth"] === true`; without it the
+        // Agent still reports the method, but as a bare `Agent` method whose
+        // `authenticate` answers with an empty result and no side effect. Vibex
+        // then offers "re-authenticate", runs that no-op, and declares success
+        // without ever opening a login. The agent-extension `meta` spelling
+        // above does not satisfy OpenCode, and Claude Code reads the reserved
+        // key as well.
+        reserved_meta.insert("terminal-auth".to_string(), json!(terminal_auth));
         // DeepSeek Harness reads this to relay a subagent's transcript onto the
         // root session, tagging every relayed update with `_meta.dsh.subagent`.
         // Vibex scopes those updates to the child that produced them, so the
@@ -1055,7 +1066,11 @@ mod tests {
                         "terminal-auth": true,
                         "mcpServers": true
                     },
-                    "_meta": { "terminal_output": false, "subagent-transcript": true }
+                    "_meta": {
+                        "terminal_output": false,
+                        "terminal-auth": true,
+                        "subagent-transcript": true
+                    }
                 },
                 "clientInfo": {
                     "name": "vibex",
@@ -1068,10 +1083,10 @@ mod tests {
     /// Cursor reads the spec's reserved `_meta`, so the capability must not be
     /// folded into the plain `meta` extension key above.
     ///
-    /// `terminal_output` shares that reserved key because the Agents that
-    /// stream terminal output read it from there, and it is reported even when
-    /// terminal tools are off, so that an Agent cannot mistake silence for a
-    /// client that never looked.
+    /// `terminal_output` and `terminal-auth` share that reserved key because
+    /// the Agents that stream terminal output or offer a terminal login read
+    /// them from there. They are reported even when the feature is off, so that
+    /// an Agent cannot mistake silence for a client that never looked.
     #[test]
     fn parameterized_model_picker_is_advertised_through_the_reserved_meta_key() {
         let capabilities =
@@ -1080,6 +1095,7 @@ mod tests {
             capabilities["_meta"],
             json!({
                 "terminal_output": false,
+                "terminal-auth": false,
                 "subagent-transcript": true,
                 "parameterizedModelPicker": true
             })
@@ -1090,8 +1106,32 @@ mod tests {
             &build_initialize_params(true, true, false, false, false, false)["clientCapabilities"];
         assert_eq!(
             without["_meta"],
-            json!({ "terminal_output": false, "subagent-transcript": true }),
+            json!({
+                "terminal_output": false,
+                "terminal-auth": false,
+                "subagent-transcript": true
+            }),
             "subagent-transcript is unconditional; the picker stays opt-in"
+        );
+    }
+
+    /// OpenCode gates its terminal login method on the reserved
+    /// `_meta.terminal-auth` key. Advertising only the plain `meta` extension
+    /// left its method downgraded to a bare `Agent` method, whose `authenticate`
+    /// is a no-op — so "re-authenticate" reported success without a login.
+    #[test]
+    fn terminal_auth_is_advertised_through_the_reserved_meta_key() {
+        let enabled =
+            &build_initialize_params(true, true, false, true, false, false)["clientCapabilities"];
+        assert_eq!(enabled["_meta"]["terminal-auth"], json!(true));
+        assert_eq!(enabled["meta"]["terminal-auth"], json!(true));
+
+        let disabled =
+            &build_initialize_params(true, true, false, false, false, false)["clientCapabilities"];
+        assert_eq!(
+            disabled["_meta"]["terminal-auth"],
+            json!(false),
+            "the reserved key is reported as an explicit false, never omitted"
         );
     }
 

@@ -3131,7 +3131,10 @@ logout({})
   errors, Debug output, or UI state. The catalog exposes only `configured`.
 - A terminal auth process advertises `clientCapabilities.auth.terminal` only
   when a real terminal host exists. Headless hosts filter terminal methods and
-  never return a fake terminal id.
+  never return a fake terminal id. The reserved `_meta["terminal-auth"]` key is
+  advertised alongside it, so an Agent that gates its terminal login on the
+  spec's `_meta` still reports the method as `Terminal` kind instead of falling
+  back to a silent `Agent` method.
 - Every ACP child is launched with stdio pipes and must detach itself from the
   desktop's controlling terminal before entering its background process group.
   Some CLIs open `/dev/tty` for interactive services even in ACP mode; leaving
@@ -3331,6 +3334,13 @@ AgentAuthModelCatalogSnapshot {
   Interactive terminal/browser work returns an execution location and a
   redacted terminal descriptor; completion is followed by verification in a
   fresh process.
+- A method is only an update of shared credentials when its `authenticate`
+  actually performs one. An `Agent` method that answers with an empty result and
+  no terminal descriptor changed nothing, so it must not be presented as
+  replacing credentials: "re-authenticate" exists to change them. OpenCode is
+  the reference case — its login is a capability-gated terminal method, and
+  advertising the reserved `_meta["terminal-auth"]` key is what makes the method
+  arrive as `Terminal` kind with a real login command instead of a silent no-op.
 - Verification shuts down old account-source processes first, increments the
   context revision for a credential change, probes models with that exact
   revision, then commits `Authenticated` and the snapshot. A successful RPC
@@ -3477,7 +3487,23 @@ clientCapabilities.terminal: bool
 clientCapabilities.auth.terminal: bool
 clientCapabilities.meta.terminal_output: bool
 clientCapabilities.meta["terminal-auth"]: bool
+clientCapabilities._meta.terminal_output: bool
+clientCapabilities._meta["terminal-auth"]: bool
+clientCapabilities._meta["subagent-transcript"]: true
 ```
+
+The plain `meta` extension and the spec's reserved `_meta` are both emitted on
+purpose and are not interchangeable. Agents that gate a feature on the reserved
+key read only `_meta`, so an extension-only advertisement silently degrades the
+feature rather than merely losing it: OpenCode advertises `opencode-login` as a
+capability-gated method and attaches its `opencode auth login` terminal command
+only when `_meta["terminal-auth"] === true`. Without the reserved key the method
+stays `Agent` kind, and those Agents answer `authenticate` with an empty result
+and no side effect — which the UI would otherwise report as a completed
+"re-authentication" without opening a login. Both keys are emitted for every
+Agent, and as an explicit `false` when the capability is off, so an Agent cannot
+mistake silence for a client that never looked. This is the same failure class
+the reserved `_meta.terminal_output` key was added for.
 
 Runtime terminal host seam:
 

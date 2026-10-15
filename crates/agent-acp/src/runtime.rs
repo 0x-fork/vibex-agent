@@ -22282,6 +22282,7 @@ mod tests {
                     },
                     "_meta": {
                         "terminal_output": false,
+                        "terminal-auth": false,
                         "subagent-transcript": true
                     }
                 },
@@ -25320,6 +25321,11 @@ advertise_steering = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_STEERING") == "tru
 advertise_goal = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_GOAL") == "true"
 advertise_auth = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_LOGIN") == "true"
 authenticate_hangs = os.environ.get("VIBEX_MOCK_ACP_LOGIN_HANG") == "true"
+# OpenCode advertises one bare `Agent` method and only attaches the
+# `_meta.terminal-auth` login command when the client advertises the reserved
+# `_meta` capability. Without it the method stays an `Agent` method whose
+# `authenticate` is a silent no-op, which is the bug this mock reproduces.
+terminal_auth_gated = os.environ.get("VIBEX_MOCK_TERMINAL_LOGIN_GATED") == "true"
 initialize_mode = os.environ.get("VIBEX_MOCK_ACP_INITIALIZE_MODE", "success")
 session_new_delay = float(os.environ.get("VIBEX_MOCK_ACP_SESSION_NEW_DELAY", "0"))
 fail_first_session_new = os.environ.get("VIBEX_MOCK_ACP_FAIL_FIRST_SESSION_NEW") == "true"
@@ -25411,6 +25417,35 @@ for line in sys.stdin:
             sys.stderr.write("You are not logged in, please log in with the CLI login command\n")
             sys.stderr.flush()
             raise SystemExit(1)
+        client_capabilities = (msg.get("params") or {}).get("clientCapabilities") or {}
+        if terminal_auth_gated:
+            # Exactly OpenCode: the login method is always advertised, but the
+            # terminal descriptor only rides along when the client reads it
+            # from the spec's reserved `_meta` key.
+            method = {
+                "id": "opencode-login",
+                "name": "Login with opencode",
+                "description": "Run `opencode auth login` in the terminal",
+            }
+            if (client_capabilities.get("_meta") or {}).get("terminal-auth") is True:
+                method["_meta"] = {
+                    "terminal-auth": {
+                        "command": "opencode",
+                        "args": ["auth", "login"],
+                        "label": "OpenCode Login",
+                    }
+                }
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {
+                    "protocolVersion": 1,
+                    "agentCapabilities": {},
+                    "agentInfo": {"name": "mock-opencode", "version": "1.0.0"},
+                    "authMethods": [method],
+                },
+            })
+            continue
         capabilities = {
             "loadSession": True,
             "listSessions": True,
@@ -26970,6 +27005,29 @@ for line in sys.stdin:
                 .unwrap();
         }
 
+        /// Advertise OpenCode's capability-gated login method: one bare `Agent`
+        /// method whose terminal descriptor only appears when the client
+        /// advertises the reserved `_meta.terminal-auth` capability.
+        fn enable_terminal_auth_gated_login(&self) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_TERMINAL_LOGIN_GATED".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some("true".to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock capability-gated terminal login".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
         fn set_authentication_hang(&self, hang: bool) {
             let service = self.service();
             let mut config = service
@@ -27073,6 +27131,52 @@ for line in sys.stdin:
         fn cleanup(self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// OpenCode advertises its login as a bare `Agent` method and attaches the
+    /// terminal login command only when the client advertises the reserved
+    /// `_meta.terminal-auth` capability. When Vibex advertised only the plain
+    /// `meta` extension spelling, the method stayed `Agent` kind, so
+    /// `authenticate` returned no terminal and the UI declared a successful
+    /// "re-authentication" without ever opening a login.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capability_gated_terminal_login_is_not_a_silent_agent_no_op() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let Some(fixture) =
+            MockAcpFixture::create_for_agent("agent-auth-terminal-gated", Some(agent_id.clone()))
+        else {
+            return;
+        };
+        fixture.enable_terminal_auth_gated_login();
+        let terminal_host = Arc::new(MockTerminalHost::default());
+        let client = AcpRuntimeClient::with_terminal_host(fixture.service(), terminal_host.clone());
+
+        let catalog = client
+            .list_auth_methods(&agent_id, Some(&fixture.profile_id))
+            .await
+            .unwrap();
+        assert_eq!(catalog.methods.len(), 1);
+        assert_eq!(catalog.methods[0].id, "opencode-login");
+        assert_eq!(
+            catalog.methods[0].kind,
+            AgentAuthMethodKind::Terminal,
+            "the reserved terminal-auth capability must upgrade the method so a login can open"
+        );
+
+        let authenticated = client
+            .authenticate_agent(AgentAuthenticateRequest {
+                operation_id: AgentAuthenticationOperationId::new(),
+                agent_id,
+                provider_profile_id: Some(fixture.profile_id.clone()),
+                method_id: "opencode-login".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            authenticated.terminal.is_some(),
+            "re-authentication must open a real login terminal, not answer with an empty result"
+        );
+        fixture.cleanup();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
