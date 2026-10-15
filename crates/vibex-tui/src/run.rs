@@ -2425,6 +2425,35 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                     });
             }
         },
+        AppMessage::PairingOfferStatus(result) => match result {
+            Ok(summary) => {
+                // A cancel answers with the summary the runtime now holds, and a
+                // status poll answers with the one on screen. Only the second
+                // can be news, and only when it says the device arrived.
+                if app.device_center.pairing.apply_offer_status(&summary)
+                    && app.device_center.pairing.offer_was_claimed()
+                {
+                    app.toast(Toast::success(app.strings.devices_offer_claimed()));
+                }
+            }
+            Err(error) => {
+                // The panel is not on screen any more — a cancel was the press
+                // that asked — so the toast is the only place left to say the
+                // runtime did not take it down.
+                app.device_center.pairing.busy = None;
+                app.toast(Toast::danger(error.message.clone()));
+            }
+        },
+        AppMessage::PairingPublications(result) => {
+            // The code travels rather than the message: the panel turns it into
+            // what the reader can do about it, and a server sentence is not
+            // that.
+            let settled = match &result {
+                Ok(rows) => Ok(rows.clone()),
+                Err(error) => Err(error.code.as_str()),
+            };
+            app.device_center.publications.settle(settled);
+        }
         AppMessage::LanPairing(result) => match result {
             Ok(window) => {
                 app.device_center

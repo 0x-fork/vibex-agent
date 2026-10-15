@@ -1491,6 +1491,21 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::ActivateDevicePairing,
         |strings| Intent::ActivateDevicePairing.label(strings),
     ),
+    // The route the code carries is the one thing on this page the reader can
+    // change without the runtime: the transport lives in the link, so moving it
+    // is a re-encode rather than a new offer.
+    binding(
+        Scope::Devices,
+        Chord::plain(KeyCode::Char('[')),
+        Intent::PairingRoutePrevious,
+        |strings| Intent::PairingRoutePrevious.label(strings),
+    ),
+    binding(
+        Scope::Devices,
+        Chord::plain(KeyCode::Char(']')),
+        Intent::PairingRouteNext,
+        |strings| Intent::PairingRouteNext.label(strings),
+    ),
     binding(
         Scope::Devices,
         Chord::plain(KeyCode::Char('a')),

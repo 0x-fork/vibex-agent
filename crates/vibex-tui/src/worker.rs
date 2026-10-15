@@ -162,6 +162,13 @@ pub enum AppMessage {
     DirectoryListing(BackendResult<vibex_core::RemoteWorkspaceDirectoryListing>),
     Devices(BackendResult<Vec<vibex_core::RemoteDeviceDetail>>),
     PairingOffer(BackendResult<Box<vibex_core::RemoteCreatePairingOfferResponse>>),
+    /// The offer the runtime now holds, answering a cancel or a status read.
+    /// The summary carries no secret: the code was shown once and is not
+    /// travelling back.
+    PairingOfferStatus(BackendResult<Box<vibex_core::RemotePairingOfferSummary>>),
+    /// What the runtime answered when asked how it publishes itself. An empty
+    /// list is the answer that explains an empty pairing page.
+    PairingPublications(BackendResult<Vec<vibex_core::RemotePairingPublicationSummary>>),
     /// Every LAN-pairing answer: opening a window, re-reading one, deciding a
     /// request, and taking it down all answer with the window the runtime now
     /// holds. `None` is a state rather than an error — the window is gone.
@@ -1574,6 +1581,27 @@ impl Dispatch {
                 // reach; the v1 code path is authority-only.
                 let result = self.facade.device().create_pairing_offer_v2(request).await;
                 self.send(AppMessage::PairingOffer(result.map(Box::new)));
+            }
+            Effect::CancelPairingOffer { offer_id } => {
+                let request =
+                    MutationRequest::new(vibex_core::RemoteCancelPairingOfferRequest { offer_id });
+                // Taking an offer down answers with the summary it now holds, so
+                // the client learns the runtime really stopped accepting the
+                // code rather than assuming it did.
+                let result = self.facade.device().cancel_pairing_offer(request).await;
+                self.send(AppMessage::PairingOfferStatus(result.map(Box::new)));
+            }
+            Effect::PairingOfferStatus { offer_id } => {
+                let result = self
+                    .facade
+                    .device()
+                    .pairing_offer_status(vibex_core::RemotePairingOfferStatusRequest { offer_id })
+                    .await;
+                self.send(AppMessage::PairingOfferStatus(result.map(Box::new)));
+            }
+            Effect::PairingPublications => {
+                let result = self.facade.device().pairing_publications().await;
+                self.send(AppMessage::PairingPublications(result));
             }
             Effect::StartLanPairing {
                 permission_level,

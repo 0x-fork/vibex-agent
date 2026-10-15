@@ -4787,10 +4787,17 @@ fn an_open_pairing_row_draws_the_offer_it_minted() {
     app.perform(Intent::GotoDevices);
     app.device_center.toggle(PairMethod::QrCode);
     app.device_center.pairing.offer = Some(PairingOffer {
+        offer_id: vibex_core::RequestId::new(),
         code: "4821-7390".to_string(),
-        url: "vibex://open/direct#/pair/AAAA".to_string(),
+        fragment: "/pair/AAAA".to_string(),
         permission: vibex_core::RemoteDevicePermissionLevel::FullControl,
         expires_at_ms: i64::MAX,
+        routes: vec![vibex_tui::device_center::PairingRoute {
+            transport: vibex_core::RemotePairingTransport::Direct,
+            origin: "https://127.0.0.1:1428".to_string(),
+        }],
+        selected: 0,
+        claimed: false,
     });
     let screen = text(&render(&mut app, 200, 60));
     assert!(screen.contains("4821-7390"), "{screen}");
@@ -4799,6 +4806,9 @@ fn an_open_pairing_row_draws_the_offer_it_minted() {
         "{screen}"
     );
     assert!(screen.contains("Shown once"), "{screen}");
+    // The route the code carries is named, so a reader can tell which road the
+    // phone in their hand has to be on.
+    assert!(screen.contains("https://127.0.0.1:1428"), "{screen}");
     // A link this short is a small code, so a large terminal draws one: the
     // half-block renderer leaves block characters on screen.
     assert!(
@@ -4812,10 +4822,17 @@ fn an_open_pairing_row_draws_the_offer_it_minted() {
     small.perform(Intent::GotoDevices);
     small.device_center.toggle(PairMethod::QrCode);
     small.device_center.pairing.offer = Some(PairingOffer {
+        offer_id: vibex_core::RequestId::new(),
         code: "4821-7390".to_string(),
-        url: "vibex://open/direct#/pair/AAAA".to_string(),
+        fragment: "/pair/AAAA".to_string(),
         permission: vibex_core::RemoteDevicePermissionLevel::FullControl,
         expires_at_ms: i64::MAX,
+        routes: vec![vibex_tui::device_center::PairingRoute {
+            transport: vibex_core::RemotePairingTransport::Direct,
+            origin: "https://127.0.0.1:1428".to_string(),
+        }],
+        selected: 0,
+        claimed: false,
     });
     let screen = text(&render(&mut small, 60, 20));
     assert!(
@@ -4837,16 +4854,23 @@ fn a_terminal_with_pixels_is_handed_the_code_as_a_picture() {
     use vibex_tui::terminal_image::{ImageProtocol, ImageSupport};
     // The offer a desktop runtime really mints: a link of about a kilobyte,
     // which the half-block renderer needs a 173-column terminal to hold.
-    let url = format!("vibex://open/direct#/pair/{}", "A".repeat(1_200));
+    let fragment = format!("/pair/{}", "A".repeat(1_200));
     let mut app = device_app(120, 40, vibex_core::RemoteServerKind::Desktop);
     app.terminal_images = ImageSupport::forced(ImageProtocol::Kitty);
     app.perform(Intent::GotoDevices);
     app.device_center.toggle(PairMethod::QrCode);
     app.device_center.pairing.offer = Some(PairingOffer {
+        offer_id: vibex_core::RequestId::new(),
         code: "4821-7390".to_string(),
-        url,
+        fragment,
         permission: vibex_core::RemoteDevicePermissionLevel::FullControl,
         expires_at_ms: i64::MAX,
+        routes: vec![vibex_tui::device_center::PairingRoute {
+            transport: vibex_core::RemotePairingTransport::Direct,
+            origin: "https://127.0.0.1:1428".to_string(),
+        }],
+        selected: 0,
+        claimed: false,
     });
     let screen = text(&render(&mut app, 120, 40));
     // The code is a picture the terminal is holding rather than half blocks in
@@ -4890,10 +4914,17 @@ fn a_terminal_with_pixels_is_handed_the_code_as_a_picture() {
     small.perform(Intent::GotoDevices);
     small.device_center.toggle(PairMethod::QrCode);
     small.device_center.pairing.offer = Some(PairingOffer {
+        offer_id: vibex_core::RequestId::new(),
         code: "4821-7390".to_string(),
-        url: "vibex://open/direct#/pair/AAAA".to_string(),
+        fragment: "/pair/AAAA".to_string(),
         permission: vibex_core::RemoteDevicePermissionLevel::FullControl,
         expires_at_ms: i64::MAX,
+        routes: vec![vibex_tui::device_center::PairingRoute {
+            transport: vibex_core::RemotePairingTransport::Direct,
+            origin: "https://127.0.0.1:1428".to_string(),
+        }],
+        selected: 0,
+        claimed: false,
     });
     let screen = text(&render(&mut small, 60, 20));
     assert!(

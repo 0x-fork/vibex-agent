@@ -1158,7 +1158,7 @@ impl App {
             Intent::ConfigRegistryPageNext => self.step_registry_page(1),
             Intent::GotoDevices => {
                 self.navigate_to(Page::Devices);
-                Outcome::effects(vec![Effect::ListDevices])
+                Outcome::effects(self.device_page_effects())
             }
 
             // ---- management ------------------------------------------------
@@ -1166,6 +1166,8 @@ impl App {
             Intent::ActivateDevicePairing => self.activate_device_pairing(),
             Intent::DevicesTabNext => self.step_device_tab(1),
             Intent::DevicesTabPrevious => self.step_device_tab(-1),
+            Intent::PairingRouteNext => self.cycle_pairing_route(1),
+            Intent::PairingRoutePrevious => self.cycle_pairing_route(-1),
             Intent::AllowLanPairing => self.decide_lan_pairing(true),
             Intent::RefuseLanPairing => self.decide_lan_pairing(false),
             Intent::RevokeSelectedDevice => self.begin_revoke_device(),
@@ -5475,12 +5477,27 @@ impl App {
                 Outcome::effects(vec![Effect::CreatePairingOffer])
             }
             Activation::Opened(Opening::Window) => self.start_lan_pairing(),
-            Activation::Closed { cancel_window } => {
-                if cancel_window {
-                    return self.close_device_panel();
-                }
-                Outcome::effects(vec![])
+            Activation::Closed { release } => {
+                Outcome::effects(self.device_release_effects(release))
             }
+        }
+    }
+
+    /// Move the offer's route, which is what the code and the link carry.
+    ///
+    /// A local choice: nothing is asked of the runtime, because the transport is
+    /// the client's to name and the fragment behind it does not change. The
+    /// press does not dirty the frame when there is only one route to be on.
+    fn cycle_pairing_route(&mut self, delta: i64) -> Outcome {
+        let moved = self
+            .device_center
+            .pairing
+            .offer
+            .as_mut()
+            .is_some_and(|offer| offer.cycle_route(delta));
+        Outcome {
+            effects: vec![],
+            dirty: moved,
         }
     }
 
@@ -5523,23 +5540,18 @@ impl App {
         }])
     }
 
-    /// Close the open pairing panel. The window panel takes its advertisement
-    /// down with it: the panel is the only place the window is drawn, so a
-    /// runtime left discoverable behind it would pair a phone the reader never
-    /// saw. The client stops believing in the window either way — if the
-    /// runtime refuses to take it down, the reader is told rather than shown a
-    /// window that is still up.
+    /// Close the open pairing panel.
+    ///
+    /// A window panel takes its advertisement down and an offer panel takes its
+    /// code down: the panel is the only place either is drawn, so a runtime left
+    /// discoverable — or a code left claimable — behind a closed panel would let
+    /// in a device the reader never saw.
     fn close_device_panel(&mut self) -> Outcome {
-        use crate::device_center::PairMethod;
         let Some(method) = self.device_center.open.take() else {
             return Outcome::quiet();
         };
-        if method != PairMethod::LocalNetwork {
-            return Outcome::effects(vec![]);
-        }
-        self.device_center.pairing.window = None;
-        self.device_center.pairing.busy = None;
-        Outcome::effects(vec![Effect::CancelLanPairing])
+        let release = self.device_center.pairing.release(method);
+        Outcome::effects(self.device_release_effects(release))
     }
 
     /// Switch halves of the devices page.
@@ -5547,13 +5559,18 @@ impl App {
         if self.page != Page::Devices {
             return Outcome::quiet();
         }
-        if self.device_center.step_tab(delta) {
-            // The window belonged to the half the reader just left, and nothing
-            // on screen can close it any more.
-            self.device_center.pairing.busy = None;
-            return Outcome::effects(vec![Effect::CancelLanPairing]);
+        let tabs = self.device_tabs();
+        let release = self.device_center.step_tab(delta, &tabs);
+        let mut effects = self.device_release_effects(release);
+        if self.device_center.tab == crate::device_center::DeviceTab::Publishing
+            && self.device_publications_available()
+        {
+            // The half is a read, and arriving on it is the moment to make it:
+            // a status page that waited for its own poll would show the previous
+            // visit's answer first.
+            effects.push(Effect::PairingPublications);
         }
-        Outcome::effects(vec![])
+        Outcome::effects(effects)
     }
 
     fn begin_revoke_device(&mut self) -> Outcome {
@@ -7158,7 +7175,7 @@ impl App {
         match self.page {
             Page::NewSession | Page::Sessions => Outcome::effects(self.session_page_effects()),
             Page::Agent => Outcome::effects(self.refresh_timeline().into_iter().collect()),
-            Page::Devices => Outcome::effects(vec![Effect::ListDevices]),
+            Page::Devices => Outcome::effects(self.device_page_effects()),
             Page::Providers => Outcome::effects(vec![Effect::ListProfiles]),
             Page::Agents => Outcome::effects(vec![Effect::ListAgents]),
             Page::Mcp => Outcome::effects(vec![Effect::ListMcp]),

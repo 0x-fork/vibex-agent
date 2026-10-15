@@ -128,13 +128,13 @@ const OLDER_HISTORY_PREFETCH_HALF_SCREENS: usize = 3;
 /// worker's queue. What is left is asked for again as the answers land.
 const TIMELINE_DETAIL_BATCH: usize = 4;
 
-/// Ticks between two reads of an open LAN pairing window.
+/// Ticks between two reads of an open pairing panel.
 ///
 /// The tick is 200 ms, so five of them put a request on screen about a second
 /// after the phone asks — quick enough to read as live, slow enough that the
 /// poll is not traffic of its own. Only the pairing panel polls; every other
 /// surface still repaints only when something changed.
-const LAN_PAIRING_POLL_TICKS: u8 = 5;
+const PAIRING_POLL_TICKS: u8 = 5;
 
 /// A page the reader left, and the pane that owned the keyboard on it.
 ///
@@ -1269,12 +1269,12 @@ pub struct App {
     /// The countdown second the surfaces last painted, so a tick that does not
     /// move the display is not a reason to repaint it.
     pub schedule_shown_second: Option<i64>,
-    /// Ticks left before the LAN pairing window is re-read.
+    /// Ticks left before the open pairing panel is re-read.
     ///
-    /// The window is the one pairing fact the client cannot learn from an
-    /// answer to its own action: a device asks from outside, and the only way
-    /// to hear about it is to ask again. Zero means "not polling", which is
-    /// what the rest of the client does.
+    /// The window and the offer are the two pairing facts the client cannot
+    /// learn from an answer to its own action: a device asks, or claims a code,
+    /// from outside, and the only way to hear about it is to ask again. Zero
+    /// means "not polling", which is what the rest of the client does.
     lan_poll_ticks: u8,
     /// The message that has been sent but not yet echoed back by the runtime.
     ///
@@ -3711,14 +3711,16 @@ impl App {
             if self.device_center.tab == tab {
                 return Some(crate::reduce::Outcome::quiet());
             }
-            if self.device_center.select_tab(tab) {
-                // The window belonged to the half the reader just left.
-                self.device_center.pairing.busy = None;
-                return Some(crate::reduce::Outcome::effects(vec![
-                    Effect::CancelLanPairing,
-                ]));
+            let release = self.device_center.select_tab(tab);
+            let mut effects = self.device_release_effects(release);
+            if tab == crate::device_center::DeviceTab::Publishing
+                && self.device_publications_available()
+            {
+                // Arriving on the read is the moment to make it, exactly as the
+                // key that steps between halves does.
+                effects.push(Effect::PairingPublications);
             }
-            return Some(crate::reduce::Outcome::effects(vec![]));
+            return Some(crate::reduce::Outcome::effects(effects));
         }
         let index = self
             .regions
@@ -3847,7 +3849,73 @@ impl App {
             self.runtime_kind,
             self.availability(BackendOperation::DevicePairing),
             self.availability(BackendOperation::DeviceLanPairing),
+            self.device_center.publications.lan_precondition(),
         )
+    }
+
+    /// The halves of the devices page that exist on this runtime.
+    ///
+    /// The publishing half is absent where the runtime cannot answer for its own
+    /// routes: a page that listed Tailscale Serve, Direct, and Relay without
+    /// being able to confirm any of them would be inventing them.
+    pub fn device_tabs(&self) -> Vec<crate::device_center::DeviceTab> {
+        let mut tabs = crate::device_center::DeviceTab::ALWAYS.to_vec();
+        if self.device_publications_available() {
+            tabs.push(crate::device_center::DeviceTab::Publishing);
+        }
+        tabs
+    }
+
+    /// Whether this runtime can say how it publishes itself.
+    pub fn device_publications_available(&self) -> bool {
+        self.availability(BackendOperation::DevicePairingPublications) == Availability::Available
+    }
+
+    /// The reads the devices page owes when it opens.
+    ///
+    /// The trust store always; how the runtime publishes itself wherever the
+    /// runtime can answer, because that is the read that turns an empty pairing
+    /// half into a sentence naming what to switch on.
+    pub fn device_page_effects(&self) -> Vec<Effect> {
+        let mut effects = vec![Effect::ListDevices];
+        if self.device_publications_available() {
+            effects.push(Effect::PairingPublications);
+        }
+        effects
+    }
+
+    /// What a closed panel gives up, as the effects that give it up.
+    ///
+    /// The client stops believing in what it was holding either way: if the
+    /// runtime refuses to take the advertisement or the offer down, the reader
+    /// is told rather than shown something that is still live.
+    pub fn device_release_effects(
+        &mut self,
+        release: crate::device_center::Release,
+    ) -> Vec<Effect> {
+        use crate::device_center::Release;
+        match release {
+            Release::Nothing => Vec::new(),
+            Release::Window => {
+                self.device_center.pairing.window = None;
+                self.device_center.pairing.busy = None;
+                vec![Effect::CancelLanPairing]
+            }
+            Release::Offer => {
+                let Some(offer_id) = self
+                    .device_center
+                    .pairing
+                    .offer
+                    .as_ref()
+                    .map(|offer| offer.offer_id.clone())
+                else {
+                    return Vec::new();
+                };
+                self.device_center.pairing.offer = None;
+                self.device_center.pairing.busy = None;
+                vec![Effect::CancelPairingOffer { offer_id }]
+            }
+        }
     }
 
     /// The pairing row the keyboard is on, when the pairing half is open.
@@ -4100,6 +4168,15 @@ impl App {
                     && self.selected_pair_method().is_some()
             }
             Intent::DevicesTabNext | Intent::DevicesTabPrevious => true,
+            // The route keys exist wherever the panel does; the bar drops them
+            // when the offer has a single route, because a control with one
+            // option is a control that does nothing.
+            Intent::PairingRouteNext | Intent::PairingRoutePrevious => self
+                .device_center
+                .pairing
+                .offer
+                .as_ref()
+                .is_some_and(|offer| offer.route_is_chosen()),
             Intent::RevokeSelectedDevice => self.selected_paired_device().is_some(),
             Intent::OpenDeviceAudit => {
                 self.device_center.tab == crate::device_center::DeviceTab::Devices
@@ -5338,11 +5415,23 @@ impl App {
         // enough that the poll is not the client's own traffic, quick enough
         // that a reader watching for a request sees it — and each read is also
         // what expires the countdown the panel draws.
+        //
+        // An offer is the same kind of fact for the same reason: the phone
+        // claims it on the runtime, and the only way this client learns the code
+        // was used is by asking. The publishing half is re-read on that clock
+        // too, because a route can come up while the reader is looking at it and
+        // a status page that never changes is a status page nobody trusts.
         let mut poll = false;
-        if self.device_center.lan_panel_open() && self.device_center.pairing.window.is_some() {
+        let wants_pairing_poll = self.device_center.lan_panel_open()
+            && self.device_center.pairing.window.is_some()
+            || self.device_center.pairing.live_offer(now_ms).is_some()
+            || (self.page == Page::Devices
+                && self.device_center.tab == crate::device_center::DeviceTab::Publishing
+                && self.device_publications_available());
+        if wants_pairing_poll {
             self.lan_poll_ticks = self.lan_poll_ticks.saturating_sub(1);
             if self.lan_poll_ticks == 0 {
-                self.lan_poll_ticks = LAN_PAIRING_POLL_TICKS;
+                self.lan_poll_ticks = PAIRING_POLL_TICKS;
                 poll = true;
             }
         } else {
@@ -5350,7 +5439,23 @@ impl App {
         }
         let mut effects: Vec<Effect> = actions.into_iter().map(auto_continue_effect).collect();
         if poll {
-            effects.push(Effect::LanPairingStatus);
+            if self.device_center.lan_panel_open() && self.device_center.pairing.window.is_some() {
+                effects.push(Effect::LanPairingStatus);
+            }
+            if let Some(offer_id) = self
+                .device_center
+                .pairing
+                .live_offer(now_ms)
+                .map(|offer| offer.offer_id.clone())
+            {
+                effects.push(Effect::PairingOfferStatus { offer_id });
+            }
+            if self.page == Page::Devices
+                && self.device_center.tab == crate::device_center::DeviceTab::Publishing
+                && self.device_publications_available()
+            {
+                effects.push(Effect::PairingPublications);
+            }
         }
         // An MCP page whose index is still being walked is asked again on a slow
         // clock, for the same reason the pairing window is: the fact changes on
@@ -9034,6 +9139,20 @@ pub enum Effect {
     },
     ListDevices,
     CreatePairingOffer,
+    /// Take a minted offer down. Leaving the panel is what "shown once" means:
+    /// an offer the reader walked away from is still claimable until the runtime
+    /// is told to stop accepting it.
+    CancelPairingOffer {
+        offer_id: vibex_core::RequestId,
+    },
+    /// Re-read whether a minted offer is still live. The claim arrives from
+    /// outside this process, so this is the read the tick keeps asking for while
+    /// the code is on screen.
+    PairingOfferStatus {
+        offer_id: vibex_core::RequestId,
+    },
+    /// Read which publishing methods behind pairing are up, degraded, or off.
+    PairingPublications,
     /// Open a LAN pairing window, which puts an advertisement on the local
     /// network and holds the requests that answer it.
     StartLanPairing {
@@ -9282,6 +9401,9 @@ impl Effect {
             Effect::BrowseDirectories { .. } => "browse",
             Effect::ListDevices => "devices",
             Effect::CreatePairingOffer => "pairing_offer",
+            Effect::CancelPairingOffer { .. } => "pairing_offer_cancel",
+            Effect::PairingOfferStatus { .. } => "pairing_offer_status",
+            Effect::PairingPublications => "pairing_publications",
             Effect::StartLanPairing { .. } => "lan_pairing_start",
             Effect::LanPairingStatus => "lan_pairing_status",
             Effect::DecideLanPairing { .. } => "lan_pairing_decision",

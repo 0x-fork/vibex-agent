@@ -247,6 +247,8 @@ intents! {
     ActivateDevicePairing => { scope: Devices, id: "device_pair_activate", label: label_device_pair_activate, help: help_device_pair_activate },
     DevicesTabNext => { scope: Devices, id: "device_tab_next", label: label_device_tab_next, help: help_device_tab_next },
     DevicesTabPrevious => { scope: Devices, id: "device_tab_previous", label: label_device_tab_previous, help: help_device_tab_previous },
+    PairingRouteNext => { scope: Devices, id: "device_route_next", label: label_device_route_next, help: help_device_route_next },
+    PairingRoutePrevious => { scope: Devices, id: "device_route_previous", label: label_device_route_previous, help: help_device_route_previous },
     AllowLanPairing => { scope: Devices, id: "device_lan_allow", label: label_device_lan_allow, help: help_device_lan_allow },
     RefuseLanPairing => { scope: Devices, id: "device_lan_refuse", label: label_device_lan_refuse, help: help_device_lan_refuse },
     RevokeSelectedDevice => { scope: Devices, id: "device_revoke", label: label_device_revoke, help: help_device_revoke },

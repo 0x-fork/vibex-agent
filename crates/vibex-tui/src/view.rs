@@ -6240,11 +6240,14 @@ fn render_devices(
         crate::device_center::DeviceTab::Devices => {
             render_paired_devices(frame, bands[2], app, theme, strings);
         }
+        crate::device_center::DeviceTab::Publishing => {
+            render_publications(frame, bands[2], app, theme, strings);
+        }
     }
     render_device_footer(frame, bands[3], app, theme, strings);
 }
 
-/// The page's two halves, drawn as the configuration centre draws its modules.
+/// The page's halves, drawn as the configuration centre draws its modules.
 ///
 /// What sits on the right is the runtime this page pairs and what kind it is.
 /// The kind is why a row is missing, so it is worth naming before the reader
@@ -6258,7 +6261,7 @@ fn render_device_tabs(
 ) {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0u16;
-    for tab in crate::device_center::DeviceTab::ALL {
+    for tab in app.device_tabs() {
         let active = tab == app.device_center.tab;
         let label = format!(" {} ", tab.label(strings));
         let width = display_width(&label) as u16;
@@ -6322,9 +6325,22 @@ fn render_pair_rows(
     let methods = app.device_pair_methods();
     if methods.is_empty() {
         // "This runtime cannot pair one" and "your grant does not allow it" are
-        // different answers, and only one of them is the reader's to fix.
+        // different answers, and only one of them is the reader's to fix. A
+        // third is the one worth naming most: the runtime can pair, and there is
+        // no published route for it to pair over — which is a thing the reader
+        // can go and switch on.
         let message = match app.availability(vibex_backend::BackendOperation::DevicePairing) {
             Availability::RequiresPermission => strings.permission_required_for(),
+            _ if app.device_publications_available()
+                && app.device_center.publications.loaded
+                && !app.device_center.publications.any_reachable() =>
+            {
+                // Two sentences, because the state and the way out of it are
+                // both the answer: this is the page a reader reaches when
+                // pairing does not work, and "no route is published" without
+                // "turn one on" is a diagnosis with no treatment.
+                strings.devices_pair_no_route()
+            }
             _ => strings.devices_pair_unavailable(),
         };
         empty_state(frame, area, theme, message);
@@ -6487,6 +6503,16 @@ fn push_offer_panel(
     let indent = "    ";
     let text_width = usize::from(area.width).saturating_sub(indent.len()).max(8);
     let now_ms = vibex_core::unix_timestamp_ms();
+    if app.device_center.pairing.offer_was_claimed() {
+        // A claimed code is not an expired one: the reader's device is in, and
+        // the panel says so rather than counting down to a deadline that no
+        // longer means anything.
+        lines.push(Line::from(Span::styled(
+            format!("{indent}{}", strings.devices_offer_claimed()),
+            theme.success(),
+        )));
+        return;
+    }
     let Some(offer) = app.device_center.pairing.live_offer(now_ms) else {
         // A code the runtime has stopped accepting is not a code: the row says
         // so, and the next press mints a new one.
@@ -6512,21 +6538,17 @@ fn push_offer_panel(
         format!("{indent}{hint}"),
         theme.accent(),
     )));
+    push_offer_route(lines, offer, area, theme, strings);
     // The link is what the code encodes and what a desktop pastes, so it is
     // wrapped once here: the picture decides how many of its lines are drawn.
-    let link = wrap_link(&offer.url, text_width);
+    let url = offer.url();
+    let link = wrap_link(&url, text_width);
     if method == PairMethod::QrCode {
         // A terminal that draws pictures is handed the code itself. The
         // half-block code below needs a terminal some 173 columns wide, which
         // is not a terminal anyone has, so this is the row's real answer.
         let drawn = app.terminal_images.supports_pixels()
-            && push_qr_picture(
-                lines,
-                &mut app.pairing_qr,
-                &app.terminal_images,
-                area,
-                &offer.url,
-            );
+            && push_qr_picture(lines, &mut app.pairing_qr, &app.terminal_images, area, &url);
         if !drawn {
             // The QR is the whole point of this row, so it is drawn first and
             // the link below it is the fallback. A terminal that cannot hold it
@@ -6540,7 +6562,7 @@ fn push_offer_panel(
             let room = usize::from(area.height)
                 .saturating_sub(lines.len())
                 .saturating_sub(reserved);
-            let blocks = qr_blocks(&offer.url, text_width, room, app.glyph_tier());
+            let blocks = qr_blocks(&url, text_width, room, app.glyph_tier());
             match blocks {
                 Some(blocks) => {
                     for block in blocks {
@@ -6617,6 +6639,315 @@ fn push_offer_panel(
         format!("{indent}{}", strings.devices_code_hint()),
         theme.warning(),
     )));
+}
+
+/// The route the code and the link below it carry.
+///
+/// One line, in a stable column, because the reader's question is "can the phone
+/// in my hand reach the address this code names" — a question the transport word
+/// and the origin answer together. With a single published route there is
+/// nothing to choose, so the line names it and the choice key stays out of the
+/// bar; with several, the position is shown so the reader knows the `]` has
+/// somewhere to go.
+fn push_offer_route(
+    lines: &mut Vec<Line<'static>>,
+    offer: &crate::device_center::PairingOffer,
+    area: Rect,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let indent = "    ";
+    let Some(route) = offer.selected_route() else {
+        // No route published and an offer in hand is a contradiction the client
+        // does not try to resolve: the runtime is the side that decides whether
+        // a code can be claimed, so the link is drawn and its origin is not
+        // invented.
+        return;
+    };
+    let transport_width = usize::from(area.width) / 4;
+    let transport = crate::device_center::pairing_transport_name(route.transport);
+    let label = format!("{}: ", strings.devices_route());
+    // The origin is what is left after the label and the transport, and one
+    // column of it is still worth drawing: a route the reader cannot read is a
+    // route they cannot judge.
+    let origin_width = usize::from(area.width)
+        .saturating_sub(indent.len() + display_width(&label) + transport_width + 6)
+        .max(1);
+    lines.push(Line::from(vec![
+        Span::styled(format!("{indent}{label}"), theme.muted()),
+        Span::styled(format!("{:<transport_width$}", transport), theme.base()),
+        Span::styled(
+            truncate_to_width(&route.origin, origin_width, "…"),
+            Style::default().fg(theme.roles.gray_dim),
+        ),
+    ]));
+    if !offer.route_is_chosen() {
+        return;
+    }
+    let position = format!(
+        "{} {}/{}",
+        strings.devices_route_choice(),
+        offer.selected + 1,
+        offer.route_count()
+    );
+    lines.push(Line::from(Span::styled(
+        format!("{indent}{position}"),
+        theme.muted(),
+    )));
+}
+
+/// The publishing half: how this runtime can be reached, and what is wrong with
+/// the ways that are not up.
+///
+/// Every row is a statement rather than a verb. Switching one of these on moves
+/// a Tailscale Serve config, binds a port, or enrolls a relay, and the desktop
+/// Remote Access page is where a reader can see the certificate, the port, and
+/// the ownership that decision turns on. A terminal that offered the switch
+/// without those facts would be offering a verb it cannot explain.
+fn render_publications(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    if !app.device_publications_available() {
+        empty_state(
+            frame,
+            area,
+            theme,
+            strings.devices_publication_unavailable(),
+        );
+        return;
+    }
+    let publications = &app.device_center.publications;
+    if let Some(code) = publications.error.clone() {
+        let message = if code == "remote_permission_denied" {
+            strings.permission_required_for()
+        } else {
+            strings.devices_publication_unavailable()
+        };
+        empty_state(frame, area, theme, message);
+        return;
+    }
+    if !publications.loaded {
+        empty_state(frame, area, theme, strings.loading());
+        return;
+    }
+    if publications.rows.is_empty() {
+        // Two lines: the state, and the one thing the reader can do about it.
+        // The empty page is the case this whole read exists for, so it is the
+        // one that must not be a bare assertion.
+        let lines = vec![
+            Line::from(Span::styled(
+                strings.devices_publication_empty().to_string(),
+                theme.muted(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("    {}", strings.devices_publication_empty_hint()),
+                theme.warning(),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
+    let selected = app.device_cursor();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut rows: Vec<(usize, usize)> = Vec::new();
+    for (index, row) in publications.rows.iter().enumerate() {
+        rows.push((lines.len(), index));
+        lines.push(publication_row_line(
+            row,
+            index == selected,
+            area.width,
+            app.glyph_tier(),
+            theme,
+            strings,
+        ));
+    }
+    if let Some(row) = publications.row(selected) {
+        lines.push(Line::from(""));
+        for line in publication_detail(row, theme, strings) {
+            lines.push(line);
+        }
+        lines.push(Line::from(Span::styled(
+            format!("    {}", strings.devices_publications_hint()),
+            Style::default()
+                .fg(theme.roles.gray_dim)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+    for (offset, index) in rows {
+        if offset >= usize::from(area.height) {
+            continue;
+        }
+        app.regions.device_rows.push((
+            Rect {
+                x: area.x,
+                y: area.y + offset as u16,
+                width: area.width,
+                height: 1,
+            },
+            index,
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// One publishing method: the reader's name for it, and where it stands.
+fn publication_row_line(
+    row: &vibex_core::RemotePairingPublicationSummary,
+    selected: bool,
+    width: u16,
+    tier: crate::glyphs::GlyphTier,
+    theme: &TuiTheme,
+    strings: Strings,
+) -> Line<'static> {
+    let method = publication_method_label(row.method, strings).to_string();
+    let state = publication_state_label(row, strings).to_string();
+    let state_width = usize::from(width) / 3;
+    let label_width = usize::from(width).saturating_sub(6 + state_width).max(8);
+    Line::from(vec![
+        Span::styled(
+            if selected {
+                format!("{} ", crate::glyphs::accent_bar(tier))
+            } else {
+                "  ".to_string()
+            },
+            Style::default().fg(theme.roles.accent_user),
+        ),
+        Span::styled(
+            format!(
+                "{:<label_width$}",
+                truncate_to_width(&method, label_width, "…")
+            ),
+            if selected {
+                theme.selected()
+            } else {
+                theme.base()
+            },
+        ),
+        Span::styled(
+            format!(
+                "  {:<state_width$}",
+                truncate_to_width(&state, state_width, "…")
+            ),
+            publication_state_style(row, theme),
+        ),
+    ])
+}
+
+/// What the highlighted method is, in the runtime's own words.
+///
+/// A method that is off because nobody enabled it and one that is off because it
+/// failed are different facts, and only one of them is the reader's to act on.
+fn publication_detail(
+    row: &vibex_core::RemotePairingPublicationSummary,
+    theme: &TuiTheme,
+    strings: Strings,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(origin) = row.origin.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("    {}: ", strings.devices_link()), theme.muted()),
+            Span::styled(origin.clone(), theme.base()),
+        ]));
+    }
+    if let Some(code) = row.error_code.as_ref() {
+        lines.push(Line::from(Span::styled(
+            format!("    {code}"),
+            theme.danger(),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("    {}", publication_recovery_copy(row, strings)),
+        publication_state_style(row, theme),
+    )));
+    lines
+}
+
+/// The name the desktop Remote Access page uses for one publishing method.
+fn publication_method_label(
+    method: vibex_core::RemotePairingPublicationMethod,
+    strings: Strings,
+) -> &'static str {
+    use vibex_core::RemotePairingPublicationMethod as Method;
+    match method {
+        Method::TailscaleServe => strings.devices_publication_method_tailscale(),
+        Method::Direct => strings.devices_publication_method_direct(),
+        Method::SelfHostedRelay => strings.devices_publication_method_relay(),
+        Method::Unknown => strings.devices_publication_method_unknown(),
+    }
+}
+
+/// Where one method stands, and whether the operator asked for it.
+///
+/// "Off" and "off, and nobody switched it on" are different sentences: the
+/// first is a route that failed to come up, the second is one the reader can
+/// decide to want.
+fn publication_state_label(
+    row: &vibex_core::RemotePairingPublicationSummary,
+    strings: Strings,
+) -> &'static str {
+    use vibex_core::RemotePairingPublicationState as State;
+    match row.state {
+        State::Disabled if !row.desired_enabled => strings.devices_publication_never_enabled(),
+        State::Disabled => strings.devices_publication_state_disabled(),
+        State::Checking => strings.devices_publication_state_checking(),
+        State::ConfirmationNeeded => strings.devices_publication_state_confirmation_needed(),
+        State::Enabling => strings.devices_publication_state_enabling(),
+        State::Online => strings.devices_publication_state_online(),
+        State::Degraded => strings.devices_publication_state_degraded(),
+        State::RepairRequired => strings.devices_publication_state_repair_required(),
+        State::Conflict => strings.devices_publication_state_conflict(),
+        State::Stopping => strings.devices_publication_state_stopping(),
+        State::Error => strings.devices_publication_state_error(),
+        State::Unknown => strings.devices_publication_state_unknown(),
+    }
+}
+
+fn publication_state_style(
+    row: &vibex_core::RemotePairingPublicationSummary,
+    theme: &TuiTheme,
+) -> Style {
+    use vibex_core::RemotePairingPublicationState as State;
+    match row.state {
+        State::Online => theme.success(),
+        State::Degraded => theme.warning(),
+        State::ConfirmationNeeded | State::RepairRequired | State::Conflict | State::Error => {
+            theme.danger()
+        }
+        _ => Style::default().fg(theme.roles.gray_dim),
+    }
+}
+
+/// What an operator has to do about a method that is not up.
+///
+/// The client cannot do any of it, so the sentence names the action and where it
+/// happens rather than offering a key that would do nothing.
+fn publication_recovery_copy(
+    row: &vibex_core::RemotePairingPublicationSummary,
+    strings: Strings,
+) -> &'static str {
+    use vibex_core::RemotePairingPublicationRecovery as Recovery;
+    match row.recovery_action {
+        Recovery::None if row.state.is_reachable() => strings.devices_publication_hint_ok(),
+        Recovery::None => strings.devices_publications_hint(),
+        Recovery::ConfirmPort => strings.devices_publication_recovery_confirm_port(),
+        Recovery::RepairRoute => strings.devices_publication_recovery_repair_route(),
+        Recovery::Configure => strings.devices_publication_recovery_configure(),
+        Recovery::Retry => strings.devices_publication_recovery_retry(),
+        Recovery::ManualCommand => strings.devices_publication_recovery_manual(),
+        Recovery::RePair => strings.devices_publication_recovery_re_pair(),
+        Recovery::Unknown => strings.devices_publication_recovery_unknown(),
+    }
 }
 
 /// The rows a picture of the code is worth drawing in at all.
@@ -6886,6 +7217,11 @@ fn render_device_footer(
             strings.devices_audit(),
             app.management_data.audit.len()
         ),
+        // The publishing half has no verb of its own, so the line says where
+        // the verb lives rather than naming a key that does nothing.
+        crate::device_center::DeviceTab::Publishing => {
+            strings.devices_publications_hint().to_string()
+        }
     };
     frame.render_widget(Paragraph::new(text).style(theme.muted()), area);
 }

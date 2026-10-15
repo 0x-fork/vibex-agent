@@ -34,21 +34,31 @@ use crate::locale::Strings;
 ///
 /// The pairing half comes first because it is what the page is for; a reader
 /// who came back to check a device is one `→` away, and the module they were on
-/// is remembered while they are there.
+/// is remembered while they are there. The publishing half is last because it is
+/// the only half that never asks the runtime for anything: it is where a reader
+/// goes when pairing is not offering what they expected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
 pub enum DeviceTab {
     #[default]
     Pair,
     Devices,
+    /// How this runtime publishes itself: Tailscale Serve, Direct, Relay.
+    ///
+    /// The tab exists only where the runtime can answer: a peer that predates
+    /// the read has no rows to draw, and a page that lists methods it cannot
+    /// confirm would be inventing them.
+    Publishing,
 }
 
 impl DeviceTab {
-    pub const ALL: [Self; 2] = [Self::Pair, Self::Devices];
+    /// The halves that always exist, in the order they are drawn.
+    pub const ALWAYS: [Self; 2] = [Self::Pair, Self::Devices];
 
     pub const fn key(self) -> &'static str {
         match self {
             Self::Pair => "pair",
             Self::Devices => "devices",
+            Self::Publishing => "publishing",
         }
     }
 
@@ -56,6 +66,7 @@ impl DeviceTab {
         match self {
             Self::Pair => strings.devices_tab_pair(),
             Self::Devices => strings.devices_title(),
+            Self::Publishing => strings.devices_tab_publishing(),
         }
     }
 }
@@ -123,30 +134,60 @@ pub enum Opening {
 pub enum Activation {
     /// The row's panel was opened, and this is what it needs.
     Opened(Opening),
-    /// The row's panel was closed. A closed window panel asks for the
-    /// advertisement to come down: a runtime left discoverable behind a page
-    /// that says it is not looking would pair a phone the reader never saw.
-    Closed { cancel_window: bool },
+    /// The row's panel was closed, and this is what has to come down with it.
+    Closed { release: Release },
+}
+
+/// What taking a panel down gives up.
+///
+/// A LAN window and an offer are both advertisements of the same runtime: one is
+/// found by a device on the network, the other is read off the screen. Leaving
+/// either live behind a closed panel is the same mistake, so the state machine
+/// answers which one it was holding rather than a boolean per kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Release {
+    /// Nothing was advertised, so the press asks the runtime for nothing.
+    Nothing,
+    /// A minted offer the runtime is still accepting.
+    Offer,
+    /// An advertisement on the local network.
+    Window,
+}
+
+/// What is known about the Direct route a LAN window has to stand on.
+///
+/// A local-network window is refused outright when no Direct route is online
+/// (`remote_lan_direct_unavailable`), so the row is a verb the runtime would
+/// reject unless a route is up. `Unknown` is a runtime that does not report its
+/// routes at all: nothing is known, so nothing is hidden on the strength of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanPrecondition {
+    Unknown,
+    Reachable,
+    Unreachable,
 }
 
 /// The pairing rows this runtime can actually offer, in the order they are
 /// drawn.
 ///
 /// A row is present only when it can work here. The runtime's kind decides the
-/// desktop row — only a headless runtime accepts a desktop client — and the
-/// capabilities decide the rest, because whether a runtime can advertise itself
-/// on the local network is a fact about the runtime rather than about the
-/// reader's network.
+/// desktop row — only a headless runtime accepts a desktop client — the
+/// capabilities decide the rest, and the LAN row also needs the Direct route its
+/// advertisement is built on.
 pub fn pair_methods(
     runtime_kind: RemoteServerKind,
     pairing: Availability,
     lan_pairing: Availability,
+    lan_precondition: LanPrecondition,
 ) -> Vec<PairMethod> {
     if pairing != Availability::Available {
         return Vec::new();
     }
     let mut methods = vec![PairMethod::QrCode];
-    if lan_pairing == Availability::Available && runtime_kind == RemoteServerKind::Desktop {
+    if lan_pairing == Availability::Available
+        && runtime_kind == RemoteServerKind::Desktop
+        && lan_precondition != LanPrecondition::Unreachable
+    {
         methods.push(PairMethod::LocalNetwork);
     }
     if runtime_kind == RemoteServerKind::Headless {
@@ -155,13 +196,124 @@ pub fn pair_methods(
     methods
 }
 
+/// One published route an offer can be carried over.
+///
+/// The runtime publishes a route per method, and the offer carries all of them:
+/// the difference between the entries is the transport named in the launch link,
+/// because the fragment after it is route-independent. `origin` is the address a
+/// device would dial, which is what lets a reader recognise the route their phone
+/// is actually on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingRoute {
+    pub transport: vibex_core::RemotePairingTransport,
+    pub origin: String,
+}
+
+/// The transport preference the desktop uses, applied to one route list.
+///
+/// Tailnet first, then Direct, then the relay: the same order the desktop's
+/// segmented control draws, so "the route this client picked for you" is the one
+/// the desktop would have picked too.
+fn route_index(transport: vibex_core::RemotePairingTransport) -> usize {
+    match transport {
+        vibex_core::RemotePairingTransport::Tailnet => 0,
+        vibex_core::RemotePairingTransport::Direct => 1,
+        vibex_core::RemotePairingTransport::SelfHostedRelay => 2,
+        vibex_core::RemotePairingTransport::Unknown => 3,
+    }
+}
+
 /// One offer, as the panel draws it.
 ///
 /// The code and the link are the same offer seen twice: the code is what the
 /// reader reads out, the link is what the QR encodes and what a desktop pastes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingOffer {
+    /// What a cancel or a status read addresses. The code is shown once and
+    /// never stored, but the id has to be kept: leaving the panel is what takes
+    /// the offer down, and the runtime can only take down what it can name.
+    pub offer_id: vibex_core::RequestId,
     pub code: String,
+    /// The launch fragment the runtime answered with, without its `#`.
+    ///
+    /// It is the same for every route — only the transport segment in front of
+    /// it changes — which is why switching routes costs nothing but a re-encode.
+    pub fragment: String,
+    pub permission: RemoteDevicePermissionLevel,
+    /// When the runtime stops accepting the code. An offer that is drawn past
+    /// its deadline is a code the reader will type into a phone that refuses
+    /// it, so the page stops drawing one.
+    pub expires_at_ms: i64,
+    /// Every route the runtime published for this offer, in preference order.
+    pub routes: Vec<PairingRoute>,
+    /// Which of them the link below the code carries.
+    pub selected: usize,
+    /// Whether a device claimed it. A claimed offer is spent: the code in front
+    /// of the reader is no longer a code, so the panel says the device arrived
+    /// rather than counting down to an expiry that no longer matters.
+    pub claimed: bool,
+}
+
+impl PairingOffer {
+    /// The offer the runtime answered with, as the panel shows it.
+    pub fn from_response(response: &vibex_core::RemoteCreatePairingOfferResponse) -> Self {
+        let summary = &response.offer.summary;
+        let mut routes: Vec<PairingRoute> = Vec::new();
+        for candidate in summary
+            .direct_candidates
+            .iter()
+            .chain(summary.relay_candidate.iter())
+        {
+            if candidate.transport == vibex_core::RemotePairingTransport::Unknown {
+                continue;
+            }
+            // One route per method: the runtime may publish several Direct
+            // candidates, and a reader choosing between two identical labels is
+            // being asked a question the link cannot answer.
+            if routes
+                .iter()
+                .any(|route| route.transport == candidate.transport)
+            {
+                continue;
+            }
+            routes.push(PairingRoute {
+                transport: candidate.transport,
+                origin: candidate.url.clone(),
+            });
+        }
+        routes.sort_by_key(|route| route_index(route.transport));
+        Self {
+            offer_id: summary.offer_id.clone(),
+            code: response.offer.one_time_challenge.clone(),
+            fragment: response
+                .launch_fragment
+                .strip_prefix('#')
+                .unwrap_or(&response.launch_fragment)
+                .to_string(),
+            permission: summary.permission_level,
+            expires_at_ms: summary.expires_at_ms,
+            routes,
+            selected: 0,
+            claimed: false,
+        }
+    }
+
+    /// The route the code and the link carry, when the offer has one.
+    pub fn selected_route(&self) -> Option<&PairingRoute> {
+        self.routes.get(self.selected)
+    }
+
+    /// How many routes there are to choose between.
+    pub fn route_count(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// Whether the reader has a choice to make. One route is not a choice, and
+    /// a control that offers a single option is a control that does nothing.
+    pub fn route_is_chosen(&self) -> bool {
+        self.routes.len() > 1
+    }
+
     /// The link a phone opens, and the one a desktop pastes into its
     /// add-runtime form.
     ///
@@ -170,48 +322,36 @@ pub struct PairingOffer {
     /// offer's routes it is showing. The `vibex://open/…` form around it is not
     /// decoration: the mobile scanner only accepts a `vibex://` link, so a
     /// fragment on its own is a code no camera would act on.
-    pub url: String,
-    pub permission: RemoteDevicePermissionLevel,
-    /// When the runtime stops accepting the code. An offer that is drawn past
-    /// its deadline is a code the reader will type into a phone that refuses
-    /// it, so the page stops drawing one.
-    pub expires_at_ms: i64,
-}
-
-impl PairingOffer {
-    /// The offer the runtime answered with, as the panel shows it.
-    pub fn from_response(response: &vibex_core::RemoteCreatePairingOfferResponse) -> Self {
-        let summary = &response.offer.summary;
-        let transport = summary
-            .direct_candidates
-            .iter()
-            .map(|candidate| candidate.transport)
-            .chain(
-                summary
-                    .relay_candidate
-                    .iter()
-                    .map(|candidate| candidate.transport),
-            )
-            .find(|transport| *transport != vibex_core::RemotePairingTransport::Unknown)
+    pub fn url(&self) -> String {
+        let transport = self
+            .selected_route()
+            .map(|route| route.transport)
             .unwrap_or(vibex_core::RemotePairingTransport::Direct);
-        let fragment = response
-            .launch_fragment
-            .strip_prefix('#')
-            .unwrap_or(&response.launch_fragment);
-        Self {
-            code: response.offer.one_time_challenge.clone(),
-            url: format!(
-                "vibex://open/{}#{fragment}",
-                pairing_transport_name(transport)
-            ),
-            permission: summary.permission_level,
-            expires_at_ms: summary.expires_at_ms,
+        format!(
+            "vibex://open/{}#{}",
+            pairing_transport_name(transport),
+            self.fragment
+        )
+    }
+
+    /// Moves the selection by `delta`, wrapping. Answers whether it moved, so a
+    /// key press with nothing to choose between repaints nothing.
+    pub fn cycle_route(&mut self, delta: i64) -> bool {
+        if !self.route_is_chosen() {
+            return false;
         }
+        let count = self.routes.len() as i64;
+        let next = (self.selected as i64 + delta).rem_euclid(count) as usize;
+        if next == self.selected {
+            return false;
+        }
+        self.selected = next;
+        true
     }
 }
 
 /// The path segment that tells the mobile app which route the offer carries.
-const fn pairing_transport_name(transport: vibex_core::RemotePairingTransport) -> &'static str {
+pub const fn pairing_transport_name(transport: vibex_core::RemotePairingTransport) -> &'static str {
     match transport {
         vibex_core::RemotePairingTransport::Direct => "direct",
         vibex_core::RemotePairingTransport::Tailnet => "tailnet",
@@ -301,7 +441,16 @@ impl Pairing {
     pub fn live_offer(&self, now_ms: i64) -> Option<&PairingOffer> {
         self.offer
             .as_ref()
-            .filter(|offer| offer.expires_at_ms > now_ms)
+            .filter(|offer| !offer.claimed && offer.expires_at_ms > now_ms)
+    }
+
+    /// Whether the code in front of the reader was already used.
+    ///
+    /// Kept apart from [`Self::live_offer`] because the two draw different
+    /// things: a spent code is not an expired one, and telling a reader their
+    /// code expired when a phone just paired is the wrong sentence.
+    pub fn offer_was_claimed(&self) -> bool {
+        self.offer.as_ref().is_some_and(|offer| offer.claimed)
     }
 
     /// Whether the open row has nothing left to show: no offer, one the
@@ -315,6 +464,45 @@ impl Pairing {
             PairMethod::LocalNetwork => self.window.is_none() || self.expired(now_ms),
             PairMethod::QrCode | PairMethod::CodeOrLink => self.live_offer(now_ms).is_none(),
         }
+    }
+
+    /// What closing the panel behind `method` gives up.
+    ///
+    /// The answer is read from what is actually held rather than from the row
+    /// that was open: a row whose request never answered was never advertising
+    /// anything, so closing it asks the runtime for nothing.
+    pub fn release(&self, method: PairMethod) -> Release {
+        match method {
+            PairMethod::LocalNetwork if self.window.is_some() => Release::Window,
+            // A claimed offer is already spent — the runtime closed it when the
+            // device claimed it — so there is nothing left to take down, and
+            // asking anyway would turn a successful pairing into an error toast
+            // on the way out.
+            PairMethod::QrCode | PairMethod::CodeOrLink
+                if self.offer.as_ref().is_some_and(|offer| !offer.claimed) =>
+            {
+                Release::Offer
+            }
+            _ => Release::Nothing,
+        }
+    }
+
+    /// Folds a status read into the offer it names.
+    ///
+    /// An answer about a different offer is dropped rather than applied: the
+    /// reader has moved on to a newer code, and the old read says nothing about
+    /// the one on screen.
+    pub fn apply_offer_status(&mut self, summary: &vibex_core::RemotePairingOfferSummary) -> bool {
+        let Some(offer) = self.offer.as_mut() else {
+            return false;
+        };
+        if offer.offer_id != summary.offer_id {
+            return false;
+        }
+        let claimed = summary.claimed_device_id.is_some();
+        let moved = claimed != offer.claimed;
+        offer.claimed = claimed;
+        moved
     }
 
     /// Everything the page learned from a fresh read or a finished action.
@@ -340,6 +528,81 @@ impl Pairing {
     }
 }
 
+/// The ways this runtime publishes itself, as the third half of the page reads
+/// them.
+///
+/// Nothing here is a verb. Switching a route on moves a Tailscale Serve config,
+/// binds a port, or enrolls a relay, and confirming a port is a decision about a
+/// machine the reader may not be sitting in front of — the desktop Remote Access
+/// page owns all of it. What a terminal can honestly do is say which routes are
+/// up, which are broken, and what an operator has to do about it.
+#[derive(Debug, Clone, Default)]
+pub struct Publications {
+    /// Whether a read has answered. The difference between "nothing is
+    /// published" and "nobody has asked yet" is the difference between a
+    /// conclusion and a blank page.
+    pub loaded: bool,
+    pub rows: Vec<vibex_core::RemotePairingPublicationSummary>,
+    /// The error code the last read failed with, if it failed.
+    pub error: Option<String>,
+}
+
+impl Publications {
+    /// Whether a route a device could actually reach is up.
+    pub fn any_reachable(&self) -> bool {
+        self.rows.iter().any(|row| row.state.is_reachable())
+    }
+
+    /// The row the cursor is on.
+    pub fn row(&self, index: usize) -> Option<&vibex_core::RemotePairingPublicationSummary> {
+        self.rows.get(index)
+    }
+
+    /// Whether the Direct route a LAN window needs is up.
+    ///
+    /// Only a reachable `Direct` entry counts: a Tailnet route also travels as a
+    /// Direct candidate, but the window is opened against the Direct method
+    /// specifically, so Tailnet is not a substitute for it.
+    pub fn lan_precondition(&self) -> LanPrecondition {
+        if !self.loaded {
+            return LanPrecondition::Unknown;
+        }
+        if self.error.is_some() {
+            return LanPrecondition::Unknown;
+        }
+        let direct = self
+            .rows
+            .iter()
+            .find(|row| row.method == vibex_core::RemotePairingPublicationMethod::Direct);
+        match direct {
+            Some(row) if row.state.is_reachable() => LanPrecondition::Reachable,
+            Some(_) => LanPrecondition::Unreachable,
+            // A runtime that does not list the method is not a runtime that has
+            // said the method is down.
+            None => LanPrecondition::Unknown,
+        }
+    }
+
+    /// Folds one answer in. The rows are replaced whole: this is a status read,
+    /// so the last answer is the truth rather than a merge of two snapshots.
+    pub fn settle(
+        &mut self,
+        result: Result<Vec<vibex_core::RemotePairingPublicationSummary>, &str>,
+    ) {
+        self.loaded = true;
+        match result {
+            Ok(rows) => {
+                self.rows = rows;
+                self.error = None;
+            }
+            Err(code) => {
+                self.rows.clear();
+                self.error = Some(code.to_string());
+            }
+        }
+    }
+}
+
 /// The page's own navigation: which tab is open, which row the keyboard is on,
 /// and which pairing row has its panel open.
 #[derive(Debug, Clone, Default)]
@@ -353,6 +616,7 @@ pub struct DeviceCenter {
     /// would be the same facts drawn twice.
     pub open: Option<PairMethod>,
     pub pairing: Pairing,
+    pub publications: Publications,
 }
 
 impl DeviceCenter {
@@ -369,6 +633,7 @@ impl DeviceCenter {
         match tab {
             DeviceTab::Pair => pair_rows,
             DeviceTab::Devices => devices,
+            DeviceTab::Publishing => self.publications.rows.len(),
         }
     }
 
@@ -385,23 +650,29 @@ impl DeviceCenter {
         self.cursor(self.tab).min(count - 1)
     }
 
-    /// Switch halves. Returns whether an advertisement has to come down: the
-    /// window belongs to the pairing rows, so leaving that half closes the
-    /// panels and gives up the offer — a code shown again after the reader
-    /// walked away is shown twice.
-    pub fn select_tab(&mut self, tab: DeviceTab) -> bool {
+    /// Switch halves. Answers what has to come down: the window and the offer
+    /// both belong to the pairing rows, so leaving that half closes its panel
+    /// and gives up what it was advertising — a code shown again after the
+    /// reader walked away is shown twice, and one left claimable is worse.
+    pub fn select_tab(&mut self, tab: DeviceTab) -> Release {
         if self.tab == tab {
-            return false;
+            return Release::Nothing;
         }
         self.tab = tab;
-        self.open = None;
-        let cancel_window = self.pairing.window.is_some();
+        let release = self
+            .open
+            .take()
+            .map_or(Release::Nothing, |method| self.pairing.release(method));
         self.pairing.clear();
-        cancel_window
+        release
     }
 
-    pub fn step_tab(&mut self, delta: i64) -> bool {
-        let tabs = DeviceTab::ALL;
+    pub fn step_tab(&mut self, delta: i64, tabs: &[DeviceTab]) -> Release {
+        let tabs = if tabs.is_empty() {
+            &DeviceTab::ALWAYS[..]
+        } else {
+            tabs
+        };
         let current = tabs.iter().position(|tab| *tab == self.tab).unwrap_or(0) as i64;
         let next = (current + delta).rem_euclid(tabs.len() as i64) as usize;
         self.select_tab(tabs[next])
@@ -413,7 +684,7 @@ impl DeviceCenter {
         if self.open == Some(method) {
             self.open = None;
             return Activation::Closed {
-                cancel_window: method == PairMethod::LocalNetwork,
+                release: self.pairing.release(method),
             };
         }
         self.open = Some(method);
@@ -431,9 +702,35 @@ mod tests {
     use super::*;
     const AVAILABLE: Availability = Availability::Available;
     const UNSUPPORTED: Availability = Availability::Unsupported;
+    const UNKNOWN_ROUTE: LanPrecondition = LanPrecondition::Unknown;
 
     fn rows(kind: RemoteServerKind, pairing: Availability, lan: Availability) -> Vec<PairMethod> {
-        pair_methods(kind, pairing, lan)
+        pair_methods(kind, pairing, lan, UNKNOWN_ROUTE)
+    }
+
+    fn rows_with_direct(
+        kind: RemoteServerKind,
+        pairing: Availability,
+        lan: Availability,
+        direct: LanPrecondition,
+    ) -> Vec<PairMethod> {
+        pair_methods(kind, pairing, lan, direct)
+    }
+
+    fn offer() -> PairingOffer {
+        PairingOffer {
+            offer_id: vibex_core::RequestId::new(),
+            code: "1234".to_string(),
+            fragment: "/pair/x".to_string(),
+            permission: RemoteDevicePermissionLevel::FullControl,
+            expires_at_ms: i64::MAX,
+            routes: vec![PairingRoute {
+                transport: vibex_core::RemotePairingTransport::Direct,
+                origin: "https://localhost:1428".to_string(),
+            }],
+            selected: 0,
+            claimed: false,
+        }
     }
 
     #[test]
@@ -474,23 +771,105 @@ mod tests {
     }
 
     #[test]
+    fn the_lan_row_is_absent_when_the_route_it_stands_on_is_down() {
+        // The window is opened against the Direct method specifically, so a
+        // runtime the reader can tell has no Direct route is not offered a verb
+        // that would be refused.
+        assert_eq!(
+            rows_with_direct(
+                RemoteServerKind::Desktop,
+                AVAILABLE,
+                AVAILABLE,
+                LanPrecondition::Unreachable
+            ),
+            vec![PairMethod::QrCode]
+        );
+        // A route that is up keeps the row, and a runtime that does not report
+        // its routes is not treated as if it had said "down".
+        assert_eq!(
+            rows_with_direct(
+                RemoteServerKind::Desktop,
+                AVAILABLE,
+                AVAILABLE,
+                LanPrecondition::Reachable
+            ),
+            vec![PairMethod::QrCode, PairMethod::LocalNetwork]
+        );
+        assert_eq!(
+            rows_with_direct(
+                RemoteServerKind::Desktop,
+                AVAILABLE,
+                AVAILABLE,
+                LanPrecondition::Unknown
+            ),
+            vec![PairMethod::QrCode, PairMethod::LocalNetwork]
+        );
+    }
+
+    #[test]
+    fn the_lan_precondition_reads_only_a_reachable_direct_entry() {
+        let mut publications = Publications::default();
+        // Nothing has answered yet: not knowing is not a "no".
+        assert_eq!(publications.lan_precondition(), LanPrecondition::Unknown);
+        publications.settle(Ok(vec![publication(
+            vibex_core::RemotePairingPublicationMethod::TailscaleServe,
+            vibex_core::RemotePairingPublicationState::Online,
+        )]));
+        // A Tailnet route travels as a Direct candidate but is not the Direct
+        // method the window is opened against.
+        assert_eq!(publications.lan_precondition(), LanPrecondition::Unknown);
+        publications.settle(Ok(vec![publication(
+            vibex_core::RemotePairingPublicationMethod::Direct,
+            vibex_core::RemotePairingPublicationState::Degraded,
+        )]));
+        assert_eq!(publications.lan_precondition(), LanPrecondition::Reachable);
+        publications.settle(Ok(vec![publication(
+            vibex_core::RemotePairingPublicationMethod::Direct,
+            vibex_core::RemotePairingPublicationState::RepairRequired,
+        )]));
+        assert_eq!(
+            publications.lan_precondition(),
+            LanPrecondition::Unreachable
+        );
+        // A failed read knows nothing, so nothing is hidden on the strength of
+        // it.
+        publications.settle(Err("remote_pairing_publications_unavailable"));
+        assert_eq!(publications.lan_precondition(), LanPrecondition::Unknown);
+        assert!(publications.error.is_some());
+    }
+
+    fn publication(
+        method: vibex_core::RemotePairingPublicationMethod,
+        state: vibex_core::RemotePairingPublicationState,
+    ) -> vibex_core::RemotePairingPublicationSummary {
+        vibex_core::RemotePairingPublicationSummary {
+            method,
+            desired_enabled: true,
+            state,
+            origin: None,
+            recovery_action: vibex_core::RemotePairingPublicationRecovery::None,
+            error_code: None,
+        }
+    }
+
+    #[test]
     fn leaving_the_pairing_tab_closes_its_panel_and_drops_the_offer() {
         let mut center = DeviceCenter::default();
         assert_eq!(
             center.toggle(PairMethod::QrCode),
             Activation::Opened(Opening::Offer)
         );
-        center.pairing.offer = Some(PairingOffer {
-            code: "1234".to_string(),
-            url: "vibex://open/direct#/pair/x".to_string(),
-            permission: RemoteDevicePermissionLevel::FullControl,
-            expires_at_ms: i64::MAX,
-        });
-        center.select_tab(DeviceTab::Devices);
+        center.pairing.offer = Some(offer());
+        // The offer is handed back to the runtime rather than only forgotten:
+        // a code the reader walked away from is still a code until it is taken
+        // down.
+        assert_eq!(center.select_tab(DeviceTab::Devices), Release::Offer);
         assert!(center.open.is_none());
         assert!(center.pairing.offer.is_none());
         center.select_tab(DeviceTab::Pair);
         assert_eq!(center.cursor(DeviceTab::Pair), 0);
+        // A second hop has nothing left to give up.
+        assert_eq!(center.select_tab(DeviceTab::Devices), Release::Nothing);
     }
 
     #[test]
@@ -501,14 +880,25 @@ mod tests {
             Activation::Opened(Opening::Window)
         );
         assert!(center.lan_panel_open());
+        // The row is open but no window has been opened yet, so there is
+        // nothing to take down.
         assert_eq!(
             center.toggle(PairMethod::LocalNetwork),
             Activation::Closed {
-                cancel_window: true
+                release: Release::Nothing
             }
         );
         assert!(!center.lan_panel_open());
-        // The QR panel is not an advertisement, so closing it asks for nothing.
+        center.pairing.window = Some(window(Vec::new()));
+        center.toggle(PairMethod::LocalNetwork);
+        assert_eq!(
+            center.toggle(PairMethod::LocalNetwork),
+            Activation::Closed {
+                release: Release::Window
+            }
+        );
+        // The QR panel is not an advertisement, so a closed one with no offer
+        // behind it asks for nothing.
         assert_eq!(
             center.toggle(PairMethod::QrCode),
             Activation::Opened(Opening::Offer)
@@ -516,9 +906,158 @@ mod tests {
         assert_eq!(
             center.toggle(PairMethod::QrCode),
             Activation::Closed {
-                cancel_window: false
+                release: Release::Nothing
             }
         );
+    }
+
+    #[test]
+    fn an_offer_carries_every_published_route_and_defaults_to_the_desktops_pick() {
+        let response = offer_response(vec![
+            candidate(
+                vibex_core::RemotePairingTransport::Direct,
+                "https://lan:8443",
+            ),
+            candidate(
+                vibex_core::RemotePairingTransport::Tailnet,
+                "https://mac.ts.net",
+            ),
+            candidate(vibex_core::RemotePairingTransport::Unknown, "https://?"),
+            candidate(
+                vibex_core::RemotePairingTransport::Direct,
+                "https://dup:8443",
+            ),
+        ]);
+        let offer = PairingOffer::from_response(&response);
+        // The order is the desktop's, and a method appears once however many
+        // candidates carry it.
+        assert_eq!(
+            offer
+                .routes
+                .iter()
+                .map(|route| route.transport)
+                .collect::<Vec<_>>(),
+            vec![
+                vibex_core::RemotePairingTransport::Tailnet,
+                vibex_core::RemotePairingTransport::Direct,
+            ]
+        );
+        assert_eq!(offer.route_count(), 2);
+        assert!(offer.route_is_chosen());
+        // Tailnet first is the desktop's preference, so the client picks what
+        // the desktop would have picked.
+        assert_eq!(offer.selected, 0);
+        assert_eq!(offer.url(), "vibex://open/tailnet#/pair/x");
+        let mut offer = offer;
+        assert!(offer.cycle_route(1));
+        assert_eq!(offer.url(), "vibex://open/direct#/pair/x");
+        assert!(offer.cycle_route(1));
+        assert_eq!(offer.selected, 0);
+        assert!(offer.cycle_route(-1));
+        assert_eq!(offer.selected, 1);
+    }
+
+    #[test]
+    fn a_single_route_offer_has_nothing_to_choose_between() {
+        let response = offer_response(vec![candidate(
+            vibex_core::RemotePairingTransport::SelfHostedRelay,
+            "https://relay.example",
+        )]);
+        let mut offer = PairingOffer::from_response(&response);
+        assert!(!offer.route_is_chosen());
+        assert!(!offer.cycle_route(1));
+        assert_eq!(offer.selected, 0);
+        assert_eq!(offer.url(), "vibex://open/self_hosted_relay#/pair/x");
+    }
+
+    #[test]
+    fn an_offer_with_no_route_still_names_one_the_phone_can_parse() {
+        // A peer that published nothing gets the Direct segment: the link has to
+        // stay a `vibex://` link the scanner accepts, and the runtime is the
+        // side that decides whether it can be claimed.
+        let offer = PairingOffer::from_response(&offer_response(Vec::new()));
+        assert_eq!(offer.route_count(), 0);
+        assert_eq!(offer.url(), "vibex://open/direct#/pair/x");
+    }
+
+    #[test]
+    fn a_claimed_offer_is_spent_and_says_so() {
+        let mut pairing = Pairing::default();
+        let offer = offer();
+        let offer_id = offer.offer_id.clone();
+        pairing.offer = Some(offer);
+        assert!(pairing.live_offer(0).is_some());
+        assert!(!pairing.offer_was_claimed());
+        // An answer about another offer says nothing about this one.
+        assert!(!pairing.apply_offer_status(&summary(vibex_core::RequestId::new(), true)));
+        assert!(pairing.live_offer(0).is_some());
+        assert!(pairing.apply_offer_status(&summary(offer_id.clone(), true)));
+        assert!(pairing.offer_was_claimed());
+        // A claimed offer is not a code any more, so the panel stops drawing it
+        // even though its deadline has not passed.
+        assert!(pairing.live_offer(0).is_none());
+        assert!(pairing.spent(PairMethod::QrCode, 0));
+        // A claimed offer is already spent on the runtime, so leaving the half
+        // has nothing left to take down.
+        assert_eq!(pairing.release(PairMethod::QrCode), Release::Nothing);
+        // Folding the same answer twice is not news.
+        assert!(!pairing.apply_offer_status(&summary(offer_id, true)));
+    }
+
+    fn summary(
+        offer_id: vibex_core::RequestId,
+        claimed: bool,
+    ) -> vibex_core::RemotePairingOfferSummary {
+        vibex_core::RemotePairingOfferSummary {
+            format_version: 2,
+            protocol_range: vibex_core::RemoteProtocolVersionRange::v2(),
+            server_id: "server".to_string(),
+            server_identity_public_key: "key".to_string(),
+            offer_id,
+            expires_at_ms: i64::MAX,
+            direct_candidates: Vec::new(),
+            relay_candidate: None,
+            permission_level: RemoteDevicePermissionLevel::FullControl,
+            granted_permissions: Vec::new(),
+            canceled: false,
+            claimed_device_id: claimed.then(|| vibex_core::DeviceId::parse("device_one").unwrap()),
+        }
+    }
+
+    fn candidate(
+        transport: vibex_core::RemotePairingTransport,
+        url: &str,
+    ) -> vibex_core::RemotePairingCandidate {
+        vibex_core::RemotePairingCandidate {
+            transport,
+            url: url.to_string(),
+            relay_room_id: None,
+            relay_pc_peer_id: None,
+            relay_pc_public_key: None,
+        }
+    }
+
+    fn offer_response(
+        candidates: Vec<vibex_core::RemotePairingCandidate>,
+    ) -> vibex_core::RemoteCreatePairingOfferResponse {
+        let mut summary = summary(vibex_core::RequestId::new(), false);
+        summary.direct_candidates = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.transport != vibex_core::RemotePairingTransport::SelfHostedRelay
+            })
+            .cloned()
+            .collect();
+        summary.relay_candidate = candidates.into_iter().find(|candidate| {
+            candidate.transport == vibex_core::RemotePairingTransport::SelfHostedRelay
+        });
+        vibex_core::RemoteCreatePairingOfferResponse {
+            offer: vibex_core::RemotePairingOffer {
+                summary,
+                one_time_challenge: "1234".to_string(),
+            },
+            launch_fragment: "#/pair/x".to_string(),
+        }
     }
 
     #[test]

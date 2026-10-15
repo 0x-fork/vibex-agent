@@ -1384,6 +1384,120 @@ strings! {
         "当前设备的权限级别不允许配对。",
         "目前裝置的權限層級不允許配對。"
     },
+    // ---- the publishing half: how this runtime can be reached -------------
+    devices_tab_publishing => { "Remote access", "远程接入", "遠端存取" },
+    devices_publications_hint => {
+        "Enter does nothing here: switching a route on is done in the desktop app's Remote Access page.",
+        "这里没有可执行的操作：开启某条发布方式要在桌面端的「远程访问」页面完成。",
+        "這裡沒有可執行的操作：開啟某條發佈方式要在桌面端的「遠端存取」頁面完成。"
+    },
+    devices_publication_hint_ok => {
+        "Devices can reach this runtime over it.",
+        "设备可以通过这条路线连接该运行时。",
+        "裝置可以透過這條路線連線該執行時。"
+    },
+    devices_publication_unavailable => {
+        "This runtime cannot report how it publishes itself",
+        "该运行时无法报告自己的发布方式",
+        "該執行時無法回報自己的發佈方式"
+    },
+    devices_publication_empty => {
+        "No route is published, so no device can pair",
+        "尚未发布任何路线，因此无法配对设备",
+        "尚未發佈任何路線，因此無法配對裝置"
+    },
+    devices_publication_empty_hint => {
+        "Turn on Tailscale Serve, Direct, or the self-hosted Relay in the desktop app's Remote Access page.",
+        "请在桌面端「远程访问」中开启 Tailscale Serve、Direct 或自建 Relay 之一。",
+        "請在桌面端「遠端存取」中開啟 Tailscale Serve、Direct 或自建 Relay 之一。"
+    },
+    devices_pair_no_route => {
+        "No route is published, so no device can pair — turn one on in the desktop app's Remote Access page.",
+        "尚未发布任何路线，无法配对设备——请在桌面端「远程访问」中开启一条。",
+        "尚未發佈任何路線，無法配對裝置——請在桌面端「遠端存取」中開啟一條。"
+    },
+    devices_publication_method_tailscale => {
+        "Tailscale Serve",
+        "Tailscale Serve",
+        "Tailscale Serve"
+    },
+    devices_publication_method_direct => { "Direct HTTPS", "Direct HTTPS", "Direct HTTPS" },
+    devices_publication_method_relay => { "Self-hosted Relay", "自建 Relay", "自建 Relay" },
+    devices_publication_method_unknown => {
+        "Another method",
+        "其他发布方式",
+        "其他發佈方式"
+    },
+    devices_publication_state_disabled => { "Off", "未开启", "未開啟" },
+    devices_publication_state_online => { "Online", "在线", "線上" },
+    devices_publication_state_degraded => { "Degraded", "降级", "降級" },
+    devices_publication_state_checking => { "Checking…", "检查中…", "檢查中…" },
+    devices_publication_state_enabling => { "Starting…", "启动中…", "啟動中…" },
+    devices_publication_state_stopping => { "Stopping…", "停止中…", "停止中…" },
+    devices_publication_state_confirmation_needed => {
+        "Needs confirmation",
+        "需要确认",
+        "需要確認"
+    },
+    devices_publication_state_repair_required => { "Needs repair", "需要修复", "需要修復" },
+    devices_publication_state_conflict => { "Conflicting", "存在冲突", "存在衝突" },
+    devices_publication_state_error => { "Failed", "失败", "失敗" },
+    devices_publication_state_unknown => {
+        "Not something this client can name",
+        "此客户端无法识别该状态",
+        "此客戶端無法識別該狀態"
+    },
+    devices_publication_recovery_confirm_port => {
+        "Confirm the HTTPS port in the desktop app.",
+        "请在桌面端确认 HTTPS 端口。",
+        "請在桌面端確認 HTTPS 連接埠。"
+    },
+    devices_publication_recovery_repair_route => {
+        "Repair the route in the desktop app.",
+        "请在桌面端修复该路线。",
+        "請在桌面端修復該路線。"
+    },
+    devices_publication_recovery_configure => {
+        "Finish configuring it in the desktop app.",
+        "请在桌面端完成配置。",
+        "請在桌面端完成設定。"
+    },
+    devices_publication_recovery_retry => {
+        "Retry it from the desktop app.",
+        "请在桌面端重试。",
+        "請在桌面端重試。"
+    },
+    devices_publication_recovery_manual => {
+        "It needs a command run on this machine.",
+        "需要在这台机器上执行命令。",
+        "需要在這台機器上執行命令。"
+    },
+    devices_publication_recovery_re_pair => {
+        "The relay enrollment has to be made again on this machine.",
+        "需要在这台机器上重新登记 Relay。",
+        "需要在這台機器上重新登記 Relay。"
+    },
+    devices_publication_recovery_unknown => {
+        "Open the desktop app's Remote Access page to see what it needs.",
+        "请打开桌面端的「远程访问」查看它需要什么。",
+        "請開啟桌面端的「遠端存取」查看它需要什麼。"
+    },
+    devices_publication_never_enabled => {
+        "Off — nobody has switched it on",
+        "未开启——尚未有人打开它",
+        "未開啟——尚未有人開啟它"
+    },
+    devices_offer_claimed => {
+        "That device paired. The code is spent.",
+        "该设备已配对，配对码已作废。",
+        "該裝置已配對，配對碼已作廢。"
+    },
+    devices_route => { "Route", "路线", "路線" },
+    devices_route_choice => {
+        "switch route",
+        "切换路线",
+        "切換路線"
+    },
     permission_read_only => { "Read only", "只读", "唯讀" },
     permission_approve_only => { "Approve only", "仅审批", "僅審批" },
     permission_full_control => { "Full control", "完全控制", "完全控制" },
@@ -1992,6 +2106,8 @@ strings! {
     label_device_pair_activate => { "Open", "打开", "開啟" },
     label_device_tab_next => { "Tab", "标签页", "標籤頁" },
     label_device_tab_previous => { "Tab", "标签页", "標籤頁" },
+    label_device_route_next => { "Route", "路线", "路線" },
+    label_device_route_previous => { "Route", "路线", "路線" },
     label_device_lan_allow => { "Allow", "允许", "允許" },
     label_device_lan_refuse => { "Refuse", "拒绝", "拒絕" },
     label_device_revoke => { "Revoke", "撤销授权", "復原授權" },
@@ -2204,6 +2320,16 @@ strings! {
     help_device_pair_activate => { "Open the highlighted way to pair a device.", "打开高亮的设备配对方式。", "開啟高亮的裝置配對方式。" },
     help_device_tab_next => { "Move to the other half of the devices page.", "移到设备页的另一半。", "移到裝置頁的另一半。" },
     help_device_tab_previous => { "Move to the other half of the devices page.", "移到设备页的另一半。", "移到裝置頁的另一半。" },
+    help_device_route_next => {
+        "Carry the code and the link over the next published route.",
+        "让配对码和链接改用下一条已发布的路线。",
+        "讓配對碼和連結改用下一條已發佈的路線。"
+    },
+    help_device_route_previous => {
+        "Carry the code and the link over the previous published route.",
+        "让配对码和链接改用上一条已发布的路线。",
+        "讓配對碼和連結改用上一條已發佈的路線。"
+    },
     help_device_lan_allow => { "Approve the device that asked to pair on this network.", "批准在此网络上请求配对的设备。", "批准在此網路上請求配對的裝置。" },
     help_device_lan_refuse => { "Refuse the device that asked to pair on this network.", "拒绝在此网络上请求配对的设备。", "拒絕在此網路上請求配對的裝置。" },
     help_device_revoke => { "Revoke the highlighted device's access.", "撤销高亮设备的访问权限。", "復原高亮裝置的訪問許可權。" },
