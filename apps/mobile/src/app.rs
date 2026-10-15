@@ -22406,11 +22406,11 @@ impl MobileApp {
         let host_status = self
             .active_host_status()
             .unwrap_or_else(RuntimeStatusView::inactive);
-        // The wordmark the drawer header wears. The label takes the heading
-        // step — the drawer's own title rather than a row among the tree — and
+        // The wordmark the drawer header wears. The label takes the title step
+        // — the drawer's own heading over the tree, not a row among it — and
         // the mark is scaled from that same size, so the two stay one lockup on
         // one baseline at every text-size step.
-        let brand_mark = theme::wordmark_mark(theme::font_heading().to_pixels(theme::rem_base()));
+        let brand_mark = theme::wordmark_mark(theme::font_title().to_pixels(theme::rem_base()));
 
         div()
             .absolute()
@@ -22435,7 +22435,7 @@ impl MobileApp {
                     // the product wordmark: the brand mark supplies the capital
                     // "V" and the label completes it. The mark's point sits on
                     // the label's baseline — the geometry the desktop's own
-                    // lockup is authored with — and both halves take the heading
+                    // lockup is authored with — and both halves take the title
                     // step, so the word reads as one lockup at any text size.
                     .child(
                         div()
@@ -22444,7 +22444,7 @@ impl MobileApp {
                             .flex()
                             .items_center()
                             .gap(px(1.0))
-                            .text_size(theme::font_heading())
+                            .text_size(theme::font_title())
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(
                                 svg()
@@ -33687,8 +33687,8 @@ mod tests {
             "the drawer's mark should be scaled from the label's own size"
         );
         assert!(
-            drawer.contains(".text_size(theme::font_heading())"),
-            "the drawer's wordmark should take the heading step"
+            drawer.contains(".text_size(theme::font_title())"),
+            "the drawer's wordmark should take the title step"
         );
         let mark = drawer
             .split_once("icons/vibex-mark.svg")
