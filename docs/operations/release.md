@@ -92,13 +92,15 @@ instructions, artifact hashes, or anything the updater must trust into it.
 ## Mobile
 
 Android and iOS are built independently from the desktop package. Tagged
-releases publish signed Android APK/AAB files plus an unsigned iOS simulator app
-and XCFramework as GitHub Release artifacts. Android signing credentials stay in
-GitHub Actions secrets and are never checked into the repository.
+releases publish signed Android APK/AAB files plus an unsigned iOS simulator
+app, an unsigned iOS device IPA, and the XCFramework as GitHub Release
+artifacts. Android signing credentials stay in GitHub Actions secrets and are
+never checked into the repository.
 
 ```bash
 pnpm package:mobile:android
 pnpm build:mobile:ios
+pnpm package:mobile:ios
 ```
 
 The Android release job installs the checked-in Gradle wrapper, Android API 35,
@@ -107,7 +109,12 @@ with `apksigner` and signs the AAB with `jarsigner`. RC and preview releases
 fall back to an ephemeral CI key when no repository key is configured; stable
 releases fail until a release keystore is configured. The iOS job runs on a free
 GitHub-hosted macOS runner, installs XcodeGen, builds both Apple Rust targets,
-and performs a code-signing-disabled simulator build.
+performs a code-signing-disabled simulator build, and packages the unsigned
+device IPA. No Apple account, certificate, or provisioning profile is involved
+anywhere in that job: the installer re-signs the IPA with their own Apple ID.
+`.github/workflows/mobile-ios-unsigned.yml` builds the same IPA on demand for a
+commit that is not a release tag. See
+[Installing the Unsigned iOS Build](./ios-unsigned-install.md).
 
 For stable Android releases, configure the repository secret
 `VIBEX_ANDROID_KEYSTORE_BASE64` together with

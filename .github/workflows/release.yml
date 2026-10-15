@@ -344,6 +344,14 @@ jobs:
           MARKETING_VERSION=${{ needs.release-meta.outputs.version }}
           -derivedDataPath target/mobile-ios CODE_SIGNING_ALLOWED=NO
           CODE_SIGNING_REQUIRED=NO build
+      # Ships the device IPA as well as the simulator bundle. It carries no
+      # signature on purpose: producing a signed one needs an Apple account, and
+      # the installer re-signs this file with their own. See
+      # docs/operations/ios-unsigned-install.md.
+      - name: Package unsigned device IPA
+        env:
+          VIBEX_MOBILE_VERSION: ${{ needs.release-meta.outputs.version }}
+        run: bash apps/mobile/scripts/package-ios-unsigned-ipa.sh
       - name: Normalize iOS artifacts and checksums
         shell: bash
         run: |
@@ -352,7 +360,7 @@ jobs:
           mkdir -p "${output}"
           ditto -c -k --sequesterRsrc --keepParent apps/mobile/ios/VibexFFI.xcframework "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-xcframework.zip"
           ditto -c -k --sequesterRsrc --keepParent target/mobile-ios/Build/Products/Release-iphonesimulator/Vibex.app "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-simulator.app.zip"
-          for artifact in "${output}"/*.zip; do
+          for artifact in "${output}"/*.zip "${output}"/*.ipa; do
             shasum -a 256 "${artifact}" > "${artifact}.sha256"
           done
       - name: Upload iOS artifacts

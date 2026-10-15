@@ -78,3 +78,15 @@ pnpm build:mobile:ios
 ```
 
 The command builds `VibexFFI.xcframework` and generates the Xcode project.
+
+To produce an installable artifact, package the unsigned device IPA:
+
+```bash
+pnpm package:mobile:ios
+```
+
+It writes `target/mobile-ios-artifacts/vibex-<version>-ios-unsigned.ipa` plus a
+SHA-256 sidecar. Building it needs no Apple account, but iOS will not run
+unsigned code, so the person installing it re-signs the bundle with their own
+free Apple ID. See
+[Installing the Unsigned iOS Build](../../docs/operations/ios-unsigned-install.md).

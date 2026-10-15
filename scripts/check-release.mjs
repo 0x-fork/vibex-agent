@@ -291,6 +291,35 @@ function validatePackaging() {
   assert(iosBuildScript.includes("--crate-type staticlib"), "iOS release build must emit a static library");
   assert(iosBuildScript.includes("--lib"), "iOS release build must select the mobile library target");
   assert(!iosBuildScript.includes("cargo build -p vibex-mobile"), "iOS release build must not link manifest crate types");
+  // The unsigned device IPA is how an iOS build ships without an Apple account.
+  // Keep it unsigned by contract: a signed bundle would need credentials the
+  // release pipeline deliberately does not hold, and the artifact name would
+  // stop describing its contents.
+  const iosIpaScript = source("apps/mobile/scripts/package-ios-unsigned-ipa.sh");
+  for (const required of [
+    "-sdk iphoneos",
+    "CODE_SIGNING_ALLOWED=NO",
+    "CODE_SIGNING_REQUIRED=NO",
+    "Payload/Vibex.app",
+    "refusing to publish a signed bundle as an unsigned IPA"
+  ]) {
+    assert(
+      iosIpaScript.includes(required),
+      `iOS unsigned packaging script is missing ${required}`
+    );
+  }
+  assert(
+    iosIpaScript.includes("vibex-${VERSION}-ios-unsigned.ipa"),
+    "iOS unsigned packaging script does not name the device IPA"
+  );
+  assert(
+    releaseWorkflow.includes("package-ios-unsigned-ipa.sh"),
+    "publish workflow does not package the unsigned iOS device IPA"
+  );
+  assert(
+    releaseWorkflow.includes('"${output}"/*.ipa'),
+    "publish workflow does not checksum the unsigned iOS device IPA"
+  );
   const desktopReleaseScript = source("scripts/package-desktop-release.mjs");
   assert(
     desktopReleaseScript.includes("withIcons(config, MACOS_ICON_INPUTS)"),

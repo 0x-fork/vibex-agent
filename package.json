@@ -26,6 +26,7 @@
     "build:mobile:android": "bash apps/mobile/scripts/build-android.sh",
     "build:mobile:ios": "bash apps/mobile/scripts/build-ios.sh",
     "package:mobile:android": "VIBEX_MOBILE_PROFILE=release bash apps/mobile/scripts/build-android.sh",
+    "package:mobile:ios": "bash apps/mobile/scripts/package-ios-unsigned-ipa.sh",
     "release:build-smoke": "cargo check -p vibex-desktop --locked && cargo check -p vibex-mobile --locked && cargo check -p vibex-relay-server --bin vibex-relay-server --locked",
     "release:preflight": "node scripts/check-release.mjs --write",
     "smoke:acp:opencode": "cargo run -p vibex-agent-acp --bin vibex-acp-opencode-smoke",
