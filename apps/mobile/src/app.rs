@@ -14054,14 +14054,16 @@ impl MobileApp {
                            label: String,
                            destructive: bool,
                            action: SheetAction| {
-            sheet.child(sidebar_sheet_entry(id, label, destructive, false).on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.sidebar_row_menu = None;
-                    action(this, window, cx);
-                }),
-            ))
+            sheet.child(
+                sidebar_sheet_entry(id, label, destructive, false).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.sidebar_row_menu = None;
+                        action(this, window, cx);
+                    }),
+                ),
+            )
         };
         // The same entry for the rows whose list is built at render time: a
         // session can be offered one entry per group it could join, so the id
@@ -14243,12 +14245,8 @@ impl MobileApp {
                     sheet = entry(
                         sheet,
                         "mobile-row-menu-cancel-scheduled",
-                        locale::text(
-                            "Cancel scheduled send",
-                            "取消定时发送",
-                            "取消定時傳送",
-                        )
-                        .to_string(),
+                        locale::text("Cancel scheduled send", "取消定时发送", "取消定時傳送")
+                            .to_string(),
                         true,
                         Box::new(move |this, _, cx| {
                             this.send_sidebar_mutation(
@@ -36825,12 +36823,19 @@ fn session_opened(cx: &mut Context<Self>) {
     /// hour it was pinned for.
     #[test]
     fn a_pinned_row_reports_its_pin_alone() {
-        let idle = sidebar_session_column(AgentSessionState::Idle, true, false, false, false, false);
+        let idle =
+            sidebar_session_column(AgentSessionState::Idle, true, false, false, false, false);
         assert!(!idle.show_time, "a pinned row keeps no timestamp");
         assert_eq!(idle.label, None);
 
-        let starting =
-            sidebar_session_column(AgentSessionState::Initializing, true, false, false, false, false);
+        let starting = sidebar_session_column(
+            AgentSessionState::Initializing,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(
             starting.label, None,
             "the pin owns the slot the state words would take"
@@ -36841,7 +36846,8 @@ fn session_opened(cx: &mut Context<Self>) {
     /// The session the reader has open is never marked unread.
     #[test]
     fn an_open_session_is_never_marked_unread() {
-        let closed = sidebar_session_column(AgentSessionState::Idle, false, true, false, false, false);
+        let closed =
+            sidebar_session_column(AgentSessionState::Idle, false, true, false, false, false);
         assert!(closed.show_unread);
         assert!(!closed.show_time, "the unread dot takes the hour's slot");
 
@@ -36856,20 +36862,23 @@ fn session_opened(cx: &mut Context<Self>) {
     /// A suspended session shows the pause mark instead of an hour.
     #[test]
     fn a_suspended_session_reports_the_pause_and_no_hour() {
-        let paused = sidebar_session_column(AgentSessionState::Idle, false, false, false, true, false);
+        let paused =
+            sidebar_session_column(AgentSessionState::Idle, false, false, false, true, false);
         assert!(paused.show_paused);
         assert!(
             !paused.show_time,
             "a suspended row is not waiting on the clock"
         );
 
-        let working = sidebar_session_column(AgentSessionState::Running, false, false, false, true, false);
+        let working =
+            sidebar_session_column(AgentSessionState::Running, false, false, false, true, false);
         assert!(
             working.show_status && working.show_paused,
             "a working session that is suspended reports both"
         );
 
-        let plain = sidebar_session_column(AgentSessionState::Idle, false, false, false, false, false);
+        let plain =
+            sidebar_session_column(AgentSessionState::Idle, false, false, false, false, false);
         assert!(!plain.show_paused);
         assert!(plain.show_time);
     }
@@ -36886,17 +36895,25 @@ fn session_opened(cx: &mut Context<Self>) {
 
         // A closed session has a mark and an hour, which is what tells it apart
         // from an archived one.
-        let closed = sidebar_session_column(AgentSessionState::Closed, false, false, false, false, false);
+        let closed =
+            sidebar_session_column(AgentSessionState::Closed, false, false, false, false, false);
         assert_eq!(closed.label, None);
         assert!(closed.show_status && closed.show_time);
 
         // The two states that own a mark report nothing else.
-        let waiting =
-            sidebar_session_column(AgentSessionState::NeedsInput, false, false, false, false, false);
+        let waiting = sidebar_session_column(
+            AgentSessionState::NeedsInput,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(waiting.show_attention);
         assert!(!waiting.show_status && !waiting.show_time && waiting.label.is_none());
 
-        let failed = sidebar_session_column(AgentSessionState::Error, false, false, false, false, false);
+        let failed =
+            sidebar_session_column(AgentSessionState::Error, false, false, false, false, false);
         assert!(failed.show_error);
         assert!(!failed.show_status && !failed.show_time && failed.label.is_none());
     }
@@ -37030,20 +37047,11 @@ fn session_opened(cx: &mut Context<Self>) {
         let failed =
             sidebar_session_column(AgentSessionState::Error, false, false, false, false, true);
         assert!(failed.show_scheduled && failed.show_error);
-        assert!(
-            !failed.show_time,
-            "a failure takes no countdown with it"
-        );
+        assert!(!failed.show_time, "a failure takes no countdown with it");
 
         // A pinned row keeps the clock and yields the text slot to its pin.
-        let pinned = sidebar_session_column(
-            AgentSessionState::Idle,
-            true,
-            false,
-            false,
-            false,
-            true,
-        );
+        let pinned =
+            sidebar_session_column(AgentSessionState::Idle, true, false, false, false, true);
         assert!(pinned.show_scheduled);
         assert!(!pinned.show_time);
 
