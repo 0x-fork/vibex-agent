@@ -21357,18 +21357,44 @@ impl MobileApp {
                             .text_size(theme::font_micro())
                             .text_color(theme::text_muted())
                             .child(row.child_count.to_string()),
-                    )
-                    .child(
-                        svg()
-                            .path(if row.collapsed {
-                                "icons/chevron-right.svg"
-                            } else {
-                                "icons/chevron-down.svg"
-                            })
-                            .size(px(12.0))
-                            .flex_shrink_0()
-                            .text_color(theme::sidebar_foreground(0.78)),
                     ),
+            )
+            // A collapsed group stands in for its members, so it reports the
+            // most actionable thing among them; an expanded one lets each member
+            // row speak for itself, which is the rule the desktop's trailing
+            // column applies. The member count above stays either way: on the
+            // phone it sits with the name rather than sharing the trailing slot
+            // the mark needs, so the two cannot crowd each other out.
+            .when(row.collapsed, |group| {
+                group.when_some(row.state, |group, state| {
+                    group.child(sidebar_workspace_status_indicator(
+                        Some(state),
+                        ElementId::from(format!("mobile-group-mark-{}", row.id())),
+                    ))
+                })
+            })
+            .when(row.pinned, |group| {
+                group.child(
+                    svg()
+                        .path("icons/pin.svg")
+                        .size(px(12.0))
+                        .flex_shrink_0()
+                        .text_color(theme::accent_yellow()),
+                )
+            })
+            // The expander is the row's last control, after the marks it stands
+            // beside: the whole row toggles the group, so the chevron reports the
+            // state rather than owning the tap.
+            .child(
+                svg()
+                    .path(if row.collapsed {
+                        "icons/chevron-right.svg"
+                    } else {
+                        "icons/chevron-down.svg"
+                    })
+                    .size(px(12.0))
+                    .flex_shrink_0()
+                    .text_color(theme::sidebar_foreground(0.78)),
             )
             .into_any_element()
     }

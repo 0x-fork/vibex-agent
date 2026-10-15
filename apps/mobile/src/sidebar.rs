@@ -952,7 +952,7 @@ fn push_group_rows(
         selected: input
             .selected_session_id
             .is_some_and(|selected| members.iter().any(|session| session.id == *selected)),
-        state: group_status(&members),
+        state: group_status(&members, input.view),
         session_id: None,
         unread: input.view.unread_session_ids.iter().any(|session_id| {
             members
@@ -991,19 +991,17 @@ fn session_working(session: &AgentSession) -> bool {
     )
 }
 
-fn group_status(members: &[&AgentSession]) -> Option<AgentSessionState> {
-    let mut state = None;
-    for member in members {
-        match member.state {
-            AgentSessionState::NeedsInput => return Some(AgentSessionState::NeedsInput),
-            AgentSessionState::Error => state = Some(AgentSessionState::Error),
-            AgentSessionState::Running if state != Some(AgentSessionState::Error) => {
-                state = Some(AgentSessionState::Running);
-            }
-            _ => {}
-        }
-    }
-    state
+/// The state a collapsed session group reports for its members.
+///
+/// A group stands in for its members exactly the way a worktree does, so both
+/// resolve their aggregate through the same rules: the call to action outranks
+/// the spinner, and an unread completion is a state a collapsed group has to
+/// report because the rows that would have reported it are off screen.
+fn group_status(
+    members: &[&AgentSession],
+    view: &SidebarOrganizationView,
+) -> Option<AgentSessionState> {
+    workspace_status(members, view).0
 }
 
 fn session_row(
@@ -1318,6 +1316,48 @@ mod tests {
             auto_continue_paused: false,
             delegated_child: false,
         }
+    }
+
+    /// A collapsed group reports its members the way a worktree does.
+    ///
+    /// The rows that would have reported a member's state are off screen once
+    /// the group is folded, so the group has to answer for them — including an
+    /// unread completion, which the projection used to drop entirely.
+    #[test]
+    fn a_collapsed_group_reports_the_state_its_members_hide() {
+        let idle = session("session-a", "project", "Idle");
+        let mut working = session("session-b", "project", "Working");
+        working.state = AgentSessionState::Running;
+        let mut waiting = session("session-c", "project", "Waiting");
+        waiting.state = AgentSessionState::NeedsInput;
+        let view = SidebarOrganizationView::default();
+
+        // The call to action outranks the spinner, and a quiet group reports
+        // nothing at all rather than a state nobody has to act on.
+        assert_eq!(
+            group_status(&[&idle, &working, &waiting], &view),
+            Some(AgentSessionState::NeedsInput)
+        );
+        assert_eq!(
+            group_status(&[&idle, &working], &view),
+            Some(AgentSessionState::Running)
+        );
+        assert_eq!(group_status(&[&idle], &view), None);
+
+        let unread = SidebarOrganizationView {
+            unread_session_ids: [idle.id.as_str().to_string()].into_iter().collect(),
+            ..SidebarOrganizationView::default()
+        };
+        assert_eq!(
+            group_status(&[&idle, &working], &unread),
+            Some(AgentSessionState::Running),
+            "a working member still outranks a completion waiting to be read"
+        );
+        assert_eq!(
+            group_status(&[&idle], &unread),
+            Some(AgentSessionState::Idle),
+            "a completed group reports the unread completion it hides"
+        );
     }
 
     /// A project's badge reports its sessions, and its mark reports the ones
