@@ -8497,6 +8497,28 @@ impl MobileApp {
         (members.len() >= 2).then_some((project_id, workspace_id, members))
     }
 
+    /// The hour a queued send still waits for, when the row reports one.
+    ///
+    /// The desktop admits the mark for a session that can still send: one that
+    /// is starting up, idle, or failed. A running turn, an Agent parked on the
+    /// user, and a closed session keep their own state, because that is what
+    /// the row is doing right now and the clock is only what happens next.
+    fn scheduled_send_at(&self, session_id: &str, state: AgentSessionState) -> Option<i64> {
+        matches!(
+            state,
+            AgentSessionState::Initializing | AgentSessionState::Idle | AgentSessionState::Error
+        )
+        .then(|| {
+            self.sidebar_view
+                .scheduled_sends
+                .iter()
+                .filter(|send| send.session_id == session_id)
+                .map(|send| send.scheduled_at_ms)
+                .min()
+        })
+        .flatten()
+    }
+
     /// The groups a session could join, in the sidebar's own order.
     ///
     /// A group is scoped to one Worktree, so only the groups anchored to the
@@ -21984,12 +22006,14 @@ impl MobileApp {
         // label and the hour share a slot, the pin takes the column, and a row
         // that reports something else does not also report an hour — so they are
         // answered together and pinned by the tests at the bottom of this file.
+        let scheduled_at_ms = self.scheduled_send_at(session_id.as_str(), session_state);
         let column = sidebar_session_column(
             session_state,
             row.pinned,
             row.unread,
             row.selected,
             row.auto_continue_paused,
+            scheduled_at_ms.is_some(),
         );
         let open_session_id = session_id.clone();
         let batch_session_id = session_id.clone();
@@ -22193,6 +22217,12 @@ impl MobileApp {
                             row.id()
                         ))))
                     })
+                    .when_some(scheduled_at_ms, |right, at_ms| {
+                        right.child(sidebar_schedule_mark(
+                            ElementId::from(format!("mobile-sidebar-scheduled-{}", row.id())),
+                            at_ms,
+                        ))
+                    })
                     .when(column.show_status, |right| {
                         right.child(sidebar_session_status_indicator(
                             session_state,
@@ -22215,10 +22245,17 @@ impl MobileApp {
                                 .overflow_hidden()
                                 .text_ellipsis()
                                 .whitespace_nowrap()
-                                .when_some(
-                                    session.map(|session| session.last_message_at_ms),
-                                    |time, last| time.child(session_sidebar_time_label(last)),
-                                ),
+                                .when_some(scheduled_at_ms, |time, at_ms| {
+                                    time.child(mobile_schedule_countdown(
+                                        at_ms.saturating_sub(unix_timestamp_ms()),
+                                    ))
+                                })
+                                .when(scheduled_at_ms.is_none(), |time| {
+                                    time.when_some(
+                                        session.map(|session| session.last_message_at_ms),
+                                        |time, last| time.child(session_sidebar_time_label(last)),
+                                    )
+                                }),
                         )
                     })
                     .when(column.show_unread, |right| {
@@ -29229,6 +29266,70 @@ fn sidebar_session_state_pill(label: &'static str) -> gpui::AnyElement {
         .into_any_element()
 }
 
+/// How long a queued send still waits, in the desktop's own words.
+///
+/// Under a day it counts down to the second, because that is the reader's
+/// question; past that the seconds stop mattering and the day leads.
+fn mobile_schedule_countdown(remaining_ms: i64) -> String {
+    let seconds = remaining_ms.max(0).saturating_add(999) / 1_000;
+    if seconds < 24 * 60 * 60 {
+        return format!(
+            "{:02}:{:02}:{:02}",
+            seconds / 3_600,
+            seconds / 60 % 60,
+            seconds % 60
+        );
+    }
+    format!(
+        "{}d {:02}:{:02}",
+        seconds / (24 * 60 * 60),
+        seconds / 3_600 % 24,
+        seconds / 60 % 60
+    )
+}
+
+/// The clock of a row waiting on a queued send.
+///
+/// The countdown rides the row itself, in the slot the hour would take, so the
+/// absolute deadline is what the accessible name carries — the two questions a
+/// scheduled row is asked are "when" and "how long", and the phone has no
+/// tooltip to answer the first one with.
+fn sidebar_schedule_mark(id: ElementId, at_ms: i64) -> gpui::AnyElement {
+    let label = format!(
+        "{} {} · {}",
+        locale::text("Scheduled send", "定时发送", "定時傳送"),
+        mobile_schedule_deadline(at_ms),
+        mobile_schedule_countdown(at_ms.saturating_sub(unix_timestamp_ms()))
+    );
+    div()
+        .id(id)
+        .size(px(16.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .aria_label(label)
+        .child(
+            svg()
+                .path("icons/clock.svg")
+                .size(px(14.0))
+                .flex_shrink_0()
+                .text_color(theme::sidebar_text_muted()),
+        )
+        .into_any_element()
+}
+
+/// The deadline a queued send waits for, in the reader's own clock.
+fn mobile_schedule_deadline(at_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(at_ms)
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
 /// The auto continue suspension, at the head of the state column.
 ///
 /// The desktop hangs a pause mark on a session whose auto continue the reader
@@ -29276,20 +29377,26 @@ struct SidebarSessionColumn {
     show_error: bool,
     /// The auto continue suspension.
     show_paused: bool,
+    /// The clock of a queued send: the row is waiting on the hour rather than
+    /// on the Agent.
+    show_scheduled: bool,
 }
 
 /// Resolves a session row's trailing column the way the desktop's does.
 ///
 /// `pinned` is the row the reader keeps at the top, which yields the slot to its
 /// pin; `selected` is the session the reader has open, which the desktop never
-/// marks unread; and `auto_continue_paused` is a session whose automatic
-/// continuation was suspended, which is not the same thing as an idle one.
+/// marks unread; `auto_continue_paused` is a session whose automatic
+/// continuation was suspended, which is not the same thing as an idle one; and
+/// `scheduled` is a row waiting on a queued send, which the caller has already
+/// admitted for the states that can still send.
 fn sidebar_session_column(
     state: AgentSessionState,
     pinned: bool,
     unread: bool,
     selected: bool,
     auto_continue_paused: bool,
+    scheduled: bool,
 ) -> SidebarSessionColumn {
     let awaiting_user = state == AgentSessionState::NeedsInput;
     let has_error = state == AgentSessionState::Error;
@@ -29304,22 +29411,27 @@ fn sidebar_session_column(
     // wears its state in words: neither a pulse nor a dot says which of the two
     // it is. A pinned row keeps only its pin, which is the whole slot the
     // desktop yields to it.
-    let label = sidebar_session_state_label(state).filter(|_| !pinned);
+    // A queued send is the row's posture while it waits, so it takes the state
+    // words with it: the row is not starting up, it is waiting on the clock.
+    let label = sidebar_session_state_label(state).filter(|_| !pinned && !scheduled);
     SidebarSessionColumn {
         // The mark answers every state but the three that own one: the question
-        // mark, the unread dot, and the danger dot.
-        show_status: !awaiting_user
+        // mark, the unread dot, and the danger dot. A queued send answers with
+        // its clock instead, which is the state the row is actually in.
+        show_status: !scheduled
+            && !awaiting_user
             && !has_unread_completion
             && !has_error
             && state != AgentSessionState::Idle,
         show_attention: awaiting_user,
         label,
-        // The words and the hour share the slot, and a row that is working,
-        // waiting on the reader, unread, failed, suspended, or pinned does not
-        // also report an hour.
+        // The countdown stands in the slot the hour would take. A row that is
+        // still starting up has no hour to report — but a queued send is
+        // exactly the case where that slot carries the countdown instead, which
+        // is why the working state only closes the slot when nothing is queued.
         show_time: !pinned
             && !awaiting_user
-            && !working
+            && (!working || scheduled)
             && !has_unread_completion
             && !has_error
             && !auto_continue_paused
@@ -29327,6 +29439,7 @@ fn sidebar_session_column(
         show_unread: has_unread_completion,
         show_error: has_error,
         show_paused: auto_continue_paused,
+        show_scheduled: scheduled,
     }
 }
 
@@ -35128,12 +35241,12 @@ fn session_opened(cx: &mut Context<Self>) {
     /// hour it was pinned for.
     #[test]
     fn a_pinned_row_reports_its_pin_alone() {
-        let idle = sidebar_session_column(AgentSessionState::Idle, true, false, false, false);
+        let idle = sidebar_session_column(AgentSessionState::Idle, true, false, false, false, false);
         assert!(!idle.show_time, "a pinned row keeps no timestamp");
         assert_eq!(idle.label, None);
 
         let starting =
-            sidebar_session_column(AgentSessionState::Initializing, true, false, false, false);
+            sidebar_session_column(AgentSessionState::Initializing, true, false, false, false, false);
         assert_eq!(
             starting.label, None,
             "the pin owns the slot the state words would take"
@@ -35144,11 +35257,11 @@ fn session_opened(cx: &mut Context<Self>) {
     /// The session the reader has open is never marked unread.
     #[test]
     fn an_open_session_is_never_marked_unread() {
-        let closed = sidebar_session_column(AgentSessionState::Idle, false, true, false, false);
+        let closed = sidebar_session_column(AgentSessionState::Idle, false, true, false, false, false);
         assert!(closed.show_unread);
         assert!(!closed.show_time, "the unread dot takes the hour's slot");
 
-        let open = sidebar_session_column(AgentSessionState::Idle, false, true, true, false);
+        let open = sidebar_session_column(AgentSessionState::Idle, false, true, true, false, false);
         assert!(
             !open.show_unread,
             "an open session has been read by the fact of being open"
@@ -35159,20 +35272,20 @@ fn session_opened(cx: &mut Context<Self>) {
     /// A suspended session shows the pause mark instead of an hour.
     #[test]
     fn a_suspended_session_reports_the_pause_and_no_hour() {
-        let paused = sidebar_session_column(AgentSessionState::Idle, false, false, false, true);
+        let paused = sidebar_session_column(AgentSessionState::Idle, false, false, false, true, false);
         assert!(paused.show_paused);
         assert!(
             !paused.show_time,
             "a suspended row is not waiting on the clock"
         );
 
-        let working = sidebar_session_column(AgentSessionState::Running, false, false, false, true);
+        let working = sidebar_session_column(AgentSessionState::Running, false, false, false, true, false);
         assert!(
             working.show_status && working.show_paused,
             "a working session that is suspended reports both"
         );
 
-        let plain = sidebar_session_column(AgentSessionState::Idle, false, false, false, false);
+        let plain = sidebar_session_column(AgentSessionState::Idle, false, false, false, false, false);
         assert!(!plain.show_paused);
         assert!(plain.show_time);
     }
@@ -35181,7 +35294,7 @@ fn session_opened(cx: &mut Context<Self>) {
     #[test]
     fn the_states_with_words_take_the_hour_slot() {
         for state in [AgentSessionState::Initializing, AgentSessionState::Archived] {
-            let column = sidebar_session_column(state, false, false, false, false);
+            let column = sidebar_session_column(state, false, false, false, false, false);
             assert!(column.label.is_some(), "{state:?} wears its state in words");
             assert!(!column.show_time, "{state:?} does not also report an hour");
             assert!(column.show_status, "{state:?} keeps its mark too");
@@ -35189,17 +35302,17 @@ fn session_opened(cx: &mut Context<Self>) {
 
         // A closed session has a mark and an hour, which is what tells it apart
         // from an archived one.
-        let closed = sidebar_session_column(AgentSessionState::Closed, false, false, false, false);
+        let closed = sidebar_session_column(AgentSessionState::Closed, false, false, false, false, false);
         assert_eq!(closed.label, None);
         assert!(closed.show_status && closed.show_time);
 
         // The two states that own a mark report nothing else.
         let waiting =
-            sidebar_session_column(AgentSessionState::NeedsInput, false, false, false, false);
+            sidebar_session_column(AgentSessionState::NeedsInput, false, false, false, false, false);
         assert!(waiting.show_attention);
         assert!(!waiting.show_status && !waiting.show_time && waiting.label.is_none());
 
-        let failed = sidebar_session_column(AgentSessionState::Error, false, false, false, false);
+        let failed = sidebar_session_column(AgentSessionState::Error, false, false, false, false, false);
         assert!(failed.show_error);
         assert!(!failed.show_status && !failed.show_time && failed.label.is_none());
     }
@@ -35300,6 +35413,74 @@ fn session_opened(cx: &mut Context<Self>) {
             sheet.contains("sidebar_sheet_entry("),
             "and its entry is the same entry every other sheet draws"
         );
+    }
+
+    /// A queued send takes the state words and the hour, and answers with a
+    /// clock.
+    #[test]
+    fn a_queued_send_takes_the_state_words_and_the_hour() {
+        let starting = sidebar_session_column(
+            AgentSessionState::Initializing,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(starting.show_scheduled);
+        assert_eq!(
+            starting.label, None,
+            "the row is waiting on the clock, not starting up"
+        );
+        assert!(
+            !starting.show_status,
+            "the clock answers instead of the pulse"
+        );
+        assert!(
+            starting.show_time,
+            "and the countdown takes the slot the state words would have"
+        );
+
+        // A failed session keeps its own dot beside the clock: the row reports
+        // both what it is and what happens next.
+        let failed =
+            sidebar_session_column(AgentSessionState::Error, false, false, false, false, true);
+        assert!(failed.show_scheduled && failed.show_error);
+        assert!(
+            !failed.show_time,
+            "a failure takes no countdown with it"
+        );
+
+        // A pinned row keeps the clock and yields the text slot to its pin.
+        let pinned = sidebar_session_column(
+            AgentSessionState::Idle,
+            true,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(pinned.show_scheduled);
+        assert!(!pinned.show_time);
+
+        // Without a queued send the column is what it always was.
+        let plain =
+            sidebar_session_column(AgentSessionState::Idle, false, false, false, false, false);
+        assert!(!plain.show_scheduled);
+        assert!(plain.show_time);
+    }
+
+    /// The countdown's two shapes, at the desktop's own boundary.
+    #[test]
+    fn the_schedule_countdown_switches_shape_at_a_day() {
+        assert_eq!(mobile_schedule_countdown(0), "00:00:00");
+        assert_eq!(mobile_schedule_countdown(1_000), "00:00:01");
+        // Rounded up, so a row that is still waiting never reads 00:00:00.
+        assert_eq!(mobile_schedule_countdown(59_001), "00:01:00");
+        assert_eq!(mobile_schedule_countdown(23 * 3_600_000), "23:00:00");
+        // A day or more leads with the day.
+        assert_eq!(mobile_schedule_countdown(24 * 3_600_000), "1d 00:00");
+        assert_eq!(mobile_schedule_countdown(50 * 3_600_000), "2d 02:00");
     }
 
     /// A folder row's new-chat entry names the folder it starts in.
