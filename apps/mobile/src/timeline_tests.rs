@@ -410,7 +410,7 @@ fn reasoning_tracks_the_tail_and_preserves_explicit_full_or_collapsed_choices(
     click(cx, &format!("reasoning-header:{row_id}"));
     let window = cx.debug_bounds(window_selector.clone().leak()).unwrap();
     let content = cx.debug_bounds(body_selector.clone().leak()).unwrap();
-    assert!(window.size.height <= px(15.0 * markdown::LINE_HEIGHT_REM * 6.0 + 1.0));
+    assert!(window.size.height <= px(15.0 * theme::BODY_LINE_HEIGHT_REM * 6.0 + 1.0));
     assert!(content.size.height > window.size.height);
     assert!(
         (content.bottom() - window.bottom()).abs() <= px(1.0),

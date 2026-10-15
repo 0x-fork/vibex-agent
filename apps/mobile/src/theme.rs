@@ -247,56 +247,82 @@ pub const TOAST_MAX_WIDTH: f32 = 420.0;
 pub const TOAST_MAX_VISIBLE: usize = 3;
 
 /// The rem the ladder below is expressed against. Every value in the type
-/// scale is a logical pixel *at the default rem*; [`ui_rems`] converts it, so
-/// the whole interface tracks the platform's accessibility text scaling the
-/// same way `apps/desktop/src/typography.rs` makes the shell track it.
+/// scale is a logical pixel at this rem; [`ui_rems`] converts it, so the whole
+/// interface tracks the platform's accessibility text scaling the same way
+/// `apps/desktop/src/typography.rs` makes the shell track it.
+///
+/// The reader's text-size step lives in the window's live rem base
+/// ([`rem_base`]), *not* in [`ui_rems`]: the base multiplies every rem in the
+/// frame at once, so a step repaints the whole interface — the hand-built rows
+/// and the kit controls alike — through the one value the kit also reads.
 pub const UI_REM: f32 = 16.0;
 
-/// Page-level title on a full-screen surface (a settings sub-page, the new
-/// session page). One step above [`FONT_TITLE`].
-pub const FONT_APP_TITLE: f32 = 22.0;
+/// Ratio of a line box to its font size. A surface that does not carry its own
+/// metric takes [`line_height_for`], so a ladder step scales its leading with
+/// it instead of freezing at one screen's pixel height.
+pub const LINE_HEIGHT_RATIO: f32 = 1.45;
+
 /// The title of a surface or a hero row.
 pub const FONT_TITLE: f32 = 20.0;
 /// A section's own heading — strictly above the rows it groups.
 pub const FONT_HEADING: f32 = 17.0;
 /// Conversation text and every primary row label.
 pub const FONT_BODY: f32 = 16.0;
-/// Code buffers: monospace reads larger than the interface face at the same
-/// size, so it sits one step down.
-pub const FONT_CODE: f32 = 13.0;
 /// Supporting text under a primary label: row details, timeline metadata.
 pub const FONT_DETAIL: f32 = 14.0;
 /// Captions, chips, and button labels.
 pub const FONT_CAPTION: f32 = 13.0;
+/// Code buffers: monospace reads larger than the interface face at the same
+/// size, so it sits at the caption's step. An alias rather than a second value
+/// so the two can never drift apart.
+pub const FONT_CODE: f32 = FONT_CAPTION;
 /// The floor of the ladder: timestamps, counts, badges. Never below the
 /// 12sp Android minimum.
 pub const FONT_MICRO: f32 = 12.0;
+/// Large isolated numerals — the pairing code, a count on an otherwise empty
+/// page. Never used for prose, so it sits above [`FONT_TITLE`].
+pub const FONT_DISPLAY: f32 = 30.0;
+/// The product wordmark where a page leads with it. Above [`FONT_DISPLAY`]
+/// because it is a mark, not a size any row or label ever takes.
+pub const FONT_WORDMARK: f32 = 36.0;
 
-// The sidebar preserves the desktop hierarchy at one denser mobile type step
-// so a full project tree remains scannable on a phone.
-pub const FONT_SIDEBAR_TITLE: f32 = 17.0;
-pub const FONT_SIDEBAR_ROW: f32 = 15.0;
-pub const FONT_SIDEBAR_META: f32 = 13.0;
+/// Body line height as a rem multiple: the handful of call sites that need the
+/// number rather than an element style (a max-height line count) read it here
+/// instead of restating the ratio.
+pub const BODY_LINE_HEIGHT_REM: f32 = FONT_BODY * LINE_HEIGHT_RATIO / UI_REM;
 
-/// The rem ladder. Views must reach for these instead of `px(theme::FONT_*)`,
-/// which ignores the platform's text-scaling setting.
+/// The window's live rem base: the ladder's default rem times the reader's
+/// text-size step. This is the single place the preference enters layout — the
+/// kit reads the same value as its `theme.font_size`, so a step moves both
+/// halves of the interface together.
+pub fn rem_base() -> Pixels {
+    rem_base_for(font_scale_percent())
+}
+
+/// The rem base one text-size step produces.
 ///
-/// The reader's own text-size step multiplies the ladder here, in the one
-/// place every size passes through, so a step repaints the whole interface
-/// rather than the handful of views that remembered to ask.
+/// Split from [`rem_base`] so the scaling rule is unit-testable without
+/// mutating the process-global step (which parallel UI tests also read).
+fn rem_base_for(percent: u32) -> Pixels {
+    px(UI_REM * percent.clamp(75, 150) as f32 / 100.0)
+}
+
+/// A ladder value as rems. Pure unit conversion: the scale already lives in
+/// [`rem_base`], so applying it here as well would square it.
 pub fn ui_rems(value: f32) -> Rems {
-    let scale = font_scale_percent() as f32 / 100.0;
-    rems(value * scale / UI_REM)
+    rems(value / UI_REM)
+}
+
+/// A ladder value as scaled pixels, for the few surfaces GPUI sizes in pixels
+/// rather than rems (a brand lockup whose vector geometry must track its text).
+pub fn scaled_px(value: f32) -> Pixels {
+    px(value * font_scale_percent() as f32 / 100.0)
 }
 
 /// The size a code buffer is drawn at, which is a step below the body text and
 /// follows the same preference.
 pub fn code_font_size() -> Rems {
     ui_rems(FONT_CODE)
-}
-
-pub fn font_app_title() -> Rems {
-    ui_rems(FONT_APP_TITLE)
 }
 
 pub fn font_title() -> Rems {
@@ -323,22 +349,33 @@ pub fn font_micro() -> Rems {
     ui_rems(FONT_MICRO)
 }
 
+pub fn font_display() -> Rems {
+    ui_rems(FONT_DISPLAY)
+}
+
+pub fn font_wordmark() -> Rems {
+    ui_rems(FONT_WORDMARK)
+}
+
+/// The sidebar reuses the main ladder — a project is a [`FONT_HEADING`] over
+/// [`FONT_DETAIL`] session rows with [`FONT_CAPTION`] metadata — so the tree
+/// keeps its hierarchy without a second, drifting set of constants.
 pub fn font_sidebar_title() -> Rems {
-    ui_rems(FONT_SIDEBAR_TITLE)
+    ui_rems(FONT_HEADING)
 }
 
 pub fn font_sidebar_row() -> Rems {
-    ui_rems(FONT_SIDEBAR_ROW)
+    ui_rems(FONT_DETAIL)
 }
 
 pub fn font_sidebar_meta() -> Rems {
-    ui_rems(FONT_SIDEBAR_META)
+    ui_rems(FONT_CAPTION)
 }
 
-/// Line height for a step of the ladder: 1.45× the font, rounded to a whole
-/// logical pixel so baselines land on the touch grid.
-pub fn line_height_for(font: f32) -> Pixels {
-    px((font * 1.45).round())
+/// Line box for a step of the ladder, at [`LINE_HEIGHT_RATIO`]. Returned as
+/// rems so it scales with [`rem_base`] like the font it belongs to.
+pub fn line_height_for(font: f32) -> Rems {
+    rems(font * LINE_HEIGHT_RATIO / UI_REM)
 }
 
 pub const ICON_MD: f32 = 18.0;
@@ -401,10 +438,24 @@ static FONT_SCALE_PERCENT: AtomicU32 = AtomicU32::new(100);
 /// without turning the choice into a slider nobody can judge.
 pub const FONT_SCALE_STEPS: [u32; 3] = [90, 100, 115];
 
-/// Applies the persisted text-size preference. Called at startup and when the
-/// setting changes.
+/// Stores the reader's text-size step.
+///
+/// The step only reaches layout through [`rem_base`], which the kit publishes
+/// as the window rem and which this module rewrites whenever the scale changes.
+/// Callers pass their window so the new base takes effect on this frame rather
+/// than the next window layout.
 pub fn set_font_scale_percent(percent: u32) {
     FONT_SCALE_PERCENT.store(percent.clamp(75, 150), Ordering::Relaxed);
+}
+
+/// Applies a text-size step to the live window and repaints it.
+///
+/// `window.set_rem_size` is the one lever that moves the whole interface: the
+/// ladder's rems resolve against it, and so do the kit controls once
+/// [`apply_component_theme`] has written the same value into `theme.font_size`.
+pub fn apply_font_scale(percent: u32, window: &mut Window) {
+    set_font_scale_percent(percent);
+    window.set_rem_size(rem_base());
 }
 
 pub fn font_scale_percent() -> u32 {
@@ -791,11 +842,14 @@ pub fn apply_component_theme(window: Option<&mut Window>, cx: &mut App) {
 
     let token = |name: &str| semantic_color(name, dark);
     Theme::update(cx, |theme| {
-        // The phone runs one step denser than the desktop shell; keep kit controls
-        // on the compact end so they sit in the same rhythm as the hand-built rows.
+        // The kit's base is the same rem the ladder is written against, so a
+        // kit control and the hand-built row beside it resolve to one scale.
+        // Crucially it carries the reader's text-size step too: the kit's
+        // `Root` publishes `theme.font_size` as the window rem, which is what
+        // makes a step move the kit controls as well as the ladder.
         theme.font_family = "IBM Plex Sans".into();
-        theme.font_size = px(15.0);
-        theme.mono_font_size = px(13.0);
+        theme.font_size = rem_base();
+        theme.mono_font_size = scaled_px(FONT_CODE);
         theme.radius = px(RADIUS_CONTROL);
         theme.radius_lg = px(RADIUS_CARD);
 
@@ -986,5 +1040,61 @@ mod tests {
         }
         assert_eq!(AppearanceMode::from_storage("nope"), None);
         set_appearance_mode(AppearanceMode::System);
+    }
+
+    // The three tests below cover the type-scale contract that the mobile
+    // screen got wrong: one rem base carries the reader's step, the ladder is
+    // pure unit conversion on top of it, and the sidebar has no second ladder.
+
+    #[test]
+    fn the_reader_step_moves_the_rem_base_once() {
+        // The scale enters layout exactly once, through the window rem. If a
+        // ladder accessor multiplied it too, the default step would no longer
+        // render at its authored size.
+        assert_eq!(rem_base_for(100), px(UI_REM));
+        assert_eq!(rem_base_for(115), px(UI_REM * 1.15));
+        assert_eq!(rem_base_for(90), px(UI_REM * 0.90));
+        assert_eq!(rem_base_for(1000), px(UI_REM * 1.5), "clamped at the top");
+        assert_eq!(rem_base_for(0), px(UI_REM * 0.75), "clamped at the floor");
+
+        // `ui_rems` must not re-apply the step: at the default step a body
+        // value is exactly one rem, and the same value is scale-independent.
+        assert_eq!(font_body().0, 1.0);
+        assert_eq!(font_micro().0, FONT_MICRO / UI_REM);
+    }
+
+    #[test]
+    fn the_ladder_descends_and_has_no_duplicate_steps() {
+        let ladder = [
+            (FONT_TITLE, "title"),
+            (FONT_HEADING, "heading"),
+            (FONT_BODY, "body"),
+            (FONT_DETAIL, "detail"),
+            (FONT_CAPTION, "caption"),
+            (FONT_MICRO, "micro"),
+        ];
+        for pair in ladder.windows(2) {
+            assert!(
+                pair[0].0 > pair[1].0,
+                "the ladder must strictly descend: {pair:?}"
+            );
+        }
+        // Code is the one deliberate alias; the sidebar reuses the main ladder
+        // rather than carrying a second set of values that could drift.
+        assert_eq!(FONT_CODE, FONT_CAPTION);
+        assert_eq!(font_sidebar_title().0, font_heading().0);
+        assert_eq!(font_sidebar_row().0, font_detail().0);
+        assert_eq!(font_sidebar_meta().0, font_caption().0);
+    }
+
+    #[test]
+    fn line_height_scales_with_the_font_it_belongs_to() {
+        // A line box is a rem multiple, so it tracks the rem base like the
+        // font does rather than freezing at one screen's pixel height.
+        let body = line_height_for(FONT_BODY);
+        assert!((body.0 - FONT_BODY * LINE_HEIGHT_RATIO / UI_REM).abs() < f32::EPSILON);
+        assert!((BODY_LINE_HEIGHT_REM - body.0).abs() < f32::EPSILON);
+        // A denser step gets a proportionally tighter box.
+        assert!(line_height_for(FONT_MICRO).0 < body.0);
     }
 }

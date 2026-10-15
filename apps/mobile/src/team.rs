@@ -223,20 +223,24 @@ impl MobileApp {
                 div()
                     .px_4()
                     .py_2()
-                    .text_sm()
+                    .text_size(theme::font_detail())
                     .text_color(theme::accent_red())
                     .child(error.clone())
             }))
             .when(count == 0, |root| {
                 root.child(
-                    div().p_4().text_sm().text_color(theme::text_muted()).child(
-                        team.map(|team| team.status_label(locale::current()))
-                            .unwrap_or(locale::text(
-                                "Team views unavailable",
-                                "团队视图不可用",
-                                "團隊檢視無法使用",
-                            )),
-                    ),
+                    div()
+                        .p_4()
+                        .text_size(theme::font_detail())
+                        .text_color(theme::text_muted())
+                        .child(
+                            team.map(|team| team.status_label(locale::current()))
+                                .unwrap_or(locale::text(
+                                    "Team views unavailable",
+                                    "团队视图不可用",
+                                    "團隊檢視無法使用",
+                                )),
+                        ),
                 )
             })
             .when(count > 0, |root| {
@@ -270,7 +274,7 @@ impl MobileApp {
                         div()
                             .px_4()
                             .py_2()
-                            .text_sm()
+                            .text_size(theme::font_detail())
                             .text_color(theme::accent_red())
                             .child(locale::text(
                                 "Couldn’t refresh team",
@@ -285,7 +289,7 @@ impl MobileApp {
                     div()
                         .px_4()
                         .py_2()
-                        .text_sm()
+                        .text_size(theme::font_detail())
                         .text_color(theme::text_muted())
                         .child(locale::text("Read only", "只读", "唯讀")),
                 )
@@ -301,11 +305,16 @@ impl MobileApp {
                 )
             })
             .when(team.is_some_and(|team| team.is_limited()), |root| {
-                root.child(div().p_4().text_sm().child(locale::text(
-                    "Showing the first 1,000 team records",
-                    "显示前 1,000 条团队记录",
-                    "顯示前 1,000 筆團隊記錄",
-                )))
+                root.child(
+                    div()
+                        .p_4()
+                        .text_size(theme::font_detail())
+                        .child(locale::text(
+                            "Showing the first 1,000 team records",
+                            "显示前 1,000 条团队记录",
+                            "顯示前 1,000 筆團隊記錄",
+                        )),
+                )
             })
             .into_any_element()
     }
@@ -366,13 +375,13 @@ impl MobileApp {
             .child(
                 div()
                     .font_weight(FontWeight::MEDIUM)
-                    .text_sm()
+                    .text_size(theme::font_detail())
                     .truncate()
                     .child(title),
             )
             .child(
                 div()
-                    .text_xs()
+                    .text_size(theme::font_micro())
                     .text_color(theme::text_muted())
                     .child(if pending {
                         format!(
@@ -385,7 +394,7 @@ impl MobileApp {
             )
             .child(
                 div()
-                    .text_sm()
+                    .text_size(theme::font_detail())
                     .text_color(theme::text_secondary())
                     .truncate()
                     .child(summary),

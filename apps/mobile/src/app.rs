@@ -1180,7 +1180,7 @@ fn apply_app_settings(settings: &AppSettings, window: &mut Window, cx: &mut App)
     theme::set_system_dark(system_appearance_is_dark(cx));
     locale::set_preference(settings.language.unwrap_or_default());
     theme::set_reduce_motion(settings.reduce_motion);
-    theme::set_font_scale_percent(settings.font_scale_percent);
+    theme::apply_font_scale(settings.font_scale_percent, window);
     theme::set_theme_selection(&settings.theme_selection);
     // The kit's own components (inputs, sheets, notification layer) read the
     // theme global, and it was only ever applied at startup: changing the
@@ -3607,7 +3607,7 @@ impl MobileApp {
     }
 
     /// Steps the text size through its three settings.
-    fn cycle_text_size(&mut self, cx: &mut Context<Self>) {
+    fn cycle_text_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let steps = theme::FONT_SCALE_STEPS;
         let current = self.app_settings.font_scale_percent;
         let next = steps
@@ -3616,7 +3616,10 @@ impl MobileApp {
             .map(|index| steps[(index + 1) % steps.len()])
             .unwrap_or(100);
         self.app_settings.font_scale_percent = next;
-        theme::set_font_scale_percent(next);
+        // A step has to move the kit's base and the window rem together with
+        // the ladder, or half the screen keeps the old size.
+        theme::apply_font_scale(next, window);
+        theme::apply_component_theme(Some(window), cx);
         self.persist_app_settings(cx);
         cx.notify();
     }
@@ -11506,7 +11509,12 @@ impl MobileApp {
     /// the mark stays a little wider than the label is tall and rides above the
     /// baseline, which is what makes the two read as one word.
     fn render_pairing_brand(&self) -> impl IntoElement {
-        let scale = PAIRING_WORDMARK_FONT / 42.0;
+        // The mark's geometry is authored against the 42pt lockup the desktop
+        // ships. Its scale therefore follows the label's *rendered* size, so a
+        // text-size step grows the glyph with the word instead of leaving it
+        // behind at a frozen ratio.
+        let font = f32::from(theme::font_wordmark().to_pixels(theme::rem_base()));
+        let scale = font / 42.0;
         div()
             .debug_selector(|| "pairing-brand".to_string())
             .flex()
@@ -11514,7 +11522,7 @@ impl MobileApp {
             .justify_center()
             .gap(px(1.0))
             .mb(px(theme::SPACING_XL))
-            .text_size(px(PAIRING_WORDMARK_FONT))
+            .text_size(theme::font_wordmark())
             .font_weight(FontWeight::SEMIBOLD)
             .child(
                 svg()
@@ -12106,7 +12114,7 @@ impl MobileApp {
                     })
                     .child(
                         div()
-                            .text_size(px(15.0))
+                            .text_size(theme::font_body())
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::bg_primary())
                             .child(if busy {
@@ -12188,7 +12196,7 @@ impl MobileApp {
                                             .child(
                                                 div()
                                                     .truncate()
-                                                    .text_size(px(14.0))
+                                                    .text_size(theme::font_detail())
                                                     .text_color(theme::text_primary())
                                                     .child(candidate.display_name),
                                             )
@@ -12246,7 +12254,7 @@ impl MobileApp {
                     .pb(px(theme::SPACING_MD))
                     .child(
                         div()
-                            .text_size(px(14.0))
+                            .text_size(theme::font_detail())
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text_primary())
                             .child(format!(
@@ -12269,7 +12277,7 @@ impl MobileApp {
                             .h(px(56.0))
                             .flex()
                             .items_center()
-                            .text_size(px(30.0))
+                            .text_size(theme::font_display())
                             .font_weight(FontWeight::EXTRA_BOLD)
                             .text_color(theme::text_primary())
                             .child(code),
@@ -13221,7 +13229,7 @@ impl MobileApp {
                     .bg(background)
                     .font_family("IBM Plex Mono")
                     .text_size(theme::code_font_size())
-                    .line_height(px(17.0))
+                    .line_height(theme::line_height_for(theme::FONT_CODE))
                     .text_color(color)
                     .whitespace_normal()
                     .child(if text.trim().is_empty() {
@@ -16825,7 +16833,7 @@ impl MobileApp {
                     .px_3()
                     .py_2()
                     .text_size(theme::font_body())
-                    .line_height(px(22.0))
+                    .line_height(theme::line_height_for(theme::FONT_BODY))
                     .text_color(theme::text_primary())
                     .whitespace_normal()
                     .child(row.body.clone())
@@ -17816,7 +17824,7 @@ impl MobileApp {
                 .items_start()
                 .gap_2()
                 .text_size(theme::font_body())
-                .line_height(px(18.0))
+                .line_height(theme::line_height_for(theme::FONT_BODY))
                 .text_color(color)
                 .child(
                     svg()
@@ -17842,7 +17850,7 @@ impl MobileApp {
             .items_start()
             .gap_2()
             .text_size(theme::font_caption())
-            .line_height(px(17.0))
+            .line_height(theme::line_height_for(theme::FONT_CAPTION))
             .text_color(color)
             .child(
                 svg()
@@ -17912,7 +17920,7 @@ impl MobileApp {
                     .px_2()
                     .py_1()
                     .text_size(theme::font_micro())
-                    .line_height(px(16.0))
+                    .line_height(theme::line_height_for(theme::FONT_MICRO))
                     .text_color(theme::text_secondary())
                     .whitespace_normal()
                     .child(bounded_timeline_detail(value)),
@@ -19675,7 +19683,7 @@ impl MobileApp {
                 .child(
                     div()
                         .text_size(theme::font_body())
-                        .line_height(px(20.0))
+                        .line_height(theme::line_height_for(theme::FONT_BODY))
                         .text_color(theme::text_primary())
                         .child(objective.clone()),
                 )
@@ -21772,7 +21780,7 @@ impl MobileApp {
                             .flex()
                             .items_center()
                             .gap(px(1.0))
-                            .text_size(px(15.0))
+                            .text_size(theme::font_sidebar_row())
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(
                                 svg()
@@ -22804,7 +22812,7 @@ impl MobileApp {
                                 header.child(
                                     div()
                                         .pt_2()
-                                        .text_sm()
+                                        .text_size(theme::font_detail())
                                         .text_color(theme::accent_red())
                                         .child(message.clone()),
                                 )
@@ -23910,7 +23918,7 @@ impl MobileApp {
                         div()
                             .text_size(theme::font_body())
                             .text_color(theme::text_primary())
-                            .line_height(px(20.0))
+                            .line_height(theme::line_height_for(theme::FONT_BODY))
                             // Long prompts are clipped to three lines: the
                             // sheet is for recognition, and the full text is
                             // one tap away in the field.
@@ -26040,7 +26048,7 @@ impl MobileApp {
                     locale::text("Text size", "文字大小", "文字大小").to_string(),
                     text_size_label(self.app_settings.font_scale_percent),
                     theme::accent_chart3(),
-                    cx.listener(|this, _, _, cx| this.cycle_text_size(cx)),
+                    cx.listener(|this, _, window, cx| this.cycle_text_size(window, cx)),
                 )],
             ),
             settings_group(
@@ -28223,12 +28231,6 @@ const PAIRING_SWITCHER_TOP_PAD: f32 = 56.0;
 /// A sheet always leaves the wordmark and the entries above it in sight, so the
 /// screen never becomes a sheet with nothing behind it.
 const PAIRING_SHEET_HEIGHT_RATIO: f32 = 0.62;
-
-/// The pairing page's product wordmark, at the size the first screen wants.
-///
-/// The lockup is drawn from the desktop wordmark's geometry scaled to this
-/// size, so the mark stays a little wider than the label is tall.
-const PAIRING_WORDMARK_FONT: f32 = 36.0;
 
 /// How tall one saved-runtime row is: a touch target with the room its state
 /// dot, its name and its own actions control need.

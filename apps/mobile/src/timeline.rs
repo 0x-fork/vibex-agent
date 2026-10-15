@@ -90,7 +90,7 @@ impl MobileApp {
                     .min_w_0()
                     .flex_1()
                     .truncate()
-                    .text_sm()
+                    .text_size(theme::font_detail())
                     .font_normal()
                     .child(label),
             )
@@ -157,7 +157,7 @@ impl MobileApp {
                                 .min_w_0()
                                 .flex_1()
                                 .truncate()
-                                .text_sm()
+                                .text_size(theme::font_detail())
                                 .font_normal()
                                 .child(activity_text(
                                     &format!("reasoning-label:{}", row.id),
@@ -217,7 +217,7 @@ impl MobileApp {
                     .when(windowed, |body| {
                         body.debug_selector(|| format!("reasoning-window:{}", row.id))
                             .max_h(gpui::rems(
-                                markdown::LINE_HEIGHT_REM
+                                theme::BODY_LINE_HEIGHT_REM
                                     * vibex_ui::timeline::REASONING_WINDOW_LINES as f32,
                             ))
                             .overflow_hidden()
@@ -283,7 +283,7 @@ impl MobileApp {
                         .min_w_0()
                         .flex_1()
                         .truncate()
-                        .text_sm()
+                        .text_size(theme::font_detail())
                         .font_normal()
                         .child(activity_text(
                             &format!("group-label:{}", group.id),
@@ -346,7 +346,7 @@ impl MobileApp {
                     .child(
                         div()
                             .flex_none()
-                            .text_sm()
+                            .text_size(theme::font_detail())
                             .font_normal()
                             .child(activity.action()),
                     )
@@ -360,7 +360,7 @@ impl MobileApp {
                                 div()
                                     .min_w_0()
                                     .truncate()
-                                    .text_sm()
+                                    .text_size(theme::font_detail())
                                     .font_normal()
                                     .when(activity.path().is_some(), |target| {
                                         target
@@ -379,7 +379,7 @@ impl MobileApp {
                         header.child(
                             div()
                                 .flex_none()
-                                .text_xs()
+                                .text_size(theme::font_micro())
                                 .text_color(theme::accent_yellow())
                                 .child(locale::text("Approval", "待确认", "待確認")),
                         )
@@ -452,8 +452,8 @@ impl MobileApp {
                         .max_h_48()
                         .overflow_y_scroll()
                         .font_family(cx.theme().mono_font_family.clone())
-                        .text_sm()
-                        .line_height(gpui::relative(1.5))
+                        .text_size(theme::font_detail())
+                        .line_height(theme::line_height_for(theme::FONT_DETAIL))
                         .text_color(theme::text_secondary())
                         .whitespace_normal()
                         .child(value),

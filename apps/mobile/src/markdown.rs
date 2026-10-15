@@ -16,9 +16,6 @@ use vibex_ui::markdown::plain_text;
 
 use crate::theme;
 
-/// Body text and its line height share the same rem scale as the live window.
-pub const LINE_HEIGHT_REM: f32 = 0.875 * 1.5;
-
 pub struct MarkdownView {
     source: Arc<str>,
     revision: u64,
@@ -85,8 +82,8 @@ impl Render for MarkdownView {
             .flex()
             .flex_col()
             .gap_2()
-            .text_sm()
-            .line_height(gpui::relative(1.5))
+            .text_size(theme::font_body())
+            .line_height(theme::line_height_for(theme::FONT_BODY))
             .text_color(if self.muted {
                 theme::text_muted()
             } else {

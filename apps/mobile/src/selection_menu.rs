@@ -30,7 +30,6 @@ use crate::theme;
 /// Width of one toolbar item. The bar's width follows from the item count, so
 /// everything drawn against it can be placed without measuring text.
 const ITEM_WIDTH: f32 = 72.0;
-const ITEM_FONT_SIZE: f32 = 15.0;
 const BAR_HEIGHT: f32 = 44.0;
 const BAR_RADIUS: f32 = 8.0;
 const DIVIDER_WIDTH: f32 = 1.0;
@@ -474,7 +473,7 @@ impl Render for SelectionMenu {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(ITEM_FONT_SIZE))
+                        .text_size(theme::font_detail())
                         .text_color(if available {
                             theme::text_primary()
                         } else {

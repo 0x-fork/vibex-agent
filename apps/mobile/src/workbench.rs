@@ -48,6 +48,10 @@ const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(600);
 /// How much of a long diff is shown at once, and how much more each "show
 /// more" adds.
 const GIT_DIFF_PAGE_LINES: usize = 800;
+/// The terminal grid keeps absolute pixels on purpose: the PTY is sized to a
+/// row/column count, so a cell that grew with the text-size preference would
+/// desynchronize the rendered grid from the shell's belief about its size.
+/// These mirror the desktop terminal surface's metrics.
 const TERMINAL_FONT_SIZE: f32 = 13.0;
 const TERMINAL_CELL_WIDTH: f32 = 8.0;
 const TERMINAL_CELL_HEIGHT: f32 = 18.0;
