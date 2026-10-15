@@ -20969,14 +20969,21 @@ async fn wait_for_agent_auth_completion(
             .map_err(crate::app::remote_error_into_vibex)?;
         match operation.state {
             vibex_core::AgentAuthenticationOperationState::Succeeded => {
+                // Verification commits the credential change, which advances the
+                // context revision past the fence this operation was opened
+                // against. Refresh against the *committed* revision: reusing the
+                // operation's own revision makes the compare-and-set reject the
+                // request as a stale-revision conflict, so a sign-in that
+                // actually succeeded would surface as an error.
+                let contexts = backend
+                    .agent()
+                    .list_agent_auth_contexts()
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
+                let request = agent_auth_refresh_request_after_sign_in(&operation, &contexts)?;
                 return backend
                     .agent()
-                    .refresh_agent_auth_models(MutationRequest::new(
-                        AgentAuthContextRefreshModelsRequest {
-                            auth_context_id: operation.auth_context_id,
-                            expected_context_revision: operation.expected_context_revision,
-                        },
-                    ))
+                    .refresh_agent_auth_models(MutationRequest::new(request))
                     .await
                     .map_err(crate::app::remote_error_into_vibex);
             }
@@ -21002,6 +21009,33 @@ async fn wait_for_agent_auth_completion(
         "agent_authentication_completion_timeout",
         "Interactive Agent authentication did not reach a final state",
     ))
+}
+
+/// Builds the post-sign-in model refresh request against the context revision
+/// the authority actually committed.
+///
+/// The operation stores the revision it was opened against, and verification
+/// advances that revision as part of committing the credential change. Reusing
+/// the operation's revision therefore fails the compare-and-set fence with
+/// `agent_auth_context_revision_conflict`, turning a successful sign-in into an
+/// error. The freshly read context is authoritative.
+fn agent_auth_refresh_request_after_sign_in(
+    operation: &vibex_core::AgentAuthenticationOperation,
+    contexts: &[AgentAuthContext],
+) -> VibexResult<AgentAuthContextRefreshModelsRequest> {
+    let context = contexts
+        .iter()
+        .find(|context| context.id == operation.auth_context_id)
+        .ok_or_else(|| {
+            VibexError::validation(
+                "agent_auth_context_not_found",
+                "Agent authentication context was not found after sign-in",
+            )
+        })?;
+    Ok(AgentAuthContextRefreshModelsRequest {
+        auth_context_id: context.id.clone(),
+        expected_context_revision: context.revision,
+    })
 }
 
 fn management_locale_text(
@@ -28838,6 +28872,55 @@ mod tests {
         ] {
             assert!(render.contains(expected), "missing auth flow: {expected}");
         }
+    }
+
+    /// A terminal sign-in commits a credential change, and verification
+    /// advances the context revision as it does so. The follow-up model refresh
+    /// must use the committed revision; reusing the operation's own revision
+    /// trips the compare-and-set fence and reports a successful sign-in as
+    /// `agent_auth_context_revision_conflict`. This surfaced as soon as
+    /// OpenCode's login stopped being a silent `Agent` no-op and actually
+    /// opened a terminal.
+    #[test]
+    fn post_sign_in_refresh_uses_the_committed_context_revision() {
+        let operation = vibex_core::AgentAuthenticationOperation {
+            operation_id: AgentAuthenticationOperationId::new(),
+            auth_context_id: vibex_core::AgentAuthContextId::new(),
+            // The revision the operation was opened against, before verification
+            // committed the change.
+            expected_context_revision: 4,
+            method_id: "opencode-login".to_string(),
+            state: vibex_core::AgentAuthenticationOperationState::Succeeded,
+            error_code: None,
+            created_at_ms: 0,
+            updated_at_ms: 1,
+        };
+        let context = |revision| AgentAuthContext {
+            id: operation.auth_context_id.clone(),
+            agent_id: AgentId::parse("opencode").expect("valid Agent id"),
+            status: AgentAuthContextStatus::Authenticated,
+            account_hint: None,
+            authenticated_via_method: Some("opencode-login".to_string()),
+            revision,
+            last_verified_at_ms: Some(2),
+            created_at_ms: 0,
+            updated_at_ms: 2,
+        };
+
+        let request =
+            agent_auth_refresh_request_after_sign_in(&operation, &[context(5)]).expect("context");
+        assert_eq!(request.auth_context_id, operation.auth_context_id);
+        assert_eq!(
+            request.expected_context_revision, 5,
+            "the refresh must fence on the committed revision, not the operation's stale one"
+        );
+        assert_ne!(
+            request.expected_context_revision, operation.expected_context_revision,
+            "the stale operation revision is exactly what the fence rejected"
+        );
+
+        let missing = agent_auth_refresh_request_after_sign_in(&operation, &[]).unwrap_err();
+        assert_eq!(missing.code, "agent_auth_context_not_found");
     }
 
     #[test]

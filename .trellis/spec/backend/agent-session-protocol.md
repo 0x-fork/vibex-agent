@@ -3366,6 +3366,14 @@ AgentAuthModelCatalogSnapshot {
   context revision for a credential change, probes models with that exact
   revision, then commits `Authenticated` and the snapshot. A successful RPC
   alone, a non-empty `authMethods` list, or a credential file is not proof.
+- The revision fence a caller holds before a sign-in is not the fence that
+  exists after it. Verification advances the context revision as it commits the
+  credential change, while the durable operation keeps the revision it was
+  opened against; a follow-up keyed on that previous revision — the
+  post-sign-in model refresh, for instance — is rejected by the compare-and-set
+  fence as `agent_auth_context_revision_conflict`. Read the committed context and
+  fence on its revision. The failure stays latent on paths that never open a
+  login, which is why it only appears once an interactive method actually runs.
 - Discovery prefers a direct Agent model catalog, then session config evidence,
   a verified compatibility descriptor, and live-session evidence. If no real
   model list exists, it stores `AgentDefaultOnly` and publishes
