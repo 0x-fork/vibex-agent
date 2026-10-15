@@ -2151,6 +2151,12 @@ pub enum FormPurpose {
     /// Nothing is carried but the Agent the reader chose and the values they
     /// typed: the authority mints the id, so there is no record to name.
     NewProviderProfile,
+    /// The settings of one Model inside a profile.
+    ProviderModel {
+        agent_id: String,
+        profile_id: String,
+        model_id: String,
+    },
     /// Which Agents receive one MCP server or Skill.
     McpMatrix {
         server_id: String,
@@ -3032,6 +3038,145 @@ fn model_detail(
         ));
     }
     detail
+}
+
+/// One wire protocol as a form value, and back.
+///
+/// The value is the registry's own spelling so a form the reader opened and
+/// saved without touching the field writes back what it read.
+pub fn wire_api_from_value(value: &str) -> Option<vibex_core::ProviderModelWireApi> {
+    use vibex_core::ProviderModelWireApi as Api;
+    Some(match value {
+        "openai_responses" => Api::OpenaiResponses,
+        "openai_chat_completions" => Api::OpenaiChatCompletions,
+        "anthropic_messages" => Api::AnthropicMessages,
+        "mistral_conversations" => Api::MistralConversations,
+        "google_generative_ai" => Api::GoogleGenerativeAi,
+        "google_vertex" => Api::GoogleVertex,
+        "aws_bedrock_converse" => Api::AwsBedrockConverse,
+        _ => return None,
+    })
+}
+
+/// Every protocol a Model may be called over, with "leave it to the Agent"
+/// first: a profile that names no protocol is the common case.
+pub fn wire_api_choices() -> (Vec<String>, Vec<String>) {
+    let mut options = vec![INHERIT.to_string()];
+    let mut labels = vec!["inherit".to_string()];
+    for api in [
+        vibex_core::ProviderModelWireApi::OpenaiResponses,
+        vibex_core::ProviderModelWireApi::OpenaiChatCompletions,
+        vibex_core::ProviderModelWireApi::AnthropicMessages,
+        vibex_core::ProviderModelWireApi::MistralConversations,
+        vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
+        vibex_core::ProviderModelWireApi::GoogleVertex,
+        vibex_core::ProviderModelWireApi::AwsBedrockConverse,
+    ] {
+        options.push(wire_api_label(api).to_string());
+        labels.push(wire_api_label(api).to_string());
+    }
+    (options, labels)
+}
+
+/// The value a choice field carries when the answer is "whatever the Agent
+/// does", which is not the same as an empty answer.
+pub const INHERIT: &str = "inherit";
+
+/// The settings of one Model inside a profile.
+///
+/// A Model is not a record, so neither is its editor: the purpose names the
+/// profile and the Model together, and the save writes the profile's whole Model
+/// list back with this one replaced.
+pub fn provider_model_form(
+    agent_id: &str,
+    profile_id: &str,
+    model: &vibex_core::ProviderConfiguredModel,
+    strings: Strings,
+) -> ConfigForm {
+    let (wire_options, wire_labels) = wire_api_choices();
+    let wire = model
+        .wire_api
+        .map(wire_api_label)
+        .unwrap_or(INHERIT)
+        .to_string();
+    let reasoning = match model.capabilities.reasoning {
+        None => INHERIT,
+        Some(true) => "reasoning",
+        Some(false) => "non_reasoning",
+    };
+    let efforts = model
+        .capabilities
+        .reasoning_efforts
+        .as_ref()
+        .map(|efforts| {
+            efforts
+                .declared_levels()
+                .map(|(level, wire)| match wire {
+                    Some(wire) if wire != level.as_str() => format!("{level}={wire}"),
+                    _ => level.as_str().to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let fields = vec![
+        FormField::text(
+            "display_name",
+            strings.config_form_name(),
+            model.display_name.clone().unwrap_or_default(),
+        ),
+        FormField::choice_owned(
+            "wire_api",
+            strings.config_field_wire_api(),
+            wire_options,
+            wire_labels,
+            &wire,
+        ),
+        FormField::choice(
+            "reasoning",
+            strings.config_field_reasoning(),
+            vec![INHERIT, "reasoning", "non_reasoning"],
+            vec![
+                strings.config_hint_inherit(),
+                strings.config_choice_reasoning(),
+                strings.config_choice_non_reasoning(),
+            ],
+            reasoning,
+        ),
+        FormField::text(
+            "context_tokens",
+            strings.config_field_context_tokens(),
+            model
+                .capabilities
+                .context_tokens
+                .map(|tokens| tokens.to_string())
+                .unwrap_or_default(),
+        ),
+        FormField::text(
+            "output_tokens",
+            strings.config_field_output_tokens(),
+            model
+                .capabilities
+                .output_tokens
+                .map(|tokens| tokens.to_string())
+                .unwrap_or_default(),
+        ),
+        FormField::text(
+            "reasoning_efforts",
+            strings.config_field_reasoning_efforts(),
+            efforts,
+        )
+        .hint(strings.config_hint_reasoning_efforts()),
+    ];
+    ConfigForm::new(
+        FormPurpose::ProviderModel {
+            agent_id: agent_id.to_string(),
+            profile_id: profile_id.to_string(),
+            model_id: model.id.clone(),
+        },
+        format!("{} · {}", strings.config_form_edit_model(), model.id),
+        fields,
+    )
 }
 
 /// What one wire protocol is called on screen.

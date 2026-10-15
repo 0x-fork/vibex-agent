@@ -1709,3 +1709,97 @@ fn a_model_typed_by_hand_is_added_to_the_profile_it_was_asked_for() {
     // The reader is put back where they were: the list they were editing.
     assert!(matches!(app.overlay, Some(Overlay::Models { .. })));
 }
+
+/// One Model's settings are edited on the Model, and written through the profile.
+///
+/// A Model is not a record: its name, its protocol, whether it reasons and the
+/// limits it declares belong to the entry in the profile's list. The thinking
+/// levels are read by the authority's own parser, so the form accepts exactly
+/// what a thinking-depth control can consume and refuses the rest with a
+/// sentence rather than writing a table dispatch would choke on.
+#[test]
+fn one_models_settings_are_edited_and_written_through_the_profile() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+    app.perform(vibex_tui::action::Intent::ConfigModels);
+    app.perform(vibex_tui::action::Intent::ConfigModelEdit);
+
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("`e` opened no settings form");
+    };
+    assert_eq!(form.value("wire_api").as_deref(), Some("inherit"));
+    assert_eq!(form.value("reasoning").as_deref(), Some("inherit"));
+
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        form.field_mut("display_name").unwrap().value = "GPT-5".to_string();
+        form.field_mut("wire_api").unwrap().value = "anthropic_messages".to_string();
+        form.field_mut("reasoning").unwrap().value = "reasoning".to_string();
+        form.field_mut("context_tokens").unwrap().value = "200000".to_string();
+        form.field_mut("reasoning_efforts").unwrap().value = "low, high, max".to_string();
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::UpdateProviderProfile {
+                configured_models: Some(models),
+                ..
+            } = mutation
+            else {
+                panic!("the save was not a Model write: {mutation:?}");
+            };
+            assert_eq!(models.len(), 1, "the settings changed the number of Models");
+            let model = &models[0];
+            assert_eq!(model.display_name.as_deref(), Some("GPT-5"));
+            assert_eq!(
+                model.wire_api,
+                Some(vibex_core::ProviderModelWireApi::AnthropicMessages)
+            );
+            assert_eq!(model.capabilities.reasoning, Some(true));
+            assert_eq!(model.capabilities.context_tokens, Some(200_000));
+            assert_eq!(model.capabilities.output_tokens, None);
+            let levels = model
+                .capabilities
+                .reasoning_efforts
+                .as_ref()
+                .expect("the levels were dropped")
+                .declared_levels()
+                .map(|(level, _)| level.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(levels, vec!["low", "high", "max"]);
+        }
+        other => panic!("the save produced {other:?}"),
+    }
+}
+
+/// A limit that is not a number, and a level that is not a level, are refused
+/// with the reason on screen rather than written as something else.
+#[test]
+fn a_model_setting_the_authority_could_not_read_is_refused() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+    app.perform(vibex_tui::action::Intent::ConfigModels);
+    app.perform(vibex_tui::action::Intent::ConfigModelEdit);
+
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        form.field_mut("context_tokens").unwrap().value = "a lot".to_string();
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    assert!(outcome.effects.is_empty(), "a bad limit was written");
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the form closed on an invalid save");
+    };
+    assert!(form.error.is_some(), "no reason was given");
+    let screen = text(&mut app, 140, 40);
+    assert!(screen.contains("whole numbers"), "{screen}");
+
+    // A level the parser cannot read is refused too, and the form stays open.
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        form.field_mut("context_tokens").unwrap().value.clear();
+        form.field_mut("reasoning_efforts").unwrap().value = "quite a lot".to_string();
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    assert!(outcome.effects.is_empty(), "a bad level was written");
+    assert!(matches!(app.overlay, Some(Overlay::Form { .. })));
+}

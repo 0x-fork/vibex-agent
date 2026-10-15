@@ -1142,7 +1142,8 @@ impl App {
             Intent::ConfigModelToggle
             | Intent::ConfigModelAdd
             | Intent::ConfigModelRemove
-            | Intent::ConfigModelFetch => Outcome::quiet(),
+            | Intent::ConfigModelFetch
+            | Intent::ConfigModelEdit => Outcome::quiet(),
             Intent::ConfigRegistryFilter => self.step_registry_narrowing(RegistryStep::Transport),
             Intent::ConfigRegistrySort => self.step_registry_narrowing(RegistryStep::Sort),
             Intent::ConfigRegistryPagePrevious => self.step_registry_page(-1),
@@ -2061,6 +2062,34 @@ impl App {
                 self.overlay = Some(Overlay::Models { view });
                 Outcome::effects(vec![Effect::FetchProviderModels { profile_id }])
             }
+            // A Model the profile does not declare has no settings yet: there is
+            // nothing to edit until the press that offers it makes it part of
+            // the profile.
+            Intent::ConfigModelEdit => {
+                let Some(row) = rows.get(selected).filter(|row| row.declared) else {
+                    return Outcome::quiet();
+                };
+                let Some(model) = self
+                    .provider(&view.profile_id)
+                    .and_then(|profile| {
+                        profile
+                            .configured_models
+                            .iter()
+                            .find(|model| model.id == row.id)
+                    })
+                    .cloned()
+                else {
+                    return Outcome::quiet();
+                };
+                let form = crate::config_center::provider_model_form(
+                    &view.agent_id,
+                    &view.profile_id,
+                    &model,
+                    self.strings,
+                );
+                self.overlay = Some(Overlay::Form { form });
+                Outcome::effects(vec![])
+            }
             Intent::ConfigModelAdd => {
                 self.overlay = Some(Overlay::Prompt {
                     title: self.strings.config_form_add_model().to_string(),
@@ -2900,6 +2929,65 @@ impl App {
                         },
                     ))),
                 }
+            }
+            FormPurpose::ProviderModel {
+                agent_id,
+                profile_id,
+                model_id,
+            } => {
+                let Some(profile) = self
+                    .management_data
+                    .providers
+                    .iter()
+                    .find(|profile| profile.id.as_str() == profile_id.as_str())
+                    .cloned()
+                else {
+                    return Err("unknown record");
+                };
+                let Some(index) = profile
+                    .configured_models
+                    .iter()
+                    .position(|model| model.id == *model_id)
+                else {
+                    return Err("unknown record");
+                };
+                let context_tokens = declared_token_limit(form, "context_tokens", strings)?;
+                let output_tokens = declared_token_limit(form, "output_tokens", strings)?;
+                // The thinking-level declaration is parsed by the authority's own
+                // reader, so the form accepts exactly what dispatch can consume
+                // and says why when it cannot.
+                let reasoning_efforts = match form.value("reasoning_efforts") {
+                    Some(input) if !input.trim().is_empty() => {
+                        // The reason is core's own sentence, which names the
+                        // level it could not read rather than saying "invalid".
+                        vibex_core::ProviderModelReasoningEfforts::parse(&input)
+                            .map_err(|_| strings.config_form_error_reasoning_efforts())?
+                    }
+                    _ => None,
+                };
+                let mut models = profile.configured_models.clone();
+                let model = &mut models[index];
+                model.display_name = form.optional("display_name");
+                model.wire_api = form
+                    .value("wire_api")
+                    .filter(|value| value != crate::config_center::INHERIT)
+                    .and_then(|value| crate::config_center::wire_api_from_value(&value));
+                model.capabilities.reasoning = match form.value("reasoning").as_deref() {
+                    Some("reasoning") => Some(true),
+                    Some("non_reasoning") => Some(false),
+                    _ => None,
+                };
+                model.capabilities.context_tokens = context_tokens;
+                model.capabilities.output_tokens = output_tokens;
+                model.capabilities.reasoning_efforts = reasoning_efforts;
+                Ok(ConfigMutation::UpdateProviderProfile {
+                    agent_id: parse_config_id(agent_id)?,
+                    profile_id: parse_config_id(profile_id)?,
+                    display_name: None,
+                    base_url: None,
+                    default_model: None,
+                    configured_models: Some(models),
+                })
             }
             FormPurpose::NewProviderProfile => {
                 let Some(agent_id) = form
@@ -6937,6 +7025,25 @@ impl ElicitationDraft {
 /// "nothing happened" rather than writing to a guessed id.
 fn parse_config_id<T: std::str::FromStr>(value: &str) -> Result<T, &'static str> {
     value.parse().map_err(|_| "unknown record")
+}
+
+/// A token limit as the form typed it: a whole number greater than zero, or
+/// nothing at all.
+///
+/// A limit that is not a number is refused rather than dropped, because a
+/// silent zero would tell the Agent the Model has no context at all.
+fn declared_token_limit(
+    form: &crate::config_center::ConfigForm,
+    key: &str,
+    strings: crate::locale::Strings,
+) -> Result<Option<u32>, &'static str> {
+    match form.optional(key) {
+        None => Ok(None),
+        Some(value) => match value.parse::<u32>() {
+            Ok(tokens) if tokens > 0 => Ok(Some(tokens)),
+            _ => Err(strings.config_form_error_tokens()),
+        },
+    }
 }
 
 /// Which narrowing of a registry one press asked for.

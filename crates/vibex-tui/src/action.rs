@@ -226,6 +226,7 @@ intents! {
     ConfigModelAdd => { scope: Overlay, id: "config_model_add", label: label_config_model_add, help: help_config_model_add },
     ConfigModelRemove => { scope: Overlay, id: "config_model_remove", label: label_config_model_remove, help: help_config_model_remove },
     ConfigModelFetch => { scope: Overlay, id: "config_model_fetch", label: label_config_model_fetch, help: help_config_model_fetch },
+    ConfigModelEdit => { scope: Overlay, id: "config_model_edit", label: label_config_model_edit, help: help_config_model_edit },
     ConfigRegistryFilter => { scope: Management, id: "config_registry_filter", label: label_config_registry_filter, help: help_config_registry_filter },
     ConfigRegistrySort => { scope: Management, id: "config_registry_sort", label: label_config_registry_sort, help: help_config_registry_sort },
     ConfigRegistryPagePrevious => { scope: Management, id: "config_registry_page_previous", label: label_config_registry_page_previous, help: help_config_registry_page_previous },

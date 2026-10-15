@@ -1362,6 +1362,12 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         |strings| Intent::ConfigModelFetch.label(strings),
     ),
     binding(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('e')),
+        Intent::ConfigModelEdit,
+        |strings| Intent::ConfigModelEdit.label(strings),
+    ),
+    binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('t')),
         Intent::ConfigRegistryFilter,
