@@ -20,7 +20,7 @@ mod platform {
                 activity,
                 jni::jni_str!("gpuiKeepScreenOn"),
                 jni::jni_sig!((keep_on: jboolean) -> ()),
-                &[jni::objects::JValue::Bool(u8::from(keep_on))],
+                &[jni::objects::JValue::Bool(keep_on)],
             )?;
             Ok(())
         });
