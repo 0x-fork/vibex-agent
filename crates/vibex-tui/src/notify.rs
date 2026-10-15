@@ -1374,6 +1374,29 @@ impl App {
         control
     }
 
+    /// Forget every picture the terminal was holding.
+    ///
+    /// The other half of [`App::take_terminal_control`]: that door carries what
+    /// a frame wants *put* on the terminal, this one is for the moments the
+    /// terminal has already taken everything down itself. A resize clears the
+    /// screen, the clear takes the pictures with it — a terminal that draws
+    /// images for itself drops them when the screen is cleared, which is what
+    /// kitty's own protocol rules require — and leaving the alternate screen
+    /// drops them the same way. This client's record of what is placed is what
+    /// would stop the next frame from sending a mark again, so the reader sees
+    /// a list whose logos are missing until each row happens to scroll out of
+    /// the window and back in. Forgetting is cheap and sending is not: every
+    /// picture goes out once, on the frame after this.
+    ///
+    /// One door for the same reason the escapes have one: three surfaces own a
+    /// picture, and a caller that forgot only the one it was thinking about
+    /// would leave the others blank.
+    pub fn forget_terminal_pictures(&mut self) {
+        self.picture.forget();
+        self.pairing_qr.forget();
+        self.row_marks.forget();
+    }
+
     /// The message one notification says.
     ///
     /// The parts are handed over separately rather than joined here: the Agent's

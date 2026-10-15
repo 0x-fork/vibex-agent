@@ -252,6 +252,26 @@ impl PlacedPicture {
         self.rect = None;
         self.bytes = None;
     }
+
+    /// Drop the record of the picture without telling the terminal anything.
+    ///
+    /// For the frame after the terminal has already dropped it: a resize clears
+    /// the screen, a clear takes every picture with it, and leaving the
+    /// alternate screen takes them too — all of them rules the terminal keeps,
+    /// not this client. The escapes [`PlacedPicture::clear`] would send are
+    /// worse than useless there, because they name a picture the terminal no
+    /// longer has; what is left to do is stop believing it is on the terminal,
+    /// so the next placement transmits the picture again instead of *moving*
+    /// one that is not there.
+    ///
+    /// Escapes this frame has already queued are kept: a caller forgets on the
+    /// way into a frame, and the escapes in hand were queued for the screen
+    /// that frame is about to paint.
+    pub fn forget(&mut self) {
+        self.label = None;
+        self.rect = None;
+        self.bytes = None;
+    }
 }
 
 /// What the panel draws with, gathered once per frame.

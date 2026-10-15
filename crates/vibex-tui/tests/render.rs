@@ -11362,6 +11362,71 @@ fn a_modal_keeps_the_marks_it_does_not_cover() {
     );
 }
 
+/// A screen the terminal cleared comes back with its marks, not with the empty
+/// cells a stale record of them would leave.
+///
+/// A resize makes the backend clear the screen, and a clear takes a terminal's
+/// pictures with it — kitty's own protocol rules say a clear must clear the
+/// images — so what the pools believe they have placed is worth nothing from
+/// one frame to the next. Without `App::forget_terminal_pictures` the session
+/// list came back from a resize looking as if rows had lost their Agent: the
+/// mark's cells are reserved blank, and a frame that believes the picture is
+/// still there sends nothing to put it back. This pins the two halves of the
+/// repair — the record is dropped, and the frame that follows *sends* the
+/// marks again rather than moving pictures the terminal no longer has.
+#[test]
+fn a_cleared_screen_gets_its_marks_again() {
+    use vibex_tui::terminal_image::{ImageProtocol, ImageSupport};
+    let now = vibex_core::unix_timestamp_ms();
+    let mut session = seeded_session("session_pixels003", "the one after the resize");
+    session.last_message_at_ms = now;
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Sessions);
+    app.agent
+        .apply_sessions(Ok(vec![session]))
+        .expect("sessions apply");
+    app.terminal_images = ImageSupport::forced(ImageProtocol::Kitty);
+
+    // A first frame puts the row's marks on the terminal.
+    let _ = render(&mut app, 120, 40);
+    let first = String::from_utf8(app.take_terminal_control()).expect("escapes are text");
+    assert!(
+        first.contains("a=T,f=100"),
+        "the row's marks were never sent: {first:?}"
+    );
+    assert!(
+        app.row_marks
+            .held_labels()
+            .iter()
+            .any(|label| label.starts_with("agent:")),
+        "the row drew no Agent mark: {:?}",
+        app.row_marks.held_labels()
+    );
+
+    // An unchanged frame owes the terminal nothing: this is what makes the
+    // frame after the clear below the interesting one rather than one of many.
+    let _ = render(&mut app, 120, 40);
+    let quiet = String::from_utf8(app.take_terminal_control()).expect("escapes are text");
+    assert!(
+        quiet.is_empty(),
+        "a frame that changed nothing sent a picture: {quiet:?}"
+    );
+
+    // The terminal was resized, so its screen was cleared and every picture on
+    // it with it. What the client does about that is the whole test.
+    app.forget_terminal_pictures();
+    assert!(
+        !app.row_marks.is_holding(),
+        "the marks are still believed to be on the terminal"
+    );
+    let _ = render(&mut app, 120, 40);
+    let again = String::from_utf8(app.take_terminal_control()).expect("escapes are text");
+    assert!(
+        again.contains("a=T,f=100"),
+        "the frame after the clear moved pictures instead of sending them: {again:?}"
+    );
+}
+
 /// The screen with the blank continuation cells a wide glyph leaves behind
 /// removed, so a CJK assertion compares words rather than cells.
 ///

@@ -54,6 +54,19 @@
 //! marks that box covers never reach the terminal, and the ones beside it are
 //! left exactly where they were. Taking every mark down because a dialog is
 //! somewhere on screen is what this exists to avoid.
+//!
+//! # When the terminal forgets
+//!
+//! The pool is a *client's* record of what the terminal holds, and the terminal
+//! can drop that behind its back: a resize clears the screen, a clear takes
+//! every picture with it, and so does leaving the alternate screen — kitty's
+//! own rules say a clear must clear the images, and a terminal that ignored
+//! them would leave pictures standing over a screen the client believes is
+//! empty. Which is why the two are not the same thing, and why
+//! [`RowMarks::forget`] exists: without it, a row whose mark the terminal has
+//! dropped keeps its blank cells until its slot is released by a scroll, so a
+//! window that was resized comes back with logos missing and grows them back
+//! only as rows leave and enter the list.
 
 use std::sync::Arc;
 
@@ -304,6 +317,31 @@ impl RowMarks {
         }
     }
 
+    /// Forget every mark without sending anything: the terminal already has.
+    ///
+    /// For the frame after the screen was cleared. A resize clears it — the
+    /// backend does — and a terminal keeps its own pictures, so a clear takes
+    /// every mark with it; leaving the alternate screen takes them the same
+    /// way. What this pool believes is what lets a frame leave a mark to the
+    /// terminal ([`RowMarks::show`]'s first question is "is it there
+    /// already?"), so believing a mark the terminal has dropped is what leaves
+    /// a row's cells empty for as long as its slot lives. Forgetting means the
+    /// next frame *transmits* every mark again, which is the only thing that
+    /// puts a picture back.
+    ///
+    /// The rastered bytes stay cached: they are the picture of a mark, not a
+    /// placement of one, and re-sending costs an encode the cache has already
+    /// paid for.
+    pub fn forget(&mut self) {
+        self.asked.clear();
+        for slot in &mut self.slots {
+            slot.picture.forget();
+            slot.label.clear();
+            slot.color = None;
+            slot.wanted = false;
+        }
+    }
+
     /// Take the escapes the frame queued, leaving none behind.
     pub fn take_escapes(&mut self) -> Vec<u8> {
         let mut escapes = Vec::new();
@@ -452,6 +490,43 @@ mod tests {
         assert!(
             !moved.contains("a=T,f=100"),
             "moving a mark re-sent the picture: {moved:?}"
+        );
+    }
+
+    /// The screen was cleared and the terminal dropped every picture with it,
+    /// so the frame after has to *send* the mark again: a move asks the
+    /// terminal to put a picture it no longer has somewhere, which is a frame
+    /// that leaves the row's cells empty and reports success.
+    #[test]
+    fn a_forgotten_mark_is_sent_again_rather_than_moved() {
+        let support = ImageSupport::forced(ImageProtocol::Kitty);
+        let mut marks = RowMarks::default();
+        marks.begin_frame();
+        marks.show(&support, &agent(DEEPSEEK), None, rect(4, 6));
+        let sent = String::from_utf8(marks.take_escapes()).expect("escapes are text");
+        assert!(
+            sent.contains("a=T,f=100"),
+            "the mark was not sent: {sent:?}"
+        );
+        assert!(marks.is_holding(), "the pool did not record the mark");
+
+        // The frame after a resize: the terminal cleared the screen, so
+        // everything the pool believed is worth nothing.
+        marks.forget();
+        assert!(
+            !marks.is_holding() && marks.held_labels().is_empty(),
+            "a forgotten mark is still believed placed"
+        );
+
+        marks.begin_frame();
+        assert!(
+            marks.show(&support, &agent(DEEPSEEK), None, rect(4, 6)),
+            "the mark was refused after the screen was cleared"
+        );
+        let again = String::from_utf8(marks.take_escapes()).expect("escapes are text");
+        assert!(
+            again.contains("a=T,f=100"),
+            "the mark the terminal dropped was moved instead of sent: {again:?}"
         );
     }
 

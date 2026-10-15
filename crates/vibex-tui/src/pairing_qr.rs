@@ -154,6 +154,18 @@ impl PairingQr {
         self.picture.is_holding()
     }
 
+    /// Forget the code: the terminal has already dropped it.
+    ///
+    /// The same door [`crate::row_marks::RowMarks::forget`] is for, and for the
+    /// same reason: a resize or a handover clears the screen, a clear takes the
+    /// picture with it, and the record this client keeps is what would stop the
+    /// next frame from sending the code again. The encoded PNG stays: the link
+    /// has not changed, only the terminal's hold on it.
+    pub fn forget(&mut self) {
+        self.picture.forget();
+        self.wanted = false;
+    }
+
     /// The PNG for `url`, encoded once per link rather than once per frame.
     fn bytes_for(&mut self, url: &str) -> Option<Arc<Vec<u8>>> {
         if self.url.as_deref() == Some(url)

@@ -87,6 +87,12 @@ fn event_loop(
     let mut last_frame = Instant::now() - FRAME_INTERVAL;
     let mut last_tick = Instant::now();
     let mut reason = ExitReason::UserQuit;
+    // The size the frame on the terminal was drawn at, which is what says that
+    // the backend cleared the screen — and with it every picture — since the
+    // frame before. `None` until the first frame: a screen nothing has been
+    // drawn on has no pictures to forget, and this way the first frame is the
+    // one that admits it knows nothing.
+    let mut drawn_size: Option<(u16, u16)> = None;
     // Whether the Agent's blocking question is worth looking for again. It is
     // derived from the timeline, so the loop asks only after input or a worker
     // result could have changed what is pending — an idle client does not walk
@@ -337,6 +343,22 @@ fn event_loop(
             dirty = true;
         }
         if dirty && last_frame.elapsed() >= FRAME_INTERVAL {
+            // A frame drawn at a size the client has not drawn at yet begins
+            // with the backend clearing the screen, and the clear takes every
+            // picture on it: a terminal holds its own images, and kitty's own
+            // rules say a clear must clear them. So the frame the new size
+            // arrives on is the last moment the pictures this client believes
+            // it has placed are worth believing — forgetting them *here*, on
+            // the way into that frame rather than after it, is what makes the
+            // frame itself send every mark again instead of leaving the rows
+            // the clear emptied blank until they scroll away.
+            if let Ok(size) = terminal.size() {
+                let drawn = (size.width, size.height);
+                if drawn_size != Some(drawn) {
+                    app.forget_terminal_pictures();
+                    drawn_size = Some(drawn);
+                }
+            }
             // Every size draws the interface itself. There is no minimum: the
             // layout gives back the bands around the transcript and the
             // composer as the terminal shrinks, so a small one still paints a
@@ -966,6 +988,13 @@ fn handle_key(
         let edited = with_terminal_restored(guard, || {
             crate::terminal::edit_in_editor("Vibex draft", &body)
         })?;
+        // The screen was given back and taken again, and the alternate screen
+        // does not keep what was on it: the terminal dropped every picture the
+        // frame had placed, exactly as it does when a resize clears it. What
+        // the pools believe is placed is worth nothing from here, so the frame
+        // that follows the editor sends every mark and the reader's list comes
+        // back with its icons rather than with empty slots.
+        app.forget_terminal_pictures();
         if let Ok(Some(text)) = edited {
             app.composer.set_text(text);
         }
