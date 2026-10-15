@@ -6592,33 +6592,34 @@ fn agent_generation_phase(turn: &TimelineConversationTurn) -> AgentGenerationPha
     }
 }
 
-/// The word a running turn's phase reads as.
+/// The plain word a running turn's phase reads as.
 ///
-/// Every in-progress phase wears the closing ellipsis in the string itself, the
-/// way the runtime's placeholder line does (`agent_pending_response` is
-/// `思考中...`): the label is the whole live reading, so `准备中...` and
-/// `思考中...` are the same kind of word and a reader never has to wonder which
-/// of them is still going. The waiting-for-approval arm is the exception
-/// because this function never renders it — `agent_live_progress_text` answers
-/// that state from `agent_waiting_confirmation` first, and that string already
-/// carries both the `中` and the dots.
+/// This is the vocabulary, not the whole reading. The information bar above the
+/// composer draws these words as they stand — `准备中`, `思考中`, `调用工具`,
+/// `生成中` — and only the timeline's pending row closes them with the single
+/// ellipsis that marks work still going. Keeping the mark out of the table is
+/// what lets the two surfaces differ by exactly that mark and nothing else.
+///
+/// The waiting-for-approval arm is a stopped turn rather than an in-progress
+/// one, and this function never renders it either: `agent_live_progress_text`
+/// answers that state from `agent_waiting_confirmation` first.
 fn agent_generation_phase_label(
     phase: AgentGenerationPhase,
     locale: locale::ResolvedLocale,
 ) -> &'static str {
     match (phase, locale) {
-        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::En) => "Preparing...",
-        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::ZhCn) => "准备中...",
-        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::ZhTw) => "準備中...",
-        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::En) => "Thinking...",
-        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::ZhCn) => "思考中...",
-        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::ZhTw) => "思考中...",
-        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::En) => "Calling tool...",
-        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::ZhCn) => "调用工具...",
-        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::ZhTw) => "呼叫工具...",
-        (AgentGenerationPhase::Generating, locale::ResolvedLocale::En) => "Generating...",
-        (AgentGenerationPhase::Generating, locale::ResolvedLocale::ZhCn) => "生成中...",
-        (AgentGenerationPhase::Generating, locale::ResolvedLocale::ZhTw) => "生成中...",
+        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::En) => "Preparing",
+        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::ZhCn) => "准备中",
+        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::ZhTw) => "準備中",
+        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::En) => "Thinking",
+        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::ZhCn) => "思考中",
+        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::ZhTw) => "思考中",
+        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::En) => "Calling tool",
+        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::ZhCn) => "调用工具",
+        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::ZhTw) => "呼叫工具",
+        (AgentGenerationPhase::Generating, locale::ResolvedLocale::En) => "Generating",
+        (AgentGenerationPhase::Generating, locale::ResolvedLocale::ZhCn) => "生成中",
+        (AgentGenerationPhase::Generating, locale::ResolvedLocale::ZhTw) => "生成中",
         (AgentGenerationPhase::WaitingForApproval, locale::ResolvedLocale::En) => {
             "Waiting for approval"
         }
@@ -6627,8 +6628,8 @@ fn agent_generation_phase_label(
     }
 }
 
-/// The words a running turn does its work in, before they are bounded for a
-/// row.
+/// The words a running turn does its work in, before either surface bounds
+/// them.
 ///
 /// The timeline's pending indicator and the information bar above the composer
 /// answer the same question about the same turn, so they are one projection
@@ -6638,8 +6639,9 @@ fn agent_generation_phase_label(
 /// the bar read `准备中` — and the reader had to guess which of the two was
 /// current.
 ///
-/// This is the unbounded text. Both surfaces draw
-/// [`agent_live_progress_label`], which is what bounds it.
+/// This is the unbounded wording. Each surface then bounds it on its own terms:
+/// the bar states it plainly ([`agent_live_progress_status`]) and the timeline
+/// closes it with the ellipsis its pending row wears.
 fn agent_live_progress_text(
     turn: &TimelineConversationTurn,
     locale: locale::ResolvedLocale,
@@ -6657,21 +6659,23 @@ fn agent_live_progress_text(
     }
 }
 
-/// The live label as both surfaces draw it.
+/// The live reading as the information bar above the composer draws it.
 ///
-/// One string, bounded once, so the row under the conversation and the leading
-/// text of the information bar above the composer cannot be different words:
-/// `agent_progress_label` reduces the runtime's markdown to a single-line stem
-/// closed with the one ellipsis an in-progress label wears, and
-/// `truncate_agent_thinking_label` cuts it to the width a row has. `fallback`
-/// is what a turn with nothing readable to say of its own reads as, which is
-/// `思考中...` in the reader's language.
-fn agent_live_progress_label(
+/// The bar states what the Agent is doing without the closing ellipsis: that
+/// mark belongs to the timeline's pending row, which is the surface that says
+/// work is still arriving. The wording itself is the shared
+/// [`agent_live_progress_text`], so the bar and the row cannot name different
+/// work — they differ by exactly that one mark.
+///
+/// `agent_progress_stem` reduces the runtime's markdown to a single readable
+/// line and `truncate_agent_thinking_stem` holds it to the width the row has,
+/// cutting without adding a mark of its own.
+fn agent_live_progress_status(
     turn: &TimelineConversationTurn,
     locale: locale::ResolvedLocale,
     fallback: &str,
 ) -> String {
-    truncate_agent_thinking_label(&agent_progress_label(
+    truncate_agent_thinking_stem(&agent_progress_stem(
         &agent_live_progress_text(turn, locale),
         fallback,
     ))
@@ -21628,10 +21632,10 @@ impl VibexWorkbench {
             .map(|stats| (stats.started_at_ms, stats.tokens_per_second))?;
         let locale = self.resolved_locale();
         let fallback = locale::strings(locale).agent_pending_response;
-        // The same words the timeline's pending row is drawing this frame, put
-        // through the same bounds: the runtime's own activity line when it has
-        // written one, the turn's phase otherwise.
-        let phase_label = agent_live_progress_label(&turn, locale, fallback);
+        // The same words the timeline's pending row names this frame, stated
+        // without the row's closing ellipsis: only the timeline says work is
+        // still arriving, so only it wears that mark.
+        let phase_label = agent_live_progress_status(&turn, locale, fallback);
         let duration = format_compact_duration(started_at_ms, None);
         let tool_count = agent_generation_tool_call_count(&turn);
         let compaction_count = self
@@ -66292,7 +66296,13 @@ fn permission_response_label(kind: PermissionResponseKind) -> &'static str {
     }
 }
 
-fn agent_progress_label(label: &str, fallback: &str) -> String {
+/// The live reading reduced to the one line a status surface can draw.
+///
+/// The runtime's markdown becomes plain text, whitespace collapses, a dangling
+/// sentence stop is trimmed, and a line with no readable word falls back to
+/// `fallback`. No ellipsis is added: the callers decide whether the mark of
+/// work still in progress belongs on their surface.
+fn agent_progress_stem(label: &str, fallback: &str) -> String {
     let (plain_text, _) = agent_markdown_summary(label);
     let compact = compact_agent_turn_preview_message(&plain_text);
     let stem = compact.trim_end().trim_end_matches(['.', '…']).trim_end();
@@ -66305,7 +66315,15 @@ fn agent_progress_label(label: &str, fallback: &str) -> String {
     } else {
         fallback.trim_end().trim_end_matches(['.', '…']).trim_end()
     };
-    format!("{stem}...")
+    stem.to_string()
+}
+
+/// The same stem closed with the one ellipsis an in-progress row wears.
+///
+/// This is the timeline's pending indicator: the row is the surface that says
+/// work is still arriving, so the mark belongs here and nowhere else.
+fn agent_progress_label(label: &str, fallback: &str) -> String {
+    format!("{}...", agent_progress_stem(label, fallback))
 }
 
 fn agent_progress_tooltip(label: &str, fallback: &str) -> String {
@@ -66348,6 +66366,20 @@ fn truncate_agent_thinking_label(label: &str) -> String {
         .iter()
         .collect::<String>()
         + "..."
+}
+
+/// The same width cut, made without adding a mark of its own.
+///
+/// A surface that does not wear the in-progress ellipsis still has to fit the
+/// row's width; it drops the tail instead of claiming more is coming.
+fn truncate_agent_thinking_stem(label: &str) -> String {
+    let characters = label.chars().collect::<Vec<_>>();
+    if characters.len() <= AGENT_THINKING_LABEL_MAX_CHARS {
+        return label.to_string();
+    }
+    characters[..AGENT_THINKING_LABEL_MAX_CHARS]
+        .iter()
+        .collect()
 }
 
 fn reasoning_preview_text(label: &str) -> String {
@@ -84609,76 +84641,157 @@ mod tests {
             agent_generation_phase(&reporting),
             AgentGenerationPhase::Thinking
         );
+        // The two surfaces name the same work and differ by exactly the mark of
+        // work still arriving: the timeline's pending row wears it, and the
+        // information bar above the composer does not.
         assert_eq!(
-            agent_live_progress_label(&reporting, zh_cn, "思考中..."),
+            agent_live_progress_status(&reporting, zh_cn, "思考中..."),
+            "read src/net/upload.rs"
+        );
+        assert_eq!(
+            agent_progress_label(&agent_live_progress_text(&reporting, zh_cn), "思考中..."),
             "read src/net/upload.rs..."
         );
         assert_eq!(
-            agent_live_progress_label(&reporting, en, "Thinking..."),
-            "read src/net/upload.rs..."
+            agent_live_progress_status(&reporting, en, "Thinking..."),
+            "read src/net/upload.rs"
         );
 
-        // A turn that has said nothing of its own reads as its phase — the
-        // register the information bar already used, now behind both surfaces.
+        // The same split for the phase vocabulary the bar states on its own.
         let fresh = turn(vec![], None, None, false);
         assert_eq!(
             agent_generation_phase(&fresh),
             AgentGenerationPhase::Preparing
         );
         assert_eq!(
-            agent_live_progress_label(&fresh, zh_cn, "思考中..."),
+            agent_live_progress_status(&fresh, zh_cn, "思考中..."),
+            "准备中"
+        );
+        assert_eq!(
+            agent_progress_label(&agent_live_progress_text(&fresh, zh_cn), "思考中..."),
             "准备中..."
         );
         assert_eq!(
-            agent_live_progress_label(&fresh, en, "Thinking..."),
-            "Preparing..."
+            agent_live_progress_status(&fresh, en, "Thinking..."),
+            "Preparing"
         );
 
         // A turn whose only status carries nothing visible — the runtime's
-        // placeholder line — still falls back to the phase rather than reading
-        // as a turn that has no word for itself.
+        // placeholder line — falls back to the phase on both surfaces.
         let blank_status = turn(vec![], None, Some("   "), false);
         assert_eq!(
-            agent_live_progress_label(&blank_status, zh_cn, "思考中..."),
+            agent_live_progress_status(&blank_status, zh_cn, "思考中..."),
+            "思考中"
+        );
+        assert_eq!(
+            agent_progress_label(&agent_live_progress_text(&blank_status, zh_cn), "思考中..."),
             "思考中..."
         );
 
         // Waiting on the reader replaces both, because the phase is the whole
-        // message: nothing is progressing until the request is answered.
+        // message: nothing is progressing until the request is answered. The
+        // bar states it without the mark, the row with it.
         let waiting = turn(vec![], None, Some("read src/net/upload.rs"), true);
         assert_eq!(
             agent_generation_phase(&waiting),
             AgentGenerationPhase::WaitingForApproval
         );
         assert_eq!(
-            agent_live_progress_label(&waiting, zh_cn, "思考中..."),
+            agent_live_progress_status(&waiting, zh_cn, "思考中..."),
+            "等待确认中"
+        );
+        assert_eq!(
+            agent_progress_label(&agent_live_progress_text(&waiting, zh_cn), "思考中..."),
             "等待确认中..."
         );
         assert_eq!(
-            agent_live_progress_label(&waiting, en, "Thinking..."),
-            "Waiting for confirmation..."
+            agent_live_progress_status(&waiting, en, "Thinking..."),
+            "Waiting for confirmation"
         );
 
-        // The label is bounded once, for both surfaces: a runtime activity line
-        // longer than a timeline row can hold arrives at the bar already cut,
-        // so the two are the same string rather than merely the same source.
+        // Both surfaces cut a runtime activity line to the width they have. The
+        // bar trims to that width without adding a mark; the timeline's row adds
+        // the mark inside its own renderer, so its drawn label ends in it.
         let long = turn(vec![], None, Some(&"detailed activity ".repeat(8)), false);
-        let label = agent_live_progress_label(&long, en, "Thinking...");
-        assert_eq!(label.chars().count(), AGENT_THINKING_LABEL_MAX_CHARS);
-        assert!(label.ends_with("..."));
-        assert_eq!(
-            truncate_agent_thinking_label(&label),
-            label,
-            "the label is already inside the bound the timeline draws it at"
+        let bar = agent_live_progress_status(&long, en, "Thinking...");
+        assert_eq!(bar.chars().count(), AGENT_THINKING_LABEL_MAX_CHARS);
+        assert!(
+            !bar.ends_with("..."),
+            "the bar must not wear the mark: {bar:?}"
         );
+        let row = agent_progress_label(&agent_live_progress_text(&long, en), "Thinking...");
+        assert!(row.ends_with("..."));
+        let drawn = truncate_agent_thinking_label(&row);
+        assert_eq!(drawn.chars().count(), AGENT_THINKING_LABEL_MAX_CHARS);
+        assert!(drawn.ends_with("..."));
     }
 
     #[test]
-    fn every_in_progress_phase_label_wears_the_same_trailing_ellipsis() {
-        // The labels are one vocabulary, so the runtime's placeholder line
-        // (`agent_pending_response`) sets the shape and the four phases follow
-        // it: an in-progress reading always closes with one ellipsis, on every
-        // surface that draws it.
+    fn only_the_timeline_pending_row_closes_a_phase_with_an_ellipsis() {
+        // The phase table is the vocabulary both surfaces share, so it carries
+        // no mark of its own: the information bar draws these words as they
+        // stand, and the timeline's pending row is the only surface that closes
+        // them with the ellipsis meaning work is still arriving.
+        let row = |kind: TimelineRowKind, streaming: bool| TimelineRow {
+            id: "row".to_string(),
+            kind,
+            item_ids: vec!["item".to_string()],
+            turn_id: Some("turn:progress".to_string()),
+            turn_item_count: 0,
+            turn_failed: false,
+            turn_pending_permission: false,
+            conclusion: kind == TimelineRowKind::AgentMessage,
+            first_sequence: 1,
+            last_sequence: 1,
+            timestamp_ms: 1_700_000_000_000,
+            title: String::new(),
+            body: String::new(),
+            streaming,
+            collapsible: false,
+            pending_permission: false,
+            failed: false,
+            runtime_attribution: None,
+            file_path: None,
+        };
+        let turn = |process_rows: Vec<TimelineRow>,
+                    conclusion_row: Option<TimelineRow>,
+                    pending_permission: bool| TimelineConversationTurn {
+            id: "turn:progress".to_string(),
+            user_row: None,
+            process_rows,
+            process_activity_groups: Vec::new(),
+            process_activity_groups_with_commands: Vec::new(),
+            process_activity_groups_with_file_operations: Vec::new(),
+            process_activity_groups_with_commands_and_file_operations: Vec::new(),
+            live_status: None,
+            conclusion_row,
+            runtime_attribution: None,
+            complete: false,
+            failed: false,
+            pending_permission,
+            item_count: 0,
+            started_at_ms: 1_000,
+            ended_at_ms: None,
+            superseded: false,
+        };
+        // One turn per phase, each reaching its own arm of the projection.
+        let phase_turn = |phase: AgentGenerationPhase| match phase {
+            AgentGenerationPhase::Preparing => turn(vec![], None, false),
+            AgentGenerationPhase::Thinking => {
+                turn(vec![row(TimelineRowKind::Reasoning, true)], None, false)
+            }
+            AgentGenerationPhase::CallingTool => {
+                turn(vec![row(TimelineRowKind::ToolCall, true)], None, false)
+            }
+            AgentGenerationPhase::Generating => turn(
+                vec![],
+                Some(row(TimelineRowKind::AgentMessage, true)),
+                false,
+            ),
+            AgentGenerationPhase::WaitingForApproval => turn(vec![], None, true),
+        };
+        let zh_cn = locale::ResolvedLocale::ZhCn;
+
         for locale in [
             locale::ResolvedLocale::En,
             locale::ResolvedLocale::ZhCn,
@@ -84690,31 +84803,36 @@ mod tests {
                 AgentGenerationPhase::CallingTool,
                 AgentGenerationPhase::Generating,
             ] {
-                let label = agent_generation_phase_label(phase, locale);
-                assert!(
-                    label.ends_with("..."),
-                    "{phase:?} in {locale:?} does not close like the other live labels: {label:?}"
+                let turn = phase_turn(phase);
+                assert_eq!(
+                    agent_generation_phase(&turn),
+                    phase,
+                    "the fixture must land in the arm it is named for"
                 );
-                // One ellipsis, and it is the ASCII one the fallback uses, so
-                // two surfaces never disagree on the character.
+                let word = agent_generation_phase_label(phase, locale);
                 assert!(
-                    !label.trim_end_matches('.').ends_with('…'),
-                    "{phase:?} in {locale:?} mixes the typed ellipsis into its dots: {label:?}"
+                    !word.ends_with("...") && !word.ends_with('…'),
+                    "{phase:?} in {locale:?} carries a mark the table must not: {word:?}"
                 );
-                // The phase label is the drawn label once it passes through the
-                // same bound, so `...` is not doubled or dropped on the way.
-                assert_eq!(agent_progress_label(label, "思考中..."), label);
+                // The row adds exactly one ASCII ellipsis and the bar adds none,
+                // so neither surface doubles or drops the mark.
+                assert_eq!(
+                    agent_progress_label(&agent_live_progress_text(&turn, locale), "思考中..."),
+                    format!("{word}...")
+                );
+                assert_eq!(agent_live_progress_status(&turn, locale, "思考中..."), word);
             }
         }
 
-        // Waiting on the reader is a stopped turn rather than an in-progress
-        // one, and it keeps the plain statement the phase table already had.
+        // Waiting on the reader is a stopped turn, not an in-progress one, so
+        // the bar states it as the plain phrase it already was.
         assert_eq!(
-            agent_generation_phase_label(
-                AgentGenerationPhase::WaitingForApproval,
-                locale::ResolvedLocale::ZhCn
+            agent_live_progress_status(
+                &phase_turn(AgentGenerationPhase::WaitingForApproval),
+                zh_cn,
+                "思考中..."
             ),
-            "等待确认"
+            "等待确认中"
         );
     }
 
@@ -93767,10 +93885,11 @@ mod tests {
             .map(|(body, _)| body)
             .expect("timeline turn renderer should remain inspectable");
         // The pending row reads the shared projection rather than deciding for
-        // itself: the information bar above the composer opens with the same
-        // words, so the two live surfaces cannot drift apart.
+        // itself, and it is the surface that closes the words with the mark of
+        // work still arriving.
         assert!(turn.contains("agent_live_progress_text(turn, self.resolved_locale())"));
         assert!(turn.contains("agent_progress_label(&pending_text"));
+        assert!(!turn.contains("agent_live_progress_status"));
         assert!(!turn.contains("if turn.pending_permission"));
 
         let progress = source
@@ -93789,17 +93908,31 @@ mod tests {
             "等待确认中..."
         );
 
-        // The bar the reader sees over the composer renders that same label.
+        // The bar over the composer opens with the same words, stated without
+        // that mark: the phase table itself carries no ellipsis.
         let bar = source
             .split_once("    fn render_agent_generation_status(")
             .and_then(|(_, tail)| tail.split_once("\n    fn agent_token_usage_metrics("))
             .map(|(body, _)| body)
             .expect("the generation status renderer should remain inspectable");
         assert!(
-            bar.contains("agent_live_progress_label(&turn, locale, fallback)"),
-            "the information bar opens with the shared live label"
+            bar.contains("agent_live_progress_status(&turn, locale, fallback)"),
+            "the information bar opens with the shared live words, unmarked"
         );
+        assert!(!bar.contains("agent_live_progress_label"));
         assert!(bar.contains("locale::strings(locale).agent_pending_response"));
+
+        let table = source
+            .split_once("fn agent_generation_phase_label(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// The words a running turn does its work in")
+            })
+            .map(|(body, _)| body)
+            .expect("the phase vocabulary should remain inspectable");
+        assert!(
+            !table.contains("..."),
+            "the shared phase table must not carry the row's mark"
+        );
     }
 
     #[test]

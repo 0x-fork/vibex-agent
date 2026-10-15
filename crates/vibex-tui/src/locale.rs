@@ -93,15 +93,14 @@ strings! {
     // has called. The count comes first because both languages put it there:
     // the label is the unit, not the sentence.
     //
-    // Each in-progress phase wears the closing ellipsis in the string itself,
-    // the way the desktop's runtime placeholder line does: the label is the
-    // whole live reading, so `生成中...` and the desktop's `思考中...` are the
-    // same kind of word. Waiting for approval is not in-progress work — the
-    // turn is stopped on the reader — so it stays a plain statement of state.
-    phase_preparing => { "Preparing...", "准备中...", "準備中..." },
-    phase_thinking => { "Thinking...", "思考中...", "思考中..." },
-    phase_calling_tool => { "Calling tool...", "调用工具...", "呼叫工具..." },
-    phase_generating => { "Generating...", "生成中...", "生成中..." },
+    // These are the plain words: the band above the prompt is the desktop's
+    // information bar, which states what the Agent is doing without the closing
+    // ellipsis. That mark belongs to the desktop timeline's pending row, the
+    // surface that says work is still arriving, and this band has no such row.
+    phase_preparing => { "Preparing", "准备中", "準備中" },
+    phase_thinking => { "Thinking", "思考中", "思考中" },
+    phase_calling_tool => { "Calling tool", "调用工具", "呼叫工具" },
+    phase_generating => { "Generating", "生成中", "生成中" },
     phase_waiting_approval => { "Waiting for approval", "等待确认", "等待確認" },
     tool_calls => { "tool calls", "次工具调用", "次工具呼叫" },
     archived => { "Archived", "已归档", "已封存" },
@@ -2123,11 +2122,13 @@ mod tests {
     }
 
     #[test]
-    fn every_in_progress_phase_label_wears_the_same_trailing_ellipsis() {
-        // The turn line draws one of these words while the turn is running, and
-        // the desktop's runtime placeholder line is the shape they follow: an
-        // in-progress reading always closes with one ellipsis, so a reader who
-        // sees `生成中...` and `思考中...` reads the same kind of word.
+    fn the_turn_band_states_a_phase_without_the_timeline_ellipsis() {
+        // The band above the prompt is the desktop's information bar, and that
+        // surface states what the Agent is doing plainly. The closing ellipsis
+        // belongs to the desktop timeline's pending row, which says work is
+        // still arriving; this band is not that row, so its words carry no
+        // mark of their own — the runtime's own activity line is what a reader
+        // sees close with one, and it comes from elsewhere.
         for locale in [Locale::En, Locale::ZhCn, Locale::ZhTw] {
             let strings = Strings::for_locale(locale);
             for label in [
@@ -2135,22 +2136,17 @@ mod tests {
                 strings.phase_thinking(),
                 strings.phase_calling_tool(),
                 strings.phase_generating(),
+                strings.phase_waiting_approval(),
             ] {
                 assert!(
-                    label.ends_with("..."),
-                    "{locale:?} draws a live phase without the closing ellipsis: {label:?}"
-                );
-                // One ellipsis, and it is the ASCII one the desktop uses, so
-                // the two surfaces never disagree on the character.
-                assert!(
-                    !label.trim_end_matches('.').ends_with('…'),
-                    "{locale:?} mixes the typed ellipsis into its dots: {label:?}"
+                    !label.ends_with("...") && !label.ends_with('…'),
+                    "{locale:?} draws a live phase with the timeline's mark: {label:?}"
                 );
             }
         }
 
         // Waiting on the reader is a stopped turn rather than an in-progress
-        // one, so it stays the plain statement of state it already was.
+        // one, and it reads as the plain statement of state it already was.
         assert_eq!(
             Strings::for_locale(Locale::ZhCn).phase_waiting_approval(),
             "等待确认"
