@@ -334,6 +334,8 @@ enum BackScreen {
     RuntimeOptions,
     /// A choice list the new-session page opened along its bottom edge.
     NewSessionPicker,
+    /// The new-session page's settings sheet.
+    NewSessionOptions,
     /// The Sessions drawer.
     SessionsDrawer,
     /// The Workbench drawer.
@@ -486,10 +488,13 @@ enum RuntimeOptionsTarget {
 /// Which list the new-session page has open along its bottom edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NewSessionPicker {
-    /// The projects the paired runtime knows about.
-    Project,
-    /// The worktrees of the selected project.
-    Workspace,
+    /// Where the session will run: the projects the paired runtime knows about
+    /// and, under the chosen one, the workspaces it can start in.
+    ///
+    /// One sheet rather than one per question: the two answers belong together,
+    /// and picking a project re-scopes the list underneath it on the spot
+    /// instead of closing and making the reader open the second list.
+    Location,
 }
 
 /// One row of a new-session choice list.
@@ -1620,6 +1625,14 @@ pub struct MobileApp {
     /// every project to reach the fourth one is the one interaction the new
     /// session page could not make pleasant, and the desktop picks from a list.
     new_session_picker: Option<NewSessionPicker>,
+    /// Whether the new-session page's own settings sheet is up.
+    ///
+    /// It holds what the page used to spell out as rows: the optional title,
+    /// the permission the session starts with, the reasoning depth, and the
+    /// per-Agent options. The page keeps the two decisions a session cannot
+    /// start without — the Agent and the permission — on its control row, and
+    /// this sheet is where they are changed and where the rest lives.
+    new_session_options_open: bool,
     /// Whether the composer's attach menu is up.
     composer_attach_menu_open: bool,
     /// Which field the attach menu is filling. The new-session page has its own
@@ -2316,13 +2329,17 @@ fn settings_danger_note(
         .into_any_element()
 }
 
-/// One choice on the new-session page: an icon, a label, and the value it is
-/// currently set to. Chips rather than full rows, so the page reads as a
-/// composer with options instead of a form.
-fn new_session_chip(
+/// One pill inside a prompt card's control row.
+///
+/// The pill is what the reader sees, the row is what the reader aims at: a chip
+/// is one compact line inside a full touch target, so the card stays short
+/// without asking the thumb to be precise. A chip carries the value it is set
+/// to rather than a label for it — the model, the permission, the place the
+/// session will run — because on this page the value is the thing being
+/// decided.
+fn composer_chip(
     id: &'static str,
-    icon: &'static str,
-    label: &'static str,
+    icon: gpui::AnyElement,
     value: String,
     warn: bool,
     handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
@@ -2330,50 +2347,131 @@ fn new_session_chip(
     div()
         .id(id)
         .debug_selector(move || id.to_string())
-        .max_w_full()
         .h(px(theme::TOUCH_TARGET))
-        .px(px(theme::SPACING_MD))
-        .rounded_full()
-        .border_1()
-        .border_color(if warn {
-            theme::accent_yellow()
-        } else {
-            theme::border_default()
-        })
-        .bg(theme::bg_card())
+        .min_w_0()
         .flex()
         .items_center()
-        .gap(px(theme::SPACING_SM))
         .cursor_pointer()
         .aria_label(value.clone())
-        .active(|style| style.bg(theme::row_pressed_bg()))
+        .active(|style| style.opacity(0.7))
         .on_mouse_up(MouseButton::Left, handler)
+        .child(
+            div()
+                .h(px(theme::CHIP_HEIGHT))
+                .max_w_full()
+                .min_w_0()
+                .px(px(theme::SPACING_MD))
+                .rounded_full()
+                .bg(theme::bg_card_dim())
+                .flex()
+                .items_center()
+                .gap(px(theme::SPACING_XS))
+                .child(icon)
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(theme::font_caption())
+                        .text_color(if warn {
+                            theme::accent_yellow()
+                        } else {
+                            theme::text_primary()
+                        })
+                        .child(value),
+                ),
+        )
+}
+
+/// A bare icon control in a prompt card's control row: something the reader
+/// does to the message rather than something they set on it.
+fn composer_icon_button(
+    id: &'static str,
+    icon: &'static str,
+    aria: String,
+    enabled: bool,
+    handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .size(px(theme::TOUCH_TARGET))
+        .flex_shrink_0()
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .aria_label(aria)
+        .when(enabled, |button| {
+            button
+                .cursor_pointer()
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .on_mouse_up(MouseButton::Left, handler)
+        })
+        .when(!enabled, |button| button.opacity(0.42))
         .child(
             svg()
                 .path(icon)
-                .size(px(theme::ICON_SM))
-                .text_color(theme::text_muted()),
-        )
-        .child(
-            div()
-                .text_size(theme::font_micro())
-                .text_color(theme::text_muted())
-                .child(label),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .max_w(px(180.0))
-                .overflow_hidden()
-                .text_ellipsis()
-                .whitespace_nowrap()
-                .text_size(theme::font_caption())
-                .text_color(if warn {
-                    theme::accent_yellow()
+                .size(px(theme::ICON_MD))
+                .text_color(if enabled {
+                    theme::text_secondary()
                 } else {
-                    theme::text_primary()
-                })
-                .child(value),
+                    theme::text_muted()
+                }),
+        )
+}
+
+/// The prompt card's send control.
+///
+/// It carries the page's primary action, so its three states are the whole
+/// story: filled while there is something to send, dimmed while there is not,
+/// and a spinner while the session is being created and the rest of the card
+/// is only reporting that fact.
+fn composer_send_button(
+    id: &'static str,
+    aria: String,
+    enabled: bool,
+    busy: bool,
+    handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let button = div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .size(px(theme::TOUCH_TARGET))
+        .flex_shrink_0()
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .aria_label(aria);
+    if busy {
+        return button.bg(theme::bg_card_dim()).child(
+            ProgressCircle::new(ElementId::from(format!("{id}-busy")))
+                .loading(true)
+                .color(theme::text_secondary()),
+        );
+    }
+    button
+        .when(enabled, |button| {
+            button
+                .bg(theme::primary())
+                .cursor_pointer()
+                .active(|style| style.opacity(0.75))
+                .on_mouse_up(MouseButton::Left, handler)
+        })
+        .when(!enabled, |button| {
+            button.bg(theme::bg_card_dim()).opacity(0.55)
+        })
+        .child(
+            svg()
+                .path("icons/send.svg")
+                .size(px(theme::ICON_MD))
+                .text_color(if enabled {
+                    theme::primary_foreground()
+                } else {
+                    theme::text_muted()
+                }),
         )
 }
 
@@ -2829,12 +2927,15 @@ impl MobileApp {
                 ))
             }),
             new_session_prompt_input: cx.new(|cx| {
-                // The first message *is* the session, so it is a textarea that
-                // fills the page rather than a one-line field in a tall box.
+                // The first message *is* the session, so it gets a textarea that
+                // grows with the message rather than a one-line field. The
+                // placeholder doubles as the only place the three suggestion
+                // characters are introduced, which is how the desktop teaches
+                // them too.
                 TextareaState::new(window, cx).placeholder(locale::text(
-                    "Describe what you want to build…",
-                    "描述你想完成的事情…",
-                    "描述你想完成的事情…",
+                    "Describe a task, or type / for commands, @ for files, $ for skills",
+                    "描述你的任务，或输入 / 唤出命令、@ 引用文件、$ 调用 Skill",
+                    "描述你的任務，或輸入 / 喚出命令、@ 引用檔案、$ 呼叫 Skill",
                 ))
             }),
             worktree_path_browser: None,
@@ -2905,6 +3006,7 @@ impl MobileApp {
             session_action_busy: false,
             runtime_options_open: false,
             new_session_picker: None,
+            new_session_options_open: false,
             composer_attach_menu_open: false,
             attach_menu_target: AttachmentTarget::Composer,
             new_session_attachments: Vec::new(),
@@ -5207,7 +5309,21 @@ impl MobileApp {
         self.runtime_draft = Some(selection);
         self.runtime_switch_error = None;
         self.sync_runtime_feature_inputs();
+        self.commit_new_session_runtime_draft();
         cx.notify();
+    }
+
+    /// The new-session page has no session to apply a draft to, so a choice made
+    /// while its sheet is open *is* the choice: the draft lands on the page as
+    /// it changes. The session page keeps the explicit apply, because switching
+    /// a running session's runtime is a mutation the authority has to accept.
+    fn commit_new_session_runtime_draft(&mut self) {
+        if self.runtime_options_target != RuntimeOptionsTarget::NewSession {
+            return;
+        }
+        if let Some(draft) = self.runtime_draft.clone() {
+            self.new_session_runtime = Some(draft);
+        }
     }
 
     fn choose_default_runtime_reasoning(&mut self, cx: &mut Context<Self>) {
@@ -5215,6 +5331,7 @@ impl MobileApp {
             draft.reasoning_effort = None;
         }
         self.runtime_switch_error = None;
+        self.commit_new_session_runtime_draft();
         cx.notify();
     }
 
@@ -5223,6 +5340,7 @@ impl MobileApp {
             draft.mode_id = None;
         }
         self.runtime_switch_error = None;
+        self.commit_new_session_runtime_draft();
         cx.notify();
     }
 
@@ -5243,6 +5361,7 @@ impl MobileApp {
             }
         }
         self.runtime_switch_error = None;
+        self.commit_new_session_runtime_draft();
         cx.notify();
     }
 
@@ -8883,6 +9002,7 @@ impl MobileApp {
             self.new_session_workspace_id = None;
             self.new_session_folder_id = None;
             self.new_session_picker = None;
+            self.new_session_options_open = false;
         }
         self.overlay = None;
         self.overlay_parents.clear();
@@ -8916,6 +9036,7 @@ impl MobileApp {
         let session_action_open = self.session_action.is_some();
         let runtime_options_open = self.runtime_options_open;
         let new_session_picker_open = self.new_session_picker.is_some();
+        let new_session_options_open = self.new_session_options_open;
         let settled_target = self.settled_drawer_target();
         let sidebar_search_open = self.sidebar_search_open;
         let sidebar_batch_mode = self.sidebar_batch_mode;
@@ -8941,6 +9062,7 @@ impl MobileApp {
             BackScreen::SessionAction => session_action_open,
             BackScreen::RuntimeOptions => runtime_options_open,
             BackScreen::NewSessionPicker => new_session_picker_open,
+            BackScreen::NewSessionOptions => new_session_options_open,
             BackScreen::SessionsDrawer => settled_target == DrawerPage::Sessions.open_offset(),
             BackScreen::WorkbenchDrawer => settled_target == DrawerPage::Workbench.open_offset(),
             BackScreen::SidebarSearch => sidebar_search_open,
@@ -9068,6 +9190,7 @@ impl MobileApp {
             BackScreen::NewSessionPicker => {
                 self.close_new_session_picker(&noop_mouse_up(), window, cx)
             }
+            BackScreen::NewSessionOptions => self.dismiss_new_session_options(cx),
             BackScreen::Overlay(_) => self.dismiss_overlay(Some(window), cx),
             BackScreen::SessionsDrawer | BackScreen::WorkbenchDrawer => {
                 self.start_drawer_snap(0.0, Some(window), cx)
@@ -9113,6 +9236,7 @@ impl MobileApp {
             self.new_session_workspace_id = None;
             self.new_session_folder_id = None;
             self.new_session_picker = None;
+            self.new_session_options_open = false;
             // The first message's files and references belong to the page that
             // was just closed, not to the next one, and so do the worktree's
             // name and path: the next session is a different piece of work.
@@ -13029,6 +13153,9 @@ impl MobileApp {
                 .when_some(self.new_session_picker, |root, _| {
                     root.child(self.render_new_session_picker_sheet(cx))
                 })
+                .when(self.new_session_options_open, |root| {
+                    root.child(self.render_new_session_options_sheet(cx))
+                })
                 .when(self.composer_attach_menu_open, |root| {
                     root.child(self.render_composer_attach_sheet(cx))
                 })
@@ -15592,6 +15719,7 @@ impl MobileApp {
             backend.capability_snapshot().agent.supports(operation)
         });
         let can_apply = can_switch && selection_available && !busy;
+        let new_session_target = self.runtime_options_target == RuntimeOptionsTarget::NewSession;
 
         div()
             .absolute()
@@ -15664,27 +15792,35 @@ impl MobileApp {
                             .flex()
                             .justify_end()
                             .gap_2()
-                            .child(
-                                runtime_sheet_action_button(
-                                    "cancel-runtime-options",
-                                    locale::common("Cancel"),
-                                    false,
+                            // The new-session page has already taken every choice
+                            // by the time this footer is drawn, so there is
+                            // nothing to cancel and nothing to apply: the sheet
+                            // closes, and the card behind it shows the result.
+                            .when(!new_session_target, |footer| {
+                                footer.child(
+                                    runtime_sheet_action_button(
+                                        "cancel-runtime-options",
+                                        locale::common("Cancel"),
+                                        false,
+                                    )
+                                    .when(!busy, |button| {
+                                        button
+                                            .cursor_pointer()
+                                            .active(|style| style.opacity(0.7))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(Self::close_runtime_options),
+                                            )
+                                    }),
                                 )
-                                .when(!busy, |button| {
-                                    button
-                                        .cursor_pointer()
-                                        .active(|style| style.opacity(0.7))
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(Self::close_runtime_options),
-                                        )
-                                }),
-                            )
+                            })
                             .child(
                                 runtime_sheet_action_button(
                                     "apply-runtime-options",
                                     if busy {
                                         locale::common("Applying...")
+                                    } else if new_session_target {
+                                        locale::common("Done")
                                     } else {
                                         locale::text(
                                             "Apply session settings",
@@ -15694,7 +15830,7 @@ impl MobileApp {
                                     },
                                     true,
                                 )
-                                .when(can_apply, |button| {
+                                .when(can_apply && !new_session_target, |button| {
                                     button
                                         .cursor_pointer()
                                         .active(|style| style.opacity(0.7))
@@ -15703,7 +15839,21 @@ impl MobileApp {
                                             cx.listener(Self::apply_runtime_options),
                                         )
                                 })
-                                .when(!can_apply, |button| button.opacity(0.5)),
+                                // Done is a dismissal, not a mutation: every
+                                // choice in this sheet already landed on the
+                                // page's draft as it was made.
+                                .when(new_session_target && !busy, |button| {
+                                    button
+                                        .cursor_pointer()
+                                        .active(|style| style.opacity(0.7))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(Self::close_runtime_options),
+                                        )
+                                })
+                                .when(!can_apply && !new_session_target, |button| {
+                                    button.opacity(0.5)
+                                }),
                             ),
                     ),
             )
@@ -19301,13 +19451,23 @@ impl MobileApp {
             .as_ref()
             .and_then(|controller| controller.state.runtime_options.value.as_ref());
         let runtime_summary = runtime_selection_summary(runtime_catalog, runtime_selection);
-        let runtime_trigger_enabled = state.is_some()
-            && !runtime_switch_pending
-            && self.backend.as_ref().is_some_and(|backend| {
-                backend
-                    .capability_snapshot()
-                    .agent
-                    .supports(BackendOperation::AgentSwitchRuntime)
+        // The control row names the model rather than the whole runtime: the
+        // chip has one line, and the sheet behind it is where the Agent, the
+        // authentication source and the mode are read together.
+        let model_id = match runtime_selection.map(|selection| &selection.model) {
+            Some(vibex_core::RuntimeModelSelection::Explicit { model_id }) => {
+                Some(model_id.clone())
+            }
+            _ => None,
+        };
+        let model_label = runtime_catalog
+            .zip(runtime_selection)
+            .and_then(|(catalog, selection)| matching_runtime_option(&catalog.options, selection))
+            .map(|option| option.model_label.clone())
+            .unwrap_or_else(|| {
+                model_id
+                    .clone()
+                    .unwrap_or_else(|| locale::common("Default").to_string())
             });
         div()
             .flex_shrink_0()
@@ -19378,20 +19538,25 @@ impl MobileApp {
                         }),
                 )
             })
+            // One card, two lines: what the reader is writing on top, and what
+            // it will run on underneath. The runtime row and the token row that
+            // used to sit below the field are gone — the chip reports the first
+            // and the ring the second, on the line the reader is already using.
             .child(
                 div()
                     .min_h(px(52.0))
-                    .rounded(px(theme::RADIUS_CONTROL))
+                    .rounded(px(theme::RADIUS_COMPOSER))
                     .border_1()
-                    .border_color(theme::border_default())
+                    .border_color(theme::border_subtle())
                     .bg(theme::bg_card())
+                    .p(px(theme::SPACING_MD))
                     .flex()
-                    .items_end()
-                    .pl(px(theme::SPACING_XS))
+                    .flex_col()
+                    .gap(px(theme::SPACING_SM))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
+                            .w_full()
+                            .min_h(px(theme::TOUCH_TARGET))
                             .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                             .child(
                                 Textarea::new(&self.composer_input)
@@ -19412,301 +19577,139 @@ impl MobileApp {
                                     }),
                             ),
                     )
-                    // Stop is its own control while a turn runs. It used to
-                    // replace Send, which left the user with no way to say
-                    // anything to a turn that was already going: now Send
-                    // steers the running turn and Stop pauses it.
-                    .when(running, |row| {
-                        row.child(
-                            div()
-                                .id("stop-turn")
-                                .size(px(theme::TOUCH_TARGET))
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .aria_label(locale::common("Stop"))
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .when(stop_enabled, |button| {
-                                    button
-                                        .cursor_pointer()
-                                        .active(|style| style.bg(theme::row_pressed_bg()))
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(Self::interrupt),
-                                        )
-                                })
-                                .when(!stop_enabled, |button| button.opacity(0.45))
-                                .child(
-                                    svg()
-                                        .path("icons/stop.svg")
-                                        .size(px(theme::ICON_SM))
-                                        .text_color(if stop_enabled {
-                                            theme::accent_red()
-                                        } else {
-                                            theme::text_muted()
-                                        }),
-                                ),
-                        )
-                    })
-                    // Recall rather than retype: the prompts already sent in
-                    // this session are one tap away.
                     .child(
                         div()
-                            .id("composer-history")
-                            .size(px(theme::TOUCH_TARGET))
-                            .flex_shrink_0()
+                            .w_full()
+                            .h(px(theme::TOUCH_TARGET))
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .aria_label(
+                            .gap(px(theme::SPACING_XS))
+                            // The attach menu offers the two things a phone can
+                            // hand over: a photo the host scales down, or a file
+                            // it carries whole.
+                            .child(composer_icon_button(
+                                "attach-file",
+                                "icons/plus.svg",
+                                locale::text("Attach a file", "添加附件", "新增附件").to_string(),
+                                attach_enabled,
+                                cx.listener(Self::open_composer_attach_menu),
+                            ))
+                            // The model is the chip's whole story here: the mode
+                            // the session is running under was chosen when it
+                            // started, and the sheet behind this chip is where
+                            // either one is read or changed.
+                            .child(
+                                composer_chip(
+                                    "composer-runtime-options",
+                                    runtime_model_icon(
+                                        model_id.as_deref(),
+                                        px(theme::ICON_SM),
+                                        theme::text_secondary(),
+                                    ),
+                                    model_label,
+                                    !runtime_summary.available,
+                                    cx.listener(Self::open_runtime_options),
+                                )
+                                .flex_1()
+                                .min_w_0(),
+                            )
+                            // Recall rather than retype: the prompts already sent
+                            // in this session are one tap away.
+                            .child(composer_icon_button(
+                                "composer-history",
+                                "icons/clock.svg",
                                 locale::text("Earlier messages", "历史消息", "歷史訊息")
                                     .to_string(),
-                            )
-                            .when(history_enabled, |button| {
-                                button
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, window, cx| {
-                                            this.open_composer_history(window, cx)
-                                        }),
-                                    )
-                            })
-                            .when(!history_enabled, |button| button.opacity(0.45))
-                            .child(
-                                svg()
-                                    .path("icons/clock.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(if history_enabled {
-                                        theme::text_secondary()
-                                    } else {
-                                        theme::text_muted()
-                                    }),
-                            ),
-                    )
-                    // The attach menu offers the two things a phone can hand
-                    // over: a photo the host scales down, or a file it carries
-                    // whole.
-                    .child(
-                        div()
-                            .id("attach-file")
-                            .size(px(theme::TOUCH_TARGET))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .aria_label(
-                                locale::text("Attach a file", "添加附件", "新增附件").to_string(),
-                            )
-                            .when(attach_enabled, |button| {
-                                button
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::open_composer_attach_menu),
-                                    )
-                            })
-                            .when(!attach_enabled, |button| button.opacity(0.45))
-                            .child(
-                                svg()
-                                    .path("icons/file-plus.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(if attach_enabled {
-                                        theme::text_secondary()
-                                    } else {
-                                        theme::text_muted()
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("send-message")
-                            .size(px(theme::TOUCH_TARGET))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .aria_label(if editing_message {
-                                locale::text("Replace message", "替换消息", "取代訊息")
-                            } else if running {
-                                locale::text("Steer the turn", "引导当前回合", "引導目前回合")
-                            } else {
-                                locale::common("Send")
-                            })
-                            .when(send_enabled, |button| {
-                                button
-                                    .cursor_pointer()
-                                    .bg(theme::primary())
-                                    .active(|style| style.opacity(0.72))
-                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::send_message))
-                            })
-                            .when(!send_enabled, |button| button.opacity(0.45))
-                            .child(
-                                svg()
-                                    .path("icons/send.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(if send_enabled {
-                                        theme::primary_foreground()
-                                    } else {
-                                        theme::text_muted()
-                                    }),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .id("composer-runtime-options")
-                    .mt(px(theme::SPACING_SM))
-                    .h(px(theme::TOUCH_TARGET))
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(theme::border_subtle())
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .when(runtime_trigger_enabled, |row| {
-                        row.cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::open_runtime_options))
-                    })
-                    .when(!runtime_trigger_enabled, |row| row.opacity(0.62))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(theme::font_micro())
-                            .text_color(theme::text_muted())
-                            .child(locale::common("Runtime")),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
+                                history_enabled,
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_composer_history(window, cx)
+                                }),
+                            ))
+                            // The ring: the one usage surface a phone gets, and
+                            // the only place the reader can tell how full the
+                            // context window is before the next turn fails on it.
                             .child(
                                 div()
-                                    .w_full()
-                                    .truncate()
-                                    .text_size(theme::font_caption())
-                                    .text_color(if runtime_summary.available {
-                                        theme::text_primary()
-                                    } else {
-                                        theme::accent_yellow()
-                                    })
-                                    .child(runtime_summary.primary),
+                                    .id("composer-token-usage")
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .aria_label(locale::text(
+                                        "Token usage",
+                                        "Token 使用情况",
+                                        "Token 使用情況",
+                                    ))
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.show_token_usage(cx)),
+                                    )
+                                    .child(
+                                        ProgressCircle::new("composer-token-ring")
+                                            .value(usage_percent)
+                                            .color(if usage_reported {
+                                                usage_color
+                                            } else {
+                                                theme::text_muted()
+                                            }),
+                                    ),
                             )
-                            .when(!runtime_summary.secondary.is_empty(), |summary| {
-                                summary.child(
+                            // Stop is its own control while a turn runs. It used
+                            // to replace Send, which left the user with no way to
+                            // say anything to a turn that was already going: now
+                            // Send steers the running turn and Stop pauses it.
+                            .when(running, |row| {
+                                row.child(
                                     div()
-                                        .w_full()
-                                        .truncate()
-                                        .text_size(theme::font_micro())
-                                        .text_color(theme::text_muted())
-                                        .child(runtime_summary.secondary),
+                                        .id("stop-turn")
+                                        .size(px(theme::TOUCH_TARGET))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .aria_label(locale::common("Stop"))
+                                        .rounded_full()
+                                        .when(stop_enabled, |button| {
+                                            button
+                                                .cursor_pointer()
+                                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(Self::interrupt),
+                                                )
+                                        })
+                                        .when(!stop_enabled, |button| button.opacity(0.45))
+                                        .child(
+                                            svg()
+                                                .path("icons/stop.svg")
+                                                .size(px(theme::ICON_MD))
+                                                .text_color(if stop_enabled {
+                                                    theme::accent_red()
+                                                } else {
+                                                    theme::text_muted()
+                                                }),
+                                        ),
                                 )
-                            }),
-                    )
-                    .child(
-                        svg()
-                            .path("icons/chevron-right.svg")
-                            .size(px(theme::ICON_SM))
-                            .text_color(theme::text_muted()),
-                    ),
-            )
-            // The token ring: the one usage surface a phone gets, and the only
-            // place the reader can tell how full the context window is before
-            // the next turn fails on it.
-            .child(
-                div()
-                    .id("composer-token-usage")
-                    .mt(px(theme::SPACING_SM))
-                    .h(px(theme::TOUCH_TARGET))
-                    .px(px(theme::SPACING_MD))
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(theme::border_subtle())
-                    .flex()
-                    .items_center()
-                    .gap(px(theme::SPACING_SM))
-                    .cursor_pointer()
-                    .aria_label(locale::text(
-                        "Token usage",
-                        "Token 使用情况",
-                        "Token 使用情況",
-                    ))
-                    .active(|style| style.bg(theme::row_pressed_bg()))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.show_token_usage(cx)),
-                    )
-                    .child(
-                        ProgressCircle::new("composer-token-ring")
-                            .value(usage_percent)
-                            .color(usage_color),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_size(theme::font_caption())
-                                    .text_color(if usage_reported {
-                                        theme::text_secondary()
-                                    } else {
-                                        theme::text_muted()
-                                    })
-                                    .child(match (usage_fraction, self.token_usage.as_ref()) {
-                                        (Some(fraction), Some(usage)) => format!(
-                                            "{}% · {} / {}",
-                                            (fraction * 100.0).round() as u64,
-                                            format_compact_tokens(
-                                                usage
-                                                    .context_window_used_tokens
-                                                    .unwrap_or_default()
-                                            ),
-                                            format_compact_tokens(
-                                                usage
-                                                    .context_window_size_tokens
-                                                    .unwrap_or_default()
-                                            )
-                                        ),
-                                        (None, Some(usage)) => format!(
-                                            "{} / {}",
-                                            format_compact_tokens(
-                                                usage.input_tokens.unwrap_or_default()
-                                            ),
-                                            format_compact_tokens(
-                                                usage.output_tokens.unwrap_or_default()
-                                            )
-                                        ),
-                                        _ => locale::text(
-                                            "Token usage not reported yet",
-                                            "尚未上报 token 使用情况",
-                                            "尚未回報 token 使用情況",
-                                        )
-                                        .to_string(),
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(theme::font_micro())
-                                    .text_color(theme::text_muted())
-                                    .child(locale::text(
-                                        "Context window",
-                                        "上下文窗口",
-                                        "上下文視窗",
-                                    )),
-                            ),
+                            })
+                            .child(composer_send_button(
+                                "send-message",
+                                if editing_message {
+                                    locale::text("Replace message", "替换消息", "取代訊息")
+                                        .to_string()
+                                } else if running {
+                                    locale::text("Steer the turn", "引导当前回合", "引導目前回合")
+                                        .to_string()
+                                } else {
+                                    locale::common("Send").to_string()
+                                },
+                                send_enabled,
+                                false,
+                                cx.listener(Self::send_message),
+                            )),
                     ),
             )
     }
@@ -24562,9 +24565,11 @@ impl MobileApp {
         }
     }
 
+    /// Choosing a project re-scopes the workspace list under it and leaves the
+    /// sheet open: the list below is the other half of the same answer.
     fn choose_new_session_project(&mut self, project_id: String, cx: &mut Context<Self>) {
-        self.new_session_picker = None;
         self.select_new_session_project(&project_id, cx);
+        cx.notify();
     }
 
     fn choose_new_session_workspace(&mut self, workspace_id: String, cx: &mut Context<Self>) {
@@ -25068,84 +25073,179 @@ impl MobileApp {
     /// It is a list rather than a cycle because the desktop picks from a list:
     /// a phone tapping through five projects to reach the last one is slower
     /// than reading five names, and there is no way to go back a step.
+    /// Where the session will run.
+    ///
+    /// Two questions, one sheet: the project is the list on top and the
+    /// workspaces under it are re-scoped by the choice above them, so the reader
+    /// sees where they are about to start without opening a second sheet. The
+    /// project row stays open on purpose — the answer below it is the point.
     fn render_new_session_picker_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(picker) = self.new_session_picker else {
+        if self.new_session_picker.is_none() {
             return div().into_any_element();
-        };
-        let (title, rows) = match picker {
-            NewSessionPicker::Project => (
-                locale::text("Choose project", "选择项目", "選擇專案"),
-                self.sidebar_projects()
-                    .into_iter()
-                    .map(|project| {
-                        let workspaces = self
-                            .workspace_summaries
-                            .iter()
-                            .filter(|summary| summary.project.id.as_str() == project.id)
-                            .count();
-                        NewSessionPickerRow {
-                            selected: self.new_session_project_id.as_deref()
-                                == Some(project.id.as_str()),
-                            id: project.id,
-                            title: project.label,
-                            subtitle: match workspaces {
-                                0 => locale::text("No workspace yet", "暂无工作区", "尚無工作區")
-                                    .to_string(),
-                                1 => locale::text("1 workspace", "1 个工作区", "1 個工作區")
-                                    .to_string(),
-                                count => format!(
-                                    "{count} {}",
-                                    locale::text("workspaces", "个工作区", "個工作區")
-                                ),
-                            },
-                            is_project: true,
-                        }
+        }
+        let project_id = self.new_session_project_id.clone();
+        let workspace_id = self.new_session_workspace_id.clone();
+
+        let project_rows = self
+            .sidebar_projects()
+            .into_iter()
+            .map(|project| {
+                let selected = project_id.as_deref() == Some(project.id.as_str());
+                let workspaces = self
+                    .workspace_summaries
+                    .iter()
+                    .filter(|summary| summary.project.id.as_str() == project.id)
+                    .count();
+                let subtitle = match workspaces {
+                    0 => locale::text("No workspace yet", "暂无工作区", "尚無工作區").to_string(),
+                    1 => locale::text("1 workspace", "1 个工作区", "1 個工作區").to_string(),
+                    count => format!(
+                        "{count} {}",
+                        locale::text("workspaces", "个工作区", "個工作區")
+                    ),
+                };
+                let id = project.id.clone();
+                div()
+                    .id(format!("new-session-project:{}", project.id))
+                    .flex_shrink_0()
+                    .min_h(px(theme::TOUCH_TARGET))
+                    .px(px(theme::SPACING_LG))
+                    .py(px(theme::SPACING_SM))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_MD))
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .when(selected, |row| row.bg(theme::sidebar_selected_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.choose_new_session_project(id.clone(), cx)
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(theme::font_body())
+                                    .text_color(theme::text_primary())
+                                    .child(project.label),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_muted())
+                                    .child(subtitle),
+                            ),
+                    )
+                    .when(selected, |row| {
+                        row.child(
+                            svg()
+                                .path("icons/check.svg")
+                                .size(px(theme::ICON_SM))
+                                .text_color(theme::accent_green()),
+                        )
                     })
-                    .collect::<Vec<_>>(),
-            ),
-            NewSessionPicker::Workspace => {
-                let project_id = self.new_session_project_id.clone();
-                (
-                    locale::text("Choose workspace", "选择工作区", "選擇工作區"),
-                    self.workspaces
-                        .iter()
-                        .filter(|workspace| {
-                            project_id
-                                .as_deref()
-                                .is_none_or(|id| workspace.project_id.as_str() == id)
-                        })
-                        .map(|workspace| {
-                            let summary = self.workspace_summaries.iter().find(|summary| {
-                                summary.workspace.id.as_str() == workspace.id.as_str()
-                            });
-                            let title = self
-                                .sidebar_view
-                                .worktree_titles
-                                .get(workspace.id.as_str())
-                                .cloned()
-                                .unwrap_or_else(|| {
-                                    workspace_label(&workspace.root_path).to_string()
-                                });
-                            let mut subtitle = workspace_mode_label(workspace.mode).to_string();
-                            if let Some(branch) = summary
-                                .and_then(|summary| summary.git_branch.as_deref())
-                                .filter(|branch| !branch.trim().is_empty())
-                            {
-                                subtitle = format!("{subtitle} · {branch}");
-                            }
-                            NewSessionPickerRow {
-                                selected: self.new_session_workspace_id.as_deref()
-                                    == Some(workspace.id.as_str()),
-                                id: workspace.id.as_str().to_string(),
-                                title,
-                                subtitle,
-                                is_project: false,
-                            }
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            }
-        };
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        let workspace_rows = self
+            .workspaces
+            .iter()
+            .filter(|workspace| {
+                project_id
+                    .as_deref()
+                    .is_none_or(|id| workspace.project_id.as_str() == id)
+            })
+            .map(|workspace| {
+                let summary = self
+                    .workspace_summaries
+                    .iter()
+                    .find(|summary| summary.workspace.id.as_str() == workspace.id.as_str());
+                let title = self
+                    .sidebar_view
+                    .worktree_titles
+                    .get(workspace.id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| workspace_label(&workspace.root_path).to_string());
+                let mut subtitle = workspace_mode_label(workspace.mode).to_string();
+                if let Some(branch) = summary
+                    .and_then(|summary| summary.git_branch.as_deref())
+                    .filter(|branch| !branch.trim().is_empty())
+                {
+                    subtitle = format!("{subtitle} · {branch}");
+                }
+                let selected = workspace_id.as_deref() == Some(workspace.id.as_str());
+                let id = workspace.id.as_str().to_string();
+                div()
+                    .id(format!("new-session-workspace:{}", workspace.id))
+                    .flex_shrink_0()
+                    .min_h(px(theme::TOUCH_TARGET))
+                    .px(px(theme::SPACING_LG))
+                    .py(px(theme::SPACING_SM))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_MD))
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .when(selected, |row| row.bg(theme::sidebar_selected_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.choose_new_session_workspace(id.clone(), cx)
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(theme::font_body())
+                                    .text_color(theme::text_primary())
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_muted())
+                                    .child(subtitle),
+                            ),
+                    )
+                    .when(selected, |row| {
+                        row.child(
+                            svg()
+                                .path("icons/check.svg")
+                                .size(px(theme::ICON_SM))
+                                .text_color(theme::accent_green()),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
 
         div()
             .absolute()
@@ -25163,7 +25263,7 @@ impl MobileApp {
                 div()
                     .debug_selector(|| "mobile-new-session-picker".to_string())
                     .w_full()
-                    .max_h(px(460.0))
+                    .max_h(gpui::relative(0.7))
                     .rounded_t(px(theme::RADIUS_CARD))
                     .border_t_1()
                     .border_color(theme::border_default())
@@ -25204,7 +25304,11 @@ impl MobileApp {
                                     .text_size(theme::font_heading())
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme::text_primary())
-                                    .child(title),
+                                    .child(locale::text(
+                                        "Project and workspace",
+                                        "项目与工作区",
+                                        "專案與工作區",
+                                    )),
                             )
                             .child(
                                 div()
@@ -25234,127 +25338,35 @@ impl MobileApp {
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
+                            .restrict_scroll_to_axis()
                             .flex()
                             .flex_col()
                             .pb(px(theme::SPACING_SM))
-                            .children(rows.into_iter().map(|row| {
-                                let id = row.id.clone();
-                                let is_project = row.is_project;
-                                div()
-                                    .id(format!("new-session-picker:{}", row.id))
-                                    .flex_shrink_0()
-                                    .min_h(px(theme::TOUCH_TARGET))
-                                    .px(px(theme::SPACING_LG))
-                                    .py(px(theme::SPACING_SM))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(theme::SPACING_MD))
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .when(row.selected, |row| row.bg(theme::sidebar_selected_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            if is_project {
-                                                this.choose_new_session_project(id.clone(), cx)
-                                            } else {
-                                                this.choose_new_session_workspace(id.clone(), cx)
-                                            }
-                                        }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .flex()
-                                            .flex_col()
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .overflow_hidden()
-                                                    .text_ellipsis()
-                                                    .whitespace_nowrap()
-                                                    .text_size(theme::font_body())
-                                                    .text_color(theme::text_primary())
-                                                    .child(row.title),
-                                            )
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .overflow_hidden()
-                                                    .text_ellipsis()
-                                                    .whitespace_nowrap()
-                                                    .text_size(theme::font_micro())
-                                                    .text_color(theme::text_muted())
-                                                    .child(row.subtitle),
-                                            ),
-                                    )
-                                    .when(row.selected, |row| {
-                                        row.child(
-                                            svg()
-                                                .path("icons/check.svg")
-                                                .size(px(theme::ICON_SM))
-                                                .text_color(theme::accent_green()),
-                                        )
-                                    })
-                            })),
+                            .child(runtime_section_heading(locale::text(
+                                "Project", "项目", "專案",
+                            )))
+                            .children(project_rows)
+                            .child(runtime_section_heading(locale::text(
+                                "Workspace",
+                                "工作区",
+                                "工作區",
+                            )))
+                            .children(workspace_rows),
                     ),
             )
             .into_any_element()
     }
 
-    fn render_new_session_mode_button(
-        &self,
-        id: &'static str,
-        mode: WorkspaceMode,
-        label: String,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let available =
-            mode == WorkspaceMode::CurrentCheckout || self.supports_new_session_worktree();
-        div()
-            .id(id)
-            .h(px(theme::TOUCH_TARGET))
-            .flex_1()
-            .rounded(px(theme::RADIUS_CONTROL))
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(theme::font_caption())
-            .text_color(if !available {
-                theme::text_muted()
-            } else if self.new_session_workspace_mode == mode {
-                theme::text_primary()
-            } else {
-                theme::text_muted()
-            })
-            .when(
-                self.new_session_workspace_mode == mode && available,
-                |button| button.bg(theme::sidebar_selected_bg()),
-            )
-            .when(available, |button| button.cursor_pointer())
-            .when(!available, |button| button.opacity(0.42))
-            .active(|style| style.bg(theme::row_pressed_bg()))
-            .when(available, |button| {
-                button.on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(move |this, event, window, cx| {
-                        this.toggle_new_session_workspace_mode(mode, event, window, cx)
-                    }),
-                )
-            })
-            .child(label)
-            .into_any_element()
-    }
-
     /// The new-session page.
     ///
-    /// It is a conversation page, not a configuration form: the first message
-    /// occupies the page the way the composer occupies a session, and the
-    /// choices that shape it (runtime, location, title) are chips along its
-    /// bottom edge. The desktop's creation panel reads the same way, which is
-    /// the point — the phone used to open on two cycling pickers and a pair of
-    /// unlabelled text boxes.
+    /// The prompt card is the page: an introduction above it for orientation,
+    /// the message inside it, and the row under it naming where that message
+    /// will run. Everything that shapes the session beyond those two belongs to
+    /// a sheet, and the two decisions a session cannot start without — the model
+    /// that answers and the permission it runs under — sit on the card's control
+    /// row so they are read without opening anything. The desktop's creation
+    /// panel draws the same split, which is the point: the phone used to open on
+    /// a stack of cards and a button at the far end of the screen.
     fn render_new_session(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let project_label = self
             .new_session_project_id
@@ -25411,7 +25423,51 @@ impl MobileApp {
                 .supports(BackendOperation::AgentCreateSession)
         });
         let runtime_ready = runtime_summary.available && can_create_session;
-        let title_value = self.new_session_title_input.read(cx).value().to_string();
+        // The page is the card. Everything above it is orientation, the card is
+        // the message, and the row under it is where that message will run. The
+        // choices that used to be rows of their own now live on the card's
+        // control row or in the sheet the header opens, so the first thing the
+        // page shows is the field it is asking the reader to write in.
+        //
+        // The introduction stays while the reader writes: the keyboard already
+        // takes the room it needs, and a page that rearranges itself on the
+        // first keystroke is a page that jumps under the reader's thumb.
+        let busy = self.new_session_busy;
+        let location_label = if mode == WorkspaceMode::VibexWorktree {
+            locale::text("New worktree", "新建 Worktree", "新建 Worktree").to_string()
+        } else {
+            locale::text("Current checkout", "当前检出", "目前檢出").to_string()
+        };
+        // The two decisions the card reports rather than hides: which model will
+        // answer, and what the session is allowed to do. Both are read off the
+        // same projection the sheets write to, so a choice made in a sheet shows
+        // up here on the next frame.
+        let runtime_option = runtime_catalog
+            .zip(runtime_selection)
+            .and_then(|(catalog, selection)| matching_runtime_option(&catalog.options, selection));
+        let model_id = match runtime_selection.map(|selection| &selection.model) {
+            Some(vibex_core::RuntimeModelSelection::Explicit { model_id }) => {
+                Some(model_id.clone())
+            }
+            _ => None,
+        };
+        let model_label = runtime_option
+            .map(|option| option.model_label.clone())
+            .unwrap_or_else(|| {
+                model_id
+                    .clone()
+                    .unwrap_or_else(|| locale::common("Default").to_string())
+            });
+        let mode_label = runtime_catalog
+            .zip(runtime_selection)
+            .and_then(|(catalog, selection)| {
+                RuntimeCascadeProjection::from_catalog(catalog, selection)
+                    .modes
+                    .into_iter()
+                    .find(|choice| selection.mode_id.as_ref() == Some(&choice.value))
+                    .map(|choice| choice.label)
+            })
+            .unwrap_or_else(|| locale::common("Default").to_string());
 
         div()
             .absolute()
@@ -25420,419 +25476,693 @@ impl MobileApp {
             .block_mouse_except_scroll()
             .flex()
             .flex_col()
-            .child(self.render_overlay_header("mobile-new-session", "New session", None, cx))
+            .child(
+                self.render_overlay_header(
+                    "mobile-new-session",
+                    "New session",
+                    Some(
+                        div()
+                            .id("mobile-new-session-options")
+                            .debug_selector(|| "mobile-new-session-options".to_string())
+                            .aria_label(
+                                locale::text("Session options", "会话选项", "工作階段選項")
+                                    .to_string(),
+                            )
+                            .size(px(theme::HEADER_BUTTON_SIZE))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.65))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::open_new_session_options),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/ellipsis.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            )
+                            .into_any_element(),
+                    ),
+                    cx,
+                ),
+            )
             .child(
                 div()
-                    .id("mobile-new-session-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .restrict_scroll_to_axis()
-                    .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
-                    .px(px(theme::SPACING_LG))
-                    .py(px(theme::SPACING_LG))
                     .flex()
                     .flex_col()
-                    .gap(px(theme::SPACING_MD))
-                    // ── the first message ────────────────────────────────────
+                    // ── where the page introduces itself ─────────────────────
                     .child(
                         div()
-                            .w_full()
-                            .rounded(px(theme::RADIUS_CARD))
-                            .border_1()
-                            .border_color(theme::border_default())
-                            .bg(theme::bg_card())
-                            .p(px(theme::SPACING_MD))
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .px(px(theme::SPACING_XL))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .when(!busy, |hero| {
+                                hero.child(self.render_pairing_brand())
+                                    .child(
+                                        div()
+                                            .text_size(theme::font_title())
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme::text_primary())
+                                            .child(locale::text(
+                                                "Start something new",
+                                                "开始新的工作",
+                                                "開始新的工作",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt(px(theme::SPACING_SM))
+                                            .text_size(theme::font_caption())
+                                            .text_color(theme::text_muted())
+                                            .child(format!("{project_label} · {location_label}")),
+                                    )
+                            }),
+                    )
+                    // ── the message, and what it will run on ────────────────
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px(px(theme::SPACING_LG))
+                            .pb(px(theme::SPACING_MD))
                             .flex()
                             .flex_col()
                             .gap(px(theme::SPACING_SM))
-                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
-                            .child(
-                                div()
-                                    .text_size(theme::font_micro())
-                                    .text_color(theme::text_muted())
-                                    .child(locale::text(
-                                        "FIRST MESSAGE",
-                                        "第一条消息",
-                                        "第一條訊息",
-                                    )),
-                            )
                             .child(
                                 div()
                                     .w_full()
-                                    .min_h_0()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        resume_keyboard_on_tap,
-                                    )
-                                    .child(
-                                        Textarea::new(&self.new_session_prompt_input)
-                                            .appearance(false),
-                                    ),
-                            )
-                            .when(!new_session_mentions.is_empty(), |card| {
-                                card.child(self.render_composer_suggestion_panel(
-                                    &new_session_mentions,
-                                    ComposerSuggestionKind::NewSessionMention,
-                                    cx,
-                                ))
-                            })
-                            // The first message carries what a prompt carries:
-                            // a picture the Agent should look at, or a file it
-                            // should read, before the session has even started.
-                            .when(!self.new_session_attachments.is_empty(), |card| {
-                                card.child(self.render_new_session_attachments(cx))
-                            })
-                            .child(
-                                div()
+                                    .rounded(px(theme::RADIUS_COMPOSER))
+                                    .border_1()
+                                    .border_color(theme::border_subtle())
+                                    .bg(theme::bg_card())
+                                    .p(px(theme::SPACING_MD))
                                     .flex()
-                                    .items_center()
+                                    .flex_col()
                                     .gap(px(theme::SPACING_SM))
                                     .child(
                                         div()
-                                            .id("mobile-new-session-attach")
-                                            .aria_label(
+                                            .w_full()
+                                            .min_h(px(theme::TOUCH_TARGET))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                resume_keyboard_on_tap,
+                                            )
+                                            .child(
+                                                Textarea::new(&self.new_session_prompt_input)
+                                                    .appearance(false),
+                                            ),
+                                    )
+                                    .when(!new_session_mentions.is_empty(), |card| {
+                                        card.child(self.render_composer_suggestion_panel(
+                                            &new_session_mentions,
+                                            ComposerSuggestionKind::NewSessionMention,
+                                            cx,
+                                        ))
+                                    })
+                                    // The first message carries what a prompt carries:
+                                    // a picture the Agent should look at, or a file it
+                                    // should read, before the session has even started.
+                                    .when(!self.new_session_attachments.is_empty(), |card| {
+                                        card.child(self.render_new_session_attachments(cx))
+                                    })
+                                    // The control row keeps the two choices a session
+                                    // cannot start without on the card itself: what
+                                    // answers, and what it may do. Everything else is
+                                    // one tap away in a sheet.
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .h(px(theme::TOUCH_TARGET))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(theme::SPACING_XS))
+                                            .child(composer_icon_button(
+                                                "mobile-new-session-attach",
+                                                "icons/plus.svg",
                                                 locale::text(
                                                     "Attach a file",
                                                     "添加附件",
                                                     "新增附件",
                                                 )
                                                 .to_string(),
-                                            )
-                                            .h(px(32.0))
-                                            .px(px(theme::SPACING_MD))
-                                            .rounded(px(theme::RADIUS_CONTROL))
-                                            .border_1()
-                                            .border_color(theme::border_default())
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .cursor_pointer()
-                                            .active(|style| style.bg(theme::row_pressed_bg()))
-                                            .on_mouse_up(
-                                                MouseButton::Left,
+                                                !busy,
                                                 cx.listener(Self::open_new_session_attach_menu),
-                                            )
+                                            ))
                                             .child(
-                                                svg()
-                                                    .path("icons/file-plus.svg")
-                                                    .size(px(theme::ICON_SM))
-                                                    .text_color(theme::text_secondary()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(theme::font_micro())
-                                                    .text_color(theme::text_secondary())
-                                                    .child(locale::text(
-                                                        "Attach",
-                                                        "附件",
-                                                        "附件",
-                                                    )),
-                                            ),
-                                    ),
-                            ),
-                    )
-                    // ── the new worktree's own fields ────────────────────────
-                    .when(mode == WorkspaceMode::VibexWorktree, |page| {
-                        page.child(
-                            div()
-                                .w_full()
-                                .rounded(px(theme::RADIUS_CARD))
-                                .border_1()
-                                .border_color(theme::border_subtle())
-                                .bg(theme::bg_card())
-                                .p(px(theme::SPACING_MD))
-                                .flex()
-                                .flex_col()
-                                .gap(px(theme::SPACING_SM))
-                                .child(
-                                    div()
-                                        .text_size(theme::font_micro())
-                                        .text_color(theme::text_muted())
-                                        .child(locale::text(
-                                            "NEW WORKTREE",
-                                            "新建 WORKTREE",
-                                            "新建 WORKTREE",
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .h(px(theme::TOUCH_TARGET))
-                                        .rounded(px(theme::RADIUS_CONTROL))
-                                        .border_1()
-                                        .border_color(theme::border_default())
-                                        .bg(theme::workbench_panel_bg())
-                                        .px_2()
-                                        .flex()
-                                        .items_center()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            resume_keyboard_on_tap,
-                                        )
-                                        .child(
-                                            Input::new(&self.new_session_worktree_name_input)
-                                                .appearance(false),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(theme::SPACING_XS))
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .flex_1()
-                                                .h(px(theme::TOUCH_TARGET))
-                                                .rounded(px(theme::RADIUS_CONTROL))
-                                                .border_1()
-                                                .border_color(theme::border_default())
-                                                .bg(theme::workbench_panel_bg())
-                                                .px_2()
-                                                .flex()
-                                                .items_center()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    resume_keyboard_on_tap,
-                                                )
-                                                .child(
-                                                    Input::new(
-                                                        &self.new_session_worktree_path_input,
-                                                    )
-                                                    .appearance(false),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("browse-worktree-path")
-                                                .size(px(theme::TOUCH_TARGET))
-                                                .flex_shrink_0()
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded(px(theme::RADIUS_CONTROL))
-                                                .border_1()
-                                                .border_color(theme::border_default())
-                                                .cursor_pointer()
-                                                .aria_label(
-                                                    locale::text(
-                                                        "Browse the desktop's folders",
-                                                        "浏览桌面端文件夹",
-                                                        "瀏覽桌面版資料夾",
-                                                    )
-                                                    .to_string(),
-                                                )
-                                                .active(|style| {
-                                                    style.bg(theme::row_pressed_bg())
-                                                })
-                                                .on_mouse_up(
-                                                    MouseButton::Left,
-                                                    cx.listener(
-                                                        Self::open_worktree_path_browser,
+                                                composer_chip(
+                                                    "mobile-new-session-model",
+                                                    runtime_model_icon(
+                                                        model_id.as_deref(),
+                                                        px(theme::ICON_SM),
+                                                        theme::text_secondary(),
                                                     ),
+                                                    model_label,
+                                                    !runtime_ready,
+                                                    cx.listener(|this, event, window, cx| {
+                                                        this.open_new_session_runtime_options(
+                                                            event, window, cx,
+                                                        )
+                                                    }),
                                                 )
-                                                .child(
-                                                    svg()
-                                                        .path("icons/folder-open.svg")
-                                                        .size(px(theme::ICON_SM))
-                                                        .text_color(theme::text_secondary()),
-                                                ),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(theme::font_micro())
-                                        .text_color(theme::text_muted())
-                                        .child(locale::text(
-                                            "The worktree is created from the selected workspace's branch before the session starts.",
-                                            "会话启动前，会基于所选工作区的分支创建 Worktree。",
-                                            "工作階段啟動前，會基於所選工作區的分支建立 Worktree。",
-                                        )),
-                                ),
-                        )
-                    })
-                    // ── title, only when the user wants one ──────────────────
-                    .child(
-                        div()
-                            .w_full()
-                            .rounded(px(theme::RADIUS_CARD))
-                            .border_1()
-                            .border_color(theme::border_subtle())
-                            .bg(theme::bg_card())
-                            .px(px(theme::SPACING_MD))
-                            .py(px(theme::SPACING_SM))
-                            .flex()
-                            .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
-                            .child(
-                                svg()
-                                    .path("icons/pencil.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_muted()),
+                                                .flex_1()
+                                                .min_w_0(),
+                                            )
+                                            .child(composer_chip(
+                                                "mobile-new-session-mode",
+                                                svg()
+                                                    .path("icons/shield-alert.svg")
+                                                    .size(px(theme::ICON_SM))
+                                                    .text_color(theme::text_muted())
+                                                    .into_any_element(),
+                                                mode_label,
+                                                false,
+                                                cx.listener(Self::open_new_session_options),
+                                            ))
+                                            .child(composer_send_button(
+                                                "mobile-new-session-submit",
+                                                locale::common("Start session").to_string(),
+                                                can_submit && runtime_ready,
+                                                busy,
+                                                cx.listener(Self::submit_new_session),
+                                            )),
+                                    ),
                             )
+                            // ── where it will run ───────────────────────────
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        resume_keyboard_on_tap,
-                                    )
-                                    .child(
-                                        Input::new(&self.new_session_title_input)
-                                            .appearance(false),
-                                    ),
+                                    .w_full()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap(px(theme::SPACING_XS))
+                                    .child(composer_chip(
+                                        "mobile-new-session-scope",
+                                        svg()
+                                            .path("icons/layers.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_muted())
+                                            .into_any_element(),
+                                        format!("{project_label} · {workspace_display}"),
+                                        self.new_session_project_id.is_none(),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.open_new_session_picker(
+                                                NewSessionPicker::Location,
+                                                cx,
+                                            )
+                                        }),
+                                    ))
+                                    .child(composer_chip(
+                                        "mobile-new-session-location",
+                                        svg()
+                                            .path(if mode == WorkspaceMode::VibexWorktree {
+                                                "icons/git-branch.svg"
+                                            } else {
+                                                "icons/folder-open.svg"
+                                            })
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_muted())
+                                            .into_any_element(),
+                                        location_label.clone(),
+                                        !worktree_supported,
+                                        cx.listener(move |this, event, window, cx| {
+                                            let next = if mode == WorkspaceMode::VibexWorktree {
+                                                WorkspaceMode::CurrentCheckout
+                                            } else {
+                                                WorkspaceMode::VibexWorktree
+                                            };
+                                            this.toggle_new_session_workspace_mode(
+                                                next, event, window, cx,
+                                            )
+                                        }),
+                                    )),
                             )
-                            .when(!title_value.is_empty(), |row| {
-                                row.child(
+                            // ── the worktree the session will start in ──────
+                            .when(mode == WorkspaceMode::VibexWorktree, |page| {
+                                page.child(self.render_new_session_worktree_fields(busy, cx))
+                            })
+                            // A page that cannot start says so next to the control
+                            // that is holding it up, rather than in a sentence the
+                            // reader has to connect to a row further up.
+                            .when(!runtime_ready, |page| {
+                                page.child(
                                     div()
+                                        .px(px(theme::SPACING_XS))
+                                        .text_size(theme::font_micro())
+                                        .text_color(theme::accent_yellow())
+                                        .child(locale::text(
+                                            "Select an Agent runtime before starting.",
+                                            "开始前请先选择 Agent 运行时。",
+                                            "開始前請先選擇 Agent 執行環境。",
+                                        )),
+                                )
+                            })
+                            .when(busy, |page| {
+                                page.child(
+                                    div()
+                                        .px(px(theme::SPACING_XS))
                                         .text_size(theme::font_micro())
                                         .text_color(theme::text_muted())
-                                        .child(locale::common("Optional")),
-                                )
-                            }),
-                    )
-                    // ── the choices that shape it ────────────────────────────
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .flex_wrap()
-                            .gap(px(theme::SPACING_SM))
-                            .child(new_session_chip(
-                                "mobile-new-session-runtime",
-                                "icons/bot.svg",
-                                locale::common("Runtime"),
-                                runtime_summary.primary.clone(),
-                                !runtime_summary.available,
-                                cx.listener(|this, event, window, cx| {
-                                    this.open_new_session_runtime_options(event, window, cx)
-                                }),
-                            ))
-                            .child(new_session_chip(
-                                "mobile-new-session-location",
-                                if mode == WorkspaceMode::VibexWorktree {
-                                    "icons/git-branch.svg"
-                                } else {
-                                    "icons/folder-open.svg"
-                                },
-                                locale::common("Location"),
-                                if mode == WorkspaceMode::VibexWorktree {
-                                    locale::text("New worktree", "新建 Worktree", "新建 Worktree")
-                                        .to_string()
-                                } else {
-                                    locale::text("Current checkout", "当前检出", "目前檢出")
-                                        .to_string()
-                                },
-                                !worktree_supported,
-                                cx.listener(move |this, _event, window, cx| {
-                                    let next = if mode == WorkspaceMode::VibexWorktree {
-                                        WorkspaceMode::CurrentCheckout
-                                    } else {
-                                        WorkspaceMode::VibexWorktree
-                                    };
-                                    this.toggle_new_session_workspace_mode(next, _event, window, cx)
-                                }),
-                            ))
-                            .child(new_session_chip(
-                                "mobile-new-session-project",
-                                "icons/folder.svg",
-                                locale::common("Project"),
-                                project_label,
-                                false,
-                                cx.listener(|this, _, _, cx| {
-                                    this.open_new_session_picker(NewSessionPicker::Project, cx)
-                                }),
-                            ))
-                            .child(new_session_chip(
-                                "mobile-new-session-workspace",
-                                "icons/layers.svg",
-                                locale::common("Workspace"),
-                                workspace_display,
-                                false,
-                                cx.listener(|this, _, _, cx| {
-                                    this.open_new_session_picker(NewSessionPicker::Workspace, cx)
-                                }),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .text_size(theme::font_micro())
-                            .text_color(theme::text_muted())
-                            .child(if worktree_supported {
-                                locale::text(
-                                    "Worktrees are created from the desktop's branch state; pick one here and the session starts in it.",
-                                    "Worktree 由桌面端的分支状态创建；在此选择后会话将在其中启动。",
-                                    "Worktree 由桌面版的分支狀態建立；在此選擇後工作階段將在其中啟動。",
-                                )
-                            } else {
-                                locale::text(
-                                    "This runtime cannot create worktrees, so the session starts in the current checkout.",
-                                    "该运行时不支持创建 worktree，会话将在当前检出中启动。",
-                                    "該執行環境不支援建立 worktree，工作階段將在目前檢出中啟動。",
+                                        .child(locale::text(
+                                            "Creating the session…",
+                                            "正在创建会话…",
+                                            "正在建立工作階段…",
+                                        )),
                                 )
                             }),
                     ),
             )
-            // ── start ────────────────────────────────────────────────────────
+            .into_any_element()
+    }
+
+    /// The worktree's own fields, in place, and only while a new worktree is
+    /// the choice.
+    ///
+    /// They used to be a card on every visit to the page with a sentence
+    /// explaining worktrees under it; a reader starting in the current checkout
+    /// needs neither, and the sentence now appears only where it applies.
+    fn render_new_session_worktree_fields(
+        &self,
+        busy: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .w_full()
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            .border_color(theme::border_subtle())
+            .bg(theme::bg_card())
+            .p(px(theme::SPACING_MD))
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACING_SM))
             .child(
                 div()
-                    .flex_shrink_0()
-                    .border_t_1()
-                    .border_color(theme::border_subtle())
-                    .p(px(theme::SPACING_MD))
+                    .text_size(theme::font_micro())
+                    .text_color(theme::text_muted())
+                    .child(locale::text("NEW WORKTREE", "新建 WORKTREE", "新建 WORKTREE")),
+            )
+            .child(
+                div()
+                    .h(px(theme::TOUCH_TARGET))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .bg(theme::bg_card_dim())
+                    .px_2()
                     .flex()
-                    .flex_col()
-                    .gap(px(theme::SPACING_SM))
-                    .when(!runtime_ready, |bar| {
-                        bar.child(
-                            div()
-                                .text_size(theme::font_micro())
-                                .text_color(theme::accent_yellow())
-                                .child(locale::text(
-                                    "Select an Agent runtime before starting.",
-                                    "开始前请先选择 Agent 运行时。",
-                                    "開始前請先選擇 Agent 執行環境。",
-                                )),
-                        )
+                    .items_center()
+                    .when(!busy, |field| {
+                        field.on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                     })
                     .child(
+                        Input::new(&self.new_session_worktree_name_input).appearance(false),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .child(
                         div()
-                            .id("mobile-new-session-submit")
-                            .debug_selector(|| "mobile-new-session-submit".to_string())
-                            .w_full()
-                            .h(px(theme::TOUCH_TARGET + 4.0))
+                            .min_w_0()
+                            .flex_1()
+                            .h(px(theme::TOUCH_TARGET))
                             .rounded(px(theme::RADIUS_CONTROL))
-                            .bg(if can_submit && runtime_ready {
-                                theme::primary()
-                            } else {
-                                theme::bg_card_dim()
+                            .bg(theme::bg_card_dim())
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .when(!busy, |field| {
+                                field.on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                             })
+                            .child(
+                                Input::new(&self.new_session_worktree_path_input).appearance(false),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("browse-worktree-path")
+                            .size(px(theme::TOUCH_TARGET))
+                            .flex_shrink_0()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .gap(px(theme::SPACING_SM))
-                            .text_size(theme::font_body())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(if can_submit && runtime_ready {
-                                theme::primary_foreground()
-                            } else {
-                                theme::text_muted()
-                            })
-                            .when(can_submit && runtime_ready, |button| {
-                                button.cursor_pointer().active(|style| style.opacity(0.8)).on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(Self::submit_new_session),
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .aria_label(
+                                locale::text(
+                                    "Browse the desktop's folders",
+                                    "浏览桌面端文件夹",
+                                    "瀏覽桌面版資料夾",
                                 )
+                                .to_string(),
+                            )
+                            .when(!busy, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::open_worktree_path_browser),
+                                    )
                             })
-                            .child(if self.new_session_busy {
-                                locale::common("Creating...")
+                            .child(
+                                svg()
+                                    .path("icons/folder-open.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(theme::font_micro())
+                    .text_color(theme::text_muted())
+                    .child(locale::text(
+                        "The worktree is created from the selected workspace's branch before the session starts.",
+                        "会话启动前，会基于所选工作区的分支创建 Worktree。",
+                        "工作階段啟動前，會基於所選工作區的分支建立 Worktree。",
+                    )),
+            )
+            .into_any_element()
+    }
+
+    /// Opens the new-session page's settings sheet.
+    ///
+    /// The sheet edits the same draft the model sheet does, so a permission
+    /// chosen here is the permission the session is created with.
+    fn open_new_session_options(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.new_session_busy || !self.new_session_open {
+            return;
+        }
+        let desired = self
+            .new_session_runtime
+            .clone()
+            .or_else(|| {
+                self.controller.as_ref().and_then(|controller| {
+                    controller
+                        .state
+                        .runtime_selection
+                        .value
+                        .as_ref()
+                        .map(|state| state.desired.clone())
+                })
+            })
+            .or_else(|| {
+                self.controller.as_ref().and_then(|controller| {
+                    controller
+                        .state
+                        .runtime_options
+                        .value
+                        .as_ref()?
+                        .options
+                        .iter()
+                        .find(|option| option.availability == RuntimeOptionAvailability::Available)
+                        .map(|option| option.selection.clone())
+                })
+            });
+        if let Some(desired) = desired {
+            self.runtime_options_target = RuntimeOptionsTarget::NewSession;
+            self.runtime_draft = Some(desired);
+            self.sync_runtime_feature_inputs();
+        }
+        self.new_session_options_open = true;
+        self.push_back_screen(BackScreen::NewSessionOptions);
+        crate::platform::hide_keyboard();
+        cx.notify();
+    }
+
+    fn dismiss_new_session_options(&mut self, cx: &mut Context<Self>) {
+        if self.new_session_options_open {
+            self.new_session_options_open = false;
+            self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
+            self.runtime_draft = None;
+            self.clear_runtime_feature_inputs();
+            crate::platform::hide_keyboard();
+            cx.notify();
+        }
+    }
+
+    /// The new-session page's settings sheet.
+    ///
+    /// It holds what the page no longer spells out as rows of its own: the
+    /// optional title, the permission the session starts with, the reasoning
+    /// depth, and the per-Agent options. Every choice lands on the page's own
+    /// draft as it is made — there is no session yet, so there is nothing to
+    /// apply it to afterwards.
+    fn render_new_session_options_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if !self.new_session_options_open {
+            return div().into_any_element();
+        }
+        let catalog = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.runtime_options.value.as_ref().cloned());
+        let draft = self
+            .runtime_draft
+            .clone()
+            .or_else(|| self.new_session_runtime.clone());
+        let projection = catalog
+            .as_ref()
+            .zip(draft.as_ref())
+            .map(|(catalog, draft)| RuntimeCascadeProjection::from_catalog(catalog, draft))
+            .unwrap_or_default();
+        let RuntimeCascadeProjection {
+            reasoning_efforts,
+            modes,
+            features,
+            ..
+        } = projection;
+        let busy = self.new_session_busy || self.runtime_switch_busy_generation.is_some();
+        let title_value = self.new_session_title_input.read(cx).value().to_string();
+        let selected_mode = draft.as_ref().and_then(|draft| draft.mode_id.clone());
+        let selected_effort = draft
+            .as_ref()
+            .and_then(|draft| draft.reasoning_effort.clone());
+
+        let mut body = div()
+            .id("mobile-new-session-options-body")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .restrict_scroll_to_axis()
+            .pb(px(theme::SPACING_LG))
+            // ── the optional title ──────────────────────────────────────────
+            .child(runtime_section_heading(locale::text(
+                "Title",
+                "会话标题",
+                "工作階段標題",
+            )))
+            .child(
+                div()
+                    .px_3()
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACING_XS))
+                    .child(
+                        div()
+                            .h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::bg_card_dim())
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
+                            .child(Input::new(&self.new_session_title_input).appearance(false)),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_muted())
+                            .child(if title_value.trim().is_empty() {
+                                locale::text(
+                                    "Optional: the first message names the session when this is empty.",
+                                    "可选：留空时由第一条消息为会话命名。",
+                                    "可選：留空時由第一則訊息為工作階段命名。",
+                                )
                             } else {
-                                locale::common("Start session")
+                                locale::common("Optional")
                             }),
                     ),
+            );
+        // ── what the session may do ─────────────────────────────────────────
+        if !modes.is_empty() {
+            body = body
+                .child(runtime_section_heading(locale::common("Mode")))
+                .child(
+                    div()
+                        .px_3()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            runtime_choice_button(
+                                "new-session-mode:default",
+                                locale::common("Default"),
+                                selected_mode.is_none(),
+                            )
+                            .when(!busy, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.choose_default_runtime_mode(cx)
+                                        }),
+                                    )
+                            }),
+                        )
+                        .children(modes.into_iter().map(|choice| {
+                            let selected = selected_mode.as_deref() == Some(choice.value.as_str());
+                            self.render_runtime_choice("mode", choice, selected, cx)
+                        })),
+                );
+        }
+        if !reasoning_efforts.is_empty() {
+            body = body
+                .child(runtime_section_heading(locale::common("Reasoning")))
+                .child(
+                    div()
+                        .px_3()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            runtime_choice_button(
+                                "new-session-reasoning:default",
+                                locale::common("Default"),
+                                selected_effort.is_none(),
+                            )
+                            .when(!busy, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.choose_default_runtime_reasoning(cx)
+                                        }),
+                                    )
+                            }),
+                        )
+                        .children(reasoning_efforts.into_iter().map(|choice| {
+                            let selected =
+                                selected_effort.as_deref() == Some(choice.value.as_str());
+                            self.render_runtime_choice("reasoning", choice, selected, cx)
+                        })),
+                );
+        }
+        if !features.is_empty() {
+            body = body
+                .child(runtime_section_heading(locale::common("Session options")))
+                .children(
+                    features
+                        .into_iter()
+                        .map(|feature| self.render_runtime_feature(feature, cx)),
+                );
+        }
+
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.45))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.dismiss_new_session_options(cx)),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "mobile-new-session-options".to_string())
+                    .w_full()
+                    .max_h(gpui::relative(0.72))
+                    .rounded_t(px(theme::RADIUS_CARD))
+                    .border_t_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    // The sheet itself is not the dismiss target.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w_full()
+                            .pt(px(theme::SPACING_SM))
+                            .flex()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .w(px(36.0))
+                                    .h(px(4.0))
+                                    .rounded_full()
+                                    .bg(theme::border_default()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .h(px(theme::TOUCH_TARGET))
+                            .pl(px(theme::SPACING_LG))
+                            .pr(px(theme::SPACING_SM))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(theme::font_heading())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_primary())
+                                    .child(locale::text(
+                                        "Session options",
+                                        "会话选项",
+                                        "工作階段選項",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("new-session-options-close")
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .aria_label(locale::common("Close"))
+                                    .cursor_pointer()
+                                    .active(|style| style.opacity(0.6))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.dismiss_new_session_options(cx)
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/x.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_secondary()),
+                                    ),
+                            ),
+                    )
+                    .child(body),
             )
             .into_any_element()
     }
@@ -30718,6 +31048,50 @@ mod tests {
         assert!(batch.contains("BackendEvent::Timeline(_) | BackendEvent::SessionUpdated(_)"));
     }
 
+    /// The new-session page has no session to apply a draft to, so a choice
+    /// made while one of its sheets is open is already the choice; the session
+    /// page keeps the explicit apply, because switching a running session's
+    /// runtime is a mutation the authority has to accept.
+    #[gpui::test]
+    fn a_new_session_choice_lands_on_the_page_without_an_apply(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app
+        });
+        cx.run_until_parked();
+
+        let chosen = SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse("codex").unwrap(),
+            vibex_core::ProviderProfileId::new(),
+            "gpt-5",
+        );
+        app.update(cx, |app, cx| {
+            app.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
+            app.runtime_draft = Some(chosen.clone());
+            app.commit_new_session_runtime_draft();
+            assert!(app.new_session_runtime.is_none());
+
+            app.runtime_options_target = RuntimeOptionsTarget::NewSession;
+            app.commit_new_session_runtime_draft();
+            assert_eq!(app.new_session_runtime.as_ref(), Some(&chosen));
+
+            // Closing the sheet leaves the page's own draft in place and the
+            // sheet flag retired, so the next open starts from the page again.
+            app.new_session_options_open = true;
+            app.push_back_screen(BackScreen::NewSessionOptions);
+            app.dismiss_new_session_options(cx);
+            assert!(!app.new_session_options_open);
+            assert!(app.runtime_draft.is_none());
+            assert_eq!(app.new_session_runtime.as_ref(), Some(&chosen));
+        });
+    }
+
     #[test]
     fn composer_runtime_summary_uses_catalog_labels_and_selected_dimensions() {
         let mut selection = SessionRuntimeSelection::provider(
@@ -33900,6 +34274,7 @@ mod tests {
             BackScreen::SessionAction => session_action_open,
             BackScreen::RuntimeOptions => false,
             BackScreen::NewSessionPicker => false,
+            BackScreen::NewSessionOptions => false,
             BackScreen::SessionsDrawer => true,
             BackScreen::WorkbenchDrawer => true,
             BackScreen::SidebarSearch => false,

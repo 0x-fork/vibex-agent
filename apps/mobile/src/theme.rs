@@ -465,8 +465,14 @@ pub const CARD_WIDTH: f32 = 300.0;
 
 pub const RADIUS_CARD: f32 = 10.0;
 pub const RADIUS_CONTROL: f32 = 8.0;
+/// The prompt card's own radius: rounder than a list card, because it is the
+/// one surface the reader types into rather than reads.
+pub const RADIUS_COMPOSER: f32 = 14.0;
 /// Pills, chips, and the composer's own container.
 pub const RADIUS_PILL: f32 = 999.0;
+/// The height of the pill inside a control row. The row keeps a full touch
+/// target; only the pill the reader sees is this tall.
+pub const CHIP_HEIGHT: f32 = 32.0;
 
 pub const DRAWER_ROW_HEIGHT: f32 = 56.0;
 /// A phone row is a touch target first: the desktop's 32/40px rows put the
