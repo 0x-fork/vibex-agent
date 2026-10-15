@@ -7068,7 +7068,11 @@ fn render_help(
                 || binding.chord.display().to_lowercase().contains(&needle)
                 || app.binding_label(binding).to_lowercase().contains(&needle)
                 || binding.intent.id().contains(&needle)
-                || binding.intent.help(app.strings).to_lowercase().contains(&needle)
+                || binding
+                    .intent
+                    .help(app.strings)
+                    .to_lowercase()
+                    .contains(&needle)
         })
         .collect::<Vec<_>>();
     if bindings.is_empty() {
@@ -7165,7 +7169,11 @@ pub fn key_editor_rows<'a>(app: &'a App, query: &str) -> Vec<KeyRow<'a>> {
         binding.chord.display().to_lowercase().contains(&needle)
             || app.binding_label(binding).to_lowercase().contains(&needle)
             || binding.intent.id().contains(&needle)
-            || binding.intent.help(app.strings).to_lowercase().contains(&needle)
+            || binding
+                .intent
+                .help(app.strings)
+                .to_lowercase()
+                .contains(&needle)
             || binding.scope.id().contains(&needle)
     };
     let mut rows = Vec::new();
@@ -7243,7 +7251,11 @@ pub fn shortcut_rows<'a>(
                     || binding.chord.display().to_lowercase().contains(&needle)
                     || app.binding_label(binding).to_lowercase().contains(&needle)
                     || binding.intent.id().contains(&needle)
-                    || binding.intent.help(app.strings).to_lowercase().contains(&needle)
+                    || binding
+                        .intent
+                        .help(app.strings)
+                        .to_lowercase()
+                        .contains(&needle)
                     || binding.scope.id().contains(&needle)
             })
             .collect::<Vec<_>>();
