@@ -92,10 +92,16 @@ strings! {
     // names them so the two surfaces read alike, and the tally of the tools it
     // has called. The count comes first because both languages put it there:
     // the label is the unit, not the sentence.
-    phase_preparing => { "Preparing", "准备中", "準備中" },
-    phase_thinking => { "Thinking", "思考中", "思考中" },
-    phase_calling_tool => { "Calling tool", "调用工具", "呼叫工具" },
-    phase_generating => { "Generating", "生成中", "生成中" },
+    //
+    // Each in-progress phase wears the closing ellipsis in the string itself,
+    // the way the desktop's runtime placeholder line does: the label is the
+    // whole live reading, so `生成中...` and the desktop's `思考中...` are the
+    // same kind of word. Waiting for approval is not in-progress work — the
+    // turn is stopped on the reader — so it stays a plain statement of state.
+    phase_preparing => { "Preparing...", "准备中...", "準備中..." },
+    phase_thinking => { "Thinking...", "思考中...", "思考中..." },
+    phase_calling_tool => { "Calling tool...", "调用工具...", "呼叫工具..." },
+    phase_generating => { "Generating...", "生成中...", "生成中..." },
     phase_waiting_approval => { "Waiting for approval", "等待确认", "等待確認" },
     tool_calls => { "tool calls", "次工具调用", "次工具呼叫" },
     archived => { "Archived", "已归档", "已封存" },
@@ -2114,6 +2120,41 @@ mod tests {
         assert!(Strings::ALL_KEYS.len() > 100);
         assert_ne!(en.nav_sessions(), cn.nav_sessions());
         assert_ne!(cn.nav_sessions(), tw.nav_sessions());
+    }
+
+    #[test]
+    fn every_in_progress_phase_label_wears_the_same_trailing_ellipsis() {
+        // The turn line draws one of these words while the turn is running, and
+        // the desktop's runtime placeholder line is the shape they follow: an
+        // in-progress reading always closes with one ellipsis, so a reader who
+        // sees `生成中...` and `思考中...` reads the same kind of word.
+        for locale in [Locale::En, Locale::ZhCn, Locale::ZhTw] {
+            let strings = Strings::for_locale(locale);
+            for label in [
+                strings.phase_preparing(),
+                strings.phase_thinking(),
+                strings.phase_calling_tool(),
+                strings.phase_generating(),
+            ] {
+                assert!(
+                    label.ends_with("..."),
+                    "{locale:?} draws a live phase without the closing ellipsis: {label:?}"
+                );
+                // One ellipsis, and it is the ASCII one the desktop uses, so
+                // the two surfaces never disagree on the character.
+                assert!(
+                    !label.trim_end_matches('.').ends_with('…'),
+                    "{locale:?} mixes the typed ellipsis into its dots: {label:?}"
+                );
+            }
+        }
+
+        // Waiting on the reader is a stopped turn rather than an in-progress
+        // one, so it stays the plain statement of state it already was.
+        assert_eq!(
+            Strings::for_locale(Locale::ZhCn).phase_waiting_approval(),
+            "等待确认"
+        );
     }
 
     #[test]

@@ -6535,23 +6535,33 @@ fn agent_generation_phase(turn: &TimelineConversationTurn) -> AgentGenerationPha
     }
 }
 
+/// The word a running turn's phase reads as.
+///
+/// Every in-progress phase wears the closing ellipsis in the string itself, the
+/// way the runtime's placeholder line does (`agent_pending_response` is
+/// `思考中...`): the label is the whole live reading, so `准备中...` and
+/// `思考中...` are the same kind of word and a reader never has to wonder which
+/// of them is still going. The waiting-for-approval arm is the exception
+/// because this function never renders it — `agent_live_progress_text` answers
+/// that state from `agent_waiting_confirmation` first, and that string already
+/// carries both the `中` and the dots.
 fn agent_generation_phase_label(
     phase: AgentGenerationPhase,
     locale: locale::ResolvedLocale,
 ) -> &'static str {
     match (phase, locale) {
-        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::En) => "Preparing",
-        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::ZhCn) => "准备中",
-        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::ZhTw) => "準備中",
-        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::En) => "Thinking",
-        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::ZhCn) => "思考中",
-        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::ZhTw) => "思考中",
-        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::En) => "Calling tool",
-        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::ZhCn) => "调用工具",
-        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::ZhTw) => "呼叫工具",
-        (AgentGenerationPhase::Generating, locale::ResolvedLocale::En) => "Generating",
-        (AgentGenerationPhase::Generating, locale::ResolvedLocale::ZhCn) => "生成中",
-        (AgentGenerationPhase::Generating, locale::ResolvedLocale::ZhTw) => "生成中",
+        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::En) => "Preparing...",
+        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::ZhCn) => "准备中...",
+        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::ZhTw) => "準備中...",
+        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::En) => "Thinking...",
+        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::ZhCn) => "思考中...",
+        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::ZhTw) => "思考中...",
+        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::En) => "Calling tool...",
+        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::ZhCn) => "调用工具...",
+        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::ZhTw) => "呼叫工具...",
+        (AgentGenerationPhase::Generating, locale::ResolvedLocale::En) => "Generating...",
+        (AgentGenerationPhase::Generating, locale::ResolvedLocale::ZhCn) => "生成中...",
+        (AgentGenerationPhase::Generating, locale::ResolvedLocale::ZhTw) => "生成中...",
         (AgentGenerationPhase::WaitingForApproval, locale::ResolvedLocale::En) => {
             "Waiting for approval"
         }
@@ -84049,6 +84059,51 @@ mod tests {
             truncate_agent_thinking_label(&label),
             label,
             "the label is already inside the bound the timeline draws it at"
+        );
+    }
+
+    #[test]
+    fn every_in_progress_phase_label_wears_the_same_trailing_ellipsis() {
+        // The labels are one vocabulary, so the runtime's placeholder line
+        // (`agent_pending_response`) sets the shape and the four phases follow
+        // it: an in-progress reading always closes with one ellipsis, on every
+        // surface that draws it.
+        for locale in [
+            locale::ResolvedLocale::En,
+            locale::ResolvedLocale::ZhCn,
+            locale::ResolvedLocale::ZhTw,
+        ] {
+            for phase in [
+                AgentGenerationPhase::Preparing,
+                AgentGenerationPhase::Thinking,
+                AgentGenerationPhase::CallingTool,
+                AgentGenerationPhase::Generating,
+            ] {
+                let label = agent_generation_phase_label(phase, locale);
+                assert!(
+                    label.ends_with("..."),
+                    "{phase:?} in {locale:?} does not close like the other live labels: {label:?}"
+                );
+                // One ellipsis, and it is the ASCII one the fallback uses, so
+                // two surfaces never disagree on the character.
+                assert!(
+                    !label.trim_end_matches('.').ends_with('…'),
+                    "{phase:?} in {locale:?} mixes the typed ellipsis into its dots: {label:?}"
+                );
+                // The phase label is the drawn label once it passes through the
+                // same bound, so `...` is not doubled or dropped on the way.
+                assert_eq!(agent_progress_label(label, "思考中..."), label);
+            }
+        }
+
+        // Waiting on the reader is a stopped turn rather than an in-progress
+        // one, and it keeps the plain statement the phase table already had.
+        assert_eq!(
+            agent_generation_phase_label(
+                AgentGenerationPhase::WaitingForApproval,
+                locale::ResolvedLocale::ZhCn
+            ),
+            "等待确认"
         );
     }
 
