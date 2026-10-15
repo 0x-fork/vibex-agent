@@ -557,6 +557,9 @@ const REMOTE_EVENT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const RUNTIME_UI_SIGNAL_BATCH_LIMIT: usize = 256;
 const RUNTIME_UI_SIGNAL_QUEUE_CAPACITY: usize = RUNTIME_UI_SIGNAL_BATCH_LIMIT;
 const RUNTIME_UI_SIGNAL_COALESCE_DELAY: Duration = Duration::from_millis(16);
+/// How long a passive ownership pass waits before it walks the pages again.
+/// A stale root page wakes the pass instead of waiting this out.
+const DELEGATED_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 struct ComposerSubmissionLocator {
@@ -8654,6 +8657,13 @@ pub struct VibexWorkbench {
     delegated_pages: BTreeMap<Option<String>, DelegatedBranchPage>,
     delegated_tree_generation: u64,
     delegated_refresh_task: Option<Task<()>>,
+    /// Wakes the delegated refresh pass out of its poll interval.
+    ///
+    /// The interval keeps the ownership walk flat while nothing asks for it; a
+    /// session snapshot the workbench cannot place is something that does ask —
+    /// another client's creation is a row the sidebar does not have yet, and
+    /// waiting a full interval to draw it is what that looks like.
+    delegated_refresh_wake: Arc<tokio::sync::Notify>,
     delegated_refresh_offset: usize,
     delegated_roots_dirty: bool,
     delegated_reveal_target: Option<String>,
@@ -10267,6 +10277,7 @@ impl VibexWorkbench {
             delegated_pages: BTreeMap::new(),
             delegated_tree_generation: 0,
             delegated_refresh_task: None,
+            delegated_refresh_wake: Arc::new(tokio::sync::Notify::new()),
             delegated_refresh_offset: 0,
             delegated_roots_dirty: false,
             delegated_reveal_target: None,
@@ -16401,10 +16412,20 @@ impl VibexWorkbench {
             return;
         }
         if self.delegated_refresh_task.is_none() {
+            let wake = self.delegated_refresh_wake.clone();
             self.delegated_refresh_task = Some(cx.spawn(
                 async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                     loop {
-                        cx.background_executor().timer(Duration::from_secs(3)).await;
+                        // The interval keeps a passive pass passive; a session
+                        // the workbench cannot place wakes it instead of waiting
+                        // it out, because that is another client's creation
+                        // arriving and the sidebar does not have the row yet.
+                        tokio::select! {
+                            _ = cx
+                                .background_executor()
+                                .timer(DELEGATED_REFRESH_INTERVAL) => {}
+                            _ = wake.notified() => {}
+                        }
                         if entity
                             .update(cx, |this, cx| {
                                 if this.delegated_roots_dirty {
@@ -23633,6 +23654,13 @@ impl VibexWorkbench {
                         self.delegated_sessions
                             .insert(session_id.as_str().to_string(), session);
                         self.delegated_roots_dirty = true;
+                        // A session the workbench cannot place is another
+                        // client's creation as often as it is a child whose
+                        // page has not arrived, and only the authoritative root
+                        // list can say which. The pass is woken rather than
+                        // waiting out its interval, so a creation is drawn when
+                        // it is announced.
+                        self.delegated_refresh_wake.notify_one();
                         self.refresh_delegated_sessions(cx);
                     } else {
                         self.upsert_session_snapshot(session);
@@ -100979,6 +101007,48 @@ mod tests {
         assert!(refresh.contains(
             "self.load_delegated_page(None, root_page_has_more, DelegatedPageLoad::Background, cx);"
         ));
+    }
+
+    /// Another client's creation does not wait out the ownership poll.
+    ///
+    /// A session the workbench cannot place marks the root page stale, and the
+    /// pass that reloads it is asleep on its interval. Without a wake, a row the
+    /// TUI just created appeared one poll later — the sidebars of two windows on
+    /// one runtime are supposed to agree when the row exists, not eventually.
+    /// The flag alone is only as prompt as the timer, so the announcement and the
+    /// wake have to stay wired together.
+    #[test]
+    fn an_unplaceable_session_wakes_the_ownership_pass() {
+        let source = include_str!("app.rs");
+        let refresh = source
+            .split_once("    fn refresh_delegated_sessions(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn delegated_branch_hidden("))
+            .map(|(body, _)| body)
+            .expect("delegated refresh should remain inspectable");
+        assert!(
+            refresh.contains("timer(DELEGATED_REFRESH_INTERVAL)"),
+            "the interval stays the passive cadence of the pass"
+        );
+        assert!(
+            refresh.contains("_ = wake.notified() => {}"),
+            "the pass has to be woken out of its interval"
+        );
+
+        let snapshot = source
+            .split_once("            DesktopEvent::SessionUpdated(session) => {")
+            .and_then(|(_, tail)| {
+                tail.split_once("            DesktopEvent::SessionsRemoved(session_ids) => {")
+            })
+            .map(|(body, _)| body)
+            .expect("the session snapshot arm should remain inspectable");
+        assert!(
+            snapshot.contains("self.delegated_roots_dirty = true;"),
+            "the pass only reloads the root page it is told is stale"
+        );
+        assert!(
+            snapshot.contains("self.delegated_refresh_wake.notify_one();"),
+            "an unplaceable session has to wake the pass that can place it"
+        );
     }
 
     /// The child Agent rail owns its element tree.

@@ -880,12 +880,19 @@ is never a column count.
     caller's reply reaches nobody else, so the manager publishes the committed
     snapshot on the session-update stream (`subscribe_session_updates`) — the
     same stream a rename, an archive or a turn boundary rides. The runtime fans
-    it out as `DesktopEvent::SessionUpdated`, which is what makes an in-process
-    client answer a session it cannot place by refreshing the authoritative root
-    list, and publishes the sidebar invalidation beside it, which is how a remote
-    client learns to re-read its own. The snapshot is published only after the
-    row commits, and a client whose own creation reply races the announcement
-    must still end up with a navigation row rather than a delegated one.
+    it out as `DesktopEvent::SessionUpdated` and publishes the sidebar
+    invalidation beside it, which is how a remote client learns to re-read its
+    own. An in-process client answers a session it cannot place by marking the
+    root page stale **and waking the ownership pass** (`delegated_refresh_wake`):
+    the pass polls, and a creation that waited out the poll interval arrived
+    visibly late in a sidebar the reader was watching. A session an owner is
+    about to link under itself — a delegation, or a session an Agent creates — is
+    the exception: creation does not announce it, and the owner announces it with
+    `announce_created_session` once the ownership edge is committed. A child
+    announced before that edge exists has nothing to place it with, and every
+    client drawing a session list reads it as a navigation root. A client whose
+    own creation reply races the announcement still ends up with a navigation row
+    rather than a delegated one.
 * **A running turn is what the spinner animates on.** `is_animating` is the
   single question the loop asks before repainting on its own, and it answers
   yes while a turn reads as running (`turn_reads_running`), not only while

@@ -310,10 +310,11 @@ impl AgentManager {
             },
         )?;
         let existing_child = SessionRepository::get(&self.open_migrated()?, &child_session_id)?;
+        let child_was_created = existing_child.is_none();
         let created_child = if let Some(child) = existing_child {
             Ok(child)
         } else {
-            self.create_session_deferred_with_id(
+            self.create_owned_session_with_id(
                 CreateAgentSessionRequest {
                     session_id: None,
                     defer_runtime_materialization: false,
@@ -420,6 +421,14 @@ impl AgentManager {
                 )
             })?
         };
+
+        // The ownership edge is committed, so the child can be announced: a
+        // client that hears about it now has something to place it with, and
+        // draws it under its parent rather than as a root of its own. A child
+        // that already existed was announced when it was created.
+        if child_was_created {
+            self.announce_created_session(&child);
+        }
 
         let provenance = MessageProvenance::DelegatedInput {
             actor_session_ref: VibexUseRef::session(&delegation.parent_session_id),

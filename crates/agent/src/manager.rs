@@ -495,6 +495,20 @@ enum InitialRuntimeMaterialization {
     Deferred,
 }
 
+/// Who announces a created session to the other clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionCreationAnnouncement {
+    /// A session that stands on its own is announced as soon as its row
+    /// commits. No client's list has it yet, and no later event names it.
+    Committed,
+    /// A session an owner is about to link under itself is announced by that
+    /// owner, once the ownership edge is committed. The edge is written after
+    /// creation, and a client told about the child before it exists reads the
+    /// row as a navigation root — a row that then has to be taken back out of
+    /// the sidebar.
+    Owned,
+}
+
 /// Native provider fork carried into a session-creation switch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SessionForkOrigin {
@@ -1207,6 +1221,7 @@ impl AgentManager {
             InitialRuntimeMaterialization::WaitForReady,
             Some(session_id),
             SessionForkOrigin::default(),
+            SessionCreationAnnouncement::Committed,
         )
         .await
     }
@@ -1226,6 +1241,7 @@ impl AgentManager {
             InitialRuntimeMaterialization::Deferred,
             None,
             SessionForkOrigin::default(),
+            SessionCreationAnnouncement::Committed,
         )
         .await
     }
@@ -1242,6 +1258,31 @@ impl AgentManager {
             InitialRuntimeMaterialization::Deferred,
             Some(session_id),
             SessionForkOrigin::default(),
+            SessionCreationAnnouncement::Committed,
+        )
+        .await
+    }
+
+    /// Creates a session whose owner links it under itself immediately after.
+    ///
+    /// The row is deliberately not announced by creation: the ownership edge is
+    /// written by the caller once this returns, and a client told about the child
+    /// before that edge exists reads the row as a navigation root and draws it in
+    /// the sidebar until the next authoritative tree read. The caller announces
+    /// the committed row with [`Self::announce_created_session`] instead.
+    pub async fn create_owned_session_with_id(
+        &self,
+        request: CreateAgentSessionRequest,
+        session_id: VibexSessionId,
+    ) -> VibexResult<AgentSession> {
+        self.create_session_with_timeline_and_materialization(
+            request,
+            Vec::new(),
+            |_| {},
+            InitialRuntimeMaterialization::Deferred,
+            Some(session_id),
+            SessionForkOrigin::default(),
+            SessionCreationAnnouncement::Owned,
         )
         .await
     }
@@ -1277,10 +1318,12 @@ impl AgentManager {
             InitialRuntimeMaterialization::WaitForReady,
             None,
             fork,
+            SessionCreationAnnouncement::Committed,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_session_with_timeline_and_materialization<F>(
         &self,
         request: CreateAgentSessionRequest,
@@ -1289,6 +1332,7 @@ impl AgentManager {
         materialization: InitialRuntimeMaterialization,
         requested_session_id: Option<VibexSessionId>,
         fork: SessionForkOrigin,
+        announcement: SessionCreationAnnouncement,
     ) -> VibexResult<AgentSession>
     where
         F: FnOnce(AgentSession) + Send,
@@ -1468,8 +1512,12 @@ impl AgentManager {
             // caller's answer reaches nobody else. The snapshot is how the
             // authority announces it: the sidebar invalidation published beside
             // it makes a remote client re-read the list, and an in-process
-            // client answers a session it cannot place the same way.
-            self.publish_root_session_update(&conn, created.clone());
+            // client answers a session it cannot place the same way. An owned
+            // session is the exception — it is announced by its owner, once the
+            // ownership edge that makes it somebody's child is committed.
+            if announcement == SessionCreationAnnouncement::Committed {
+                self.publish_root_session_update(&conn, created.clone());
+            }
             return Ok(created);
         }
 
@@ -1487,7 +1535,9 @@ impl AgentManager {
                 "created session could not be reloaded",
             )
         })?;
-        self.publish_root_session_update(&conn, created.clone());
+        if announcement == SessionCreationAnnouncement::Committed {
+            self.publish_root_session_update(&conn, created.clone());
+        }
         Ok(created)
     }
 
@@ -5520,13 +5570,23 @@ impl AgentManager {
         Ok(item)
     }
 
+    /// Announces a created session to every subscribed client.
+    ///
+    /// The owner paths create the row first and link it to its parent second, so
+    /// they announce it themselves with this call once the ownership edge is
+    /// committed: a client that hears about a child before the edge exists has
+    /// nothing to place it with and reads the row as a navigation root.
+    pub fn announce_created_session(&self, session: &AgentSession) {
+        let _ = self.session_events.send(session.clone());
+    }
+
     fn publish_root_session_update(&self, _conn: &DbConnection, session: AgentSession) {
         // Child updates refresh open worker views and tree metadata. Client
         // session-list queries keep their authoritative roots-only projection,
         // so a client that cannot place a snapshot answers it by re-reading
         // that list — which is what a creation needs: the row exists now and
         // no other event names it.
-        let _ = self.session_events.send(session);
+        self.announce_created_session(&session);
     }
 
     fn apply_auto_session_title(
@@ -9226,7 +9286,7 @@ mod tests {
             .create_session(CreateAgentSessionRequest {
                 session_id: Some(reserved_id.clone()),
                 defer_runtime_materialization: true,
-                runtime: selection,
+                runtime: selection.clone(),
                 workspace_root: workspace_root.to_string_lossy().to_string(),
                 workspace_mode: WorkspaceMode::CurrentCheckout,
                 title: Some("Creation broadcast".to_string()),
@@ -9239,6 +9299,38 @@ mod tests {
             .find(|update| update.id == reserved_id)
             .expect("a committed creation must be announced to every subscribed client");
         assert_eq!(published, session);
+
+        // The shape a delegation or an Agent-created session sends: the row is
+        // created first and linked under its owner second. Announcing it here
+        // would describe a child before the tree knows whose child it is, and a
+        // client drawing a session list reads that as a navigation root. The
+        // owner announces it once the edge is committed, and only then.
+        let owned_id = VibexSessionId::new();
+        manager
+            .create_owned_session_with_id(
+                CreateAgentSessionRequest {
+                    session_id: None,
+                    defer_runtime_materialization: false,
+                    runtime: selection.clone(),
+                    workspace_root: workspace_root.to_string_lossy().to_string(),
+                    workspace_mode: WorkspaceMode::CurrentCheckout,
+                    title: Some("Owned session".to_string()),
+                    safety: Some(AgentSessionSafety::workspace_write_ask_on_risk()),
+                },
+                owned_id.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            std::iter::from_fn(|| updates.try_recv().ok()).all(|update| update.id != owned_id),
+            "an owned creation must stay unannounced until its edge is committed"
+        );
+
+        let conn = manager.open_migrated().unwrap();
+        let owned = SessionRepository::get(&conn, &owned_id).unwrap().unwrap();
+        drop(conn);
+        manager.announce_created_session(&owned);
+        assert_eq!(updates.try_recv().unwrap().id, owned_id);
 
         drop(manager);
         cleanup_db(&db_path);

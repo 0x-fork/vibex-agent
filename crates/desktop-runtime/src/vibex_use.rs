@@ -1351,11 +1351,12 @@ impl VibexUseService {
         };
         let session_id = self.operation_session_id(&operation)?;
         let existing = SessionRepository::get(&self.open()?, &session_id)?;
+        let session_was_created = existing.is_none();
         let session = if let Some(existing) = existing {
             Ok(existing)
         } else {
             self.manager
-                .create_session_deferred_with_id(
+                .create_owned_session_with_id(
                     CreateAgentSessionRequest {
                         session_id: None,
                         defer_runtime_materialization: false,
@@ -1393,6 +1394,12 @@ impl VibexUseService {
                 "session",
                 VibexUseRef::session(&session.id),
             )?;
+        }
+        // Announced only now that the edge is committed: a client that hears
+        // about the child before its parent is known reads the row as a root of
+        // its own. A session that already existed was announced when created.
+        if session_was_created {
+            self.manager.announce_created_session(&session);
         }
 
         let mut execution_ref = None;
