@@ -248,6 +248,10 @@ pub enum ConfigAction {
     Validate,
     /// Make a second profile with the same settings under a new name.
     Duplicate,
+    /// Move a profile one place earlier in its Agent's order.
+    MoveUp,
+    /// Move a profile one place later in its Agent's order.
+    MoveDown,
     /// Choose which Agents receive a resource.
     Matrix,
     /// Import a discovered resource.
@@ -275,6 +279,8 @@ impl ConfigAction {
             Self::Matrix => strings.config_action_matrix(),
             Self::Import => strings.config_action_import(),
             Self::Duplicate => strings.config_action_duplicate(),
+            Self::MoveUp => strings.config_action_move_up(),
+            Self::MoveDown => strings.config_action_move_down(),
         }
     }
 
@@ -1494,8 +1500,20 @@ fn version_label(agent: &vibex_core::AgentSnapshotEntry, strings: Strings) -> St
 }
 
 fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
-    data.providers
-        .iter()
+    // The authority lists profiles in its own order; the reader's arrangement
+    // is a separate record, so the rows follow it when this client has read it.
+    // A profile the arrangement does not name keeps its place after the ones it
+    // does, which is what a stable sort over "unindexed last" gives.
+    let mut ordered = data.providers.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|profile| {
+        data.provider_order
+            .iter()
+            .find(|entry| entry.provider_profile_id == profile.id)
+            .map(|entry| entry.order_index)
+            .unwrap_or(i64::MAX)
+    });
+    ordered
+        .into_iter()
         .map(|profile| {
             let enabled = profile.status == vibex_core::ProviderProfileStatus::Enabled;
             ConfigRow::new(
@@ -1549,6 +1567,8 @@ fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                 ConfigAction::Activate,
                 ConfigAction::Edit,
                 ConfigAction::Duplicate,
+                ConfigAction::MoveUp,
+                ConfigAction::MoveDown,
                 ConfigAction::Secret,
                 ConfigAction::Test,
                 ConfigAction::FetchModels,

@@ -170,6 +170,8 @@ pub enum AppMessage {
     Profiles(BackendResult<Vec<vibex_core::ProviderProfileSummary>>),
     /// One profile as the authority holds it, read for an editor.
     ProviderProfile(BackendResult<vibex_core::ProviderProfile>),
+    /// One Agent's profile order, as the authority holds it.
+    ProviderOrder(BackendResult<Vec<vibex_core::AgentModelProviderDisplayOrderEntry>>),
     ProviderTest(BackendResult<vibex_core::AgentModelProviderProfileTestResult>),
     ProviderModels(BackendResult<Vec<vibex_core::ProviderConfiguredModel>>),
     Agents(BackendResult<Vec<vibex_core::AgentSnapshotEntry>>),
@@ -600,6 +602,25 @@ impl Dispatch {
                     .rollback_managed_agent(request)
                     .await
                     .map(|state| install_outcome(&state))
+            }
+            M::SetProviderOrder { agent_id, profiles } => {
+                let request =
+                    MutationRequest::new(vibex_core::AgentModelProviderDisplayOrderSetRequest {
+                        agent_id,
+                        entries: profiles
+                            .into_iter()
+                            .map(|provider_profile_id| {
+                                vibex_core::AgentModelProviderDisplayOrderSetEntry {
+                                    provider_profile_id,
+                                }
+                            })
+                            .collect(),
+                    });
+                self.facade
+                    .management()
+                    .set_agent_model_provider_display_order(request)
+                    .await
+                    .map(|_| Outcome::Plain)
             }
             M::CreateProviderProfile(request) => {
                 let request = MutationRequest::new(*request);
@@ -1526,6 +1547,17 @@ impl Dispatch {
                     .agent_model_provider_profile_detail(request)
                     .await;
                 self.send(AppMessage::ProviderProfile(result));
+            }
+            Effect::LoadProviderOrder { agent_id } => {
+                let request = vibex_core::AgentModelProviderDisplayOrderListRequest { agent_id };
+                let result = self
+                    .facade
+                    .management()
+                    .agent_model_provider_display_order(request)
+                    .await;
+                self.send(AppMessage::ProviderOrder(
+                    result.map(|response| response.entries),
+                ));
             }
             Effect::ListProfiles => {
                 let result = self.facade.management().list_profiles().await;

@@ -659,6 +659,8 @@ pub struct ManagementData {
     pub audit: Vec<vibex_core::RemoteAuditRecord>,
     pub profiles: Vec<vibex_core::ProviderProfileSummary>,
     pub providers: Vec<vibex_core::ProviderProfileSummary>,
+    /// The order the reader arranged the profiles in, per Agent.
+    pub provider_order: Vec<vibex_core::AgentModelProviderDisplayOrderEntry>,
     /// The last profile configuration this client read in full.
     ///
     /// The list answers with the summary the authority publishes, which leaves
@@ -8523,6 +8525,11 @@ pub enum ConfigMutation {
     // ---- provider profiles ----------------------------------------------
     /// Make a profile that does not exist yet.
     CreateProviderProfile(Box<vibex_core::AgentModelProviderProfileCreateRequest>),
+    /// Arrange one Agent's profiles in a new order, first to last.
+    SetProviderOrder {
+        agent_id: vibex_core::AgentId,
+        profiles: Vec<vibex_core::ProviderProfileId>,
+    },
     UpdateProviderProfile {
         agent_id: vibex_core::AgentId,
         profile_id: vibex_core::ProviderProfileId,
@@ -8624,6 +8631,7 @@ impl ConfigMutation {
             Self::UpdateProviderProfile { profile_id, .. }
             | Self::DeleteProviderProfile { profile_id, .. } => profile_id.as_str().to_string(),
             Self::CreateProviderProfile(_) => "provider:new".to_string(),
+            Self::SetProviderOrder { agent_id, .. } => agent_id.as_str().to_string(),
             Self::CreateMcpServer(_) => "mcp:new".to_string(),
             Self::UpdateMcpServer(request) => request.mcp_server_id.as_str().to_string(),
             Self::DeleteMcpServer { server_id }
@@ -8656,6 +8664,7 @@ impl ConfigMutation {
             Self::CheckAgentUpdate { .. } => "agent_update_check",
             Self::RollbackAgent { .. } => "agent_rollback",
             Self::CreateProviderProfile(_) => "provider_profile_create",
+            Self::SetProviderOrder { .. } => "provider_order_set",
             Self::UpdateProviderProfile { .. } => "provider_profile",
             Self::DeleteProviderProfile { .. } => "provider_profile_delete",
             Self::CreateMcpServer(_) => "mcp_create",
@@ -8701,6 +8710,7 @@ impl ConfigMutation {
             Self::CheckAgentUpdate { .. } => Verb::CheckUpdate,
             Self::RollbackAgent { .. } => Verb::Rollback,
             Self::CreateProviderProfile(_) => Verb::Create,
+            Self::SetProviderOrder { .. } => Verb::Save,
             Self::UpdateProviderProfile { .. } => Verb::Save,
             Self::DeleteProviderProfile { .. } => Verb::Delete,
             Self::CreateMcpServer(_) | Self::CreateSkill(_) | Self::CreatePrompt(_) => Verb::Create,
@@ -9041,6 +9051,10 @@ pub enum Effect {
     DiscoverSources {
         module: crate::config_center::ConfigModule,
     },
+    /// Read the order one Agent's profiles are arranged in.
+    LoadProviderOrder {
+        agent_id: vibex_core::AgentId,
+    },
     /// Read one provider profile in full, for an editor.
     ///
     /// The list answers with the summary; an editor that writes a profile back
@@ -9111,6 +9125,7 @@ impl Effect {
             Effect::DiscoverSources { .. } => "config_sources",
             Effect::SearchRegistry { .. } => "config_registry",
             Effect::LoadProviderProfile { .. } => "provider_profile_detail",
+            Effect::LoadProviderOrder { .. } => "provider_order",
             Effect::OpenSession { .. } => "open_session",
             Effect::RefreshTimeline => "timeline",
             Effect::LoadOlder { .. } => "older_timeline",

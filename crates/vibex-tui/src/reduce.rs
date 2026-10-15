@@ -1209,7 +1209,25 @@ impl App {
         use crate::config_center::ConfigSection;
         match (self.config_center.module, self.config_center.section) {
             (_, ConfigSection::Agents) => vec![Effect::ListAgents],
-            (_, ConfigSection::Providers) => vec![Effect::ListProfiles],
+            (_, ConfigSection::Providers) => {
+                let mut effects = vec![Effect::ListProfiles];
+                // The arrangement is a record of its own, read per Agent: a
+                // list that cannot say what order the reader chose would show
+                // the authority's order and call it theirs.
+                let mut agents = self
+                    .management_data
+                    .providers
+                    .iter()
+                    .map(|profile| profile.agent_id.clone())
+                    .collect::<Vec<_>>();
+                agents.dedup();
+                effects.extend(
+                    agents
+                        .into_iter()
+                        .map(|agent_id| Effect::LoadProviderOrder { agent_id }),
+                );
+                effects
+            }
             (_, ConfigSection::Servers) => vec![Effect::ListMcp],
             (_, ConfigSection::Installed) => vec![Effect::ListSkills],
             (_, ConfigSection::Prompts) => vec![Effect::ListPrompts],
@@ -1658,6 +1676,8 @@ impl App {
             // this client reads profiles as summaries, and a summary has no
             // endpoint to copy. The reader is shown what the copy carries and
             // asked for the rest.
+            (ConfigSection::Providers, ConfigAction::MoveUp) => self.move_provider(key, -1),
+            (ConfigSection::Providers, ConfigAction::MoveDown) => self.move_provider(key, 1),
             (ConfigSection::Providers, ConfigAction::Duplicate) => {
                 let Some(profile_id) = self.provider_id(key) else {
                     return Outcome::quiet();
@@ -2148,6 +2168,53 @@ impl App {
         // list away from the reader, and the re-read lands behind it.
         self.overlay = Some(Overlay::Models { view });
         outcome
+    }
+
+    /// Move one profile a place earlier or later among its Agent's profiles.
+    ///
+    /// The arrangement is the whole list, not one index: the authority is asked
+    /// to hold this order, and an order that named only the moved profile would
+    /// say nothing about the ones it moved past.
+    fn move_provider(&mut self, key: &str, delta: isize) -> Outcome {
+        let Some(profile) = self.provider(key).cloned() else {
+            return Outcome::quiet();
+        };
+        let agent_id = profile.agent_id.clone();
+        // The reader's order is the order on screen, which is what the rows
+        // were sorted by; a profile the arrangement does not name sorts last.
+        let mut siblings = self
+            .management_data
+            .providers
+            .iter()
+            .filter(|candidate| candidate.agent_id == agent_id)
+            .collect::<Vec<_>>();
+        siblings.sort_by_key(|candidate| {
+            self.management_data
+                .provider_order
+                .iter()
+                .find(|entry| entry.provider_profile_id == candidate.id)
+                .map(|entry| entry.order_index)
+                .unwrap_or(i64::MAX)
+        });
+        let Some(index) = siblings
+            .iter()
+            .position(|candidate| candidate.id == profile.id)
+        else {
+            return Outcome::quiet();
+        };
+        let next = index.saturating_add_signed(delta);
+        if next == index || next >= siblings.len() {
+            return Outcome::quiet();
+        }
+        let mut profiles = siblings
+            .iter()
+            .map(|candidate| candidate.id.clone())
+            .collect::<Vec<_>>();
+        profiles.swap(index, next);
+        self.begin_config_mutation(crate::app::ConfigMutation::SetProviderOrder {
+            agent_id,
+            profiles,
+        })
     }
 
     /// Open one of a profile's surfaces, reading the profile first if this

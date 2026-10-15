@@ -2493,6 +2493,22 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
+        AppMessage::ProviderOrder(result) => match result {
+            Ok(entries) => {
+                // The read is per Agent and answers with that Agent's whole
+                // arrangement, so it replaces those entries rather than adding
+                // to them: two orders for one Agent is not an order.
+                let agent_ids = entries
+                    .iter()
+                    .map(|entry| entry.agent_id.clone())
+                    .collect::<Vec<_>>();
+                app.management_data
+                    .provider_order
+                    .retain(|entry| !agent_ids.contains(&entry.agent_id));
+                app.management_data.provider_order.extend(entries);
+            }
+            Err(error) => app.toast(Toast::danger(error.message)),
+        },
         AppMessage::ProviderProfile(result) => {
             let pending = app.pending_provider_open.take();
             match result {

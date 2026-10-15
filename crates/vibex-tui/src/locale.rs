@@ -916,6 +916,8 @@ strings! {
     config_action_edit => { "Edit", "编辑", "編輯" },
     config_action_delete => { "Delete", "删除", "刪除" },
     config_action_duplicate => { "Duplicate", "复制", "複製" },
+    config_action_move_up => { "Move up", "上移", "上移" },
+    config_action_move_down => { "Move down", "下移", "下移" },
     config_action_refresh => { "Re-probe", "重新探测", "重新探測" },
     config_action_sign_in => { "Sign in", "登录", "登入" },
     config_action_sign_out => { "Sign out", "退出登录", "登出" },

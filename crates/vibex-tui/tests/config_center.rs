@@ -1903,3 +1903,110 @@ fn a_model_setting_the_authority_could_not_read_is_refused() {
     assert!(outcome.effects.is_empty(), "a bad level was written");
     assert!(matches!(app.overlay, Some(Overlay::Form { .. })));
 }
+
+/// A profile is moved a place at a time, and the whole order is what is written.
+///
+/// The authority lists profiles in its own order and the reader's arrangement is
+/// a separate record, so the rows follow that record when this client has read
+/// it — and a move writes the list it produced rather than one index, because an
+/// order that named only the moved profile would say nothing about the ones it
+/// moved past.
+#[test]
+fn a_profile_is_moved_within_its_agents_order() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![
+        provider_profile("provider_first", "First"),
+        provider_profile("provider_second", "Second"),
+    ];
+    // The reader's arrangement puts the second one first.
+    app.management_data.provider_order = vec![
+        serde_json::from_value(serde_json::json!({
+            "agentId": "codex",
+            "providerProfileId": "provider_second",
+            "orderIndex": 0,
+            "updatedAtMs": 1
+        }))
+        .unwrap(),
+        serde_json::from_value(serde_json::json!({
+            "agentId": "codex",
+            "providerProfileId": "provider_first",
+            "orderIndex": 1,
+            "updatedAtMs": 1
+        }))
+        .unwrap(),
+    ];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    // The rows follow the arrangement rather than the order the authority
+    // happened to list them in.
+    let rows = app.management_data.providers.clone();
+    let visible = app.config_center.visible(&app.management_data, app.strings);
+    assert_eq!(
+        visible
+            .iter()
+            .map(|row| row.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["provider_second", "provider_first"],
+        "the rows did not follow the reader's arrangement (listed {rows:?})"
+    );
+
+    // Moving the first one down swaps the two, and the write is the whole order.
+    let outcome = app.run_config_action_by_key("provider_second", ConfigAction::MoveDown);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::SetProviderOrder { agent_id, profiles } = mutation
+            else {
+                panic!("the move was not an order write: {mutation:?}");
+            };
+            assert_eq!(agent_id.as_str(), "codex");
+            assert_eq!(
+                profiles.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                vec!["provider_first", "provider_second"]
+            );
+        }
+        other => panic!("the move produced {other:?}"),
+    }
+
+    // At the end of the list there is nowhere to go.
+    app.config_center.pending.clear();
+    app.management_data.provider_order = vec![
+        serde_json::from_value(serde_json::json!({
+            "agentId": "codex",
+            "providerProfileId": "provider_second",
+            "orderIndex": 0,
+            "updatedAtMs": 1
+        }))
+        .unwrap(),
+        serde_json::from_value(serde_json::json!({
+            "agentId": "codex",
+            "providerProfileId": "provider_first",
+            "orderIndex": 1,
+            "updatedAtMs": 1
+        }))
+        .unwrap(),
+    ];
+    let outcome = app.run_config_action_by_key("provider_first", ConfigAction::MoveDown);
+    assert!(outcome.effects.is_empty(), "the last profile moved down");
+}
+
+/// The arrangement is read per Agent, beside the list it arranges.
+#[test]
+fn reading_the_providers_area_reads_the_arrangement_too() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![
+        provider_profile("provider_first", "First"),
+        provider_profile("provider_second", "Second"),
+    ];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+    let outcome = app.perform(vibex_tui::action::Intent::ReloadManagement);
+    let reads = outcome
+        .effects
+        .iter()
+        .filter(|effect| matches!(effect, vibex_tui::app::Effect::LoadProviderOrder { .. }))
+        .count();
+    assert_eq!(
+        reads, 1,
+        "the arrangement was read {reads} times for one Agent: {:#?}",
+        outcome.effects
+    );
+}
