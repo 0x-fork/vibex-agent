@@ -2735,18 +2735,15 @@ fn band_fills_row(block: &Block) -> bool {
 /// One empty row of a banded block: the padding above and below the text.
 ///
 /// It is a row of the box rather than a gap between blocks, which is why it
-/// carries the edge, the band to the content edge and the pointer, and why it
-/// keeps an empty plain line — the copy of a message is the message, not its
-/// padding. The row holds nothing but that padding, so the box's own cell is the
-/// first thing after the chrome and the band fills the rest.
-fn band_row(
-    row: usize,
-    live: bool,
-    pointer: bool,
-    phase: u32,
-    content_width: usize,
-    theme: &TuiTheme,
-) -> Line<'static> {
+/// carries the edge and the band to the content edge, and why it keeps an empty
+/// plain line — the copy of a message is the message, not its padding. The row
+/// holds nothing but that padding, so the box's own edge is the first thing
+/// after the chrome and the band fills the rest.
+///
+/// The edge is the only mark it draws. The padding is air the box keeps, not a
+/// row of the message, so there is nothing here for a cursor to take: the
+/// selection lights the box as an object instead.
+fn band_row(content_width: usize, theme: &TuiTheme) -> Line<'static> {
     let band = Style::default().bg(theme.roles.surface_raised);
     let mut spans = Vec::new();
     close_body_row(
@@ -2757,29 +2754,27 @@ fn band_row(
         None,
         Style::default(),
     );
-    row_line(box_marker(row, live, pointer, phase, theme), spans).style(band)
+    row_line(box_edge(theme), spans).style(band)
 }
 
-/// The marker cell of one row of a boxed block.
+/// Light the reader's own box, which is what the cursor on it looks like.
 ///
-/// A boxed block spends the column every block spends on its marker: the reader's
-/// own message is marked by its edge, so the box costs the message no width and
-/// the edge lands in the column the composer draws its own in — with the cell of
-/// padding behind it that every block spends on its margin, the prompt mark and
-/// the words under it start on the composer's own column. The cursor's bar is the
-/// same cell, so the row the reader is on is marked by the pointer rather than by
-/// the rule — one column, one mark.
-fn box_marker(
-    row: usize,
-    live: bool,
-    pointer: bool,
-    phase: u32,
-    theme: &TuiTheme,
-) -> Span<'static> {
-    if pointer || live {
-        return row_marker(row, live, pointer, phase, theme);
+/// Every other block marks its current row with the pointer in the margin — a
+/// swap the reader reads because the cell underneath was blank. The box's margin
+/// already carries the edge that says whose message this is, and the box is a
+/// surface rather than a titled section with a header to lift, so the cursor is
+/// spent on the whole object: the reader sees the message they are on light up
+/// rather than a glyph appear in a column that already meant something else.
+///
+/// Only the cells are repainted; the row's own style keeps saying the block is a
+/// band, because a pinned prompt is clipped by reading exactly that.
+fn lift_box(lines: &mut [Line<'static>], theme: &TuiTheme) {
+    let lit = Some(theme.roles.surface_highlight);
+    for line in lines {
+        for span in &mut line.spans {
+            span.style.bg = lit;
+        }
     }
-    box_edge(theme)
 }
 
 /// Whether a block kind is a dense, foldable work item.
@@ -3491,16 +3486,13 @@ fn render_block_inner(
         // read as a highlight behind a sentence rather than as the thing they
         // wrote into.
         let mut block_row = 0usize;
+        // Where the box starts, so the cursor can light the whole of it once the
+        // last row has been drawn — the box is one object, and a cursor that
+        // arrived row by row would light its top before its bottom existed.
+        let box_start = lines.len();
         if band.is_some() {
             for _ in 0..BOX_PAD_ROWS {
-                lines.push(band_row(
-                    block_row,
-                    live,
-                    block_row == 0 && selected,
-                    phase,
-                    content_width,
-                    theme,
-                ));
+                lines.push(band_row(content_width, theme));
                 plain.push(String::new());
                 block_row += 1;
             }
@@ -3549,12 +3541,15 @@ fn render_block_inner(
             // window's rail runs unbroken, and a fold's title or rule is the
             // block's first drawn row. The rail counts from the header, so the
             // body's first row is cell one whatever padding the block drew
-            // above it.
-            let pointer = selected && block_row == 0 && !live && !furniture_holds_cursor;
-            // A boxed block is marked by its edge in the marker column, and by
-            // the pointer on the one row the cursor is on: one column, one mark.
+            // above it. A boxed block has no pointer cell at all: its margin
+            // already carries the edge, and the cursor is spent on the box as a
+            // whole instead.
+            let pointer =
+                selected && band.is_none() && block_row == 0 && !live && !furniture_holds_cursor;
+            // The marker: the pointer where the block has a margin to spend, and
+            // the reader's own edge where the block is a box.
             let marker = if band.is_some() {
-                box_marker(block_row + 1, live, pointer, phase, theme)
+                box_edge(theme)
             } else {
                 row_marker(block_row + 1, live, pointer, phase, theme)
             };
@@ -3568,16 +3563,15 @@ fn render_block_inner(
         }
         if band.is_some() {
             for _ in 0..BOX_PAD_ROWS {
-                lines.push(band_row(
-                    block_row,
-                    live,
-                    false,
-                    phase,
-                    content_width,
-                    theme,
-                ));
+                lines.push(band_row(content_width, theme));
                 plain.push(String::new());
-                block_row += 1;
+            }
+            // The cursor is on this box: light it, padding and all. It is the
+            // reader's own surface, and the gesture that says "you are here" on
+            // a thing they wrote is the thing itself going bright rather than a
+            // glyph appearing in the column that already means "your message".
+            if selected && !furniture_holds_cursor {
+                lift_box(&mut lines[box_start..], theme);
             }
         }
     }
@@ -5399,6 +5393,54 @@ mod density_tests {
             assert!(
                 !line_text(line).contains(edge),
                 "the answer wears the reader's edge"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cursor_lights_the_box_without_taking_its_edge() {
+        let theme = theme();
+        let row = item("user", TimelineRowKind::UserMessage, "a question", false);
+        let rendered = render_block_styled(&row, &theme, 60, strings(), true, 0);
+        let edge = crate::glyphs::accent_bar(crate::glyphs::GlyphTier::of(&theme));
+        let box_rows = rendered.height - chrome::GAP;
+        // The edge is drawn on every row of the box, the cursor's included. It
+        // used to be swapped for the pointer glyph on the box's first drawn row —
+        // a row of padding above the text — where that white cell read as
+        // something the reader had put there rather than as a cursor.
+        for (index, line) in rendered.lines.iter().take(box_rows).enumerate() {
+            let (glyph, style) = cell_at(line, 0);
+            assert_eq!(glyph, edge, "row {index} of the selected box lost its edge");
+            assert_eq!(
+                style.fg,
+                Some(theme.roles.accent_success),
+                "row {index} of the selected box lost the reader's green"
+            );
+        }
+        // The cursor is spent on the surface instead: every cell behind the edge
+        // is lit, padding rows included.
+        let lit = Some(theme.roles.surface_highlight);
+        for (index, line) in rendered.lines.iter().take(box_rows).enumerate() {
+            let tail = line.spans.last().expect("the row ends in a span");
+            assert_eq!(tail.style.bg, lit, "row {index} of the box is not lit");
+        }
+        // The row's own style still says the block is a band: a pinned prompt is
+        // clipped by reading exactly that, so the cursor must not change it.
+        for (index, line) in rendered.lines.iter().take(box_rows).enumerate() {
+            assert_eq!(
+                line.style.bg,
+                Some(theme.roles.surface_raised),
+                "row {index} of the box stopped being a band"
+            );
+        }
+        // Unselected, the box is the raised band it always was.
+        let plain = render_block(&row, &theme, 60, strings());
+        for (index, line) in plain.lines.iter().take(box_rows).enumerate() {
+            let tail = line.spans.last().expect("the row ends in a span");
+            assert_eq!(
+                tail.style.bg,
+                Some(theme.roles.surface_raised),
+                "row {index} of an unselected box is lit"
             );
         }
     }
