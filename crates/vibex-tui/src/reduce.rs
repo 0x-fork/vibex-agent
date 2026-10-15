@@ -809,7 +809,7 @@ impl App {
                         session_id: session_id.clone(),
                     });
                 }
-                self.history.push(text.clone());
+                self.history_log.push(text.clone());
                 // The message is the reactivation that lifts a suspension.
                 self.auto_continue.resume(&session_id);
                 let send_id =
@@ -946,17 +946,9 @@ impl App {
                 self.composer.insert_char('\n');
                 Outcome::effects(vec![])
             }
-            Intent::ComposerHistoryPrevious => {
-                let current = self.composer.text().to_string();
-                if let Some(entry) = self.history.previous(&current) {
-                    self.composer.set_text(entry);
-                }
-                Outcome::effects(vec![])
-            }
-            Intent::ComposerHistoryNext => {
-                if let Some(entry) = self.history.next() {
-                    self.composer.set_text(entry);
-                }
+            Intent::ComposerHistoryPrevious | Intent::ComposerHistoryNext => {
+                let previous = intent == Intent::ComposerHistoryPrevious;
+                self.step_composer_history(previous);
                 Outcome::effects(vec![])
             }
             Intent::EditComposerExternally => {
@@ -4978,7 +4970,7 @@ impl App {
             self.toast(Toast::info(message));
             return Outcome::effects(vec![]);
         }
-        self.history.push(text.clone());
+        self.history_log.push(text.clone());
         self.scroll.follow = true;
         let attachments = self.wire_attachments(&images);
         // The runtime owns the timeline, so its copy of this message is a round
@@ -5018,7 +5010,7 @@ impl App {
         };
         let outgoing = self.composer.take_outgoing();
         let (text, images) = (outgoing.text, outgoing.images);
-        self.history.push(text.clone());
+        self.history_log.push(text.clone());
         // Remote seats have no steering RPC, so the worker falls back to
         // interrupt + resend and says so.
         let fallback = self.seat != crate::view::SeatKind::Authority;

@@ -5317,7 +5317,7 @@ fn the_history_drawer_lists_and_recalls_sent_messages() {
         "add a retry to the upload path",
         "write the release notes",
     ] {
-        app.history.push(entry);
+        app.history_log.push(entry);
     }
     app.composer.set_text("? upload");
     app.sync_composer_mode();

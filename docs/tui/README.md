@@ -151,7 +151,8 @@ do.
 
 **Focus.** A pointer marks the selected transcript block. The prompt marker and
 terminal caret show where typing lands. `Tab` switches between the transcript
-and composer; `Up` in an empty composer enters the transcript at its last row.
+and composer; `↑` in an empty composer recalls an earlier message into it, the
+way the desktop composer does.
 
 **One chrome, many modals.** Every popup — the command palette, the Agent setup
 picker, an approval card, a diff view, a confirmation — is drawn through one
@@ -296,8 +297,12 @@ selection replaces it. A selection that touches a collapsed chip selects the
 whole chip, so a cut can never leave half a `[Pasted: …]` marker behind.
 
 Typing `? ` turns the composer into a filter over the messages you have sent;
-`↑↓` walks the matches and `Enter` recalls one into the draft. `Up` on an empty
-draft still steps through history one entry at a time.
+`↑↓` walks the matches and `Enter` recalls one into the draft. That drawer
+searches your own vocabulary; `↑`/`↓` on an empty draft walk the session's
+messages instead, so a message another client sent comes back too. The oldest is
+sticky, `↓` past the newest restores the draft you started from, `Esc` leaves
+the walk the same way, and typing into a recalled message turns it into live
+text and ends the walk.
 
 Opening a session puts the caret in the composer, and a click anywhere in the
 box takes the keyboard (a click on a text row also places the caret). The
@@ -315,7 +320,7 @@ already has:
 | `Alt+D` | kill the word after the cursor |
 | `Ctrl+Y` | yank the last killed text back |
 | `Alt+B` / `Alt+F`, `Ctrl+←` / `Ctrl+→` | move by word |
-| `↑` / `↓` | move through draft lines; `↑` in an empty draft enters the timeline |
+| `↑` / `↓` | move through draft lines; `↑` in an empty draft recalls an earlier message |
 
 There is one kill buffer rather than a ring: a ring is a second thing to learn
 for a case that a terminal rarely reaches. Undo coalesces consecutive typing

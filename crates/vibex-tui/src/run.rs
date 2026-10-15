@@ -1235,22 +1235,11 @@ fn handle_composer_key(
             if app.completion.is_some() {
                 let outcome = app.perform(Intent::CompletionPrevious);
                 dispatch_all(worker, &outcome);
-            } else if app.composer.is_empty()
-                && app.page == Page::Agent
-                && !app.transcript.is_empty()
-            {
-                // An empty editor hands Up to the last visible transcript row.
-                app.focus = Focus::Main;
-                let index = app
-                    .transcript
-                    .blocks()
-                    .iter()
-                    .rposition(|block| !block.is_hidden())
-                    .unwrap_or(0);
-                app.set_selection(crate::keymap::Scope::Agent, index);
-                app.scroll.follow = false;
-                app.scroll.offset = app.transcript.offset_of_block(index);
-            } else {
+            } else if !app.step_composer_history(true) {
+                // Otherwise `Up` is the draft's own key. It used to hand an
+                // empty editor to the transcript; the walk takes that press
+                // instead, and `Tab` is what moves the keyboard between the
+                // transcript and the composer.
                 app.composer.move_up();
                 app.refresh_completion();
             }
@@ -1260,7 +1249,7 @@ fn handle_composer_key(
             if app.completion.is_some() {
                 let outcome = app.perform(Intent::CompletionNext);
                 dispatch_all(worker, &outcome);
-            } else {
+            } else if !app.step_composer_history(false) {
                 app.composer.move_down();
                 app.refresh_completion();
             }
@@ -1293,6 +1282,12 @@ fn handle_composer_key(
             // and pressed Escape wanted the highlight gone, not to leave the
             // session.
             if app.composer.clear_selection() {
+                return Ok(Some(false));
+            }
+            // A history walk is left the same way the desktop leaves one: the
+            // recalled message goes and the draft it displaced comes back. Only
+            // once there is no walk to leave does `Esc` mean "out of here".
+            if app.cancel_composer_history() {
                 return Ok(Some(false));
             }
             // Otherwise `Esc` walks back out of the session, exactly as the
@@ -4953,14 +4948,19 @@ mod tests {
                 .all(|block| !block.expanded)
         );
         app.focus = Focus::Composer;
+        // This session has no user message to recall, so `Up` is the draft's
+        // own key and the keyboard stays in the composer. The transcript is
+        // reached with `Tab`, not by an empty draft.
         handle_composer_key(
             &mut app,
             &worker,
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
         )
         .unwrap();
+        assert_eq!(app.focus, Focus::Composer);
+        let outcome = app.perform(Intent::FocusNext);
+        dispatch_all(&worker, &outcome);
         assert_eq!(app.focus, Focus::Main);
-        assert_eq!(app.selection_for(crate::keymap::Scope::Agent), 4);
     }
 
     /// A settled turn hides its process behind the answer's own title. Opening
@@ -5358,7 +5358,7 @@ mod tests {
             assert_eq!(app.pending_sends[&send_a].session_id.as_ref(), Some(&a));
             assert_eq!(app.pending_sends[&send_b].text, "second prompt");
             assert_eq!(app.pending_sends[&send_b].session_id.as_ref(), Some(&b));
-            assert_eq!(app.history.entries().len(), 2);
+            assert_eq!(app.history_log.entries().len(), 2);
         }
     }
 
@@ -7102,5 +7102,109 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app.active_session(), Some(&settled));
+    }
+
+    #[test]
+    fn up_recalls_the_sessions_earlier_messages_in_the_composer() {
+        use vibex_core::{TimelinePayload, UserMessagePayload};
+        let worker = isolation_worker();
+        let mut app = test_app(100, 30);
+        app.navigate_to(Page::Agent);
+        let id = vibex_core::VibexSessionId::new();
+        app.agent.state.selected_session_id = Some(id.clone());
+        let items = ["first question", "second question"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                conversation_item(
+                    &id,
+                    index as i64 + 1,
+                    TimelinePayload::UserMessage(UserMessagePayload {
+                        text: text.into(),
+                        ..Default::default()
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        app.agent.state.timeline.replace_authoritative(id, items);
+        app.sync_transcript();
+        conversation_frame(&mut app, 100, 30);
+        app.focus = Focus::Composer;
+
+        // `Up` from an empty draft lands on the newest message, and again on
+        // the one before it. The keyboard stays in the composer: this is what
+        // the desktop does, and the transcript is `Tab`'s destination.
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "second question");
+        assert_eq!(app.focus, Focus::Composer);
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "first question");
+        // The oldest message is sticky rather than wrapping to the newest.
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "first question");
+
+        // `Down` walks back toward the newest message and, past it, returns the
+        // draft the walk started from.
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "second question");
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "");
+
+        // `Esc` leaves a running walk and puts the preserved draft back. The
+        // draft belongs to the composer, so the walk starts from it only once
+        // the box is empty again.
+        app.composer.clear();
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "second question");
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "");
+        assert_eq!(app.focus, Focus::Composer, "Esc left the session instead");
+
+        // A live draft does not start a walk, so `Up` keeps the caret's own
+        // upward movement.
+        app.composer.set_text("a\nhalf-written\ndraft");
+        handle_composer_key(
+            &mut app,
+            &worker,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.composer.text(), "a\nhalf-written\ndraft");
+        assert_ne!(app.composer.cursor(), app.composer.text().len());
     }
 }

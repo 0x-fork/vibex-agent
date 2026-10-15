@@ -8,6 +8,8 @@
 
 use unicode_segmentation::UnicodeSegmentation;
 
+use vibex_core::VibexSessionId;
+
 use crate::text::{display_width, take_width};
 
 /// Which trigger opened the completion menu.
@@ -2038,21 +2040,23 @@ fn floor_boundary(text: &str, offset: usize) -> usize {
     offset
 }
 
-/// Sent-message history with a cursor into it.
+/// The messages this client sent, for the `? ` history drawer.
+///
+/// The arrows no longer walk this: they walk the *session's* timeline, so a
+/// message another client sent is recallable too. The drawer is a search over
+/// what this reader typed, which is a different question — it is a vocabulary
+/// of one's own — so it keeps its own bounded, deduplicated list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ComposerHistory {
+pub struct ComposerLog {
     entries: Vec<String>,
-    /// `None` means "editing a fresh draft"; `Some(index)` walks backwards.
-    index: Option<usize>,
-    draft: String,
     limit: usize,
 }
 
-impl ComposerHistory {
+impl ComposerLog {
     pub fn new(limit: usize) -> Self {
         Self {
             limit: limit.max(1),
-            ..Self::default()
+            entries: Vec::new(),
         }
     }
 
@@ -2070,45 +2074,160 @@ impl ComposerHistory {
         while self.entries.len() > self.limit {
             self.entries.remove(0);
         }
-        self.reset();
+    }
+}
+
+/// What one press of `Up`/`Down` did to the walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryStep {
+    /// Put this text in the composer.
+    Text(String),
+    /// The press was the walk's, but it put nothing new in the composer: the
+    /// oldest message is sticky, and the caret must not wander inside it.
+    Sticky,
+    /// The press was not the walk's, so `Up`/`Down` keep their normal meaning.
+    Ignored,
+}
+
+/// `Up`/`Down` recall of the selected session's earlier user messages.
+///
+/// The list is the *session's*: the messages are the user rows of the session's
+/// own timeline, handed to the walk at the moment a key is pressed rather than
+/// accumulated here — the same pool the desktop's composer draws from. That is
+/// what makes a message another client sent recallable too, and what keeps a
+/// session that was cleared or reloaded from leaving a stale message behind the
+/// cursor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ComposerHistory {
+    /// `None` means "editing a fresh draft"; `Some(index)` walks backwards
+    /// through the list, newest last.
+    index: Option<usize>,
+    /// What the draft held when the walk started, restored when the walk steps
+    /// past the newest message or the reader leaves it.
+    draft: String,
+    /// The text the walk last put in the composer.
+    ///
+    /// It is what tells the walk's own step apart from the reader's edit: once
+    /// the box holds anything else, the recalled message has become live text
+    /// and the arrows go back to moving the caret.
+    installed: String,
+    /// The session the walk is pinned to, so switching sessions cannot resume a
+    /// stale cursor on a message the reader can no longer see.
+    session_id: Option<VibexSessionId>,
+}
+
+impl ComposerHistory {
+    /// Whether a walk is running on `session_id`.
+    ///
+    /// A begun walk counts even before it has stepped anywhere: what pins it to
+    /// a composer is the session it belongs to, not how far it has walked.
+    pub fn is_browsing(&self, session_id: Option<&VibexSessionId>) -> bool {
+        session_id.is_some() && self.session_id.as_ref() == session_id
     }
 
+    /// Begin a walk on `session_id`, remembering the draft it displaces.
+    ///
+    /// This is the caller's decision rather than the walk's: the composer owns
+    /// the rule that `Up` only starts one from an empty box, and a caller that
+    /// starts one from a live draft already knows what it is doing.
+    pub fn begin(&mut self, session_id: &VibexSessionId, current: &str) {
+        self.index = None;
+        self.installed = current.to_string();
+        self.draft = current.to_string();
+        self.session_id = Some(session_id.clone());
+    }
+
+    /// Step to an older entry. `entries` is the session's user messages, oldest
+    /// first; `current` is the text the composer holds now.
+    pub fn previous(
+        &mut self,
+        session_id: &VibexSessionId,
+        entries: &[String],
+        current: &str,
+    ) -> HistoryStep {
+        self.end_if_edited(session_id, current);
+        let active = self.is_browsing(Some(session_id));
+        if !active {
+            return HistoryStep::Ignored;
+        }
+        // A cursor whose message left the timeline cannot name a row: the
+        // session was cleared or reloaded, so the walk ends rather than
+        // pointing at nothing.
+        match self.index {
+            Some(index) if index >= entries.len() => {
+                self.reset();
+                HistoryStep::Ignored
+            }
+            // The oldest message is sticky rather than wrapping around to the
+            // newest.
+            Some(0) if !entries.is_empty() => HistoryStep::Sticky,
+            Some(index) => self.install(index - 1, entries),
+            None => match entries.is_empty() {
+                true => {
+                    self.reset();
+                    HistoryStep::Sticky
+                }
+                false => self.install(entries.len() - 1, entries),
+            },
+        }
+    }
+
+    /// Step to a newer entry, restoring the draft past the newest message.
+    ///
+    /// `Down` never starts a walk on its own, so an untouched composer keeps
+    /// the caret's own downward movement.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(
+        &mut self,
+        session_id: &VibexSessionId,
+        entries: &[String],
+        current: &str,
+    ) -> HistoryStep {
+        self.end_if_edited(session_id, current);
+        let Some(index) = self.index.filter(|_| self.is_browsing(Some(session_id))) else {
+            return HistoryStep::Ignored;
+        };
+        if index + 1 >= entries.len() {
+            // Past the newest message: the walk ends and the draft returns.
+            let draft = std::mem::take(&mut self.draft);
+            self.reset();
+            return HistoryStep::Text(draft);
+        }
+        self.install(index + 1, entries)
+    }
+
+    /// End the walk, handing back the draft it was holding.
+    ///
+    /// `None` means no walk was running, so the caller leaves the composer
+    /// alone rather than clearing text the reader never left.
+    pub fn cancel(&mut self) -> Option<String> {
+        self.session_id.as_ref()?;
+        let draft = std::mem::take(&mut self.draft);
+        self.reset();
+        Some(draft)
+    }
+
+    /// Forget the walk without handing anything back.
     pub fn reset(&mut self) {
         self.index = None;
         self.draft.clear();
+        self.installed.clear();
+        self.session_id = None;
     }
 
-    /// Step to an older entry. Returns the text to load, if any.
-    pub fn previous(&mut self, current: &str) -> Option<String> {
-        if self.entries.is_empty() {
-            return None;
+    /// End a walk the reader has typed into, so an edit is never replaced by a
+    /// stale draft on the next press.
+    fn end_if_edited(&mut self, session_id: &VibexSessionId, current: &str) {
+        if self.is_browsing(Some(session_id)) && self.installed != current {
+            self.reset();
         }
-        let next = match self.index {
-            None => {
-                self.draft = current.to_string();
-                self.entries.len() - 1
-            }
-            Some(0) => return None,
-            Some(index) => index - 1,
-        };
-        self.index = Some(next);
-        Some(self.entries[next].clone())
     }
 
-    /// Step to a newer entry, restoring the draft at the end.
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<String> {
-        let index = self.index?;
-        if index + 1 >= self.entries.len() {
-            self.index = None;
-            return Some(std::mem::take(&mut self.draft));
-        }
-        self.index = Some(index + 1);
-        Some(self.entries[index + 1].clone())
-    }
-
-    pub fn is_browsing(&self) -> bool {
-        self.index.is_some()
+    fn install(&mut self, index: usize, entries: &[String]) -> HistoryStep {
+        let text = entries[index].clone();
+        self.index = Some(index);
+        self.installed = text.clone();
+        HistoryStep::Text(text)
     }
 }
 
@@ -2450,28 +2569,131 @@ mod tests {
 
     #[test]
     fn history_walks_back_and_restores_the_draft() {
-        let mut history = ComposerHistory::new(10);
-        history.push("first");
-        history.push("second");
-        assert_eq!(history.previous("my draft").as_deref(), Some("second"));
-        assert_eq!(history.previous("").as_deref(), Some("first"));
-        assert_eq!(history.previous(""), None);
-        assert_eq!(history.next().as_deref(), Some("second"));
-        assert_eq!(history.next().as_deref(), Some("my draft"));
-        assert!(!history.is_browsing());
+        let session = vibex_core::VibexSessionId::new();
+        let entries = vec!["first".to_string(), "second".to_string()];
+        let mut history = ComposerHistory::default();
+        history.begin(&session, "my draft");
+        assert_eq!(
+            history.previous(&session, &entries, "my draft"),
+            HistoryStep::Text("second".to_string())
+        );
+        assert_eq!(
+            history.previous(&session, &entries, "second"),
+            HistoryStep::Text("first".to_string())
+        );
+        // The oldest message is sticky: the press is the walk's, but it puts
+        // nothing new in the composer.
+        assert_eq!(
+            history.previous(&session, &entries, "first"),
+            HistoryStep::Sticky
+        );
+        assert_eq!(
+            history.next(&session, &entries, "first"),
+            HistoryStep::Text("second".to_string())
+        );
+        // Past the newest message the draft comes back, and the walk ends.
+        assert_eq!(
+            history.next(&session, &entries, "second"),
+            HistoryStep::Text("my draft".to_string())
+        );
+        assert!(!history.is_browsing(Some(&session)));
     }
 
     #[test]
-    fn history_is_bounded_and_deduplicated() {
-        let mut history = ComposerHistory::new(3);
+    fn an_unstarted_walk_ignores_both_arrows() {
+        let session = vibex_core::VibexSessionId::new();
+        let entries = vec!["sent".to_string()];
+        let mut history = ComposerHistory::default();
+        // Neither arrow starts a walk: the caller begins one, and only from a
+        // composer it means to walk (the composer's own rule is `Up` from an
+        // empty box). An idle walk therefore has nothing to say about either.
+        assert_eq!(
+            history.previous(&session, &entries, ""),
+            HistoryStep::Ignored
+        );
+        assert_eq!(history.next(&session, &entries, ""), HistoryStep::Ignored);
+        // A walk that is running keeps the keys even while text is in the box:
+        // that text is a recalled message the reader may step away from.
+        history.begin(&session, "");
+        history.previous(&session, &entries, "");
+        assert_eq!(
+            history.next(&session, &entries, "sent"),
+            HistoryStep::Text(String::new())
+        );
+    }
+
+    #[test]
+    fn typing_into_a_recalled_message_ends_the_walk() {
+        let session = vibex_core::VibexSessionId::new();
+        let entries = vec!["first".to_string(), "second".to_string()];
+        let mut history = ComposerHistory::default();
+        history.begin(&session, "my draft");
+        history.previous(&session, &entries, "my draft");
+        // The reader edits what came back: it is live text now, and the arrows
+        // must not replace the edit with a stale draft.
+        assert_eq!(
+            history.next(&session, &entries, "second, edited"),
+            HistoryStep::Ignored
+        );
+        assert!(!history.is_browsing(Some(&session)));
+    }
+
+    #[test]
+    fn history_is_pinned_to_one_session() {
+        let first = vibex_core::VibexSessionId::new();
+        let second = vibex_core::VibexSessionId::new();
+        let entries = vec!["from the first session".to_string()];
+        let mut history = ComposerHistory::default();
+        history.begin(&first, "");
+        assert!(history.is_browsing(Some(&first)));
+        assert_eq!(
+            history.previous(&first, &entries, ""),
+            HistoryStep::Text("from the first session".to_string())
+        );
+        // Another session's composer is a fresh draft: the leftover cursor is
+        // not resumed, and its draft is not walked over.
+        assert!(!history.is_browsing(Some(&second)));
+        assert_eq!(
+            history.previous(&second, &entries, "a draft"),
+            HistoryStep::Ignored
+        );
+    }
+
+    #[test]
+    fn history_gives_up_a_cursor_whose_message_left_the_timeline() {
+        let session = vibex_core::VibexSessionId::new();
+        let mut history = ComposerHistory::default();
+        history.begin(&session, "");
+        history.previous(&session, &["one".to_string(), "two".to_string()], "");
+        // The session was cleared: the cursor names a row that no longer
+        // exists, so the walk ends rather than pointing at nothing.
+        assert_eq!(history.previous(&session, &[], ""), HistoryStep::Ignored);
+        assert!(!history.is_browsing(Some(&session)));
+    }
+
+    #[test]
+    fn cancelling_a_walk_hands_the_draft_back_once() {
+        let session = vibex_core::VibexSessionId::new();
+        let entries = vec!["sent".to_string()];
+        let mut history = ComposerHistory::default();
+        assert_eq!(history.cancel(), None, "there was no walk to leave");
+        history.begin(&session, "my draft");
+        history.previous(&session, &entries, "my draft");
+        assert_eq!(history.cancel().as_deref(), Some("my draft"));
+        assert_eq!(history.cancel(), None, "the draft came back twice");
+    }
+
+    #[test]
+    fn the_sent_log_is_bounded_and_deduplicated() {
+        let mut log = ComposerLog::new(3);
         for index in 0..5 {
-            history.push(format!("entry {index}"));
+            log.push(format!("entry {index}"));
         }
-        assert_eq!(history.entries().len(), 3);
-        assert_eq!(history.entries()[0], "entry 2");
-        history.push("entry 4");
-        assert_eq!(history.entries().len(), 3);
-        assert_eq!(history.entries().last().unwrap(), "entry 4");
+        assert_eq!(log.entries().len(), 3);
+        assert_eq!(log.entries()[0], "entry 2");
+        log.push("entry 4");
+        assert_eq!(log.entries().len(), 3);
+        assert_eq!(log.entries().last().unwrap(), "entry 4");
     }
 
     #[test]

@@ -22,7 +22,7 @@ use vibex_ui::shell::{CompactNavigation, GlobalDestination, SessionDestination, 
 use vibex_ui::{AgentWorkflowController, ManagementWorkflowController};
 
 use crate::action::Intent;
-use crate::composer::{CompletionMenu, ComposerBuffer, ComposerHistory};
+use crate::composer::{CompletionMenu, ComposerBuffer, ComposerHistory, ComposerLog, HistoryStep};
 use serde::{Deserialize, Serialize};
 
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -940,7 +940,10 @@ pub struct App {
     timeline_details_in_flight: BTreeSet<(vibex_ui::WorkflowViewGeneration, i64)>,
 
     pub composer: ComposerBuffer,
+    /// `Up`/`Down` recall over the selected session's earlier messages.
     pub history: ComposerHistory,
+    /// The messages this client sent, which the `? ` drawer searches.
+    pub history_log: ComposerLog,
     pub completion: Option<CompletionMenu>,
 
     pub page: Page,
@@ -1789,7 +1792,8 @@ impl App {
             pending_timeline_details: BTreeSet::new(),
             timeline_details_in_flight: BTreeSet::new(),
             composer: ComposerBuffer::default(),
-            history: ComposerHistory::new(64),
+            history: ComposerHistory::default(),
+            history_log: ComposerLog::new(HISTORY_LOG_LIMIT),
             completion: None,
             page: Page::Sessions,
             focus: Focus::Main,
@@ -5452,7 +5456,7 @@ impl App {
         pending.submitted_at = std::time::Instant::now();
         let correlation_id = pending.correlation_id.clone();
         let attachments = self.wire_attachments(&creation.outgoing.images);
-        self.history.push(creation.outgoing.text.clone());
+        self.history_log.push(creation.outgoing.text.clone());
         Some(Effect::SendMessage {
             session_id,
             send_id: creation.send_id,
@@ -6719,7 +6723,7 @@ impl App {
                 self.queue_selection =
                     (remaining > 0).then(|| self.queue_selection.unwrap_or(0).min(remaining - 1));
             }
-            self.history.push(queued.text.clone());
+            self.history_log.push(queued.text.clone());
             let attachments = self.wire_attachments(&queued.images);
             released.push((session_id, queued.text, attachments));
         }
@@ -7350,6 +7354,95 @@ impl App {
             .any(running)
     }
 
+    // ---- composer history -------------------------------------------------
+
+    /// The messages `Up`/`Down` walk, oldest first.
+    ///
+    /// The pool is the selected session's own timeline — the same one the
+    /// desktop's composer recalls from — so a message another client sent is
+    /// recallable here too, and a session that was cleared or reloaded cannot
+    /// leave a stale message behind the cursor.
+    ///
+    /// A user row is only a message when it is an actual prompt: a delegated
+    /// instruction reaches the provider through the same payload and is not the
+    /// reader's to recall. The body is the row's own, which is what the client
+    /// draws — attachments in their place — so what comes back to the composer
+    /// is exactly what the message looked like when it was sent.
+    pub fn composer_history_entries(&self) -> Vec<String> {
+        if !self.page_shows_session() {
+            return Vec::new();
+        }
+        let mut entries = self
+            .transcript
+            .blocks()
+            .iter()
+            .filter(|block| {
+                block.kind == vibex_desktop_model::TimelineRowKind::UserMessage
+                    && !block.body.trim().is_empty()
+            })
+            .map(|block| block.body.clone())
+            .collect::<Vec<_>>();
+        // A send the runtime has not echoed yet is a message the reader has
+        // already sent, and it is projected as a row of the transcript. It
+        // comes last because that is where the echo will land.
+        if let Some(pending) = self.pending_send_for_active() {
+            let text = pending.row(self.strings).body;
+            if !text.trim().is_empty() {
+                entries.push(text);
+            }
+        }
+        entries
+    }
+
+    /// Step the composer's `Up`/`Down` walk over the session's messages.
+    ///
+    /// Returns whether the press was the walk's. A press that was not keeps its
+    /// normal meaning — the caret moves through the draft — which is what keeps
+    /// a multi-line message editable with the same two keys.
+    ///
+    /// `Up` is the only way in, and only from an empty box: a box holding a
+    /// draft the reader wrote belongs to the reader, so the caret moves inside
+    /// it instead of the draft being swapped for an older message.
+    pub fn step_composer_history(&mut self, previous: bool) -> bool {
+        let Some(session_id) = self.selected_session_id().cloned() else {
+            return false;
+        };
+        let entries = self.composer_history_entries();
+        let current = self.composer.text().to_string();
+        let active = self.history.is_browsing(Some(&session_id));
+        if !active && !(previous && current.trim().is_empty() && !entries.is_empty()) {
+            return false;
+        }
+        if !active {
+            self.history.begin(&session_id, &current);
+        }
+        let step = if previous {
+            self.history.previous(&session_id, &entries, &current)
+        } else {
+            self.history.next(&session_id, &entries, &current)
+        };
+        match step {
+            HistoryStep::Ignored => false,
+            HistoryStep::Sticky => true,
+            HistoryStep::Text(text) => {
+                self.composer.set_text(text);
+                true
+            }
+        }
+    }
+
+    /// Leave a running walk, putting the draft it displaced back.
+    ///
+    /// Answers whether one was running, so a caller that means something else
+    /// by the key — `Esc` — only spends the press on the walk when there is one.
+    pub fn cancel_composer_history(&mut self) -> bool {
+        let Some(draft) = self.history.cancel() else {
+            return false;
+        };
+        self.composer.set_text(draft);
+        true
+    }
+
     // ---- composer history search ----------------------------------------
 
     /// Derive the composer's mode from what the draft starts with.
@@ -7396,7 +7489,7 @@ impl App {
             return Vec::new();
         };
         let query = query.trim().to_lowercase();
-        let entries = self.history.entries();
+        let entries = self.history_log.entries();
         if query.is_empty() {
             return entries
                 .iter()
@@ -7872,6 +7965,13 @@ impl App {
 
 /// How many history entries the composer's drawer will show.
 pub const MAX_HISTORY_MATCHES: usize = 100;
+
+/// How many sent messages the composer's `? ` drawer keeps to search.
+///
+/// The arrow walk reads the session's timeline and is bounded by it instead;
+/// this bounds only the reader's own vocabulary, which is there to be
+/// remembered rather than to be complete.
+pub const HISTORY_LOG_LIMIT: usize = 64;
 
 /// Frames a first `Ctrl+C` waits for its second before forgetting.
 ///
