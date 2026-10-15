@@ -512,6 +512,180 @@ fn moving_a_message_in_front_of_a_schedule_sends_it(cx: &mut TestAppContext) {
     });
 }
 
+/// A settled session's head leaves when no completion verdict can be obtained
+/// at all.
+///
+/// The probe's budget for the revision is spent, so no answer is on its way and
+/// none can be asked for again. The settled session is then the best evidence
+/// the queue has, and the head must actually leave the queue — not be handed
+/// back by the submission path after the dispatcher already reported it gone.
+#[gpui::test]
+fn the_queue_hands_over_its_head_when_no_verdict_can_be_obtained(cx: &mut TestAppContext) {
+    let (workbench, cx, _receiver) = fixture(cx, 1);
+    let session_id = session(0).id.clone();
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            workbench.auto_continue_probe_attempts.insert(
+                session_id.to_string(),
+                AutoContinueProbeAttempt {
+                    session_updated_at_ms: session(0).updated_at_ms,
+                    attempted_at: Instant::now() - AUTO_CONTINUE_PROBE_RETRY_BACKOFF,
+                    attempts: AUTO_CONTINUE_PROBE_MAX_ATTEMPTS,
+                },
+            );
+            workbench.composer_queue = vec![head_queue_message(1, &session_id, None)];
+            assert!(
+                workbench.maybe_dispatch_next_composer_queue_message(
+                    None,
+                    ComposerQueueDispatchBehavior::Automatic,
+                    window,
+                    cx,
+                ),
+                "the queue reports the hand-over it decided"
+            );
+            assert!(
+                workbench.composer_queue.is_empty(),
+                "a verdict that is not coming cannot hold a settled session's message"
+            );
+        });
+    });
+}
+
+/// A hand-over the submission path refuses is not reported as dispatched.
+///
+/// The local runtime is gone, which is the one case the submission path still
+/// hands a message back. The queue must report that honestly: its caller drops
+/// the session's re-evaluation on a `true`, and the message would then wait for
+/// an event that no longer comes.
+#[gpui::test]
+fn a_refused_hand_over_is_not_reported_as_dispatched(cx: &mut TestAppContext) {
+    let (workbench, cx, _receiver) = fixture(cx, 1);
+    let session_id = session(0).id.clone();
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            workbench.backend = None;
+            workbench.composer_queue = vec![head_queue_message(1, &session_id, None)];
+            assert!(
+                !workbench.maybe_dispatch_next_composer_queue_message(
+                    None,
+                    ComposerQueueDispatchBehavior::Automatic,
+                    window,
+                    cx,
+                ),
+                "a message that stayed in the queue was not dispatched"
+            );
+            assert_eq!(workbench.composer_queue.len(), 1);
+            assert!(
+                workbench
+                    .composer_queue_paused_session_ids
+                    .contains(session_id.as_str()),
+                "the local-runtime fallback is the pause the reader can see"
+            );
+        });
+    });
+}
+
+/// A live view settles a revision only for the completion it can actually see.
+///
+/// The streamed answer arrives as deltas, so a view's tail is routinely
+/// mid-turn while the session has already settled. Caching that reading as an
+/// abnormal stop pins it to the settled revision — no later event can revise
+/// it — and the queued auto-send behind it waits for a verdict that will never
+/// change. The final answer is the one item that proves the turn ended, and
+/// only that reading settles the revision here.
+#[gpui::test]
+fn a_live_view_settles_only_the_completion_it_can_see(cx: &mut TestAppContext) {
+    fn live_event(
+        session_id: &VibexSessionId,
+        sequence: i64,
+        payload: TimelinePayload,
+    ) -> TimelineLiveEvent {
+        TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence,
+            item: TimelineItem {
+                id: TimelineItemId::new(),
+                session_id: session_id.clone(),
+                sequence,
+                timestamp_ms: sequence,
+                source: TimelineSource::Agent,
+                kind: payload.kind(),
+                correlation_id: None,
+                provider_correlation_id: None,
+                redaction_state: TimelineRedactionState::None,
+                execution_attribution: None,
+                payload_depth: vibex_core::TimelinePayloadDepth::Detail,
+                payload,
+            },
+        }
+    }
+
+    let (workbench, cx, _receiver) = fixture(cx, 1);
+    let session_id = session(0).id.clone();
+    let revision = session(0).updated_at_ms;
+    cx.update(|_, cx| {
+        workbench.update(cx, |workbench, cx| {
+            // The fixture keeps the selected session's view borrowed but never
+            // loads it, so its timeline is bound the way an authoritative load
+            // binds one: a live projection only applies to the view's own
+            // session, and the verdict rule is what this test is about.
+            workbench.timeline.session_id = Some(session_id.clone());
+            assert!(
+                workbench.borrow_session_view_unweighed(&session_id),
+                "the borrowed view is bound to the session"
+            );
+            let applied = workbench.apply_timeline_events_to_borrowed_view(
+                &session_id,
+                vec![live_event(
+                    &session_id,
+                    1,
+                    TimelinePayload::ToolCall(ToolCallPayload {
+                        tool_call_id: "tool_1".into(),
+                        tool_name: "execute".into(),
+                        status: ToolCallStatus::Started,
+                        summary: "cargo test".into(),
+                        input_summary: None,
+                        output_summary: None,
+                        raw_extension: None,
+                    }),
+                )],
+                cx,
+            );
+            workbench.release_session_view_unweighed();
+            assert!(applied.0, "the mid-turn item reached the view");
+            assert!(
+                workbench
+                    .cached_auto_continue_turn_status(&session_id, revision)
+                    .is_none(),
+                "a mid-turn tail cannot judge the settled revision"
+            );
+
+            assert!(workbench.borrow_session_view_unweighed(&session_id));
+            let applied = workbench.apply_timeline_events_to_borrowed_view(
+                &session_id,
+                vec![live_event(
+                    &session_id,
+                    2,
+                    TimelinePayload::AgentMessage(AgentMessagePayload {
+                        text: "done".into(),
+                        is_final: true,
+                    }),
+                )],
+                cx,
+            );
+            workbench.release_session_view_unweighed();
+            assert!(applied.0, "the final answer reached the view");
+            assert_eq!(
+                workbench
+                    .cached_auto_continue_turn_status(&session_id, revision)
+                    .map(|status| status.ended_normally),
+                Some(Some(true)),
+                "a final answer settles the revision as a normal completion"
+            );
+        });
+    });
+}
+
 #[gpui::test]
 fn team_root_reconciliation_retains_unloaded_members_and_queued_mentions(cx: &mut TestAppContext) {
     let (workbench, cx, _) = fixture(cx, 3);

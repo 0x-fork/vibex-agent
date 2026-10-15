@@ -23766,13 +23766,23 @@ impl VibexWorkbench {
                     .registered_session(session_id.as_str())
                     .map(|session| session.updated_at_ms)
             {
-                let ended_normally = latest_timeline_turn_ended_normally(&self.timeline.items);
-                self.cache_auto_continue_turn_status(
-                    session_id,
-                    session_updated_at_ms,
-                    ended_normally,
-                    cx,
-                );
+                // A live view may only assert the completion it can see: the
+                // final answer is the one item that proves the turn ended.
+                // Anything else is a view that has not caught up, and the
+                // streamed answer arrives as deltas, so the tail it holds is
+                // routinely mid-turn while the session has already settled.
+                // Caching that reading would pin an "abnormal stop" to the
+                // settled revision — a verdict no later event can revise, and
+                // the one that keeps a queued auto-send from ever leaving. Such
+                // a revision stays uncached so the authority's probe answers it.
+                if latest_timeline_turn_ended_normally(&self.timeline.items) == Some(true) {
+                    self.cache_auto_continue_turn_status(
+                        session_id,
+                        session_updated_at_ms,
+                        Some(true),
+                        cx,
+                    );
+                }
             }
             let mut streaming_cache_update = None;
             if updates_existing_item || optimistic_reconciled {
@@ -27319,6 +27329,14 @@ impl VibexWorkbench {
                 })
     }
 
+    /// Hands one Composer message to its submission path.
+    ///
+    /// This is the direct-send entry point, where the message may still become
+    /// a queued one: the reader typed it into the composer, and a session that
+    /// turns out to be busy hands it back to the queue it belongs in. The
+    /// pre-send queue's own dispatch has already admitted the head it removed
+    /// and enters through [`Self::dispatch_admitted_composer_message`] instead,
+    /// so a hand-over the queue reported can never be quietly undone here.
     fn dispatch_composer_message(
         &mut self,
         message: ComposerQueueMessage,
@@ -27327,7 +27345,6 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         let session_id = message.session_id.clone();
-        let delivery = composer_queue_message_delivery(behavior);
         let session = self.registered_session(session_id.as_str());
         let session_state = session.map(|session| session.state);
         let cached_turn_status = session.and_then(|session| {
@@ -27365,6 +27382,27 @@ impl VibexWorkbench {
             cx.notify();
             return;
         }
+        self.dispatch_admitted_composer_message(message, behavior, window, cx);
+    }
+
+    /// Submits one Composer message whose admission is already decided.
+    ///
+    /// The caller owns the wait: a message reaches this path only after the
+    /// admission rules of the caller's own entry point have accepted it, so it
+    /// is submitted rather than judged a second time. Admission is decided
+    /// once, because the two halves cannot be allowed to disagree — a message
+    /// handed back after its caller was told it left the queue stays in the
+    /// queue while the caller drops the very re-evaluation that would have
+    /// retried it.
+    fn dispatch_admitted_composer_message(
+        &mut self,
+        message: ComposerQueueMessage,
+        behavior: ComposerQueueDispatchBehavior,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = message.session_id.clone();
+        let delivery = composer_queue_message_delivery(behavior);
         let Some(runtime) = self.runtime.clone() else {
             let Some(backend) = self.backend.clone() else {
                 let insert_at = self
@@ -27646,6 +27684,11 @@ impl VibexWorkbench {
     /// message is only deferred and the queue is re-evaluated once a later turn
     /// is confirmed to have completed normally. The paused state is reserved for
     /// an explicit user interrupt.
+    ///
+    /// A `true` means the entry really left: the admission decided here is the
+    /// one the submission path honors, and a message that comes back anyway
+    /// (only a local runtime that is not ready does that) is reported as `false`
+    /// so the caller keeps re-evaluating the queue it still holds.
     fn maybe_dispatch_next_composer_queue_message(
         &mut self,
         origin: Option<&VibexSessionId>,
@@ -27741,15 +27784,17 @@ impl VibexWorkbench {
             awaits_turn: message.command_invocation.is_none(),
         });
         self.publish_sidebar_invalidation();
-        self.dispatch_composer_message(message, behavior, window, cx);
-        // A submission the dispatch path handed straight back never left the
-        // queue: it keeps the head it had, and it must not hold the queue behind
-        // it either.
-        if let Some(bounced) = self
+        self.dispatch_admitted_composer_message(message, behavior, window, cx);
+        // The one hand-over the submission path still refuses — a local runtime
+        // that is not ready — puts the message back and pauses its session. The
+        // queue must not report that as a dispatch: its caller drops the
+        // session's re-evaluation on a `true`, and the message would then wait
+        // for an event that no longer comes.
+        let bounced = self
             .composer_queue
             .iter()
-            .position(|queued| queued.id == message_id)
-        {
+            .position(|queued| queued.id == message_id);
+        if let Some(bounced) = bounced {
             if bounced > 0 {
                 let message = self.composer_queue.remove(bounced);
                 self.composer_queue.insert(0, message);
@@ -27759,7 +27804,7 @@ impl VibexWorkbench {
         // The send left the queue, so its name no longer stands and the
         // persisted queue must not bring the message back on the next launch.
         self.composer_queue_changed();
-        true
+        bounced.is_none()
     }
 
     /// Whether the pre-send queue is still waiting for the turn of the message it
@@ -96435,11 +96480,12 @@ mod tests {
 
         // Waiting for an unobserved or abnormal turn boundary only defers the
         // message; it must never install the paused state. The only pause the
-        // dispatch path still installs is the local-runtime error fallback.
+        // dispatch path still installs is the local-runtime error fallback, and
+        // it belongs to the hand-over that follows the wait.
         let wait_branch = dispatch
             .split_once("|| waits_for_continuation\n        {")
             .map(|(_, tail)| tail)
-            .and_then(|tail| tail.split_once("let Some(runtime) = self.runtime.clone()"))
+            .and_then(|tail| tail.split_once("self.dispatch_admitted_composer_message"))
             .map(|(body, _)| body)
             .expect("the queue wait branch should remain inspectable");
         assert!(wait_branch.contains("probe_composer_queue_turn_status"));

@@ -762,6 +762,20 @@ session's own state whether the turn still holds the queue.
   nothing can judge the boundary, the settled session is the best evidence the
   queue has, and the queue advances rather than stalling behind a verdict that
   is not coming.
+- Admission is decided once per message. The pre-send queue removes the head it
+  admitted and hands it to the submission path, so the submission path must not
+  judge that message again: a hand-over the queue reported as dispatched can
+  never be undone, because the queue's caller drops the session's
+  re-evaluation on it and the message would then sit in the queue waiting for
+  an event that no longer comes. The submission path re-judges only the
+  direct-send entry point, where a message the reader typed may still become a
+  queued one, and a message it does hand back is reported as *not* dispatched.
+- A completion verdict may only be derived from a view that can actually see
+  the completion: the final answer item. A live view's tail is routinely
+  mid-turn while the session has already settled — a turn's answer arrives as
+  deltas — and caching that reading would pin an "abnormal stop" to the settled
+  revision, a verdict no later event can revise. Such a revision stays uncached
+  so the authority's probe answers it, in either direction.
 - Explicit sends are the one gesture allowed to overtake the queue: the row's
   send-now/steer action promotes the message to the head and its behavior may
   leave the fence behind. A head that carries a deadline is always dispatched as
@@ -803,6 +817,9 @@ session's own state whether the turn still holds the queue.
 | A message sits in front of a due schedule | Retain the schedule and send the head first |
 | The turn ahead of a schedule is still running or its submission is in flight | Retain the schedule until that session settles |
 | The session that owes the queue a turn stops abnormally | Release the fence once the session settles; a stopped turn is still over |
+| No completion verdict can be obtained for a settled session | Hand the head over on the settled session rather than deferring it forever |
+| The submission path hands a message back (local runtime not ready) | Report it as not dispatched, and pause the session it belongs to |
+| A live view's tail cannot prove a completion | Leave the revision uncached so the authority's probe answers it |
 | The fenced submission failed, or was a command with no turn of its own | Release the fence so the queue is not stranded |
 | A row is being edited | Hold the queue, head included, until the edit ends |
 | The reader moves a message in front of a schedule and its session is settled | Send it without waiting for the deadline |
@@ -826,6 +843,10 @@ session's own state whether the turn still holds the queue.
   let a due schedule overtake another session's queued entry.
 - Bad: hold the whole queue on an unresolved completion probe, so one error
   session freezes every other session's messages.
+- Bad: report a hand-over as dispatched while the submission path put the
+  message back, or settle a settled revision from a live view that cannot see
+  the completion — either one leaves the queued message waiting for an event
+  that will not come.
 - Bad: show the manager's `<agent> session` placeholder on a row that is only
   waiting for its scheduled send, or keep that name after the send has landed.
 
@@ -842,7 +863,10 @@ settled/closed/archived/untracked session — and the per-behavior admission of
 `AfterCompletion`, `AfterInterrupt`, `Automatic`, `ForceNext` and `Scheduled`.
 `team_tests.rs` drives the real dispatch path: a due head fires while a
 schedule waits behind it, a settled session releases a fence without any probe,
-and moving an ordinary message in front of a schedule sends it. `desktop-model`
+moving an ordinary message in front of a schedule sends it, a head with no
+obtainable verdict is handed over instead of bouncing back, a refused hand-over
+is not reported as dispatched, and a live view settles a revision only for the
+completion it can see. `desktop-model`
 covers the persisted queue's normalization, its bounds, and the UI-state
 encode/decode round trip. A source-level test asserts the row keeps the
 scheduled mark ahead of the generic
