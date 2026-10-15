@@ -221,11 +221,16 @@ pub enum Overlay {
     Approval { selected: usize },
     /// The pending elicitation form.
     ///
-    /// The request is pinned rather than re-read as "whichever question is
-    /// first": a second question arriving while the reader is filling this one
-    /// in must not swap the fields under their cursor, and the answers must go
-    /// back to the request they were typed for. `choice` is the option the
-    /// cursor is on inside the active field.
+    /// The card is not a modal box in the middle of the screen: it is drawn in
+    /// the composer's band, where the reader is already looking and already
+    /// typing, so it carries no chrome of its own beyond the panel. The
+    /// request is pinned rather than re-read as "whichever question is first":
+    /// a second question arriving while the reader is filling this one in must
+    /// not swap the questions under their cursor, and the answers must go back
+    /// to the request they were typed for.
+    ///
+    /// `field` is the tab: a question, or the Confirm tab one past the last of
+    /// them. `choice` is the option the cursor is on inside the open question.
     Elicitation {
         request: String,
         field: usize,
@@ -304,10 +309,27 @@ pub enum Overlay {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElicitationForm {
     pub request: vibex_core::ElicitationRequest,
-    /// Index of the field being answered.
+    /// The open tab: a question, or the Confirm tab one past the last of them.
     pub field: usize,
-    /// Index of the option the cursor is on inside that field.
+    /// Index of the option the cursor is on inside that question.
     pub choice: usize,
+}
+
+impl ElicitationForm {
+    /// How many tabs the card has: one per question, plus Confirm.
+    pub fn tabs(&self) -> usize {
+        self.request.fields.len() + 1
+    }
+
+    /// The question the open tab holds, when it is not the Confirm tab.
+    pub fn question(&self) -> Option<&vibex_core::ElicitationField> {
+        self.request.fields.get(self.field)
+    }
+
+    /// Whether the Confirm tab is the one open.
+    pub fn confirming(&self) -> bool {
+        self.field >= self.request.fields.len()
+    }
 }
 
 /// One row the workspace picker draws, top to bottom.

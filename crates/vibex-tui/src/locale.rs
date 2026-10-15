@@ -111,6 +111,7 @@ strings! {
     hint_expand => { "expand", "展开", "展開" },
     hint_collapse => { "collapse", "收起", "收合" },
     hint_toggle => { "toggle", "切换", "切換" },
+    hint_switch => { "switch", "切换", "切換" },
     hint_edit => { "edit", "编辑", "編輯" },
     hint_previous => { "prev", "上一个", "上一個" },
     hint_next => { "next", "下一个", "下一個" },
@@ -650,6 +651,14 @@ strings! {
     elicitation_title => { "The Agent needs input", "Agent 需要输入", "Agent 需要輸入" },
     elicitation_submit => { "Submit", "提交", "提交" },
     elicitation_decline => { "Decline", "拒绝", "拒絕" },
+    elicitation_confirm => { "Confirm", "确认", "確認" },
+    elicitation_dismiss => { "later", "稍后", "稍後" },
+    elicitation_unanswered => { "Not answered", "未回答", "未回答" },
+    elicitation_answer_required => {
+        "Answer this question before moving on",
+        "请先回答这个问题",
+        "請先回答這個問題"
+    },
     elicitation_yes => { "Yes", "是", "是" },
     elicitation_no => { "No", "否", "否" },
     elicitation_unsupported => {

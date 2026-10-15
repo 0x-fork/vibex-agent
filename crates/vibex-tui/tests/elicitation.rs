@@ -182,7 +182,7 @@ fn app_with_items(
     app
 }
 
-fn screen(app: &mut App, columns: u16, rows: u16) -> String {
+fn frame_text(app: &mut App, columns: u16, rows: u16) -> String {
     let backend = TestBackend::new(columns, rows);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     terminal
@@ -222,9 +222,12 @@ fn a_pending_question_opens_its_form_by_itself() {
     assert!(app.overlay.is_none());
     assert!(app.sync_pending_question());
     assert!(matches!(app.overlay, Some(Overlay::Elicitation { .. })));
-    let screen = screen(&mut app, 100, 30);
+    let screen = frame_text(&mut app, 100, 30);
     assert!(screen.contains("How should I proceed?"), "{screen}");
-    assert!(screen.contains("The agent needs your input."), "{screen}");
+    // The question is a tab of the card, and the card is where the composer
+    // is: the band at the bottom of the frame, not a box in the middle of it.
+    assert!(screen.contains("Confirm"), "{screen}");
+    assert!(screen.contains("Tab switch"), "{screen}");
 }
 
 #[test]
@@ -278,7 +281,7 @@ fn typing_into_a_text_field_is_what_gets_submitted() {
     for character in "ship it".chars() {
         app.elicitation_type_char(character);
     }
-    let screen = screen(&mut app, 100, 30);
+    let screen = frame_text(&mut app, 100, 30);
     assert!(screen.contains("ship it"), "{screen}");
 
     let outcome = app.perform(Intent::ElicitationSubmit);
@@ -325,14 +328,45 @@ fn the_arrows_choose_an_option_and_the_digits_choose_one_outright() {
         30,
     );
     app.sync_pending_question();
-    // The cursor opens on the first option, and `Space` takes it.
-    let outcome = app.perform(Intent::OverlayToggleValue);
+    // The cursor opens on the first option; `↓` moves it and `Enter` takes the
+    // row it is on, which is what "confirm" means on a question tab.
+    let outcome = app.perform(Intent::SelectNext);
     assert!(outcome.effects.is_empty());
-    // The second option is one step down, and a digit picks it outright.
-    app.perform(Intent::SelectNext);
-    let screen = screen(&mut app, 100, 30);
+    let screen = frame_text(&mut app, 100, 30);
     assert!(screen.contains("In a scratch copy"), "{screen}");
-    app.perform(Intent::OverlayToggleValue);
+    app.perform(Intent::ConfirmOverlay);
+    // Confirming a question moves to the next tab, and the last tab is the one
+    // that sends the answers.
+    let screen = frame_text(&mut app, 100, 30);
+    assert!(screen.contains("In a scratch copy"), "{screen}");
+    let outcome = app.perform(Intent::ConfirmOverlay);
+    let resolution = resolution(&outcome).expect("the answers were sent");
+    assert_eq!(
+        resolution.answers.get("q"),
+        Some(&ElicitationAnswerValue::String("scratch".into()))
+    );
+}
+
+#[test]
+fn a_digit_picks_an_option_outright() {
+    // The rows are numbered because the number is a key: a reader who can see
+    // the option they want should not have to walk to it.
+    let mut app = app_with_question(
+        vec![choice_field(
+            "q",
+            "Where should I work?",
+            &[
+                ("shared", "In the shared tree"),
+                ("scratch", "In a scratch copy"),
+            ],
+        )],
+        100,
+        30,
+    );
+    app.sync_pending_question();
+    let outcome = app.select_elicitation_option(1);
+    assert!(outcome.effects.is_empty());
+    app.perform(Intent::ConfirmOverlay);
     let outcome = app.perform(Intent::ConfirmOverlay);
     let resolution = resolution(&outcome).expect("the answers were sent");
     assert_eq!(
@@ -365,17 +399,18 @@ fn a_multi_select_ticks_each_option_it_is_given() {
 }
 
 #[test]
-fn a_boolean_is_a_switch_the_same_key_flips() {
+fn a_boolean_is_two_rows_the_cursor_picks_between() {
     let mut app = app_with_question(vec![boolean_field("q", "Run the migration?")], 100, 30);
     app.sync_pending_question();
-    // The cursor's field has no options, so `Space` reaches the switch rather
-    // than a list, and the first press is the reader's answer.
-    app.perform(Intent::OverlayToggleValue);
-    let outcome = app.perform(Intent::ElicitationSubmit);
+    // `Yes` and `No` are rows like any other option, so the same keys answer a
+    // boolean as answer a list.
+    app.perform(Intent::SelectNext);
+    app.perform(Intent::ConfirmOverlay);
+    let outcome = app.perform(Intent::ConfirmOverlay);
     let resolution = resolution(&outcome).expect("the answers were sent");
     assert_eq!(
         resolution.answers.get("q"),
-        Some(&ElicitationAnswerValue::Boolean(true))
+        Some(&ElicitationAnswerValue::Boolean(false))
     );
 }
 
@@ -397,18 +432,16 @@ fn the_form_walks_every_field_and_the_arrows_do_not_stop_at_one() {
         30,
     );
     app.sync_pending_question();
-    // Down past the two options, which is where the next question starts.
-    app.perform(Intent::SelectNext);
-    app.perform(Intent::SelectNext);
+    // `Enter` on the first question takes the option under the cursor and moves
+    // to the next one, where the same key hands the reader on to Confirm.
+    app.perform(Intent::ConfirmOverlay);
     for character in "because".chars() {
         app.elicitation_type_char(character);
     }
-    let screen = screen(&mut app, 100, 30);
+    let screen = frame_text(&mut app, 100, 30);
     assert!(screen.contains("because"), "{screen}");
-    // Back up one field, and `Space` takes the option the cursor lands on.
-    app.perform(Intent::ElicitationFieldPrevious);
-    app.perform(Intent::OverlayToggleValue);
-    let outcome = app.perform(Intent::ElicitationSubmit);
+    app.perform(Intent::ConfirmOverlay);
+    let outcome = app.perform(Intent::ConfirmOverlay);
     let resolution = resolution(&outcome).expect("the answers were sent");
     assert_eq!(
         resolution.answers.get("first"),
@@ -418,6 +451,84 @@ fn the_form_walks_every_field_and_the_arrows_do_not_stop_at_one() {
         resolution.answers.get("second"),
         Some(&ElicitationAnswerValue::String("because".into()))
     );
+}
+
+#[test]
+fn tab_walks_the_questions_without_taking_an_answer() {
+    // `Tab` and `←`/`→` are the way between questions: a reader who is only
+    // looking must be able to leave a question without answering it.
+    let mut app = app_with_question(
+        vec![
+            choice_field(
+                "first",
+                "Where?",
+                &[("shared", "Shared"), ("scratch", "Scratch")],
+            ),
+            text_field("second", "Why?", false),
+        ],
+        100,
+        30,
+    );
+    app.sync_pending_question();
+    app.perform(Intent::OverlayNextField);
+    let screen = frame_text(&mut app, 100, 30);
+    assert!(screen.contains("Why?"), "{screen}");
+    app.perform(Intent::OverlayPreviousField);
+    let screen = frame_text(&mut app, 100, 30);
+    assert!(screen.contains("Where?"), "{screen}");
+    // Nothing was answered by walking, so the first question is still required
+    // and unanswered: submitting says so rather than sending half a form.
+    let outcome = app.perform(Intent::ElicitationSubmit);
+    assert!(resolution(&outcome).is_none());
+    assert!(app.toast.is_some());
+}
+
+#[test]
+fn the_confirm_tab_reads_the_answers_back() {
+    let mut app = app_with_question(
+        vec![
+            choice_field("first", "Where?", &[("shared", "Shared")]),
+            text_field("second", "Why?", true),
+        ],
+        100,
+        30,
+    );
+    app.sync_pending_question();
+    app.perform(Intent::ConfirmOverlay);
+    for character in "because".chars() {
+        app.elicitation_type_char(character);
+    }
+    app.perform(Intent::ConfirmOverlay);
+    let screen = frame_text(&mut app, 100, 30);
+    assert!(screen.contains("Confirm"), "{screen}");
+    assert!(screen.contains("Shared"), "{screen}");
+    assert!(screen.contains("because"), "{screen}");
+    assert!(screen.contains("Enter Submit"), "{screen}");
+}
+
+#[test]
+fn a_required_answer_is_asked_for_before_the_card_moves_on() {
+    // Moving on would only hide the question the Agent is waiting for.
+    let mut app = app_with_question(
+        vec![
+            text_field("first", "Why?", true),
+            text_field("second", "How?", false),
+        ],
+        100,
+        30,
+    );
+    app.sync_pending_question();
+    app.perform(Intent::ConfirmOverlay);
+    let shown = frame_text(&mut app, 100, 30);
+    // The card is still on the question that has no answer, and it says why:
+    // the tab strip names every question, so the proof is the open question's
+    // own heading and the notice rather than the absence of the second title.
+    assert!(shown.contains("Why?  *Required"), "{shown}");
+    assert!(
+        shown.contains("Answer this question before moving on"),
+        "{shown}"
+    );
+    assert!(app.toast.is_some(), "the refusal was silent");
 }
 
 #[test]
@@ -506,27 +617,45 @@ fn a_long_form_scrolls_to_the_question_being_answered() {
         .collect::<Vec<_>>();
     let mut app = app_with_question(fields, 80, 24);
     app.sync_pending_question();
-    let first = screen(&mut app, 80, 24);
+    let first = frame_text(&mut app, 80, 24);
     assert!(first.contains("Question number 0"), "{first}");
     for _ in 0..11 {
         app.perform(Intent::ElicitationFieldNext);
     }
-    let last = screen(&mut app, 80, 24);
+    let last = frame_text(&mut app, 80, 24);
     assert!(last.contains("Question number 11"), "{last}");
 }
 
 #[test]
-fn the_form_names_the_keys_it_answers_to() {
+fn the_card_names_the_keys_the_open_question_answers_to() {
     let mut app = app_with_question(
         vec![text_field("q", "How should I proceed?", true)],
         100,
         30,
     );
     app.sync_pending_question();
-    let screen = screen(&mut app, 100, 30);
-    for key in ["Enter", "Submit", "Decline", "Esc"] {
+    let screen = frame_text(&mut app, 100, 30);
+    // A question that is typed into has no list to move a cursor over, so the
+    // legend does not promise `↑↓` there.
+    for key in ["Tab", "Enter", "Confirm", "Esc", "later"] {
         assert!(screen.contains(key), "{key} is not named:\n{screen}");
     }
+    assert!(!screen.contains("↑↓"), "{screen}");
+
+    // A list of options does have one, and a multi-select also has a toggle.
+    let mut app = app_with_question(
+        vec![choice_field("q", "Where?", &[("shared", "Shared")])],
+        100,
+        30,
+    );
+    app.sync_pending_question();
+    let screen = frame_text(&mut app, 100, 30);
+    assert!(screen.contains("↑↓"), "{screen}");
+
+    let mut app = app_with_question(vec![multi_field("q", "Which?", &["unit"])], 100, 30);
+    app.sync_pending_question();
+    let screen = frame_text(&mut app, 100, 30);
+    assert!(screen.contains("Space"), "{screen}");
 }
 
 #[test]
@@ -571,18 +700,94 @@ fn the_card_opens_over_the_composer_and_gives_it_back_on_escape() {
     app.composer.set_text("a message I was writing");
     assert!(app.sync_pending_question());
     assert!(matches!(app.overlay, Some(Overlay::Elicitation { .. })));
-    // The question is what the card is about, and the draft is still there
-    // under it — nothing the reader wrote was taken away to ask.
-    let screen = screen(&mut app, 100, 30);
+    // The card takes the composer's place — the band holds one of them — and
+    // the draft is not lost with the box it was written in.
+    let screen = frame_text(&mut app, 100, 30);
     assert!(screen.contains("Why?"), "{screen}");
-    assert!(screen.contains("a message I was writing"), "{screen}");
+    assert!(!screen.contains("a message I was writing"), "{screen}");
 
     app.perform(Intent::CloseOverlay);
     assert!(app.overlay.is_none());
     assert_eq!(app.composer.text(), "a message I was writing");
     assert_eq!(app.focus, vibex_tui::app::Focus::Composer);
+    let screen = frame_text(&mut app, 100, 30);
+    assert!(screen.contains("a message I was writing"), "{screen}");
     // And it stays down: `Esc` means later, not "ask me again next frame".
     assert!(!app.sync_pending_question());
+}
+
+#[test]
+fn the_card_leaves_the_transcript_above_it_alone() {
+    // The card is a band, not a window: what the Agent has already said stays
+    // on screen while the reader answers, which is what a modal box costs.
+    let session_id = VibexSessionId::new();
+    let question = ElicitationRequest {
+        id: RequestId::new(),
+        session_id: session_id.clone(),
+        provider_request_id: None,
+        tool_call_id: None,
+        message: "The agent needs your input.".to_string(),
+        title: Some("Grok needs an answer".to_string()),
+        description: None,
+        fields: vec![text_field("q", "Why?", true)],
+        status: ElicitationRequestStatus::Pending,
+        requested_at_ms: 1_000,
+    };
+    let mut app = app_with_items(
+        session_id,
+        vec![
+            (
+                TimelineItemKind::AgentMessage,
+                TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                    text: "I read the failing test and it is the fake clock.".to_string(),
+                    is_final: true,
+                }),
+            ),
+            (
+                TimelineItemKind::ElicitationRequest,
+                TimelinePayload::ElicitationRequest(question),
+            ),
+        ],
+        100,
+        30,
+    );
+    app.sync_pending_question();
+    let screen = frame_text(&mut app, 100, 30);
+    assert!(
+        screen.contains("I read the failing test"),
+        "the transcript was covered:\n{screen}"
+    );
+    assert!(screen.contains("Why?"), "{screen}");
+}
+
+#[test]
+fn a_long_option_list_scrolls_under_the_question() {
+    // A question can carry two dozen options. The ones off the bottom are not
+    // worth the transcript, but the one the cursor is on is worth everything:
+    // it is the row `Enter` would take.
+    let options = (0..24)
+        .map(|index| (format!("option-{index}"), format!("Option number {index}")))
+        .collect::<Vec<_>>();
+    let borrowed = options
+        .iter()
+        .map(|(value, title)| (value.as_str(), title.as_str()))
+        .collect::<Vec<_>>();
+    // The question is long enough to wrap, so the window has to be measured in
+    // display rows: a band that counted lines would show one row too many and
+    // push the cursor off the bottom of the box.
+    let question = "Which one of these would you like me to use for the new \
+                    session, given everything that has been said so far?";
+    let mut app = app_with_question(vec![choice_field("q", question, &borrowed)], 80, 24);
+    app.sync_pending_question();
+    let first = frame_text(&mut app, 80, 24);
+    assert!(first.contains("Option number 0"), "{first}");
+    for _ in 0..23 {
+        app.perform(Intent::SelectNext);
+    }
+    let last = frame_text(&mut app, 80, 24);
+    assert!(last.contains("Option number 23"), "{last}");
+    // The question stays put while the options move under it.
+    assert!(last.contains("Which one of these"), "{last}");
 }
 
 #[test]
@@ -618,7 +823,7 @@ fn the_next_question_is_the_one_that_opens_after_an_answer() {
         30,
     );
     app.sync_pending_question();
-    let first = screen(&mut app, 100, 30);
+    let first = frame_text(&mut app, 100, 30);
     assert!(first.contains("First question"), "{first}");
 
     app.elicitation_type_char('x');
@@ -631,7 +836,7 @@ fn the_next_question_is_the_one_that_opens_after_an_answer() {
     // The runtime has not answered yet, so the first request is still pending
     // and stays offered; the second is not, and opens on the next sync.
     assert!(app.sync_pending_question());
-    let second = screen(&mut app, 100, 30);
+    let second = frame_text(&mut app, 100, 30);
     assert!(second.contains("Second question"), "{second}");
 }
 
@@ -670,6 +875,6 @@ fn an_approval_is_a_blocking_question_too() {
     );
     assert!(app.sync_pending_question());
     assert!(matches!(app.overlay, Some(Overlay::Approval { .. })));
-    let screen = screen(&mut app, 100, 30);
+    let screen = frame_text(&mut app, 100, 30);
     assert!(screen.contains("Run the test suite"), "{screen}");
 }

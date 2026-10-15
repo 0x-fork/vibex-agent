@@ -725,30 +725,32 @@ the edges, and copies on release. A double click takes the whole word, so
 copies the selection again if the clipboard was clobbered.
 
 A request the Agent is blocked on — an approval, or a question from a tool like
-`ask_user_question` — is a card that opens itself the moment it arrives, the way
-the desktop draws the same card inline in the timeline. Nothing has to be found
-first: it opens over the Composer too, because a question that waits to be
-looked for is a question the Agent stays blocked on. Nothing of the reader's is
-lost to it — a draft being written stays exactly where it was, still visible
-under the card — and `Esc` puts the card down for now: it stays counted in the
-status band and on its transcript row, `Enter` on that row asks for it again,
-and the keyboard goes straight back to the draft.
+`ask_user_question` — comes to the reader the moment it arrives, the way the
+desktop draws the same card inline in the timeline. Nothing has to be found
+first, and the Composer's keyboard does not hold it back: a question that waits
+to be looked for is a question the Agent stays blocked on.
 
-An approval card answers with `a` to allow, `d` to deny, `Ctrl+A` to allow for
-the rest of the session, and a digit for one of the options the request
+An approval is a card over the page: `a` allows, `d` denies, `Ctrl+A` allows for
+the rest of the session, and a digit answers with one of the options the request
 advertised.
 
-An elicitation form draws one control per question. `↑`/`↓` walk the whole form
-— through a question's options and on into the next question — while `Tab`,
-`Shift+Tab` and `←`/`→` move between questions only. On a list of options,
-`Space` takes the option under the cursor and a digit takes one outright; a
-multi-select ticks each one it is given. A field that takes an answer is typed
-into directly — `Backspace` rubs out the last character and `Delete` clears the
-field — which is why `d` is a letter there rather than "decline": refusing the
-question is `Ctrl+D`, a chord no answer field can swallow. `Enter` submits, and
-the card only closes once the answers pass the request's own validation, so a
-required question left blank says so instead of leaving the Agent waiting on
-nothing.
+A question is not a box over the page — it takes the Composer's band, so the
+form is where the reader's hands already are and the transcript above it stays
+readable. Each question is a tab: `Tab`, `Shift+Tab` and `←`/`→` walk the tabs,
+`↑`/`↓` walk the open question's options, `Space` ticks an option in a
+multi-select, and a digit takes one outright. `Enter` confirms the answer and
+carries the reader on to the next question; the last tab reads the answers back,
+and `Enter` there sends them. A question that takes an answer is typed into
+directly — `Backspace` rubs out the last character and `Delete` clears the field
+— which is why `d` is a letter there rather than "decline": refusing the whole
+request is `Ctrl+D`, a chord no answer field can swallow. A required question
+left blank stops the walk where it is and says so, and the card only closes once
+the answers pass the request's own validation — so nothing is ever sent half
+answered.
+
+`Esc` puts the card down for now: the draft that was in the Composer is still
+there, the question stays counted in the status band and on its transcript row,
+and `Enter` on that row asks for it again.
 
 ### Management
 

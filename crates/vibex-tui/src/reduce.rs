@@ -3069,10 +3069,11 @@ impl App {
                 _ => Outcome::quiet(),
             },
             Overlay::Elicitation { .. } => match intent {
-                // `Enter` and `s` both submit: the first is what every modal in
-                // this client answers to, the second is what the desktop's
-                // Submit button is called here.
-                Intent::ElicitationSubmit | Intent::ConfirmOverlay => self.submit_elicitation(),
+                // `Enter` is the card's one key: it confirms the answer on a
+                // question tab and sends the form from the Confirm tab. `s`
+                // keeps working as the desktop's Submit.
+                Intent::ElicitationSubmit => self.submit_elicitation(),
+                Intent::ConfirmOverlay => self.confirm_elicitation(),
                 // The approval card's "deny" is the form's "decline": one verb
                 // for refusing the Agent's request, whichever card asks.
                 Intent::ApprovalDeny => self.decline_elicitation(),
@@ -4492,6 +4493,10 @@ impl App {
         match request.fields.get(field).map(|field| &field.kind) {
             Some(ElicitationFieldKind::Text { options, .. }) => options.len(),
             Some(ElicitationFieldKind::MultiSelect { options, .. }) => options.len(),
+            // A boolean is a two-row list rather than a switch: the card is
+            // walked with the same keys whatever the question asks, and `Yes`
+            // and `No` are the two answers it has.
+            Some(ElicitationFieldKind::Boolean { .. }) => 2,
             _ => 0,
         }
     }
@@ -4506,6 +4511,9 @@ impl App {
             Some(ElicitationFieldKind::Text { options, .. })
             | Some(ElicitationFieldKind::MultiSelect { options, .. }) => {
                 options.iter().map(|option| option.value.clone()).collect()
+            }
+            Some(ElicitationFieldKind::Boolean { .. }) => {
+                vec!["true".to_string(), "false".to_string()]
             }
             _ => Vec::new(),
         }
@@ -4529,6 +4537,10 @@ impl App {
             vibex_core::ElicitationFieldKind::MultiSelect { .. } => {
                 draft.multi(&definition.id).into_iter().next()
             }
+            vibex_core::ElicitationFieldKind::Boolean { default } => draft
+                .boolean(&definition.id)
+                .or(*default)
+                .map(|value| value.to_string()),
             _ => draft.text(&definition.id).map(str::to_string),
         };
         chosen
@@ -4580,53 +4592,88 @@ impl App {
         Some((id, form.request, form.field, form.choice, draft))
     }
 
-    /// Move the form's cursor by `delta`, walking into and out of a field's
-    /// options rather than stopping at its edge.
+    /// Move the option cursor inside the open question.
     ///
-    /// One gesture over the whole form: the arrows move down the list of
-    /// controls, and a field that opens into a list of options takes them
-    /// first. `Tab` and `←`/`→` are the other way round — they move between
-    /// fields and leave the option cursor where it lands.
+    /// `↑`/`↓` are the *select* keys here, not the way between questions: a
+    /// card whose questions are tabs moves between them with `Tab` and `←`/`→`,
+    /// and an arrow that also changed the tab would make the option list
+    /// impossible to walk past its first entry. It wraps, so the last option
+    /// leads back to the first rather than dead-ending.
     fn step_elicitation_cursor(&mut self, delta: i64) -> Outcome {
-        let Some((id, request, field, choice, draft)) = self.elicitation_cursor() else {
+        let Some((id, request, field, choice, _)) = self.elicitation_cursor() else {
             return Outcome::quiet();
         };
-        let count = request.fields.len();
-        if count == 0 {
+        let choices = Self::elicitation_choice_count(&request, field);
+        if choices == 0 {
             return Outcome::quiet();
         }
-        let choices = Self::elicitation_choice_count(&request, field);
-        if delta > 0 && choice + 1 < choices {
-            return self.set_elicitation_cursor(id, field, choice + 1);
-        }
-        if delta < 0 && choice > 0 {
-            return self.set_elicitation_cursor(id, field, choice - 1);
-        }
-        let next = if delta > 0 {
-            (field + 1) % count
+        let choice = if delta > 0 {
+            (choice + 1) % choices
         } else {
-            (field + count - 1) % count
+            (choice + choices - 1) % choices
+        };
+        self.set_elicitation_cursor(id, field, choice)
+    }
+
+    /// Move between the card's tabs: the questions, then Confirm.
+    ///
+    /// The option cursor lands on whatever that question already answers with,
+    /// so `Enter` on arrival confirms what the reader can see rather than the
+    /// first row of a list they have not read.
+    fn step_elicitation_field(&mut self, delta: i64) -> Outcome {
+        let Some((id, request, field, _, draft)) = self.elicitation_cursor() else {
+            return Outcome::quiet();
+        };
+        let tabs = request.fields.len() + 1;
+        let next = if delta > 0 {
+            (field + 1) % tabs
+        } else {
+            (field + tabs - 1) % tabs
         };
         let choice = Self::elicitation_entry_choice(&request, next, &draft);
         self.set_elicitation_cursor(id, next, choice)
     }
 
-    /// Move between fields, leaving the option cursor where it lands.
-    fn step_elicitation_field(&mut self, delta: i64) -> Outcome {
-        let Some((id, request, field, _, draft)) = self.elicitation_cursor() else {
+    /// Take the `Enter` of the open tab: confirm this answer, or submit.
+    ///
+    /// One key for the whole card. On a question it records the option under
+    /// the cursor — the ticked set is already recorded, and an answer that is
+    /// typed is already in the draft — and moves on to the next tab. On the
+    /// Confirm tab it sends the answers back. A required question that has no
+    /// answer stops the walk where it is and says so, because moving on would
+    /// only hide the field the Agent is waiting for.
+    fn confirm_elicitation(&mut self) -> Outcome {
+        let Some(form) = self.elicitation_form() else {
             return Outcome::quiet();
         };
-        let count = request.fields.len();
-        if count == 0 {
+        if form.confirming() {
+            return self.submit_elicitation();
+        }
+        let Some(definition) = form.question().cloned() else {
+            return Outcome::quiet();
+        };
+        // A row under the cursor *is* an answer for the questions that are
+        // chosen from: `Enter` is how the reader says "this one", so it is
+        // recorded before the question is judged. A list of ticks is already
+        // recorded — the key that ticks them is `Space` — and an answer that is
+        // typed is already in the draft.
+        match &definition.kind {
+            vibex_core::ElicitationFieldKind::Text { options, .. } if !options.is_empty() => {
+                self.toggle_elicitation_choice();
+            }
+            vibex_core::ElicitationFieldKind::Boolean { .. } => {
+                self.toggle_elicitation_choice();
+            }
+            _ => {}
+        }
+        let draft = self.elicitation_form_draft(form.request.id.as_str());
+        if draft.answer_for(&definition.id, &definition).is_none() && definition.required {
+            self.toast(Toast::warning(
+                self.strings.elicitation_answer_required().to_string(),
+            ));
             return Outcome::quiet();
         }
-        let next = if delta > 0 {
-            (field + 1) % count
-        } else {
-            (field + count - 1) % count
-        };
-        let choice = Self::elicitation_entry_choice(&request, next, &draft);
-        self.set_elicitation_cursor(id, next, choice)
+        self.step_elicitation_field(1)
     }
 
     fn set_elicitation_cursor(&mut self, request: String, field: usize, choice: usize) -> Outcome {
@@ -4661,9 +4708,10 @@ impl App {
                 };
                 draft.toggle_multi(definition.id.clone(), option.value.clone());
             }
+            // `Yes` and `No` are the field's two rows, so the key takes the
+            // row under the cursor rather than flipping whatever was there.
             ElicitationFieldKind::Boolean { .. } => {
-                let current = draft.boolean(&definition.id).unwrap_or(false);
-                draft.set_boolean(definition.id.clone(), !current);
+                draft.set_boolean(definition.id.clone(), choice == 0);
             }
             _ => return Outcome::quiet(),
         }

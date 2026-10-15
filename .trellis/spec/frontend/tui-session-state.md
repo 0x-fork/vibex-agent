@@ -124,15 +124,27 @@ without fetching a record before creation has completed.
   `ask_user_question` — opens its card once, when it first appears on the page
   the reader owns. The desktop draws the same card inline in the timeline, so it
   is visible without a gesture; the terminal transcript is a block list with no
-  controls in it, so the card is a modal that offers itself. A request already
-  offered, or put down with `Esc`, is not offered again: `Enter` on its pending
-  transcript row is the way back, and the status band keeps counting it.
+  controls in it, so the card offers itself. A request already offered, or put
+  down with `Esc`, is not offered again: `Enter` on its pending transcript row
+  is the way back, and the status band keeps counting it.
 - The card opens the moment the request appears, the Composer's keyboard
   included: the reader must not have to navigate to the question before it can
-  be answered. Nothing of the reader's is lost to it — a draft stays in the
-  Composer, still drawn under the card — and `Esc` puts the card down and
-  returns the keyboard to whatever held it. Closing the card never clears,
-  submits, or edits the draft.
+  be answered. An approval is drawn over the page. A question is drawn in the
+  Composer's band, which is where the reader is already looking and typing: the
+  band holds the form *instead of* the draft, so the transcript above it stays
+  readable and the question is never a box that hides what the Agent said.
+- Nothing of the reader's is lost to the card. A draft stays in the Composer —
+  it is not drawn while the card holds the band, and it is drawn again the
+  moment the card closes — and `Esc` puts the card down and returns the keyboard
+  to whatever held it. Closing the card never clears, submits, or edits the
+  draft.
+- The card is a set of tabs: one per question, then Confirm. `Tab` and `←`/`→`
+  move between tabs, `↑`/`↓` move the option cursor inside the open question,
+  `Enter` confirms that question's answer and advances, and `Enter` on Confirm
+  submits. A required question with no answer stops the walk where it is and
+  reports it. The option list scrolls under a fixed question when the band is
+  shorter than the content, and every measurement is in display rows, because a
+  wrapped question must not push the cursor's row out of the box.
 - The elicitation form pins the request it opened on and drafts answers per
   request. A second question arriving while the reader is filling the first in
   cannot swap the fields under their cursor, and what was typed for one request
@@ -166,7 +178,9 @@ without fetching a record before creation has completed.
 | A title the authority supplies lands, then a placeholder snapshot follows | The authority's title stands; the reader's recorded name is not consulted again. |
 | A question arrives while the reader is typing a message | Open the card over the Composer; leave the draft untouched and give the keyboard back on `Esc`. |
 | A second question arrives while the form is open | The open form keeps its request and its answers; the next one opens after this is answered. |
-| A required field is blank when the form is submitted | Keep the form open and report it; send no resolution. |
+| A required field is blank when the form is submitted | Keep the card on that question and report it; send no resolution. |
+| The option list is taller than the band | Scroll it under the question; the row the cursor is on stays visible. |
+| The question wraps over more than one row | Measure the window in display rows; the cursor's row is still the row shown. |
 | The reader presses `Esc` on a card | Put it down and do not reopen it on a later frame; the band and the row keep counting it. |
 | A request is resolved from another client while its form is open | The form closes with it; nothing typed there is sent to a later request. |
 
@@ -200,14 +214,16 @@ without fetching a record before creation has completed.
   repaint. Cover existing-session runtime switches with the picker open/closed,
   the disabled setting, and transitions cleared when changing composer targets.
 - `tests/elicitation.rs` drives the card through public intents and effects and
-  asserts on the drawn frame. Cover: a pending request opening itself, opening
-  over the Composer with the draft left intact and the keyboard handed back on
-  `Esc`, `Esc` keeping it down, `Enter` on its transcript row bringing it back,
-  walking fields and options, choosing an option by arrow and by digit, ticking
-  a multi-select, flipping a boolean, typing and rubbing out an answer, a blank
-  required field keeping the form open, `Ctrl+D` declining with no answers, a
-  second question taking the first one's place, and an approval opening the
-  same way.
+  asserts on the drawn frame. Cover: a pending request opening itself, the card
+  taking the Composer's band with the transcript left readable and the draft
+  handed back on `Esc`, `Esc` keeping it down, `Enter` on its transcript row
+  bringing it back, tabs moving without taking an answer, `Enter` confirming and
+  advancing, the Confirm tab reading the answers back and submitting, choosing
+  an option by arrow and by digit, ticking a multi-select, picking between a
+  boolean's two rows, typing and rubbing out an answer, a blank required field
+  stopping the walk, a long option list scrolling under a wrapped question,
+  `Ctrl+D` declining with no answers, a second question taking the first one's
+  place, and an approval opening the same way.
 - PTY scenarios own temporary interface, runtime-preference, and keymap files.
   Pinning `LC_ALL` alone is insufficient because remembered locale settings
   outrank environment detection.
