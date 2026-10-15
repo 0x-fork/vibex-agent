@@ -1676,6 +1676,15 @@ fn legacy_agent_model_id(profile: &ProviderProfile, provider_model_id: &str) -> 
 /// value the projection leaves for the runtime to fill. Anything else is
 /// ignored rather than guessed at, so a hand-edited option cannot turn into a
 /// header the user never configured.
+///
+/// The list is sorted by name because the object it is read from is not the same
+/// kind of map in every build: `serde_json` keeps insertion order where the
+/// `preserve_order` feature reaches it and sorts otherwise, and the feature is
+/// resolved per build graph. An order that came from that map would therefore
+/// move between a `-p` build and a workspace build, and the projection compares
+/// this list for equality to decide whether a record changed — so the same
+/// profile could look edited on one build and not on another, and the settings
+/// UI would list the same headers in a different order.
 const LEGACY_HEADER_OVERRIDE_OPTION_KEY: &str = "headerOverrideJson";
 
 fn legacy_headers(profile: &ProviderProfile) -> Vec<ModelProviderHeaderReference> {
@@ -1688,7 +1697,7 @@ fn legacy_headers(profile: &ProviderProfile) -> Vec<ModelProviderHeaderReference
     else {
         return Vec::new();
     };
-    object
+    let mut headers = object
         .into_iter()
         .filter_map(|(name, value)| {
             let name = name.trim().to_string();
@@ -1718,7 +1727,17 @@ fn legacy_headers(profile: &ProviderProfile) -> Vec<ModelProviderHeaderReference
                 redacted_hint: redacted_hint.to_string(),
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    // Case-insensitive first so a reader sees an alphabetical list whatever a
+    // header's own capitalisation is, then by the name itself so two headers
+    // differing only in case still have one order.
+    headers.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    headers
 }
 
 fn legacy_acp_config(profile: &ProviderProfile) -> Option<AcpProviderConfig> {
@@ -2366,6 +2385,8 @@ mod tests {
 
         let saved = ProviderProjectionCompatibilityRepository::sync_legacy_profile(&conn, &profile)
             .unwrap();
+        // The order is the projection's, not the JSON object's: it is sorted by
+        // name so the same profile projects the same list on every build.
         assert_eq!(
             saved.model_provider.headers,
             vec![
