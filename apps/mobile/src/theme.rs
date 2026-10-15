@@ -374,6 +374,48 @@ pub fn font_wordmark() -> Rems {
     ui_rems(FONT_WORDMARK)
 }
 
+/// The label size the mark's geometry below is authored against: the 42pt
+/// lockup `logo-wordmark-white.svg` draws for the desktop, where the mark's box
+/// is 46×45, sits 2px into a centering row, and then rides 6px above it.
+const WORDMARK_AUTHORED_FONT: f32 = 42.0;
+const WORDMARK_MARK_WIDTH: f32 = 46.0;
+const WORDMARK_MARK_HEIGHT: f32 = 45.0;
+const WORDMARK_MARK_MARGIN_TOP: f32 = 2.0;
+const WORDMARK_MARK_TOP_OFFSET: f32 = -6.0;
+
+/// The brand mark that supplies a wordmark lockup's capital "V", sized for the
+/// label drawn beside it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WordmarkMark {
+    /// The box the SVG is drawn in. The mark's own ink follows the viewBox's
+    /// ratio inside it, so the box is not square.
+    pub width: Pixels,
+    pub height: Pixels,
+    /// Margin over the box. The row centers margin boxes, so this is part of
+    /// the geometry rather than a gap between two elements.
+    pub margin_top: Pixels,
+    /// What `.top()` takes: the offset that moves the drawn mark off the row's
+    /// center line and onto the label's baseline.
+    pub top_offset: Pixels,
+}
+
+/// The mark beside a label rendered at `font` pixels.
+///
+/// Every length scales from the label's own size. That is the whole point of
+/// the helper: the authored offsets land the mark's point on the 42pt baseline,
+/// and a mark frozen in pixels leaves that line as soon as the reader's
+/// text-size step moves the label off 42 — the label is where the step enters
+/// the lockup, so a fixed mark drifts against it at every other size.
+pub fn wordmark_mark(font: Pixels) -> WordmarkMark {
+    let scale = f32::from(font) / WORDMARK_AUTHORED_FONT;
+    WordmarkMark {
+        width: px(WORDMARK_MARK_WIDTH * scale),
+        height: px(WORDMARK_MARK_HEIGHT * scale),
+        margin_top: px(WORDMARK_MARK_MARGIN_TOP * scale),
+        top_offset: px(WORDMARK_MARK_TOP_OFFSET * scale),
+    }
+}
+
 /// The sidebar's steps, one rung above the same role on the content pages. The
 /// tree is read by scanning, and the extra step is what stops a project name
 /// from reading as a section label and a session row from reading as metadata.
@@ -1216,6 +1258,44 @@ mod tests {
         assert!((BODY_LINE_HEIGHT_REM - body.0).abs() < f32::EPSILON);
         // A denser step gets a proportionally tighter box.
         assert!(line_height_for(FONT_MICRO).0 < body.0);
+    }
+
+    /// The lockup's mark is a function of the label beside it, at every step.
+    ///
+    /// The authored 42pt numbers are the desktop wordmark's; what matters here
+    /// is that nothing about the mark is frozen. A mark that keeps one pixel
+    /// size while the label follows the reader's step is what put its point off
+    /// the label's baseline at any step but the default, and the four ratios
+    /// below are the contract that keeps it there.
+    #[test]
+    fn the_wordmark_mark_scales_with_the_label_it_belongs_to() {
+        let authored = wordmark_mark(px(WORDMARK_AUTHORED_FONT));
+        let close =
+            |left: Pixels, right: Pixels| (f32::from(left) - f32::from(right)).abs() < 0.001;
+        assert!(close(authored.width, px(WORDMARK_MARK_WIDTH)));
+        assert!(close(authored.height, px(WORDMARK_MARK_HEIGHT)));
+        assert!(close(authored.margin_top, px(WORDMARK_MARK_MARGIN_TOP)));
+        assert!(close(authored.top_offset, px(WORDMARK_MARK_TOP_OFFSET)));
+
+        // The mark's box is wider than it is tall, and its ink is drawn to the
+        // viewBox's ratio inside it rather than to the box's own.
+        assert!(authored.width > authored.height);
+        assert!(authored.top_offset < px(0.0), "the mark rides above center");
+
+        for font in [
+            FONT_MICRO,
+            FONT_CAPTION,
+            FONT_BODY,
+            FONT_HEADING,
+            FONT_WORDMARK,
+        ] {
+            let mark = wordmark_mark(px(font));
+            let scale = font / WORDMARK_AUTHORED_FONT;
+            assert!(close(mark.width, px(WORDMARK_MARK_WIDTH * scale)));
+            assert!(close(mark.height, px(WORDMARK_MARK_HEIGHT * scale)));
+            assert!(close(mark.margin_top, px(WORDMARK_MARK_MARGIN_TOP * scale)));
+            assert!(close(mark.top_offset, px(WORDMARK_MARK_TOP_OFFSET * scale)));
+        }
     }
 
     #[test]

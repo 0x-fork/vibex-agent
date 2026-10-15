@@ -11612,15 +11612,13 @@ impl MobileApp {
     /// title line that repeats what the buttons already say.
     ///
     /// The lockup is the desktop wordmark's geometry at this page's type size:
-    /// the mark stays a little wider than the label is tall and rides above the
-    /// baseline, which is what makes the two read as one word.
+    /// the mark stays a little wider than the label is tall and its point lands
+    /// on the label's baseline, which is what makes the two read as one word.
     fn render_pairing_brand(&self) -> impl IntoElement {
-        // The mark's geometry is authored against the 42pt lockup the desktop
-        // ships. Its scale therefore follows the label's *rendered* size, so a
-        // text-size step grows the glyph with the word instead of leaving it
-        // behind at a frozen ratio.
-        let font = f32::from(theme::font_wordmark().to_pixels(theme::rem_base()));
-        let scale = font / 42.0;
+        // The mark is sized from the label's *rendered* size, so a text-size
+        // step grows the glyph with the word instead of leaving it behind at a
+        // frozen ratio.
+        let mark = theme::wordmark_mark(theme::font_wordmark().to_pixels(theme::rem_base()));
         div()
             .debug_selector(|| "pairing-brand".to_string())
             .flex()
@@ -11633,11 +11631,11 @@ impl MobileApp {
             .child(
                 svg()
                     .path("icons/vibex-mark.svg")
-                    .w(px(46.0 * scale))
-                    .h(px(45.0 * scale))
-                    .mt(px(2.0 * scale))
+                    .w(mark.width)
+                    .h(mark.height)
+                    .mt(mark.margin_top)
                     .relative()
-                    .top(px(-6.0 * scale))
+                    .top(mark.top_offset)
                     .flex_shrink_0()
                     .text_color(theme::text_primary()),
             )
@@ -21923,6 +21921,11 @@ impl MobileApp {
         let host_status = self
             .active_host_status()
             .unwrap_or_else(RuntimeStatusView::inactive);
+        // The wordmark the drawer header wears. The label takes the heading
+        // step — the drawer's own title rather than a row among the tree — and
+        // the mark is scaled from that same size, so the two stay one lockup on
+        // one baseline at every text-size step.
+        let brand_mark = theme::wordmark_mark(theme::font_heading().to_pixels(theme::rem_base()));
 
         div()
             .absolute()
@@ -21945,7 +21948,10 @@ impl MobileApp {
                     .gap(px(theme::SPACING_SM))
                     // The sessions page is the phone's home surface, so it wears
                     // the product wordmark: the brand mark supplies the capital
-                    // "V" and the label completes it.
+                    // "V" and the label completes it. The mark's point sits on
+                    // the label's baseline — the geometry the desktop's own
+                    // lockup is authored with — and both halves take the heading
+                    // step, so the word reads as one lockup at any text size.
                     .child(
                         div()
                             .flex_1()
@@ -21953,15 +21959,16 @@ impl MobileApp {
                             .flex()
                             .items_center()
                             .gap(px(1.0))
-                            .text_size(theme::font_sidebar_row())
+                            .text_size(theme::font_heading())
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(
                                 svg()
                                     .path("icons/vibex-mark.svg")
-                                    .size(px(18.0))
-                                    .mt(px(1.0))
+                                    .w(brand_mark.width)
+                                    .h(brand_mark.height)
+                                    .mt(brand_mark.margin_top)
                                     .relative()
-                                    .top(px(-2.0))
+                                    .top(brand_mark.top_offset)
                                     .flex_shrink_0()
                                     .text_color(theme::sidebar_text_primary()),
                             )
@@ -32182,6 +32189,9 @@ mod tests {
         assert!(brand.contains("\"ibex\""));
         assert!(brand.contains(".justify_center()"));
         assert!(!brand.contains("brand/logo.svg"));
+        // The mark is sized from the label's rendered size, not from a pixel
+        // box of its own.
+        assert!(brand.contains("theme::wordmark_mark("));
 
         // Every saved runtime is reachable, and the row scrolls sideways once
         // they stop fitting.
@@ -32241,6 +32251,40 @@ mod tests {
         for panel in ["PairingPanel::Nearby", "PairingPanel::Manual"] {
             assert!(sheet.contains(panel), "the sheet should serve {panel}");
         }
+    }
+
+    /// The drawer's header wears the same lockup as the pairing page, from the
+    /// drawer's own title step.
+    ///
+    /// The label is where the reader's text-size step enters the lockup, so the
+    /// mark has to be scaled from that same size: a box frozen in pixels leaves
+    /// the label's baseline as soon as the step moves, which is the drift the
+    /// drawer used to show. The mark's own chain is checked rather than the
+    /// whole renderer, so the header's buttons stay free to size in pixels.
+    #[test]
+    fn the_drawer_wordmark_scales_both_halves_from_one_size() {
+        let source = include_str!("app.rs");
+        let drawer = renderer_source(source, "render_drawer");
+        assert!(
+            drawer.contains("theme::wordmark_mark("),
+            "the drawer's mark should be scaled from the label's own size"
+        );
+        assert!(
+            drawer.contains(".text_size(theme::font_heading())"),
+            "the drawer's wordmark should take the heading step"
+        );
+        let mark = drawer
+            .split_once("icons/vibex-mark.svg")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split_once("\"ibex\"").map(|(mark, _)| mark))
+            .expect("the drawer's header should still wear the mark beside its label");
+        assert!(mark.contains(".w(brand_mark.width)"));
+        assert!(mark.contains(".h(brand_mark.height)"));
+        assert!(mark.contains(".top(brand_mark.top_offset)"));
+        assert!(
+            !mark.contains(".size(px("),
+            "a frozen box is what put the mark off the label's baseline"
+        );
     }
 
     /// Back closes the open pairing sheet before it does anything else, because
