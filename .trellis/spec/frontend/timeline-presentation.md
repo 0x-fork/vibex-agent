@@ -115,6 +115,13 @@ Transcript::advance_disclosures(&mut self, Instant) -> bool
 - Reasoning content keeps its natural height, bottom-aligned within the
   six-line cap. Answers and commentary use body foreground; reasoning stays
   muted. A turn without process rows has no empty process header.
+- TUI draws work one grey under the prose it produced: an activity row's action
+  and target, and the summary standing for a run of them, wear
+  `TuiTheme::quiet()` (`ThemeRole::gray_quiet`, derived a quarter of the way
+  from the theme's muted grey to its background). The step is a role rather
+  than a fade so the indexed colour tiers keep the same hierarchy; failures
+  stay on `danger` and a running row's mark carries its liveness, so its words
+  are quiet too. Answer, commentary, and reasoning inks are unchanged.
 - A settled, answered turn folds its process section. The fold is only offered
   when the transcript actually draws work for the turn and the turn produced a
   non-empty answer (`complete || superseded` plus a `conclusion_row` body):

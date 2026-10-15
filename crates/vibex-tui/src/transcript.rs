@@ -3183,10 +3183,15 @@ fn render_block_inner(
     // it"; a dense row is showing one line because that is its shape, so only
     // an explicit expansion reveals its body.
     let open = if dense { body_open } else { block.is_open() };
+    // A work row's words are the record of what happened, not the text the
+    // reader came for: they sit one grey under the muted step, so a run of tool
+    // calls recedes behind the answer it produced. Failure stays loud, and a
+    // running row's own mark — its lit bullet and the turn line below — already
+    // says "now", so its words are quiet too.
     let title_style = match block.kind {
         TimelineRowKind::UserMessage => theme.base().add_modifier(Modifier::BOLD),
         _ if block.activity.is_some() && block.failed => theme.danger(),
-        _ if block.activity.is_some() => theme.muted(),
+        _ if block.activity.is_some() => theme.quiet(),
         _ => theme.base(),
     };
     let mut parts: Vec<(String, Style)> = Vec::new();
@@ -3199,13 +3204,15 @@ fn render_block_inner(
             theme.dimmed(theme.roles.gray).add_modifier(Modifier::BOLD),
         ));
     }
+    // The row that stands for a run of work is a summary of it, not the work:
+    // it wears the same quiet grey as the rows it folds.
+    let (heading, title_style) = if let Some(summary) = &block.group_summary {
+        (summary.label(strings.locale), theme.quiet())
+    } else if let Some(activity) = &block.activity {
+        (activity.action().to_string(), title_style)
     // A notice's title is its severity and its body is the sentence, so the
     // sentence is what the row shows — with the severity carried by colour
     // rather than by a word the reader has to skip.
-    let (heading, title_style) = if let Some(summary) = &block.group_summary {
-        (summary.label(strings.locale), theme.muted())
-    } else if let Some(activity) = &block.activity {
-        (activity.action().to_string(), title_style)
     } else if matches!(block.kind, TimelineRowKind::SystemNotice) {
         let style = match block.title.trim() {
             "Warning" => theme.warning(),

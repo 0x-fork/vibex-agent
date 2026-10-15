@@ -8370,6 +8370,129 @@ fn a_running_session_reads_as_rows() {
     );
 }
 
+/// A tool row is the record of what happened, not the text the reader came for.
+///
+/// The commands a turn ran — and the summary that stands for a run of them —
+/// sit one grey under the muted step, so the answer they produced keeps the
+/// eye. The step is a role rather than a fade, so an indexed palette draws the
+/// same hierarchy.
+#[test]
+fn tool_rows_are_quieter_than_the_prose_beside_them() {
+    let mut app = app(110, 30);
+    app.navigate_to(Page::Agent);
+    let session_id = vibex_core::VibexSessionId::new();
+    let command = |sequence: i64, command: &str| {
+        seeded_item(
+            &session_id,
+            sequence,
+            vibex_core::TimelineItemKind::ToolCall,
+            vibex_core::TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+                tool_call_id: format!("call-{sequence}"),
+                tool_name: "execute".to_string(),
+                status: vibex_core::ToolCallStatus::Completed,
+                summary: "execute".to_string(),
+                input_summary: Some(format!("{{\"command\":\"{command}\"}}")),
+                output_summary: None,
+                raw_extension: None,
+            }),
+        )
+    };
+    let user = seeded_item(
+        &session_id,
+        1,
+        vibex_core::TimelineItemKind::UserMessage,
+        vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+            text: "make the timeline readable".to_string(),
+            attachments: Vec::new(),
+            ..Default::default()
+        }),
+    );
+    let answer = seeded_item(
+        &session_id,
+        5,
+        vibex_core::TimelineItemKind::AgentMessage,
+        vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+            text: "Done: the work rows now sit a step down.".to_string(),
+            is_final: true,
+        }),
+    );
+    app.agent.state.selected_session_id = Some(session_id.clone());
+    app.agent.state.timeline.replace_authoritative(
+        session_id.clone(),
+        vec![
+            user,
+            command(2, "cargo test -p vibex-tui"),
+            command(3, "cargo clippy -p vibex-tui"),
+            command(4, "cargo fmt --check"),
+            answer,
+        ],
+    );
+    app.sync_transcript();
+
+    // The turn is settled and answered, so its process folds behind the
+    // divider: the work is what the reader opens to see it.
+    let control = app
+        .transcript
+        .blocks()
+        .iter()
+        .position(|block| {
+            block
+                .fold
+                .as_ref()
+                .is_some_and(vibex_tui::transcript::TurnFold::is_control)
+        })
+        .expect("a settled, answered turn owns a fold control");
+    assert!(app.transcript.toggle_block(control));
+    assert!(
+        app.transcript.blocks()[1].group.is_head(),
+        "the three commands are not one run"
+    );
+
+    // The run is folded into its summary, which is the one row standing for the
+    // three commands while the group is shut.
+    let label = app.transcript.blocks()[1]
+        .group_summary
+        .clone()
+        .expect("the run of commands is one summary")
+        .label(app.strings.locale);
+    let buffer = render_buffer(&mut app, 110, 30);
+    let summary_inks = label_inks(&buffer, &label);
+    assert!(
+        summary_inks
+            .iter()
+            .all(|ink| *ink == app.theme.roles.gray_quiet),
+        "the group summary is not drawn quietly: {summary_inks:?}"
+    );
+
+    // Opened, the commands themselves are rows of the same grey.
+    assert!(app.transcript.toggle_block(1));
+    let buffer = render_buffer(&mut app, 110, 30);
+    let command_inks = label_inks(&buffer, "cargo clippy");
+    assert!(
+        command_inks
+            .iter()
+            .all(|ink| *ink == app.theme.roles.gray_quiet),
+        "the tool row is not drawn quietly: {command_inks:?}"
+    );
+
+    // The answer below the work is prose, and it is the brighter of the two:
+    // that difference is what the reader scans by.
+    let prose_ink = app.theme.prose().fg.expect("prose is drawn in ink");
+    let prose_inks = label_inks(&buffer, "Done: the work rows");
+    assert!(
+        prose_inks.iter().all(|ink| *ink == prose_ink),
+        "the answer is not drawn as prose: {prose_inks:?}"
+    );
+    assert_ne!(
+        app.theme.roles.gray_quiet, prose_ink,
+        "the tool row and the prose it produced are the same grey"
+    );
+    assert!(
+        command_inks[0] != app.theme.roles.gray,
+        "a work row still wears the muted grey"
+    );
+}
+
 #[test]
 fn the_runtime_chosen_on_the_new_session_page_is_not_the_old_sessions() {
     // With a session open, pressing `n` opens the composing page — and the

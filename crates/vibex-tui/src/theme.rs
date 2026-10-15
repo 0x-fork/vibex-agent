@@ -369,8 +369,8 @@ impl Default for ColorCapability {
 ///   a distinct plane rather than as text on the same canvas;
 /// * **rails** — the accent colour for each kind of transcript block, which is
 ///   how a reader tells a tool call from a thought without reading the label;
-/// * **grey** — three steps, because "dim punctuation", "muted body" and
-///   "secondary label" are three different jobs;
+/// * **grey** — four steps, because "dim punctuation", "muted body",
+///   "secondary label" and "a work row's record" are four different jobs;
 /// * **semantic** — a command is not an error. `path` is the exception that
 ///   proves the rule: a location is where the reader already is, so it takes the
 ///   secondary grey rather than a hue, and colour on a status row keeps meaning
@@ -409,6 +409,9 @@ pub struct ThemeRole {
     pub gray_bright: Color,
     /// The default grey: muted body, collapsed summaries.
     pub gray: Color,
+    /// A work row's record: what a tool did, one step under `gray` so the text
+    /// it produced keeps the eye, one step over `gray_dim` so it stays read.
+    pub gray_quiet: Color,
     /// Dimmest: punctuation, separators, chrome.
     pub gray_dim: Color,
 
@@ -678,11 +681,19 @@ impl TuiTheme {
 
             foreground: color(foreground_rgb),
             text_secondary: color(token("secondary-foreground", foreground_rgb)),
-            // Three greys derived from the one the catalogue ships: the bright
-            // step leans toward the foreground, the dim step away from it. A
-            // single muted token cannot carry three jobs.
+            // Four greys derived from the one the catalogue ships: the bright
+            // step leans toward the foreground, the quiet and dim steps away
+            // from it. A single muted token cannot carry four jobs.
             gray_bright: color(bright_rgb),
             gray: color(token("muted-foreground", foreground_rgb)),
+            // A quarter of the way to the page: a work row has to recede from
+            // the prose it sits under without becoming the chrome that
+            // `gray_dim` carries.
+            gray_quiet: color(mix_rgb(
+                token("muted-foreground", foreground_rgb),
+                background_rgb,
+                0.25,
+            )),
             gray_dim: color(mix_rgb(
                 token("muted-foreground", foreground_rgb),
                 background_rgb,
@@ -801,6 +812,18 @@ impl TuiTheme {
 
     pub fn muted(&self) -> Style {
         Style::default().fg(self.roles.gray)
+    }
+
+    /// A record of work rather than something to read: the tool rows and the
+    /// summaries that stand for a run of them.
+    ///
+    /// One step under [`Self::muted`] and one over the chrome [`Self::dimmed`]
+    /// draws, so a session's answers keep the eye while the commands that
+    /// produced them stay legible. The step is a role rather than a fade,
+    /// because an indexed palette cannot blend and would otherwise draw the
+    /// work as loudly as the prose.
+    pub fn quiet(&self) -> Style {
+        Style::default().fg(self.roles.gray_quiet)
     }
 
     /// Running prose: one step below `foreground`, so headings, emphasis and
@@ -1318,6 +1341,49 @@ mod tests {
                     "{} lost its danger colour",
                     definition.id
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn every_shipped_theme_keeps_its_grey_ladder_stepped() {
+        // A work row wears the quiet grey and the chrome under it the dim one;
+        // the prose beside it wears the bright one. Steps that collapsed would
+        // draw every tool call as loudly as the answer it produced — in the
+        // true-colour tier that blends them and in the indexed one that
+        // quantizes them, which is where a step is easiest to lose. The bright
+        // step is checked against the quiet one rather than against the muted
+        // one: several themes already resolve those two to the same index, and
+        // that pair is not the hierarchy this test is about.
+        for mode in [ColorMode::TrueColor, ColorMode::Ansi256] {
+            let capability = ColorCapability {
+                mode,
+                glyphs: GlyphMode::Unicode,
+            };
+            for theme_mode in GpuiThemeMode::ALL {
+                for definition in theme_catalog::themes_for(theme_mode) {
+                    let theme = TuiTheme::from_definition(definition, capability);
+                    let steps = [
+                        theme.roles.gray,
+                        theme.roles.gray_quiet,
+                        theme.roles.gray_dim,
+                    ];
+                    let distinct = steps
+                        .iter()
+                        .map(|colour| format!("{colour:?}"))
+                        .collect::<std::collections::BTreeSet<_>>();
+                    assert_eq!(
+                        distinct.len(),
+                        steps.len(),
+                        "{} collapses its grey steps in {mode:?}",
+                        definition.id
+                    );
+                    assert_ne!(
+                        theme.roles.gray_bright, theme.roles.gray_quiet,
+                        "{} draws prose and work in one grey in {mode:?}",
+                        definition.id
+                    );
+                }
             }
         }
     }
