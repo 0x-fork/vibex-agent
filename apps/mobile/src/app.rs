@@ -23222,6 +23222,45 @@ impl MobileApp {
                                                 .text_color(theme::sidebar_text_secondary()),
                                         ),
                                 )
+                                // The switch above clears the list only once
+                                // everything is on it; a partial selection has
+                                // no way back to none without tapping every row
+                                // again, which is the state the desktop keeps a
+                                // Clear button for.
+                                .when(!self.sidebar_state.selected_ids.is_empty(), |bar| {
+                                    bar.child(
+                                        div()
+                                            .id("mobile-sidebar-batch-clear")
+                                            .aria_label(
+                                                locale::text(
+                                                    "Clear selection",
+                                                    "清除选择",
+                                                    "清除選取",
+                                                )
+                                                .to_string(),
+                                            )
+                                            .size(px(32.0))
+                                            .rounded(px(theme::RADIUS_CONTROL))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .active(|style| style.bg(theme::row_pressed_bg()))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.sidebar_state.clear_selection();
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(
+                                                svg()
+                                                    .path("icons/x.svg")
+                                                    .size(px(16.0))
+                                                    .text_color(theme::sidebar_text_secondary()),
+                                            ),
+                                    )
+                                })
                                 .child(
                                     div()
                                         .id("mobile-sidebar-batch-pin")
@@ -30277,7 +30316,12 @@ fn sidebar_workspace_status_color(state: Option<AgentSessionState>) -> gpui::Hsl
         Some(AgentSessionState::NeedsInput) => theme::accent_yellow(),
         Some(AgentSessionState::Error) => theme::accent_red(),
         Some(AgentSessionState::Idle) => theme::accent_green(),
-        Some(AgentSessionState::Archived | AgentSessionState::Closed) | None => theme::accent_dim(),
+        // Nothing to report is the same dim mark the desktop draws for a
+        // worktree whose sessions are all quiet: a faint dot that says the row
+        // was looked at, rather than a muted token of its own.
+        Some(AgentSessionState::Archived | AgentSessionState::Closed) | None => {
+            theme::sidebar_foreground(0.28)
+        }
     }
 }
 
@@ -31021,7 +31065,12 @@ fn sidebar_session_status_indicator(
         AgentSessionState::Archived | AgentSessionState::Closed => {
             sidebar_status_dot(theme::sidebar_foreground(0.35))
         }
-        AgentSessionState::Idle => sidebar_status_dot(theme::sidebar_foreground(0.78)),
+        // The desktop paints an idle session's mark in the success colour at a
+        // lower opacity: the same green a completion wears, held back so it does
+        // not read as news. The branch is unreachable from a session row — an
+        // idle row reports its hour instead of a mark — but it is the projection
+        // every row would use if that gate ever moved.
+        AgentSessionState::Idle => sidebar_status_dot(theme::accent_green().opacity(0.78)),
     }
 }
 
