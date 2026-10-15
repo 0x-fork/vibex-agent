@@ -3573,7 +3573,7 @@ mod tests {
         let worker = isolation_worker();
         let mut app = isolation_app();
         let session_id = vibex_core::VibexSessionId::new();
-        app.note_pending_session_title(&session_id, "  Fix   the flake  ");
+        app.note_pending_session_title(&session_id, "  Fix   the flake  ", &[]);
 
         apply_message(
             &mut app,
