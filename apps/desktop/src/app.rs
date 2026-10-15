@@ -8858,6 +8858,17 @@ pub struct VibexWorkbench {
     new_session_project_menu_close_task: Option<Task<()>>,
     initial_new_session_panel_handled: bool,
     initial_new_session_setup_pending: bool,
+    /// Whether removing the open session should land on the New Session home.
+    ///
+    /// Deleting or archiving the session the reader is looking at takes the
+    /// timeline with it, and the frame that follows has no choice left to
+    /// offer: the session is gone on purpose. The workbench opens the New
+    /// Session home instead of the "create or select a session" placeholder,
+    /// which is the same page the reader would reach by asking for a new
+    /// session. The navigation itself needs the window, so the flag is
+    /// consumed by the render pass, next to the startup setup that defers for
+    /// the same reason.
+    session_removal_new_session_pending: bool,
     agent_snapshots: Vec<AgentSnapshotEntry>,
     new_session_agent_id: Option<AgentId>,
     new_session_runtime_selection: Option<SessionRuntimeSelection>,
@@ -10380,6 +10391,7 @@ impl VibexWorkbench {
             new_session_project_menu_close_task: None,
             initial_new_session_panel_handled: false,
             initial_new_session_setup_pending: false,
+            session_removal_new_session_pending: false,
             agent_snapshots: Vec::new(),
             new_session_agent_id: None,
             new_session_runtime_selection: None,
@@ -35399,7 +35411,9 @@ impl VibexWorkbench {
     /// `removal` decides how long the row is allowed to stay hidden: a deletion
     /// is terminal and keeps the id until a load reconciles it, while an archive
     /// is a reversible removal that stops hiding the row as soon as the runtime
-    /// confirms it.
+    /// confirms it. Taking the session the reader was reading is the one case
+    /// that also navigates: the page it was showing is gone, so the workbench
+    /// goes to the New Session home.
     fn optimistically_remove_sessions(
         &mut self,
         session_ids: &BTreeSet<String>,
@@ -35487,6 +35501,17 @@ impl VibexWorkbench {
             self.composer_attachments.clear();
             self.composer_command_entry = None;
             self.clear_suggestions();
+            // The reader was looking at the session that just left, so the
+            // page this frame renders is gone with it. The New Session home
+            // takes that page's place instead of the "create or select a
+            // session" placeholder, which would ask for a choice the removal
+            // already made. Opening it here keeps the placeholder from being
+            // painted at all; the window-aware half of the navigation runs in
+            // the render pass, the same way the startup setup does.
+            if session_removal_opens_new_session_home(&self.ui_state.workbench.active_tab) {
+                self.new_session_open = true;
+                self.session_removal_new_session_pending = true;
+            }
         }
         self.reconcile_sidebar_state();
         self.publish_sidebar_invalidation();
@@ -79812,6 +79837,17 @@ fn resolve_initial_new_session_open(
     currently_open || sessions_empty || startup_destination == StartupDestination::NewSession
 }
 
+/// Whether removing the open session sends the workbench to the New Session
+/// home.
+///
+/// Only the Agent tab draws that session — and the "create or select a session"
+/// placeholder that would take its place — so only a removal made from there
+/// navigates. An archive the background pass runs while the reader is in
+/// settings leaves them on the page they are reading.
+fn session_removal_opens_new_session_home(active_tab: &str) -> bool {
+    active_tab == "agent"
+}
+
 fn shortcut_is_valid(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 80
@@ -79898,6 +79934,20 @@ impl Render for VibexWorkbench {
             window.defer(cx, move |window, cx| {
                 let _ = workbench.update(cx, |this, cx| {
                     if this.new_session_open && !this.new_session_draft_initialized {
+                        this.open_new_session(None, window, cx);
+                    }
+                });
+            });
+        }
+        if self.session_removal_new_session_pending {
+            self.session_removal_new_session_pending = false;
+            let workbench = cx.weak_entity();
+            window.defer(cx, move |window, cx| {
+                let _ = workbench.update(cx, |this, cx| {
+                    // A session selected between the removal and this frame is
+                    // the page the reader asked for: selecting one closes the
+                    // home, and a closed home is left closed.
+                    if this.new_session_open && this.selected_session_id.is_none() {
                         this.open_new_session(None, window, cx);
                     }
                 });
@@ -87560,6 +87610,20 @@ mod tests {
         assert!(optimistic_state.contains("self.session_views\n            .retain"));
         assert!(optimistic_state.contains("self.reconcile_sidebar_state();"));
         assert!(optimistic_state.contains("self.reconcile_sidebar_state();"));
+        // A removal that takes the page the reader is on hands the workbench
+        // the New Session home, and only from the tab that was showing it.
+        let selection_cleared = optimistic_state
+            .find("self.selected_session_id = None;")
+            .expect("removal should clear the removed session's selection");
+        let home_opened = optimistic_state
+            .find("self.new_session_open = true;")
+            .expect("removal should open the New Session home");
+        let deferred = optimistic_state
+            .find("self.session_removal_new_session_pending = true;")
+            .expect("the window-aware half of the navigation should be deferred");
+        assert!(selection_cleared < home_opened);
+        assert!(home_opened < deferred);
+        assert!(optimistic_state.contains("session_removal_opens_new_session_home("));
 
         let completion = source
             .split_once("    fn finish_optimistic_session_deletion(")
@@ -95271,6 +95335,44 @@ mod tests {
             .find("this.open_new_session(None, window, cx);")
             .expect("startup should reuse the normal New Session flow");
         assert!(pending < open);
+    }
+
+    /// Losing the open session is not a prompt to choose one: the workbench
+    /// already knows what the reader wants next, because removing the session
+    /// is what closed it. The render pass runs the window-aware half of the
+    /// navigation the removal asked for, and it only runs it while the home is
+    /// still open and nothing has been selected in the meantime.
+    #[test]
+    fn removing_the_open_session_defers_the_new_session_home_setup_to_render() {
+        let source = include_str!("app.rs");
+        let render = source
+            .split_once("impl Render for VibexWorkbench")
+            .map(|(_, body)| body)
+            .expect("workbench render should remain inspectable");
+        let pending = render
+            .find("if self.session_removal_new_session_pending {")
+            .expect("a removal should defer its window-aware setup");
+        let open = render[pending..]
+            .find("this.open_new_session(None, window, cx);")
+            .expect("a removal should reuse the normal New Session flow");
+        assert!(
+            render[pending..pending + open]
+                .contains("if this.new_session_open && this.selected_session_id.is_none()")
+        );
+
+        // The flag is consumed by the frame that acts on it, so a later render
+        // cannot repeat the navigation.
+        assert!(render[pending..].contains("self.session_removal_new_session_pending = false;"));
+    }
+
+    /// The tab that was drawing the removed session is the only one that
+    /// navigates: an archive the background pass runs while the reader is in
+    /// settings must not pull them out of the page they are reading.
+    #[test]
+    fn only_the_agent_tab_opens_the_new_session_home_after_a_removal() {
+        assert!(session_removal_opens_new_session_home("agent"));
+        assert!(!session_removal_opens_new_session_home("management"));
+        assert!(!session_removal_opens_new_session_home("usage"));
     }
 
     #[test]
