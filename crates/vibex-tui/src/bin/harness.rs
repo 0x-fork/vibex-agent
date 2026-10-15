@@ -37,6 +37,14 @@ fn main() {
     };
     match vibex_tui::run(DisconnectedBackend::facade(), options) {
         Ok(ExitReason::UserQuit) | Ok(ExitReason::ConnectionLost) => {}
+        // The real client restarts itself as the runtime's owner here. The
+        // harness cannot: its backend is a disconnected one that never offers
+        // the home, so a handover would be a state this seat cannot reach, and
+        // saying so beats exiting quietly on a reason nothing asked for.
+        Ok(ExitReason::Handover) => {
+            eprintln!("unexpected_handover: the harness backend cannot offer a runtime home");
+            std::process::exit(1);
+        }
         Err(error) => {
             // Printed outside the alternate screen: `run` restores the
             // terminal before returning, so this reaches the real stdout.
