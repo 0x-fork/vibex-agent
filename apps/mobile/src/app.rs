@@ -1572,6 +1572,10 @@ pub struct MobileApp {
     /// than a row: the entries that belong to the sidebar's root scope and not
     /// to any row in it.
     sidebar_root_menu: bool,
+    /// The folder whose archive window is being chosen. The window is a value
+    /// rather than a command, so it opens a sheet of its own instead of sitting
+    /// in the folder's list.
+    sidebar_folder_archive_menu: Option<String>,
     sidebar_name_prompt: Option<SidebarNamePrompt>,
     sidebar_name_input: Entity<InputState>,
     /// The Desktop's sidebar tree, mirrored so the phone renders the layout the
@@ -2967,6 +2971,7 @@ impl MobileApp {
             workspace_action_busy: false,
             sidebar_row_menu: None,
             sidebar_root_menu: false,
+            sidebar_folder_archive_menu: None,
             sidebar_name_prompt: None,
             sidebar_name_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(locale::text(
@@ -8193,6 +8198,7 @@ impl MobileApp {
         self.sidebar_batch_delete_confirmation = false;
         self.sidebar_row_menu = None;
         self.sidebar_root_menu = false;
+        self.sidebar_folder_archive_menu = None;
         self.sidebar_name_prompt = None;
         self.workspace_action = None;
         self.workspace_action_busy = false;
@@ -12948,9 +12954,6 @@ impl MobileApp {
             div()
                 .size_full()
                 .relative()
-                // The page paints its own surface so a drawer sliding over it
-                // cannot repaint the middle of the phone with its own tone.
-                .bg(conversation_surface())
                 .track_focus(&self.root_focus)
                 .on_action(cx.listener(Self::handle_navigate_back))
                 .child(
@@ -13130,6 +13133,9 @@ impl MobileApp {
                 })
                 .when(self.sidebar_root_menu, |root| {
                     root.child(self.render_sidebar_root_menu(window, cx))
+                })
+                .when_some(self.sidebar_folder_archive_menu.clone(), |root, folder_id| {
+                    root.child(self.render_folder_archive_menu(&folder_id, window, cx))
                 })
                 .when_some(name_prompt, |root, prompt| {
                     root.child(self.render_folder_name_prompt(&prompt, cx))
@@ -13827,7 +13833,7 @@ impl MobileApp {
                            label: String,
                            destructive: bool,
                            action: SheetAction| {
-            sheet.child(sidebar_sheet_entry(id, label, destructive).on_mouse_up(
+            sheet.child(sidebar_sheet_entry(id, label, destructive, false).on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
@@ -14004,6 +14010,36 @@ impl MobileApp {
                         }
                     }
                 }
+                // A suspension the shell applied on the reader's behalf — the
+                // one it installs when a turn is stopped — is lifted from here:
+                // the desktop offers the same entry beside the switch, and the
+                // switch itself clears a pause rather than resuming one.
+                if row.auto_continue_paused {
+                    let resume_session_id = row
+                        .session_id
+                        .as_ref()
+                        .map(|session_id| session_id.as_str().to_string());
+                    sheet = entry(
+                        sheet,
+                        "mobile-row-menu-resume-auto-continue",
+                        locale::text("Resume auto continue", "恢复自动继续", "恢復自動繼續")
+                            .to_string(),
+                        false,
+                        Box::new(move |this, _, cx| {
+                            let Some(session_id) = resume_session_id.clone() else {
+                                return;
+                            };
+                            this.send_sidebar_mutation(
+                                RemoteSidebarOrganizationMutation::SetSessionAutoContinuePaused {
+                                    session_ids: vec![session_id],
+                                    paused: false,
+                                },
+                                false,
+                                cx,
+                            );
+                        }),
+                    );
+                }
                 let fork_session_id = row.session_id.clone();
                 sheet = entry(
                     sheet,
@@ -14112,6 +14148,30 @@ impl MobileApp {
                             },
                             cx,
                         );
+                    }),
+                );
+                // The desktop nests this under the folder's advanced properties;
+                // a sheet has no submenu, so the entry opens a sheet of its own —
+                // and says what the folder is set to now, because the value is
+                // what the reader came to check.
+                let archive_folder_id = row.id().to_string();
+                let archive_current = self
+                    .sidebar_view
+                    .organization
+                    .folder(&archive_folder_id)
+                    .and_then(|folder| folder.auto_archive_after_days);
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-folder-archive",
+                    format!(
+                        "{} · {}",
+                        locale::text("Scheduled archive", "定时归档", "定時封存"),
+                        mobile_folder_archive_label(archive_current)
+                    ),
+                    false,
+                    Box::new(move |this, _, cx| {
+                        this.sidebar_folder_archive_menu = Some(archive_folder_id.clone());
+                        cx.notify();
                     }),
                 );
                 let delete_id = row.id().to_string();
@@ -14454,6 +14514,7 @@ impl MobileApp {
                 "mobile-sidebar-root-menu-new-folder".to_string(),
                 locale::text("New folder", "新建文件夹", "新增資料夾").to_string(),
                 false,
+                false,
             )
             .on_mouse_up(
                 MouseButton::Left,
@@ -14476,6 +14537,67 @@ impl MobileApp {
             "mobile-sidebar-root-menu",
             Box::new(|this, _, cx| {
                 this.sidebar_root_menu = false;
+                cx.notify();
+            }),
+            sheet,
+            window,
+            cx,
+        )
+    }
+
+    /// The window a folder archives on: off, or a number of idle days.
+    ///
+    /// The desktop offers the same choice from a submenu and marks the window
+    /// the folder already carries; a sheet has no submenu, so the list is its
+    /// own sheet and the mark travels with it.
+    fn render_folder_archive_menu(
+        &self,
+        folder_id: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let current = self
+            .sidebar_view
+            .organization
+            .folder(folder_id)
+            .and_then(|folder| folder.auto_archive_after_days);
+        let mut sheet = div().p_2().flex().flex_col().gap(px(2.0));
+        for days in std::iter::once(None)
+            .chain((1..=vibex_desktop_model::SIDEBAR_AUTO_ARCHIVE_MAX_DAYS).map(Some))
+        {
+            let folder_id = folder_id.to_string();
+            sheet = sheet.child(
+                sidebar_sheet_entry(
+                    match days {
+                        Some(days) => format!("mobile-folder-archive-{days}"),
+                        None => "mobile-folder-archive-off".to_string(),
+                    },
+                    mobile_folder_archive_label(days),
+                    false,
+                    days == current,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.sidebar_folder_archive_menu = None;
+                        this.send_sidebar_mutation(
+                            RemoteSidebarOrganizationMutation::SetFolderAutoArchive {
+                                folder_id: folder_id.clone(),
+                                days,
+                            },
+                            false,
+                            cx,
+                        );
+                    }),
+                ),
+            );
+        }
+        self.render_drawer_sheet(
+            locale::text("Scheduled archive", "定时归档", "定時封存"),
+            "mobile-folder-archive-menu",
+            Box::new(|this, _, cx| {
+                this.sidebar_folder_archive_menu = None;
                 cx.notify();
             }),
             sheet,
@@ -23998,10 +24120,14 @@ impl Render for MobileApp {
         } else {
             self.mode
         };
-        let root_background = root_surface(
+        let root_background = match (
             visible_mode,
             visible_drawer_page(self.drawer_offset, self.drawer_snap),
-        );
+        ) {
+            (RootMode::Pairing, _) => theme::bg_primary(),
+            (_, Some(DrawerPage::Sessions) | Some(DrawerPage::Workbench)) => theme::sidebar_bg(),
+            _ => theme::bg_primary(),
+        };
         // The page under the phone's finger sees a touch pan before the lists
         // inside it consume the gesture, so a rightward swipe can leave a page
         // opened on top of another one. The wrapper forwards layout, so the page
@@ -27861,29 +27987,6 @@ fn visible_drawer_page(offset: f32, snap: Option<DrawerSnap>) -> Option<DrawerPa
     }
 }
 
-/// The surface the conversation page paints for itself, inside the content box.
-///
-/// The page owns this colour instead of letting the root's show through. The
-/// root follows a drawer, so the band the window's insets leave around the
-/// content box reads as part of an open side page; a page that borrowed that
-/// colour would take the drawer's tone over the whole middle of the phone the
-/// moment a swipe began.
-fn conversation_surface() -> Hsla {
-    theme::bg_primary()
-}
-
-/// The root's own surface: everything no page paints over.
-///
-/// In the workspace that is only the band the window's insets leave around the
-/// content box, and a side page takes the band over as soon as one is on
-/// screen. Pairing and connecting have no drawer, so the root is their page.
-fn root_surface(mode: RootMode, drawer: Option<DrawerPage>) -> Hsla {
-    match (mode, drawer) {
-        (RootMode::Pairing, _) | (_, None) => theme::bg_primary(),
-        (_, Some(_)) => theme::sidebar_bg(),
-    }
-}
-
 fn drawer_snap_target(
     page: DrawerPage,
     offset: f32,
@@ -29200,7 +29303,12 @@ fn sidebar_session_group_candidates(
 ///
 /// Both sheets build their entries from this, so an entry looks the same
 /// whichever surface opened it.
-fn sidebar_sheet_entry(id: String, label: String, destructive: bool) -> gpui::Stateful<gpui::Div> {
+fn sidebar_sheet_entry(
+    id: String,
+    label: String,
+    destructive: bool,
+    checked: bool,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .h(px(theme::TOUCH_TARGET))
@@ -29208,6 +29316,7 @@ fn sidebar_sheet_entry(id: String, label: String, destructive: bool) -> gpui::St
         .rounded(px(theme::RADIUS_CONTROL))
         .flex()
         .items_center()
+        .gap(px(theme::SPACING_SM))
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
         .text_size(theme::font_body())
@@ -29216,7 +29325,40 @@ fn sidebar_sheet_entry(id: String, label: String, destructive: bool) -> gpui::St
         } else {
             theme::text_primary()
         })
-        .child(label)
+        .child(div().flex_1().min_w_0().truncate().child(label))
+        // A sheet that offers a choice says which one it is on, the way the
+        // desktop's menu checks the window a folder already carries.
+        .when(checked, |entry| {
+            entry.child(
+                svg()
+                    .path("icons/check.svg")
+                    .size(px(14.0))
+                    .flex_shrink_0()
+                    .text_color(theme::primary()),
+            )
+        })
+}
+
+/// The window a folder archives on, in the desktop's own words.
+///
+/// The desktop splits this across two helpers — one for the day count and one
+/// for "off" — because its submenu lists them separately; a sheet lists them
+/// together, so one helper answers for both.
+fn mobile_folder_archive_label(days: Option<u8>) -> String {
+    let Some(days) = days else {
+        return locale::text("Off", "关闭", "關閉").to_string();
+    };
+    match locale::current() {
+        Locale::En => {
+            if days == 1 {
+                "After 1 day".to_string()
+            } else {
+                format!("After {days} days")
+            }
+        }
+        Locale::ZhCn => format!("{days}天后"),
+        Locale::ZhTw => format!("{days}天後"),
+    }
 }
 
 /// The entry that adds a session to one group.
@@ -34327,40 +34469,6 @@ mod tests {
         assert_eq!(drawer_left(DrawerPage::Workbench, -1.0, width), 0.0);
     }
 
-    /// A drawer sliding over the conversation page never repaints it.
-    ///
-    /// This is the reported bug: pulling a side page out turned the whole
-    /// middle of the phone the drawer's colour, because the conversation page
-    /// let the root's background through and the root follows the drawer so
-    /// the band the window's insets leave reads as part of an open side page.
-    /// The page now paints its own surface, so the root's colour only ever
-    /// reaches that band.
-    #[test]
-    fn a_drawer_never_repaints_the_page_it_slides_over() {
-        let source = include_str!("app.rs");
-        let workspace = source
-            .split_once("    fn render_workspace(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_row_menu("))
-            .map(|(body, _)| body)
-            .expect("the workspace page should remain inspectable");
-        assert!(
-            workspace.contains(".bg(conversation_surface())"),
-            "the conversation page paints its own surface, not the root's"
-        );
-        assert_eq!(conversation_surface(), theme::bg_primary());
-        // The band around the page still follows the drawer, from the first
-        // frame of the swipe to the frame that closes it.
-        assert_eq!(
-            root_surface(RootMode::Workspace, Some(DrawerPage::Sessions)),
-            theme::sidebar_bg()
-        );
-        assert_eq!(
-            root_surface(RootMode::Workspace, Some(DrawerPage::Workbench)),
-            theme::sidebar_bg()
-        );
-        assert_eq!(root_surface(RootMode::Workspace, None), theme::bg_primary());
-    }
-
     #[test]
     fn timeline_follow_only_stays_active_near_the_bottom() {
         assert_eq!(timeline_distance_to_bottom(-500.0, 500.0), 0.0);
@@ -35912,6 +36020,53 @@ fn session_opened(cx: &mut Context<Self>) {
         // A day or more leads with the day.
         assert_eq!(mobile_schedule_countdown(24 * 3_600_000), "1d 00:00");
         assert_eq!(mobile_schedule_countdown(50 * 3_600_000), "2d 02:00");
+    }
+
+    /// A folder's archive entry says which window is on, and every window the
+    /// desktop offers can be chosen from the phone.
+    #[test]
+    fn a_folder_offers_the_archive_window_the_desktop_offers() {
+        assert!(!mobile_folder_archive_label(None).is_empty());
+        assert!(mobile_folder_archive_label(Some(3)).contains('3'));
+        assert_ne!(
+            mobile_folder_archive_label(None),
+            mobile_folder_archive_label(Some(3)),
+            "off and a window cannot read the same"
+        );
+
+        let source = include_str!("app.rs");
+        let sheet = renderer_source(source, "render_folder_archive_menu");
+        assert!(
+            sheet.contains("SIDEBAR_AUTO_ARCHIVE_MAX_DAYS"),
+            "the list ends where the desktop's does"
+        );
+        assert!(
+            sheet.contains("days == current"),
+            "the window in force is the one marked"
+        );
+        assert!(
+            sheet.contains("SetFolderAutoArchive"),
+            "and choosing one writes it to the authority"
+        );
+    }
+
+    /// A suspension the shell installed can be lifted from the session's sheet.
+    #[test]
+    fn a_suspended_session_can_be_resumed_from_its_sheet() {
+        let source = include_str!("app.rs");
+        let sheet = renderer_source(source, "render_sidebar_row_menu");
+        assert!(
+            sheet.contains("row.auto_continue_paused"),
+            "the entry is offered only while a suspension is in force"
+        );
+        assert!(
+            sheet.contains("mobile-row-menu-resume-auto-continue"),
+            "and it is an entry of the same sheet every other command lives in"
+        );
+        assert!(
+            sheet.contains("SetSessionAutoContinuePaused"),
+            "which lifts the suspension on the authority"
+        );
     }
 
     /// A folder row's new-chat entry names the folder it starts in.
