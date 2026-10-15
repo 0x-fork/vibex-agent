@@ -134,8 +134,9 @@ pnpm check:mobile-native              native mobile crate and project contract
 | A gpui-kit bump adds or removes a color token the palette bridge does not map | `cargo test -p vibex-ui` fails on `the_bridge_covers_every_framework_token`. |
 | The vendored `GpuiInputActivity` package or class name changes | `pnpm check:mobile-native` fails; the JNI export would no longer match. |
 | An unapproved or missing SPDX selection enters the graph | `pnpm check:licenses` fails; do not silently broaden the policy. |
-| A font or icon asset moves between trees | Update the policy `assetInputs`/`fontInputs` count and tree hash in the same change. |
-| Generated SBOM, notices, or baseline inventory drift | Regenerate the owning artifact and rerun its verification command. |
+| A font or icon asset moves between trees | Update the policy `assetInputs`/`fontInputs` count and tree hash in the same change; see [Audited Asset Provenance Pin](#scenario-audited-asset-provenance-pin-and-generated-license-artifacts). |
+| A workspace crate is added or removed | The license graph approves it from `license.workspace`, but the SBOM and the notices stay stale until `node scripts/check-licenses.mjs --write` runs. |
+| Generated SBOM, notices, or baseline inventory drift | Regenerate the owning artifact and rerun its verification command. `--write` never rewrites a policy pin, so a stale pin is a separate repair. |
 
 ### 5. Good / Base / Bad Cases
 
@@ -277,4 +278,133 @@ Package libpdfium.so, let linuxdeploy rewrite it arbitrarily, and retain only LI
 ```text
 Verify source SHA-256 -> package all reviewed licenses -> permit only $ORIGIN RUNPATH
 -> compare Build ID and NEEDED -> record transformed SHA-256 -> run packaged --probe.
+```
+
+## Scenario: Audited Asset Provenance Pin And Generated License Artifacts
+
+### 1. Scope / Trigger
+
+- Trigger: adding, removing, or editing a file under a license-policy
+  `assetInputs`, `fontInputs`, or native input root; adding or removing a
+  workspace crate.
+- Each audited root is pinned by file count and tree digest, so the gate fails
+  until a human re-reviews the input and re-pins it. The failure is the
+  mechanism working, not a defect.
+- The pin and the generated artifacts are two independent states. Repairing one
+  does not repair the other, and the pin check runs first, so a stale pin hides
+  everything behind it.
+
+### 2. Signatures
+
+```text
+docs/licenses/desktop-policy.json              hand-maintained input; never generated
+  assetInputs[] | fontInputs[]
+    root                  audited directory
+    extensions[]          the only file types the root may contain
+    expectedFileCount     pin, half 1
+    treeSha256            pin, half 2
+    licenseExpression | source | licenseEvidence
+    files[]               optional explicit list; absent means walk the root
+
+docs/licenses/desktop.cdx.json                 generated; embeds the digest, the
+                                               count, and bom-refs derived from the
+                                               first 16 digest characters
+docs/licenses/desktop-third-party-notices.md   generated; embeds the count
+
+pnpm check:licenses                            verify only, never writes
+node scripts/check-licenses.mjs --write         rewrites exactly the two generated files
+```
+
+The pin covers every file under `root` whose extension is in `extensions`,
+walked recursively with each directory's entries sorted. The digest is SHA-256
+over, per file in that order: the POSIX path relative to `root`, `\0`, the file
+bytes, `\0`.
+
+### 3. Contracts
+
+- `--write` rewrites the SBOM and the notices. **It never rewrites a pin.** A
+  stale pin is repaired by editing the policy by hand, so the two repairs are
+  ordered: re-pin first, then regenerate.
+- `expectedFileCount` and `treeSha256` are one pin. Update both, or the gate
+  keeps failing on whichever half still disagrees.
+- A new file inside an existing audited root joins that entry's declared
+  provenance. Confirm it really carries the `licenseExpression` the entry
+  declares before re-pinning; a file that does not needs its own entry.
+- A new workspace crate inherits `license.workspace` and needs no new license
+  decision, but it is absent from the SBOM and the notices until `--write` runs.
+- `--write` is idempotent: a second run produces no further diff.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| A file is added or removed under an audited root without re-pinning | `pnpm check:licenses` fails with `<id> provenance changed: expected <count>/<digest>, found <count>/<digest>`. |
+| A pinned file's bytes change | The same failure: the digest moves even though the count does not. |
+| A file with an unlisted extension is added under a pinned root | Fails with `<id> contains unreviewed file types: <paths>` before the pin is even compared. |
+| A pin is corrected but the generated artifacts are not regenerated | Fails with `docs/licenses/desktop.cdx.json is stale; review the graph and run node scripts/check-licenses.mjs --write`. |
+| A workspace crate is added and only `--write` runs | The crate is registered; a concurrently stale asset pin still fails, because the two states are independent. |
+| The SBOM or the notices are hand-edited | The check compares them byte for byte against regenerated content and fails. |
+| An unapproved SPDX selection enters the graph | Fails; do not broaden the policy to silence it. |
+
+A single failure is not evidence of a single cause. Fix the reported one, re-run,
+and expect the next one: the pin check precedes the generated-artifact check, so
+`--write` alone changes nothing visible until the pin is correct.
+
+### 5. Good / Base / Bad Cases
+
+- Good: add an icon, confirm it carries the license its entry declares, prove the
+  drift is only that file, then write both pin fields from the values the failure
+  reported, run `--write`, and read every regenerated hunk before running
+  `pnpm check:licenses`.
+- Base: editing Rust that moves no dependency and touching no audited root needs
+  no license work.
+- Base: a dependency bump regenerates the SBOM and the notices without touching
+  any asset pin, because the graph changed and the audited trees did not.
+- Bad: run `--write` and commit the regenerated SBOM while the pin stays stale.
+  The diff looks plausible and the gate still fails.
+- Bad: write the pin from the checker's `found` value without first confirming
+  what drifted. The pin would then record whatever the tree happens to contain,
+  which is the review the pin exists to force.
+
+### 6. Tests Required
+
+- `pnpm check:licenses` passes and reports the expected package, bundle, and
+  native-input counts.
+- Before writing a pin, prove the drift is the change being made:
+  `git diff --name-status <last-re-pin-commit> HEAD -- <audited-root>` must list
+  only the files this change touches. Take `<last-re-pin-commit>` from
+  `git log -1 --format=%H -- docs/licenses/desktop-policy.json`.
+- Recompute the digest from the tree independently and confirm it equals the
+  value about to be written, so the pin records the tree rather than the
+  checker's own output.
+- `--write` twice produces no second diff.
+- Every hunk in the regenerated diff is attributable to this change. An
+  unattributable hunk means another drift is riding along and needs its own
+  review.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```bash
+# The pin is not regenerated by --write, so this repairs nothing.
+node scripts/check-licenses.mjs --write
+git add docs/licenses/desktop.cdx.json
+git commit -m "chore(licenses): refresh the SBOM"
+```
+
+#### Correct
+
+```bash
+# 1. What actually drifted since the pin was last written?
+git log -1 --format=%H -- docs/licenses/desktop-policy.json
+git diff --name-status <that-commit> HEAD -- apps/mobile/assets/icons
+
+# 2. Review each listed file against the provenance its entry declares.
+# 3. Write the count and digest the failure reported into both pin fields.
+# 4. Regenerate only after the pin is correct.
+node scripts/check-licenses.mjs --write
+
+# 5. Read the regenerated diff, then verify.
+pnpm check:licenses
 ```
