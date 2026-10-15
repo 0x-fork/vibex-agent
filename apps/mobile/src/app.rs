@@ -1589,6 +1589,9 @@ pub struct MobileApp {
     /// rather than a command, so it opens a sheet of its own instead of sitting
     /// in the folder's list.
     sidebar_folder_archive_menu: Option<String>,
+    /// The queued send being moved: its session and the holder's queue entry,
+    /// which is what an edit addresses.
+    sidebar_reschedule_menu: Option<(String, u64)>,
     sidebar_name_prompt: Option<SidebarNamePrompt>,
     sidebar_name_input: Entity<InputState>,
     /// The Desktop's sidebar tree, mirrored so the phone renders the layout the
@@ -3095,6 +3098,7 @@ impl MobileApp {
             sidebar_row_menu: None,
             sidebar_root_menu: false,
             sidebar_folder_archive_menu: None,
+            sidebar_reschedule_menu: None,
             sidebar_name_prompt: None,
             sidebar_name_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(locale::text(
@@ -8395,6 +8399,7 @@ impl MobileApp {
         self.sidebar_row_menu = None;
         self.sidebar_root_menu = false;
         self.sidebar_folder_archive_menu = None;
+        self.sidebar_reschedule_menu = None;
         self.sidebar_name_prompt = None;
         self.workspace_action = None;
         self.workspace_action_busy = false;
@@ -8829,15 +8834,22 @@ impl MobileApp {
             state,
             AgentSessionState::Initializing | AgentSessionState::Idle | AgentSessionState::Error
         )
-        .then(|| {
-            self.sidebar_view
-                .scheduled_sends
-                .iter()
-                .filter(|send| send.session_id == session_id)
-                .map(|send| send.scheduled_at_ms)
-                .min()
-        })
+        .then(|| self.scheduled_send(session_id))
         .flatten()
+        .map(|send| send.scheduled_at_ms)
+    }
+
+    /// The message a session is waiting on, if any: the earliest one, which is
+    /// the one the row reports and the one an edit addresses.
+    fn scheduled_send(
+        &self,
+        session_id: &str,
+    ) -> Option<&vibex_desktop_model::SidebarScheduledSend> {
+        self.sidebar_view
+            .scheduled_sends
+            .iter()
+            .filter(|send| send.session_id == session_id)
+            .min_by_key(|send| send.scheduled_at_ms)
     }
 
     /// The groups a session could join, in the sidebar's own order.
@@ -13334,9 +13346,18 @@ impl MobileApp {
                 .when(self.sidebar_root_menu, |root| {
                     root.child(self.render_sidebar_root_menu(window, cx))
                 })
-                .when_some(self.sidebar_folder_archive_menu.clone(), |root, folder_id| {
-                    root.child(self.render_folder_archive_menu(&folder_id, window, cx))
-                })
+                .when_some(
+                    self.sidebar_folder_archive_menu.clone(),
+                    |root, folder_id| {
+                        root.child(self.render_folder_archive_menu(&folder_id, window, cx))
+                    },
+                )
+                .when_some(
+                    self.sidebar_reschedule_menu.clone(),
+                    |root, (session_id, message_id)| {
+                        root.child(self.render_reschedule_menu(&session_id, message_id, window, cx))
+                    },
+                )
                 .when_some(name_prompt, |root, prompt| {
                     root.child(self.render_folder_name_prompt(&prompt, cx))
                 })
@@ -14210,6 +14231,51 @@ impl MobileApp {
                         }
                     }
                 }
+                // A waiting send is the row's posture, so it is also where the
+                // send is answered: the deadline is taken away, or moved to
+                // another hour. Both address the holder's queue entry, which is
+                // why the row carries its id and not just its clock.
+                if let (Some(send), Some(session_id)) =
+                    (self.scheduled_send(row.id()), row.session_id.as_ref())
+                {
+                    let cancel_session_id = session_id.as_str().to_string();
+                    let cancel_message_id = send.message_id;
+                    sheet = entry(
+                        sheet,
+                        "mobile-row-menu-cancel-scheduled",
+                        locale::text(
+                            "Cancel scheduled send",
+                            "取消定时发送",
+                            "取消定時傳送",
+                        )
+                        .to_string(),
+                        true,
+                        Box::new(move |this, _, cx| {
+                            this.send_sidebar_mutation(
+                                RemoteSidebarOrganizationMutation::SetScheduledSend {
+                                    session_id: cancel_session_id.clone(),
+                                    message_id: cancel_message_id,
+                                    scheduled_at_ms: None,
+                                },
+                                false,
+                                cx,
+                            );
+                        }),
+                    );
+                    let reschedule_session_id = session_id.as_str().to_string();
+                    let reschedule_message_id = send.message_id;
+                    sheet = entry(
+                        sheet,
+                        "mobile-row-menu-reschedule-scheduled",
+                        locale::text("Send later instead", "改期发送", "改期傳送").to_string(),
+                        false,
+                        Box::new(move |this, _, cx| {
+                            this.sidebar_reschedule_menu =
+                                Some((reschedule_session_id.clone(), reschedule_message_id));
+                            cx.notify();
+                        }),
+                    );
+                }
                 // A suspension the shell applied on the reader's behalf — the
                 // one it installs when a turn is stopped — is lifted from here:
                 // the desktop offers the same entry beside the switch, and the
@@ -14798,6 +14864,61 @@ impl MobileApp {
             "mobile-folder-archive-menu",
             Box::new(|this, _, cx| {
                 this.sidebar_folder_archive_menu = None;
+                cx.notify();
+            }),
+            sheet,
+            window,
+            cx,
+        )
+    }
+
+    /// The hours a waiting send can be moved to.
+    ///
+    /// The desktop opens a calendar and a clock, and its countdown mode takes
+    /// any duration at all; a sheet offers the few a reader actually reaches
+    /// for, and every one is a countdown from now — the same arithmetic that
+    /// mode does. Both halves of the edit address the holder's queue entry, so
+    /// the session and the message travel together.
+    fn render_reschedule_menu(
+        &self,
+        session_id: &str,
+        message_id: u64,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut sheet = div().p_2().flex().flex_col().gap(px(2.0));
+        for seconds in MOBILE_RESCHEDULE_CHOICES {
+            let session_id = session_id.to_string();
+            sheet = sheet.child(
+                sidebar_sheet_entry(
+                    format!("mobile-reschedule-{seconds}"),
+                    mobile_reschedule_label(seconds),
+                    false,
+                    false,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.sidebar_reschedule_menu = None;
+                        this.send_sidebar_mutation(
+                            RemoteSidebarOrganizationMutation::SetScheduledSend {
+                                session_id: session_id.clone(),
+                                message_id,
+                                scheduled_at_ms: Some(unix_timestamp_ms() + seconds * 1_000),
+                            },
+                            false,
+                            cx,
+                        );
+                    }),
+                ),
+            );
+        }
+        self.render_drawer_sheet(
+            &locale::text("Send later", "稍后发送", "稍後傳送").to_string(),
+            "mobile-reschedule-menu",
+            Box::new(|this, _, cx| {
+                this.sidebar_reschedule_menu = None;
                 cx.notify();
             }),
             sheet,
@@ -22345,6 +22466,13 @@ impl MobileApp {
             row.auto_continue_paused,
             scheduled_at_ms.is_some(),
         );
+        // A session that exists only to wait for a queued send is named by that
+        // send until it goes out, which is what keeps the manager's `<agent>
+        // session` placeholder off the row while it waits.
+        let row_title = self
+            .scheduled_send(session_id.as_str())
+            .and_then(|send| session.and_then(|session| scheduled_session_title(session, send)))
+            .unwrap_or_else(|| row.label.clone());
         let open_session_id = session_id.clone();
         let batch_session_id = session_id.clone();
         let delegated_child = row.delegated_child;
@@ -22518,7 +22646,7 @@ impl MobileApp {
                             } else {
                                 theme::sidebar_session_title()
                             })
-                            .child(row.label.clone()),
+                            .child(row_title),
                     ),
             )
             .when_some(disclosure, |row, disclosure| row.child(disclosure))
@@ -30165,6 +30293,71 @@ fn sidebar_sheet_entry(
         })
 }
 
+/// The hours a waiting send can be moved to, as countdowns from now.
+const MOBILE_RESCHEDULE_CHOICES: [i64; 4] = [15 * 60, 60 * 60, 3 * 60 * 60, 24 * 60 * 60];
+
+/// How far off a reschedule entry moves a waiting send.
+fn mobile_reschedule_label(seconds: i64) -> String {
+    let (value, unit) = if seconds < 3_600 {
+        (seconds / 60, "minute")
+    } else if seconds < 86_400 {
+        (seconds / 3_600, "hour")
+    } else {
+        (seconds / 86_400, "day")
+    };
+    match locale::current() {
+        Locale::En => {
+            if value == 1 {
+                format!("In an {unit}")
+            } else {
+                format!("In {value} {unit}s")
+            }
+        }
+        Locale::ZhCn => {
+            let unit = match unit {
+                "minute" => "分钟",
+                "hour" => "小时",
+                _ => "天",
+            };
+            format!("{value} {unit}后")
+        }
+        Locale::ZhTw => {
+            let unit = match unit {
+                "minute" => "分鐘",
+                "hour" => "小時",
+                _ => "天",
+            };
+            format!("{value} {unit}後")
+        }
+    }
+}
+
+/// The name a session waiting on a queued send borrows from it.
+///
+/// The manager names a session created without one `<agent> session`, so a row
+/// showing that is showing the placeholder rather than what the session is for.
+/// The desktop borrows the message's own words instead — and only while the name
+/// is still the placeholder, or already those words, so a manual rename or an
+/// Agent's own title is never overwritten. The attachments are part of the words
+/// because a message with no text is named by its first one.
+fn scheduled_session_title(
+    session: &AgentSession,
+    send: &vibex_desktop_model::SidebarScheduledSend,
+) -> Option<String> {
+    let title = vibex_core::normalize_agent_session_title(&vibex_core::user_message_display_text(
+        &send.text,
+        &send.attachments,
+    ))?;
+    (session.title == mobile_agent_session_fallback_title(&session.agent_id)
+        || session.title == title)
+        .then_some(title)
+}
+
+/// The name the manager gives a session created without one.
+fn mobile_agent_session_fallback_title(agent_id: impl std::fmt::Display) -> String {
+    format!("{agent_id} session")
+}
+
 /// The window a folder archives on, in the desktop's own words.
 ///
 /// The desktop splits this across two helpers — one for the day count and one
@@ -36995,6 +37188,122 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             reset.contains("self.delegated_nodes.clear()"),
             "and the records the snapshots belong to"
+        );
+    }
+
+    /// A session waiting on a queued send is named by that send.
+    ///
+    /// The manager names a session created without one `<agent> session`, so a
+    /// row that shows that is showing the placeholder; the desktop borrows the
+    /// message's own words instead, and reads its attachments while doing it.
+    #[test]
+    fn a_waiting_session_is_named_by_the_send_it_waits_for() {
+        fn session(title: &str) -> AgentSession {
+            AgentSession {
+                id: VibexSessionId::parse("session_waiting").expect("valid session id"),
+                title: title.to_string(),
+                project_id: vibex_core::ProjectId::parse("project_a").expect("valid project"),
+                workspace_id: vibex_core::WorkspaceId::parse("workspace_a")
+                    .expect("valid workspace"),
+                workspace_root: "/tmp/a".to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                agent_id: AgentId::parse("claude").expect("valid agent id"),
+                state: AgentSessionState::Idle,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                last_message_at_ms: 0,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            }
+        }
+        fn send(
+            text: &str,
+            attachments: Vec<MessageAttachment>,
+        ) -> vibex_desktop_model::SidebarScheduledSend {
+            vibex_desktop_model::SidebarScheduledSend {
+                session_id: "session_waiting".to_string(),
+                message_id: 7,
+                text: text.to_string(),
+                attachments,
+                scheduled_at_ms: 1_800_000_000_000,
+            }
+        }
+
+        assert_eq!(
+            scheduled_session_title(
+                &session("claude session"),
+                &send("ship the release", Vec::new())
+            ),
+            Some("ship the release".to_string()),
+            "the placeholder gives way to what the send says"
+        );
+        assert_eq!(
+            scheduled_session_title(
+                &session("Release train"),
+                &send("ship the release", Vec::new())
+            ),
+            None,
+            "a session the reader named keeps its name"
+        );
+        assert_eq!(
+            scheduled_session_title(
+                &session("ship the release"),
+                &send("ship the release", Vec::new())
+            ),
+            Some("ship the release".to_string()),
+            "a title that already says the same words is left as it is"
+        );
+        assert_eq!(
+            scheduled_session_title(
+                &session("claude session"),
+                &send(
+                    "",
+                    vec![message_attachment("shot.png", Some("image/png"), None)]
+                )
+            ),
+            Some("shot.png".to_string()),
+            "a message with no words is named by what it will send"
+        );
+        assert_eq!(
+            scheduled_session_title(&session("claude session"), &send("   ", Vec::new())),
+            None,
+            "a message with neither has no name to lend"
+        );
+    }
+
+    /// Every reschedule entry says how far off it moves the send.
+    #[test]
+    fn a_reschedule_entry_says_how_far_off_it_moves_the_send() {
+        let labels = MOBILE_RESCHEDULE_CHOICES.map(mobile_reschedule_label);
+        for label in &labels {
+            assert!(!label.is_empty());
+        }
+        // The English "In an hour" carries no digit, so what the entries have to
+        // do is read differently from one another — a sheet of four identical
+        // rows would be no choice at all.
+        let distinct = labels.iter().collect::<BTreeSet<_>>();
+        assert_eq!(distinct.len(), labels.len());
+        assert!(labels[0].contains("15"), "the minutes entry says how many");
+        assert!(labels[2].contains('3'), "and so does the hours one");
+    }
+
+    /// A waiting send is answered from its row's sheet.
+    #[test]
+    fn a_waiting_send_can_be_cancelled_or_moved_from_its_sheet() {
+        let source = include_str!("app.rs");
+        let sheet = renderer_source(source, "render_sidebar_row_menu");
+        assert!(sheet.contains("mobile-row-menu-cancel-scheduled"));
+        assert!(sheet.contains("mobile-row-menu-reschedule-scheduled"));
+        assert!(
+            sheet.contains("scheduled_at_ms: None"),
+            "cancelling takes the hour away"
+        );
+        let reschedule = renderer_source(source, "render_reschedule_menu");
+        assert!(reschedule.contains("MOBILE_RESCHEDULE_CHOICES"));
+        assert!(
+            reschedule.contains("unix_timestamp_ms() + seconds * 1_000"),
+            "and moving it counts from now, the way the desktop's countdown does"
         );
     }
 
