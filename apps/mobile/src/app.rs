@@ -10373,39 +10373,56 @@ impl MobileApp {
     }
 
     fn sync_elicitation_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let requests = self
-            .controller
-            .as_ref()
-            .map(|controller| {
-                controller
-                    .state
-                    .elicitation_surfaces(ShellKind::Compact)
-                    .into_iter()
-                    .map(|surface| surface.request)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if requests.is_empty() {
+        let elicitation_state = self.controller.as_ref().map(|controller| {
+            let requests = controller
+                .state
+                .elicitation_surfaces(ShellKind::Compact)
+                .into_iter()
+                .map(|surface| surface.request)
+                .collect::<Vec<_>>();
+            // A resolution the active timeline shows settles its request, so
+            // the form behind it goes with it.
+            let settled = controller
+                .state
+                .timeline
+                .items
+                .iter()
+                .filter_map(|item| match &item.payload {
+                    TimelinePayload::ElicitationResolution(resolution) => {
+                        Some(resolution.request_id.to_string())
+                    }
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            (requests, settled)
+        });
+        let Some((requests, settled)) = elicitation_state else {
+            // With no controller there is no conversation to answer, so nothing
+            // is parked for one.
             self.elicitation_form_requests.clear();
             self.elicitation_inputs.clear();
             self.elicitation_drafts.clear();
             return;
-        }
+        };
+        // Switching sessions parks a form with the session that asked for it.
+        // The chosen options and the typed text are an answer the reader has
+        // not sent yet, so only a request the timeline shows as settled clears
+        // its form; that is what lets the reader come back to a question they
+        // were half-way through. The app does not keep a registry of child
+        // sessions here, so a request whose session is gone is left parked
+        // rather than risk dropping a live answer with it.
+        self.elicitation_inputs
+            .retain(|(request_id, _), _| !settled.contains(request_id));
+        self.elicitation_drafts
+            .retain(|request_id, _| !settled.contains(request_id));
         // An agent can raise more than one elicitation at a time. The form is
         // built per request so the second one is as fillable as the first,
         // instead of rendering an empty box because the first had claimed the
         // single slot.
-        let live = requests
-            .iter()
-            .map(|request| request.id.as_str().to_string())
-            .collect::<BTreeSet<_>>();
-        self.elicitation_inputs
-            .retain(|(request_id, _), _| live.contains(request_id));
-        self.elicitation_drafts
-            .retain(|request_id, _| live.contains(request_id));
-        self.elicitation_form_requests = live;
+        let mut live = BTreeSet::new();
         for request in requests {
             let request_id = request.id.as_str().to_string();
+            live.insert(request_id.clone());
             if !self.elicitation_drafts.contains_key(&request_id) {
                 self.elicitation_drafts.insert(
                     request_id.clone(),
@@ -10449,6 +10466,7 @@ impl MobileApp {
                     .insert((request_id.clone(), field.id.clone()), input);
             }
         }
+        self.elicitation_form_requests = live;
     }
 
     fn set_elicitation_option(
@@ -30814,6 +30832,180 @@ mod tests {
             assert_eq!(app.composer_queue.len(), 1);
             assert_eq!(app.composer_queue[0].session_id, session_id);
             assert_eq!(app.composer_queue[0].text, "and then one more");
+        });
+    }
+
+    /// A half-filled elicitation belongs to the session that asked for it.
+    ///
+    /// Opening another conversation replaces the timeline the form was painted
+    /// from. The options the reader picked and the text they typed are an
+    /// answer they have not sent yet, so they must still be there when the
+    /// conversation comes back; only a request the timeline shows as settled
+    /// clears its form.
+    #[gpui::test]
+    fn a_half_filled_elicitation_survives_a_session_switch(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let mut bundle = host_bundle("runtime-a", "studio");
+        bundle.route = Some(crate::pairing::MobileRemoteRouteBundle {
+            local_network: None,
+            direct_candidates: vec![bundle.record.server_url.clone()],
+            relay: None,
+        });
+        let backend = bundle.backend().expect("valid saved runtime");
+        let session_id = VibexSessionId::parse("session_elicitation_a").expect("session id");
+        let other_session_id = VibexSessionId::parse("session_elicitation_b").expect("session id");
+        let request = vibex_core::ElicitationRequest {
+            id: RequestId::new(),
+            session_id: session_id.clone(),
+            provider_request_id: None,
+            tool_call_id: None,
+            message: "Which state model should the rail use?".into(),
+            title: None,
+            description: None,
+            fields: vec![
+                vibex_core::ElicitationField {
+                    id: "approach".into(),
+                    title: "Approach".into(),
+                    description: None,
+                    required: false,
+                    kind: ElicitationFieldKind::Text {
+                        min_length: None,
+                        max_length: None,
+                        pattern: None,
+                        format: None,
+                        default: None,
+                        options: vec![vibex_core::ElicitationOption {
+                            value: "global".into(),
+                            title: "Global state".into(),
+                            description: None,
+                        }],
+                    },
+                },
+                vibex_core::ElicitationField {
+                    id: "notes".into(),
+                    title: "Notes".into(),
+                    description: None,
+                    required: false,
+                    kind: ElicitationFieldKind::Text {
+                        min_length: None,
+                        max_length: None,
+                        pattern: None,
+                        format: None,
+                        default: None,
+                        options: Vec::new(),
+                    },
+                },
+            ],
+            status: vibex_core::ElicitationRequestStatus::Pending,
+            requested_at_ms: 1,
+        };
+        let timeline_item = |session_id: &VibexSessionId,
+                             sequence: i64,
+                             source: TimelineSource,
+                             payload: TimelinePayload| TimelineItem {
+            id: vibex_core::TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence,
+            timestamp_ms: sequence,
+            source,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
+            payload,
+        };
+        let request_payload = TimelinePayload::ElicitationRequest(request.clone());
+        let resolution_payload = |session_id: &VibexSessionId, sequence: i64| -> TimelinePayload {
+            TimelinePayload::ElicitationResolution(vibex_core::ElicitationResolution {
+                request_id: request.id.clone(),
+                session_id: session_id.clone(),
+                action: ElicitationResolutionAction::Accept,
+                answers: BTreeMap::new(),
+                responder_device_id: None,
+                resolved_at_ms: sequence,
+            })
+        };
+
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app.backend = Some(backend.clone());
+            let mut controller =
+                AgentWorkflowController::new(backend.clone(), backend.capability_snapshot().agent);
+            controller.state.selected_session_id = Some(session_id.clone());
+            controller.state.timeline.replace_authoritative(
+                session_id.clone(),
+                [timeline_item(
+                    &session_id,
+                    1,
+                    TimelineSource::Provider,
+                    request_payload.clone(),
+                )],
+            );
+            app.controller = Some(controller);
+            app
+        });
+        cx.run_until_parked();
+
+        let notes_key = (request.id.to_string(), "notes".to_string());
+        app.update_in(cx, |app, window, cx| {
+            app.sync_elicitation_form(window, cx);
+            app.set_elicitation_option(request.id.clone(), "approach".into(), "global".into(), cx);
+            let notes = app
+                .elicitation_inputs
+                .get(&notes_key)
+                .cloned()
+                .expect("text field input");
+            notes.update(cx, |notes, cx| {
+                notes.set_value("the rail stays compact", window, cx)
+            });
+
+            // Opening another conversation replaces the timeline the form was
+            // painted from, which must not take the answer with it.
+            if let Some(controller) = app.controller.as_mut() {
+                controller.state.selected_session_id = Some(other_session_id.clone());
+                controller.state.timeline.replace_authoritative(
+                    other_session_id.clone(),
+                    std::iter::empty::<TimelineItem>(),
+                );
+            }
+            app.sync_elicitation_form(window, cx);
+            let draft = app
+                .elicitation_drafts
+                .get(request.id.as_str())
+                .expect("a pending form survives the conversation it was painted in");
+            assert_eq!(draft.text("approach"), Some("global"));
+            assert!(app.elicitation_inputs.contains_key(&notes_key));
+            assert_eq!(notes.read(cx).value().as_ref(), "the rail stays compact");
+
+            // Seeing the resolution is what settles it.
+            if let Some(controller) = app.controller.as_mut() {
+                controller.state.timeline.replace_authoritative(
+                    session_id.clone(),
+                    [
+                        timeline_item(
+                            &session_id,
+                            1,
+                            TimelineSource::Provider,
+                            request_payload.clone(),
+                        ),
+                        timeline_item(
+                            &session_id,
+                            2,
+                            TimelineSource::User,
+                            resolution_payload(&session_id, 2),
+                        ),
+                    ],
+                );
+            }
+            app.sync_elicitation_form(window, cx);
+            assert!(!app.elicitation_drafts.contains_key(request.id.as_str()));
+            assert!(!app.elicitation_inputs.contains_key(&notes_key));
         });
     }
 
