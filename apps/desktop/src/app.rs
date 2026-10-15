@@ -6560,6 +6560,56 @@ fn agent_generation_phase_label(
     }
 }
 
+/// The words a running turn does its work in, before they are bounded for a
+/// row.
+///
+/// The timeline's pending indicator and the information bar above the composer
+/// answer the same question about the same turn, so they are one projection
+/// read twice: the runtime's own activity line when it has written one, the
+/// turn's phase otherwise. The two used to be derived separately — a turn that
+/// had not reported anything yet read `思考中...` under the conversation while
+/// the bar read `准备中` — and the reader had to guess which of the two was
+/// current.
+///
+/// This is the unbounded text. Both surfaces draw
+/// [`agent_live_progress_label`], which is what bounds it.
+fn agent_live_progress_text(
+    turn: &TimelineConversationTurn,
+    locale: locale::ResolvedLocale,
+) -> String {
+    if turn.pending_permission {
+        // Waiting on the reader replaces the phase: nothing is progressing
+        // until the request is answered, and both surfaces say so.
+        return locale::strings(locale)
+            .agent_waiting_confirmation
+            .to_string();
+    }
+    match turn.live_status.as_deref().map(str::trim) {
+        Some(activity) if !activity.is_empty() => activity.to_string(),
+        _ => agent_generation_phase_label(agent_generation_phase(turn), locale).to_string(),
+    }
+}
+
+/// The live label as both surfaces draw it.
+///
+/// One string, bounded once, so the row under the conversation and the leading
+/// text of the information bar above the composer cannot be different words:
+/// `agent_progress_label` reduces the runtime's markdown to a single-line stem
+/// closed with the one ellipsis an in-progress label wears, and
+/// `truncate_agent_thinking_label` cuts it to the width a row has. `fallback`
+/// is what a turn with nothing readable to say of its own reads as, which is
+/// `思考中...` in the reader's language.
+fn agent_live_progress_label(
+    turn: &TimelineConversationTurn,
+    locale: locale::ResolvedLocale,
+    fallback: &str,
+) -> String {
+    truncate_agent_thinking_label(&agent_progress_label(
+        &agent_live_progress_text(turn, locale),
+        fallback,
+    ))
+}
+
 fn agent_generation_tool_call_count(turn: &TimelineConversationTurn) -> usize {
     turn.process_rows
         .iter()
@@ -21445,8 +21495,11 @@ impl VibexWorkbench {
             .as_ref()
             .map(|stats| (stats.started_at_ms, stats.tokens_per_second))?;
         let locale = self.resolved_locale();
-        let phase = agent_generation_phase(&turn);
-        let phase_label = agent_generation_phase_label(phase, locale);
+        let fallback = locale::strings(locale).agent_pending_response;
+        // The same words the timeline's pending row is drawing this frame, put
+        // through the same bounds: the runtime's own activity line when it has
+        // written one, the turn's phase otherwise.
+        let phase_label = agent_live_progress_label(&turn, locale, fallback);
         let duration = format_compact_duration(started_at_ms, None);
         let tool_count = agent_generation_tool_call_count(&turn);
         let compaction_count = self
@@ -54508,20 +54561,20 @@ impl VibexWorkbench {
                     response =
                         response.child(self.render_live_reasoning(turn, reasoning, window, cx));
                 } else {
-                    let pending_label = if turn.pending_permission {
-                        strings.agent_waiting_confirmation.to_string()
-                    } else {
-                        turn.live_status
-                            .as_deref()
-                            .unwrap_or(strings.agent_pending_response)
-                            .to_string()
-                    };
+                    // The bounded label is what the row draws and what the
+                    // information bar above the composer opens with, so the
+                    // two surfaces cannot drift. The unbounded text is what
+                    // the hover reads: a cut activity line is the one thing a
+                    // reader wants the rest of.
+                    let pending_text = agent_live_progress_text(turn, self.resolved_locale());
+                    let pending_label =
+                        agent_progress_label(&pending_text, strings.agent_pending_response);
                     let pending_tooltip =
-                        agent_progress_tooltip(&pending_label, strings.agent_pending_response);
+                        agent_progress_tooltip(&pending_text, strings.agent_pending_response);
                     let live = self.borrowed_session_turn_is_live();
                     response = response.child(render_agent_thinking_indicator(
                         &turn.id,
-                        &agent_progress_label(&pending_label, strings.agent_pending_response),
+                        &pending_label,
                         Some(&pending_tooltip),
                         live,
                         cx,
@@ -83775,6 +83828,130 @@ mod tests {
     }
 
     #[test]
+    fn one_progress_projection_names_the_turn_for_both_live_surfaces() {
+        let row = |kind: TimelineRowKind, streaming: bool| TimelineRow {
+            id: "row".to_string(),
+            kind,
+            item_ids: vec!["item".to_string()],
+            turn_id: Some("turn:progress".to_string()),
+            turn_item_count: 0,
+            turn_failed: false,
+            turn_pending_permission: false,
+            conclusion: kind == TimelineRowKind::AgentMessage,
+            first_sequence: 1,
+            last_sequence: 1,
+            timestamp_ms: 1_700_000_000_000,
+            title: String::new(),
+            body: String::new(),
+            streaming,
+            collapsible: false,
+            pending_permission: false,
+            failed: false,
+            runtime_attribution: None,
+            file_path: None,
+        };
+        let turn = |process_rows: Vec<TimelineRow>,
+                    conclusion_row: Option<TimelineRow>,
+                    live_status: Option<&str>,
+                    pending_permission: bool| TimelineConversationTurn {
+            id: "turn:progress".to_string(),
+            user_row: None,
+            process_rows,
+            process_activity_groups: Vec::new(),
+            process_activity_groups_with_commands: Vec::new(),
+            process_activity_groups_with_file_operations: Vec::new(),
+            process_activity_groups_with_commands_and_file_operations: Vec::new(),
+            live_status: live_status.map(str::to_string),
+            conclusion_row,
+            runtime_attribution: None,
+            complete: false,
+            failed: false,
+            pending_permission,
+            item_count: 0,
+            started_at_ms: 1_000,
+            ended_at_ms: None,
+            superseded: false,
+        };
+        let zh_cn = locale::ResolvedLocale::ZhCn;
+        let en = locale::ResolvedLocale::En;
+
+        // The runtime's own activity line is the most specific answer either
+        // surface can give, so both read it rather than the phase.
+        let reporting = turn(
+            vec![row(TimelineRowKind::Reasoning, true)],
+            None,
+            Some("  read src/net/upload.rs  "),
+            false,
+        );
+        assert_eq!(
+            agent_generation_phase(&reporting),
+            AgentGenerationPhase::Thinking
+        );
+        assert_eq!(
+            agent_live_progress_label(&reporting, zh_cn, "思考中..."),
+            "read src/net/upload.rs..."
+        );
+        assert_eq!(
+            agent_live_progress_label(&reporting, en, "Thinking..."),
+            "read src/net/upload.rs..."
+        );
+
+        // A turn that has said nothing of its own reads as its phase — the
+        // register the information bar already used, now behind both surfaces.
+        let fresh = turn(vec![], None, None, false);
+        assert_eq!(
+            agent_generation_phase(&fresh),
+            AgentGenerationPhase::Preparing
+        );
+        assert_eq!(
+            agent_live_progress_label(&fresh, zh_cn, "思考中..."),
+            "准备中..."
+        );
+        assert_eq!(
+            agent_live_progress_label(&fresh, en, "Thinking..."),
+            "Preparing..."
+        );
+
+        // A turn whose only status carries nothing visible — the runtime's
+        // placeholder line — still falls back to the phase rather than reading
+        // as a turn that has no word for itself.
+        let blank_status = turn(vec![], None, Some("   "), false);
+        assert_eq!(
+            agent_live_progress_label(&blank_status, zh_cn, "思考中..."),
+            "思考中..."
+        );
+
+        // Waiting on the reader replaces both, because the phase is the whole
+        // message: nothing is progressing until the request is answered.
+        let waiting = turn(vec![], None, Some("read src/net/upload.rs"), true);
+        assert_eq!(
+            agent_generation_phase(&waiting),
+            AgentGenerationPhase::WaitingForApproval
+        );
+        assert_eq!(
+            agent_live_progress_label(&waiting, zh_cn, "思考中..."),
+            "等待确认中..."
+        );
+        assert_eq!(
+            agent_live_progress_label(&waiting, en, "Thinking..."),
+            "Waiting for confirmation..."
+        );
+
+        // The label is bounded once, for both surfaces: a runtime activity line
+        // longer than a timeline row can hold arrives at the bar already cut,
+        // so the two are the same string rather than merely the same source.
+        let long = turn(vec![], None, Some(&"detailed activity ".repeat(8)), false);
+        let label = agent_live_progress_label(&long, en, "Thinking...");
+        assert_eq!(label.chars().count(), AGENT_THINKING_LABEL_MAX_CHARS);
+        assert!(label.ends_with("..."));
+        assert_eq!(
+            truncate_agent_thinking_label(&label),
+            label,
+            "the label is already inside the bound the timeline draws it at"
+        );
+    }
+
+    #[test]
     fn agent_thinking_label_truncates_with_a_stable_ascii_ellipsis() {
         let label = truncate_agent_thinking_label(&"字符".repeat(40));
         assert_eq!(label.chars().count(), AGENT_THINKING_LABEL_MAX_CHARS);
@@ -92721,12 +92898,40 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn timeline_turn_execution_attribution("))
             .map(|(body, _)| body)
             .expect("timeline turn renderer should remain inspectable");
-        assert!(turn.contains("if turn.pending_permission"));
-        assert!(turn.contains("strings.agent_waiting_confirmation"));
+        // The pending row reads the shared projection rather than deciding for
+        // itself: the information bar above the composer opens with the same
+        // words, so the two live surfaces cannot drift apart.
+        assert!(turn.contains("agent_live_progress_text(turn, self.resolved_locale())"));
+        assert!(turn.contains("agent_progress_label(&pending_text"));
+        assert!(!turn.contains("if turn.pending_permission"));
+
+        let progress = source
+            .split_once("fn agent_live_progress_text(")
+            .and_then(|(_, tail)| tail.split_once("\nfn agent_generation_tool_call_count("))
+            .map(|(body, _)| body)
+            .expect("the shared progress projection should remain inspectable");
+        assert!(progress.contains("if turn.pending_permission"));
+        assert!(progress.contains("agent_waiting_confirmation"));
+        assert!(progress.contains("turn.live_status"));
+        assert!(
+            progress.contains("agent_generation_phase_label(agent_generation_phase(turn), locale)")
+        );
         assert_eq!(
             locale::strings(locale::ResolvedLocale::ZhCn).agent_waiting_confirmation,
             "等待确认中..."
         );
+
+        // The bar the reader sees over the composer renders that same label.
+        let bar = source
+            .split_once("    fn render_agent_generation_status(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn agent_token_usage_metrics("))
+            .map(|(body, _)| body)
+            .expect("the generation status renderer should remain inspectable");
+        assert!(
+            bar.contains("agent_live_progress_label(&turn, locale, fallback)"),
+            "the information bar opens with the shared live label"
+        );
+        assert!(bar.contains("locale::strings(locale).agent_pending_response"));
     }
 
     #[test]
