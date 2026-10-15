@@ -7475,6 +7475,7 @@ impl MobileApp {
                         .clone()
                         .or_else(|| child.agent_id.as_ref().map(|id| id.as_str().to_string())),
                     child_count: child.child_count,
+                    running_count: 0,
                     collapsed: false,
                     pinned: false,
                     selected: self
@@ -20898,13 +20899,12 @@ impl MobileApp {
         let card = workspace_card.filter(|card| {
             self.sidebar_selected_workspace_id.as_deref() == Some(card.workspace_id.as_str())
         });
-        let session_selected = row.kind == SidebarRowKind::Session
-            && (row.selected
-                || row.session_id.as_ref().is_some_and(|session_id| {
-                    self.sidebar_state
-                        .selected_ids
-                        .contains(session_id.as_str())
-                }));
+        // Only the session the reader has open wears the row's fill and the
+        // heavier title. A row that is merely checked in batch mode is answered
+        // by its checkbox, which is what the desktop does too: a checked row
+        // that looked exactly like the open one made the two indistinguishable
+        // on a phone, where the fill used to be the only evidence of either.
+        let session_selected = row.kind == SidebarRowKind::Session && row.selected;
         let session_fill_left = theme::SIDEBAR_LIST_PADDING + row.indent
             - if inside_workspace_card {
                 theme::SIDEBAR_ICON_SLOT_OVERHANG
@@ -21443,8 +21443,9 @@ impl MobileApp {
                             })
                             .child(row.label.clone()),
                     )
-                    // The badge counts worktrees in both hierarchies, so it sits
-                    // against the name rather than at the row's trailing edge.
+                    // The badge counts the project's sessions in both
+                    // hierarchies, so it sits against the name rather than at
+                    // the row's trailing edge.
                     .child(
                         div()
                             .size(px(20.0))
@@ -21460,6 +21461,37 @@ impl MobileApp {
                             .child(row.child_count.to_string()),
                     ),
             )
+            // A collapsed project still says that something inside it is
+            // working. The desktop prints the count in words at the row's
+            // trailing edge; the phone has no room for them, so the number
+            // rides the mark a working session leads with — parked, because a
+            // project row summarizes the rows below it rather than working
+            // itself, and a second animation per project buys nothing.
+            .when(row.running_count > 0, |project| {
+                let running_label = format!(
+                    "{} {}",
+                    row.running_count,
+                    locale::text("running", "运行中", "執行中")
+                );
+                project.child(
+                    div()
+                        .id(format!("mobile-project-running-{}", row.id()))
+                        .aria_label(running_label)
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.0))
+                        .text_size(theme::font_sidebar_meta())
+                        .text_color(theme::sidebar_session_meta())
+                        .child(
+                            div()
+                                .size(px(16.0))
+                                .flex_shrink_0()
+                                .child(sidebar_activity_mark(theme::primary(), None)),
+                        )
+                        .child(row.running_count.to_string()),
+                )
+            })
             // Always visible: a phone has no hover state to reveal it.
             .child(
                 div()
@@ -21852,9 +21884,9 @@ impl MobileApp {
                     .items_center()
                     .gap(px(theme::SPACING_SM))
                     // In batch mode the agent mark becomes the selection
-                    // control: the phone had no checkbox at all, so the only
-                    // evidence of what was selected was the row fill, which is
-                    // the same fill the open session wears.
+                    // control, and it is the control that answers for the row:
+                    // the fill belongs to the open session alone, so a checked
+                    // row states its own selection here.
                     .when(self.sidebar_batch_mode, |title| {
                         let batch_selected = self
                             .sidebar_state
@@ -21862,6 +21894,11 @@ impl MobileApp {
                             .contains(session_id.as_str());
                         title.child(
                             div()
+                                .id(format!("mobile-session-check-{}", row.id()))
+                                .aria_label(
+                                    locale::text("Select session", "选择会话", "選擇工作階段")
+                                        .to_string(),
+                                )
                                 .size(px(20.0))
                                 .flex_shrink_0()
                                 .rounded(px(4.0))
@@ -33925,6 +33962,7 @@ fn session_opened(cx: &mut Context<Self>) {
             workspace_id: None,
             detail: None,
             child_count: 2,
+            running_count: 0,
             collapsed: false,
             pinned: false,
             selected: false,

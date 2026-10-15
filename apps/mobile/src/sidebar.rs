@@ -57,6 +57,10 @@ pub struct SidebarRow {
     /// Number of direct children represented by the row. Projects use this for
     /// the workspace count badge; workspace rows use it for their session count.
     pub child_count: usize,
+    /// Sessions of this row that are working right now. A project row reports
+    /// it so a collapsed project still says that something inside it is busy;
+    /// the desktop draws the same count in words at its trailing edge.
+    pub running_count: usize,
     pub collapsed: bool,
     pub pinned: bool,
     pub selected: bool,
@@ -220,12 +224,7 @@ fn workspace_status(
     sessions: &[&AgentSession],
     view: &SidebarOrganizationView,
 ) -> (Option<AgentSessionState>, bool) {
-    let running = sessions.iter().any(|session| {
-        matches!(
-            session.state,
-            AgentSessionState::Running | AgentSessionState::Initializing
-        )
-    });
+    let running = sessions.iter().any(|session| session_working(session));
     let error = sessions
         .iter()
         .any(|session| session.state == AgentSessionState::Error);
@@ -450,10 +449,18 @@ fn push_root_children(
                     project_id: None,
                     workspace_id: None,
                     detail: None,
-                    // Desktop's project badge counts workspaces in both
-                    // hierarchy modes; Compact only changes where sessions
-                    // are rendered, not the project summary.
-                    child_count: workspaces_by_project.get(&project_id).map_or(0, Vec::len),
+                    // The badge reports the project's sessions, not its
+                    // Worktrees: the desktop sums its per-workspace summaries,
+                    // and Compact only changes where the sessions are rendered.
+                    // The list is the unfiltered one, so a search does not move
+                    // the total.
+                    child_count: sessions_by_project.get(&project_id).map_or(0, Vec::len),
+                    running_count: sessions_by_project.get(&project_id).map_or(0, |sessions| {
+                        sessions
+                            .iter()
+                            .filter(|session| session_working(session))
+                            .count()
+                    }),
                     collapsed,
                     pinned: false,
                     selected,
@@ -505,6 +512,7 @@ fn push_root_children(
                     workspace_id: folder.workspace_id.clone(),
                     detail: None,
                     child_count: 0,
+                    running_count: 0,
                     collapsed,
                     pinned: false,
                     selected: false,
@@ -622,6 +630,7 @@ fn push_project_children(
                     workspace_id: folder.workspace_id.clone(),
                     detail: None,
                     child_count: 0,
+                    running_count: 0,
                     collapsed,
                     pinned: false,
                     selected: false,
@@ -746,6 +755,7 @@ fn push_project_children(
                 .clone()
                 .or_else(|| Some(workspace.detail.clone())),
             child_count: workspace_sessions.len(),
+            running_count: 0,
             collapsed: workspace.collapsed,
             pinned: false,
             selected: input.selected_session_id.is_some_and(|selected| {
@@ -843,6 +853,7 @@ fn push_workspace_children(
                     workspace_id: Some(workspace_id.to_string()),
                     detail: None,
                     child_count: 0,
+                    running_count: 0,
                     collapsed,
                     pinned: false,
                     selected: false,
@@ -935,6 +946,7 @@ fn push_group_rows(
         workspace_id: Some(group.workspace_id.clone()),
         detail: None,
         child_count: members.len(),
+        running_count: 0,
         collapsed,
         pinned: group.pinned,
         selected: input
@@ -967,6 +979,18 @@ fn push_group_rows(
 
 /// The state a group reports: waiting on the user outranks running, exactly as
 /// the worktree card's aggregate does.
+/// Whether a session is working right now.
+///
+/// The desktop's per-workspace summary counts a session that is starting up as
+/// running along with one that is running, and both draw the same pulse in the
+/// list, so a count of what is busy has to include both.
+fn session_working(session: &AgentSession) -> bool {
+    matches!(
+        session.state,
+        AgentSessionState::Running | AgentSessionState::Initializing
+    )
+}
+
 fn group_status(members: &[&AgentSession]) -> Option<AgentSessionState> {
     let mut state = None;
     for member in members {
@@ -1000,6 +1024,7 @@ fn session_row(
         workspace_id: Some(session.workspace_id.as_str().to_string()),
         detail: None,
         child_count: 0,
+        running_count: 0,
         collapsed: false,
         pinned: input.view.pinned_session_ids.contains(&session_id),
         selected: input
@@ -1039,6 +1064,7 @@ fn empty_workspace_row(
         workspace_id: Some(workspace_id.to_string()),
         detail: None,
         child_count: 0,
+        running_count: 0,
         collapsed: false,
         pinned: false,
         selected: false,
@@ -1281,6 +1307,7 @@ mod tests {
             workspace_id: None,
             detail: None,
             child_count: 0,
+            running_count: 0,
             collapsed: false,
             pinned: false,
             selected: false,
@@ -1291,6 +1318,72 @@ mod tests {
             auto_continue_paused: false,
             delegated_child: false,
         }
+    }
+
+    /// A project's badge reports its sessions, and its mark reports the ones
+    /// that are working — the same two numbers the desktop's project row shows.
+    ///
+    /// The badge used to count the project's Worktrees, which read as a session
+    /// total beside a session list: one Worktree holding three sessions showed
+    /// a "1". Neither number follows a search, because the desktop's summaries
+    /// do not either.
+    #[test]
+    fn a_project_reports_its_sessions_and_the_ones_that_are_working() {
+        let view = SidebarOrganizationView::default();
+        let projects = vec![SidebarProject {
+            id: "project_project".to_string(),
+            label: "vibex".to_string(),
+        }];
+        let workspaces = vec![SidebarWorkspace {
+            id: "workspace_project".to_string(),
+            project_id: "project_project".to_string(),
+            label: "checkout".to_string(),
+            detail: String::new(),
+            branch: None,
+            mode: WorkspaceMode::CurrentCheckout,
+            collapsed: false,
+        }];
+        let mut working = session("session-b", "project", "Working");
+        working.state = AgentSessionState::Running;
+        let mut starting = session("session-c", "project", "Starting");
+        starting.state = AgentSessionState::Initializing;
+        let sessions = vec![session("session-a", "project", "Hello"), working, starting];
+        let rows = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &projects,
+            workspaces: &workspaces,
+            sessions: &sessions,
+            selected_session_id: None,
+            query: "",
+        });
+        let project = rows
+            .iter()
+            .find(|row| row.kind == SidebarRowKind::Project)
+            .expect("the project row is listed");
+        assert_eq!(
+            project.child_count, 3,
+            "the badge counts sessions, not the one Worktree that holds them"
+        );
+        assert_eq!(
+            project.running_count, 2,
+            "a session that is starting up is working too"
+        );
+
+        // A search narrows the rows, not the project's summary.
+        let searched = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &projects,
+            workspaces: &workspaces,
+            sessions: &sessions,
+            selected_session_id: None,
+            query: "hello",
+        });
+        let project = searched
+            .iter()
+            .find(|row| row.kind == SidebarRowKind::Project)
+            .expect("the project row survives a matching search");
+        assert_eq!(project.child_count, 3);
+        assert_eq!(project.running_count, 2);
     }
 
     #[test]
