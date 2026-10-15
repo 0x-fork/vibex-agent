@@ -752,6 +752,18 @@ impl SidebarOrganizationView {
                     SidebarMutationOutcome::AlreadyApplied
                 }
             }
+            RemoteSidebarOrganizationMutation::SetFolderAutoArchive { folder_id, days } => {
+                if !self
+                    .organization
+                    .set_folder_auto_archive_after_days(folder_id, *days)
+                {
+                    // The window is out of range, or the folder is gone: the
+                    // setter refuses both, and a client cannot tell them apart
+                    // from here.
+                    return Err(SidebarMutationRejection::Rejected);
+                }
+                SidebarMutationEffect::ORGANIZATION.into()
+            }
             RemoteSidebarOrganizationMutation::SetProjectCollapsed {
                 project_id,
                 collapsed,
@@ -814,6 +826,29 @@ impl SidebarOrganizationView {
                 // An explicit enable/disable always clears a pause; the
                 // suspension is only set by pausing or stopping a session.
                 self.auto_continue_paused_session_ids.remove(session_id);
+                SidebarMutationEffect::NAVIGATION.into()
+            }
+            RemoteSidebarOrganizationMutation::SetSessionAutoContinuePaused {
+                session_ids,
+                paused,
+            } => {
+                for session_id in session_ids {
+                    if !session_projects.contains_key(session_id) {
+                        return Err(SidebarMutationRejection::Rejected);
+                    }
+                    if *paused {
+                        // Only a session that will continue on its own can be
+                        // suspended, which is the rule the Desktop applies when
+                        // it suspends one itself.
+                        if !self.auto_continue_session_ids.contains(session_id) {
+                            continue;
+                        }
+                        self.auto_continue_paused_session_ids
+                            .insert(session_id.clone());
+                    } else {
+                        self.auto_continue_paused_session_ids.remove(session_id);
+                    }
+                }
                 SidebarMutationEffect::NAVIGATION.into()
             }
             RemoteSidebarOrganizationMutation::CreateGroup {
@@ -1526,6 +1561,184 @@ mod tests {
         assert!(compact.contains(&SidebarOrganizationItem::Folder("folder-a".into())));
         assert!(compact.contains(&SidebarOrganizationItem::Folder("folder-b".into())));
         assert!(compact.contains(&SidebarOrganizationItem::Folder("folder-legacy".into())));
+    }
+
+    /// A client can set a folder's archive window, and the window is the
+    /// project's: a second folder taking one clears the first.
+    #[test]
+    fn a_remote_archive_window_lands_on_the_folder_and_moves_between_siblings() {
+        let mut view = view_with_folder();
+        assert!(view.organization.create_folder(
+            "folder-2",
+            "Later",
+            Some("project-1".to_string()),
+            None,
+        ));
+
+        let outcome = view
+            .apply_remote(
+                &RemoteSidebarOrganizationMutation::SetFolderAutoArchive {
+                    folder_id: "folder-1".to_string(),
+                    days: Some(7),
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .expect("a window in range is legal");
+        let SidebarMutationOutcome::Applied(effect) = outcome else {
+            panic!("setting a window should report an applied effect");
+        };
+        assert!(effect.organization);
+        assert_eq!(
+            view.organization
+                .folder("folder-1")
+                .and_then(|folder| folder.auto_archive_after_days),
+            Some(7)
+        );
+
+        view.apply_remote(
+            &RemoteSidebarOrganizationMutation::SetFolderAutoArchive {
+                folder_id: "folder-2".to_string(),
+                days: Some(14),
+            },
+            &session_projects(),
+            &session_workspaces(),
+            "unused",
+            "unused",
+        )
+        .expect("a second window is legal on another folder");
+        assert_eq!(
+            view.organization
+                .folder("folder-1")
+                .and_then(|folder| folder.auto_archive_after_days),
+            None,
+            "one project carries one window, so the first folder gives it up"
+        );
+
+        // A window out of range, and a window on a folder that is gone, are
+        // both refusals.
+        assert!(
+            view.apply_remote(
+                &RemoteSidebarOrganizationMutation::SetFolderAutoArchive {
+                    folder_id: "folder-1".to_string(),
+                    days: Some(crate::SIDEBAR_AUTO_ARCHIVE_MAX_DAYS + 1),
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .is_err()
+        );
+        assert!(
+            view.apply_remote(
+                &RemoteSidebarOrganizationMutation::SetFolderAutoArchive {
+                    folder_id: "folder-gone".to_string(),
+                    days: Some(7),
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .is_err()
+        );
+
+        // Turning the window off is a change of its own.
+        let outcome = view
+            .apply_remote(
+                &RemoteSidebarOrganizationMutation::SetFolderAutoArchive {
+                    folder_id: "folder-2".to_string(),
+                    days: None,
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .expect("turning a window off is legal");
+        let SidebarMutationOutcome::Applied(effect) = outcome else {
+            panic!("turning a window off should report an applied effect");
+        };
+        assert!(effect.organization);
+        assert_eq!(
+            view.organization
+                .folder("folder-2")
+                .and_then(|folder| folder.auto_archive_after_days),
+            None
+        );
+    }
+
+    /// A client can lift (and set) the suspension of a session's auto continue,
+    /// and only a session that would continue on its own can be suspended.
+    #[test]
+    fn a_remote_suspension_follows_the_session_it_suspends() {
+        let mut view = SidebarOrganizationView::default();
+        view.auto_continue_session_ids
+            .insert("session-a".to_string());
+
+        // A session that is not continuing on its own cannot be suspended: the
+        // mutation is accepted, and does nothing for it.
+        view.apply_remote(
+            &RemoteSidebarOrganizationMutation::SetSessionAutoContinuePaused {
+                session_ids: vec!["session-b".to_string()],
+                paused: true,
+            },
+            &session_projects(),
+            &session_workspaces(),
+            "unused",
+            "unused",
+        )
+        .expect("a session of the project is legal");
+        assert!(view.auto_continue_paused_session_ids.is_empty());
+
+        let outcome = view
+            .apply_remote(
+                &RemoteSidebarOrganizationMutation::SetSessionAutoContinuePaused {
+                    session_ids: vec!["session-a".to_string()],
+                    paused: true,
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .expect("suspending a continuing session is legal");
+        let SidebarMutationOutcome::Applied(effect) = outcome else {
+            panic!("a suspension should report an applied effect");
+        };
+        assert!(effect.navigation);
+        assert!(view.auto_continue_paused_session_ids.contains("session-a"));
+
+        view.apply_remote(
+            &RemoteSidebarOrganizationMutation::SetSessionAutoContinuePaused {
+                session_ids: vec!["session-a".to_string()],
+                paused: false,
+            },
+            &session_projects(),
+            &session_workspaces(),
+            "unused",
+            "unused",
+        )
+        .expect("lifting a suspension is legal");
+        assert!(!view.auto_continue_paused_session_ids.contains("session-a"));
+
+        // A session the project does not know is a refusal, not a no-op.
+        assert!(
+            view.apply_remote(
+                &RemoteSidebarOrganizationMutation::SetSessionAutoContinuePaused {
+                    session_ids: vec!["session-gone".to_string()],
+                    paused: false,
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .is_err()
+        );
     }
 
     #[test]

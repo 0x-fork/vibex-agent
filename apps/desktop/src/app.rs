@@ -12076,6 +12076,27 @@ impl VibexWorkbench {
                                 cx,
                             );
                         }
+                        if let vibex_core::RemoteSidebarOrganizationMutation::SetSessionAutoContinuePaused {
+                            session_ids,
+                            paused,
+                        } = &mutation
+                        {
+                            // The view carries the suspension; the countdown that
+                            // would otherwise still fire is this shell's, so the
+                            // two halves of the state move together — a client
+                            // that lifts a suspension here stops the clock that
+                            // would have continued the turn on its own.
+                            for session_id in session_ids {
+                                let Ok(session_id) = VibexSessionId::parse(session_id) else {
+                                    continue;
+                                };
+                                if *paused {
+                                    self.pause_auto_continue(&session_id, cx);
+                                } else {
+                                    self.resume_auto_continue(&session_id, cx);
+                                }
+                            }
+                        }
                         if effect.unread
                             && let vibex_core::RemoteSidebarOrganizationMutation::SetSessionsUnread {
                                 session_ids,

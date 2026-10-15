@@ -4802,6 +4802,13 @@ pub enum RemoteSidebarOrganizationMutation {
         folder_id: String,
         collapsed: bool,
     },
+    /// The window after which a folder archives its own sessions. `None` turns
+    /// the window off. A project carries one window at a time, so setting one
+    /// clears it from that folder's siblings.
+    SetFolderAutoArchive {
+        folder_id: String,
+        days: Option<u8>,
+    },
     SetProjectCollapsed {
         project_id: String,
         collapsed: bool,
@@ -4817,6 +4824,15 @@ pub enum RemoteSidebarOrganizationMutation {
     SetSessionAutoContinue {
         session_id: String,
         enabled: bool,
+    },
+    /// Suspends or lifts the automatic continuation of the listed sessions.
+    ///
+    /// The Desktop suspends this itself when the reader stops a turn, so a
+    /// client mostly lifts the suspension — but the two are one state, and a
+    /// client that can lift it can set it.
+    SetSessionAutoContinuePaused {
+        session_ids: Vec<String>,
+        paused: bool,
     },
     /// Creates a group from existing sessions. Every member must belong to
     /// `workspace_id`; the Desktop rejects members from another Worktree.
