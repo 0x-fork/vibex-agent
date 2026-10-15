@@ -44,6 +44,7 @@ const ICONS: &[&str] = &[
     "icons/folder.svg",
     "icons/folder-open.svg",
     "icons/triangle-alert.svg",
+    "icons/circle-question-mark.svg",
     "icons/copy.svg",
     "icons/git-branch.svg",
     "icons/wifi-outlined.svg",
@@ -512,6 +513,12 @@ impl AssetSource for MobileAssets {
             "icons/triangle-alert.svg" => {
                 Some(include_bytes!("../assets/icons/triangle-alert.svg"))
             }
+            // The attention mark is the desktop's own glyph, included from the
+            // desktop asset pack so the two shells cannot drift: a session the
+            // Agent parked on the user wears the same question mark on both.
+            "icons/circle-question-mark.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/circle-question-mark.svg"
+            )),
             "icons/copy.svg" => Some(include_bytes!("../assets/icons/copy.svg")),
             "icons/wifi-outlined.svg" => Some(include_bytes!(
                 "../../desktop/assets/icons/wifi-outlined.svg"

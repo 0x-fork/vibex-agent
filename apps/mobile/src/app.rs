@@ -11725,6 +11725,11 @@ impl MobileApp {
             };
         let switch_id = host.id.clone();
         let menu_id = host.id.clone();
+        // The probing spinner is the one thing on the row that animates, so it
+        // carries an id of its own: a single id shared by every saved runtime
+        // would tie all of them to one clock and land a late frame on each row
+        // at the same moment.
+        let activity_id = format!("pairing-runtime-activity-{}", host.id);
         div()
             .id(format!("pairing-runtime-{}", host.id))
             .debug_selector(|| format!("pairing-runtime-{}", host.id))
@@ -11769,7 +11774,7 @@ impl MobileApp {
             // The dot leads the row: green once the runtime answers, red when
             // it does not, and the spinner while the phone is still asking.
             .child(if probing {
-                sidebar_running_indicator(status_color)
+                sidebar_running_indicator(ElementId::from(activity_id), status_color)
             } else {
                 sidebar_status_dot(status_color)
             })
@@ -20858,13 +20863,13 @@ impl MobileApp {
         }
 
         match row.kind {
-            SidebarRowKind::Session => {
-                if inside_workspace_card {
-                    theme::SIDEBAR_LIST_PADDING + theme::SIDEBAR_CARD_INSET
-                } else {
-                    theme::SIDEBAR_LIST_PADDING
-                }
-            }
+            // A session row's trailing menu is always drawn — the phone has
+            // no hover to reveal it — so the row's own content stops before the
+            // strip's hitbox instead of under it. The body's right margin is the
+            // list padding outside a card and the card inset inside one, and
+            // `sidebar_trailing_menu_inset` returns the remainder, which lands
+            // the content edge on the strip's left edge in both cases.
+            SidebarRowKind::Session => sidebar_trailing_menu_inset(inside_workspace_card),
             // Project and workspace rows carry an inline create button in the
             // trailing column, and the row menu is absolutely positioned over
             // the same strip. Reserving the whole action column is what keeps
@@ -20883,7 +20888,16 @@ impl MobileApp {
                 - theme::SIDEBAR_ICON_SLOT_OVERHANG)
                 .max(0.0),
             SidebarRowKind::Folder => theme::SIDEBAR_ACTION_CONTENT_INSET,
-            SidebarRowKind::Group => 0.0,
+            // A group row is a flat row, so its reservation is the strip's
+            // width less the margin the row already carries. Without the menu it
+            // keeps the small visual inset it has always had.
+            SidebarRowKind::Group => {
+                if can_organize {
+                    sidebar_trailing_menu_inset(false)
+                } else {
+                    theme::SIDEBAR_ACTION_CONTENT_INSET
+                }
+            }
             SidebarRowKind::EmptyWorkspace => 0.0,
         }
     }
@@ -20916,7 +20930,11 @@ impl MobileApp {
                         })
                     })
             }
-            SidebarRowKind::Group => false,
+            // A group's own commands — rename, pin, auto continue, edit its
+            // members, dissolve it — live in the same sheet every other row
+            // opens, and the trailing menu is the only way to open it. With the
+            // menu withheld there, the whole sheet was unreachable on the phone.
+            SidebarRowKind::Group => can_organize,
             SidebarRowKind::EmptyWorkspace => false,
         }
     }
@@ -21120,7 +21138,7 @@ impl MobileApp {
             .left(px(-theme::SIDEBAR_ICON_SLOT_OVERHANG))
             .mx(px(theme::SIDEBAR_LIST_PADDING))
             .pl(px(row.indent))
-            .pr(px(theme::SIDEBAR_ACTION_CONTENT_INSET))
+            .pr(px(self.sidebar_row_content_inset(row, false)))
             .rounded(px(theme::SIDEBAR_ROW_RADIUS))
             .flex()
             .items_center()
@@ -21338,7 +21356,10 @@ impl MobileApp {
         });
         let workspace_selected = row.selected
             || self.sidebar_selected_workspace_id.as_deref() == Some(workspace_id.as_str());
-        let status_indicator = sidebar_workspace_status_indicator(row.state);
+        let status_indicator = sidebar_workspace_status_indicator(
+            row.state,
+            ElementId::from(format!("mobile-sidebar-workspace-mark-{workspace_id}")),
+        );
         let detail = row.detail.clone().unwrap_or_else(|| {
             format!(
                 "{} · {}",
@@ -21546,6 +21567,12 @@ impl MobileApp {
         );
         let needs_approval = session_state == AgentSessionState::NeedsInput;
         let has_error = session_state == AgentSessionState::Error;
+        // A session that is still starting up, or one that has been filed away,
+        // wears its state in words: neither a pulse nor a dot says which of the
+        // two it is, and the phone has no tooltip to carry the difference. A
+        // pinned row keeps only its pin, which is the whole slot the desktop
+        // yields to it.
+        let state_label = sidebar_session_state_label(session_state).filter(|_| !row.pinned);
         // A pinned row keeps its pin *and* its state: the pin is drawn after
         // the state mark rather than in place of it. Losing the state to the
         // pin hid exactly the rows the user cared enough to pin.
@@ -21553,6 +21580,16 @@ impl MobileApp {
             && !row.unread
             && !has_error
             && session_state != AgentSessionState::Idle;
+        // The label and the timestamp share one slot: a row reports its state in
+        // words when it has them, and the hour only when it does not. Waiting on
+        // the user and working are answered by their marks, so neither takes a
+        // timestamp with it, and a pinned row answers with its pin alone.
+        let show_time = !row.pinned
+            && !needs_approval
+            && !generating
+            && !row.unread
+            && !has_error
+            && state_label.is_none();
         let open_session_id = session_id.clone();
         let batch_session_id = session_id.clone();
         let delegated_child = row.delegated_child;
@@ -21727,14 +21764,12 @@ impl MobileApp {
             .when_some(disclosure, |row, disclosure| row.child(disclosure))
             .child(
                 div()
-                    // A pin takes a fixed 20px out of this column, so the column
-                    // grows with it instead of clipping the timestamp it was
-                    // already too narrow to show.
-                    .w(px(if row.pinned {
-                        theme::SIDEBAR_SESSION_META_WIDTH + 20.0
-                    } else {
-                        theme::SIDEBAR_SESSION_META_WIDTH
-                    }))
+                    // The column is a floor rather than a fixed width: the
+                    // desktop can afford a status lane that is always 76px wide
+                    // and the phone cannot. A pin, a state in words, or a
+                    // timestamp needs more than the floor, and the title gives
+                    // up the room instead of the mark being clipped.
+                    .min_w(px(theme::SIDEBAR_SESSION_META_WIDTH))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
@@ -21742,42 +21777,37 @@ impl MobileApp {
                     .gap(px(6.0))
                     .text_size(theme::font_sidebar_meta())
                     .text_color(theme::sidebar_session_meta())
-                    .when(
-                        !needs_approval
-                            && !generating
-                            && !row.unread
-                            && !has_error
-                            && session_state == AgentSessionState::Idle,
-                        |right| {
-                            right.child(
-                                div()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .when_some(
-                                        session.map(|session| session.last_message_at_ms),
-                                        |time, last| time.child(session_sidebar_time_label(last)),
-                                    ),
-                            )
-                        },
-                    )
+                    // The desktop's own order, so a mark and whatever stands
+                    // beside it read as one statement: the state first, then the
+                    // words or the hour it carries, then the dots that qualify
+                    // it, and the pin in the trailing slot it owns.
                     .when(show_status, |right| {
                         right.child(sidebar_session_status_indicator(
                             session_state,
                             row.auto_continue,
+                            ElementId::from(format!("mobile-sidebar-mark-{}", row.id())),
                         ))
                     })
                     .when(needs_approval, |right| {
-                        right.child(
-                            svg()
-                                .path("icons/triangle-alert.svg")
-                                .size(px(14.0))
-                                .flex_shrink_0()
-                                .text_color(theme::accent_yellow()),
-                        )
+                        right.child(sidebar_attention_glyph(ElementId::from(format!(
+                            "mobile-sidebar-attention-{}",
+                            row.id()
+                        ))))
                     })
-                    .when(has_error, |right| {
-                        right.child(sidebar_status_dot(theme::accent_red()))
+                    .when_some(state_label, |right, label| {
+                        right.child(sidebar_session_state_pill(label))
+                    })
+                    .when(show_time, |right| {
+                        right.child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .when_some(
+                                    session.map(|session| session.last_message_at_ms),
+                                    |time, last| time.child(session_sidebar_time_label(last)),
+                                ),
+                        )
                     })
                     .when(row.unread, |right| {
                         right.child(
@@ -21790,6 +21820,9 @@ impl MobileApp {
                                 // different state from the one above it.
                                 .bg(theme::primary()),
                         )
+                    })
+                    .when(has_error, |right| {
+                        right.child(sidebar_status_dot(theme::accent_red()))
                     })
                     .when(row.pinned, |right| {
                         right.child(
@@ -28376,9 +28409,15 @@ fn workspace_mode_label(mode: WorkspaceMode) -> &'static str {
     }
 }
 
+/// The colour a worktree or group row's aggregate mark takes.
+///
+/// The working arm is the accent, the same one a session row's mark takes and
+/// the same one the desktop paints its aggregate in: the two rows answer the
+/// same question about the sessions they stand for, so they answer it in one
+/// colour.
 fn sidebar_workspace_status_color(state: Option<AgentSessionState>) -> gpui::Hsla {
     match state {
-        Some(AgentSessionState::Running | AgentSessionState::Initializing) => theme::text_primary(),
+        Some(AgentSessionState::Running | AgentSessionState::Initializing) => theme::primary(),
         Some(AgentSessionState::NeedsInput) => theme::accent_yellow(),
         Some(AgentSessionState::Error) => theme::accent_red(),
         Some(AgentSessionState::Idle) => theme::accent_green(),
@@ -28480,20 +28519,209 @@ fn sidebar_branch_guide(session_id: &str, continues: bool) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn sidebar_running_indicator(color: gpui::Hsla) -> gpui::AnyElement {
-    svg()
-        .path("icons/loader-circle.svg")
-        .size(px(theme::SIDEBAR_STATUS_ICON_SIZE))
+/// One frame of the terminal spinner, at the pace the desktop holds it.
+const SIDEBAR_ACTIVITY_FRAME: Duration = Duration::from_millis(100);
+/// Frames in one lap of the spinner the desktop paints its ring from.
+///
+/// The ring has six dots and the spinner has eight frames: both shells walk the
+/// dots over the spinner's own lap, so the mark turns at the spinner's speed
+/// rather than at a dot per frame.
+const SIDEBAR_ACTIVITY_SPINNER_FRAMES: u32 = 8;
+/// Frames per second the mark is sampled at.
+///
+/// A working row is already asking for a frame every display refresh — the
+/// status mark is the one thing in the list that moves — so the cap costs
+/// nothing and keeps a long list of working sessions off the compositor's back.
+const SIDEBAR_ACTIVITY_MAX_FPS: f32 = 30.0;
+/// The painted mark's dots, as indexes into the Braille cell.
+///
+/// Dots 1-3 run down the left column and 4-6 back up the right one, so the six
+/// form a closed ring the highlight can walk without jumping across the cell.
+/// The table is the desktop's and the terminal client's
+/// (`vibex_tui::glyphs::ACTIVITY_RING`); the phone does not link the terminal
+/// stack, so the six numbers are restated here and pinned by the tests at the
+/// bottom of this file.
+const SIDEBAR_ACTIVITY_RING: [usize; 6] = [0, 1, 2, 5, 4, 3];
+/// The slot the mark is painted in: the desktop's `size_5()`.
+///
+/// The ring is a shape rather than a glyph, so it needs the room a 20px box
+/// gives it to read as a spinner instead of a smudge.
+const SIDEBAR_ACTIVITY_SLOT: f32 = 20.0;
+
+/// One lap of the ring, at the pace the desktop's sidebar mark takes.
+fn sidebar_activity_cycle() -> Duration {
+    SIDEBAR_ACTIVITY_FRAME * SIDEBAR_ACTIVITY_SPINNER_FRAMES
+}
+
+/// Where each Braille dot sits in its two-by-four cell.
+///
+/// Dots 1-3 run down the left column and 4-6 down the right one, then the
+/// bottom row holds dots 7 and 8 — the arrangement a terminal cell uses, which
+/// is what makes the painted mark read as the same spinner the TUI draws.
+fn sidebar_braille_dot_cell(index: usize) -> (f32, f32) {
+    match index {
+        0 => (0.0, 0.0),
+        1 => (0.0, 1.0),
+        2 => (0.0, 2.0),
+        3 => (1.0, 0.0),
+        4 => (1.0, 1.0),
+        5 => (1.0, 2.0),
+        6 => (0.0, 3.0),
+        _ => (1.0, 3.0),
+    }
+}
+
+/// The sidebar mark: the spinner's dot ring with one highlight walking it.
+///
+/// `phase` is the fraction of a lap the head has travelled, or `None` for the
+/// still mark that Reduce Motion and a backgrounded app fall back to — the head
+/// parked at the lap's start, which is the pose the desktop's mark holds too.
+/// The frame is painted rather than shaped, so the mark renders in whatever font
+/// the phone is set to and only its brightness carries the motion.
+fn sidebar_activity_mark(color: gpui::Hsla, phase: Option<f32>) -> gpui::AnyElement {
+    let head = phase.unwrap_or(0.0) * SIDEBAR_ACTIVITY_RING.len() as f32;
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let extent = bounds.size.width.min(bounds.size.height);
+            let center = bounds.center();
+            let diameter = extent * 0.16;
+            let pitch = extent * 0.26;
+            let lap = SIDEBAR_ACTIVITY_RING.len() as f32;
+            for (index, dot) in SIDEBAR_ACTIVITY_RING.iter().copied().enumerate() {
+                let (column, row) = sidebar_braille_dot_cell(dot);
+                // Brightness is the cosine of the dot's distance from the head
+                // around the ring: the dot under the head is at full contrast,
+                // the one opposite it is at rest, and the lap closes seamlessly.
+                let offset = (index as f32 - head).rem_euclid(lap);
+                let distance = offset.min(lap - offset);
+                let intensity = 0.5 + 0.5 * (distance / lap * std::f32::consts::TAU).cos();
+                let origin = point(
+                    center.x + (column - 0.5) * pitch - diameter * 0.5,
+                    center.y + (row - 1.5) * pitch - diameter * 0.5,
+                );
+                window.paint_quad(
+                    gpui::fill(
+                        Bounds::new(origin, gpui::size(diameter, diameter)),
+                        color.opacity(0.28 + 0.72 * intensity),
+                    )
+                    .corner_radii(diameter * 0.5),
+                );
+            }
+        },
+    )
+    .size_full()
+    .into_any_element()
+}
+
+/// The working mark a session, group, or worktree row leads with.
+///
+/// `id` scopes the one animation per row: several listed sessions work at once,
+/// and one id shared by all of them would tie every mark to a single clock and
+/// land a late frame on every row at the same moment.
+fn sidebar_running_indicator(id: ElementId, color: gpui::Hsla) -> gpui::AnyElement {
+    let slot = div().size(px(SIDEBAR_ACTIVITY_SLOT)).flex_shrink_0();
+    // Reduce Motion and a backgrounded app both park the mark: the preference is
+    // the reader's, and a phone in a pocket has no frame to spend.
+    if theme::reduce_motion() || crate::lifecycle::is_backgrounded() {
+        return slot
+            .child(sidebar_activity_mark(color, None))
+            .into_any_element();
+    }
+    slot.with_animation(
+        id,
+        Animation::new(sidebar_activity_cycle())
+            .repeat_synced()
+            .with_max_fps(SIDEBAR_ACTIVITY_MAX_FPS),
+        move |this, phase| this.child(sidebar_activity_mark(color, Some(phase))),
+    )
+    .into_any_element()
+}
+
+/// The call to action for a session the Agent parked on the user.
+///
+/// The desktop answers this state with a question mark rather than a spinner or
+/// a dot: an approval request is not progress and not a status, it is something
+/// the reader has to answer, and a dot among dots says nothing. The phone has no
+/// tooltip to carry the meaning, so it rides on the accessible name instead.
+/// `id` scopes the mark, since several rows can be waiting at once.
+fn sidebar_attention_glyph(id: ElementId) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .size(px(16.0))
         .flex_shrink_0()
-        .text_color(color)
-        .with_animation(
-            "mobile-sidebar-running-status",
-            Animation::new(Duration::from_millis(800))
-                .repeat()
-                .with_easing(ease_in_out),
-            |this, delta| this.with_transformation(Transformation::rotate(percentage(delta))),
+        .flex()
+        .items_center()
+        .justify_center()
+        .aria_label(
+            locale::text(
+                "Waiting for your approval or input",
+                "等待你的确认或输入",
+                "等待你的確認或輸入",
+            )
+            .to_string(),
+        )
+        .child(
+            svg()
+                .path("icons/circle-question-mark.svg")
+                .size(px(14.0))
+                .flex_shrink_0()
+                .text_color(theme::accent_yellow()),
         )
         .into_any_element()
+}
+
+/// The states a mark cannot carry, in the desktop's own words.
+///
+/// A session that is still starting up and one that has been filed away are the
+/// two states where the mark alone is ambiguous — the same pulse as a working
+/// session, the same grey dot as a closed one — so they are the two the phone
+/// writes out. Everything else is answered by its mark: the question mark for a
+/// session parked on the user, the danger dot for a failed one, the pulse for a
+/// working one. That is the same gate the desktop's column applies.
+fn sidebar_session_state_label(state: AgentSessionState) -> Option<&'static str> {
+    match state {
+        AgentSessionState::Initializing => Some(locale::text("INIT", "初始化", "初始化")),
+        AgentSessionState::Archived => Some(locale::text("ARCHIVED", "已归档", "已封存")),
+        _ => None,
+    }
+}
+
+/// The state a row reports in words, in the slot the timestamp would take.
+///
+/// It is the desktop's pill at the phone's own scale: one quiet plate the height
+/// of the metadata line, so a labelled row never grows taller than its
+/// neighbours.
+fn sidebar_session_state_pill(label: &'static str) -> gpui::AnyElement {
+    div()
+        .h(px(16.0))
+        .flex_shrink_0()
+        .rounded(px(4.0))
+        .px(px(6.0))
+        .flex()
+        .items_center()
+        .text_size(theme::font_micro())
+        .bg(theme::bg_card_dim())
+        .text_color(theme::sidebar_text_muted())
+        .child(label)
+        .into_any_element()
+}
+
+/// How far a row's own content stops short of the list edge, so the trailing
+/// menu never covers it.
+///
+/// The phone draws that menu on every row that owns one — there is no hover to
+/// reveal it — so the reservation is the strip's whole hitbox rather than the
+/// slice a pointer happens to be over. A row's own right margin depends on where
+/// it sits (the list padding flat, the card inset inside a worktree card), so
+/// the caller says which side it is on and this returns the remainder.
+fn sidebar_trailing_menu_inset(inside_workspace_card: bool) -> f32 {
+    let row_margin = if inside_workspace_card {
+        theme::SIDEBAR_CARD_INSET
+    } else {
+        theme::SIDEBAR_LIST_PADDING
+    };
+    theme::SIDEBAR_ACTION_WIDTH + theme::SIDEBAR_CARD_INSET - row_margin
 }
 
 /// Top spacing of the pairing page's first screen.
@@ -28650,23 +28878,34 @@ fn pairing_field_label(label: &'static str) -> gpui::AnyElement {
         .into_any_element()
 }
 
+/// The colour a working session's mark takes.
+///
+/// The desktop paints the pulse in the accent and turns it green only when the
+/// session will keep going by itself: the one mark that says "still working" is
+/// also the one that can say "and it will keep working".
 fn sidebar_session_running_color(auto_continue_enabled: bool) -> gpui::Hsla {
     if auto_continue_enabled {
         theme::accent_green()
     } else {
-        theme::text_primary()
+        theme::primary()
     }
 }
 
-fn sidebar_workspace_status_indicator(state: Option<AgentSessionState>) -> gpui::AnyElement {
+fn sidebar_workspace_status_indicator(
+    state: Option<AgentSessionState>,
+    id: ElementId,
+) -> gpui::AnyElement {
     let color = sidebar_workspace_status_color(state);
     match state {
         Some(AgentSessionState::Running | AgentSessionState::Initializing) => {
-            sidebar_running_indicator(color)
+            sidebar_running_indicator(id, color)
         }
-        Some(
-            AgentSessionState::NeedsInput | AgentSessionState::Error | AgentSessionState::Idle,
-        )
+        // A worktree holding a session parked on the user answers with the same
+        // question mark a session row does: a collapsed worktree leaves this row
+        // as the only thing on screen, so it cannot downgrade the one state that
+        // asks the reader to act into a dot among dots.
+        Some(AgentSessionState::NeedsInput) => sidebar_attention_glyph(id),
+        Some(AgentSessionState::Error | AgentSessionState::Idle)
         | Some(AgentSessionState::Archived | AgentSessionState::Closed)
         | None => sidebar_status_dot(color),
     }
@@ -28675,12 +28914,13 @@ fn sidebar_workspace_status_indicator(state: Option<AgentSessionState>) -> gpui:
 fn sidebar_session_status_indicator(
     state: AgentSessionState,
     auto_continue_enabled: bool,
+    id: ElementId,
 ) -> gpui::AnyElement {
     match state {
         AgentSessionState::Running | AgentSessionState::Initializing => {
-            sidebar_running_indicator(sidebar_session_running_color(auto_continue_enabled))
+            sidebar_running_indicator(id, sidebar_session_running_color(auto_continue_enabled))
         }
-        AgentSessionState::NeedsInput => sidebar_status_dot(theme::accent_yellow()),
+        AgentSessionState::NeedsInput => sidebar_attention_glyph(id),
         AgentSessionState::Error => sidebar_status_dot(theme::accent_red()),
         AgentSessionState::Archived | AgentSessionState::Closed => {
             sidebar_status_dot(theme::sidebar_foreground(0.35))
@@ -30056,16 +30296,20 @@ mod tests {
 
     #[test]
     fn sidebar_running_status_colors_match_desktop_semantics() {
+        // The desktop paints both a session's mark and an aggregate row's in
+        // the accent, and turns either green only when it will keep going on its
+        // own: the mark that says "still working" is the one that can also say
+        // "and it will keep working".
         assert_eq!(
             sidebar_workspace_status_color(Some(AgentSessionState::Running)),
-            theme::text_primary()
+            theme::primary()
         );
         assert_eq!(
             sidebar_workspace_status_color(Some(AgentSessionState::Initializing)),
-            theme::text_primary()
+            theme::primary()
         );
         assert_eq!(sidebar_session_running_color(true), theme::accent_green());
-        assert_eq!(sidebar_session_running_color(false), theme::text_primary());
+        assert_eq!(sidebar_session_running_color(false), theme::primary());
     }
 
     #[test]
@@ -33968,6 +34212,80 @@ fn session_opened(cx: &mut Context<Self>) {
             app.read_with(cx, |app, _| app.overlay),
             Some(MobileOverlay::Settings),
             "the first pairing screen carries the settings entry"
+        );
+    }
+
+    /// The mark the phone paints is the mark the desktop paints.
+    ///
+    /// The ring's dots are the terminal spinner's dot set, and consecutive
+    /// entries are neighbours in the Braille cell, so the highlight walks the
+    /// ring instead of jumping across the cell. Those are the same two
+    /// invariants the desktop pins against the TUI's own frames.
+    #[test]
+    fn the_sidebar_activity_ring_walks_neighbouring_dots_and_closes() {
+        let mut mask = 0u8;
+        for step in 0..SIDEBAR_ACTIVITY_RING.len() {
+            let dot = SIDEBAR_ACTIVITY_RING[step];
+            mask |= 1 << dot;
+            let (column, row) = sidebar_braille_dot_cell(dot);
+            let next = SIDEBAR_ACTIVITY_RING[(step + 1) % SIDEBAR_ACTIVITY_RING.len()];
+            let (next_column, next_row) = sidebar_braille_dot_cell(next);
+            assert_eq!(
+                (column - next_column).abs() + (row - next_row).abs(),
+                1.0,
+                "ring step {step} jumps"
+            );
+        }
+        assert_eq!(
+            mask.count_ones() as usize,
+            SIDEBAR_ACTIVITY_RING.len(),
+            "a dot is painted twice"
+        );
+        assert_eq!(
+            mask, 0b0011_1111,
+            "the ring paints a different dot set than the spinner lights"
+        );
+    }
+
+    /// The phone's lap is the desktop's lap.
+    ///
+    /// The desktop turns the same ring over one spinner lap — eight frames of
+    /// 100ms — so the two shells' marks are one cue at one speed.
+    #[test]
+    fn the_sidebar_activity_cycle_matches_the_desktop() {
+        assert_eq!(sidebar_activity_cycle(), Duration::from_millis(800));
+    }
+
+    /// The two states a mark cannot carry are the two that get words.
+    #[test]
+    fn the_sidebar_state_label_names_the_ambiguous_states() {
+        assert!(sidebar_session_state_label(AgentSessionState::Initializing).is_some());
+        assert!(sidebar_session_state_label(AgentSessionState::Archived).is_some());
+        for state in [
+            AgentSessionState::Idle,
+            AgentSessionState::Running,
+            AgentSessionState::NeedsInput,
+            AgentSessionState::Error,
+            AgentSessionState::Closed,
+        ] {
+            assert!(
+                sidebar_session_state_label(state).is_none(),
+                "{state:?} is answered by its mark"
+            );
+        }
+    }
+
+    /// A row's content stops before the trailing menu on both sides of a card.
+    #[test]
+    fn a_rows_content_stops_before_the_trailing_menu() {
+        let strip = theme::SIDEBAR_ACTION_WIDTH + theme::SIDEBAR_CARD_INSET;
+        assert_eq!(
+            theme::SIDEBAR_LIST_PADDING + sidebar_trailing_menu_inset(false),
+            strip
+        );
+        assert_eq!(
+            theme::SIDEBAR_CARD_INSET + sidebar_trailing_menu_inset(true),
+            strip
         );
     }
 }
