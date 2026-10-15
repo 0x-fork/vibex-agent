@@ -7374,22 +7374,22 @@ impl App {
 
     /// The messages `Up`/`Down` walk, oldest first.
     ///
-    /// The pool is the selected session's own timeline — the same one the
+    /// The pool is the selected session's own transcript — the same one the
     /// desktop's composer recalls from — so a message another client sent is
     /// recallable here too, and a session that was cleared or reloaded cannot
-    /// leave a stale message behind the cursor.
+    /// leave a stale message behind the cursor. The transcript already carries
+    /// a send the runtime has not echoed yet, because it projects that send as
+    /// the row the echo will become, so the newest message is recallable at
+    /// once without the walk reading the pending queue itself.
     ///
-    /// A user row is only a message when it is an actual prompt: a delegated
-    /// instruction reaches the provider through the same payload and is not the
-    /// reader's to recall. The body is the row's own, which is what the client
-    /// draws — attachments in their place — so what comes back to the composer
-    /// is exactly what the message looked like when it was sent.
+    /// The body is the row's own, which is what the client draws — attachments
+    /// in their place — so what comes back to the composer is what the message
+    /// looked like when it was sent.
     pub fn composer_history_entries(&self) -> Vec<String> {
         if !self.page_shows_session() {
             return Vec::new();
         }
-        let mut entries = self
-            .transcript
+        self.transcript
             .blocks()
             .iter()
             .filter(|block| {
