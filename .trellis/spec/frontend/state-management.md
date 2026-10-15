@@ -555,6 +555,76 @@ accepted over the held extent even while the unit streams, while a same-box
 transient dip is still held; that a content-box invalidation clears the process
 unit heights; and that the estimator's wrapped column count follows the pane.
 
+### Convention: The process-unit walk is memoized per turn
+
+A turn's process section paints *units*, not rows: runs of tool activity fold
+into one summary group and a command pairs with the permission prompt that
+follows it. `SessionView::timeline_process_units` mints that list — and an id
+string per unit — by walking every process row of the turn. Both the renderer
+(`render_timeline_process_rows`) and the height estimator
+(`estimated_timeline_process_rows_height`) ask for it, and the first asks before
+it decides whether the run even needs windowing. A turn that carries a whole
+session's work therefore rebuilt the same O(process rows) list twice per frame,
+which is allocator- and memcpy-bound work on the UI thread — the prepaint spike
+behind timeline turns that sink to ~10 fps.
+
+Memoize the walk per turn, keyed by a fingerprint of everything it reads, and
+hand out `Rc<Vec<TimelineProcessUnit>>` so the run and the renderer share one
+allocation. The turn-level estimate signature already digests the rows, groups,
+command expansion, reasoning expansion and display preferences the walk branches
+on; the memo key adds only what that signature omits — which timeline the turn
+came from (`rendering_child_agent_timeline` plus the child render session, since
+a rail preview can share a turn id with the workbench turn) and the turn's own
+`pending_permission`, which the command/permission pairing reads. Do not key on
+the expansion maps again; do not key on body lengths, which stream every frame.
+
+Because the units are presentation geometry, they follow the same invalidation
+as `timeline_process_unit_heights`: clear the whole table in
+`invalidate_render_caches`, `invalidate_timeline_layout_measurements` and
+`invalidate_timeline_render_caches`; drop one turn's entry in
+`clear_timeline_turn_layout`; and retain only live turn ids in
+`rebuild_timeline_sizes` so a replaced projection cannot leak units. A pane
+resize is a reflow, not an invalidation: the memo key includes the derived
+column count, so the list rebuilds from the fingerprint rather than being
+dropped, exactly as the memoized estimate does.
+
+A memoized unit keeps the *estimate* it was built with, so read a measurement
+through `cached_timeline_process_unit_height` at both consumption sites — the
+run layout and the estimator — rather than the stored `estimated_height`.
+Otherwise a measurement that lands in place without moving the shape
+fingerprint would be ignored and the reserved extent would drift from the
+painted one.
+
+```rust
+// Wrong: the walk runs for every frame that paints the turn, twice.
+fn render_timeline_process_rows(&mut self, turn: &TimelineConversationTurn, ..) {
+    let units = Rc::new(self.timeline_process_units(turn)); // O(process rows)
+    if units.len() <= TIMELINE_PROCESS_RUN_FLOW_LIMIT { /* too late */ }
+}
+
+// Correct: the list is a fingerprinted function of the turn, retained across
+// frames, and consumed as the measurement resolves it.
+fn timeline_process_units(&mut self, turn: &TimelineConversationTurn)
+    -> Rc<Vec<TimelineProcessUnit>>
+{
+    let signature = self.timeline_process_units_signature(turn);
+    if let Some((cached, units)) = self.timeline_process_units_cache.get(&turn.id)
+        && *cached == signature
+    {
+        return units.clone();
+    }
+    // ...walk...
+    let units = Rc::new(units);
+    self.timeline_process_units_cache
+        .insert(turn.id.clone(), (signature, units.clone()));
+    units
+}
+```
+
+Regression coverage must assert that an unchanged turn reuses the same `Rc`
+across frames, that a new process row rebuilds it, and that the table never
+holds a turn the current projection dropped.
+
 ### Convention: Existing-session composer drafts
 
 Unsent Composer state is local presentation state scoped by `VibexSessionId`.

@@ -4599,6 +4599,17 @@ pub struct SessionView {
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
     timeline_turn_layout_signature_cache: BTreeMap<String, (u64, u64)>,
     timeline_process_unit_heights: BTreeMap<String, TimelineProcessUnitHeight>,
+    /// The process-unit walk of each turn, keyed by turn id and stamped with the
+    /// fingerprint of the inputs the walk read.
+    ///
+    /// The walk is O(process_rows) and mints a unit — and its id string — for
+    /// every row or collapsed group, while the renderer and the height estimator
+    /// each ask for it on every frame the turn is painted. A turn holding a
+    /// whole session's work therefore rebuilt the same units twice per frame for
+    /// a shape that had not moved. The units are a pure function of the turn's
+    /// rows and the view's display state, so they are retained between frames
+    /// and rebuilt only when that fingerprint moves.
+    timeline_process_units_cache: BTreeMap<String, (u64, Rc<Vec<TimelineProcessUnit>>)>,
     /// Measured heights of the rows inside an expanded process group, keyed by
     /// row id. SPIKE: windowing the group body keeps the rows it did not build,
     /// and this is the table the next frame places them from. See
@@ -4755,6 +4766,7 @@ impl SessionView {
             timeline_estimated_turn_heights: BTreeMap::new(),
             timeline_turn_layout_signature_cache: BTreeMap::new(),
             timeline_process_unit_heights: BTreeMap::new(),
+            timeline_process_units_cache: BTreeMap::new(),
             timeline_group_row_heights: BTreeMap::new(),
             #[cfg(test)]
             timeline_group_rows_built: Vec::new(),
@@ -4866,6 +4878,7 @@ impl SessionView {
         self.timeline_estimated_turn_heights.clear();
         self.timeline_turn_layout_signature_cache.clear();
         self.timeline_process_unit_heights.clear();
+        self.timeline_process_units_cache.clear();
         self.timeline_group_row_heights.clear();
         self.timeline_pending_turn_heights.clear();
         self.conversation_turns_cache = Rc::new(Vec::new());
@@ -4940,6 +4953,12 @@ impl SessionView {
             )
             .saturating_add(
                 self.timeline_file_changes_expansion
+                    .keys()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.timeline_process_units_cache
                     .keys()
                     .map(String::len)
                     .sum::<usize>(),
@@ -24155,6 +24174,8 @@ impl VibexWorkbench {
             .retain(|turn_id, _| active_turn_ids.contains(turn_id.as_str()));
         self.timeline_estimated_turn_heights
             .retain(|turn_id, _| active_turn_ids.contains(turn_id.as_str()));
+        self.timeline_process_units_cache
+            .retain(|turn_id, _| active_turn_ids.contains(turn_id.as_str()));
         let content_width = session_content_max_width(self.ui_state.session.content_width)
             .unwrap_or(AGENT_CONTENT_STANDARD_MAX_WIDTH);
         let mut row_sizes = Vec::with_capacity(turns.len());
@@ -24193,6 +24214,7 @@ impl VibexWorkbench {
         self.timeline_estimated_turn_heights.clear();
         self.timeline_turn_layout_signature_cache.clear();
         self.timeline_process_unit_heights.clear();
+        self.timeline_process_units_cache.clear();
         self.timeline_group_row_heights.clear();
         self.timeline_row_sizes = Rc::new(Vec::new());
         // A height prepaint parked for this view was measured against the layout
@@ -24446,6 +24468,7 @@ impl VibexWorkbench {
         self.timeline_estimated_turn_heights.clear();
         self.timeline_turn_layout_signature_cache.clear();
         self.timeline_process_unit_heights.clear();
+        self.timeline_process_units_cache.clear();
         self.timeline_group_row_heights.clear();
         // The row table is derived from the measurements just cleared. Drop it
         // so a caller that cannot rebuild immediately still cannot reuse stale
@@ -24534,6 +24557,7 @@ impl VibexWorkbench {
             .remove(turn_id);
         self.timeline_streaming_shrink_candidates.remove(turn_id);
         self.timeline_turn_layout_signature_cache.remove(turn_id);
+        self.timeline_process_units_cache.remove(turn_id);
         self.timeline_pending_turn_heights
             .retain(|_, (pending_turn_id, _)| pending_turn_id != turn_id);
     }
@@ -55198,7 +55222,7 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let units = Rc::new(self.timeline_process_units(turn));
+        let units = self.timeline_process_units(turn);
         if units.is_empty() {
             return Vec::new();
         }
@@ -56854,11 +56878,51 @@ impl VibexWorkbench {
         height
     }
 
-    fn estimated_timeline_process_rows_height(&self, turn: &TimelineConversationTurn) -> f32 {
-        self.timeline_process_units(turn)
+    fn estimated_timeline_process_rows_height(&mut self, turn: &TimelineConversationTurn) -> f32 {
+        let units = self.timeline_process_units(turn);
+        units
             .iter()
-            .map(|unit| unit.estimated_height + TIMELINE_PROCESS_UNIT_GAP)
+            .map(|unit| {
+                // The memoized unit carries the estimate it was built with, but
+                // a measurement can land afterwards without moving the shape
+                // fingerprint — a settled unit is revised in place, and the
+                // revision it settles at is not the one the walk stamped. Read
+                // the measurement the way the run layout does, so the reserved
+                // extent and the painted one agree.
+                cached_timeline_process_unit_height(
+                    self.timeline_process_unit_heights.get(&unit.id),
+                    unit.revision,
+                    unit.streaming,
+                )
+                .unwrap_or(unit.estimated_height)
+                    + TIMELINE_PROCESS_UNIT_GAP
+            })
             .sum()
+    }
+
+    /// Fingerprint of every input the process-unit walk reads.
+    ///
+    /// The walk is memoized against this. The turn-level estimate signature
+    /// already digests the rows, groups, expansions and display preferences the
+    /// walk branches on, so the only input it is missing is which timeline the
+    /// turn came from: a child Agent's rail preview can hold a turn id the
+    /// workbench turn shares, and reusing one for the other would paint a
+    /// preview's rows into the main conversation.
+    fn timeline_process_units_signature(&self, turn: &TimelineConversationTurn) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.rendering_child_agent_timeline().hash(&mut hasher);
+        self.child_agent_render_session
+            .as_ref()
+            .map(VibexSessionId::as_str)
+            .hash(&mut hasher);
+        let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
+        // The estimate signature carries the per-row fields but not the turn's
+        // own pending-permission flag, and the command/permission pairing picks
+        // its height from it.
+        turn.pending_permission.hash(&mut hasher);
+        self.timeline_turn_estimate_signature(turn, process_expansion)
+            .hash(&mut hasher);
+        hasher.finish()
     }
 
     /// The units a turn's process section paints, in order.
@@ -56868,7 +56932,23 @@ impl VibexWorkbench {
     /// the raw row — is what the estimator, the renderer and the windowed run
     /// all have to agree on. They share this list rather than repeating the
     /// walk.
-    fn timeline_process_units(&self, turn: &TimelineConversationTurn) -> Vec<TimelineProcessUnit> {
+    ///
+    /// The walk is O(process rows) and mints a unit — and its id string — for
+    /// every row, while the renderer and the estimator each ask for the list on
+    /// every frame the turn is painted. A turn that carries a whole session's
+    /// work therefore rebuilt the same units twice per frame for a shape that
+    /// had not moved. The list is retained by turn and only rebuilt when
+    /// [`Self::timeline_process_units_signature`] moves.
+    fn timeline_process_units(
+        &mut self,
+        turn: &TimelineConversationTurn,
+    ) -> Rc<Vec<TimelineProcessUnit>> {
+        let signature = self.timeline_process_units_signature(turn);
+        if let Some((cached_signature, units)) = self.timeline_process_units_cache.get(&turn.id)
+            && *cached_signature == signature
+        {
+            return units.clone();
+        }
         let enhanced_command_display = self.ui_state.session.enhanced_command_execution_display;
         let pairs_commands = enhanced_command_display && !self.rendering_child_agent_timeline();
         let process_activity_groups =
@@ -56980,6 +57060,9 @@ impl VibexWorkbench {
                 row_index += 1;
             }
         }
+        let units = Rc::new(units);
+        self.timeline_process_units_cache
+            .insert(turn.id.clone(), (signature, units.clone()));
         units
     }
 

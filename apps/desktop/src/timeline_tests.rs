@@ -2322,3 +2322,52 @@ fn an_expanded_group_body_keeps_its_rows_inside_the_box_it_reserves(cx: &mut Tes
         "the body's last row ends at the box it reserved, minus its own padding"
     );
 }
+
+/// The process-unit walk is O(process rows) and both the renderer and the height
+/// estimator ask for it, so a turn holding a whole session's work rebuilt the
+/// same units twice per frame. The walk is now memoized per turn and reused
+/// while its inputs hold.
+#[gpui::test]
+fn the_process_unit_walk_is_reused_while_its_inputs_hold(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, cx) = live_tool_timeline(cx, true);
+    draw_live_timeline_frames(&workbench, cx, 8);
+
+    let walk = |workbench: &Entity<VibexWorkbench>, cx: &mut VisualTestContext| {
+        workbench.update(cx, |workbench, _| {
+            let turn = workbench
+                .conversation_turns_cache
+                .last()
+                .cloned()
+                .expect("the fixture projects one turn");
+            workbench.timeline_process_units(&turn)
+        })
+    };
+
+    let first = walk(&workbench, cx);
+
+    // A frame later the shape has not moved, so the walk is not repeated.
+    draw_live_timeline_frames(&workbench, cx, 4);
+    let reused = walk(&workbench, cx);
+    assert!(
+        Rc::ptr_eq(&first, &reused),
+        "an unchanged turn must reuse the units the last frame built"
+    );
+
+    // Real content arriving does move the shape, so the stale list is replaced.
+    let sequence = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline.authoritative_end_sequence.unwrap()
+    });
+    apply_live_timeline_item(&workbench, cx, progress_tool(sequence + 1, 99));
+    let rewalked = walk(&workbench, cx);
+    assert!(
+        !Rc::ptr_eq(&first, &rewalked),
+        "a new tool row must rebuild the turn's units"
+    );
+
+    // The memo belongs to the projection that produced it, so a turn the walk no
+    // longer sees is evicted rather than growing the cache without bound.
+    workbench.read_with(cx, |workbench, _| {
+        assert!(workbench.timeline_process_units_cache.len() <= 1);
+    });
+}
