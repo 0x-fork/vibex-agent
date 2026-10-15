@@ -771,16 +771,20 @@ explains the value is sent to the runtime and cleared locally.
 ### Pairing and devices
 
 Pairing a device and checking what is already paired are one job, so they share
-one page with two halves and a tab strip: `←`/`→`, or a click, moves between
-**Pair** and **Paired devices**.
+one page with a tab strip: `←`/`→`, or a click, moves between **Pair**, **Paired
+devices**, and — where the runtime can answer for its own routes — **Remote
+access**.
 
 The pairing half lists the ways *this* runtime can be paired, and nothing else —
-a row the runtime would refuse is absent rather than disabled:
+a row the runtime would refuse is absent rather than disabled. The local-network
+row is one of those: the window is opened against the Direct route, so a runtime
+that reports no reachable Direct route is not offered a row that would be
+refused.
 
 | Row | Offered when | What it does |
 | --- | --- | --- |
 | Pair with a QR code | always | mints a one-time offer and draws it as a QR code, a one-time code and a link |
-| Find a device on this network | the runtime is a desktop shell that can advertise itself | opens a local-network pairing window and approves what answers it |
+| Find a device on this network | the runtime is a desktop shell that can advertise itself, over a reachable Direct route | opens a local-network pairing window and approves what answers it |
 | Pair with a code or link | the runtime is headless | shows the link a second desktop pastes into its add-runtime form |
 
 `Enter` opens the highlighted row in place and `Esc` closes it. A terminal that
@@ -790,9 +794,23 @@ long fit a terminal anyone has; anywhere else the code is drawn from half
 blocks, and a terminal too small for that says so and gives the link instead.
 The picture takes the room it needs and the link keeps what is left — one line
 of it at least, since a reader who cannot scan the code is the one who needs it;
-the full link is on the code-or-link row. A one-time code is shown once, is
-never written to logs or configuration, and is dropped when the reader leaves
-the pairing half.
+the full link is on the code-or-link row.
+
+An offer is not one route but all of them: the runtime publishes a route per
+method — Tailscale Serve, Direct, the self-hosted Relay — and the offer carries
+each one, because only the transport named in the link tells a device which road
+to take. The panel names the route the code and the link carry, with its origin,
+and `[`/`]` move the code onto another one; that switch is local, so it costs
+nothing and mints nothing. A runtime with a single published route draws the
+route without the key, because a control with one option is a control that does
+nothing.
+
+A one-time code is shown once, is never written to logs or configuration, and is
+taken down — on the runtime, not only on this screen — when the reader closes the
+panel or leaves the pairing half. A code the reader walked away from is still a
+code until the runtime is told to stop accepting it. The panel watches the offer
+while it is on screen and says so the moment a device claims it, rather than
+counting down to a deadline that has stopped meaning anything.
 
 While the local-network row is open, `a` allows and `r` refuses the device
 waiting on it — the panel names the device and the verification code both
@@ -802,6 +820,17 @@ closed panel looks again.
 The devices half is the trust store: what is paired, at which permission level
 and whether it is connected, with `x` to revoke and `u` for the remote-protocol
 audit trail.
+
+The **Remote access** half is a read: which of the three publishing methods are
+up, which are degraded, and what an operator has to do about the ones that are
+not. Nothing there is a verb. Switching a route on moves a Tailscale Serve
+config, binds a port, or enrolls a relay, and confirming a port is a decision
+about a machine the reader may not be sitting in front of — the desktop app's
+Remote Access page is where an operator can see the certificate, the port and the
+ownership that decision turns on. This half exists so that a terminal can say why
+there is nothing to pair with instead of showing a blank page: when no route is
+published, the pairing half says so and names the page that fixes it. The tab
+itself is absent on a runtime that cannot report its routes.
 
 ### Settings
 
