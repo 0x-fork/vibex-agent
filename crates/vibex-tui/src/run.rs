@@ -258,6 +258,16 @@ fn event_loop(
             app.sync_transcript();
             dirty = true;
         }
+        // ---- the transcript's liveness -------------------------------------
+        // A read can move the open session's state — a list answering an
+        // invalidated sidebar, a tree answer naming a worker — and the rows of
+        // a turn that never produced a final message stay streaming until the
+        // projection is rebuilt with that state. Settled before the clock,
+        // because the clock reads the transcript to decide whether a turn is
+        // still running.
+        if app.sync_transcript_liveness() {
+            dirty = true;
+        }
         // The turn clock follows the session's state, so the elapsed readout
         // starts when the turn does and stops when it ends, whatever path the
         // state took to get there.
@@ -3476,6 +3486,83 @@ mod tests {
         assert!(
             !app.is_animating(),
             "the settled page is still repainting for a turn that ended"
+        );
+    }
+
+    #[test]
+    fn a_list_read_that_settles_the_turn_stops_its_rows_from_streaming() {
+        // The fold is the page's copy of the state, and the transcript is where
+        // that state is drawn: a provider that streams its answer as deltas and
+        // never sends a final message leaves its last row arriving as far as the
+        // projection can tell. Folding the settled state in without rebuilding
+        // the transcript left the turn line drawing "running" — spinner, elapsed
+        // clock and all — over a turn the runtime had already finished.
+        use vibex_core::{AgentMessageDeltaPayload, TimelinePayload};
+        let (worker, _messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+        let mut app = isolation_app();
+        let mut running = isolation_session(vibex_core::VibexSessionId::new(), "codex");
+        running.state = vibex_core::AgentSessionState::Running;
+        app.agent.apply_sessions(Ok(vec![running.clone()])).unwrap();
+        app.agent.state.selected_session_id = Some(running.id.clone());
+        app.agent.state.active_session.resolve(running.clone());
+        app.navigate_to(Page::Agent);
+        app.agent.state.timeline.replace_authoritative(
+            running.id.clone(),
+            vec![conversation_item(
+                &running.id,
+                1,
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: "the answer".to_string(),
+                    chunk_index: 0,
+                    phase: Some(vibex_core::AgentMessagePhase::FinalAnswer),
+                }),
+            )],
+        );
+        app.sync_transcript();
+        assert!(
+            app.transcript_animating(),
+            "the running turn's answer is not arriving"
+        );
+        let live = conversation_frame(&mut app, 100, 30);
+        assert!(
+            live.contains(app.strings.phase_generating()),
+            "the running turn's phase is not on its own line:\n{live}"
+        );
+
+        let mut settled = running.clone();
+        settled.state = vibex_core::AgentSessionState::Idle;
+        settled.updated_at_ms = running.updated_at_ms + 1;
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Sessions(Ok(vec![settled.clone()])),
+        )
+        .unwrap();
+
+        assert_eq!(app.active_session(), Some(&settled));
+        // The read settles the page's copy of the state; the loop's own step is
+        // what settles the projection drawn from it.
+        assert!(
+            app.sync_transcript_liveness(),
+            "the loop did not notice the state move"
+        );
+        assert!(
+            !app.sync_transcript_liveness(),
+            "the loop rebuilt the transcript for a state it had already drawn"
+        );
+        assert!(
+            !app.transcript_animating(),
+            "a finished turn is still streaming"
+        );
+        let settled_frame = conversation_frame(&mut app, 100, 30);
+        assert!(
+            !settled_frame.contains(app.strings.running()),
+            "the settled session still reads as running:\n{settled_frame}"
+        );
+        assert!(
+            settled_frame.contains(app.strings.idle()),
+            "the settled session does not read as idle:\n{settled_frame}"
         );
     }
 

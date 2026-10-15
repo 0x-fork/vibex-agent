@@ -1272,6 +1272,17 @@ pub struct App {
     /// the rate is a difference between two of those readings, so it is held
     /// rather than derived at draw time.
     pub turn_readout: crate::turn::TurnReadout,
+    /// The open session's state the transcript was last built from.
+    ///
+    /// How live a row is comes from that state: a turn whose provider never
+    /// sent a final message leaves its row arriving until the projection is
+    /// rebuilt with a state that says the turn is over. The state can arrive
+    /// through a read — the session list an invalidated sidebar re-reads, an
+    /// ownership tree answer — and no rebuild follows a read, so the transcript
+    /// would keep the finished turn's rows streaming for the rest of the
+    /// session. Recording what it was built with is what lets the loop notice
+    /// that, rather than rebuilding the projection on every frame.
+    transcript_session_state: Option<vibex_core::AgentSessionState>,
     /// What the Agent is doing right now, when the runtime says.
     pub activity: Option<String>,
     /// Monotonic clock driving every animation.
@@ -1906,6 +1917,7 @@ impl App {
             banner: None,
             turn_started: None,
             turn_readout: crate::turn::TurnReadout::default(),
+            transcript_session_state: None,
             activity: None,
             animation_phase: 0,
             transitions: crate::scramble::Transitions::default(),
@@ -5815,6 +5827,31 @@ impl App {
         // The transcript is the turn's own output, so it is also where the line
         // above the composer learns that the turn moved.
         self.sync_turn_readout();
+        // What the rows were built from, so the loop can tell that the session
+        // has moved on since — see [`Self::sync_transcript_liveness`].
+        self.transcript_session_state = self.active_session().map(|session| session.state);
+    }
+
+    /// Rebuild the transcript when the state it draws from moved.
+    ///
+    /// A row's liveness is settled against the session's state, so a turn the
+    /// runtime has finished cannot still be streaming: that is what stops a
+    /// provider which never sent a final message from leaving its last row
+    /// arriving for the rest of the session. The state can move through a read
+    /// rather than an event — an attached seat learns a settled turn from the
+    /// sidebar invalidation whose list read it answers, and a delegated
+    /// worker's row arrives with the ownership tree — and no rebuild follows a
+    /// read. Without this, the page kept those rows streaming, and the turn
+    /// line reads a streaming row as work in flight: it spun, counted time and
+    /// said "running" over an answer the runtime had already finished.
+    ///
+    /// Answers whether the transcript was rebuilt.
+    pub fn sync_transcript_liveness(&mut self) -> bool {
+        if self.transcript_session_state == self.active_session().map(|session| session.state) {
+            return false;
+        }
+        self.sync_transcript();
+        true
     }
 
     /// Annotate each block with the fold its turn settled on.

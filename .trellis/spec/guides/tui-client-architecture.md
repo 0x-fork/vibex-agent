@@ -368,7 +368,15 @@ Rules that follow:
   rest of the session — and a client that draws a spinner from that flag says
   "running" over a finished answer, forever. `transcript_rows` settles it once
   for every client: only the last turn can be live, and only while the session
-  state (or an accepted send) says so.
+  state (or an accepted send) says so. That settlement reaches the screen only
+  when the projection is rebuilt, and the state can move through a *read* rather
+  than an event — the session list an invalidated sidebar re-reads, an ownership
+  tree answer — which no rebuild follows. `sync_transcript_liveness` is what
+  closes that: the loop compares the state the transcript was built from on
+  every pass and rebuilds when it moved, exactly as `sync_turn_clock` derives
+  the clock. The page that skipped it kept the finished turn's rows streaming,
+  and the turn line — which reads a streaming row as work in flight — went on
+  spinning and counting time under an answer that had already landed.
 * **A band that reports progress derives it from the projection, not from what
   is drawn.** `App::todo_progress` reads the last plan-shaped *timeline row*'s
   `Status: title` lines. Reading the transcript instead would tie a progress bar
