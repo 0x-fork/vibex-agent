@@ -784,7 +784,12 @@ read as one state in two places. The sweep is a frame driver for as long as it i
 mounted, so it takes the row's generating gate (`display_state == Running`,
 which already folds in the optimistic local dispatch) and nothing weaker — a
 parked, scheduled, initializing, or idle row keeps the plain truncated title
-with no animation. Its element ID is scoped to the row's session.
+with no animation. Its element ID is scoped to the row's session. That
+optimistic dispatch is an answer to one submission, so the authority's own
+settle retires it: a row stops sweeping and spinning when the runtime reports
+the turn settled, not when the submission's future finally returns — which can
+be a minute after the boundary on a long turn, because the runtime compacts the
+turn's streamed rows after publishing it.
 
 A session tab in a group pane's strip is the same row in a narrower lane, so it
 resolves the same two things from the same places: the title takes `ShimmerText`

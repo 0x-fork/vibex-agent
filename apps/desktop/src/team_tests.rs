@@ -1432,6 +1432,130 @@ fn a_row_reports_the_state_its_session_projection_resolves(cx: &mut TestAppConte
     );
 }
 
+/// The authority's own settle ends a locally dispatched turn's optimism.
+///
+/// The optimistic flag covers the stretch between a local dispatch and the
+/// authority admitting the turn, and it must not outlive the turn it speaks
+/// for. It used to be cleared only when the submission's future returned, which
+/// can trail the settle by the submission's own post-turn work — collapsing a
+/// long turn's streamed rows is unbounded — so the sidebar kept painting a
+/// finished turn as running while the row's persisted state already read idle.
+#[gpui::test]
+fn an_authoritative_settle_answers_the_dispatch_it_belongs_to(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    let session_id = session(0).id.clone();
+    let mut idle = session(0);
+    idle.state = AgentSessionState::Idle;
+    idle.updated_at_ms = 50;
+    let mut running = idle.clone();
+    running.state = AgentSessionState::Running;
+    running.updated_at_ms = 60;
+    let mut settled = idle.clone();
+    settled.updated_at_ms = 70;
+
+    workbench.update(cx, |workbench, _| {
+        workbench.upsert_session_snapshot(idle.clone());
+        workbench.set_session_turn_pending(&session_id, true);
+    });
+    assert!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .session_turn_pending(&session_id)),
+        "a local dispatch shows progress before the authority admits it"
+    );
+
+    // A snapshot read before the dispatch still describes the revision the
+    // dispatch started from, so it cannot be mistaken for the turn's settle.
+    workbench.update(cx, |workbench, _| {
+        workbench.upsert_session_snapshot(idle.clone());
+    });
+    assert!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .session_turn_pending(&session_id)),
+        "a snapshot from before the dispatch is not an answer to it"
+    );
+
+    // The authority admits the turn; the flag stays for as long as it runs.
+    workbench.update(cx, |workbench, _| {
+        workbench.upsert_session_snapshot(running.clone());
+    });
+    assert!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .session_turn_pending(&session_id)),
+        "an admitted turn keeps the flag while it runs"
+    );
+
+    // The turn settles while the submission that armed the flag is still busy,
+    // and the row follows the authority instead of the submission.
+    workbench.update(cx, |workbench, _| {
+        workbench.upsert_session_snapshot(settled.clone());
+    });
+    assert!(
+        !workbench.read_with(cx, |workbench, _| workbench
+            .session_turn_pending(&session_id)),
+        "the settle answers the dispatch, whatever its submission is still doing"
+    );
+    assert_eq!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .sidebar_session_row_state(&settled)),
+        AgentSessionState::Idle,
+        "the row reports the state the authority settled on"
+    );
+}
+
+/// A dispatch armed from a turn that is already running is admitted at once.
+///
+/// A native steer joins a turn no local submission owns, so no submission
+/// future would ever clear its flag: the turn's own settle is the only answer
+/// it can get.
+#[gpui::test]
+fn a_dispatch_that_joins_a_running_turn_is_answered_by_that_turn(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    let session_id = session(0).id.clone();
+    let mut running = session(0);
+    running.state = AgentSessionState::Running;
+    running.updated_at_ms = 30;
+    let mut settled = running.clone();
+    settled.state = AgentSessionState::Idle;
+    settled.updated_at_ms = 40;
+
+    workbench.update(cx, |workbench, _| {
+        workbench.upsert_session_snapshot(running.clone());
+        workbench.set_session_turn_pending(&session_id, true);
+    });
+    workbench.update(cx, |workbench, _| {
+        workbench.upsert_session_snapshot(settled.clone());
+    });
+    assert!(
+        !workbench.read_with(cx, |workbench, _| workbench
+            .session_turn_pending(&session_id)),
+        "the steered turn's settle is the answer the injection can get"
+    );
+}
+
+/// A row the workbench never saw settle still reports the dispatch.
+///
+/// `Initializing` is the runtime being prepared, not a turn the authority
+/// admitted, so the optimism the dispatch armed has not been answered yet.
+#[gpui::test]
+fn a_preparing_runtime_keeps_the_dispatch_optimism(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    let session_id = session(0).id.clone();
+    let mut preparing = session(0);
+    preparing.state = AgentSessionState::Initializing;
+    preparing.updated_at_ms = 10;
+
+    workbench.update(cx, |workbench, _| {
+        workbench.upsert_session_snapshot(preparing.clone());
+        workbench.set_session_turn_pending(&session_id, true);
+        workbench.upsert_session_snapshot(preparing.clone());
+    });
+    assert!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .session_turn_pending(&session_id)),
+        "a runtime still being prepared has not answered the dispatch"
+    );
+}
+
 #[gpui::test]
 fn team_presentation_recovers_missing_groups_preserves_manual_layout_and_respects_authority(
     cx: &mut TestAppContext,

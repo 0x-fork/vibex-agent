@@ -9241,6 +9241,23 @@ pub struct VibexWorkbench {
     agent_action_pending: bool,
     fork_session_pending: bool,
     pending_agent_turn_session_ids: BTreeSet<String>,
+    /// The authoritative session revision each locally dispatched turn was
+    /// armed against, keyed by session id.
+    ///
+    /// The optimistic flag speaks for a dispatch, not for a turn: it may only
+    /// be answered by a snapshot the authority wrote after the dispatch, which
+    /// is what the revision records. Without it a snapshot read before the
+    /// dispatch could be mistaken for the dispatch's own settle.
+    pending_agent_turn_revisions: BTreeMap<String, i64>,
+    /// Sessions whose locally dispatched turn the authority has since admitted
+    /// by reporting `Running`/`NeedsInput`.
+    ///
+    /// Only an admitted turn can settle, so this is the other half of the
+    /// answer: the flag is dropped once the authority reports a settled state
+    /// for a turn it was seen to admit. A native steer arms the flag from a
+    /// turn that is already running, and nothing else in that path would ever
+    /// clear it.
+    pending_agent_turn_admitted: BTreeSet<String>,
     unread_agent_completion_session_ids: BTreeSet<String>,
     /// Session ids with an unresolved approval or input request, mapped to the
     /// request ids still waiting for an answer.
@@ -10659,6 +10676,8 @@ impl VibexWorkbench {
             agent_action_pending: false,
             fork_session_pending: false,
             pending_agent_turn_session_ids: BTreeSet::new(),
+            pending_agent_turn_revisions: BTreeMap::new(),
+            pending_agent_turn_admitted: BTreeSet::new(),
             unread_agent_completion_session_ids: BTreeSet::new(),
             pending_user_request_ids: BTreeMap::new(),
             notification_suppressed_session_ids: BTreeSet::new(),
@@ -14807,6 +14826,10 @@ impl VibexWorkbench {
                                 .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
                                 .collect();
                             this.sessions = sessions;
+                            // The read is authoritative for whole rows, so a
+                            // dispatch whose turn it shows settled is answered
+                            // here rather than by the submission that armed it.
+                            this.reconcile_pending_agent_turns();
                             // The delegated children are read after the root
                             // list, from the runtime's ownership edges, so a
                             // child that is not a navigation row still has a
@@ -15515,6 +15538,9 @@ impl VibexWorkbench {
             return;
         }
         let session = self.reconcile_pending_new_session_title(session);
+        // The snapshot is the authority's own account of the turn a local
+        // dispatch asked for, so it is what answers the optimistic flag.
+        self.reconcile_pending_agent_turn(&session);
         let delegated = (self.delegated_sessions.contains_key(session.id.as_str())
             && !self.sessions.iter().any(|root| root.id == session.id))
             || self
@@ -15580,6 +15606,31 @@ impl VibexWorkbench {
         if pending {
             self.pending_agent_turn_session_ids
                 .insert(session_id.as_str().to_string());
+            // The flag speaks for the dispatch that armed it, so it is pinned to
+            // the revision the client held then: only a snapshot the authority
+            // wrote afterwards can answer it, and a snapshot read before the
+            // dispatch cannot be mistaken for its settle. A dispatch that joins
+            // a turn the authority is already running — a native steer — has
+            // been admitted by definition and only has its settle left.
+            let (revision, admitted) =
+                self.registered_session(session_id.as_str())
+                    .map_or((0, false), |session| {
+                        (
+                            session.updated_at_ms,
+                            matches!(
+                                session.state,
+                                AgentSessionState::Running | AgentSessionState::NeedsInput
+                            ),
+                        )
+                    });
+            self.pending_agent_turn_revisions
+                .insert(session_id.as_str().to_string(), revision);
+            if admitted {
+                self.pending_agent_turn_admitted
+                    .insert(session_id.as_str().to_string());
+            } else {
+                self.pending_agent_turn_admitted.remove(session_id.as_str());
+            }
             self.auto_continue_paused_turn_session_ids
                 .remove(session_id.as_str());
             self.auto_continue_handled_turns.remove(session_id.as_str());
@@ -15591,6 +15642,9 @@ impl VibexWorkbench {
         } else {
             self.pending_agent_turn_session_ids
                 .remove(session_id.as_str());
+            self.pending_agent_turn_revisions
+                .remove(session_id.as_str());
+            self.pending_agent_turn_admitted.remove(session_id.as_str());
         }
         if self.selected_session_id.as_ref() == Some(session_id) {
             self.agent_turn_pending = pending;
@@ -15601,6 +15655,68 @@ impl VibexWorkbench {
         if was_pending != pending {
             self.invalidate_sidebar_projection_cache();
             self.publish_sidebar_invalidation();
+        }
+    }
+
+    /// Settles the optimistic local dispatch against an authoritative snapshot.
+    ///
+    /// A locally dispatched turn paints its row as running before the authority
+    /// admits it, and that optimism is only answered by the authority's own
+    /// settle. The flag is armed with the revision the dispatch started from, so
+    /// a snapshot answers it only once the authority has moved past that
+    /// revision: the turn has to be seen admitted (`Running`/`NeedsInput`) and
+    /// then settled. Without this the flag outlives the turn whenever the
+    /// submission's own future is slower than the settle — collapsing a long
+    /// turn's streamed rows is unbounded work — and the sidebar keeps painting a
+    /// finished turn as running while the row's own state already reads idle.
+    /// It is also the only answer a native steer can get: the message joins a
+    /// turn no local submission owns, so nothing else would ever clear the flag.
+    fn reconcile_pending_agent_turn(&mut self, session: &AgentSession) -> bool {
+        let key = session.id.as_str();
+        if !self.pending_agent_turn_session_ids.contains(key) {
+            return false;
+        }
+        match session.state {
+            AgentSessionState::Running | AgentSessionState::NeedsInput => {
+                self.pending_agent_turn_admitted.insert(key.to_string());
+                false
+            }
+            // `Initializing` is the runtime being prepared, not a turn the
+            // authority admitted: the dispatch it was armed for is still ahead.
+            AgentSessionState::Initializing => false,
+            AgentSessionState::Idle
+            | AgentSessionState::Error
+            | AgentSessionState::Closed
+            | AgentSessionState::Archived => {
+                let answered = self.pending_agent_turn_admitted.contains(key)
+                    && self
+                        .pending_agent_turn_revisions
+                        .get(key)
+                        .is_none_or(|armed| session.updated_at_ms > *armed);
+                if answered {
+                    self.set_session_turn_pending(&session.id, false);
+                }
+                answered
+            }
+        }
+    }
+
+    /// Answers every armed optimistic dispatch against the rows on hand.
+    ///
+    /// An authoritative read replaces the whole list at once, so it never goes
+    /// through [`Self::upsert_session_snapshot`] one row at a time; the flags a
+    /// settle in that read answers still have to be released.
+    fn reconcile_pending_agent_turns(&mut self) {
+        let armed = self
+            .pending_agent_turn_session_ids
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for session_id in armed {
+            let Some(session) = self.registered_session(&session_id).cloned() else {
+                continue;
+            };
+            self.reconcile_pending_agent_turn(&session);
         }
     }
 
@@ -32079,6 +32195,12 @@ impl VibexWorkbench {
                     if injected {
                         this.composer_queue.retain(|queued| queued.id != message_id);
                         this.set_session_turn_pending(&session_id, true);
+                        // The adapter answered `Injected`: the message joined a
+                        // turn the authority is running, so that turn's settle
+                        // is the only answer this flag can get — no submission
+                        // of ours owns it.
+                        this.pending_agent_turn_admitted
+                            .insert(session_id.as_str().to_string());
                         this.reconcile_sidebar_state();
                         this.publish_sidebar_invalidation();
                         this.composer_queue_changed();
@@ -35866,6 +35988,10 @@ impl VibexWorkbench {
         self.pending_new_session_titles
             .retain(|session_id, _| !session_ids.contains(session_id));
         self.pending_agent_turn_session_ids
+            .retain(|session_id| !session_ids.contains(session_id));
+        self.pending_agent_turn_revisions
+            .retain(|session_id, _| !session_ids.contains(session_id));
+        self.pending_agent_turn_admitted
             .retain(|session_id| !session_ids.contains(session_id));
         self.unread_agent_completion_session_ids
             .retain(|session_id| !session_ids.contains(session_id));

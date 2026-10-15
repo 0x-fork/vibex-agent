@@ -866,7 +866,11 @@ schedule waits behind it, a settled session releases a fence without any probe,
 moving an ordinary message in front of a schedule sends it, a head with no
 obtainable verdict is handed over instead of bouncing back, a refused hand-over
 is not reported as dispatched, and a live view settles a revision only for the
-completion it can see. `desktop-model`
+completion it can see. The same file covers the optimistic dispatch projection:
+a settle the authority published answers the flag even while its submission is
+still busy, a snapshot from before the dispatch cannot, a dispatch that joins a
+running turn is answered by that turn, and a session still `Initializing` keeps
+the optimism. `desktop-model`
 covers the persisted queue's normalization, its bounds, and the UI-state
 encode/decode round trip. A source-level test asserts the row keeps the
 scheduled mark ahead of the generic
@@ -2090,6 +2094,19 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   update timeline content, not the sidebar/session-state snapshot; using the
   pre-submit `Idle` or `Running` snapshot can hide the continue affordance and
   skip recovery even though storage has already committed `Error`.
+- The local turn-pending projection is an answer to one dispatch, not a state of
+  its own, so the authority's own settle ends it. Arm it with the session
+  revision the dispatch started from; a snapshot only answers it once the
+  authority has moved past that revision — the turn was seen admitted
+  (`Running`/`NeedsInput`) and then reported settled (`Idle`/`Error`/`Closed`/
+  `Archived`). Waiting for the submission's future instead lets the flag outlive
+  the turn whenever that future is slower than the settle, which is ordinary:
+  the runtime publishes the boundary before it compacts a long turn's streamed
+  rows, while the submission returns only after the compaction. A snapshot read
+  before the dispatch must never answer it, and a dispatch that joins a turn the
+  authority is already running — a native steer, whose `Injected` answer is
+  itself proof of admission — has no submission of ours to wait for at all. A
+  session still `Initializing` has not admitted anything yet.
 - After a successful submission reaches its turn boundary, automatic Composer
   queue dispatch may ignore a lagging sidebar `Running` snapshot. The local
   per-session turn-pending flag and an authoritative `NeedsInput` state remain
