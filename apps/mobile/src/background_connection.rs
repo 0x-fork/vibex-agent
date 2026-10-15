@@ -342,7 +342,12 @@ fn stop_service_if_current(generation: u64, backend: &Arc<WebRemoteBackend>) {
     }
 }
 
-fn is_terminal(state: RemoteConnectionState) -> bool {
+/// Whether no retry can leave `state`: the runtime rejected this device's
+/// credential, or it speaks a protocol this app cannot.
+///
+/// The reader stops background delivery on these, and the app leaves the dead
+/// connection behind rather than offering a control that cannot work.
+pub(crate) fn is_terminal(state: RemoteConnectionState) -> bool {
     matches!(
         state,
         RemoteConnectionState::Revoked | RemoteConnectionState::Incompatible

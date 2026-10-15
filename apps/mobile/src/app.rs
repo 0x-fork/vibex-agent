@@ -150,6 +150,45 @@ const RESUME_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RESUME_RECOVERY_POLL_ATTEMPTS: usize = 600;
 const RUNTIME_FEATURE_VALUE_LIMIT: usize = 256;
 
+/// What a resumed phone should do about the connection it came back to.
+///
+/// The transport owns recovery, so this only says when the wait is over:
+/// `Online` is the recovery, a credential the runtime has already refused is
+/// the end of the line, and every state in between is still work in progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResumeRecoveryOutcome {
+    Recovered,
+    Unrecoverable,
+    Pending,
+}
+
+fn resume_recovery_outcome(state: RemoteConnectionState) -> ResumeRecoveryOutcome {
+    if state == RemoteConnectionState::Online {
+        ResumeRecoveryOutcome::Recovered
+    } else if crate::background_connection::is_terminal(state) {
+        ResumeRecoveryOutcome::Unrecoverable
+    } else {
+        ResumeRecoveryOutcome::Pending
+    }
+}
+
+/// Why a connection will never come up with the credential the phone holds.
+fn unrecoverable_connection_copy(state: RemoteConnectionState) -> &'static str {
+    if state == RemoteConnectionState::Revoked {
+        locale::text(
+            "This phone's access was revoked. Pair it again from the desktop",
+            "这台手机的授权已失效，请在桌面端重新配对",
+            "這台手機的授權已失效，請在桌面版重新配對",
+        )
+    } else {
+        locale::text(
+            "This desktop and this app are not compatible. Update one of them",
+            "桌面端与当前应用版本不兼容，请更新其中一端",
+            "桌面版與目前應用程式版本不相容，請更新其中一端",
+        )
+    }
+}
+
 /// The runtime sheet pins its view bands (Agent strip, search row, model
 /// list) at fixed heights so each band scrolls inside itself instead of
 /// growing the card; the session-options band fills whatever remains.
@@ -2999,14 +3038,32 @@ impl MobileApp {
         }
     }
 
+    /// Waits out a resume whose transport is still trying to get back.
+    ///
+    /// The transport owns recovery, so this only decides when waiting stops
+    /// paying off. A phone that comes back to a connection it can no longer
+    /// use must not keep the stale page: holding it is what let a backgrounded
+    /// app look as if it had closed, and every control that can start a
+    /// connection again lives on the pairing page. The wait therefore ends
+    /// either in the refetch that marks recovery, or by leaving the dead
+    /// connection behind and showing the runtimes this phone knows.
     fn wait_for_resume_recovery(&mut self, backend: Arc<WebRemoteBackend>, cx: &mut Context<Self>) {
         let background = cx.background_executor().clone();
         self.resume_recovery_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            // Switching or disconnecting finishes without cancelling this poll
+            // in every path, so every landing checks that the connection it was
+            // waiting for is still the app's before it touches the page.
+            let still_active = |this: &Self| {
+                this.backend
+                    .as_ref()
+                    .is_some_and(|c| Arc::ptr_eq(c, &backend))
+            };
+            let mut unrecoverable = None;
             for _ in 0..RESUME_RECOVERY_POLL_ATTEMPTS {
-                match backend.connection_state().state {
-                    RemoteConnectionState::Online => {
+                match resume_recovery_outcome(backend.connection_state().state) {
+                    ResumeRecoveryOutcome::Recovered => {
                         let _ = entity.update(cx, |this, cx| {
-                            if this.app_backgrounded {
+                            if this.app_backgrounded || !still_active(this) {
                                 return;
                             }
                             this.record_active_host_connected(&backend);
@@ -3023,43 +3080,35 @@ impl MobileApp {
                         });
                         return;
                     }
-                    RemoteConnectionState::Revoked | RemoteConnectionState::Incompatible => {
-                        return;
+                    ResumeRecoveryOutcome::Unrecoverable => {
+                        unrecoverable = Some(unrecoverable_connection_copy(
+                            backend.connection_state().state,
+                        ));
+                        break;
                     }
-                    RemoteConnectionState::Idle
-                    | RemoteConnectionState::Resolving
-                    | RemoteConnectionState::Probing
-                    | RemoteConnectionState::Connecting
-                    | RemoteConnectionState::Authenticating
-                    | RemoteConnectionState::Syncing
-                    | RemoteConnectionState::Reconnecting
-                    | RemoteConnectionState::Degraded
-                    | RemoteConnectionState::Offline => {}
+                    ResumeRecoveryOutcome::Pending => {}
                 }
                 background.timer(RESUME_RECOVERY_POLL_INTERVAL).await;
             }
-            // The transport gave up before the UI saw a stable connection.
-            // Say so instead of leaving the user on a frozen screen, and clear
-            // the stale event-consumer task. Restoring the connection stays
-            // where every connection control already lives — the runtime's own
-            // action sheet — so the hint only reports what happened.
+            // The transport spent its reconnect budget without reaching the
+            // desktop, or said outright that it never will. The page goes back
+            // to where a connection can be started again, and the hint says
+            // which of the two happened.
+            let message = unrecoverable.unwrap_or_else(|| {
+                locale::text(
+                    "Reconnection failed. Choose a runtime to connect again",
+                    "重新连接失败，请重新选择运行时",
+                    "重新連線失敗，請重新選擇執行環境",
+                )
+            });
             let _ = entity.update(cx, |this, cx| {
-                this.stop_event_stream();
-                this.hint(
-                    Tone::Warning,
-                    locale::text("Reconnection failed", "重新连接失败", "重新連線失敗"),
-                );
-                cx.notify();
+                if !still_active(this) {
+                    return;
+                }
+                this.return_to_pairing_home(cx);
+                this.hint(Tone::Warning, message);
             });
         }));
-    }
-
-    /// Stops forwarding backend events to the UI and cancels the recovery
-    /// poll. The transport itself is untouched, so an in-flight reconnect can
-    /// still complete and be picked up by the next lifecycle signal.
-    fn stop_event_stream(&mut self) {
-        crate::background_connection::suspend_ui_events();
-        self.event_consumer_task = None;
     }
 
     fn start_scanner_result_stream(
@@ -3830,8 +3879,22 @@ impl MobileApp {
                         this.resolve_pending_notification_action(cx);
                     }
                     Ok(Err(error)) => {
-                        this.mode = RootMode::Connecting;
-                        this.fail(error);
+                        // A credential the runtime has already refused is not
+                        // something Retry can repair, and a phone that was
+                        // killed in the background comes back through here: it
+                        // must land where a new pairing can be claimed rather
+                        // than on a page whose only control cannot work.
+                        if crate::background_connection::is_terminal(
+                            backend.connection_state().state,
+                        ) {
+                            let message =
+                                unrecoverable_connection_copy(backend.connection_state().state);
+                            this.return_to_pairing_home(cx);
+                            this.hint(Tone::Warning, message);
+                        } else {
+                            this.mode = RootMode::Connecting;
+                            this.fail(error);
+                        }
                     }
                     Err(_) => {
                         this.mode = RootMode::Connecting;
@@ -9278,7 +9341,21 @@ impl MobileApp {
     /// so their own cards are what connect again. Deleting a credential is the
     /// runtime action sheet's separate, confirmed Remove.
     fn disconnect_host(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.return_to_pairing_home(cx);
+    }
+
+    /// Leaves a connection the phone can no longer use and shows the page that
+    /// lists every runtime it knows.
+    ///
+    /// The dead transport is dropped with it, so nothing tries to deliver
+    /// events for a connection the UI has left, and the foreground service
+    /// goes with it — the phone must not keep claiming a connection it does
+    /// not have.
+    fn return_to_pairing_home(&mut self, cx: &mut Context<Self>) {
         self.teardown_active_connection(cx);
+        // An attempt that was in flight died with the connection, so no control
+        // on the page about to show may keep its disabled, busy state.
+        self.operation_busy = false;
         self.mode = RootMode::Pairing;
         crate::platform::hide_keyboard();
         // The page about to show is the one that reports which saved runtimes
@@ -30963,6 +31040,67 @@ mod tests {
         assert_eq!(mounted_hints(cx), 0, "disconnecting announces nothing");
     }
 
+    /// A phone that comes back to a connection the transport never recovers
+    /// must not keep the page it left behind. Holding that stale workspace is
+    /// what made a backgrounded app look as if it had closed; the phone drops
+    /// the dead connection instead and lands on the pairing page, where the
+    /// runtime it was on is still listed and one tap connects again.
+    #[gpui::test]
+    fn a_resume_the_transport_never_recovers_returns_to_the_pairing_page(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let mut bundle = host_bundle("runtime-a", "studio");
+        bundle.route = Some(crate::pairing::MobileRemoteRouteBundle {
+            local_network: None,
+            direct_candidates: vec![bundle.record.server_url.clone()],
+            relay: None,
+        });
+        let backend = bundle.backend().expect("valid saved runtime");
+        let host_id = bundle.host_id().to_string();
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.remember_host(&bundle, RemoteServerKind::Desktop);
+            app.persist_known_hosts();
+            app.mode = RootMode::Workspace;
+            app.backend = Some(backend.clone());
+            app.controller = Some(AgentWorkflowController::new(
+                backend.clone(),
+                backend.capability_snapshot().agent,
+            ));
+            app
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.wait_for_resume_recovery(backend.clone(), cx);
+        });
+        // The transport never reaches Online and never reports a state a retry
+        // cannot leave, so the poll window is the only thing that can end the
+        // wait; a connection that recovers first takes the other branch.
+        cx.executor().advance_clock(
+            RESUME_RECOVERY_POLL_INTERVAL * (RESUME_RECOVERY_POLL_ATTEMPTS as u32 + 1),
+        );
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.mode, RootMode::Pairing);
+            assert!(app.backend.is_none(), "the dead connection is dropped");
+            assert!(app.controller.is_none());
+            assert!(app.overlay.is_none());
+            // Still saved and still the runtime the phone was on, so the page
+            // that just painted leads with it.
+            assert_eq!(app.known_hosts.len(), 1);
+            assert_eq!(app.active_host_id.as_deref(), Some(host_id.as_str()));
+            let stored = app.storage.load_hosts().expect("stored hosts file");
+            assert_eq!(stored.len(), 1);
+        });
+        assert!(
+            hint_is_shown(cx, Tone::Warning),
+            "the phone says why it left the workspace"
+        );
+    }
+
     /// Settings' Disconnect is the same contract as the unavailable screen's:
     /// it ends the connection and keeps every saved runtime, including the ones
     /// it was not connected to. Deleting one stays the runtime action sheet's
@@ -33156,6 +33294,45 @@ fn session_opened(cx: &mut Context<Self>) {
         );
         assert!(RuntimeStatus::Reconnecting.label(3).contains('3'));
         assert!(!RuntimeStatus::Reconnecting.label(1).contains('1'));
+    }
+
+    /// The resume poll stops early only for the two states no retry can leave.
+    /// Everything else keeps waiting: a transport that is still connecting, or
+    /// has just gone offline, may still come back inside the window, and the
+    /// phone must not walk away from a connection that is about to recover.
+    #[test]
+    fn a_resume_waits_out_every_state_a_retry_can_still_leave() {
+        assert_eq!(
+            resume_recovery_outcome(RemoteConnectionState::Online),
+            ResumeRecoveryOutcome::Recovered
+        );
+        for terminal in [
+            RemoteConnectionState::Revoked,
+            RemoteConnectionState::Incompatible,
+        ] {
+            assert_eq!(
+                resume_recovery_outcome(terminal),
+                ResumeRecoveryOutcome::Unrecoverable,
+                "{terminal:?}"
+            );
+        }
+        for pending in [
+            RemoteConnectionState::Idle,
+            RemoteConnectionState::Resolving,
+            RemoteConnectionState::Probing,
+            RemoteConnectionState::Connecting,
+            RemoteConnectionState::Authenticating,
+            RemoteConnectionState::Syncing,
+            RemoteConnectionState::Reconnecting,
+            RemoteConnectionState::Degraded,
+            RemoteConnectionState::Offline,
+        ] {
+            assert_eq!(
+                resume_recovery_outcome(pending),
+                ResumeRecoveryOutcome::Pending,
+                "{pending:?}"
+            );
+        }
     }
 
     /// The detail page's type field is the only place the phone explains what

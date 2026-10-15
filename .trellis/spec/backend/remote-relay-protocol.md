@@ -1133,6 +1133,16 @@ Agent timeline service:
   only then treats the background disconnect as recovered. A disconnect event
   observed while the app is hidden must not leave a stale "connection lost"
   notice after this recovery completes.
+- A resume the transport never recovers must not keep the workspace it left.
+  Mobile polls the transport for a bounded window; a state the runtime has
+  already refused (`Revoked`, `Incompatible`) ends that wait at once, and the
+  window's expiry ends it otherwise. Either ending drops the dead connection —
+  and with it the foreground service and any attempt still in flight — and
+  shows the pairing page, where every saved runtime stays listed and its own
+  row is what connects again. The same landing replaces the retry page when a
+  connect attempt ends in a refused credential: a phone killed in the
+  background must come back to a page that can start a connection, never to a
+  control that cannot succeed.
 
 Do not let feature hooks own independent reconnect loops. One transport layer
 owns reconnect, replay, auth refresh, and queue draining.
