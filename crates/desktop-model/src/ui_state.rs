@@ -1255,7 +1255,7 @@ pub struct DesktopBehaviorUiState {
     pub notify_agent_failed: bool,
     #[serde(default = "default_update_prompts_enabled")]
     pub show_update_prompts: bool,
-    #[serde(default)]
+    #[serde(default = "default_auto_update_enabled")]
     pub auto_update: bool,
 }
 
@@ -1270,7 +1270,7 @@ impl Default for DesktopBehaviorUiState {
             notify_agent_needs_input: default_notifications_enabled(),
             notify_agent_failed: default_notifications_enabled(),
             show_update_prompts: default_update_prompts_enabled(),
-            auto_update: false,
+            auto_update: default_auto_update_enabled(),
         }
     }
 }
@@ -1284,6 +1284,15 @@ const fn default_notifications_enabled() -> bool {
 }
 
 const fn default_update_prompts_enabled() -> bool {
+    true
+}
+
+/// Automatic updates ship on: a signed release downloads as soon as it is
+/// found, and a staged one installs on quit when the user did not install it.
+/// A state file written before the preference existed has no `autoUpdate`
+/// field, so it decodes to this rather than to the old off default — that is
+/// what turns the feature on for an existing installation after an upgrade.
+const fn default_auto_update_enabled() -> bool {
     true
 }
 
@@ -3239,6 +3248,42 @@ mod tests {
         assert!(decoded.desktop_behavior.close_to_tray);
     }
 
+    /// Both update preferences ship on, so a fresh installation and one that
+    /// predates either field agree: the release downloads itself, the panel
+    /// explains what is happening, and a staged release installs on quit.
+    #[test]
+    fn update_preferences_default_to_on_for_a_fresh_and_a_legacy_state() {
+        let defaults = DesktopBehaviorUiState::default();
+        assert!(defaults.show_update_prompts);
+        assert!(defaults.auto_update);
+
+        let mut legacy = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        let behavior = legacy
+            .get_mut("desktopBehavior")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        behavior.remove("showUpdatePrompts");
+        behavior.remove("autoUpdate");
+
+        let decoded = decode_and_migrate(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(decoded.desktop_behavior.show_update_prompts);
+        assert!(decoded.desktop_behavior.auto_update);
+    }
+
+    /// Turning either preference off is the user's decision and has to survive
+    /// the round trip instead of snapping back to the shipped default.
+    #[test]
+    fn disabled_update_preferences_survive_the_round_trip() {
+        let mut state = DesktopUiStateV1::default();
+        state.desktop_behavior.show_update_prompts = false;
+        state.desktop_behavior.auto_update = false;
+
+        let decoded = decode_and_migrate(&serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert!(!decoded.desktop_behavior.show_update_prompts);
+        assert!(!decoded.desktop_behavior.auto_update);
+    }
+
     #[test]
     fn preview_window_mode_defaults_to_inline_and_round_trips_a_window_choice() {
         assert_eq!(
@@ -3387,6 +3432,9 @@ mod tests {
         behavior.remove("notifyAgentNeedsInput");
         behavior.remove("notifyAgentFailed");
         behavior.remove("showUpdatePrompts");
+        // Written before the automatic-updates preference existed, so the file
+        // carries no `autoUpdate` field and must decode to the shipped default.
+        behavior.remove("autoUpdate");
         behavior.remove("lastUpdatePromptedVersion");
 
         let decoded = decode_and_migrate(&serde_json::to_vec(&legacy).unwrap()).unwrap();
@@ -3403,7 +3451,7 @@ mod tests {
         assert_eq!(decoded.composer.message_send_key, MessageSendKey::Enter);
         assert!(decoded.desktop_behavior.notifications_enabled);
         assert!(decoded.desktop_behavior.show_update_prompts);
-        assert!(!decoded.desktop_behavior.auto_update);
+        assert!(decoded.desktop_behavior.auto_update);
         assert_eq!(
             decoded.terminal_preferences,
             TerminalPreferencesUiState::default()
@@ -3419,7 +3467,7 @@ mod tests {
         state.desktop_behavior.launch_at_login = true;
         state.desktop_behavior.notify_agent_failed = false;
         state.desktop_behavior.show_update_prompts = false;
-        state.desktop_behavior.auto_update = true;
+        state.desktop_behavior.auto_update = false;
         state.composer.queue_send_mode = ComposerQueueSendMode::Manual;
         state.composer.message_send_key = MessageSendKey::CommandEnter;
         state.agent_sort_strategy = AgentSortStrategy::UsageFrequency;
@@ -3445,7 +3493,7 @@ mod tests {
         assert!(round_trip.desktop_behavior.launch_at_login);
         assert!(!round_trip.desktop_behavior.notify_agent_failed);
         assert!(!round_trip.desktop_behavior.show_update_prompts);
-        assert!(round_trip.desktop_behavior.auto_update);
+        assert!(!round_trip.desktop_behavior.auto_update);
         assert_eq!(
             round_trip.composer.queue_send_mode,
             ComposerQueueSendMode::Manual

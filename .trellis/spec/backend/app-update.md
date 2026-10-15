@@ -146,6 +146,12 @@ without user interruption; manual failures publish a typed visible error.
 - Persist `show_update_prompts` and `auto_update` only in bounded desktop UI
   state; they are not Relay data. Disabling prompts does not disable background
   checks, and the panel's open state is session-local.
+- Both preferences default to on, and their `#[serde(default)]` resolves to the
+  same value, so a state file written before either field existed decodes to the
+  shipped default rather than to the old off answer. Keep the default function
+  and the `Default` impl in step; a test pins the fresh state, the legacy state
+  and an explicit user opt-out separately, because only the last one may store
+  `false`.
 
 ## Error And Logging Rules
 
