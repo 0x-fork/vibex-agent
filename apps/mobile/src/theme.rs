@@ -255,30 +255,39 @@ pub const TOAST_MAX_VISIBLE: usize = 3;
 /// ([`rem_base`]), *not* in [`ui_rems`]: the base multiplies every rem in the
 /// frame at once, so a step repaints the whole interface — the hand-built rows
 /// and the kit controls alike — through the one value the kit also reads.
-pub const UI_REM: f32 = 16.0;
+///
+/// The base is the body step rather than the web's 16px convention: the kit
+/// derives its own `text_base` from this rem, so anchoring it on [`FONT_BODY`]
+/// is what keeps a kit control the same size as the row label beside it.
+pub const UI_REM: f32 = FONT_BODY;
 
 /// Ratio of a line box to its font size. A surface that does not carry its own
 /// metric takes [`line_height_for`], so a ladder step scales its leading with
 /// it instead of freezing at one screen's pixel height.
+///
+/// GPUI's own default is the golden ratio (1.618), which a phone cannot afford
+/// inside its touch-target rows; this is the tighter box the ladder uses.
 pub const LINE_HEIGHT_RATIO: f32 = 1.45;
 
 /// The title of a surface or a hero row.
-pub const FONT_TITLE: f32 = 20.0;
+pub const FONT_TITLE: f32 = 22.0;
 /// A section's own heading — strictly above the rows it groups.
-pub const FONT_HEADING: f32 = 17.0;
-/// Conversation text and every primary row label.
-pub const FONT_BODY: f32 = 16.0;
+pub const FONT_HEADING: f32 = 18.0;
+/// Conversation text and every primary row label. The ladder is anchored here:
+/// it is the size the reader looks at longest, so it sets both [`UI_REM`] and
+/// the step everything else is judged against.
+pub const FONT_BODY: f32 = 17.0;
 /// Supporting text under a primary label: row details, timeline metadata.
-pub const FONT_DETAIL: f32 = 14.0;
+pub const FONT_DETAIL: f32 = 15.0;
 /// Captions, chips, and button labels.
-pub const FONT_CAPTION: f32 = 13.0;
+pub const FONT_CAPTION: f32 = 14.0;
 /// Code buffers: monospace reads larger than the interface face at the same
 /// size, so it sits at the caption's step. An alias rather than a second value
 /// so the two can never drift apart.
 pub const FONT_CODE: f32 = FONT_CAPTION;
-/// The floor of the ladder: timestamps, counts, badges. Never below the
-/// 12sp Android minimum.
-pub const FONT_MICRO: f32 = 12.0;
+/// The floor of the ladder: timestamps, counts, badges. It is the smallest
+/// step the phone renders, kept at the size secondary copy stays legible in.
+pub const FONT_MICRO: f32 = 13.0;
 /// Large isolated numerals — the pairing code, a count on an otherwise empty
 /// page. Never used for prose, so it sits above [`FONT_TITLE`].
 pub const FONT_DISPLAY: f32 = 30.0;
@@ -412,7 +421,32 @@ pub const RADIUS_PILL: f32 = 999.0;
 pub const DRAWER_ROW_HEIGHT: f32 = 56.0;
 /// A phone row is a touch target first: the desktop's 32/40px rows put the
 /// label and the trailing metadata within a few pixels of each other.
+///
+/// It is the floor, not the whole story — a row that stacks two lines takes
+/// [`sidebar_row_height`], which grows with the type so a larger text step does
+/// not clip its second line.
 pub const SIDEBAR_ROW_HEIGHT: f32 = 48.0;
+
+/// The height of a sidebar row that stacks a title over its metadata.
+///
+/// The two lines, never below the touch-target floor. The text-size preference
+/// grows the rem base, so a row pinned to the fixed floor would clip its second
+/// line at the larger steps — this makes room for it instead. At the default
+/// step the text is shorter than the floor, so the row keeps its current
+/// density and only the accessibility steps add height.
+pub fn sidebar_row_height() -> Pixels {
+    sidebar_row_height_for(rem_base())
+}
+
+/// The two-line sidebar row height one rem base produces.
+///
+/// Split from [`sidebar_row_height`] so the fitting rule is unit-testable at
+/// every step without mutating the process-global text-size preference.
+fn sidebar_row_height_for(rem: Pixels) -> Pixels {
+    let text = f32::from(line_height_for(FONT_HEADING).to_pixels(rem))
+        + f32::from(line_height_for(FONT_CAPTION).to_pixels(rem));
+    px(text.max(SIDEBAR_ROW_HEIGHT))
+}
 
 // ---------------------------------------------------------------------------
 // Motion
@@ -1050,12 +1084,20 @@ mod tests {
     fn the_reader_step_moves_the_rem_base_once() {
         // The scale enters layout exactly once, through the window rem. If a
         // ladder accessor multiplied it too, the default step would no longer
-        // render at its authored size.
-        assert_eq!(rem_base_for(100), px(UI_REM));
-        assert_eq!(rem_base_for(115), px(UI_REM * 1.15));
-        assert_eq!(rem_base_for(90), px(UI_REM * 0.90));
-        assert_eq!(rem_base_for(1000), px(UI_REM * 1.5), "clamped at the top");
-        assert_eq!(rem_base_for(0), px(UI_REM * 0.75), "clamped at the floor");
+        // render at its authored size. Float arithmetic on the two sides of
+        // each case can differ by an ulp, so compare within half a pixel.
+        let close = |left: Pixels, right: Pixels| (f32::from(left) - f32::from(right)).abs() < 0.5;
+        assert!(close(rem_base_for(100), px(UI_REM)));
+        assert!(close(rem_base_for(115), px(UI_REM * 1.15)));
+        assert!(close(rem_base_for(90), px(UI_REM * 0.90)));
+        assert!(
+            close(rem_base_for(1000), px(UI_REM * 1.5)),
+            "clamped at the top"
+        );
+        assert!(
+            close(rem_base_for(0), px(UI_REM * 0.75)),
+            "clamped at the floor"
+        );
 
         // `ui_rems` must not re-apply the step: at the default step a body
         // value is exactly one rem, and the same value is scale-independent.
@@ -1085,6 +1127,22 @@ mod tests {
         assert_eq!(font_sidebar_title().0, font_heading().0);
         assert_eq!(font_sidebar_row().0, font_detail().0);
         assert_eq!(font_sidebar_meta().0, font_caption().0);
+
+        // The phone's sizes, pinned so a future tweak has to be deliberate.
+        // The ladder is anchored on the conversation text; the floor stays at
+        // the smallest size a phone can render legibly in secondary copy.
+        assert_eq!(
+            [
+                FONT_TITLE,
+                FONT_HEADING,
+                FONT_BODY,
+                FONT_DETAIL,
+                FONT_CAPTION,
+                FONT_MICRO,
+            ],
+            [22.0, 18.0, 17.0, 15.0, 14.0, 13.0]
+        );
+        assert_eq!(UI_REM, FONT_BODY, "the rem base is the body step");
     }
 
     #[test]
@@ -1096,5 +1154,36 @@ mod tests {
         assert!((BODY_LINE_HEIGHT_REM - body.0).abs() < f32::EPSILON);
         // A denser step gets a proportionally tighter box.
         assert!(line_height_for(FONT_MICRO).0 < body.0);
+    }
+
+    #[test]
+    fn a_two_line_sidebar_row_never_clips_its_second_line() {
+        // A row stacking the heading over the caption must be at least as tall
+        // as its two line boxes at every step the reader can pick, or the
+        // larger steps clip the metadata line the row exists to show.
+        let lines_at = |rem: Pixels| {
+            f32::from(line_height_for(FONT_HEADING).to_pixels(rem))
+                + f32::from(line_height_for(FONT_CAPTION).to_pixels(rem))
+        };
+        // The default step keeps the touch-target density it had before.
+        assert_eq!(
+            sidebar_row_height_for(rem_base_for(100)),
+            px(SIDEBAR_ROW_HEIGHT)
+        );
+        for percent in FONT_SCALE_STEPS {
+            let rem = rem_base_for(percent);
+            let row = f32::from(sidebar_row_height_for(rem));
+            assert!(
+                row >= lines_at(rem),
+                "row {row}px must hold {}px of text at {percent}%",
+                lines_at(rem)
+            );
+        }
+        // Only the larger step adds height; the row is not simply padded.
+        assert_eq!(
+            sidebar_row_height_for(rem_base_for(90)),
+            px(SIDEBAR_ROW_HEIGHT)
+        );
+        assert!(sidebar_row_height_for(rem_base_for(115)) > px(SIDEBAR_ROW_HEIGHT));
     }
 }

@@ -2123,6 +2123,7 @@ fn settings_row_labels(title: String, detail: String) -> gpui::AnyElement {
                 .text_ellipsis()
                 .whitespace_nowrap()
                 .text_size(theme::font_body())
+                .line_height(theme::line_height_for(theme::FONT_BODY))
                 .text_color(theme::text_primary())
                 .child(title),
         )
@@ -2134,6 +2135,7 @@ fn settings_row_labels(title: String, detail: String) -> gpui::AnyElement {
                     .text_ellipsis()
                     .whitespace_nowrap()
                     .text_size(theme::font_micro())
+                    .line_height(theme::line_height_for(theme::FONT_MICRO))
                     .text_color(theme::text_muted())
                     .child(detail),
             )
@@ -7443,7 +7445,7 @@ impl MobileApp {
             f32::from(position.y),
             list_top,
             offset_y,
-            theme::SIDEBAR_ROW_HEIGHT,
+            f32::from(theme::sidebar_row_height()),
         );
         if row_position < 0.0 {
             return;
@@ -7515,8 +7517,12 @@ impl MobileApp {
         let (list_top, _) = self.sidebar_list_frame.get();
         let offset_y = f32::from(self.drawer_scroll.0.borrow().base_handle.offset().y);
         let pointer_y = f32::from(position.y);
-        let row_position =
-            row_at_position(pointer_y, list_top, offset_y, theme::SIDEBAR_ROW_HEIGHT);
+        let row_position = row_at_position(
+            pointer_y,
+            list_top,
+            offset_y,
+            f32::from(theme::sidebar_row_height()),
+        );
         let mut target = drop_target(&rows, index, row_position);
         if let Some(candidate) = target.as_ref() {
             let candidate_row = &rows[candidate.index];
@@ -20651,8 +20657,8 @@ impl MobileApp {
         // sides and only the ends paint a cap.
         div()
             .relative()
-            .h(px(theme::SIDEBAR_ROW_HEIGHT))
-            .min_h(px(theme::SIDEBAR_ROW_HEIGHT))
+            .h(theme::sidebar_row_height())
+            .min_h(theme::sidebar_row_height())
             .when(dragging, |row| row.opacity(0.45))
             .when(drop == Some(SidebarDropPosition::Into), |row| {
                 row.bg(theme::sidebar_drop_bg())
@@ -21281,6 +21287,7 @@ impl MobileApp {
                             .text_ellipsis()
                             .whitespace_nowrap()
                             .text_size(theme::font_sidebar_title())
+                            .line_height(theme::line_height_for(theme::FONT_HEADING))
                             .text_color(if workspace_selected {
                                 theme::sidebar_foreground(1.0)
                             } else {
@@ -21295,6 +21302,7 @@ impl MobileApp {
                             .text_ellipsis()
                             .whitespace_nowrap()
                             .text_size(theme::font_sidebar_meta())
+                            .line_height(theme::line_height_for(theme::FONT_CAPTION))
                             .text_color(theme::sidebar_session_meta())
                             .child(detail),
                     ),
@@ -22421,7 +22429,7 @@ impl MobileApp {
                                 .gap(px(theme::SPACING_SM))
                                 .children((0..3).map(|_| {
                                     div()
-                                        .h(px(theme::SIDEBAR_ROW_HEIGHT))
+                                        .h(theme::sidebar_row_height())
                                         .w_full()
                                         .rounded(px(theme::SIDEBAR_ROW_RADIUS))
                                         .bg(theme::bg_card_dim())
