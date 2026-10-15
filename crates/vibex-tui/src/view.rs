@@ -3664,12 +3664,12 @@ fn render_status_band(
     // having stepped onto one — puts the verb and the key that would have run it
     // here, and the location comes back when the reader moves on. The key is what
     // the row's controls used to spell out, and it is the half a reader cannot
-    // guess from the icon. The page's action row is left out: both of its
-    // controls are words already, and the location it would displace is the
-    // workspace those controls act on.
+    // guess from the icon. The page's action row is left out — both of its
+    // controls are words already — and so is every other page, which has no row
+    // for the remembered button to belong to.
     let focused_control = app
         .session_row_action
-        .filter(|(row, _)| *row != crate::app::SESSION_ACTION_ROW);
+        .filter(|(row, _)| app.page == Page::Sessions && *row != crate::app::SESSION_ACTION_ROW);
     if let Some((_, intent)) = app.hovered_row_action.or(focused_control) {
         let mut hint = vec![Span::styled(
             intent.default_label().to_string(),
