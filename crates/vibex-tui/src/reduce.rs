@@ -3805,7 +3805,12 @@ impl App {
         }
         let next = next.min(rows.len().saturating_sub(1) as i64) as usize;
         self.set_selection(Scope::Sessions, next);
-        Outcome::effects(vec![])
+        // Walking onto a folded branch opens it, so the rows under it are there
+        // to walk on to. It only ever opens: the cursor also lands here through
+        // a click, and a branch that folded as soon as the cursor moved would
+        // take the child row off the list while the reader was reaching for it.
+        let opened = self.open_child_branch_at(next);
+        Outcome::effects(opened.into_iter().collect())
     }
 
     /// Move the keyboard across the buttons of the row the session cursor is on.

@@ -2824,6 +2824,20 @@ impl App {
         rows.get(self.selection_for(Scope::Sessions)).cloned()
     }
 
+    /// Whether the row at this index is a session that owns children.
+    ///
+    /// A row is its own disclosure now: nothing is drawn at its right edge to
+    /// say it has a branch, so this is what tells a click that the row folds.
+    /// A heading is not a session and its `child_count` is a subtree tally, so
+    /// it answers no here: the caller folds a heading by another route.
+    pub fn sidebar_row_has_children(&self, index: usize) -> bool {
+        self.sidebar_rows().get(index).is_some_and(|row| {
+            row.kind == vibex_desktop_model::AgentSidebarRowKind::Session
+                && row.session_id.is_some()
+                && row.child_count > 0
+        })
+    }
+
     /// Where the manual arrangement is written.
     ///
     /// It sits beside the key file under the same home, so a reader who wants
@@ -4290,7 +4304,17 @@ impl App {
     /// the gesture; unfolding one that is already held is local. A row with no
     /// children has no branch and the key does nothing.
     pub fn toggle_child_branch(&mut self) -> Option<Effect> {
-        let row = self.selected_sidebar_row()?;
+        self.toggle_child_branch_at(self.selection_for(Scope::Sessions))
+    }
+
+    /// Fold or unfold the branch of the row at one index of the list.
+    ///
+    /// The keyboard folds the row its cursor is on; the pointer names the row it
+    /// landed on, which is the same row the click already selected. Both reach
+    /// the branch through here so the gesture and the key agree on what a branch
+    /// is: a session with children, open unless the reader folded it.
+    pub fn toggle_child_branch_at(&mut self, index: usize) -> Option<Effect> {
+        let row = self.sidebar_rows().get(index).cloned()?;
         let session_id = row.session_id?;
         if row.child_count == 0 {
             return None;
@@ -4300,6 +4324,30 @@ impl App {
         if folded {
             return None;
         }
+        if self.children.child_count(session_id.as_str()) > 0 {
+            return None;
+        }
+        self.load_child_page(Some(session_id), false)
+    }
+
+    /// Open a folded branch without closing an open one.
+    ///
+    /// Walking the cursor onto a row has to leave an open branch open: the
+    /// reader is on their way to a child row, and a selection that folded what
+    /// it landed on would take that row off the list before they could reach it.
+    /// So the cursor only ever opens. A row with nothing to open costs nothing.
+    pub fn open_child_branch_at(&mut self, index: usize) -> Option<Effect> {
+        let row = self.sidebar_rows().get(index).cloned()?;
+        let session_id = row.session_id?;
+        if row.child_count == 0 {
+            return None;
+        }
+        if !self.children.open(session_id.as_str()) {
+            // Already open: the reader stepped onto a branch they can see
+            // through, and there is nothing to do.
+            return None;
+        }
+        self.save_sidebar_arrangement();
         if self.children.child_count(session_id.as_str()) > 0 {
             return None;
         }

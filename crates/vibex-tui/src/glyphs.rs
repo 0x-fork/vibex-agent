@@ -62,17 +62,40 @@ pub fn connector(tier: GlyphTier) -> &'static str {
     }
 }
 
-/// The mark a delegated sub-session wears in the column a session row spends on
-/// its selection bar. One column.
+/// The trunk of a delegated branch: the vertical that runs from a session row
+/// down past the children that hang from it. One column.
 ///
-/// The indent already says the row is nested; this says *what* it is nested
-/// under — a session that delegated it rather than a folder the reader made.
-/// It is a shape of its own, so a monochrome terminal reads the difference and
-/// not only the colour.
-pub fn child_marker(tier: GlyphTier) -> &'static str {
+/// The ownership tree is drawn as lines rather than announced by one mark on
+/// each child, which is the desktop's own reading of it: the trunk leaves the
+/// parent's Agent mark and every child's elbow turns off it.
+pub fn branch_trunk(tier: GlyphTier) -> &'static str {
+    connector(tier)
+}
+
+/// The elbow where a branch turns off its trunk into a child's Agent mark. One
+/// column.
+///
+/// `last` says the child closes the branch: its trunk stops at the elbow
+/// instead of running on to a sibling below it. A legacy console has no box
+/// drawing at all, so it gets the two characters the ASCII graphs have always
+/// been drawn with.
+pub fn branch_elbow(last: bool, tier: GlyphTier) -> &'static str {
+    match (last, tier) {
+        (false, GlyphTier::Full) => "├",
+        (true, GlyphTier::Full) => "└",
+        (false, GlyphTier::Legacy) => "|",
+        (true, GlyphTier::Legacy) => "`",
+    }
+}
+
+/// The short rule an elbow reaches the row with. One column.
+///
+/// It is what makes the elbow read as a junction rather than as one more
+/// character in the column: the trunk turns toward the row it opens.
+pub fn branch_rule(tier: GlyphTier) -> &'static str {
     match tier {
-        GlyphTier::Full => "↳",
-        GlyphTier::Legacy => ">",
+        GlyphTier::Full => "─",
+        GlyphTier::Legacy => "-",
     }
 }
 
@@ -460,6 +483,10 @@ mod tests {
             for glyph in [
                 accent_bar(tier),
                 connector(tier),
+                branch_trunk(tier),
+                branch_elbow(false, tier),
+                branch_elbow(true, tier),
+                branch_rule(tier),
                 ballot_x(tier),
                 check_mark(tier),
                 diamond_filled(tier),
@@ -584,6 +611,11 @@ mod tests {
         let mut drawn = vec![
             prompt_arrow(tier),
             accent_bar(tier),
+            connector(tier),
+            branch_trunk(tier),
+            branch_elbow(false, tier),
+            branch_elbow(true, tier),
+            branch_rule(tier),
             ballot_x(tier),
             check_mark(tier),
             diamond_filled(tier),

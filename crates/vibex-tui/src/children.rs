@@ -161,6 +161,16 @@ impl ChildSessions {
         }
     }
 
+    /// Open a branch, answering whether it was folded shut.
+    ///
+    /// The reader's cursor is what opens a branch now that a row carries no
+    /// disclosure of its own, and walking onto an already open row has to leave
+    /// it alone: a selection that folded what it landed on would take the row
+    /// the reader is heading for off the list.
+    pub fn open(&mut self, session_id: &str) -> bool {
+        self.collapsed.remove(session_id)
+    }
+
     /// Keep only the branches whose owner is still a session this client knows
     /// about, so a deleted session cannot leave a heading behind.
     pub fn retain(&mut self, known: &BTreeSet<String>) {

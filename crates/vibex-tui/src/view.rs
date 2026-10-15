@@ -1491,13 +1491,62 @@ pub const SESSION_ROW_LEAD: usize = 2 + crate::row_marks::MARK_COLS as usize + 1
 /// the bar would have taken are the name's.
 pub const HEADING_ROW_LEAD: usize = crate::row_marks::MARK_COLS as usize + 1;
 
-/// The cell a session row keeps for the disclosure that opens its delegated
-/// branch.
+/// The guide a delegated row draws in place of its selection bar: the leading
+/// cells of its title line, and of the line under it.
 ///
-/// Reserved on every session row rather than only on the rows that have one, so
-/// the titles of a list end in one column and the disclosure of a branch sits
-/// under the disclosure of the session that owns it.
-const SESSION_ROW_DISCLOSURE: usize = 1;
+/// The guide is the desktop's own, in cells rather than pixels. The elbow lands
+/// in the row's indent column — the column the Agent mark of the session that
+/// owns it is drawn in — and a rule carries it on into the row's own mark, which
+/// sits one indent further in. Each level above that owns a column of its own,
+/// one indent apart, holding a trunk while the session at that level still has a
+/// sibling to reach.
+///
+/// `shape` is read from the row outward, one entry per level, the row's own
+/// level first — see [`crate::sessions::branch_shape`]. The second line mirrors
+/// the first, with a trunk where the elbow turned and only while a sibling still
+/// follows: a branch that has ended stops at its elbow instead of running on
+/// into nothing, and the trunk of a branch that has not runs down past the row's
+/// two lines to the next sibling.
+///
+/// Both runs are exactly as wide as the bar and its air — the two columns a root
+/// row spends before its Agent slot — so a delegated row's mark lands in the
+/// same column as every other row's.
+fn branch_lead(shape: &[bool], indent: usize, tier: crate::glyphs::GlyphTier) -> (String, String) {
+    if shape.is_empty() {
+        // A delegated row with no session above it in the list has no column to
+        // hang from. It is drawn as a plain row rather than as an elbow into
+        // nothing — still spending the bar's two columns, so its mark lines up
+        // with every other row's.
+        let blank = " ".repeat(indent + 2);
+        return (blank.clone(), blank);
+    }
+    let mut above = vec![" "; indent + 2];
+    for (level, continues) in shape.iter().enumerate().skip(1) {
+        let Some(column) = indent.checked_sub(level * SESSION_ROW_INDENT) else {
+            break;
+        };
+        if *continues {
+            above[column] = crate::glyphs::branch_trunk(tier);
+        }
+    }
+    let carries = shape.first().is_some_and(|continues| *continues);
+    let mut title = above.clone();
+    title[indent] = if carries {
+        crate::glyphs::branch_elbow(false, tier)
+    } else {
+        crate::glyphs::branch_elbow(true, tier)
+    };
+    title[indent + 1] = crate::glyphs::branch_rule(tier);
+    let mut below = above;
+    // The row's own column carries the trunk on to its next sibling; the air
+    // after it stays blank, because the row's Agent mark is what the rule met.
+    below[indent] = if carries {
+        crate::glyphs::branch_trunk(tier)
+    } else {
+        " "
+    };
+    (title.concat(), below.concat())
+}
 
 /// The buttons a session row offers while the reader is on it, in the order the
 /// desktop's own action cluster and menu list the same verbs.
@@ -1573,7 +1622,21 @@ fn render_session_rows(
     // is the one that has to survive the pointer being nowhere near the row.
     let focused_action = app.session_row_action;
     let hovered_action = app.hovered_row_action;
-    let sessions = app.agent.state.sessions.value.clone().unwrap_or_default();
+    // The branch every delegated row hangs from. It is read from the list as a
+    // whole — a trunk is drawn from the rows that follow, which no single row
+    // can answer — and read once, before anything is painted, so the geometry
+    // the mouse is hit-tested against is the geometry on screen.
+    let branches = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            if row.delegated {
+                crate::sessions::branch_shape(rows, index)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect::<Vec<_>>();
     let now_ms = vibex_core::unix_timestamp_ms();
     // What each row's right end says while the reader is not on it: the hour it
     // last spoke, the state it is in, and the marks that qualify either. It is
@@ -1581,15 +1644,16 @@ fn render_session_rows(
     // is what every row reserves — a title that grew when a session started
     // running would rewrite the list under the reader's hand, and the columns
     // of the list would stop lining up.
-    let statuses =
-        rows.iter()
-            .map(|row| {
-                let session = row.session_id.as_ref().and_then(|session_id| {
-                    sessions.iter().find(|session| &session.id == session_id)
-                });
-                session_status_column(row, session, app, theme, strings, now_ms)
-            })
-            .collect::<Vec<_>>();
+    let statuses = rows
+        .iter()
+        .map(|row| {
+            let session = row
+                .session_id
+                .as_ref()
+                .and_then(|session_id| app.session_by_id(session_id));
+            session_status_column(row, session, app, theme, strings, now_ms)
+        })
+        .collect::<Vec<_>>();
     let status_column = statuses
         .iter()
         .map(|column| column.width)
@@ -1619,6 +1683,7 @@ fn render_session_rows(
         let mut row_marks = Vec::new();
         let row_lines = session_list_item(
             row,
+            branches.get(index).map(Vec::as_slice).unwrap_or_default(),
             index == selected,
             app.hover == Some((Scope::Sessions, index)),
             focused_action
@@ -1628,7 +1693,6 @@ fn render_session_rows(
             statuses.get(index),
             status_column,
             usize::from(area.width),
-            &sessions,
             app,
             theme,
             strings,
@@ -1773,13 +1837,13 @@ fn render_session_rows(
 #[allow(clippy::too_many_arguments)]
 fn session_list_item(
     row: &vibex_desktop_model::AgentSidebarRow,
+    branch: &[bool],
     selected: bool,
     hovered: bool,
     lit_control: Option<Intent>,
     status: Option<&SessionStatusColumn>,
     status_column: usize,
     width: usize,
-    sessions: &[vibex_core::AgentSession],
     app: &App,
     theme: &TuiTheme,
     strings: Strings,
@@ -1789,7 +1853,7 @@ fn session_list_item(
     let session = row
         .session_id
         .as_ref()
-        .and_then(|session_id| sessions.iter().find(|session| &session.id == session_id));
+        .and_then(|session_id| app.session_by_id(session_id));
     if row.kind != vibex_desktop_model::AgentSidebarRowKind::Session {
         return vec![
             session_heading_line(
@@ -1809,6 +1873,7 @@ fn session_list_item(
     }
     let mut lines = session_row_lines(
         row,
+        branch,
         session,
         selected,
         hovered,
@@ -2356,6 +2421,7 @@ fn session_time_label(
 #[allow(clippy::too_many_arguments)]
 fn session_row_lines(
     row: &vibex_desktop_model::AgentSidebarRow,
+    branch: &[bool],
     session: Option<&vibex_core::AgentSession>,
     selected: bool,
     hovered: bool,
@@ -2392,15 +2458,7 @@ fn session_row_lines(
         None => Style::default(),
     };
     let bar_style = paint(theme.roles.accent_user).add_modifier(Modifier::BOLD);
-    let bar = if row.delegated {
-        // A child row spends the selection bar's column on the mark that says it
-        // hangs under the session above it; the selection is the row's band.
-        crate::glyphs::child_marker(tier)
-    } else if selected {
-        crate::glyphs::accent_bar(tier)
-    } else {
-        " "
-    };
+    let guide_style = paint(theme.roles.border);
     let indent = usize::from(row.depth) * SESSION_ROW_INDENT;
     // The Agent's mark, in the slot every row opens with. A terminal that cannot
     // hold a picture, or an Agent with no brand mark, leaves the cells blank and
@@ -2413,10 +2471,33 @@ fn session_row_lines(
         && identity
             .as_deref()
             .is_some_and(|identity| vibex_brands::agent_mark(identity).is_some());
-    let mut spans = vec![
-        Span::styled(" ".repeat(indent), blank_style),
-        Span::styled(format!("{bar} "), bar_style),
-    ];
+    // The left edge: a delegated row draws the branch it hangs from, where a
+    // root row draws the bar that says it is the reader's. A child never draws
+    // the bar — the band is what says it is selected — so the guide owns the
+    // columns the bar would have taken, and the elbow lands exactly where the
+    // Agent mark of the session that owns it sits.
+    //
+    // Both runs are the two columns the bar and its air occupy, and the second
+    // line draws the same one the first did: the rail down a selected row's left
+    // edge is unbroken, and a delegated row's trunk reaches the line under its
+    // title rather than stopping at it.
+    let (lead, trail) = if row.delegated {
+        branch_lead(branch, indent, tier)
+    } else {
+        let bar = if selected {
+            crate::glyphs::accent_bar(tier)
+        } else {
+            " "
+        };
+        let run = format!("{}{bar} ", " ".repeat(indent));
+        (run.clone(), run)
+    };
+    let lead_style = if row.delegated {
+        guide_style
+    } else {
+        bar_style
+    };
+    let mut spans = vec![Span::styled(lead, lead_style)];
     if drawable && let Some(identity) = identity.as_deref() {
         marks.push(SessionRowMark {
             line: 0,
@@ -2441,14 +2522,9 @@ fn session_row_lines(
         icon_cluster_width(buttons.len()) + ROW_CONTROL_AIR
     };
     let reserved = status_column.max(action_block);
-    // A session that delegated work carries a disclosure after its title, the
-    // way a heading does: it is the one mark that says the rows under it are
-    // this session's, and it is a control whether or not the row is selected. It
-    // keeps its cell on every row, so the titles of a list end together.
     let text_width = width
         .saturating_sub(indent)
         .saturating_sub(SESSION_ROW_LEAD)
-        .saturating_sub(SESSION_ROW_DISCLOSURE)
         .saturating_sub(reserved);
     // The name a session that exists only to wait for its scheduled message
     // comes from that message until the send actually leaves the queue, so the
@@ -2477,33 +2553,18 @@ fn session_row_lines(
         " ".repeat(text_width.saturating_sub(text_used)),
         blank_style,
     ));
-    let disclosure_column = indent + SESSION_ROW_LEAD + text_width;
-    if row.child_count > 0 {
-        let colour = if row.collapsed {
-            theme.roles.gray
-        } else {
-            theme.roles.accent_user
-        };
-        spans.push(Span::styled(
-            crate::glyphs::disclosure(!row.collapsed, tier).to_string(),
-            paint(colour),
-        ));
-        controls.push(SessionRowControl {
-            line: 0,
-            column: disclosure_column as u16,
-            width: 1,
-            intent: Intent::ToggleChildBranch,
-        });
-    } else {
-        spans.push(Span::styled(" ", blank_style));
-    }
+    // A session that delegated work used to carry a disclosure after its title.
+    // It is gone: the branch now opens from the row itself — the cursor onto it,
+    // or a click — so the mark that only said "there is something under this"
+    // was a control the reader had to aim at to do what the row already does.
+    // The columns it reserved go back to the title.
     // The row's own buttons, while the row is the reader's: the selected row, or
     // the one the pointer is on. They take the status column's place at the
     // right edge, and the hour is not drawn under them: two answers to "when"
     // and "act on this" in one column would be one too many.
     let active = selected || hovered;
     if active && !buttons.is_empty() {
-        let start = disclosure_column + SESSION_ROW_DISCLOSURE;
+        let start = indent + SESSION_ROW_LEAD + text_width;
         let pad = reserved.saturating_sub(action_block) + ROW_CONTROL_AIR;
         spans.push(Span::styled(" ".repeat(pad), blank_style));
         let mut column = start + pad;
@@ -2565,7 +2626,7 @@ fn session_row_lines(
         // The marks the column drew as characters are the desktop's own icons
         // wherever the terminal can hold a picture, which is what keeps a pinned
         // row wearing the pin the desktop draws rather than a star.
-        let base = indent + SESSION_ROW_LEAD + text_width + SESSION_ROW_DISCLOSURE + pad;
+        let base = indent + SESSION_ROW_LEAD + text_width + pad;
         for (offset, icon, color) in &status.icons {
             if !icon_drawable(app, *color) {
                 continue;
@@ -2601,21 +2662,17 @@ fn session_row_lines(
                 dim_style
             };
             // The mark under the title stands in the column the title's own mark
-            // took: the indent comes first, exactly as it does above, and the
-            // text then opens under the title it belongs to. Drawn before the
-            // indent, a nested row's rail broke in two at every level.
-            let lead = format!(
-                "{}{bar}{}",
-                " ".repeat(indent),
-                " ".repeat(SESSION_ROW_LEAD - 1)
-            );
+            // took: the same guide comes first, its elbow's column carried down
+            // as a trunk where the row has a sibling left, and the text then
+            // opens under the title it belongs to rather than under the mark.
             let text = truncate_to_width(&text, budget, "…");
             // What the echo does not reach keeps the band: the row is one
             // object, so its second line is as wide as its first rather than
             // ending where the sentence happened to.
             let tail = " ".repeat(budget.saturating_sub(display_width(&text)));
             lines.push(Line::from(vec![
-                Span::styled(lead, bar_style),
+                Span::styled(trail, lead_style),
+                Span::styled(" ".repeat(SESSION_ROW_LEAD - 2), blank_style),
                 Span::styled(text, style),
                 Span::styled(tail, blank_style),
             ]));
@@ -2635,7 +2692,6 @@ fn session_row_buttons(width: usize, indent: usize) -> Vec<(crate::sidebar_icons
     let available = width
         .saturating_sub(indent)
         .saturating_sub(SESSION_ROW_LEAD)
-        .saturating_sub(SESSION_ROW_DISCLOSURE)
         .min(width / 3)
         .saturating_sub(ROW_CONTROL_AIR);
     let mut buttons = SESSION_ROW_ACTIONS.to_vec();
@@ -10528,5 +10584,45 @@ mod tests {
             slot(crate::sidebar_icons::Icon::Pin),
             "a pinned row does not end in its pin: {pinned_text:?}"
         );
+    }
+
+    /// The branch a delegated row hangs from is drawn in the same columns for
+    /// every terminal: an elbow under the owning session's Agent mark, and a
+    /// trunk per level that still has a sibling to reach.
+    #[test]
+    fn a_delegated_row_draws_its_branch_in_cells_of_one_width() {
+        let full = GlyphTier::Full;
+        // A row one level down: the elbow lands in its indent column and the
+        // rule carries it to its own Agent mark.
+        let one = SESSION_ROW_INDENT;
+        let (title, below) = branch_lead(&[false], one, full);
+        assert_eq!(title, "  └─", "{title:?}");
+        // The last child of a branch stops there: the second line carries no
+        // trunk, because nothing follows.
+        assert_eq!(below, "    ", "{below:?}");
+        // A row with a sibling left runs its trunk past both lines.
+        let (title, below) = branch_lead(&[true], one, full);
+        assert_eq!(title, "  ├─", "{title:?}");
+        assert_eq!(below, "  │ ", "{below:?}");
+        // A helper under that worker: the owner's own column stands outside the
+        // worker's elbow, carrying the owner's branch on to the worker's
+        // siblings, while the elbow lands under the worker's mark.
+        let indent = SESSION_ROW_INDENT * 3;
+        let (title, below) = branch_lead(&[false, true], indent, full);
+        assert_eq!(title, "    │ └─", "{title:?}");
+        assert_eq!(below, "    │   ", "{below:?}");
+        // Both runs are as wide as the lead a root row spends, whatever the
+        // depth: the Agent marks of a list line up.
+        for shape in [vec![false], vec![true], vec![false, true], vec![true, true]] {
+            let depth = shape.len() as u8 + 1;
+            let indent = usize::from(depth) * SESSION_ROW_INDENT;
+            let (title, below) = branch_lead(&shape, indent, full);
+            assert_eq!(title.chars().count(), indent + 2, "{title:?}");
+            assert_eq!(below.chars().count(), indent + 2, "{below:?}");
+        }
+        // The legacy tier falls back to characters a console font has.
+        let legacy = GlyphTier::Legacy;
+        let (title, _) = branch_lead(&[false], one, legacy);
+        assert_eq!(title, "  `-", "{title:?}");
     }
 }

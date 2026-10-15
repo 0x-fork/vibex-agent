@@ -1505,11 +1505,26 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 }
                 app.set_selection(region.scope, index);
                 // A heading is a control, not a row to open: it folds on the
-                // first click, the way a tree does everywhere else. A session
+                // first click, the way a tree does everywhere else. So does a
+                // session that owns children — its branch is opened by the same
+                // click that selects it, which is why no disclosure is drawn at
+                // its right edge to aim at. A session with no branch under it
                 // keeps the two-step contract, because opening one leaves the
                 // page.
                 let heading = region.scope == crate::keymap::Scope::Sessions
                     && app.sidebar_row_is_heading(index);
+                let branch = region.scope == crate::keymap::Scope::Sessions
+                    && app.sidebar_row_has_children(index);
+                // The first click of a double press folds the branch; the second
+                // is the open. Both are kept, so a session that owns children is
+                // still reachable on the page the way every other session is.
+                if branch && !repeat {
+                    let outcome = crate::reduce::Outcome::effects(
+                        app.toggle_child_branch_at(index).into_iter().collect(),
+                    );
+                    dispatch_all(worker, &outcome);
+                    return true;
+                }
                 if repeat || heading {
                     let intent = match region.scope {
                         crate::keymap::Scope::Sessions => {

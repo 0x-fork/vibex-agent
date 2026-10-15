@@ -10612,6 +10612,7 @@ fn session_row(app: &App, id: &vibex_core::VibexSessionId) -> usize {
 #[test]
 fn the_session_list_nests_a_sessions_delegated_workers() {
     use vibex_tui::action::Intent;
+    use vibex_tui::terminal_image::{ImageProtocol, ImageSupport};
     let (mut app, parent_id, worker_id) = sub_session_app(120, 40);
     app.perform(Intent::GotoSessions);
     let screen = text(&render(&mut app, 120, 40));
@@ -10619,9 +10620,16 @@ fn the_session_list_nests_a_sessions_delegated_workers() {
         screen.contains("the main session") && screen.contains("the worker"),
         "the list hid a delegated session:\n{screen}"
     );
+    // The child hangs from a branch the way the desktop draws it: an elbow that
+    // turns off a trunk into the row, rather than the carriage-return mark the
+    // list used to bracket every child with.
     assert!(
-        screen.contains('↳'),
-        "a child row lost its nesting mark:\n{screen}"
+        screen.contains('└') || screen.contains('├'),
+        "a child row lost its branch elbow:\n{screen}"
+    );
+    assert!(
+        !screen.contains('↳'),
+        "the old nesting mark is still drawn:\n{screen}"
     );
     // The worker hangs one indent in from the session that owns it.
     let owner = session_row(&app, &parent_id);
@@ -10632,6 +10640,22 @@ fn the_session_list_nests_a_sessions_delegated_workers() {
         app.sidebar_rows()[worker].depth,
         app.sidebar_rows()[owner].depth + 1,
         "the branch is not indented"
+    );
+    // The child draws its own Agent mark: the mark belongs to the session the
+    // row names, and a delegated session is a session like any other. The mark
+    // is only asked for where the terminal can hold a picture, so this reading
+    // is taken with the protocol forced.
+    app.terminal_images = ImageSupport::forced(ImageProtocol::Kitty);
+    let _ = render(&mut app, 120, 40);
+    assert!(
+        app.row_marks
+            .held_labels()
+            .iter()
+            .filter(|label| label.starts_with("agent:"))
+            .count()
+            >= 2,
+        "the child row drew no Agent mark: {:?}",
+        app.row_marks.held_labels()
     );
 
     // The owner says it can fold, and folding hides the whole branch.
@@ -10648,6 +10672,74 @@ fn the_session_list_nests_a_sessions_delegated_workers() {
     assert!(
         app.sidebar_rows()[session_row(&app, &parent_id)].child_count > 0,
         "a folded branch forgot that it has children"
+    );
+}
+
+#[test]
+fn a_parent_row_opens_its_branch_from_the_row_itself() {
+    use vibex_tui::action::Intent;
+    let (mut app, parent_id, worker_id) = sub_session_app(120, 40);
+    app.perform(Intent::GotoSessions);
+    let owner = session_row(&app, &parent_id);
+    // The reader clicks the parent once: the same press that selects it folds
+    // the branch, which is what lets the right-side disclosure be removed. The
+    // branch starts open, so the first press closes it.
+    app.set_selection(Scope::Sessions, owner);
+    let _ = app.toggle_child_branch_at(owner);
+    let folded = text(&render(&mut app, 120, 40));
+    assert!(
+        !folded.contains("the worker"),
+        "a click on the parent did not fold its branch:\n{folded}"
+    );
+    // A second press opens it again: the branch is the row's own control, both
+    // ways.
+    let _ = app.toggle_child_branch_at(owner);
+    let opened = text(&render(&mut app, 120, 40));
+    assert!(
+        opened.contains("the worker"),
+        "a click on the parent did not open its branch:\n{opened}"
+    );
+    // A row that owns nothing has no branch to fold, so its press stays the
+    // two-step gesture every leaf keeps.
+    let worker = session_row(&app, &worker_id);
+    assert!(!app.sidebar_row_has_children(worker));
+    assert!(app.toggle_child_branch_at(worker).is_none());
+}
+
+#[test]
+fn walking_the_cursor_onto_a_branch_only_opens_it() {
+    use vibex_tui::action::Intent;
+    let (mut app, parent_id, worker_id) = sub_session_app(120, 40);
+    app.perform(Intent::GotoSessions);
+    let owner = session_row(&app, &parent_id);
+    // Fold the branch, then walk the cursor down from the row above onto its
+    // parent. Stepping onto a folded branch opens it, so the child row is there
+    // to step on to on the next press.
+    let _ = app.toggle_child_branch_at(owner);
+    assert!(app.children.is_collapsed(parent_id.as_str()));
+    app.set_selection(Scope::Sessions, owner - 1);
+    app.perform(Intent::SelectNext);
+    assert_eq!(app.selection_for(Scope::Sessions), owner);
+    assert!(
+        !app.children.is_collapsed(parent_id.as_str()),
+        "the cursor landed on a folded branch and left it shut"
+    );
+    // The child is now on the list, and walking on to it and back must not fold
+    // the branch: a selection that closed what it left would take the child row
+    // off the list while the reader was reaching for it.
+    let worker_row = session_row(&app, &worker_id);
+    app.perform(Intent::SelectNext);
+    assert_eq!(app.selection_for(Scope::Sessions), worker_row);
+    app.perform(Intent::SelectPrevious);
+    assert_eq!(app.selection_for(Scope::Sessions), owner);
+    assert!(
+        !app.children.is_collapsed(parent_id.as_str()),
+        "leaving the branch folded it under the reader"
+    );
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("the worker"),
+        "the branch folded as the cursor left it:\n{screen}"
     );
 }
 

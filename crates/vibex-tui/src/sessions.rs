@@ -823,12 +823,57 @@ pub fn nest_child_rows(
     nested
 }
 
+/// The branch one delegated row hangs from, read from the row outward: one
+/// entry per level below the session that owns it, the row's own level first.
+///
+/// A row at depth `d` sits under `d - 1` levels of drawn branch. The rightmost
+/// column of the guide lands on the Agent mark of the session that owns the row,
+/// and carries that session's children down to the next one; each column to its
+/// left lands on the mark of one ancestor further up, and carries *its* children
+/// down. So entry `i` answers "does the session at depth `d - i` have a sibling
+/// after it" — `true` means the trunk in that column runs on past this row, and
+/// `false` means the column closes here.
+///
+/// The answer is read from the flat rows rather than the ownership pages, which
+/// is what makes a folded branch come out right: a folded sibling is not on the
+/// list, so the trunk above the last row the reader can see stops where the eye
+/// says it should. The walk is bounded, so a malformed projection cannot make a
+/// frame run away.
+pub fn branch_shape(rows: &[AgentSidebarRow], index: usize) -> Vec<bool> {
+    let Some(depth) = rows.get(index).map(|row| row.depth) else {
+        return Vec::new();
+    };
+    if depth < 2 {
+        // A row directly under a heading owns no drawn branch: there is no
+        // session mark above it to hang an elbow from.
+        return Vec::new();
+    }
+    (0..usize::from(depth) - 1)
+        .take(BRANCH_DEPTH_LIMIT)
+        .map(|step| {
+            let level = depth - step as u8;
+            // The first row at or above this level after the row says whether
+            // the session at `level` has a sibling: a row *at* the level is one,
+            // and a row above it means the subtree ended.
+            rows.iter()
+                .skip(index + 1)
+                .find(|row| row.depth <= level)
+                .is_some_and(|row| row.depth == level)
+        })
+        .collect()
+}
+
+/// How deep the renderer will draw a delegated branch.
+///
+/// The runtime bounds ownership depth; this is the guard that keeps a malformed
+/// graph from making a frame walk forever.
+pub const BRANCH_DEPTH_LIMIT: usize = 16;
+
 /// How many characters of a session's last words the list keeps.
 ///
 /// The renderer truncates to the column it has; this is the bound that keeps a
 /// pasted document from living in memory for the rest of the process.
 const ECHO_CHARACTERS: usize = 200;
-
 /// What a session last did, one line, for the list's second line.
 ///
 /// Only what the Agent said or did. A *delta* is a message still arriving and
@@ -1563,5 +1608,46 @@ mod tests {
         assert!(nested[2].delegated);
         assert_eq!(nested[2].depth, 2);
         assert_eq!(nested[3].depth, 3);
+    }
+
+    #[test]
+    fn a_trunk_runs_past_a_row_only_while_a_sibling_follows_it() {
+        // Three workers under one owner, the last of them with a child of its
+        // own. Depth 2 rows are the owner's children; depth 3 is the helper.
+        let rows = vec![(1u8, false), (2, false), (2, true), (3, true), (2, true)];
+        let rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, (depth, delegated))| AgentSidebarRow {
+                id: format!("row-{index}"),
+                kind: AgentSidebarRowKind::Session,
+                project_id: "project_vibex".to_string(),
+                workspace_id: String::new(),
+                session_id: Some(
+                    VibexSessionId::parse(format!("session_brnch{index:04}")).unwrap(),
+                ),
+                label: "s".to_string(),
+                depth,
+                pinned: false,
+                selected: false,
+                collapsed: false,
+                state: Some(AgentSessionState::Idle),
+                parent_id: None,
+                delegated,
+                child_count: 0,
+            })
+            .collect::<Vec<_>>();
+        // The first child has siblings after it, so its trunk runs on.
+        assert_eq!(branch_shape(&rows, 1), vec![true]);
+        // The second has the sibling that follows it, and so does the last: a
+        // trunk runs past each while something is still under the owner.
+        assert_eq!(branch_shape(&rows, 2), vec![true]);
+        assert_eq!(branch_shape(&rows, 4), vec![false]);
+        // The helper is one level deeper. Its own column has nothing after it,
+        // so it closes at the elbow; the column of the parent it hangs from runs
+        // on to that parent's next sibling.
+        assert_eq!(branch_shape(&rows, 3), vec![false, true]);
+        // A row under a heading owns no drawn branch.
+        assert!(branch_shape(&rows, 0).is_empty());
     }
 }
