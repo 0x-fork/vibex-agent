@@ -1700,7 +1700,13 @@ enum UserMessageInlineSegment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UserMessageAttachmentAction {
-    PreviewImage(ComposerAttachment),
+    /// A picture a message carries, opened in the image preview.
+    ///
+    /// The message's own attachment travels with the action rather than an
+    /// already-resolved [`ComposerAttachment`]: a picture another client wrote
+    /// has no path yet — its URI is a `data:` URL — so the bytes have to be
+    /// written down before the preview pipeline can read them.
+    PreviewImage(MessageAttachment),
     OpenFile(String),
 }
 
@@ -28903,40 +28909,13 @@ impl VibexWorkbench {
     }
 
     fn persist_composer_image(&self, image: &Image) -> std::io::Result<std::path::PathBuf> {
-        const MAX_CLIPBOARD_IMAGE_BYTES: usize = 32 * 1024 * 1024;
-        if image.bytes().is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "clipboard image is empty",
-            ));
-        }
-        if image.bytes().len() > MAX_CLIPBOARD_IMAGE_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "clipboard image exceeds 32 MiB",
-            ));
-        }
         let Some(config) = self.config.as_ref() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "isolated desktop home is unavailable",
             ));
         };
-        let root = config.home_dir.join("clipboard-attachments");
-        std::fs::create_dir_all(&root)?;
-        let digest = Sha256::digest(image.bytes());
-        let digest = digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let destination = root.join(format!(
-            "clipboard-image-{digest}.{}",
-            image.format().extension()
-        ));
-        if !destination.exists() {
-            std::fs::write(&destination, image.bytes())?;
-        }
-        Ok(destination)
+        persist_clipboard_image(&config.home_dir.join("clipboard-attachments"), image)
     }
 
     fn add_composer_image_to(
@@ -29132,6 +29111,44 @@ impl VibexWorkbench {
                 cx.notify();
             });
         }));
+    }
+
+    /// Open a picture a message carries, wherever its bytes live.
+    ///
+    /// The desktop's own paste is a `file://` path and goes straight to the
+    /// preview. A picture pasted on a client that only has the pixels — the
+    /// TUI's clipboard, a phone's picker — travels as a `data:` URL, which the
+    /// preview cannot read; its bytes are written into the home's attachment
+    /// bucket first, so the reader sees the picture instead of a label that
+    /// does nothing.
+    fn open_message_attachment_preview(
+        &mut self,
+        attachment: MessageAttachment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut composer_attachment = composer_attachment_from_message(
+            &attachment,
+            format!("message-attachment:{}", attachment.label),
+        );
+        if composer_attachment.path.is_none() {
+            let clipboard_bucket = self
+                .config
+                .as_ref()
+                .map(|config| config.home_dir.join("clipboard-attachments"));
+            match message_attachment_image_file(&attachment, clipboard_bucket.as_deref()) {
+                Some(path) => composer_attachment.path = Some(path.to_string_lossy().into_owned()),
+                None => {
+                    self.agent_error = Some(format!(
+                        "image preview failed: `{}` is not a readable picture",
+                        attachment.label
+                    ));
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        self.open_attachment_preview(composer_attachment, false, window, cx);
     }
 
     fn open_attachment_preview(
@@ -60764,7 +60781,7 @@ impl VibexWorkbench {
                 };
                 let _ = view.update(cx, |this, cx| match action {
                     UserMessageAttachmentAction::PreviewImage(attachment) => {
-                        this.open_attachment_preview(attachment, false, window, cx)
+                        this.open_message_attachment_preview(attachment, window, cx)
                     }
                     UserMessageAttachmentAction::OpenFile(path) => {
                         this.open_code_file(path, window, cx)
@@ -69269,6 +69286,61 @@ fn composer_attachment_from_message(
         path: attachment.uri.as_deref().and_then(attachment_local_path),
         mime_type: attachment.mime_type.clone(),
     }
+}
+
+/// The file a message's picture can be read from.
+///
+/// A URI the client that wrote the message could read is already a path. One
+/// that carries its own bytes (`data:image/…;base64,…`) has none, so those
+/// bytes are written into `clipboard_bucket` — the same home directory a
+/// locally pasted picture uses — and the path they landed on is the answer.
+/// `None` when the URI names no picture this client can read.
+fn message_attachment_image_file(
+    attachment: &MessageAttachment,
+    clipboard_bucket: Option<&Path>,
+) -> Option<PathBuf> {
+    let uri = attachment.uri.as_deref()?;
+    if let Some(path) = attachment_local_path(uri) {
+        return Some(PathBuf::from(path));
+    }
+    let (format, bytes) = decode_data_image(uri)?;
+    persist_clipboard_image(clipboard_bucket?, &Image::from_bytes(format, bytes)).ok()
+}
+
+/// Write picture bytes into the clipboard attachment bucket and answer the
+/// path they now have.
+///
+/// Named by content, so the same screenshot pasted twice — or pasted on two
+/// clients — writes one file, and bounded, because these bytes arrived over a
+/// wire and a message cannot be allowed to fill the disk.
+fn persist_clipboard_image(root: &Path, image: &Image) -> std::io::Result<PathBuf> {
+    const MAX_CLIPBOARD_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+    if image.bytes().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "clipboard image is empty",
+        ));
+    }
+    if image.bytes().len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "clipboard image exceeds 32 MiB",
+        ));
+    }
+    std::fs::create_dir_all(root)?;
+    let digest = Sha256::digest(image.bytes());
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let destination = root.join(format!(
+        "clipboard-image-{digest}.{}",
+        image.format().extension()
+    ));
+    if !destination.exists() {
+        std::fs::write(&destination, image.bytes())?;
+    }
+    Ok(destination)
 }
 
 fn safe_attachment_file_name(label: &str, source: &str) -> String {
@@ -82231,9 +82303,17 @@ fn pinned_certificate_fingerprint(encoded: &str) -> Option<String> {
     Some(vibex_core::certificate_fingerprint(&bytes))
 }
 
-fn decode_html_data_image(html: &str) -> Option<(gpui::ImageFormat, Vec<u8>)> {
-    let data_start = html.find("data:image/")?;
-    let data = &html[data_start..];
+/// A `data:image/…;base64,…` URL decoded into the format GPUI draws and the
+/// bytes it draws.
+///
+/// The URL is found rather than required to start the string, and its payload
+/// ends at the first character that cannot be part of a URL: the caller may
+/// hand over an HTML fragment with the URL in an attribute, or the bare URI a
+/// message attachment carries. `None` for anything that is not a base64 image
+/// in a format GPUI can draw.
+fn decode_data_image(data: &str) -> Option<(gpui::ImageFormat, Vec<u8>)> {
+    let data_start = data.find("data:image/")?;
+    let data = &data[data_start..];
     let (header, encoded) = data.split_once(',')?;
     let (mime, encoding) = header.split_once(';')?;
     let mime = mime.strip_prefix("data:")?;
@@ -82244,6 +82324,10 @@ fn decode_html_data_image(html: &str) -> Option<(gpui::ImageFormat, Vec<u8>)> {
     let encoded = encoded.split(['"', '\'', '>']).next().unwrap_or_default();
     let bytes = BASE64_STANDARD.decode(encoded).ok()?;
     Some((format, bytes))
+}
+
+fn decode_html_data_image(html: &str) -> Option<(gpui::ImageFormat, Vec<u8>)> {
+    decode_data_image(html)
 }
 
 /// The plain text and the workspace paths an agent answer projects to.
@@ -82449,8 +82533,12 @@ fn user_message_inline_document(
                     format!("message-attachment:{segment_index}"),
                 );
                 let action = if composer_attachment.is_image() {
+                    // The message's attachment itself travels with the action:
+                    // a picture written by another client is a `data:` URL with
+                    // no path to resolve yet, and the preview writes it down
+                    // when the reader asks for it.
                     Some(UserMessageAttachmentAction::PreviewImage(
-                        composer_attachment.clone(),
+                        attachment.clone(),
                     ))
                 } else {
                     composer_attachment.path.as_deref().and_then(|path| {
@@ -98537,7 +98625,13 @@ mod tests {
 
         assert!(composer.contains("this.open_attachment_preview("));
         assert!(composer.contains("true,"));
-        assert!(timeline.contains("this.open_attachment_preview(attachment, false, window, cx)"));
+        assert!(timeline.contains("this.open_message_attachment_preview(attachment, window, cx)"));
+        // A sent message's picture is never editable, however it reached the
+        // message: another client's bytes are not the composer's unsent draft.
+        assert!(
+            timeline
+                .contains("self.open_attachment_preview(composer_attachment, false, window, cx)")
+        );
     }
 
     #[test]
@@ -103727,6 +103821,62 @@ mod tests {
         assert_eq!(bytes, [137_u8, 80, 78, 71]);
         assert!(decode_html_data_image("<p>plain text</p>").is_none());
         assert!(decode_html_data_image("data:image/png;base64,not-base64!").is_none());
+        // A bare URI — the form a message attachment carries — reads the same
+        // way as the attribute it was originally extracted from.
+        let bare = format!("data:image/png;base64,{encoded}");
+        assert_eq!(
+            decode_data_image(&bare),
+            Some((gpui::ImageFormat::Png, [137, 80, 78, 71].to_vec()))
+        );
+    }
+
+    #[test]
+    fn a_message_pictures_data_url_is_written_where_the_preview_can_read_it() {
+        let home = tempfile::tempdir().unwrap();
+        let bucket = home.path().join("clipboard-attachments");
+        let encoded = BASE64_STANDARD.encode([137_u8, 80, 78, 71]);
+        let attachment = MessageAttachment {
+            label: "shot.png".into(),
+            mime_type: Some("image/png".into()),
+            uri: Some(format!("data:image/png;base64,{encoded}")),
+            inline_text_offset: Some(0),
+        };
+
+        let path = message_attachment_image_file(&attachment, Some(&bucket))
+            .expect("a data URL picture is materialised");
+        assert_eq!(std::fs::read(&path).unwrap(), [137_u8, 80, 78, 71]);
+        assert!(path.starts_with(&bucket));
+        assert_eq!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("png")
+        );
+        // The file is named by content, so asking twice writes once.
+        assert_eq!(
+            message_attachment_image_file(&attachment, Some(&bucket)),
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn a_message_pictures_file_uri_is_already_a_path() {
+        let attachment = MessageAttachment {
+            label: "shot.png".into(),
+            mime_type: Some("image/png".into()),
+            uri: Some("file:///tmp/shot.png".into()),
+            inline_text_offset: None,
+        };
+        // No clipboard bucket is passed: a URI that is already a path must not
+        // need one, and a URI this client cannot read resolves to nothing
+        // rather than pretending it has bytes.
+        assert_eq!(
+            message_attachment_image_file(&attachment, None),
+            Some(std::path::PathBuf::from("/tmp/shot.png"))
+        );
+        let unreadable = MessageAttachment {
+            uri: Some("remote-object://opaque".into()),
+            ..attachment
+        };
+        assert_eq!(message_attachment_image_file(&unreadable, None), None);
     }
 
     #[test]
