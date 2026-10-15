@@ -1308,6 +1308,13 @@ mod tests {
             error_future()
         }
 
+        fn agent_model_provider_profile_detail(
+            &self,
+            _request: MutationRequest<vibex_core::AgentModelProviderProfileDetailRequest>,
+        ) -> BackendFuture<'_, vibex_core::ProviderProfile> {
+            error_future()
+        }
+
         fn list_profiles(&self) -> BackendFuture<'_, Vec<ProviderProfileSummary>> {
             error_future()
         }

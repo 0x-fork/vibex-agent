@@ -1829,6 +1829,13 @@ pub struct AgentModelProviderProfileDeleteRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentModelProviderProfileDetailRequest {
+    pub agent_id: AgentId,
+    pub provider_profile_id: ProviderProfileId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentModelProviderProfileFetchModelsRequest {
     pub agent_id: AgentId,
     pub provider_profile_id: ProviderProfileId,

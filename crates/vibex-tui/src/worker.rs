@@ -168,6 +168,8 @@ pub enum AppMessage {
     LanPairing(BackendResult<Option<Box<vibex_core::RemoteLanPairingWindowSnapshot>>>),
     Audit(BackendResult<Vec<vibex_core::RemoteAuditRecord>>),
     Profiles(BackendResult<Vec<vibex_core::ProviderProfileSummary>>),
+    /// One profile as the authority holds it, read for an editor.
+    ProviderProfile(BackendResult<vibex_core::ProviderProfile>),
     ProviderTest(BackendResult<vibex_core::AgentModelProviderProfileTestResult>),
     ProviderModels(BackendResult<Vec<vibex_core::ProviderConfiguredModel>>),
     Agents(BackendResult<Vec<vibex_core::AgentSnapshotEntry>>),
@@ -1507,6 +1509,23 @@ impl Dispatch {
                 };
                 let result = self.facade.device().audit_records(request).await;
                 self.send(AppMessage::Audit(result));
+            }
+            Effect::LoadProviderProfile {
+                agent_id,
+                profile_id,
+            } => {
+                let request = vibex_backend::MutationRequest::new(
+                    vibex_core::AgentModelProviderProfileDetailRequest {
+                        agent_id,
+                        provider_profile_id: profile_id,
+                    },
+                );
+                let result = self
+                    .facade
+                    .management()
+                    .agent_model_provider_profile_detail(request)
+                    .await;
+                self.send(AppMessage::ProviderProfile(result));
             }
             Effect::ListProfiles => {
                 let result = self.facade.management().list_profiles().await;

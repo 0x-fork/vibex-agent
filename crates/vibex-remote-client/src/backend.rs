@@ -3853,6 +3853,21 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn agent_model_provider_profile_detail(
+        &self,
+        _request: MutationRequest<vibex_core::AgentModelProviderProfileDetailRequest>,
+    ) -> BackendFuture<'_, ProviderProfile> {
+        // A profile's configuration is not part of the remote provider surface,
+        // so a paired client is refused rather than answered with a profile it
+        // would write back missing the fields it could not read.
+        Box::pin(async move {
+            Err(BackendError::failed(
+                "provider_profile_detail_unsupported",
+                "this runtime does not serve a provider profile's configuration",
+            ))
+        })
+    }
+
     fn list_profiles(&self) -> BackendFuture<'_, Vec<ProviderProfileSummary>> {
         let this = self.clone();
         Box::pin(async move {

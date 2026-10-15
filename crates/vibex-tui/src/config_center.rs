@@ -2148,9 +2148,14 @@ pub enum FormPurpose {
     },
     /// A profile that does not exist yet.
     ///
-    /// Nothing is carried but the Agent the reader chose and the values they
-    /// typed: the authority mints the id, so there is no record to name.
-    NewProviderProfile,
+    /// The authority mints the id, so there is no record to name. `source` is
+    /// the profile a copy started from, when the reader asked for one: the form
+    /// does not represent the small/large model, the reasoning effort, the
+    /// sandbox and permission defaults or the request options, and a copy that
+    /// dropped them would not be a copy. They travel whole instead.
+    NewProviderProfile {
+        source: Option<Box<vibex_core::ProviderProfile>>,
+    },
     /// The settings of one Model inside a profile.
     ProviderModel {
         agent_id: String,
@@ -2184,7 +2189,7 @@ impl FormPurpose {
             Self::McpServer { server_id: None }
                 | Self::Skill { skill_id: None }
                 | Self::Prompt { prompt_id: None }
-                | Self::NewProviderProfile
+                | Self::NewProviderProfile { .. }
         )
     }
 }
@@ -2655,14 +2660,24 @@ pub fn prompt_form(prompt: Option<&vibex_core::Prompt>, strings: Strings) -> Con
 }
 
 /// A model-provider profile editor.
-pub fn provider_form(profile: &vibex_core::ProviderProfileSummary, strings: Strings) -> ConfigForm {
+pub fn provider_form(
+    profile: &vibex_core::ProviderProfileSummary,
+    detail: Option<&vibex_core::ProviderProfile>,
+    strings: Strings,
+) -> ConfigForm {
+    // The endpoint is not in the summary, so it is shown when this client has
+    // read the profile and left empty when it has not: the field writes what it
+    // holds, and an empty one leaves what is stored alone.
+    let base_url = detail
+        .and_then(|detail| detail.base_url.clone())
+        .unwrap_or_default();
     let fields = vec![
         FormField::text(
             "name",
             strings.config_form_name(),
             profile.display_name.clone(),
         ),
-        FormField::text("base_url", strings.config_field_url(), String::new())
+        FormField::text("base_url", strings.config_field_url(), base_url)
             .hint(strings.config_hint_endpoint()),
         FormField::text(
             "default_model",
@@ -2692,6 +2707,7 @@ pub fn provider_form(profile: &vibex_core::ProviderProfileSummary, strings: Stri
 pub fn provider_create_form(
     agents: &[vibex_core::AgentSnapshotEntry],
     source: Option<&vibex_core::ProviderProfileSummary>,
+    detail: Option<&vibex_core::ProviderProfile>,
     strings: Strings,
 ) -> ConfigForm {
     let options = agents
@@ -2736,8 +2752,18 @@ pub fn provider_create_form(
                 .and_then(|profile| profile.account_alias.clone())
                 .unwrap_or_default(),
         ),
-        FormField::text("base_url", strings.config_field_url(), String::new())
-            .hint(strings.config_hint_provider_url()),
+        FormField::text(
+            "base_url",
+            strings.config_field_url(),
+            detail
+                .and_then(|detail| detail.base_url.clone())
+                .unwrap_or_default(),
+        )
+        .hint(if detail.is_some() {
+            strings.config_hint_endpoint()
+        } else {
+            strings.config_hint_provider_url()
+        }),
         FormField::text(
             "default_model",
             strings.config_field_model(),
@@ -2749,7 +2775,9 @@ pub fn provider_create_form(
             .hint(strings.config_hint_models()),
     ];
     ConfigForm::new(
-        FormPurpose::NewProviderProfile,
+        FormPurpose::NewProviderProfile {
+            source: detail.map(|detail| Box::new(detail.clone())),
+        },
         strings.config_form_new_provider(),
         fields,
     )

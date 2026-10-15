@@ -2493,6 +2493,34 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
+        AppMessage::ProviderProfile(result) => {
+            let pending = app.pending_provider_open.take();
+            match result {
+                Ok(profile) => {
+                    let profile_id = profile.id.clone();
+                    app.management_data.provider_detail = Some(profile);
+                    // The reader asked for a surface before the read; the answer
+                    // is what opens it.
+                    if let Some((wanted, open)) = pending
+                        && wanted == profile_id
+                    {
+                        let outcome = app.show_provider_open(&profile_id, open);
+                        dispatch_all(worker, &outcome);
+                    }
+                }
+                Err(error) => {
+                    // A runtime that does not serve the full profile still gets
+                    // an editor: it opens on what the summary carries, and the
+                    // reader is told which part could not be read rather than
+                    // finding a field mysteriously empty.
+                    app.toast(Toast::warning(error.message));
+                    if let Some((wanted, open)) = pending {
+                        let outcome = app.show_provider_open(&wanted, open);
+                        dispatch_all(worker, &outcome);
+                    }
+                }
+            }
+        }
         AppMessage::ProviderModels(result) => match result {
             Ok(models) => {
                 // The catalogue is kept rather than printed: the Model editor

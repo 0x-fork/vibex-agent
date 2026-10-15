@@ -2485,6 +2485,29 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn agent_model_provider_profile_detail(
+        &self,
+        request: MutationRequest<vibex_core::AgentModelProviderProfileDetailRequest>,
+    ) -> BackendFuture<'_, vibex_core::ProviderProfile> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .get_profile(&request.payload.provider_profile_id)?
+                .ok_or_else(|| {
+                    vibex_core::VibexError::validation(
+                        "provider_profile_not_found",
+                        "the provider profile was not found",
+                    )
+                    .into()
+                })
+        })
+    }
+
     fn select_profile(
         &self,
         request: MutationRequest<ManagementProfileSelectionRequest>,

@@ -8,8 +8,9 @@ use vibex_core::{
     AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
     AgentModelProviderDraftFetchModelsRequest, AgentModelProviderDraftFetchModelsResponse,
     AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
-    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
-    AgentModelProviderProfileSecretValueRequest, AgentModelProviderProfileSecretValueResponse,
+    AgentModelProviderProfileDetailRequest, AgentModelProviderProfileFetchModelsRequest,
+    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileSecretValueRequest,
+    AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
     AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
     AgentProviderProjectionCapability, AgentProviderProjectionCapabilityRequest,
@@ -247,6 +248,18 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: AgentModelProviderProfileSecretValueRequest,
     ) -> BackendFuture<'_, AgentModelProviderProfileSecretValueResponse>;
+
+    /// One profile as the authority holds it.
+    ///
+    /// The list answers with the summary published to any client, which leaves
+    /// out the endpoint and the request options. An editor that writes a profile
+    /// back needs them: a save that cannot read a field would quietly clear it.
+    /// A runtime that does not serve this answers with a refusal, and the client
+    /// falls back to editing what the summary carries.
+    fn agent_model_provider_profile_detail(
+        &self,
+        request: MutationRequest<AgentModelProviderProfileDetailRequest>,
+    ) -> BackendFuture<'_, ProviderProfile>;
 
     fn create_agent_model_provider_profile(
         &self,

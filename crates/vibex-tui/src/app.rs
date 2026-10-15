@@ -371,6 +371,19 @@ impl WorkspacePickerRow {
     }
 }
 
+/// The surface a profile read was opened for.
+///
+/// The record cannot be read in one press — the list only carries a summary —
+/// so the intent travels beside the read and the surface opens when the answer
+/// lands, rather than opening on a profile whose endpoint is still unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderOpen {
+    Edit,
+    Duplicate,
+    Models,
+    Order,
+}
+
 /// Which single-line field a prompt is editing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptField {
@@ -646,6 +659,12 @@ pub struct ManagementData {
     pub audit: Vec<vibex_core::RemoteAuditRecord>,
     pub profiles: Vec<vibex_core::ProviderProfileSummary>,
     pub providers: Vec<vibex_core::ProviderProfileSummary>,
+    /// The last profile configuration this client read in full.
+    ///
+    /// The list answers with the summary the authority publishes, which leaves
+    /// out the endpoint and the request options; an editor opened from it needs
+    /// them, or a save would quietly clear what it could not read.
+    pub provider_detail: Option<vibex_core::ProviderProfile>,
     /// The last Model catalogue an endpoint answered with. It is what the Model
     /// editor unions with the profile's own declarations, so a Model the profile
     /// does not offer yet is still one the reader can turn on.
@@ -998,6 +1017,9 @@ pub struct App {
 
     pub settings: SettingsState,
     pub management_data: ManagementData,
+    /// The profile read a surface is waiting on, if the reader asked for one
+    /// whose configuration this client has not read yet.
+    pub pending_provider_open: Option<(vibex_core::ProviderProfileId, ProviderOpen)>,
     /// The configuration centre's own navigation: which module and area are
     /// open, which pane owns the keyboard, and the filter over the records.
     ///
@@ -1868,6 +1890,7 @@ impl App {
                 filter: String::new(),
             },
             management_data: ManagementData::default(),
+            pending_provider_open: None,
             config_center: crate::config_center::ConfigCenter::default(),
             device_center: crate::device_center::DeviceCenter::default(),
             pending_config_action: None,
@@ -9018,6 +9041,14 @@ pub enum Effect {
     DiscoverSources {
         module: crate::config_center::ConfigModule,
     },
+    /// Read one provider profile in full, for an editor.
+    ///
+    /// The list answers with the summary; an editor that writes a profile back
+    /// has to read the fields the summary leaves out first.
+    LoadProviderProfile {
+        agent_id: vibex_core::AgentId,
+        profile_id: vibex_core::ProviderProfileId,
+    },
     /// Search a module's registry.
     ///
     /// The question travels whole — the text, the narrowing and the page —
@@ -9079,6 +9110,7 @@ impl Effect {
             Effect::ConfigMutation { mutation, .. } => mutation.label(),
             Effect::DiscoverSources { .. } => "config_sources",
             Effect::SearchRegistry { .. } => "config_registry",
+            Effect::LoadProviderProfile { .. } => "provider_profile_detail",
             Effect::OpenSession { .. } => "open_session",
             Effect::RefreshTimeline => "timeline",
             Effect::LoadOlder { .. } => "older_timeline",

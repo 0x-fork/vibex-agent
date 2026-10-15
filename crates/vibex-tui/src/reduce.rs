@@ -1662,15 +1662,10 @@ impl App {
                 let Some(profile_id) = self.provider_id(key) else {
                     return Outcome::quiet();
                 };
-                let source = self
-                    .management_data
-                    .providers
-                    .iter()
-                    .find(|profile| profile.id == profile_id)
-                    .cloned();
-                let form = self.provider_create_form(source.as_ref(), self.strings);
-                self.overlay = Some(Overlay::Form { form });
-                Outcome::effects(vec![])
+                let Some(agent_id) = self.profile_agent_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.open_provider(agent_id, profile_id, crate::app::ProviderOpen::Duplicate)
             }
             (ConfigSection::Providers, ConfigAction::Secret) => {
                 // The profile the key is for travels with the prompt: the list
@@ -1932,11 +1927,15 @@ impl App {
                     })
                     .cloned();
                 match profile {
-                    Some(profile) => Some(crate::config_center::provider_form(&profile, strings)),
+                    Some(profile) => Some(crate::config_center::provider_form(
+                        &profile,
+                        self.provider_detail(profile.id.as_str()),
+                        strings,
+                    )),
                     // `n` on the Providers area has no record to open, so it
                     // opens the blank form: a profile is the one record in the
                     // centre the reader can make from nothing.
-                    None if key.is_none() => Some(self.provider_create_form(None, strings)),
+                    None if key.is_none() => Some(self.provider_create_form(None, None, strings)),
                     None => None,
                 }
             }
@@ -2151,6 +2150,73 @@ impl App {
         outcome
     }
 
+    /// Open one of a profile's surfaces, reading the profile first if this
+    /// client has not read it.
+    ///
+    /// The list answers with a summary, so an editor opened straight from it
+    /// would be editing a record whose endpoint it cannot see — and a field it
+    /// cannot see is a field a save leaves empty. The read is a round trip, so
+    /// what the reader asked for travels with it and the surface opens on the
+    /// answer.
+    fn open_provider(
+        &mut self,
+        agent_id: vibex_core::AgentId,
+        profile_id: vibex_core::ProviderProfileId,
+        open: crate::app::ProviderOpen,
+    ) -> Outcome {
+        if self.provider_detail(profile_id.as_str()).is_none() {
+            self.pending_provider_open = Some((profile_id.clone(), open));
+            return Outcome::effects(vec![Effect::LoadProviderProfile {
+                agent_id,
+                profile_id,
+            }]);
+        }
+        self.show_provider_open(&profile_id, open)
+    }
+
+    /// Open the surface a profile read was for, from what this client holds.
+    pub fn show_provider_open(
+        &mut self,
+        profile_id: &vibex_core::ProviderProfileId,
+        open: crate::app::ProviderOpen,
+    ) -> Outcome {
+        use crate::app::ProviderOpen;
+        let strings = self.strings;
+        let detail = self.provider_detail(profile_id.as_str()).cloned();
+        let summary = self
+            .management_data
+            .providers
+            .iter()
+            .find(|profile| profile.id == *profile_id)
+            .cloned();
+        let form = match open {
+            ProviderOpen::Edit => summary.as_ref().map(|profile| {
+                crate::config_center::provider_form(profile, detail.as_ref(), strings)
+            }),
+            ProviderOpen::Duplicate => {
+                Some(self.provider_create_form(summary.as_ref(), detail.as_ref(), strings))
+            }
+            // Ordering acts on the list rather than on one record, and a
+            // profile's Models are in the summary already.
+            ProviderOpen::Order | ProviderOpen::Models => None,
+        };
+        match form {
+            Some(form) => {
+                self.overlay = Some(Overlay::Form { form });
+                Outcome::effects(vec![])
+            }
+            None => Outcome::quiet(),
+        }
+    }
+
+    /// The full configuration of one profile, when this client has read it.
+    fn provider_detail(&self, key: &str) -> Option<&vibex_core::ProviderProfile> {
+        self.management_data
+            .provider_detail
+            .as_ref()
+            .filter(|detail| detail.id.as_str() == key)
+    }
+
     /// The form that makes a profile, given the Agent it may belong to.
     ///
     /// The Agents offered are the ones the runtime says can hold a provider
@@ -2160,6 +2226,7 @@ impl App {
     fn provider_create_form(
         &self,
         source: Option<&vibex_core::ProviderProfileSummary>,
+        detail: Option<&vibex_core::ProviderProfile>,
         strings: crate::locale::Strings,
     ) -> crate::config_center::ConfigForm {
         let configurable = vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
@@ -2170,7 +2237,7 @@ impl App {
             .filter(|agent| configurable.contains(&agent.id))
             .cloned()
             .collect::<Vec<_>>();
-        crate::config_center::provider_create_form(&agents, source, strings)
+        crate::config_center::provider_create_form(&agents, source, detail, strings)
     }
 
     /// The per-Agent matrix of one MCP server or Skill.
@@ -2989,7 +3056,7 @@ impl App {
                     configured_models: Some(models),
                 })
             }
-            FormPurpose::NewProviderProfile => {
+            FormPurpose::NewProviderProfile { source } => {
                 let Some(agent_id) = form
                     .value("agent")
                     .filter(|id| !id.is_empty())
@@ -3025,14 +3092,32 @@ impl App {
                         account_alias: form.optional("account_alias"),
                         base_url: form.optional("base_url"),
                         default_model: form.optional("default_model"),
-                        small_model: None,
-                        large_model: None,
+                        // A copy carries the parts the form has no field for: a
+                        // copy that dropped them would not be one. The credential
+                        // references never travel — a copy starts without a key
+                        // rather than sharing one.
+                        small_model: source
+                            .as_ref()
+                            .and_then(|source| source.small_model.clone()),
+                        large_model: source
+                            .as_ref()
+                            .and_then(|source| source.large_model.clone()),
                         configured_models,
-                        reasoning_effort: None,
-                        sandbox_defaults: None,
-                        network_defaults: None,
-                        permission_defaults: None,
-                        provider_options: None,
+                        reasoning_effort: source
+                            .as_ref()
+                            .and_then(|source| source.reasoning_effort.clone()),
+                        sandbox_defaults: source
+                            .as_ref()
+                            .map(|source| source.sandbox_defaults.clone()),
+                        network_defaults: source
+                            .as_ref()
+                            .map(|source| source.network_defaults.clone()),
+                        permission_defaults: source
+                            .as_ref()
+                            .map(|source| source.permission_defaults.clone()),
+                        provider_options: source
+                            .as_ref()
+                            .map(|source| source.provider_options.clone()),
                         secret_references: Vec::new(),
                     },
                 )))

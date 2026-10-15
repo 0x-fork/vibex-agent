@@ -1492,10 +1492,10 @@ fn a_provider_profile_can_be_made_from_nothing() {
     let Some(Overlay::Form { form }) = app.overlay.clone() else {
         panic!("`n` on the Providers area opened no form");
     };
-    assert_eq!(
+    assert!(matches!(
         form.purpose,
-        vibex_tui::config_center::FormPurpose::NewProviderProfile
-    );
+        vibex_tui::config_center::FormPurpose::NewProviderProfile { source: None }
+    ));
     assert!(
         !form.value("agent").unwrap_or_default().is_empty(),
         "the form did not offer an Agent to belong to"
@@ -1539,32 +1539,132 @@ fn a_provider_profile_can_be_made_from_nothing() {
     assert!(outcome.effects.is_empty(), "a nameless profile was written");
 }
 
-/// A copy starts in the form, carrying what this client can see and asking for
-/// the rest.
+/// One profile as the authority holds it, which is what an editor needs.
+fn provider_profile_detail() -> vibex_core::ProviderProfile {
+    serde_json::from_value(serde_json::json!({
+        "id": "provider_first",
+        "agentId": "codex",
+        "kind": "codex",
+        "displayName": "First",
+        "status": "enabled",
+        "accountAlias": "work",
+        "baseUrl": "https://api.example/v1",
+        "defaultModel": "gpt-5",
+        "configuredModels": [{"id": "gpt-5", "enabled": true, "capabilities": {}}],
+        "sandboxDefaults": {
+            "permissionMode": "default",
+            "askOnRisk": true,
+            "bypassAllPermissions": false
+        },
+        "networkDefaults": {"allowNetwork": true},
+        "permissionDefaults": {
+            "fileRead": "allow",
+            "fileWrite": "ask",
+            "command": "ask",
+            "network": "ask"
+        },
+        "providerOptions": {
+            "schemaVersion": 1,
+            "entries": [{"key": "ccSwitchWebsiteUrl", "value": "https://example.test"}]
+        },
+        "secrets": [],
+        "createdAtMs": 1,
+        "updatedAtMs": 1
+    }))
+    .expect("profile detail fixture")
+}
+
+/// A copy is written from the profile itself, not from the summary of it.
 ///
-/// Profiles are read as the summary the authority publishes, which has the name,
-/// the account and the Models but no endpoint. Writing the copy straight out
-/// would produce a profile that launches nowhere, so the endpoint is asked for
-/// rather than invented.
+/// The list answers with a summary, which carries the name, the account and the
+/// Models but neither the endpoint nor the request options. A copy written from
+/// that would be a profile that launches nowhere, so the surface waits for the
+/// full read: the press asks for it, and the answer is what opens the form.
 #[test]
-fn duplicating_a_profile_opens_a_form_that_asks_for_what_it_cannot_copy() {
+fn a_copy_is_written_from_the_whole_profile() {
     let mut app = loaded(140, 40);
     app.management_data.providers = vec![provider_profile("provider_first", "First")];
     app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
 
+    // The press is a read first: the record it is about has not been read.
     let outcome = app.run_config_action_by_key("provider_first", ConfigAction::Duplicate);
-    assert!(outcome.effects.is_empty(), "the copy was written unasked");
+    match outcome.effects.as_slice() {
+        [
+            vibex_tui::app::Effect::LoadProviderProfile {
+                agent_id,
+                profile_id,
+            },
+        ] => {
+            assert_eq!(agent_id.as_str(), "codex");
+            assert_eq!(profile_id.as_str(), "provider_first");
+        }
+        other => panic!("the copy did not read the profile first: {other:?}"),
+    }
+    assert_eq!(
+        app.pending_provider_open.as_ref().map(|(_, open)| *open),
+        Some(vibex_tui::app::ProviderOpen::Duplicate)
+    );
+
+    // The answer is what opens the form, and it carries what the summary could
+    // not: the endpoint, and the request options besides.
+    app.management_data.provider_detail = Some(provider_profile_detail());
+    app.show_provider_open(
+        &vibex_core::ProviderProfileId::parse("provider_first").unwrap(),
+        vibex_tui::app::ProviderOpen::Duplicate,
+    );
     let Some(Overlay::Form { form }) = app.overlay.clone() else {
-        panic!("the copy opened no form");
+        panic!("the answer opened no form");
     };
     assert_eq!(form.value("name").as_deref(), Some("First copy"));
     assert_eq!(form.value("account_alias").as_deref(), Some("work"));
     assert_eq!(form.value("models").as_deref(), Some("gpt-5"));
     assert_eq!(
         form.value("base_url").as_deref(),
-        Some(""),
-        "the copy invented an endpoint it cannot read"
+        Some("https://api.example/v1"),
+        "the copy could not read the endpoint it is copying"
     );
+
+    // And the save writes them, rather than dropping what the form has no field
+    // for.
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::CreateProviderProfile(request) = mutation else {
+                panic!("the copy was not a creation: {mutation:?}");
+            };
+            assert_eq!(request.base_url.as_deref(), Some("https://api.example/v1"));
+            assert_eq!(
+                request
+                    .provider_options
+                    .as_ref()
+                    .map(|options| options.entries.len()),
+                Some(1),
+                "the request options were dropped by the copy"
+            );
+            assert!(
+                request.secret_references.is_empty(),
+                "a copy must not share the credential it was copied from"
+            );
+        }
+        other => panic!("the copy produced {other:?}"),
+    }
+}
+
+/// Editing a profile needs the same read, for the same reason.
+#[test]
+fn editing_a_profile_reads_it_before_it_opens() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    app.perform(vibex_tui::action::Intent::EditSelectedEntry);
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the editor did not open");
+    };
+    // A summary has no endpoint, so the field is empty and the form says so:
+    // an empty field leaves what is stored alone.
+    assert_eq!(form.value("base_url").as_deref(), Some(""));
+    assert!(form.field("base_url").unwrap().hint.is_some());
 }
 
 /// The Models a profile offers are edited as a list inside the record.
