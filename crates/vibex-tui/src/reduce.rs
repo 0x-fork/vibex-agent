@@ -1134,6 +1134,8 @@ impl App {
                 self.begin_entry_form(row)
             }
             Intent::ConfigFormSave => Outcome::quiet(),
+            // The form's own key, reaching here only when no form is open.
+            Intent::ConfigFormCopy => Outcome::quiet(),
             Intent::ConfigRegistryFilter => self.step_registry_narrowing(RegistryStep::Transport),
             Intent::ConfigRegistrySort => self.step_registry_narrowing(RegistryStep::Sort),
             Intent::ConfigRegistryPagePrevious => self.step_registry_page(-1),
@@ -1928,13 +1930,16 @@ impl App {
             let Some(entry) = self.mcp_market_entry(key) else {
                 return Outcome::quiet();
             };
-            let candidate = mcp_market_candidate(&entry);
-            let env_values = candidate.env.clone();
-            return self.begin_config_mutation(crate::app::ConfigMutation::InstallMcpMarketEntry {
-                entry_id: entry.id.clone(),
-                candidate: Box::new(candidate),
-                env_values,
-            });
+            // Installing is a form rather than a press: the registry names the
+            // variables it needs and never the reader's own values for them,
+            // and it has no idea which Agents should receive the server.
+            let form = crate::config_center::mcp_market_install_form(
+                &entry,
+                &self.management_data.agents,
+                self.strings,
+            );
+            self.overlay = Some(Overlay::Form { form });
+            return Outcome::effects(vec![]);
         }
         let Some(entry) = self
             .management_data
@@ -1969,7 +1974,7 @@ impl App {
         };
         self.begin_config_mutation(crate::app::ConfigMutation::ValidateMcpMarketEntry {
             entry_id: entry.id.clone(),
-            candidate: Box::new(mcp_market_candidate(&entry)),
+            candidate: Box::new(crate::config_center::mcp_market_candidate(&entry)),
         })
     }
 
@@ -2132,6 +2137,16 @@ impl App {
             Intent::ElicitationFieldPrevious => self.step_form_value(-1),
             Intent::ElicitationFieldNext => self.step_form_value(1),
             Intent::ConfigFormSave => self.submit_form(form),
+            // A form that reads a command back has one thing on it the reader
+            // cannot select, and a client that showed them a launcher and would
+            // not hand it over is asking them to retype it.
+            Intent::ConfigFormCopy => match form.preview.clone() {
+                Some(preview) => {
+                    self.toast(Toast::success(self.strings.copied().to_string()));
+                    Outcome::effects(vec![Effect::Clipboard { text: preview }])
+                }
+                None => Outcome::quiet(),
+            },
             _ => Outcome::quiet(),
         }
     }
@@ -2779,6 +2794,40 @@ impl App {
                         .cloned(),
                 );
                 Ok(ConfigMutation::SetSkillAgentMatrix { skill_id, matrix })
+            }
+            FormPurpose::McpMarketInstall {
+                entry_id,
+                candidate,
+            } => {
+                // What the reader filled in is written onto the candidate the
+                // registry published, so what is installed is the entry the
+                // form showed rather than a second reading of a registry that
+                // may have moved on since.
+                let env = form
+                    .fields
+                    .iter()
+                    .filter_map(|field| {
+                        let name = field.key.strip_prefix("env:")?;
+                        let value = field.optional()?;
+                        Some(vibex_core::McpServerEnvEntry {
+                            name: name.to_string(),
+                            value,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let mut candidate = (**candidate).clone();
+                candidate.env = env.clone();
+                let agent_ids = form
+                    .enabled_agents()
+                    .iter()
+                    .filter_map(|id| parse_config_id(id).ok())
+                    .collect();
+                Ok(ConfigMutation::InstallMcpMarketEntry {
+                    entry_id: entry_id.clone(),
+                    candidate: Box::new(candidate),
+                    env_values: env,
+                    agent_ids,
+                })
             }
         }
     }
@@ -6580,39 +6629,6 @@ impl ElicitationDraft {
 /// "nothing happened" rather than writing to a guessed id.
 fn parse_config_id<T: std::str::FromStr>(value: &str) -> Result<T, &'static str> {
     value.parse().map_err(|_| "unknown record")
-}
-
-/// One registry entry as the record installing it would create.
-///
-/// The registry publishes a launcher, not a record: the scope, the status and
-/// the tag that says where it came from are this client's decisions, and both
-/// "install" and "check it first" have to make them the same way or a check
-/// would answer about a different server than the install writes.
-fn mcp_market_candidate(entry: &vibex_core::McpMarketEntry) -> vibex_core::McpServerCreateRequest {
-    vibex_core::McpServerCreateRequest {
-        display_name: entry.name.clone(),
-        transport_kind: entry.transport,
-        status: vibex_core::McpServerStatus::Enabled,
-        scope_kind: vibex_core::McpServerScopeKind::User,
-        project_id: None,
-        workspace_id: None,
-        command: entry.command.clone(),
-        args: entry.args.clone(),
-        env: entry
-            .env
-            .iter()
-            .map(|requirement| vibex_core::McpServerEnvEntry {
-                name: requirement.name.clone(),
-                value: requirement.default_value.clone().unwrap_or_default(),
-            })
-            .collect(),
-        url: entry.url.clone(),
-        headers: Vec::new(),
-        description: entry.description.clone(),
-        tags: vec!["market".to_string()],
-        secret_references: Vec::new(),
-        provider_matrix: Vec::new(),
-    }
 }
 
 /// Which narrowing of a registry one press asked for.

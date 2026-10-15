@@ -7912,6 +7912,22 @@ fn render_config_form(
     let footer = layout.footer;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let label_width = 18usize;
+    // What the form is about to write, read back before it is written. It is
+    // the one line the fields do not carry — a registry entry is a launcher
+    // before it is a record — so it is shown rather than asked for.
+    if let Some(preview) = &form.preview {
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                truncate_to_width(preview, usize::from(content.width).saturating_sub(4), "…"),
+                Style::default().fg(theme.roles.text_secondary),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("  c {}", strings.config_form_copy()),
+            Style::default().fg(theme.roles.gray_dim),
+        )));
+    }
     for (index, field) in form.fields.iter().enumerate() {
         let selected = index == form.selected;
         let editing = form.editing.as_deref() == Some(field.key.as_str());
@@ -7940,7 +7956,9 @@ fn render_config_form(
             _ => "",
         };
         let multi = matches!(field.kind, crate::config_center::FormFieldKind::Multiline);
-        let shown = if multi {
+        let shown = if field.secret {
+            "•".repeat(value.chars().count())
+        } else if multi {
             value.lines().next().unwrap_or_default().to_string()
         } else {
             value.clone()

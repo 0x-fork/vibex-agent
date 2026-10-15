@@ -727,10 +727,11 @@ impl Dispatch {
                 entry_id,
                 candidate,
                 env_values,
+                agent_ids,
             } => {
                 let request = MutationRequest::new(vibex_core::McpMarketInstallRequest {
                     entry_id,
-                    agent_ids: Vec::new(),
+                    agent_ids,
                     env_values,
                     candidate: *candidate,
                 });

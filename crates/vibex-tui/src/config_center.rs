@@ -1923,6 +1923,12 @@ pub struct FormField {
     pub origin: String,
     pub kind: FormFieldKind,
     pub hint: Option<String>,
+    /// Whether the value is a secret, drawn masked and never echoed.
+    ///
+    /// A requirement the registry marked secret is one the reader is pasting a
+    /// credential into, and a credential on screen is a credential in whatever
+    /// is behind the terminal.
+    pub secret: bool,
 }
 
 impl FormField {
@@ -1935,6 +1941,7 @@ impl FormField {
             value,
             kind: FormFieldKind::Text,
             hint: None,
+            secret: false,
         }
     }
 
@@ -1951,6 +1958,7 @@ impl FormField {
             value,
             kind: FormFieldKind::Multiline,
             hint: None,
+            secret: false,
         }
     }
 
@@ -1968,6 +1976,7 @@ impl FormField {
             value: value.to_string(),
             kind: FormFieldKind::Choice { options, labels },
             hint: None,
+            secret: false,
         }
     }
 
@@ -1980,11 +1989,18 @@ impl FormField {
             value,
             kind: FormFieldKind::Toggle,
             hint: None,
+            secret: false,
         }
     }
 
     fn hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
+        self
+    }
+
+    /// Mark the value as a secret. It is drawn masked and never echoed.
+    fn secret(mut self) -> Self {
+        self.secret = true;
         self
     }
 
@@ -2077,6 +2093,16 @@ pub enum FormPurpose {
     SkillMatrix {
         skill_id: String,
     },
+    /// One registry entry, about to become a server.
+    ///
+    /// The entry has no record yet, so the form carries the candidate the
+    /// registry published and the values the reader fills in are written onto
+    /// it: what is installed is what the form showed, rather than a second
+    /// reading of the registry that could have moved on.
+    McpMarketInstall {
+        entry_id: String,
+        candidate: Box<vibex_core::McpServerCreateRequest>,
+    },
 }
 
 impl FormPurpose {
@@ -2106,6 +2132,12 @@ pub struct ConfigForm {
     pub editing: Option<String>,
     pub error: Option<String>,
     pub scroll: u16,
+    /// A line the form is about to write, shown read-only above the fields.
+    ///
+    /// A registry entry is a launcher before it is a record: what will be run
+    /// is not one of the fields the reader fills in, but it is the thing they
+    /// are agreeing to, so it is read back to them before anything is saved.
+    pub preview: Option<String>,
 }
 
 impl ConfigForm {
@@ -2118,11 +2150,18 @@ impl ConfigForm {
             editing: None,
             error: None,
             scroll: 0,
+            preview: None,
         }
     }
 
     pub fn dirty(&self) -> bool {
         self.fields.iter().any(FormField::changed)
+    }
+
+    /// Give the form a line to read back before it is saved.
+    pub fn preview(mut self, preview: impl Into<String>) -> Self {
+        self.preview = Some(preview.into());
+        self
     }
 
     pub fn field(&self, key: &str) -> Option<&FormField> {
@@ -2635,4 +2674,119 @@ pub fn skill_matrix_form(
         ),
         fields,
     )
+}
+
+/// One registry entry as the record installing it would create.
+///
+/// The registry publishes a launcher, not a record: the scope, the status and
+/// the tag that says where it came from are this client's decisions, and both
+/// "install" and "check it first" have to make them the same way or a check
+/// would answer about a different server than the install writes.
+pub fn mcp_market_candidate(
+    entry: &vibex_core::McpMarketEntry,
+) -> vibex_core::McpServerCreateRequest {
+    vibex_core::McpServerCreateRequest {
+        display_name: entry.name.clone(),
+        transport_kind: entry.transport,
+        status: vibex_core::McpServerStatus::Enabled,
+        scope_kind: vibex_core::McpServerScopeKind::User,
+        project_id: None,
+        workspace_id: None,
+        command: entry.command.clone(),
+        args: entry.args.clone(),
+        env: entry
+            .env
+            .iter()
+            .map(|requirement| vibex_core::McpServerEnvEntry {
+                name: requirement.name.clone(),
+                value: requirement.default_value.clone().unwrap_or_default(),
+            })
+            .collect(),
+        url: entry.url.clone(),
+        headers: Vec::new(),
+        description: entry.description.clone(),
+        tags: vec!["market".to_string()],
+        secret_references: Vec::new(),
+        provider_matrix: Vec::new(),
+    }
+}
+
+/// The launcher a candidate would run or connect to, as one line.
+pub fn mcp_candidate_command_line(candidate: &vibex_core::McpServerCreateRequest) -> String {
+    match candidate.transport_kind {
+        vibex_core::McpServerTransportKind::Stdio => {
+            let mut line = candidate.command.clone().unwrap_or_default();
+            if !candidate.args.is_empty() {
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(&candidate.args.join(" "));
+            }
+            line
+        }
+        _ => candidate.url.clone().unwrap_or_default(),
+    }
+}
+
+/// The form that turns one registry entry into a server.
+///
+/// The registry publishes a launcher and the variables it needs; what it cannot
+/// publish is the reader's own token or which Agents should receive the server.
+/// Both are asked for here, and the command that will be saved is read back
+/// above them: a reader agreeing to an entry is agreeing to what it runs, and
+/// that is the one thing the name of the entry does not say.
+pub fn mcp_market_install_form(
+    entry: &vibex_core::McpMarketEntry,
+    agents: &[vibex_core::AgentSnapshotEntry],
+    strings: Strings,
+) -> ConfigForm {
+    let candidate = mcp_market_candidate(entry);
+    let mut fields = Vec::new();
+    for requirement in &entry.env {
+        let mut field = FormField::text(
+            format!("env:{}", requirement.name),
+            requirement.name.clone(),
+            requirement.default_value.clone().unwrap_or_default(),
+        );
+        let hint = match (
+            requirement
+                .description
+                .clone()
+                .or_else(|| requirement.placeholder.clone()),
+            requirement.required,
+        ) {
+            (Some(description), true) => {
+                format!("{description} · {}", strings.config_form_required())
+            }
+            (Some(description), false) => description,
+            (None, true) => strings.config_form_required().to_string(),
+            (None, false) => String::new(),
+        };
+        if !hint.is_empty() {
+            field = field.hint(hint);
+        }
+        if requirement.secret {
+            field = field.secret();
+        }
+        fields.push(field);
+    }
+    // Every added Agent starts switched on, which is what the desktop does and
+    // what "install this" almost always means; the reader who wants it narrower
+    // turns one off here rather than discovering it afterwards.
+    for agent in agents {
+        fields.push(FormField::toggle(
+            format!("agent:{}", agent.id.as_str()),
+            agent.label.clone(),
+            true,
+        ));
+    }
+    ConfigForm::new(
+        FormPurpose::McpMarketInstall {
+            entry_id: entry.id.clone(),
+            candidate: Box::new(candidate.clone()),
+        },
+        format!("{} · {}", strings.config_action_install(), entry.name),
+        fields,
+    )
+    .preview(mcp_candidate_command_line(&candidate))
 }

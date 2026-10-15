@@ -8507,6 +8507,9 @@ pub enum ConfigMutation {
         entry_id: String,
         candidate: Box<vibex_core::McpServerCreateRequest>,
         env_values: Vec<vibex_core::McpServerEnvEntry>,
+        /// The Agents the reader switched the entry on for. The registry
+        /// publishes the launcher, not who should receive it.
+        agent_ids: Vec<vibex_core::AgentId>,
     },
     /// Check a registry entry's launcher before installing it.
     ///

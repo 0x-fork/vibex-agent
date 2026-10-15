@@ -1316,6 +1316,15 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     // letters rather than chords because a reader browsing a catalogue presses
     // them repeatedly, and `,`/`.` are the pair the rest of this client already
     // uses for "the one before" and "the one after".
+    // `c` copies the line a form is about to write, which is the one thing on
+    // it the reader cannot select with the pointer. It is only the copy while
+    // no field is being typed into: inside an edit it is the letter.
+    binding(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('c')),
+        Intent::ConfigFormCopy,
+        |strings| Intent::ConfigFormCopy.label(strings),
+    ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('t')),

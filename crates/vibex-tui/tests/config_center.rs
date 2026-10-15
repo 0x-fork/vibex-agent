@@ -1301,3 +1301,111 @@ fn the_skill_registry_pages_the_window_it_was_handed() {
     app.perform(vibex_tui::action::Intent::ConfigRegistryPageNext);
     assert_eq!(app.config_center.registry.page, 2);
 }
+
+/// Installing a registry entry is a form, not a press.
+///
+/// The registry publishes a launcher and the variables it needs; it never
+/// publishes the reader's own token for them, and it has no idea which Agents
+/// should receive the server. Both are asked for, the command that will be saved
+/// is read back, and what is written is the entry the form showed rather than a
+/// second reading of a registry that may have moved on.
+#[test]
+fn a_registry_entry_is_installed_through_a_form() {
+    let mut app = loaded(140, 40);
+    app.management_data.agents = vec![agent(), second_agent()];
+    app.management_data.mcp_market = vec![market_entry("registry_trace")];
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Catalog));
+
+    let outcome = app.run_config_action_by_key("registry_trace", ConfigAction::Install);
+    assert!(outcome.effects.is_empty(), "the install ran unasked");
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the install form did not open");
+    };
+    assert_eq!(form.preview.as_deref(), Some("npx -y @example/trace"));
+    let token = form
+        .field("env:TRACE_TOKEN")
+        .expect("the variable the registry asked for was not offered");
+    assert!(
+        token.secret,
+        "a secret requirement was offered in the clear"
+    );
+    assert_eq!(token.value, "from-registry");
+    assert_eq!(
+        form.enabled_agents(),
+        vec!["codex".to_string(), "claude".to_string()],
+        "every added Agent should start switched on"
+    );
+
+    // Nothing secret is echoed: the value is masked where it is drawn.
+    let screen = text(&mut app, 140, 40);
+    assert!(
+        !screen.contains("from-registry"),
+        "a secret requirement was echoed to the screen:\n{screen}"
+    );
+
+    // The reader fills the token in and turns the second Agent off.
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        form.field_mut("env:TRACE_TOKEN")
+            .expect("token field")
+            .value = "s3cret".to_string();
+        form.field_mut("agent:claude").expect("agent field").value = "off".to_string();
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::InstallMcpMarketEntry {
+                env_values,
+                agent_ids,
+                candidate,
+                ..
+            } = mutation
+            else {
+                panic!("the save was not an install: {mutation:?}");
+            };
+            assert_eq!(
+                env_values
+                    .iter()
+                    .map(|entry| (entry.name.as_str(), entry.value.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![("TRACE_TOKEN", "s3cret")]
+            );
+            assert_eq!(
+                agent_ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                vec!["codex"],
+                "the Agent that was switched off is still in the write"
+            );
+            assert_eq!(
+                candidate.env, *env_values,
+                "the launcher and the request disagree about the environment"
+            );
+        }
+        other => panic!("the save produced {other:?}"),
+    }
+}
+
+/// The command the form is about to save can be taken away.
+#[test]
+fn a_form_hands_over_the_command_it_is_about_to_save() {
+    let mut app = loaded(140, 40);
+    app.management_data.mcp_market = vec![market_entry("registry_trace")];
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Catalog));
+    app.run_config_action_by_key("registry_trace", ConfigAction::Install);
+
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormCopy);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::Clipboard { text }] => {
+            assert_eq!(text, "npx -y @example/trace");
+        }
+        other => panic!("the copy produced {other:?}"),
+    }
+
+    // A form with nothing to read back copies nothing.
+    app.overlay = None;
+    app.show_config_module(ConfigModule::Mcp, None);
+    app.perform(vibex_tui::action::Intent::EditSelectedEntry);
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormCopy);
+    assert!(
+        outcome.effects.is_empty(),
+        "a plain record editor copied something"
+    );
+}
