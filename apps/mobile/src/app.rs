@@ -20772,9 +20772,18 @@ impl MobileApp {
             // the same strip. Reserving the whole action column is what keeps
             // the two from sharing a hitbox — the "+" used to sit entirely
             // under the menu, so tapping it opened the menu instead.
-            SidebarRowKind::Project | SidebarRowKind::Workspace => {
-                theme::SIDEBAR_ACTION_WIDTH + theme::SIDEBAR_CARD_INSET
-            }
+            //
+            // The body already stops `SIDEBAR_LIST_PADDING + SIDEBAR_ICON_SLOT_OVERHANG`
+            // short of the list edge from its own margin and icon-overhang
+            // shift, so reserving the full column again left the "+" a whole
+            // column away from the menu. Reserve only the slice of the menu
+            // that reaches past the body's own edge: still enough to keep the
+            // two hitboxes apart, and the "+" now sits beside the menu.
+            SidebarRowKind::Project | SidebarRowKind::Workspace => (theme::SIDEBAR_ACTION_WIDTH
+                + theme::SIDEBAR_CARD_INSET
+                - theme::SIDEBAR_LIST_PADDING
+                - theme::SIDEBAR_ICON_SLOT_OVERHANG)
+                .max(0.0),
             SidebarRowKind::Folder => theme::SIDEBAR_ACTION_CONTENT_INSET,
             SidebarRowKind::Group => 0.0,
             SidebarRowKind::EmptyWorkspace => 0.0,
@@ -21287,7 +21296,7 @@ impl MobileApp {
                             .text_ellipsis()
                             .whitespace_nowrap()
                             .text_size(theme::font_sidebar_title())
-                            .line_height(theme::line_height_for(theme::FONT_HEADING))
+                            .line_height(theme::line_height_for(theme::FONT_SIDEBAR_TITLE))
                             .text_color(if workspace_selected {
                                 theme::sidebar_foreground(1.0)
                             } else {
@@ -21302,7 +21311,7 @@ impl MobileApp {
                             .text_ellipsis()
                             .whitespace_nowrap()
                             .text_size(theme::font_sidebar_meta())
-                            .line_height(theme::line_height_for(theme::FONT_CAPTION))
+                            .line_height(theme::line_height_for(theme::FONT_SIDEBAR_META))
                             .text_color(theme::sidebar_session_meta())
                             .child(detail),
                     ),
@@ -21868,6 +21877,8 @@ impl MobileApp {
                             .flex_shrink_0()
                             .h(px(theme::DRAWER_SECTION_HEIGHT))
                             .px(px(theme::SPACING_MD))
+                            .border_b_1()
+                            .border_color(theme::border_subtle())
                             .flex()
                             .items_center()
                             .child(

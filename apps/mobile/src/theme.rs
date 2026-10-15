@@ -295,6 +295,14 @@ pub const FONT_DISPLAY: f32 = 30.0;
 /// because it is a mark, not a size any row or label ever takes.
 pub const FONT_WORDMARK: f32 = 36.0;
 
+/// The sidebar's own steps. The tree is the screen the reader scans most, so
+/// each step sits one rung above the same role elsewhere: a project name reads
+/// a step over a section heading, a session row at body size, and its metadata
+/// at the detail size rather than the caption floor.
+pub const FONT_SIDEBAR_TITLE: f32 = 20.0;
+pub const FONT_SIDEBAR_ROW: f32 = FONT_BODY;
+pub const FONT_SIDEBAR_META: f32 = FONT_DETAIL;
+
 /// Body line height as a rem multiple: the handful of call sites that need the
 /// number rather than an element style (a max-height line count) read it here
 /// instead of restating the ratio.
@@ -366,19 +374,19 @@ pub fn font_wordmark() -> Rems {
     ui_rems(FONT_WORDMARK)
 }
 
-/// The sidebar reuses the main ladder — a project is a [`FONT_HEADING`] over
-/// [`FONT_DETAIL`] session rows with [`FONT_CAPTION`] metadata — so the tree
-/// keeps its hierarchy without a second, drifting set of constants.
+/// The sidebar's steps, one rung above the same role on the content pages. The
+/// tree is read by scanning, and the extra step is what stops a project name
+/// from reading as a section label and a session row from reading as metadata.
 pub fn font_sidebar_title() -> Rems {
-    ui_rems(FONT_HEADING)
+    ui_rems(FONT_SIDEBAR_TITLE)
 }
 
 pub fn font_sidebar_row() -> Rems {
-    ui_rems(FONT_DETAIL)
+    ui_rems(FONT_SIDEBAR_ROW)
 }
 
 pub fn font_sidebar_meta() -> Rems {
-    ui_rems(FONT_CAPTION)
+    ui_rems(FONT_SIDEBAR_META)
 }
 
 /// Line box for a step of the ladder, at [`LINE_HEIGHT_RATIO`]. Returned as
@@ -440,11 +448,15 @@ pub fn sidebar_row_height() -> Pixels {
 
 /// The two-line sidebar row height one rem base produces.
 ///
+/// The two-line row is a project or workspace row: its title is
+/// [`FONT_SIDEBAR_TITLE`] and its metadata [`FONT_SIDEBAR_META`], so the box is
+/// measured from that pair rather than the content ladder's heading/caption.
+///
 /// Split from [`sidebar_row_height`] so the fitting rule is unit-testable at
 /// every step without mutating the process-global text-size preference.
 fn sidebar_row_height_for(rem: Pixels) -> Pixels {
-    let text = f32::from(line_height_for(FONT_HEADING).to_pixels(rem))
-        + f32::from(line_height_for(FONT_CAPTION).to_pixels(rem));
+    let text = f32::from(line_height_for(FONT_SIDEBAR_TITLE).to_pixels(rem))
+        + f32::from(line_height_for(FONT_SIDEBAR_META).to_pixels(rem));
     px(text.max(SIDEBAR_ROW_HEIGHT))
 }
 
@@ -1121,12 +1133,33 @@ mod tests {
                 "the ladder must strictly descend: {pair:?}"
             );
         }
-        // Code is the one deliberate alias; the sidebar reuses the main ladder
-        // rather than carrying a second set of values that could drift.
+        // Code is the one deliberate alias.
         assert_eq!(FONT_CODE, FONT_CAPTION);
-        assert_eq!(font_sidebar_title().0, font_heading().0);
-        assert_eq!(font_sidebar_row().0, font_detail().0);
-        assert_eq!(font_sidebar_meta().0, font_caption().0);
+
+        // The sidebar deliberately does not reuse the content ladder: the tree
+        // is read by scanning, so each step sits one rung above the same role
+        // on a content page. A project name outranks a section heading, a
+        // session row outranks a row detail, and its metadata outranks a chip
+        // label — if any of these collapse back onto the content ladder the
+        // tree loses the extra step it was given. A const block makes each
+        // claim a build error, not only a failing test run.
+        const {
+            assert!(
+                FONT_SIDEBAR_TITLE > FONT_HEADING,
+                "a project name must outrank a section heading"
+            );
+            assert!(
+                FONT_SIDEBAR_ROW > FONT_DETAIL,
+                "a session row must outrank a row detail"
+            );
+            assert!(
+                FONT_SIDEBAR_META > FONT_CAPTION,
+                "sidebar metadata must outrank a chip label"
+            );
+            // The three sidebar steps still descend among themselves.
+            assert!(FONT_SIDEBAR_TITLE > FONT_SIDEBAR_ROW);
+            assert!(FONT_SIDEBAR_ROW > FONT_SIDEBAR_META);
+        }
 
         // The phone's sizes, pinned so a future tweak has to be deliberate.
         // The ladder is anchored on the conversation text; the floor stays at
@@ -1141,6 +1174,10 @@ mod tests {
                 FONT_MICRO,
             ],
             [22.0, 18.0, 17.0, 15.0, 14.0, 13.0]
+        );
+        assert_eq!(
+            [FONT_SIDEBAR_TITLE, FONT_SIDEBAR_ROW, FONT_SIDEBAR_META],
+            [20.0, 17.0, 15.0]
         );
         assert_eq!(UI_REM, FONT_BODY, "the rem base is the body step");
     }
@@ -1158,18 +1195,13 @@ mod tests {
 
     #[test]
     fn a_two_line_sidebar_row_never_clips_its_second_line() {
-        // A row stacking the heading over the caption must be at least as tall
-        // as its two line boxes at every step the reader can pick, or the
+        // A row stacking a project title over its metadata must be at least as
+        // tall as its two line boxes at every step the reader can pick, or the
         // larger steps clip the metadata line the row exists to show.
         let lines_at = |rem: Pixels| {
-            f32::from(line_height_for(FONT_HEADING).to_pixels(rem))
-                + f32::from(line_height_for(FONT_CAPTION).to_pixels(rem))
+            f32::from(line_height_for(FONT_SIDEBAR_TITLE).to_pixels(rem))
+                + f32::from(line_height_for(FONT_SIDEBAR_META).to_pixels(rem))
         };
-        // The default step keeps the touch-target density it had before.
-        assert_eq!(
-            sidebar_row_height_for(rem_base_for(100)),
-            px(SIDEBAR_ROW_HEIGHT)
-        );
         for percent in FONT_SCALE_STEPS {
             let rem = rem_base_for(percent);
             let row = f32::from(sidebar_row_height_for(rem));
@@ -1179,11 +1211,24 @@ mod tests {
                 lines_at(rem)
             );
         }
-        // Only the larger step adds height; the row is not simply padded.
+        // At the default step the two lines now exceed the touch-target floor,
+        // so the row takes the text height: the floor is a minimum, not a cap
+        // that would clip the second line.
+        assert!(lines_at(rem_base_for(100)) > SIDEBAR_ROW_HEIGHT);
+        assert_eq!(
+            sidebar_row_height_for(rem_base_for(100)),
+            px(lines_at(rem_base_for(100)))
+        );
+        // At the compact step the text still fits inside the floor, so the row
+        // stays at the touch target rather than shrinking with the type.
+        assert!(lines_at(rem_base_for(90)) <= SIDEBAR_ROW_HEIGHT);
         assert_eq!(
             sidebar_row_height_for(rem_base_for(90)),
             px(SIDEBAR_ROW_HEIGHT)
         );
-        assert!(sidebar_row_height_for(rem_base_for(115)) > px(SIDEBAR_ROW_HEIGHT));
+        // A larger step keeps growing the row.
+        assert!(
+            sidebar_row_height_for(rem_base_for(115)) > sidebar_row_height_for(rem_base_for(100))
+        );
     }
 }
