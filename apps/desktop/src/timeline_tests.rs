@@ -1974,19 +1974,6 @@ fn an_older_page_moves_the_views_leading_end(cx: &mut TestAppContext) {
     );
 }
 
-/// Draws frames the way the platform does when nothing has asked for a full
-/// refresh, which is the state a retained element tree is reused in.
-///
-/// `Window::refresh` deliberately ignores every cached subtree, so a frame that
-/// wants to see the reuse has to be drawn without it.
-fn draw_plain_timeline_frames(cx: &mut VisualTestContext, count: usize) {
-    for _ in 0..count {
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-    }
-}
-
 /// Whether a hover change and a click reach an element inside a cached view.
 ///
 /// A retained process unit is mounted through `Entity::cached`, and the fork

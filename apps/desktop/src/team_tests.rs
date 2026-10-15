@@ -2417,7 +2417,7 @@ fn an_archive_from_another_client_takes_the_row_off_the_sidebar(cx: &mut TestApp
 #[gpui::test]
 fn restoring_an_archived_session_puts_its_row_back_on_the_sidebar(cx: &mut TestAppContext) {
     let (workbench, cx, _) = fixture(cx, 2);
-    workbench.update(cx, |workbench, cx| {
+    workbench.update(cx, |workbench, _cx| {
         let archived = BTreeSet::from([session(1).id.to_string()]);
         workbench.optimistically_remove_sessions(&archived, SidebarSessionRemoval::Archive);
         assert!(workbench.session_hidden_from_sidebar(session(1).id.as_str()));
