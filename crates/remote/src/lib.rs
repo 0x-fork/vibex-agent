@@ -148,6 +148,7 @@ struct RemoteRouterState {
     composer_commands: Option<Arc<dyn RemoteAgentCommandDiscoverySource>>,
     recovery: Option<Arc<dyn RemoteRecoverySource>>,
     lan_pairing: Option<Arc<dyn RemoteLanPairingSource>>,
+    pairing_publications: Option<Arc<dyn RemotePairingRouteSource>>,
     sidebar_organization: Option<Arc<dyn RemoteSidebarOrganizationSource>>,
     team_service: Option<Arc<dyn RemoteTeamService>>,
     workbench: Option<RemoteWorkbenchRuntime>,
@@ -521,6 +522,29 @@ pub trait RemoteLanPairingSource: Send + Sync {
     async fn cancel_lan_pairing_window(&self) -> VibexResult<()>;
 }
 
+/// The ways this runtime publishes itself, as the client reads them.
+///
+/// An offer needs a published route underneath it, and the offer's own error
+/// (`remote_pairing_routes_unavailable`) says only that none exists. This source
+/// is how a client learns *which* routes there are and what is wrong with the
+/// ones that are down, so a page with nothing to pair can explain itself instead
+/// of showing an empty state.
+///
+/// Read-only by design. Switching one of these on moves a Tailscale Serve
+/// config, binds a port, or enrolls a relay — decisions that belong to whoever
+/// is sitting in front of the machine, not to a client that may be reaching it
+/// over the route it is about to change. The Desktop Remote Access page owns
+/// them; this only reports.
+#[async_trait]
+pub trait RemotePairingRouteSource: Send + Sync {
+    /// One entry per publishing method, including the ones that are switched
+    /// off: an omitted method is indistinguishable from one this runtime does
+    /// not have, and those are different answers.
+    async fn pairing_publications(
+        &self,
+    ) -> VibexResult<Vec<vibex_core::RemotePairingPublicationSummary>>;
+}
+
 #[async_trait]
 pub trait RemoteManagementSnapshotSource: Send + Sync {
     async fn management_snapshot(
@@ -765,6 +789,7 @@ impl RemoteRouterState {
             composer_commands: None,
             recovery: None,
             lan_pairing: None,
+            pairing_publications: None,
             management_snapshot: None,
             sidebar_organization: None,
             team_service: None,
@@ -792,6 +817,7 @@ impl RemoteRouterState {
             composer_commands: None,
             recovery: None,
             lan_pairing: None,
+            pairing_publications: None,
             management_snapshot: None,
             sidebar_organization: None,
             team_service: None,
@@ -824,6 +850,7 @@ impl RemoteRouterState {
             composer_commands: None,
             recovery: None,
             lan_pairing: None,
+            pairing_publications: None,
             management_snapshot: None,
             sidebar_organization: None,
             team_service: None,
@@ -858,6 +885,7 @@ impl RemoteRouterState {
             composer_commands: None,
             recovery: None,
             lan_pairing: None,
+            pairing_publications: None,
             management_snapshot: None,
             sidebar_organization: None,
             team_service: None,
@@ -1050,6 +1078,24 @@ impl RemoteDispatcher {
 
     pub fn with_lan_pairing_source(mut self, source: Arc<dyn RemoteLanPairingSource>) -> Self {
         self.state.lan_pairing = Some(source);
+        self
+    }
+
+    /// Whether this runtime can say which ways it publishes itself.
+    ///
+    /// Deliberately independent of `has_lan_pairing_source`: the read is how a
+    /// client learns there is nothing published, so a runtime that can pair
+    /// nothing is exactly the one that has to answer it.
+    pub fn has_pairing_route_source(&self) -> bool {
+        self.state.pairing_publications.is_some()
+    }
+
+    pub fn pairing_route_source(&self) -> Option<&Arc<dyn RemotePairingRouteSource>> {
+        self.state.pairing_publications.as_ref()
+    }
+
+    pub fn with_pairing_route_source(mut self, source: Arc<dyn RemotePairingRouteSource>) -> Self {
+        self.state.pairing_publications = Some(source);
         self
     }
 
@@ -10071,6 +10117,7 @@ mod tests {
                 composer_commands: None,
                 recovery: None,
                 lan_pairing: None,
+                pairing_publications: None,
                 sidebar_organization: None,
                 team_service: None,
                 workbench: None,

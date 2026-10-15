@@ -1536,6 +1536,19 @@ impl DeviceBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn pairing_publications(
+        &self,
+    ) -> BackendFuture<'_, Vec<vibex_core::RemotePairingPublicationSummary>> {
+        disconnected_future!()
+    }
+
+    fn pairing_offer_status(
+        &self,
+        _request: vibex_core::RemotePairingOfferStatusRequest,
+    ) -> BackendFuture<'_, vibex_core::RemotePairingOfferSummary> {
+        disconnected_future!()
+    }
+
     fn revoke_device(
         &self,
         _request: MutationRequest<RemoteRevokeDeviceRequest>,

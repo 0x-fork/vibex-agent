@@ -66,9 +66,9 @@ use super::zero_config_pairing::{
 };
 use super::{
     RemoteDispatcher, RemoteIdentity, RemoteIdentityStore, RemoteLanPairingSource,
-    RemoteRecoverySource, RemoteRequestEnvelope, RemoteResponseEnvelope, RemoteServiceConfig,
-    RemoteTrustService, build_router_with_dispatcher, file_service_for_workspace,
-    open_migrated_database, remote_timeline_event,
+    RemotePairingRouteSource, RemoteRecoverySource, RemoteRequestEnvelope, RemoteResponseEnvelope,
+    RemoteServiceConfig, RemoteTrustService, build_router_with_dispatcher,
+    file_service_for_workspace, open_migrated_database, remote_timeline_event,
 };
 
 const DEFAULT_WS_TICKET_TTL_MS: u32 = 30_000;
@@ -4633,6 +4633,14 @@ async fn process_device_management_rpc(
             request.auth.clone(),
             RemoteActionClass::ReadDeviceManagement,
         ),
+        RemoteDeviceRequest::PairingPublications(request) => (
+            request.auth.clone(),
+            RemoteActionClass::ReadDeviceManagement,
+        ),
+        RemoteDeviceRequest::PairingOfferStatus(request) => (
+            request.auth.clone(),
+            RemoteActionClass::ReadDeviceManagement,
+        ),
         RemoteDeviceRequest::RevokeDevice(request) => (
             request.auth.clone(),
             RemoteActionClass::MutateDeviceManagement,
@@ -4742,6 +4750,26 @@ async fn process_device_management_rpc(
                 })
                 .collect();
             serde_json::to_value(RemoteDeviceListResponse { devices })
+        }
+        RemoteDeviceRequest::PairingPublications(request) => {
+            let _ = request;
+            let publications = pairing_route_source(state)?.pairing_publications().await?;
+            serde_json::to_value(vibex_core::RemoteDevicePairingPublicationsResponse {
+                publications,
+            })
+        }
+        RemoteDeviceRequest::PairingOfferStatus(request) => {
+            let offer_id = request.request.offer_id;
+            let summary = vibex_db::RemotePairingOfferRepository::get(&connection, &offer_id)?
+                .map(|record| record.summary)
+                .ok_or_else(|| {
+                    VibexError::new(
+                        vibex_core::ErrorCategory::Remote,
+                        "remote_pairing_offer_unknown",
+                        "pairing offer is unknown",
+                    )
+                })?;
+            serde_json::to_value(summary)
         }
         RemoteDeviceRequest::ExportDiagnostics(request) => {
             let outcome = recovery_source(state)?
@@ -4903,6 +4931,25 @@ fn lan_pairing_source(state: &GatewayState) -> VibexResult<Arc<dyn RemoteLanPair
             VibexError::capability(
                 "remote_lan_pairing_unavailable",
                 "this runtime cannot advertise itself for local-network pairing",
+            )
+        })
+}
+
+/// The runtime's published pairing routes, as a client reads them.
+///
+/// A runtime that never installs this source cannot say what it publishes, which
+/// is what a client that predates the question already assumes: the read is
+/// refused, and the page falls back to the offer's own error instead of guessing
+/// at a route list.
+fn pairing_route_source(state: &GatewayState) -> VibexResult<Arc<dyn RemotePairingRouteSource>> {
+    state
+        .dispatcher
+        .pairing_route_source()
+        .cloned()
+        .ok_or_else(|| {
+            VibexError::capability(
+                "remote_pairing_publications_unavailable",
+                "this runtime cannot report how it publishes itself for pairing",
             )
         })
 }
@@ -5813,6 +5860,33 @@ fn gateway_capabilities() -> Vec<String> {
     .collect()
 }
 
+/// The pairing features one runtime advertises.
+///
+/// Split from [`gateway_features`] so the rule can be tested without standing up
+/// a gateway, because the rule is the interesting part: `device_pairing` is about
+/// an offer being creatable, and `device_pairing_publications` is about the read
+/// that explains when one is not — so the second must **not** be gated on the
+/// first. A client that treated the read as a pairing verb would be wrong, and a
+/// runtime that withheld it whenever it had nothing to pair with would be silent
+/// exactly when it needs to speak.
+fn pairing_features(
+    has_routes: bool,
+    has_lan_source: bool,
+    has_route_source: bool,
+) -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if has_routes {
+        features.push("device_pairing");
+    }
+    if has_lan_source {
+        features.push("device_lan_pairing");
+    }
+    if has_route_source {
+        features.push("device_pairing_publications");
+    }
+    features
+}
+
 fn gateway_features(state: &GatewayState) -> Vec<String> {
     let mut features = [
         "agent",
@@ -5848,17 +5922,19 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
     {
         features.push("provider_management".to_string());
     }
-    if state
-        .pairing_routes
-        .lock()
-        .map(|routes| !routes.is_empty())
-        .unwrap_or(false)
-    {
-        features.push("device_pairing".to_string());
-    }
-    if state.dispatcher.has_lan_pairing_source() {
-        features.push("device_lan_pairing".to_string());
-    }
+    features.extend(
+        pairing_features(
+            state
+                .pairing_routes
+                .lock()
+                .map(|routes| !routes.is_empty())
+                .unwrap_or(false),
+            state.dispatcher.has_lan_pairing_source(),
+            state.dispatcher.has_pairing_route_source(),
+        )
+        .into_iter()
+        .map(str::to_string),
+    );
     if state.dispatcher.has_scheduled_task_source() {
         features.push("scheduled_tasks".to_string());
     }
@@ -5998,6 +6074,33 @@ mod tests {
         assert_eq!(second.sequence, 2);
         assert_eq!(first.payload.unwrap()["sequence"], 19);
         assert_eq!(second.payload.unwrap()["sequence"], 3);
+    }
+
+    #[test]
+    fn the_publication_read_is_advertised_even_with_nothing_to_pair_with() {
+        // A runtime with a source but no published route: it can pair nothing,
+        // and it is exactly the runtime that has to answer "why not".
+        assert_eq!(
+            pairing_features(false, true, true),
+            vec!["device_lan_pairing", "device_pairing_publications"]
+        );
+        // A peer that predates the read advertises neither the read nor a route.
+        assert!(pairing_features(false, false, false).is_empty());
+        // A runtime with a route keeps all three: the read is additive, never a
+        // replacement for the verb.
+        assert_eq!(
+            pairing_features(true, true, true),
+            vec![
+                "device_pairing",
+                "device_lan_pairing",
+                "device_pairing_publications"
+            ]
+        );
+        // The read does not drag the pairing verb in behind it.
+        assert_eq!(
+            pairing_features(false, false, true),
+            vec!["device_pairing_publications"]
+        );
     }
 
     #[test]

@@ -868,6 +868,141 @@ pub struct RemotePairingOffer {
     pub one_time_challenge: String,
 }
 
+/// One of the three ways a runtime publishes itself so a device can reach it.
+///
+/// This is the *publication* half of pairing, not a pairing verb: an offer needs
+/// a published route underneath it, and a client that can name the routes can
+/// say why an offer is unavailable instead of showing an empty page. The names
+/// are the desktop Remote Access page's, so an operator reads the same word on
+/// both surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePairingPublicationMethod {
+    TailscaleServe,
+    Direct,
+    SelfHostedRelay,
+    Unknown,
+}
+
+impl_unknown_safe_enum!(
+    RemotePairingPublicationMethod,
+    "tailscale_serve" => RemotePairingPublicationMethod::TailscaleServe,
+    "direct" => RemotePairingPublicationMethod::Direct,
+    "self_hosted_relay" => RemotePairingPublicationMethod::SelfHostedRelay,
+    "unknown" => RemotePairingPublicationMethod::Unknown,
+);
+
+impl RemotePairingPublicationMethod {
+    pub const ALL: [Self; 3] = [Self::TailscaleServe, Self::Direct, Self::SelfHostedRelay];
+}
+
+/// How far one publication got, as the authority last left it.
+///
+/// The vocabulary is the desktop controller's: a reader who learned what
+/// "needs confirmation" means on the Remote Access page reads the same state on
+/// a terminal. `Unknown` is a state this client's vocabulary predates, which is
+/// drawn as "in progress" rather than guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePairingPublicationState {
+    #[default]
+    Disabled,
+    Checking,
+    ConfirmationNeeded,
+    Enabling,
+    Online,
+    Degraded,
+    RepairRequired,
+    Conflict,
+    Stopping,
+    Error,
+    Unknown,
+}
+
+impl_unknown_safe_enum!(
+    RemotePairingPublicationState,
+    "disabled" => RemotePairingPublicationState::Disabled,
+    "checking" => RemotePairingPublicationState::Checking,
+    "confirmation_needed" => RemotePairingPublicationState::ConfirmationNeeded,
+    "enabling" => RemotePairingPublicationState::Enabling,
+    "online" => RemotePairingPublicationState::Online,
+    "degraded" => RemotePairingPublicationState::Degraded,
+    "repair_required" => RemotePairingPublicationState::RepairRequired,
+    "conflict" => RemotePairingPublicationState::Conflict,
+    "stopping" => RemotePairingPublicationState::Stopping,
+    "error" => RemotePairingPublicationState::Error,
+    "unknown" => RemotePairingPublicationState::Unknown,
+);
+
+impl RemotePairingPublicationState {
+    /// Whether a device could reach this runtime over the publication as it
+    /// stands. The question a pairing row asks, so it is asked in one place.
+    pub const fn is_reachable(self) -> bool {
+        matches!(self, Self::Online | Self::Degraded)
+    }
+}
+
+/// What an operator has to do about a publication that is not simply online.
+///
+/// The client cannot perform any of these: enabling a route moves a Tailscale
+/// Serve config, a certificate, or a relay enrollment, and confirming a port is
+/// a decision about a machine the reader may not be sitting in front of. The
+/// value travels so a terminal can say *what* is wrong in the desktop page's own
+/// words instead of a generic failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePairingPublicationRecovery {
+    #[default]
+    None,
+    Retry,
+    ConfirmPort,
+    RepairRoute,
+    Configure,
+    ManualCommand,
+    RePair,
+    Unknown,
+}
+
+impl_unknown_safe_enum!(
+    RemotePairingPublicationRecovery,
+    "none" => RemotePairingPublicationRecovery::None,
+    "retry" => RemotePairingPublicationRecovery::Retry,
+    "confirm_port" => RemotePairingPublicationRecovery::ConfirmPort,
+    "repair_route" => RemotePairingPublicationRecovery::RepairRoute,
+    "configure" => RemotePairingPublicationRecovery::Configure,
+    "manual_command" => RemotePairingPublicationRecovery::ManualCommand,
+    "re_pair" => RemotePairingPublicationRecovery::RePair,
+    "unknown" => RemotePairingPublicationRecovery::Unknown,
+);
+
+/// One publication, as a client reads it.
+///
+/// `origin` is the public address a device would dial. It is the same value the
+/// runtime already puts in an offer's candidates, and it never carries a secret:
+/// the port is published so a reader can tell two Direct routes apart, and the
+/// pairing code itself lives in the offer, not here.
+///
+/// Nothing here is strict about unknown fields, unlike the LAN discovery
+/// payloads: this is a status read whose only job is to make an absence
+/// explainable, so a runtime that grows a field must not turn an older client's
+/// page into a decode failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePairingPublicationSummary {
+    pub method: RemotePairingPublicationMethod,
+    /// Whether an operator has switched this route on, which is a different
+    /// question from whether it is up: "off because nobody enabled it" is the
+    /// reader's own decision to make, and "on but not online" is not.
+    pub desired_enabled: bool,
+    pub state: RemotePairingPublicationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default)]
+    pub recovery_action: RemotePairingPublicationRecovery,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteLanPairingRequestState {
@@ -1224,6 +1359,8 @@ pub enum RemoteDeviceOperationKind {
     DecideLanPairing,
     CancelLanPairing,
     ListDevices,
+    PairingPublications,
+    PairingOfferStatus,
     RevokeDevice,
     RenameDevice,
     RenameRuntime,
@@ -1416,6 +1553,80 @@ impl fmt::Debug for RemoteDeviceListResponse {
     }
 }
 
+/// Reads the ways this runtime publishes itself for pairing.
+///
+/// This is deliberately *not* behind `device_pairing`: the read is what tells a
+/// client there are no published routes, which is exactly the case where an
+/// offer cannot be created and the page has to explain why. An empty answer is
+/// the fact, not an error.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDevicePairingPublicationsRequest {
+    pub auth: RemoteAuthProof,
+}
+
+impl fmt::Debug for RemoteDevicePairingPublicationsRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteDevicePairingPublicationsRequest")
+            .field("auth", &self.auth)
+            .finish()
+    }
+}
+
+/// Reads one pairing offer the runtime minted.
+///
+/// The code and the link are shown once and never stored, so a client that drew
+/// them cannot re-read them: what it re-reads is whether the offer is still
+/// live, canceled, or claimed. That is the difference between a panel that says
+/// "waiting" until the clock runs out and one that says the device arrived.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePairingOfferStatusRequest {
+    pub offer_id: RequestId,
+}
+
+impl fmt::Debug for RemotePairingOfferStatusRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemotePairingOfferStatusRequest")
+            .field("offer_id", &self.offer_id)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDevicePairingOfferStatusRequest {
+    pub auth: RemoteAuthProof,
+    pub request: RemotePairingOfferStatusRequest,
+}
+
+impl fmt::Debug for RemoteDevicePairingOfferStatusRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteDevicePairingOfferStatusRequest")
+            .field("auth", &self.auth)
+            .field("request", &self.request)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDevicePairingPublicationsResponse {
+    pub publications: Vec<RemotePairingPublicationSummary>,
+}
+
+impl fmt::Debug for RemoteDevicePairingPublicationsResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteDevicePairingPublicationsResponse")
+            .field("publication_count", &self.publications.len())
+            .finish()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteDeviceRevokeRequest {
@@ -1521,6 +1732,10 @@ pub enum RemoteDeviceRequest {
     DecideLanPairing(RemoteDeviceLanPairingDecisionRequest),
     CancelLanPairing(RemoteDeviceCancelLanPairingRequest),
     ListDevices(RemoteDeviceListRequest),
+    /// Reads the published pairing routes without creating anything.
+    PairingPublications(RemoteDevicePairingPublicationsRequest),
+    /// Reads whether an offer this client minted is still live.
+    PairingOfferStatus(RemoteDevicePairingOfferStatusRequest),
     RevokeDevice(RemoteDeviceRevokeRequest),
     RenameDevice(RemoteDeviceRenameRequest),
     RenameRuntime(RemoteDeviceRenameRuntimeRequest),
@@ -1613,6 +1828,8 @@ impl RemoteDeviceRequest {
             Self::DecideLanPairing(_) => RemoteDeviceOperationKind::DecideLanPairing,
             Self::CancelLanPairing(_) => RemoteDeviceOperationKind::CancelLanPairing,
             Self::ListDevices(_) => RemoteDeviceOperationKind::ListDevices,
+            Self::PairingPublications(_) => RemoteDeviceOperationKind::PairingPublications,
+            Self::PairingOfferStatus(_) => RemoteDeviceOperationKind::PairingOfferStatus,
             Self::RevokeDevice(_) => RemoteDeviceOperationKind::RevokeDevice,
             Self::RenameDevice(_) => RemoteDeviceOperationKind::RenameDevice,
             Self::RenameRuntime(_) => RemoteDeviceOperationKind::RenameRuntime,
@@ -2173,6 +2390,79 @@ mod tests {
         let decoded: RemoteDeviceLanPairingResponse =
             serde_json::from_value(empty).expect("decode");
         assert!(decoded.window.is_none());
+    }
+
+    #[test]
+    fn pairing_publications_round_trip_and_unknown_states_stay_readable() {
+        let request =
+            RemoteDeviceRequest::PairingPublications(RemoteDevicePairingPublicationsRequest {
+                auth: RemoteAuthProof {
+                    device_id: DeviceId::parse("device_one").unwrap(),
+                    auth_token: "device-auth-token-sentinel".to_string(),
+                },
+            });
+        assert_eq!(
+            request.operation_kind(),
+            RemoteDeviceOperationKind::PairingPublications
+        );
+        let decoded: RemoteDeviceRequest =
+            serde_json::from_value(serde_json::to_value(&request).expect("encode"))
+                .expect("decode");
+        assert_eq!(decoded, request);
+        // The proof is a secret: the debug line says it is there, not what it is.
+        assert!(!format!("{request:?}").contains("device-auth-token-sentinel"));
+
+        let response = RemoteDevicePairingPublicationsResponse {
+            publications: vec![
+                RemotePairingPublicationSummary {
+                    method: RemotePairingPublicationMethod::TailscaleServe,
+                    desired_enabled: true,
+                    state: RemotePairingPublicationState::Online,
+                    origin: Some("https://runtime.example.ts.net".to_string()),
+                    recovery_action: RemotePairingPublicationRecovery::None,
+                    error_code: None,
+                },
+                RemotePairingPublicationSummary {
+                    method: RemotePairingPublicationMethod::Direct,
+                    desired_enabled: true,
+                    state: RemotePairingPublicationState::ConfirmationNeeded,
+                    origin: None,
+                    recovery_action: RemotePairingPublicationRecovery::ConfirmPort,
+                    error_code: Some("remote_direct_port_confirmation_required".to_string()),
+                },
+            ],
+        };
+        let decoded: RemoteDevicePairingPublicationsResponse =
+            serde_json::from_value(serde_json::to_value(&response).expect("encode"))
+                .expect("decode");
+        assert_eq!(decoded, response);
+
+        // A vocabulary a client predates is a state it can still draw, and a
+        // field a runtime grows must not break an older client's page: this is
+        // a status read, not a validated input.
+        let future = serde_json::json!({
+            "method": "quantum_tunnel",
+            "desiredEnabled": true,
+            "state": "pondering",
+            "recoveryAction": "consult_oracle",
+            "somethingNew": 7,
+        });
+        let decoded: RemotePairingPublicationSummary =
+            serde_json::from_value(future).expect("decode");
+        assert_eq!(decoded.method, RemotePairingPublicationMethod::Unknown);
+        assert_eq!(decoded.state, RemotePairingPublicationState::Unknown);
+        assert_eq!(
+            decoded.recovery_action,
+            RemotePairingPublicationRecovery::Unknown
+        );
+        assert!(decoded.origin.is_none());
+
+        // "Up" is one question with one answer, asked in one place.
+        assert!(RemotePairingPublicationState::Online.is_reachable());
+        assert!(RemotePairingPublicationState::Degraded.is_reachable());
+        assert!(!RemotePairingPublicationState::Disabled.is_reachable());
+        assert!(!RemotePairingPublicationState::Unknown.is_reachable());
+        assert_eq!(RemotePairingPublicationMethod::ALL.len(), 3);
     }
 
     #[test]

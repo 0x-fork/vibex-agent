@@ -1843,6 +1843,87 @@ impl RemoteConnectivityController {
         self.inner.relay.clone()
     }
 
+    /// The publishing methods behind pairing, on the wire vocabulary.
+    ///
+    /// One projection, two callers: the gateway source that serves a remote
+    /// client and the in-process backend that serves a client in this process.
+    /// Keeping it here is what stops the two from disagreeing about what "up"
+    /// means for a route.
+    pub async fn pairing_publications(&self) -> Vec<vibex_core::RemotePairingPublicationSummary> {
+        self.snapshot()
+            .await
+            .methods
+            .into_iter()
+            .map(|method| vibex_core::RemotePairingPublicationSummary {
+                method: match method.method {
+                    RemoteConnectivityMethod::TailscaleServe => {
+                        vibex_core::RemotePairingPublicationMethod::TailscaleServe
+                    }
+                    RemoteConnectivityMethod::Direct => {
+                        vibex_core::RemotePairingPublicationMethod::Direct
+                    }
+                    RemoteConnectivityMethod::SelfHostedRelay => {
+                        vibex_core::RemotePairingPublicationMethod::SelfHostedRelay
+                    }
+                },
+                desired_enabled: method.desired_enabled,
+                state: match method.state {
+                    RemoteMethodState::Disabled => {
+                        vibex_core::RemotePairingPublicationState::Disabled
+                    }
+                    RemoteMethodState::Checking => {
+                        vibex_core::RemotePairingPublicationState::Checking
+                    }
+                    RemoteMethodState::ConfirmationNeeded => {
+                        vibex_core::RemotePairingPublicationState::ConfirmationNeeded
+                    }
+                    RemoteMethodState::Enabling => {
+                        vibex_core::RemotePairingPublicationState::Enabling
+                    }
+                    RemoteMethodState::Online => vibex_core::RemotePairingPublicationState::Online,
+                    RemoteMethodState::Degraded => {
+                        vibex_core::RemotePairingPublicationState::Degraded
+                    }
+                    RemoteMethodState::RepairRequired => {
+                        vibex_core::RemotePairingPublicationState::RepairRequired
+                    }
+                    RemoteMethodState::Conflict => {
+                        vibex_core::RemotePairingPublicationState::Conflict
+                    }
+                    RemoteMethodState::Stopping => {
+                        vibex_core::RemotePairingPublicationState::Stopping
+                    }
+                    RemoteMethodState::Error => vibex_core::RemotePairingPublicationState::Error,
+                },
+                origin: method.origin,
+                recovery_action: match method.recovery_action {
+                    RemoteRecoveryAction::None => {
+                        vibex_core::RemotePairingPublicationRecovery::None
+                    }
+                    RemoteRecoveryAction::Retry => {
+                        vibex_core::RemotePairingPublicationRecovery::Retry
+                    }
+                    RemoteRecoveryAction::ConfirmPort => {
+                        vibex_core::RemotePairingPublicationRecovery::ConfirmPort
+                    }
+                    RemoteRecoveryAction::RepairRoute => {
+                        vibex_core::RemotePairingPublicationRecovery::RepairRoute
+                    }
+                    RemoteRecoveryAction::Configure => {
+                        vibex_core::RemotePairingPublicationRecovery::Configure
+                    }
+                    RemoteRecoveryAction::ManualCommand => {
+                        vibex_core::RemotePairingPublicationRecovery::ManualCommand
+                    }
+                    RemoteRecoveryAction::RePair => {
+                        vibex_core::RemotePairingPublicationRecovery::RePair
+                    }
+                },
+                error_code: method.error_code,
+            })
+            .collect()
+    }
+
     pub async fn snapshot(&self) -> RemoteConnectivitySnapshot {
         let state = self.inner.state.lock().await.clone();
         let gateway_status = self.inner.gateway.status();

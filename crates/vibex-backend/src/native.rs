@@ -4338,6 +4338,36 @@ impl DeviceBackend for NativeBackend {
         })
     }
 
+    fn pairing_publications(
+        &self,
+    ) -> BackendFuture<'_, Vec<vibex_core::RemotePairingPublicationSummary>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            // Read straight from the controller rather than through
+            // `DevicePairing`: the whole point of this read is to answer when
+            // there is no route to mint an offer over.
+            let publications = runtime.remote_connectivity().pairing_publications().await;
+            BackendResult::Ok(publications)
+        })
+    }
+
+    fn pairing_offer_status(
+        &self,
+        request: vibex_core::RemotePairingOfferStatusRequest,
+    ) -> BackendFuture<'_, vibex_core::RemotePairingOfferSummary> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .remote()
+                .gateway()
+                .pairing_offer_status(&request.offer_id)
+                .map_err(Into::into)
+        })
+    }
+
     fn revoke_device(
         &self,
         request: MutationRequest<RemoteRevokeDeviceRequest>,

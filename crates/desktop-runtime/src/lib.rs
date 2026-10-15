@@ -1537,6 +1537,50 @@ impl vibex_remote::RemoteLanPairingSource for LanPairingSource {
     }
 }
 
+/// The publishing methods behind pairing, served read-only.
+///
+/// The controller already owns this state for the Remote Access page; this
+/// source is the same snapshot projected onto the wire vocabulary so a client
+/// that cannot reach that page can still say which route is missing or broken.
+/// It never performs one of the recovery actions it names: those move a
+/// Tailscale Serve config, bind a port, or enroll a relay, and they stay on the
+/// machine whose operator can see what they change.
+pub struct PairingRouteSource {
+    connectivity: Arc<std::sync::OnceLock<RemoteConnectivityController>>,
+}
+
+impl PairingRouteSource {
+    pub fn new() -> (Self, Arc<std::sync::OnceLock<RemoteConnectivityController>>) {
+        let cell = Arc::new(std::sync::OnceLock::new());
+        (
+            Self {
+                connectivity: cell.clone(),
+            },
+            cell,
+        )
+    }
+}
+
+/// Maps one publishing method onto the wire vocabulary.
+///
+/// The three names are the same three the Remote Access page uses, so an
+/// operator reads one word for one thing on both surfaces.
+#[async_trait]
+impl vibex_remote::RemotePairingRouteSource for PairingRouteSource {
+    async fn pairing_publications(
+        &self,
+    ) -> VibexResult<Vec<vibex_core::RemotePairingPublicationSummary>> {
+        let Some(connectivity) = self.connectivity.get() else {
+            // No controller is a runtime that never got as far as publishing
+            // anything. That is not a failure of the read: an empty answer is
+            // the fact the client needs, and it is the one that explains why
+            // nothing can be paired.
+            return Ok(Vec::new());
+        };
+        Ok(connectivity.pairing_publications().await)
+    }
+}
+
 /// Serves managed-Agent installation to the gateway.
 pub struct AgentInstallSource {
     agent: AgentHandle,
@@ -2523,6 +2567,7 @@ impl DesktopRuntime {
         let management_snapshot_cell;
         let recovery_cell;
         let lan_pairing_cell;
+        let pairing_route_cell;
         let sidebar_organization = SidebarOrganizationBridge::new();
         let timeline_display_settings = TimelineDisplaySettingsBridge::new();
         // The presentation bridge is separate from the sidebar organization
@@ -2592,6 +2637,11 @@ impl DesktopRuntime {
             .with_lan_pairing_source({
                 let (source, cell) = LanPairingSource::new();
                 lan_pairing_cell = cell;
+                Arc::new(source)
+            })
+            .with_pairing_route_source({
+                let (source, cell) = PairingRouteSource::new();
+                pairing_route_cell = cell;
                 Arc::new(source)
             })
             .with_automation_source(Arc::new(AutomationSource::new(AutomationHandle {
@@ -2852,6 +2902,7 @@ impl DesktopRuntime {
         let _ = management_snapshot_cell.set(runtime.management());
         let _ = recovery_cell.set(runtime.management());
         let _ = lan_pairing_cell.set(runtime.remote_connectivity());
+        let _ = pairing_route_cell.set(runtime.remote_connectivity());
         startup_stage("timeline_compaction_spawn", || {
             runtime.spawn_timeline_compaction()
         })?;

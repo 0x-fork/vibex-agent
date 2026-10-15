@@ -2088,6 +2088,19 @@ mod tests {
             error_future()
         }
 
+        fn pairing_publications(
+            &self,
+        ) -> BackendFuture<'_, Vec<vibex_core::RemotePairingPublicationSummary>> {
+            error_future()
+        }
+
+        fn pairing_offer_status(
+            &self,
+            _request: vibex_core::RemotePairingOfferStatusRequest,
+        ) -> BackendFuture<'_, vibex_core::RemotePairingOfferSummary> {
+            error_future()
+        }
+
         fn revoke_device(
             &self,
             _request: MutationRequest<RemoteRevokeDeviceRequest>,

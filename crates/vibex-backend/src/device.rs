@@ -47,6 +47,27 @@ pub trait DeviceBackend: BackendBound {
 
     fn list_devices(&self) -> BackendFuture<'_, Vec<RemoteDeviceDetail>>;
 
+    /// Whether an offer this client minted is still live, canceled, or claimed.
+    ///
+    /// The code and link are shown once and never stored, so this answers about
+    /// the offer's state without handing the secret back: a client that drew the
+    /// code is the one asking, and what it needs is to stop drawing it.
+    fn pairing_offer_status(
+        &self,
+        request: vibex_core::RemotePairingOfferStatusRequest,
+    ) -> BackendFuture<'_, vibex_core::RemotePairingOfferSummary>;
+
+    /// The ways this runtime publishes itself for pairing, one entry per
+    /// publishing method.
+    ///
+    /// An offer can only be minted over a published route, so when this is empty
+    /// there is nothing to pair with — and that is the answer, not an error. The
+    /// read stays available in exactly that state, which is why it is gated on
+    /// its own capability rather than on `DevicePairing`.
+    fn pairing_publications(
+        &self,
+    ) -> BackendFuture<'_, Vec<vibex_core::RemotePairingPublicationSummary>>;
+
     fn revoke_device(
         &self,
         request: MutationRequest<RemoteRevokeDeviceRequest>,

@@ -6715,6 +6715,57 @@ impl DeviceBackend for WebRemoteBackend {
         })
     }
 
+    fn pairing_publications(
+        &self,
+    ) -> BackendFuture<'_, Vec<vibex_core::RemotePairingPublicationSummary>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteDeviceRequest::PairingPublications(
+                vibex_core::RemoteDevicePairingPublicationsRequest { auth: this.auth() },
+            );
+            // A status read: no idempotency key, nothing to retry-merge, and the
+            // answer is a fresh read each time because a route can come up or go
+            // down between two of them.
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteDevicePairingPublicationsResponse>(value)?.publications)
+        })
+    }
+
+    fn pairing_offer_status(
+        &self,
+        request: vibex_core::RemotePairingOfferStatusRequest,
+    ) -> BackendFuture<'_, vibex_core::RemotePairingOfferSummary> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteDeviceRequest::PairingOfferStatus(
+                vibex_core::RemoteDevicePairingOfferStatusRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            // A status read, like the publication list: a fresh answer each time,
+            // because the offer can be claimed between two of them.
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            decode(value)
+        })
+    }
+
     fn revoke_device(
         &self,
         request: MutationRequest<RemoteRevokeDeviceRequest>,
@@ -6922,6 +6973,10 @@ fn remote_capabilities_for_grant(
     let has_recovery = features.contains("recovery");
     let has_device_pairing = features.contains("device_pairing");
     let has_lan_pairing = features.contains("device_lan_pairing");
+    // Not tied to `device_pairing`: a runtime with no published route is the one
+    // whose publication list has to be readable, or the client cannot say why
+    // there is nothing to pair with.
+    let has_pairing_publications = features.contains("device_pairing_publications");
     let permits = |action: RemoteActionClass| {
         if assume_permitted {
             return true;
@@ -7318,6 +7373,10 @@ fn remote_capabilities_for_grant(
                 (
                     BackendOperation::DeviceList,
                     permits(RemoteActionClass::ReadDeviceManagement),
+                ),
+                (
+                    BackendOperation::DevicePairingPublications,
+                    has_pairing_publications && permits(RemoteActionClass::ReadDeviceManagement),
                 ),
                 (
                     BackendOperation::DeviceRevoke,
@@ -8234,6 +8293,44 @@ mod tests {
         let snapshot = remote_capabilities(Some(&without_pairing_route));
         assert!(!snapshot.device.supports(BackendOperation::DevicePairing));
         assert!(snapshot.device.supports(BackendOperation::DeviceList));
+    }
+
+    #[test]
+    fn the_pairing_publication_read_survives_a_runtime_with_no_published_route() {
+        // The whole point of the read: a runtime that advertises no pairing
+        // route is the one whose publication list has to be readable, or the
+        // page cannot say why pairing is unavailable.
+        let info = full_control_server_info(&["device_management", "device_pairing_publications"]);
+        let snapshot = remote_capabilities(Some(&info));
+        assert!(
+            snapshot
+                .device
+                .supports(BackendOperation::DevicePairingPublications)
+        );
+        assert!(!snapshot.device.supports(BackendOperation::DevicePairing));
+
+        // A peer that predates the read does not get the page that needs it.
+        let without = full_control_server_info(&["device_management"]);
+        let snapshot = remote_capabilities(Some(&without));
+        assert!(
+            !snapshot
+                .device
+                .supports(BackendOperation::DevicePairingPublications)
+        );
+
+        // The read follows the same action class as `DeviceList`: a grant that
+        // may not read device management hides both, and it is the *read*
+        // class rather than the pairing verb's own feature that decides.
+        let mut no_device_read =
+            full_control_server_info(&["device_management", "device_pairing_publications"]);
+        no_device_read.device_permissions = vec![vibex_core::RemoteActionClass::ReadAgentSession];
+        let snapshot = remote_capabilities(Some(&no_device_read));
+        assert!(
+            !snapshot
+                .device
+                .supports(BackendOperation::DevicePairingPublications)
+        );
+        assert!(!snapshot.device.supports(BackendOperation::DeviceList));
     }
 
     #[test]

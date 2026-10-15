@@ -114,6 +114,13 @@ pub enum BackendOperation {
     /// pairs by offer alone, which needs a camera on the other side.
     DeviceLanPairing,
     DeviceList,
+    /// Reads which publishing methods behind pairing are up, degraded, or off.
+    ///
+    /// Deliberately separate from [`Self::DevicePairing`], and advertised even
+    /// when no route is published: the read is how a client learns there is
+    /// nothing to pair with, so a runtime that can pair nothing is exactly the
+    /// one that has to answer it.
+    DevicePairingPublications,
     DeviceRevoke,
     DeviceAudit,
     /// Authority-local recovery: diagnostic export and database backup.
@@ -332,6 +339,7 @@ impl BackendCapabilitySnapshot {
                 DevicePairing,
                 DeviceLanPairing,
                 DeviceList,
+                DevicePairingPublications,
                 DeviceRevoke,
                 DeviceAudit,
                 RecoveryDiagnosticsExport,
