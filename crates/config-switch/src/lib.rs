@@ -1942,8 +1942,14 @@ impl ProviderConfigService {
         if let Some(args) = request.args {
             server.args = args;
         }
+        if let Some(env) = request.env {
+            server.env = env;
+        }
         if request.url.is_some() {
             server.url = request.url;
+        }
+        if let Some(headers) = request.headers {
+            server.headers = headers;
         }
         if request.description.is_some() {
             server.description = request.description;
@@ -11335,6 +11341,100 @@ mod tests {
                 .any(|entry| entry.contains("Filesystem tools (stdio) -> codex"))
         );
         assert!(!format!("{preview:?}").contains("secret-token"));
+    }
+
+    /// An update carries the environment and headers the caller sent.
+    ///
+    /// An editor writes the whole record back, so a patch that dropped these
+    /// two fields would report a save and leave the server launching without
+    /// them. A caller that omits them still leaves what is stored alone.
+    #[test]
+    fn mcp_server_update_persists_environment_and_headers() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let server = service
+            .create_mcp_server(McpServerCreateRequest {
+                display_name: "Trace tools".to_string(),
+                transport_kind: McpServerTransportKind::Stdio,
+                status: McpServerStatus::Enabled,
+                scope_kind: McpServerScopeKind::User,
+                project_id: None,
+                workspace_id: None,
+                command: Some("mcp-trace".to_string()),
+                args: Vec::new(),
+                env: vec![McpServerEnvEntry {
+                    name: "TRACE_LEVEL".to_string(),
+                    value: "info".to_string(),
+                }],
+                url: None,
+                headers: Vec::new(),
+                description: None,
+                tags: Vec::new(),
+                secret_references: Vec::new(),
+                provider_matrix: Vec::new(),
+            })
+            .unwrap();
+
+        let updated = service
+            .update_mcp_server(McpServerUpdateRequest {
+                mcp_server_id: server.id.clone(),
+                display_name: None,
+                transport_kind: None,
+                status: None,
+                scope_kind: None,
+                project_id: None,
+                workspace_id: None,
+                command: None,
+                args: None,
+                env: Some(vec![McpServerEnvEntry {
+                    name: "TOKEN".to_string(),
+                    value: "abc=def".to_string(),
+                }]),
+                url: None,
+                headers: Some(vec![McpServerHeaderEntry {
+                    name: "X-Trace".to_string(),
+                    value: "on".to_string(),
+                }]),
+                description: None,
+                tags: None,
+            })
+            .unwrap();
+        assert_eq!(
+            updated.env,
+            vec![McpServerEnvEntry {
+                name: "TOKEN".to_string(),
+                value: "abc=def".to_string(),
+            }]
+        );
+        assert_eq!(
+            updated.headers,
+            vec![McpServerHeaderEntry {
+                name: "X-Trace".to_string(),
+                value: "on".to_string(),
+            }]
+        );
+
+        let renamed = service
+            .update_mcp_server(McpServerUpdateRequest {
+                mcp_server_id: server.id.clone(),
+                display_name: Some("Renamed trace tools".to_string()),
+                transport_kind: None,
+                status: None,
+                scope_kind: None,
+                project_id: None,
+                workspace_id: None,
+                command: None,
+                args: None,
+                env: None,
+                url: None,
+                headers: None,
+                description: None,
+                tags: None,
+            })
+            .unwrap();
+        assert_eq!(renamed.display_name, "Renamed trace tools");
+        assert_eq!(renamed.env, updated.env);
+        assert_eq!(renamed.headers, updated.headers);
     }
 
     #[test]
