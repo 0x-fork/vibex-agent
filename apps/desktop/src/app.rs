@@ -17018,6 +17018,32 @@ impl VibexWorkbench {
                 .contains_key(&Some(session_id.to_string()))
     }
 
+    /// Whether a branch is still holding back the descendants counted under it.
+    ///
+    /// This is the question the line beneath a session's title answers, and it
+    /// is not the one the disclosure answers. The counts come from the
+    /// ownership tree, which knows about work before any page asks for it, so a
+    /// branch nobody fetched hides them — and so does one the reader closed,
+    /// one whose page is still in flight or failed, and one whose child rows are
+    /// painted by a group instead of by this branch.
+    ///
+    /// Asking for the page is not the same as drawing it. Selecting a row
+    /// requests its branch so the row's own place in the tree is known, and a
+    /// request that has not answered has revealed nothing: a branch that
+    /// stopped reporting the moment it was asked about would hide exactly the
+    /// session that needs the user.
+    fn delegated_branch_hides_descendants(&self, session_id: &str) -> bool {
+        if self.delegated_branch_is_collapsed(session_id) {
+            return true;
+        }
+        // The branch is open, so its children are on screen exactly when one of
+        // them draws a row here.
+        !self
+            .delegated_children(session_id)
+            .into_iter()
+            .any(|node| self.delegated_child_visible_in_branch(session_id, &node.session_ref.id))
+    }
+
     /// Opens the ancestor path of one delegated session so it is visible.
     ///
     /// It runs for an explicit locate — selecting a session from a result, the
@@ -17435,15 +17461,16 @@ impl VibexWorkbench {
             .selected_session_id
             .as_ref()
             .is_some_and(|selected| selected.as_str() == session_id);
-        let summary = if collapsed && (node.active_descendants > 0 || node.blocked_descendants > 0)
-        {
-            Some(format!(
-                "{} {} · {} {}",
+        // A child row reports its own hidden branch in the same words the row
+        // above it would use, and it keeps reporting while that branch holds
+        // its rows back: a click asks for the page, and an answer that has not
+        // landed has revealed nothing.
+        let summary = if self.delegated_branch_hides_descendants(&session_id) {
+            sidebar_hidden_branch_summary(
+                self.resolved_locale(),
                 node.active_descendants,
-                locale::text("running", "运行中", "執行中"),
                 node.blocked_descendants,
-                locale::text("waiting", "等待中", "等待中")
-            ))
+            )
         } else {
             None
         };
@@ -17629,12 +17656,17 @@ impl VibexWorkbench {
                                     ),
                             )
                             .when_some(summary, |column, summary| {
+                                let color = if summary.asks_for_user {
+                                    cx.theme().warning
+                                } else {
+                                    cx.theme().muted_foreground
+                                };
                                 column.child(
                                     div()
                                         .truncate()
                                         .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(summary),
+                                        .text_color(color)
+                                        .child(summary.line),
                                 )
                             }),
                     )
@@ -46958,19 +46990,19 @@ impl VibexWorkbench {
             self.sidebar_rename_target == Some(SidebarRenameTarget::Session(session.id.clone()));
         let session_id_string = session.id.as_str().to_string();
         let branch_collapsed = self.delegated_branch_is_collapsed(&session_id_string);
+        // The line under the title reports what the branch is holding back, so
+        // it stays while the rows it counts are off screen. Selecting the row
+        // asks for the branch's page; a request that has not answered has
+        // revealed nothing, and the line must not leave with it.
         let branch_summary = self
             .delegated_tree
             .get(&session_id_string)
-            .filter(|node| {
-                branch_collapsed && (node.active_descendants > 0 || node.blocked_descendants > 0)
-            })
-            .map(|node| {
-                format!(
-                    "{} {} · {} {}",
+            .filter(|_| self.delegated_branch_hides_descendants(&session_id_string))
+            .and_then(|node| {
+                sidebar_hidden_branch_summary(
+                    self.resolved_locale(),
                     node.active_descendants,
-                    locale::text("running", "运行中", "執行中"),
                     node.blocked_descendants,
-                    locale::text("waiting", "等待中", "等待中")
                 )
             });
         let row_focus = self
@@ -47978,20 +48010,39 @@ impl VibexWorkbench {
                                     .child(sidebar_agent_logo(sidebar_agent_id.as_str(), true, cx)),
                             )
                             .child(
-                                v_flex().flex_1().min_w_0().child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_sm()
-                                        .when(selected, |this| this.font_semibold())
-                                        .group_hover(&hover_group, |style| {
-                                            style.text_color(cx.theme().sidebar_foreground)
-                                        })
-                                        .child(row_title)
-                            .when_some(branch_summary, |column, summary| column.child(
-                                div().truncate().text_xs().text_color(cx.theme().muted_foreground).child(summary)
-                            )),
-                                ),
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .when(selected, |this| this.font_semibold())
+                                            .group_hover(&hover_group, |style| {
+                                                style.text_color(cx.theme().sidebar_foreground)
+                                            })
+                                            .child(row_title),
+                                    )
+                                    // The branch reports itself on the title
+                                    // column's second row, the way a child row
+                                    // reports its own branch: the line belongs
+                                    // to the branch and must not inherit the
+                                    // title's truncation or its hover color.
+                                    .when_some(branch_summary, |column, summary| {
+                                        let color = if summary.asks_for_user {
+                                            cx.theme().warning
+                                        } else {
+                                            cx.theme().muted_foreground
+                                        };
+                                        column.child(
+                                            div()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(color)
+                                                .child(summary.line),
+                                        )
+                                    }),
                             )
                             .children(disclosure),
                     )
@@ -70719,6 +70770,56 @@ fn sidebar_session_state_label(
     }
 }
 
+/// What a branch is holding back, in the sidebar's own words.
+struct SidebarHiddenBranch {
+    /// The counts, as the one line a session row paints under its title.
+    line: String,
+    /// Whether one of them is a session parked on the user.
+    asks_for_user: bool,
+}
+
+/// The line a session row owes the reader about the branch it is hiding.
+///
+/// The counts come from the ownership tree, so they describe the session's
+/// subtree and not the row they hang under: a bare "0 running · 1 waiting"
+/// beside an idle row reads as that row's own state, so only the counts that
+/// carry information are painted, the sessions being counted are named in the
+/// locales that have room for it, and the one that waits says who it waits on.
+/// A count of zero is not news, and a branch with nothing running and nobody
+/// waiting paints no line at all.
+///
+/// The waiting count leads: it is the one that asks the reader to act.
+fn sidebar_hidden_branch_summary(
+    locale: locale::ResolvedLocale,
+    active_descendants: usize,
+    blocked_descendants: usize,
+) -> Option<SidebarHiddenBranch> {
+    let mut parts = Vec::new();
+    if blocked_descendants > 0 {
+        parts.push(format!(
+            "{blocked_descendants} {}",
+            locale::text_for(locale, "waiting for you", "等待用户", "等待使用者")
+        ));
+    }
+    if active_descendants > 0 {
+        parts.push(format!(
+            "{active_descendants} {}",
+            locale::text_for(locale, "running", "运行中", "執行中")
+        ));
+    }
+    let counts = parts.join(" · ");
+    (!counts.is_empty()).then(|| SidebarHiddenBranch {
+        line: match locale {
+            // English has no room for a leading label and needs none: "waiting
+            // for you" already says whose branch is being counted.
+            locale::ResolvedLocale::En => counts,
+            locale::ResolvedLocale::ZhCn => format!("子会话：{counts}"),
+            locale::ResolvedLocale::ZhTw => format!("子會話：{counts}"),
+        },
+        asks_for_user: blocked_descendants > 0,
+    })
+}
+
 fn sidebar_status_dot(color: Hsla) -> AnyElement {
     div()
         .size(px(8.0))
@@ -90331,6 +90432,98 @@ mod tests {
         assert!(session.contains("project_id: project_scope_id.clone()"));
         assert!(source.contains("fn sidebar_session_project_scopes(&self)"));
         assert!(source.contains("project_scopes.get(left_id) == project_scopes.get(right_id)"));
+    }
+
+    /// The line under a session's title counts the branch, not the row.
+    ///
+    /// It used to paint both counts whatever they were, so an idle session read
+    /// "0 running · 1 waiting" — a second status of the row it hangs under — and
+    /// it named the count that asks the reader for something with a word of its
+    /// own. Only the counts that carry information are painted, the waiting one
+    /// leads and says who it waits on, and a branch with nothing to report
+    /// paints no line at all.
+    #[test]
+    fn hidden_branch_summary_paints_only_the_counts_a_branch_hides() {
+        let zh_cn = locale::ResolvedLocale::ZhCn;
+        let both = sidebar_hidden_branch_summary(zh_cn, 2, 1).expect("counts should paint a line");
+        assert_eq!(both.line, "子会话：1 等待用户 · 2 运行中");
+        assert!(both.asks_for_user);
+
+        let running = sidebar_hidden_branch_summary(zh_cn, 2, 0).expect("running should paint");
+        assert_eq!(running.line, "子会话：2 运行中");
+        assert!(!running.asks_for_user);
+
+        let waiting = sidebar_hidden_branch_summary(zh_cn, 0, 1).expect("waiting should paint");
+        assert_eq!(waiting.line, "子会话：1 等待用户");
+
+        assert!(sidebar_hidden_branch_summary(zh_cn, 0, 0).is_none());
+        assert_eq!(
+            sidebar_hidden_branch_summary(locale::ResolvedLocale::En, 2, 1)
+                .map(|summary| summary.line),
+            Some("1 waiting for you · 2 running".to_string())
+        );
+        assert_eq!(
+            sidebar_hidden_branch_summary(locale::ResolvedLocale::ZhTw, 0, 1)
+                .map(|summary| summary.line),
+            Some("子會話：1 等待使用者".to_string())
+        );
+    }
+
+    /// A row keeps reporting a branch until the branch's own rows are drawn.
+    ///
+    /// Selecting a row asks for its branch, because that page is what tells the
+    /// tree where the session itself sits. The line under the title used to
+    /// follow the request instead of the answer, so it left the moment the row
+    /// was clicked — while the session it counted was still hidden, and with no
+    /// row on screen to carry what it asked for. Both rows ask the same
+    /// question now, and neither writes a count of its own.
+    #[test]
+    fn session_rows_report_a_branch_until_its_rows_are_drawn() {
+        let source = include_str!("app.rs");
+
+        let hidden = source
+            .split_once("    fn delegated_branch_hides_descendants(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Opens the ancestor path"))
+            .map(|(body, _)| body)
+            .expect("the hidden-branch rule should remain inspectable");
+        assert!(hidden.contains("if self.delegated_branch_is_collapsed(session_id)"));
+        assert!(hidden.contains(".delegated_children(session_id)"));
+        assert!(hidden.contains("self.delegated_child_visible_in_branch("));
+
+        let session = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("session renderer should remain inspectable");
+        assert!(
+            session.contains(
+                ".filter(|_| self.delegated_branch_hides_descendants(&session_id_string))"
+            )
+        );
+        assert!(session.contains("sidebar_hidden_branch_summary("));
+        let title = session
+            .find(".child(row_title),")
+            .expect("the session row should paint its title");
+        let line = session
+            .find(".when_some(branch_summary, |column, summary| {")
+            .expect("the session row should paint the branch's line");
+        let disclosure = session
+            .find(".children(disclosure),")
+            .expect("the session row should keep the branch's disclosure");
+        assert!(title < line && line < disclosure);
+
+        let child = source
+            .split_once("    fn render_delegated_session_row(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The ownership tree in the order the sidebar draws it.")
+            })
+            .map(|(body, _)| body)
+            .expect("child session row should remain inspectable");
+        assert!(child.contains("self.delegated_branch_hides_descendants(&session_id)"));
+        assert!(child.contains("sidebar_hidden_branch_summary("));
+        // The child row no longer reads the line off the disclosure's own flag:
+        // that flag is about the page, and the page is not the rows.
+        assert!(!child.contains("if collapsed &&"));
     }
 
     #[test]
