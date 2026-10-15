@@ -3362,6 +3362,19 @@ AgentAuthModelCatalogSnapshot {
   the reference case — its login is a capability-gated terminal method, and
   advertising the reserved `_meta["terminal-auth"]` key is what makes the method
   arrive as `Terminal` kind with a real login command instead of a silent no-op.
+- Method kind is not evidence that a sign-in will do anything, so the offer is
+  gated on the client being able to carry the change. A method is drivable when
+  it is `Terminal` kind (the catalog holds a login command) or when the Agent
+  advertises `supports_logout` and the method is `Agent` kind (the Agent owns a
+  credential store it can rewrite). The second clause is what keeps Codex: its
+  `chat-gpt` method is `Agent` kind with no terminal descriptor, but the adapter
+  opens the browser itself and blocks until the OAuth round trip finishes.
+  `glm-acp-agent` is the counterexample the rule exists for — it advertises an
+  `Agent` method, has no logout capability, and its `authenticate` returns an
+  empty result while the credential is configured out of band, so the surface
+  explains that the credential lives outside Vibex instead of offering an action
+  that cannot change anything. The same gate applies to the composer's
+  authentication menu, which must not run an undrivable method either.
 - Verification shuts down old account-source processes first, increments the
   context revision for a credential change, probes models with that exact
   revision, then commits `Authenticated` and the snapshot. A successful RPC

@@ -15023,6 +15023,12 @@ impl ManagementCenter {
             && catalog
                 .as_ref()
                 .is_some_and(agent_auth_catalog_supports_reauthentication);
+        // An Agent that advertises sign-in methods but none the client can
+        // drive keeps its credentials outside Vibex. Say so plainly instead of
+        // rendering buttons that cannot change anything.
+        let externally_managed_credentials = catalog
+            .as_ref()
+            .is_some_and(agent_auth_catalog_is_externally_managed);
         let reauthenticating = supports_reauthentication && self.agent_auth_reauthentication;
         let logout_loading = selected_agent_id.as_deref().is_some_and(|agent_id| {
             matches!(
@@ -15347,13 +15353,13 @@ impl ManagementCenter {
             );
         }
         if let Some(catalog) = catalog {
+            // `catalog.methods` is destructured below; the drivability rule
+            // needs one more field of the catalog than the method list carries.
+            let catalog_supports_logout = catalog.supports_logout;
             let methods = catalog
                 .methods
                 .into_iter()
-                .filter(|method| {
-                    method.effect != AgentAuthMethodEffect::RequiresProviderProfile
-                        && method.kind != AgentAuthMethodKind::Environment
-                })
+                .filter(agent_auth_method_is_visible)
                 .collect::<Vec<_>>();
             if methods.is_empty() {
                 content = content.child(compact_empty_state(
@@ -15370,6 +15376,34 @@ impl ManagementCenter {
                     cx,
                 ));
             }
+            if externally_managed_credentials {
+                content = content.child(
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .gap_2()
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(cx.theme().border.opacity(0.75))
+                        .bg(cx.theme().muted.opacity(0.20))
+                        .p_3()
+                        .child(
+                            Icon::new(IconName::Info)
+                                .size(px(16.0))
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_sm()
+                                .child(management_locale_text(
+                                    "This Agent manages its credentials outside Vibex, so they cannot be replaced here. Follow the method's own instructions on the external CLI.",
+                                    "此 Agent 的凭证在 Vibex 之外管理，无法在此重新认证。请按下面各方式自身的说明在外部 CLI 中配置。",
+                                    "此 Agent 的憑證在 Vibex 之外管理，無法在此重新驗證。請依下列各方式自身的說明在外部 CLI 中設定。",
+                                )),
+                        ),
+                );
+            }
             for method in methods {
                 let method_authenticated = native_authenticated
                     && authenticated_method_id.as_deref() == Some(method.id.as_str());
@@ -15385,7 +15419,13 @@ impl ManagementCenter {
                         .agent_auth_terminal
                         .as_ref()
                         .is_some_and(|terminal| terminal.id == method.id);
-                let submit_disabled = pending || (native_authenticated && !reauthenticating);
+                // A method the client cannot drive would run a no-op
+                // `authenticate` and still report success, so it is not offered
+                // as an action at all.
+                let method_drivable =
+                    agent_auth_method_is_drivable(catalog_supports_logout, &method);
+                let submit_disabled =
+                    pending || !method_drivable || (native_authenticated && !reauthenticating);
                 let submit_method_id = method.id.clone();
                 let action_button_id =
                     SharedString::from(format!("agent-auth-submit-{}", method.id));
@@ -20889,11 +20929,61 @@ fn agent_auth_input_key(method_id: &str, variable_name: &str) -> String {
     format!("{}:{method_id}{variable_name}", method_id.len())
 }
 
-fn agent_auth_catalog_supports_reauthentication(catalog: &AgentAuthCatalog) -> bool {
-    catalog.methods.iter().any(|method| {
-        method.effect != AgentAuthMethodEffect::RequiresProviderProfile
-            && method.kind != AgentAuthMethodKind::Environment
-    })
+/// Whether "re-authenticate" can actually replace the shared credentials for
+/// this catalog.
+///
+/// A method kind is not evidence that the Agent will do anything. `Agent` kind
+/// only means the Agent handles authentication itself, and several Agents answer
+/// `authenticate` with an empty result and no side effect — `glm-acp-agent`
+/// documents exactly that ("the agent has nothing to do here"), configuring its
+/// credential out of band instead. Offering "re-authenticate" for such a method
+/// runs a no-op and still reports success, which is worse than offering nothing.
+///
+/// A method is drivable when the client itself can carry the sign-in:
+///
+/// - `Terminal`: the catalog carries a login command, so the client opens a
+///   terminal. This also covers Agents whose login is declared as an `Agent`
+///   method with the reserved `_meta.terminal-auth` descriptor, because the
+///   parser upgrades that shape to `Terminal` on the way in.
+/// - `supports_logout`: the Agent advertises a credential store it can rewrite.
+///   Codex is the reference case — its `chat-gpt` method is `Agent` kind with no
+///   terminal descriptor, but the adapter opens the browser itself and blocks
+///   until the OAuth round trip finishes.
+///
+/// `Environment` methods are excluded: they belong to a Provider Profile and are
+/// edited through the profile's credential fields, not through Agent sign-in.
+pub(crate) fn agent_auth_catalog_supports_reauthentication(catalog: &AgentAuthCatalog) -> bool {
+    catalog
+        .methods
+        .iter()
+        .any(|method| agent_auth_method_is_drivable(catalog.supports_logout, method))
+}
+
+/// Whether one advertised method can carry a credential change the client can
+/// drive. See [`agent_auth_catalog_supports_reauthentication`] for the rule.
+pub(crate) fn agent_auth_method_is_drivable(
+    supports_logout: bool,
+    method: &vibex_core::AgentAuthMethod,
+) -> bool {
+    method.kind == AgentAuthMethodKind::Terminal
+        || (supports_logout && method.kind == AgentAuthMethodKind::Agent)
+}
+
+/// Whether an advertised method is one a client may act on at all — the shared
+/// filter for which methods an Agent-account surface lists.
+pub(crate) fn agent_auth_method_is_visible(method: &vibex_core::AgentAuthMethod) -> bool {
+    method.effect != AgentAuthMethodEffect::RequiresProviderProfile
+        && method.kind != AgentAuthMethodKind::Environment
+}
+
+/// Whether this Agent advertises sign-in methods but none the client can act
+/// on, so its credentials live entirely outside Vibex.
+///
+/// This gates the explanation, not re-authentication: such an Agent still
+/// deserves an honest statement rather than a button that cannot do anything.
+fn agent_auth_catalog_is_externally_managed(catalog: &AgentAuthCatalog) -> bool {
+    !agent_auth_catalog_supports_reauthentication(catalog)
+        && catalog.methods.iter().any(agent_auth_method_is_visible)
 }
 
 fn agent_auth_scope_matches(
@@ -28865,7 +28955,11 @@ mod tests {
             "agent_auth_reauthentication",
             "catalog.supports_logout",
             "when(supports_logout",
-            "let submit_disabled = pending || (native_authenticated && !reauthenticating)",
+            "let method_drivable =",
+            "agent_auth_method_is_drivable(catalog_supports_logout, &method)",
+            "pending || !method_drivable || (native_authenticated && !reauthenticating)",
+            "externally_managed_credentials",
+            "cannot be replaced here",
             "Authenticated through this native credential method",
             "Re-authentication is required to switch to this method",
             "Native credentials are signed in; re-authenticate to update them",
@@ -28923,8 +29017,13 @@ mod tests {
         assert_eq!(missing.code, "agent_auth_context_not_found");
     }
 
+    /// Re-authentication is offered only when the client can actually replace
+    /// the credentials. Method kind alone is not evidence: `glm-acp-agent`
+    /// advertises an `Agent` method and answers `authenticate` with an empty
+    /// result, so the old "anything but Environment" rule offered a button that
+    /// ran a no-op and reported success.
     #[test]
-    fn agent_reauthentication_requires_a_default_account_method() {
+    fn agent_reauthentication_requires_a_drivable_method() {
         let method = |kind, effect| vibex_core::AgentAuthMethod {
             id: "sign-in".to_string(),
             name: "Sign in".to_string(),
@@ -28935,7 +29034,7 @@ mod tests {
             credential_link: None,
         };
         let mut catalog = AgentAuthCatalog {
-            agent_id: AgentId::parse("codex").expect("valid Agent id"),
+            agent_id: AgentId::parse("glm-acp-agent").expect("valid Agent id"),
             methods: Vec::new(),
             supports_logout: false,
             status: AgentAuthStatus::Authenticated,
@@ -28956,11 +29055,91 @@ mod tests {
         )];
         assert!(!agent_auth_catalog_supports_reauthentication(&catalog));
 
+        // glm-acp-agent: an `Agent` method with no terminal descriptor and no
+        // logout capability. Nothing the client can drive, so no offer.
+        catalog.methods = vec![method(
+            AgentAuthMethodKind::Agent,
+            AgentAuthMethodEffect::WritesAgentStateHome,
+        )];
+        assert!(
+            !agent_auth_catalog_supports_reauthentication(&catalog),
+            "an undrivable Agent method must not offer re-authentication"
+        );
+        assert!(
+            agent_auth_catalog_is_externally_managed(&catalog),
+            "and it must be explained as externally managed instead"
+        );
+
+        // codex: also an `Agent` method, but the Agent advertises a credential
+        // store it can rewrite, and its adapter drives the browser itself.
+        catalog.supports_logout = true;
+        assert!(
+            agent_auth_catalog_supports_reauthentication(&catalog),
+            "an Agent that owns a rewritable credential store is drivable"
+        );
+        assert!(!agent_auth_catalog_is_externally_managed(&catalog));
+
+        // opencode / auggie / deepseek: a real terminal login command.
+        catalog.supports_logout = false;
         catalog.methods = vec![method(
             AgentAuthMethodKind::Terminal,
             AgentAuthMethodEffect::AgentManagedExternal,
         )];
         assert!(agent_auth_catalog_supports_reauthentication(&catalog));
+        assert!(!agent_auth_catalog_is_externally_managed(&catalog));
+    }
+
+    /// The explanation must not appear for an Agent whose methods are simply
+    /// absent, and it must not survive once a drivable method exists.
+    #[test]
+    fn externally_managed_explanation_is_limited_to_undrivable_methods() {
+        let agent_method = vibex_core::AgentAuthMethod {
+            id: "z-ai-api-key".to_string(),
+            name: "Z.AI API key".to_string(),
+            description: Some("Set Z_AI_API_KEY in the environment".to_string()),
+            kind: AgentAuthMethodKind::Agent,
+            effect: AgentAuthMethodEffect::WritesAgentStateHome,
+            environment: Vec::new(),
+            credential_link: None,
+        };
+        let base = AgentAuthCatalog {
+            agent_id: AgentId::parse("glm-acp-agent").expect("valid Agent id"),
+            methods: Vec::new(),
+            supports_logout: false,
+            status: AgentAuthStatus::Unknown,
+            refreshed_at_ms: 0,
+        };
+
+        assert!(
+            !agent_auth_catalog_is_externally_managed(&base),
+            "no methods at all is not the externally-managed case"
+        );
+
+        let managed = AgentAuthCatalog {
+            methods: vec![agent_method.clone()],
+            ..base.clone()
+        };
+        assert!(agent_auth_catalog_is_externally_managed(&managed));
+
+        let drivable = AgentAuthCatalog {
+            methods: vec![
+                agent_method,
+                vibex_core::AgentAuthMethod {
+                    id: "setup".to_string(),
+                    name: "Interactive setup".to_string(),
+                    description: None,
+                    kind: AgentAuthMethodKind::Terminal,
+                    effect: AgentAuthMethodEffect::AgentManagedExternal,
+                    environment: Vec::new(),
+                    credential_link: None,
+                },
+            ],
+            ..base
+        };
+        assert!(
+            !agent_auth_catalog_is_externally_managed(&drivable),
+            "one drivable method means the Agent is not externally managed"
+        );
     }
 
     #[test]

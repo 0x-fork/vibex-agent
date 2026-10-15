@@ -34593,11 +34593,23 @@ impl VibexWorkbench {
         else {
             return;
         };
+        // A method only the Agent can execute would answer with an empty result
+        // and no side effect, so it must not be run as a sign-in. Terminal
+        // logins are opened by the management panel, which owns the terminal
+        // surface; anything else the client cannot drive is refused rather than
+        // reported as a successful re-authentication.
+        let supports_logout = state
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.supports_logout);
         if method.kind == AgentAuthMethodKind::Terminal
             || method.kind == AgentAuthMethodKind::Environment
             || method.effect == AgentAuthMethodEffect::RequiresProviderProfile
         {
             self.open_agent_auth_management(state.agent_id, cx);
+            return;
+        }
+        if !crate::management::agent_auth_method_is_drivable(supports_logout, &method) {
             return;
         }
         let (Some(backend), Some(context)) = (self.backend.clone(), state.context) else {
@@ -48699,6 +48711,10 @@ impl VibexWorkbench {
             .map(|catalog| runtime_auth_source_label(catalog, &auth_source))
             .unwrap_or_else(|| auth_source.id().to_string());
         let back_agent_id = agent_id.clone();
+        let supports_logout = state
+            .as_ref()
+            .and_then(|state| state.catalog.as_ref())
+            .is_some_and(|catalog| catalog.supports_logout);
         let methods = state
             .as_ref()
             .and_then(|state| state.catalog.as_ref())
@@ -48739,7 +48755,12 @@ impl VibexWorkbench {
             .into_iter()
             .map(|method| {
                 let method_id = method.id.clone();
-                let managed = method.kind == AgentAuthMethodKind::Terminal;
+                let managed = method.kind == AgentAuthMethodKind::Terminal; // An `Agent` method is only actionable when the Agent owns a
+                // credential store it can rewrite; otherwise the row explains
+                // that the credential lives outside Vibex instead of offering a
+                // sign-in that cannot change anything.
+                let drivable =
+                    crate::management::agent_auth_method_is_drivable(supports_logout, &method);
                 Button::new(format!("runtime-auth-method:{}", method.id))
                     .small()
                     .ghost()
@@ -48748,7 +48769,7 @@ impl VibexWorkbench {
                     .flex_none()
                     .px_2()
                     .justify_start()
-                    .disabled(pending)
+                    .disabled(pending || !drivable)
                     .child(
                         h_flex()
                             .size_full()
@@ -48775,7 +48796,9 @@ impl VibexWorkbench {
                                     .flex_none()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if managed {
+                                    .child(if !drivable {
+                                        locale::text("External", "外部配置", "外部設定")
+                                    } else if managed {
                                         locale::text("Manage", "管理", "管理")
                                     } else {
                                         locale::text("Sign in", "登录", "登入")
