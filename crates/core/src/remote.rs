@@ -4637,6 +4637,30 @@ pub struct RemoteSessionGroup {
     pub auto_continue: Option<bool>,
 }
 
+/// Where a managed Worktree stands, as the holder publishes it.
+///
+/// The Desktop's own display state is a model type; this is the wire's copy of
+/// it, so a compact client can say that a Worktree is merging, ready, or stuck
+/// without depending on the model crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteWorktreeLifecycle {
+    Working,
+    Reviewing,
+    Ready,
+    Queued,
+    Merging,
+    NeedsResolution,
+    Aborting,
+    Archiving,
+    Archived,
+    Restoring,
+    Discarding,
+    Discarded,
+    Failed,
+    NeedsAttention,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteSidebarOrganizationSnapshot {
@@ -4677,6 +4701,11 @@ pub struct RemoteSidebarOrganizationSnapshot {
     pub project_appearances: std::collections::BTreeMap<String, RemoteSidebarProjectAppearance>,
     #[serde(default)]
     pub worktree_titles: std::collections::BTreeMap<String, String>,
+    /// Where each managed Worktree stands, by workspace id. Live state rather
+    /// than arrangement: it describes what the holder's git layer is doing, and
+    /// a client draws it instead of asking for a second round trip.
+    #[serde(default)]
+    pub worktree_lifecycle: std::collections::BTreeMap<String, RemoteWorktreeLifecycle>,
     #[serde(default)]
     pub project_new_session_locations:
         std::collections::BTreeMap<String, RemoteSidebarNewSessionLocation>,

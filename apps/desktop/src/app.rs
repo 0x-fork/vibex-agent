@@ -11860,6 +11860,17 @@ impl VibexWorkbench {
             workspace_order: self.ui_state.sidebar.workspace_order.clone(),
             project_appearances: self.ui_state.sidebar.project_appearances.clone(),
             worktree_titles: self.ui_state.sidebar.worktree_titles.clone(),
+            // The git layer's own answer, per Worktree, so a client that cannot
+            // see git still says that a Worktree is merging, ready, or stuck.
+            worktree_lifecycle: self
+                .workspace_contexts
+                .iter()
+                .filter_map(|(workspace_id, context)| {
+                    context
+                        .worktree_lifecycle_state
+                        .map(|state| (workspace_id.clone(), state))
+                })
+                .collect(),
             project_location_preferences: self
                 .ui_state
                 .sidebar

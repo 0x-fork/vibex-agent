@@ -12,6 +12,7 @@ use vibex_core::{
     RemoteSidebarHierarchyMode, RemoteSidebarItemKind, RemoteSidebarItemRef,
     RemoteSidebarNewSessionLocation, RemoteSidebarOrganizationMutation,
     RemoteSidebarOrganizationSnapshot, RemoteSidebarPlacement, RemoteSidebarProjectAppearance,
+    RemoteWorktreeLifecycle,
 };
 
 use crate::{
@@ -38,6 +39,10 @@ pub struct SidebarOrganizationView {
     pub workspace_order: BTreeMap<String, Vec<String>>,
     pub project_appearances: BTreeMap<String, SidebarProjectAppearance>,
     pub worktree_titles: BTreeMap<String, String>,
+    /// Where each managed Worktree stands, by workspace id. The Desktop reads
+    /// this from its workspace contexts; a client that cannot see git draws the
+    /// same states from here.
+    pub worktree_lifecycle: BTreeMap<String, crate::WorktreeLifecycleDisplayState>,
     pub project_location_preferences: BTreeMap<String, NewSessionLocation>,
     pub auto_continue_project_ids: BTreeSet<String>,
     pub auto_continue_session_overrides: BTreeMap<String, bool>,
@@ -158,6 +163,50 @@ pub fn item_from_remote(item: &RemoteSidebarItemRef) -> SidebarOrganizationItem 
     }
 }
 
+impl From<crate::WorktreeLifecycleDisplayState> for RemoteWorktreeLifecycle {
+    fn from(state: crate::WorktreeLifecycleDisplayState) -> Self {
+        use crate::WorktreeLifecycleDisplayState as State;
+        match state {
+            State::Working => Self::Working,
+            State::Reviewing => Self::Reviewing,
+            State::Ready => Self::Ready,
+            State::Queued => Self::Queued,
+            State::Merging => Self::Merging,
+            State::NeedsResolution => Self::NeedsResolution,
+            State::Aborting => Self::Aborting,
+            State::Archiving => Self::Archiving,
+            State::Archived => Self::Archived,
+            State::Restoring => Self::Restoring,
+            State::Discarding => Self::Discarding,
+            State::Discarded => Self::Discarded,
+            State::Failed => Self::Failed,
+            State::NeedsAttention => Self::NeedsAttention,
+        }
+    }
+}
+
+impl From<RemoteWorktreeLifecycle> for crate::WorktreeLifecycleDisplayState {
+    fn from(state: RemoteWorktreeLifecycle) -> Self {
+        use RemoteWorktreeLifecycle as Wire;
+        match state {
+            Wire::Working => Self::Working,
+            Wire::Reviewing => Self::Reviewing,
+            Wire::Ready => Self::Ready,
+            Wire::Queued => Self::Queued,
+            Wire::Merging => Self::Merging,
+            Wire::NeedsResolution => Self::NeedsResolution,
+            Wire::Aborting => Self::Aborting,
+            Wire::Archiving => Self::Archiving,
+            Wire::Archived => Self::Archived,
+            Wire::Restoring => Self::Restoring,
+            Wire::Discarding => Self::Discarding,
+            Wire::Discarded => Self::Discarded,
+            Wire::Failed => Self::Failed,
+            Wire::NeedsAttention => Self::NeedsAttention,
+        }
+    }
+}
+
 impl SidebarOrganizationView {
     pub fn to_remote(&self) -> RemoteSidebarOrganizationSnapshot {
         RemoteSidebarOrganizationSnapshot {
@@ -235,6 +284,11 @@ impl SidebarOrganizationView {
                 })
                 .collect(),
             worktree_titles: self.worktree_titles.clone(),
+            worktree_lifecycle: self
+                .worktree_lifecycle
+                .iter()
+                .map(|(id, state)| (id.clone(), (*state).into()))
+                .collect(),
             project_new_session_locations: self
                 .project_location_preferences
                 .iter()
@@ -357,6 +411,11 @@ impl SidebarOrganizationView {
                 })
                 .collect(),
             worktree_titles: snapshot.worktree_titles.clone(),
+            worktree_lifecycle: snapshot
+                .worktree_lifecycle
+                .iter()
+                .map(|(id, state)| (id.clone(), (*state).into()))
+                .collect(),
             project_location_preferences: snapshot
                 .project_new_session_locations
                 .iter()
@@ -426,6 +485,10 @@ impl SidebarOrganizationView {
             workspace_order: sidebar.workspace_order.clone(),
             project_appearances: sidebar.project_appearances.clone(),
             worktree_titles: sidebar.worktree_titles.clone(),
+            // Where a Worktree stands is live state, not an arrangement, so a
+            // shell that reads a parked arrangement has none of it until its
+            // own git layer answers.
+            worktree_lifecycle: BTreeMap::new(),
             project_location_preferences: sidebar.project_location_preferences.clone(),
             auto_continue_project_ids: state.session.auto_continue_project_ids.clone(),
             auto_continue_session_overrides: state.session.auto_continue_session_overrides.clone(),

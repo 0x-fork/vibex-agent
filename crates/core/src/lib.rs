@@ -537,7 +537,7 @@ pub use remote::{
     RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceRequest,
     RemoteWorkbenchOpenWorkspaceResponse, RemoteWorkbenchOperationKind, RemoteWorkbenchRequest,
     RemoteWorkbenchTemporarySessionRootRequest, RemoteWorkbenchTemporarySessionRootResponse,
-    RemoteWorkspaceDirectoryEntry, RemoteWorkspaceDirectoryListing,
+    RemoteWorkspaceDirectoryEntry, RemoteWorkspaceDirectoryListing, RemoteWorktreeLifecycle,
     redact_agent_snapshot_for_remote,
 };
 pub use remote_v2::*;
