@@ -12948,6 +12948,9 @@ impl MobileApp {
             div()
                 .size_full()
                 .relative()
+                // The page paints its own surface so a drawer sliding over it
+                // cannot repaint the middle of the phone with its own tone.
+                .bg(conversation_surface())
                 .track_focus(&self.root_focus)
                 .on_action(cx.listener(Self::handle_navigate_back))
                 .child(
@@ -23995,14 +23998,10 @@ impl Render for MobileApp {
         } else {
             self.mode
         };
-        let root_background = match (
+        let root_background = root_surface(
             visible_mode,
             visible_drawer_page(self.drawer_offset, self.drawer_snap),
-        ) {
-            (RootMode::Pairing, _) => theme::bg_primary(),
-            (_, Some(DrawerPage::Sessions) | Some(DrawerPage::Workbench)) => theme::sidebar_bg(),
-            _ => theme::bg_primary(),
-        };
+        );
         // The page under the phone's finger sees a touch pan before the lists
         // inside it consume the gesture, so a rightward swipe can leave a page
         // opened on top of another one. The wrapper forwards layout, so the page
@@ -27859,6 +27858,29 @@ fn visible_drawer_page(offset: f32, snap: Option<DrawerSnap>) -> Option<DrawerPa
         Some(DrawerPage::Workbench)
     } else {
         None
+    }
+}
+
+/// The surface the conversation page paints for itself, inside the content box.
+///
+/// The page owns this colour instead of letting the root's show through. The
+/// root follows a drawer, so the band the window's insets leave around the
+/// content box reads as part of an open side page; a page that borrowed that
+/// colour would take the drawer's tone over the whole middle of the phone the
+/// moment a swipe began.
+fn conversation_surface() -> Hsla {
+    theme::bg_primary()
+}
+
+/// The root's own surface: everything no page paints over.
+///
+/// In the workspace that is only the band the window's insets leave around the
+/// content box, and a side page takes the band over as soon as one is on
+/// screen. Pairing and connecting have no drawer, so the root is their page.
+fn root_surface(mode: RootMode, drawer: Option<DrawerPage>) -> Hsla {
+    match (mode, drawer) {
+        (RootMode::Pairing, _) | (_, None) => theme::bg_primary(),
+        (_, Some(_)) => theme::sidebar_bg(),
     }
 }
 
@@ -34303,6 +34325,40 @@ mod tests {
         assert_eq!(drawer_left(DrawerPage::Sessions, 1.0, width), 0.0);
         assert_eq!(drawer_left(DrawerPage::Workbench, 0.0, width), width);
         assert_eq!(drawer_left(DrawerPage::Workbench, -1.0, width), 0.0);
+    }
+
+    /// A drawer sliding over the conversation page never repaints it.
+    ///
+    /// This is the reported bug: pulling a side page out turned the whole
+    /// middle of the phone the drawer's colour, because the conversation page
+    /// let the root's background through and the root follows the drawer so
+    /// the band the window's insets leave reads as part of an open side page.
+    /// The page now paints its own surface, so the root's colour only ever
+    /// reaches that band.
+    #[test]
+    fn a_drawer_never_repaints_the_page_it_slides_over() {
+        let source = include_str!("app.rs");
+        let workspace = source
+            .split_once("    fn render_workspace(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_row_menu("))
+            .map(|(body, _)| body)
+            .expect("the workspace page should remain inspectable");
+        assert!(
+            workspace.contains(".bg(conversation_surface())"),
+            "the conversation page paints its own surface, not the root's"
+        );
+        assert_eq!(conversation_surface(), theme::bg_primary());
+        // The band around the page still follows the drawer, from the first
+        // frame of the swipe to the frame that closes it.
+        assert_eq!(
+            root_surface(RootMode::Workspace, Some(DrawerPage::Sessions)),
+            theme::sidebar_bg()
+        );
+        assert_eq!(
+            root_surface(RootMode::Workspace, Some(DrawerPage::Workbench)),
+            theme::sidebar_bg()
+        );
+        assert_eq!(root_surface(RootMode::Workspace, None), theme::bg_primary());
     }
 
     #[test]
