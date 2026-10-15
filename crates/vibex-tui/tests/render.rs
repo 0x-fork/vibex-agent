@@ -10756,6 +10756,80 @@ fn the_session_list_nests_a_sessions_delegated_workers() {
     );
 }
 
+/// A session's own child hangs from its elbow and from nothing else.
+///
+/// The child's level is the last one the branch has, so there is no column
+/// above it for a trunk to run down: the only stroke left of the child's Agent
+/// mark is its own elbow, and the cell between that elbow and the mark is air.
+/// A trunk to the left of it would arrive from no session above and reach none
+/// below, which is exactly what a reader cannot tell a stray line from. The row
+/// that follows is a session of its own, so the worker's level really does end
+/// there rather than being cut short by the list.
+#[test]
+fn a_delegated_rows_branch_holds_one_elbow_and_no_stray_trunk() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    let project = vibex_core::ProjectId::new();
+    let workspace = vibex_core::WorkspaceId::new();
+    let mut owner = seeded_session("session_owner0001", "the owner");
+    owner.last_message_at_ms = 9_000;
+    let mut worker = seeded_session("session_worker001", "the worker");
+    worker.last_message_at_ms = 9_000;
+    let mut next = seeded_session("session_next0001", "the next session");
+    next.last_message_at_ms = 8_000;
+    for session in [&mut owner, &mut worker, &mut next] {
+        session.project_id = project.clone();
+        session.workspace_id = workspace.clone();
+    }
+    let owner_id = owner.id.clone();
+    let worker_id = worker.id.clone();
+    let registry = vec![owner.clone(), worker.clone(), next.clone()];
+    app.agent
+        .apply_sessions(Ok(vec![owner, next]))
+        .expect("sessions apply");
+    app.children
+        .apply(None, false, 1_000, tree_page(Vec::new(), Vec::new()));
+    app.children.apply(
+        Some(&owner_id),
+        false,
+        1_000,
+        tree_page(
+            vec![tree_node("session_worker001", Some("session_owner0001"), 0)],
+            registry,
+        ),
+    );
+    app.perform(Intent::GotoSessions);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("the next session"),
+        "the row the worker's level ends at is missing:\n{screen}"
+    );
+    let worker_row = session_row(&app, &worker_id);
+    assert_eq!(
+        app.sidebar_rows()[worker_row].depth,
+        2,
+        "the worker is not drawn directly under its owner"
+    );
+    let line = screen
+        .lines()
+        .find(|line| line.contains("the worker"))
+        .unwrap_or_else(|| panic!("the list hid the delegated worker:\n{screen}"));
+    let elbow = line
+        .find(['└', '├'])
+        .unwrap_or_else(|| panic!("the worker row lost its elbow:\n{line}"));
+    assert!(
+        !line[..elbow].contains('│'),
+        "a trunk was drawn above the worker's own elbow:\n{line}"
+    );
+    // The branch turns toward the Agent mark and stops: the cell between the two
+    // is air, so a line never runs into the mark it opens.
+    assert_eq!(
+        line[elbow + '└'.len_utf8()..].chars().next(),
+        Some(' '),
+        "the branch runs into the worker's Agent mark:\n{line}"
+    );
+}
+
 #[test]
 fn a_parent_row_opens_its_branch_from_the_row_itself() {
     use vibex_tui::action::Intent;

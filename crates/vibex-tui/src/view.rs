@@ -1496,10 +1496,17 @@ pub const HEADING_ROW_LEAD: usize = crate::row_marks::MARK_COLS as usize + 1;
 ///
 /// The guide is the desktop's own, in cells rather than pixels. The elbow lands
 /// in the row's indent column — the column the Agent mark of the session that
-/// owns it is drawn in — and a rule carries it on into the row's own mark, which
-/// sits one indent further in. Each level above that owns a column of its own,
-/// one indent apart, holding a trunk while the session at that level still has a
-/// sibling to reach.
+/// owns it is drawn in — and turns toward the row's own mark, which sits one
+/// indent further in. Each level above that owns a column of its own, one indent
+/// apart, holding a trunk while the session at that level still has a sibling to
+/// reach.
+///
+/// The elbow keeps a cell of air between its corner and the row's mark. A rule
+/// run right up to the mark is what the desktop can do and a terminal cannot: a
+/// box-drawing corner fills its own cell to the edge, so the line would touch a
+/// picture drawn in a cell of its own. The air is the whole difference, and it
+/// is spent out of the same two columns as before, so the mark stays in the
+/// column every other row's mark is in.
 ///
 /// `shape` is read from the row outward, one entry per level, the row's own
 /// level first — see [`crate::sessions::branch_shape`]. The second line mirrors
@@ -1536,10 +1543,12 @@ fn branch_lead(shape: &[bool], indent: usize, tier: crate::glyphs::GlyphTier) ->
     } else {
         crate::glyphs::branch_elbow(true, tier)
     };
-    title[indent + 1] = crate::glyphs::branch_rule(tier);
+    // The cell past the elbow is left blank: that air is what keeps the branch
+    // off the row's Agent mark, and it costs the guide none of its own columns.
     let mut below = above;
     // The row's own column carries the trunk on to its next sibling; the air
-    // after it stays blank, because the row's Agent mark is what the rule met.
+    // after it stays blank, because the row's Agent mark is what the elbow
+    // turned toward.
     below[indent] = if carries {
         crate::glyphs::branch_trunk(tier)
     } else {
@@ -10599,29 +10608,30 @@ mod tests {
     }
 
     /// The branch a delegated row hangs from is drawn in the same columns for
-    /// every terminal: an elbow under the owning session's Agent mark, and a
-    /// trunk per level that still has a sibling to reach.
+    /// every terminal: an elbow under the owning session's Agent mark, air
+    /// between that elbow and the row's own mark, and a trunk per level that
+    /// still has a sibling to reach.
     #[test]
     fn a_delegated_row_draws_its_branch_in_cells_of_one_width() {
         let full = GlyphTier::Full;
         // A row one level down: the elbow lands in its indent column and the
-        // rule carries it to its own Agent mark.
+        // cell past it is air, so the branch stops short of the row's mark.
         let one = SESSION_ROW_INDENT;
         let (title, below) = branch_lead(&[false], one, full);
-        assert_eq!(title, "  └─", "{title:?}");
+        assert_eq!(title, "  └ ", "{title:?}");
         // The last child of a branch stops there: the second line carries no
         // trunk, because nothing follows.
         assert_eq!(below, "    ", "{below:?}");
         // A row with a sibling left runs its trunk past both lines.
         let (title, below) = branch_lead(&[true], one, full);
-        assert_eq!(title, "  ├─", "{title:?}");
+        assert_eq!(title, "  ├ ", "{title:?}");
         assert_eq!(below, "  │ ", "{below:?}");
         // A helper under that worker: the owner's own column stands outside the
         // worker's elbow, carrying the owner's branch on to the worker's
         // siblings, while the elbow lands under the worker's mark.
         let indent = SESSION_ROW_INDENT * 3;
         let (title, below) = branch_lead(&[false, true], indent, full);
-        assert_eq!(title, "    │ └─", "{title:?}");
+        assert_eq!(title, "    │ └ ", "{title:?}");
         assert_eq!(below, "    │   ", "{below:?}");
         // Both runs are as wide as the lead a root row spends, whatever the
         // depth: the Agent marks of a list line up.
@@ -10635,6 +10645,6 @@ mod tests {
         // The legacy tier falls back to characters a console font has.
         let legacy = GlyphTier::Legacy;
         let (title, _) = branch_lead(&[false], one, legacy);
-        assert_eq!(title, "  `-", "{title:?}");
+        assert_eq!(title, "  ` ", "{title:?}");
     }
 }

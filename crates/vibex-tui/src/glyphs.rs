@@ -72,8 +72,12 @@ pub fn branch_trunk(tier: GlyphTier) -> &'static str {
     connector(tier)
 }
 
-/// The elbow where a branch turns off its trunk into a child's Agent mark. One
+/// The elbow where a branch turns off its trunk toward a child's Agent mark. One
 /// column.
+///
+/// The corner is the whole junction: the cell past it is air, so the branch
+/// stops one column short of the mark it opens rather than running into it, the
+/// way the desktop's line stops at the logo it reaches.
 ///
 /// `last` says the child closes the branch: its trunk stops at the elbow
 /// instead of running on to a sibling below it. A legacy console has no box
@@ -85,17 +89,6 @@ pub fn branch_elbow(last: bool, tier: GlyphTier) -> &'static str {
         (true, GlyphTier::Full) => "└",
         (false, GlyphTier::Legacy) => "|",
         (true, GlyphTier::Legacy) => "`",
-    }
-}
-
-/// The short rule an elbow reaches the row with. One column.
-///
-/// It is what makes the elbow read as a junction rather than as one more
-/// character in the column: the trunk turns toward the row it opens.
-pub fn branch_rule(tier: GlyphTier) -> &'static str {
-    match tier {
-        GlyphTier::Full => "─",
-        GlyphTier::Legacy => "-",
     }
 }
 
@@ -486,7 +479,6 @@ mod tests {
                 branch_trunk(tier),
                 branch_elbow(false, tier),
                 branch_elbow(true, tier),
-                branch_rule(tier),
                 ballot_x(tier),
                 check_mark(tier),
                 diamond_filled(tier),
@@ -615,7 +607,6 @@ mod tests {
             branch_trunk(tier),
             branch_elbow(false, tier),
             branch_elbow(true, tier),
-            branch_rule(tier),
             ballot_x(tier),
             check_mark(tier),
             diamond_filled(tier),
