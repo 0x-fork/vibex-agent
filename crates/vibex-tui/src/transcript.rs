@@ -1761,6 +1761,24 @@ impl Transcript {
         self.offsets.get(index).copied().unwrap_or(0)
     }
 
+    /// The display line of the block's own row: the one its mark is drawn on.
+    ///
+    /// A block does not always begin on its own row. A turn's fold draws its
+    /// rows above the block's content — the title over the work the block
+    /// opens — so the row carrying the block's disclosure sits below them, and
+    /// the block's first line says "this turn's work" rather than "this run".
+    /// A message with no header has no such row at all. Asking here keeps the
+    /// renderer the single authority on where a gesture landed, exactly as
+    /// [`Self::fold_control_lines`] does for the turn's own rows.
+    pub fn block_header_line(&mut self, index: usize) -> Option<usize> {
+        let block = self.blocks.get(index)?;
+        if is_headerless(block) {
+            return None;
+        }
+        let title = block.fold.as_ref().is_some_and(TurnFold::draws_title);
+        Some(self.line_of_block(index) + fold_title_rows(title))
+    }
+
     /// The display lines of `index` that toggle its turn's fold.
     ///
     /// An open section is bracketed by two rows that do the same thing — the

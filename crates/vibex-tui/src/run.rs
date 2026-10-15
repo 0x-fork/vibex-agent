@@ -1609,8 +1609,12 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 dispatch_all(worker, &Outcome::effects(effects));
                 return true;
             }
+            // The block's own row opens the block: the one its disclosure is
+            // drawn on. A fold draws the turn's title over the work it opens,
+            // so a block that opens an open section is not on its first line —
+            // and the row the reader points at is the one that has to answer.
             if let Some(index) = app.transcript.block_at_line(line)
-                && app.transcript.line_of_block(index) == line
+                && app.transcript.block_header_line(index) == Some(line)
                 && app.transcript.block(index).is_some_and(|block| {
                     block.collapsible
                         && !block.is_hidden()
@@ -4823,6 +4827,127 @@ mod tests {
         .unwrap();
         assert_eq!(app.focus, Focus::Main);
         assert_eq!(app.selection_for(crate::keymap::Scope::Agent), 4);
+    }
+
+    /// A settled turn hides its process behind the answer's own title. Opening
+    /// the turn puts the work back on screen under the turn's title, and the
+    /// group that stands for the run is drawn below it. The row that opens the
+    /// group is the group's own, not the block's first line — which is the
+    /// turn's title, and folds the turn instead.
+    #[test]
+    fn a_click_opens_a_group_head_drawn_under_its_turns_title() {
+        use vibex_core::{
+            AgentMessagePayload, TimelinePayload, ToolCallPayload, ToolCallStatus,
+            UserMessagePayload,
+        };
+        let worker = isolation_worker();
+        let mut app = test_app(100, 30);
+        app.navigate_to(Page::Agent);
+        let id = vibex_core::VibexSessionId::new();
+        app.agent.state.selected_session_id = Some(id.clone());
+        let mut items = vec![conversation_item(
+            &id,
+            1,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "read the files".into(),
+                ..Default::default()
+            }),
+        )];
+        for sequence in 2..=4 {
+            items.push(conversation_item(
+                &id,
+                sequence,
+                TimelinePayload::ToolCall(ToolCallPayload {
+                    tool_call_id: format!("tool-{sequence}"),
+                    tool_name: "read".into(),
+                    status: ToolCallStatus::Completed,
+                    summary: String::new(),
+                    input_summary: Some(format!("src/file-{sequence}.rs")),
+                    output_summary: Some(format!("contents of file {sequence}")),
+                    raw_extension: None,
+                }),
+            ));
+        }
+        items.push(conversation_item(
+            &id,
+            5,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "All three files are read.".into(),
+                is_final: true,
+            }),
+        ));
+        app.agent.state.timeline.replace_authoritative(id, items);
+        app.sync_transcript();
+        app.focus = Focus::Main;
+
+        // The settled turn asks for its process shut, so the answer owns the
+        // control and the group is hidden behind it.
+        let head = app
+            .transcript
+            .blocks()
+            .iter()
+            .position(|block| block.group.is_head())
+            .expect("the three reads are one group");
+        let answer = app
+            .transcript
+            .blocks()
+            .iter()
+            .position(|block| {
+                block
+                    .fold
+                    .as_ref()
+                    .is_some_and(crate::transcript::TurnFold::is_control)
+            })
+            .expect("the answer owns the control");
+        conversation_frame(&mut app, 100, 30);
+        let area = app.regions.scrollback;
+        let control = app.transcript.fold_control_lines(answer)[0];
+        let offset = app.transcript.scroll_offset();
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x + 3,
+                row: area.y + u16::try_from(control - offset).unwrap(),
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(
+            app.transcript.blocks()[head]
+                .fold
+                .as_ref()
+                .is_some_and(|fold| fold.expanded),
+            "the answer's title did not open the turn"
+        );
+
+        // Open, the turn draws its title above the group's own row: two rows
+        // for the title and the air under it. The row after them is the one
+        // that carries the group's disclosure.
+        let opened = conversation_frame(&mut app, 100, 30);
+        assert!(opened.contains("Worked for"), "{opened}");
+        let header = app.transcript.line_of_block(head) + 2;
+        handle_mouse(
+            &mut app,
+            &worker,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x + 3,
+                row: area.y + u16::try_from(header - offset).unwrap(),
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        app.transcript
+            .advance_disclosures(Instant::now() + crate::transcript::DISCLOSURE_DURATION);
+        let group = conversation_frame(&mut app, 100, 30);
+        assert!(
+            app.transcript.blocks()[head].expanded,
+            "the group's own row did not open it: {group}"
+        );
+        // The members are on screen, and the turn's title is above them once:
+        // the head draws it for the run, and no member repeats it.
+        assert!(group.contains("file-3.rs"), "{group}");
+        assert_eq!(group.matches("Worked for").count(), 2, "{group}");
     }
 
     #[test]
