@@ -721,6 +721,33 @@ impl PendingWrite {
             Outcome::Models { count } => {
                 Some(format!("{count} {}", strings.config_result_models()))
             }
+            Outcome::AuthWaiting { location, detail } => {
+                let template = match location {
+                    vibex_core::AgentAuthExecutionLocation::HostTerminal => {
+                        strings.config_auth_waiting_host_terminal()
+                    }
+                    vibex_core::AgentAuthExecutionLocation::HostBrowser
+                    | vibex_core::AgentAuthExecutionLocation::ClientBrowserWithDeviceCode => {
+                        match location {
+                            vibex_core::AgentAuthExecutionLocation::ClientBrowserWithDeviceCode => {
+                                strings.config_auth_waiting_device_code()
+                            }
+                            _ => strings.config_auth_waiting_host_browser(),
+                        }
+                    }
+                    _ => strings.config_auth_waiting_elsewhere(),
+                };
+                let rendered = match detail {
+                    Some(command) if !command.trim().is_empty() => template.replace(
+                        "{detail}",
+                        &strings
+                            .config_auth_waiting_detail()
+                            .replace("{command}", command),
+                    ),
+                    _ => template.replace("{detail}", ""),
+                };
+                Some(rendered)
+            }
             Outcome::DefaultScope { workspace } => Some(
                 if *workspace {
                     strings.config_result_workspace_default()

@@ -2825,3 +2825,58 @@ fn signing_out_is_asked_about_with_what_it_ends() {
         "the first Esc closed the panel instead of the question"
     );
 }
+
+/// A sign-in that finishes somewhere else says where.
+///
+/// The runtime keeps the operation open and names the place the reader has to
+/// finish it — a terminal or browser on the host, or a device code. This client
+/// has no terminal of its own, so the honest answer is where to go, not a
+/// sign-in that did not happen.
+#[test]
+fn a_sign_in_that_finishes_elsewhere_says_where() {
+    let app: vibex_tui::app::App = loaded(140, 40);
+    let strings = app.strings;
+    let pending = vibex_tui::config_center::PendingWrite {
+        subject: "Codex".to_string(),
+        verb: vibex_tui::config_center::ConfigVerb::SignIn,
+    };
+    let message = |outcome: &vibex_tui::app::MutationOutcome| pending.message(strings, outcome);
+
+    let terminal = message(&vibex_tui::app::MutationOutcome::AuthWaiting {
+        location: vibex_core::AgentAuthExecutionLocation::HostTerminal,
+        detail: Some("codex login".to_string()),
+    });
+    assert!(
+        terminal.contains("terminal") && terminal.contains("codex login"),
+        "the terminal answer named neither the place nor the command: {terminal}"
+    );
+
+    let browser = message(&vibex_tui::app::MutationOutcome::AuthWaiting {
+        location: vibex_core::AgentAuthExecutionLocation::HostBrowser,
+        detail: None,
+    });
+    assert!(
+        browser.contains("browser"),
+        "the browser answer did not name the browser: {browser}"
+    );
+
+    let device = message(&vibex_tui::app::MutationOutcome::AuthWaiting {
+        location: vibex_core::AgentAuthExecutionLocation::ClientBrowserWithDeviceCode,
+        detail: None,
+    });
+    assert!(
+        device.contains("code"),
+        "the device-code answer did not mention the code: {device}"
+    );
+
+    // A completed sign-in still says it completed.
+    let done = message(&vibex_tui::app::MutationOutcome::Auth {
+        methods: 0,
+        account: Some("work".to_string()),
+        authenticated: true,
+    });
+    assert!(
+        !done.contains("still signing in"),
+        "a completed sign-in was reported as waiting: {done}"
+    );
+}

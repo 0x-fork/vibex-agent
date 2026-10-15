@@ -2559,12 +2559,33 @@ impl Dispatch {
             .authenticate_agent_context(request)
             .await
         {
-            Ok(result) => Ok(crate::app::MutationOutcome::Auth {
-                methods: 0,
-                account: result.context.account_hint.clone(),
-                authenticated: result.context.status
-                    == vibex_core::AgentAuthContextStatus::Authenticated,
-            }),
+            Ok(result) => {
+                if result.context.status == vibex_core::AgentAuthContextStatus::Authenticated {
+                    return Ok(crate::app::MutationOutcome::Auth {
+                        methods: 0,
+                        account: result.context.account_hint.clone(),
+                        authenticated: true,
+                    });
+                }
+                // The runtime keeps the operation open and names where the
+                // reader has to finish it. This client has no terminal of its
+                // own, so it says where rather than reporting a sign-in that
+                // did not happen.
+                let detail = result
+                    .terminal
+                    .as_ref()
+                    .map(|terminal| {
+                        std::iter::once(terminal.command.clone())
+                            .chain(terminal.args.iter().cloned())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .or_else(|| result.context.account_hint.clone());
+                Ok(crate::app::MutationOutcome::AuthWaiting {
+                    location: result.execution_location,
+                    detail,
+                })
+            }
             Err(error) => Err(error),
         }
     }

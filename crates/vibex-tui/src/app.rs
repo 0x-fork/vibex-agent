@@ -8828,6 +8828,15 @@ pub enum MutationOutcome {
     },
     /// A model catalogue was read.
     Models { count: usize },
+    /// The Agent is signing in somewhere this client cannot follow.
+    ///
+    /// The runtime keeps the operation open and names where the reader has to
+    /// finish it; a client with no terminal of its own says so rather than
+    /// reporting a sign-in that did not happen.
+    AuthWaiting {
+        location: vibex_core::AgentAuthExecutionLocation,
+        detail: Option<String>,
+    },
     /// A default was set, and at which scope it applies.
     DefaultScope { workspace: bool },
     /// A validation ran. `passed` is the verdict and `warned` keeps the middle
