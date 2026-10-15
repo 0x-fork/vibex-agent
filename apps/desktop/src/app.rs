@@ -1446,13 +1446,16 @@ struct ComposerQueueMessage {
 }
 
 impl ComposerQueueMessage {
+    /// What the queued message reads as on one line, pictures included.
+    ///
+    /// The shared projection is what a session title and the drag chip both
+    /// read, so a message of nothing but a screenshot reads as its label rather
+    /// than as a count that says nothing about which picture it was.
     fn display_text(&self) -> String {
-        let text = self.text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !text.is_empty() {
-            text
-        } else {
-            format!("{} attachment(s)", self.attachments.len())
-        }
+        vibex_core::user_message_display_text(&self.text, &self.attachments)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -32741,7 +32744,8 @@ impl VibexWorkbench {
     }
 
     fn new_session_prompt_title(&self, cx: &App) -> Option<String> {
-        session_title_from_first_message(self.new_session_input.read(cx).value().as_ref())
+        let (text, attachments) = self.new_session_draft_payload(cx);
+        session_title_from_first_message(&text, &attachments)
     }
 
     /// The text and attachments a new-session submission would actually carry.
@@ -33430,7 +33434,7 @@ impl VibexWorkbench {
             self.new_session_command_entry.as_ref(),
             allow_manual_provider_slash,
         );
-        let title = session_title_from_first_message(&text);
+        let title = session_title_from_first_message(&text, &attachments);
         let has_initial_message =
             scheduled_at_ms.is_none() && (!text.trim().is_empty() || !attachments.is_empty());
         let deferred_creation = scheduled_at_ms.is_some() || command_invocation.is_none();
@@ -69274,8 +69278,18 @@ fn clamp_attachment_preview_pan(
     (pan_x.clamp(-max_x, max_x), pan_y.clamp(-max_y, max_y))
 }
 
-fn session_title_from_first_message(message: &str) -> Option<String> {
-    normalize_agent_session_title(message)
+/// The name a first message gives its session, pictures included.
+///
+/// A message is its text and its attachments together: a paste that carries no
+/// prose still has a label — the one the composer drew in the picture's place —
+/// and that label is what names the row until an Agent supplies a title of its
+/// own. Reading only the text left the row unnamed and the sidebar's echo
+/// starting after where the picture sat.
+fn session_title_from_first_message(
+    message: &str,
+    attachments: &[MessageAttachment],
+) -> Option<String> {
+    normalize_agent_session_title(&vibex_core::user_message_display_text(message, attachments))
 }
 
 /// The manager persists a newly created session with this default title when
@@ -98323,12 +98337,38 @@ mod tests {
     #[test]
     fn new_session_title_uses_shared_whitespace_and_unicode_bounds() {
         assert_eq!(
-            session_title_from_first_message("  hello\nworld  "),
+            session_title_from_first_message("  hello\nworld  ", &[]),
             Some("hello world".into())
         );
-        assert_eq!(session_title_from_first_message(" \n\t "), None);
-        let title = session_title_from_first_message(&"你".repeat(121)).unwrap();
+        assert_eq!(session_title_from_first_message(" \n\t ", &[]), None);
+        let title = session_title_from_first_message(&"你".repeat(121), &[]).unwrap();
         assert_eq!(title.chars().count(), 120);
+    }
+
+    #[test]
+    fn a_first_message_of_only_a_picture_names_the_session() {
+        // The reported bug: a pasted screenshot and no prose left the row
+        // nameless, because the title was read from the text alone. The label
+        // the composer drew is what the row has to wear.
+        let pasted = MessageAttachment {
+            label: "粘贴的图片.png".to_string(),
+            mime_type: Some("image/png".to_string()),
+            uri: Some("file:///tmp/pasted.png".to_string()),
+            inline_text_offset: Some(0),
+        };
+        assert_eq!(
+            session_title_from_first_message("", std::slice::from_ref(&pasted)),
+            Some("粘贴的图片.png".into())
+        );
+        // And prose with a picture keeps both, in the order they were written.
+        let with_text = MessageAttachment {
+            inline_text_offset: Some(12),
+            ..pasted.clone()
+        };
+        assert_eq!(
+            session_title_from_first_message("look at this  and this", &[with_text]),
+            Some("look at this 粘贴的图片.png and this".into())
+        );
     }
 
     #[test]

@@ -13,6 +13,29 @@ use vibex_core::MessageAttachment;
 use crate::composer::utf16_offset_to_byte;
 use crate::locale::Strings;
 
+/// A draft message projected to one line, pictures included.
+///
+/// The same projection [`vibex_core::user_message_display_text`] makes for a
+/// wire message, applied to a draft before its images are wired: a row named
+/// from the draft — a session title, a countdown, a queue entry — has to read
+/// the picture the reader attached rather than the empty text around it. A
+/// paste that carries no prose would otherwise name nothing. The text is
+/// borrowed back untouched when the draft holds no picture, which is every
+/// ordinary message.
+pub fn draft_display_text<'a>(
+    text: &'a str,
+    images: &[(crate::composer::ImageAttachment, u32)],
+) -> std::borrow::Cow<'a, str> {
+    if images.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let attachments = images
+        .iter()
+        .map(|(image, offset)| crate::composer::message_attachment(image, *offset, false))
+        .collect::<Vec<_>>();
+    std::borrow::Cow::Owned(vibex_core::user_message_display_text(text, &attachments))
+}
+
 /// A message body with every attachment drawn as a placeholder where it sat.
 ///
 /// The text is otherwise untouched: this is the same message the wire carries,
@@ -214,5 +237,27 @@ mod tests {
             strings(),
         );
         assert_eq!(body, "a [Image #1] b [Image #2] c");
+    }
+
+    #[test]
+    fn a_draft_with_no_pictures_projects_to_its_own_text() {
+        assert_eq!(draft_display_text("", &[]), "");
+        assert_eq!(
+            draft_display_text("  Fix   the flake  ", &[]),
+            "  Fix   the flake  "
+        );
+    }
+
+    #[test]
+    fn a_draft_that_is_only_a_picture_names_itself() {
+        let shot = crate::composer::ImageAttachment {
+            label: "[Image #1]".to_string(),
+            mime_type: "image/png".into(),
+            source: crate::composer::ImageSource::Path("/tmp/shot.png".into()),
+            byte_len: 0,
+            thumbnail: None,
+        };
+        assert_eq!(draft_display_text("", &[(shot.clone(), 0)]), "[Image #1]");
+        assert_eq!(draft_display_text("look ", &[(shot, 5)]), "look [Image #1]");
     }
 }

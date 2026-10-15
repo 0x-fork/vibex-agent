@@ -241,6 +241,130 @@ pub struct MessageAttachment {
     pub inline_text_offset: Option<u32>,
 }
 
+impl MessageAttachment {
+    /// The words this attachment contributes to a one-line projection of its
+    /// message.
+    ///
+    /// A picture pasted into a composer carries a label and often no prose at
+    /// all, so a projection that kept only the text would leave a session with
+    /// nothing to name it — or, when the reader wrote around the picture, a
+    /// sentence that starts where the picture was. The label is what the client
+    /// that wrote the message drew in its place, so it is what every other
+    /// client puts back. An attachment that arrived without one is still named
+    /// by what it is.
+    pub fn display_label(&self) -> &str {
+        let label = self.label.trim();
+        if !label.is_empty() {
+            return label;
+        }
+        if self
+            .mime_type
+            .as_deref()
+            .is_some_and(|mime| mime.trim().to_ascii_lowercase().starts_with("image/"))
+            || self
+                .uri
+                .as_deref()
+                .is_some_and(|uri| uri.trim().to_ascii_lowercase().starts_with("data:image/"))
+        {
+            "Image"
+        } else {
+            "Attachment"
+        }
+    }
+}
+
+/// A user message projected to one line of display text.
+///
+/// This is the projection a session title, a sidebar row or a search excerpt
+/// reads: the message the way the reader composed it, with every attachment
+/// standing where it sat. `inline_text_offset` is in UTF-16 units into `text`,
+/// the same units every client writes, and an attachment that carries no offset
+/// is appended in the order it was sent — which is where a reader that cannot
+/// place it has always found it.
+///
+/// A message that is only pictures therefore projects to their labels rather
+/// than to nothing, which is what keeps a pasted screenshot from leaving a
+/// blank row behind.
+pub fn user_message_display_text(text: &str, attachments: &[MessageAttachment]) -> String {
+    if attachments.is_empty() {
+        return text.to_string();
+    }
+    // The offsets are the wire's, so they are sorted rather than trusted: a
+    // message can carry several, and the text is walked once, left to right.
+    let mut placed = attachments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, attachment)| {
+            attachment
+                .inline_text_offset
+                .map(|offset| (offset as usize, index, attachment))
+        })
+        .collect::<Vec<_>>();
+    placed.sort_by_key(|(offset, index, _)| (*offset, *index));
+
+    let mut body = String::with_capacity(text.len() + attachments.len() * 12);
+    let mut cursor = 0usize;
+    for (offset, _, attachment) in placed {
+        let byte = utf16_offset_to_byte(text, offset).clamp(cursor, text.len());
+        body.push_str(&text[cursor..byte]);
+        cursor = byte;
+        push_display_word(&mut body, attachment.display_label());
+        // What follows is appended after this, and a row draws the label as
+        // prose: without a space of its own it fuses with the next word
+        // (`shot.png世界`).
+        if text[cursor..]
+            .chars()
+            .next()
+            .is_some_and(|character| !character.is_whitespace())
+        {
+            body.push(' ');
+        }
+    }
+    body.push_str(&text[cursor..]);
+    for attachment in attachments
+        .iter()
+        .filter(|attachment| attachment.inline_text_offset.is_none())
+    {
+        push_display_word(&mut body, attachment.display_label());
+    }
+    body
+}
+
+/// Append a word, one space apart from whatever it follows.
+///
+/// The wire text separates a picture from its neighbours the way the client
+/// that wrote it did, so the space a reader expects on the left is supplied
+/// here when the text before it does not already end in whitespace.
+fn push_display_word(body: &mut String, word: &str) {
+    if !body.is_empty() && !body.ends_with(char::is_whitespace) {
+        body.push(' ');
+    }
+    body.push_str(word);
+}
+
+/// The byte index in `text` of a UTF-16 offset, clamped to its length.
+///
+/// `inline_text_offset` is counted in UTF-16 units because that is what the
+/// other clients count in; the buffer counts bytes, and a message full of CJK
+/// is where the two disagree.
+pub fn utf16_offset_to_byte(text: &str, offset: usize) -> usize {
+    if offset == 0 {
+        return 0;
+    }
+    let mut utf16 = 0usize;
+    for (byte, character) in text.char_indices() {
+        let next = utf16 + character.len_utf16();
+        if offset < next {
+            return byte;
+        }
+        if offset == next {
+            return byte + character.len_utf8();
+        }
+        utf16 = next;
+    }
+    text.len()
+}
+
 /// How a user message reached the Agent's turn.
 ///
 /// The timeline keeps the delivery because it is the only durable evidence of
@@ -1531,6 +1655,68 @@ pub struct TimelineLiveEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn attachment(label: &str, offset: Option<u32>) -> MessageAttachment {
+        MessageAttachment {
+            label: label.to_string(),
+            mime_type: Some("image/png".to_string()),
+            uri: Some("file:///tmp/shot.png".to_string()),
+            inline_text_offset: offset,
+        }
+    }
+
+    #[test]
+    fn a_message_of_only_pictures_projects_to_their_labels() {
+        // The case the sidebar showed a blank row for: a pasted image and no
+        // prose. The label is what the writer saw in the composer.
+        let text = user_message_display_text(
+            "",
+            &[
+                attachment("粘贴的图片.png", None),
+                attachment("shot.png", None),
+            ],
+        );
+        assert_eq!(text, "粘贴的图片.png shot.png");
+    }
+
+    #[test]
+    fn a_picture_sits_where_it_was_written() {
+        let text = user_message_display_text("before  after", &[attachment("shot.png", Some(7))]);
+        assert_eq!(text, "before shot.png after");
+    }
+
+    #[test]
+    fn an_offset_is_counted_in_utf16_units() {
+        let text = user_message_display_text("你好 世界", &[attachment("shot.png", Some(3))]);
+        assert_eq!(text, "你好 shot.png 世界");
+    }
+
+    #[test]
+    fn an_attachment_without_a_label_is_named_by_what_it_is() {
+        let unnamed = MessageAttachment {
+            label: String::new(),
+            mime_type: Some("image/png".to_string()),
+            uri: None,
+            inline_text_offset: None,
+        };
+        assert_eq!(user_message_display_text("look", &[unnamed]), "look Image");
+
+        let file = MessageAttachment {
+            label: "  ".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            uri: Some("file:///tmp/notes.txt".to_string()),
+            inline_text_offset: None,
+        };
+        assert_eq!(
+            user_message_display_text("read", &[file]),
+            "read Attachment"
+        );
+    }
+
+    #[test]
+    fn a_message_with_no_attachments_is_its_own_text() {
+        assert_eq!(user_message_display_text("plain text", &[]), "plain text");
+    }
 
     fn completion_item(
         session_id: &VibexSessionId,

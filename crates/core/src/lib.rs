@@ -599,7 +599,8 @@ pub use timeline::{
     TimelineTurnStart, TodoUpdatePayload, ToolCallPayload, ToolCallStatus,
     TurnExecutionAttribution, TurnExecutionAttributionView, UserMessageDelivery,
     UserMessagePayload, WebSearchPayload, is_runtime_startup_message,
-    latest_timeline_turn_ended_normally, turn_startup_notice,
+    latest_timeline_turn_ended_normally, turn_startup_notice, user_message_display_text,
+    utf16_offset_to_byte,
 };
 pub use usage::{
     AgentTurnUsageFact, AgentUsageAggregate, AgentUsageAnnualDay, AgentUsageAnnualProjection,

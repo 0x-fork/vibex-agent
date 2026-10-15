@@ -6833,13 +6833,27 @@ impl App {
     /// shows the wait counts down to the same hour. Two clients can be holding
     /// a send for one session, and what the reader is waiting for is whichever
     /// goes out first.
-    pub fn earliest_scheduled_send(&self, session_id: &VibexSessionId) -> Option<(&str, i64)> {
-        let held = self
-            .scheduled_message_for(session_id)
-            .and_then(|queued| Some((queued.text.as_str(), queued.scheduled_at_ms?)));
-        let shared = self
-            .authority_scheduled_send(session_id)
-            .map(|send| (send.text.as_str(), send.scheduled_at_ms));
+    ///
+    /// A message this client is holding is projected with its pictures: the
+    /// name a row borrows has to read the screenshot a paste carried, or a
+    /// send that is only a picture would leave the row nameless. The published
+    /// words are already the holder's projection and are read verbatim.
+    pub fn earliest_scheduled_send(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> Option<(std::borrow::Cow<'_, str>, i64)> {
+        let held = self.scheduled_message_for(session_id).and_then(|queued| {
+            Some((
+                crate::attachment::draft_display_text(&queued.text, &queued.images),
+                queued.scheduled_at_ms?,
+            ))
+        });
+        let shared = self.authority_scheduled_send(session_id).map(|send| {
+            (
+                std::borrow::Cow::Borrowed(send.text.as_str()),
+                send.scheduled_at_ms,
+            )
+        });
         match (held, shared) {
             (Some(held), Some(shared)) => Some(if held.1 <= shared.1 { held } else { shared }),
             (held, shared) => held.or(shared),
@@ -6890,7 +6904,7 @@ impl App {
     /// Desktop is owed the same row here.
     pub fn pending_scheduled_session_title(&self, session: &AgentSession) -> Option<String> {
         let (text, _) = self.earliest_scheduled_send(&session.id)?;
-        let title = vibex_core::normalize_agent_session_title(text)?;
+        let title = vibex_core::normalize_agent_session_title(&text)?;
         let fallback = session_fallback_title(&session.agent_id);
         (session.title == fallback || session.title == title).then_some(title)
     }
@@ -6907,9 +6921,17 @@ impl App {
     /// Read by [`Self::reconcile_pending_session_title`] until an authoritative
     /// title lands. A message that normalizes to nothing — whitespace, or the
     /// bare command that sends no prose — names nothing, so the placeholder
-    /// stands rather than the row wearing a blank name.
-    pub fn note_pending_session_title(&mut self, session_id: &VibexSessionId, message: &str) {
-        if let Some(title) = vibex_core::normalize_agent_session_title(message) {
+    /// stands rather than the row wearing a blank name. Pictures count: a
+    /// creation whose only message is a pasted screenshot is named by the label
+    /// the composer drew for it.
+    pub fn note_pending_session_title(
+        &mut self,
+        session_id: &VibexSessionId,
+        message: &str,
+        images: &[(crate::composer::ImageAttachment, u32)],
+    ) {
+        let display = crate::attachment::draft_display_text(message, images);
+        if let Some(title) = vibex_core::normalize_agent_session_title(&display) {
             self.pending_session_titles
                 .insert(session_id.clone(), title);
         }
@@ -9635,7 +9657,8 @@ mod tests {
         );
         assert_eq!(
             app.earliest_scheduled_send(&session_id)
-                .map(|(text, _)| text),
+                .map(|(text, _)| text)
+                .as_deref(),
             Some("mine")
         );
 
@@ -9651,7 +9674,8 @@ mod tests {
         assert_eq!(app.next_scheduled_message_at(&session_id), Some(theirs));
         assert_eq!(
             app.earliest_scheduled_send(&session_id)
-                .map(|(text, _)| text),
+                .map(|(text, _)| text)
+                .as_deref(),
             Some("theirs")
         );
         assert_eq!(app.next_scheduled_message_at_anywhere(), Some(theirs));
@@ -9691,7 +9715,7 @@ mod tests {
     fn a_session_created_here_is_named_by_its_first_message() {
         let session_id = VibexSessionId::new();
         let mut app = scheduled_app(&session_id);
-        app.note_pending_session_title(&session_id, "  Fix   the flake  ");
+        app.note_pending_session_title(&session_id, "  Fix   the flake  ", &[]);
 
         // The authority's answer to the creation is the manager's placeholder,
         // and so is every read until the message reaches a turn: the row wears
@@ -9730,7 +9754,7 @@ mod tests {
     fn an_early_update_cannot_put_the_placeholder_back_on_a_named_row() {
         let session_id = VibexSessionId::new();
         let mut app = scheduled_app(&session_id);
-        app.note_pending_session_title(&session_id, "Fix the flake");
+        app.note_pending_session_title(&session_id, "Fix the flake", &[]);
         app.record_created_session(&unnamed_session(&session_id, "codex"));
 
         // The manager announces the session it has just persisted — still under
@@ -9750,7 +9774,7 @@ mod tests {
     fn a_message_that_names_nothing_leaves_the_placeholder_standing() {
         let session_id = VibexSessionId::new();
         let mut app = scheduled_app(&session_id);
-        app.note_pending_session_title(&session_id, " \n\t ");
+        app.note_pending_session_title(&session_id, " \n\t ", &[]);
 
         assert!(
             app.pending_session_titles.is_empty(),
@@ -9764,6 +9788,29 @@ mod tests {
     }
 
     #[test]
+    fn a_creation_that_is_only_a_picture_is_named_by_its_label() {
+        // The reported bug: a pasted screenshot and no prose left the row on
+        // the manager's placeholder, because the name was read from the text
+        // alone. The label the composer drew names it instead.
+        let session_id = VibexSessionId::new();
+        let mut app = scheduled_app(&session_id);
+        let image = crate::composer::ImageAttachment {
+            label: "[Image #1]".to_string(),
+            mime_type: "image/png".into(),
+            source: crate::composer::ImageSource::Path("/tmp/pasted.png".into()),
+            byte_len: 0,
+            thumbnail: None,
+        };
+        app.note_pending_session_title(&session_id, "", &[(image, 0)]);
+
+        app.record_created_session(&unnamed_session(&session_id, "codex"));
+        assert_eq!(
+            app.session_title(&session_id).as_deref(),
+            Some("[Image #1]")
+        );
+    }
+
+    #[test]
     fn a_name_is_pruned_with_the_session_it_was_going_to_name() {
         let session_id = VibexSessionId::new();
         let mut app = scheduled_app(&session_id);
@@ -9771,7 +9818,7 @@ mod tests {
         // A creation that has not been acknowledged yet is not in the list, and
         // is exactly the row the name is for.
         app.new_draft_id = session_id.clone();
-        app.note_pending_session_title(&session_id, "Fix the flake");
+        app.note_pending_session_title(&session_id, "Fix the flake", &[]);
         app.retain_pending_session_titles();
         assert!(app.pending_session_titles.contains_key(&session_id));
 

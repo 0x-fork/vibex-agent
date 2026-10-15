@@ -3555,10 +3555,14 @@ impl AgentManager {
                 }
             };
             let default_title = format!("{} session", session.agent_id);
+            // The title is the message the reader composed, pictures included:
+            // a session whose first message is only a pasted screenshot has no
+            // text to name it, and the label the client drew in the composer is
+            // what every other client can put back.
             if let Ok(Some(updated)) = SessionRepository::seed_auto_title(
                 &conn,
                 &session.id,
-                &request.text,
+                &vibex_core::user_message_display_text(&request.text, &request.attachments),
                 &default_title,
             ) {
                 self.publish_root_session_update(&conn, updated);

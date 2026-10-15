@@ -1268,7 +1268,7 @@ fn scheduled_session_title(
         .filter(|message| message.session_id == session.id)
         .filter(|message| message.scheduled_at_ms.is_some())
         .min_by_key(|message| message.scheduled_at_ms)?;
-    let title = session_title_from_first_message(&message.display_text())?;
+    let title = session_title_from_first_message(&message.text, &message.attachments)?;
     // A session that already carries a name — a manual rename, an Agent title,
     // or an earlier message — keeps it.
     (session.title == agent_session_fallback_title(&session.agent_id) || session.title == title)

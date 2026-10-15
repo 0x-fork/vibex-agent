@@ -4163,7 +4163,9 @@ impl App {
         // for. The authority has no name for it until that message reaches a
         // turn — which waits on the Agent being materialized — and the
         // placeholder it reports until then is not what the reader wrote.
-        self.note_pending_session_title(&request_id, &outgoing.text);
+        // Pictures travel too: a creation that carries only a screenshot is
+        // named by its label, not left blank.
+        self.note_pending_session_title(&request_id, &outgoing.text, &outgoing.images);
         self.pending_creations.insert(
             request_id.clone(),
             PendingCreation {
