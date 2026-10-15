@@ -69,7 +69,7 @@ pub enum AppMessage {
         skill: Option<BackendResult<Vec<vibex_core::SkillMarketEntry>>>,
         /// What the registry said about the search itself, when it said
         /// anything: how much of the catalogue the page covers.
-        note: Option<String>,
+        note: Option<crate::app::MarketNote>,
     },
     /// A configuration write finished, so the area it changed is re-read.
     ConfigReload,
@@ -463,7 +463,7 @@ impl Dispatch {
     /// Search one registry and hand the page back.
     async fn search_registry(&mut self, module: crate::config_center::ConfigModule, query: String) {
         use crate::config_center::ConfigModule;
-        let result = match module {
+        let message = match module {
             ConfigModule::Mcp => {
                 let request = vibex_core::McpMarketSearchRequest {
                     query: (!query.trim().is_empty()).then_some(query),
@@ -473,15 +473,22 @@ impl Dispatch {
                     extend: None,
                 };
                 match self.facade.management().search_mcp_market(request).await {
-                    Ok(response) => Ok((
-                        response.entries,
-                        None,
-                        Some(format!(
-                            "{} / {}",
-                            response.total_matches, response.catalog_size
-                        )),
-                    )),
-                    Err(error) => Err(error),
+                    Ok(response) => AppMessage::Registry {
+                        module,
+                        note: Some(crate::app::MarketNote {
+                            shown: response.entries.len(),
+                            matched: Some(response.total_matches),
+                            exhausted: response.catalog_exhausted,
+                        }),
+                        mcp: Ok(response.entries),
+                        skill: None,
+                    },
+                    Err(error) => AppMessage::Registry {
+                        module,
+                        mcp: Err(error.clone()),
+                        skill: Some(Err(error)),
+                        note: None,
+                    },
                 }
             }
             _ => {
@@ -492,25 +499,29 @@ impl Dispatch {
                     sort: None,
                 };
                 match self.facade.management().search_skill_market(request).await {
-                    Ok(response) => Ok((Vec::new(), Some(Ok(response.entries)), None)),
-                    Err(error) => Err(error),
+                    Ok(response) => AppMessage::Registry {
+                        module,
+                        note: Some(crate::app::MarketNote {
+                            shown: response.entries.len(),
+                            // The Skill index pages by cursor and reports no
+                            // total, so the line counts what is on screen and
+                            // stops there rather than inventing a denominator.
+                            matched: None,
+                            exhausted: !response.has_more,
+                        }),
+                        mcp: Ok(Vec::new()),
+                        skill: Some(Ok(response.entries)),
+                    },
+                    Err(error) => AppMessage::Registry {
+                        module,
+                        mcp: Err(error.clone()),
+                        skill: Some(Err(error)),
+                        note: None,
+                    },
                 }
             }
         };
-        match result {
-            Ok((mcp, skill, note)) => self.send(AppMessage::Registry {
-                module,
-                mcp: Ok(mcp),
-                skill,
-                note,
-            }),
-            Err(error) => self.send(AppMessage::Registry {
-                module,
-                mcp: Err(error.clone()),
-                skill: Some(Err(error)),
-                note: None,
-            }),
-        }
+        self.send(message);
     }
 
     /// Issue one configuration-centre write and report what it did.
@@ -713,12 +724,13 @@ impl Dispatch {
                     Ok(response) => {
                         self.send(AppMessage::Registry {
                             module: crate::config_center::ConfigModule::Mcp,
+                            note: Some(crate::app::MarketNote {
+                                shown: response.entries.len(),
+                                matched: Some(response.total_matches),
+                                exhausted: response.catalog_exhausted,
+                            }),
                             mcp: Ok(response.entries),
                             skill: None,
-                            note: Some(format!(
-                                "{} / {}",
-                                response.total_matches, response.catalog_size
-                            )),
                         });
                         Ok(Outcome::Plain)
                     }
@@ -741,6 +753,30 @@ impl Dispatch {
                     .install_mcp_market_entry(request)
                     .await
                     .map(|_| Outcome::Plain)
+            }
+            M::ValidateMcpMarketEntry {
+                entry_id: _,
+                candidate,
+            } => {
+                // The entry is not a record yet, so the check names the
+                // candidate the registry published instead of an identifier.
+                let request = vibex_core::McpServerValidateRequest {
+                    mcp_server_id: None,
+                    candidate: Some(*candidate),
+                };
+                self.facade
+                    .management()
+                    .validate_mcp_server(request)
+                    .await
+                    .map(|result| {
+                        use vibex_core::McpServerValidationStatus as Status;
+                        Outcome::verdict(
+                            result.status == Status::Warn,
+                            result.status == Status::Fail,
+                            &result.code,
+                            &result.message,
+                        )
+                    })
             }
             M::CreateSkill(request) => {
                 let request = MutationRequest::new(*request);
@@ -835,9 +871,13 @@ impl Dispatch {
                     Ok(response) => {
                         self.send(AppMessage::Registry {
                             module: crate::config_center::ConfigModule::Skills,
+                            note: Some(crate::app::MarketNote {
+                                shown: response.entries.len(),
+                                matched: None,
+                                exhausted: !response.has_more,
+                            }),
                             mcp: Ok(Vec::new()),
                             skill: Some(Ok(response.entries)),
-                            note: None,
                         });
                         Ok(Outcome::Plain)
                     }

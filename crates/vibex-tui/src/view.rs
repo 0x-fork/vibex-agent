@@ -5627,8 +5627,17 @@ fn render_config_table(
             Style::default().fg(theme.roles.gray_dim),
         )));
     }
+    // The last row of the table belongs to the registry when one is on screen:
+    // forty rows of a catalogue the runtime is still walking must not read as
+    // the whole of it, and the sentence is about the page rather than about any
+    // record on it, so it sits under them rather than in the detail pane.
+    let note = registry_note(app, strings);
+    let reserved = u16::from(note.is_some());
     let selected = app.config_center.cursor(rows.len());
-    let window = area.height.saturating_sub(body_top) as usize;
+    let window = area
+        .height
+        .saturating_sub(body_top)
+        .saturating_sub(reserved) as usize;
     let first = selected.saturating_sub(window.saturating_sub(1) / 2);
     for (offset, row) in rows.iter().skip(first).take(window.max(1)).enumerate() {
         let index = first + offset;
@@ -5711,7 +5720,56 @@ fn render_config_table(
         first_row: first,
         heights: Vec::new(),
     });
+    let note_row = Rect {
+        y: area.y + area.height.saturating_sub(1),
+        height: 1,
+        ..area
+    };
     frame.render_widget(Paragraph::new(lines), area);
+    if let Some(note) = note {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(
+                    " {}",
+                    truncate_to_width(&note, usize::from(area.width).saturating_sub(1), "…")
+                ),
+                Style::default().fg(theme.roles.gray_dim),
+            ))),
+            note_row,
+        );
+    }
+}
+
+/// What the registry said about the page the table is showing, when the area on
+/// screen is one of the registries.
+///
+/// It is drawn from the numbers rather than stored as a sentence so the three
+/// languages can spell it, and it is only shown where it means something: the
+/// installed areas have no page and no catalogue behind them.
+fn registry_note(app: &App, strings: Strings) -> Option<String> {
+    if app.config_center.section != crate::config_center::ConfigSection::Catalog {
+        return None;
+    }
+    let note = app.management_data.market_note.as_ref()?;
+    let shown = note.shown;
+    let mut line = match note.matched {
+        Some(matched) => format!(
+            "{} {shown} {} {matched} {}",
+            strings.config_registry_shown(),
+            strings.config_registry_of(),
+            strings.config_registry_entries()
+        ),
+        None => format!(
+            "{} {shown} {}",
+            strings.config_registry_shown(),
+            strings.config_registry_entries()
+        ),
+    };
+    if !note.exhausted {
+        line.push_str(" · ");
+        line.push_str(strings.config_registry_indexing());
+    }
+    Some(line)
 }
 
 /// The columns the table lays out, in display columns.
@@ -8377,6 +8435,7 @@ fn render_overlay(
             title,
             value,
             field,
+            ..
         } => {
             let chrome = modal_chrome(
                 app,

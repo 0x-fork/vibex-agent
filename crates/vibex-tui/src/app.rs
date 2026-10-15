@@ -195,10 +195,18 @@ pub enum Overlay {
         confirm: Intent,
     },
     /// A single-line text prompt.
+    ///
+    /// `target` names the record the answer is about, for the prompts whose
+    /// answer is written to one — the value itself is a string, and a prompt
+    /// that sent it to whichever record the cursor happened to be on would be
+    /// answering about a record the reader never chose. It travels with the
+    /// overlay because the overlay outlives the cursor: a read that lands while
+    /// the reader is typing must not move the write.
     Prompt {
         title: String,
         field: PromptField,
         value: String,
+        target: Option<String>,
     },
     /// A multi-field editor for one configuration record.
     ///
@@ -642,12 +650,31 @@ pub struct ManagementData {
     /// rather than inside the surface that drew them.
     pub mcp_market: Vec<vibex_core::McpMarketEntry>,
     pub skill_market: Vec<vibex_core::SkillMarketEntry>,
-    /// What the registry answered about the read itself: how many entries the
-    /// page holds and whether another page exists.
-    pub market_note: Option<String>,
+    /// What the registry answered about the read itself: how much of the
+    /// registry the page on screen covers.
+    pub market_note: Option<MarketNote>,
     pub mcp_discoveries: Vec<vibex_core::McpServerDiscovery>,
     pub skill_discoveries: Vec<vibex_core::SkillDiscovery>,
     pub backups: Vec<vibex_core::BackupCreateOutcome>,
+}
+
+/// How much of a registry one page of it covers.
+///
+/// A page is not a catalog, and a reader who is shown forty rows has no way to
+/// tell "that is all there is" from "the index has not walked any further yet".
+/// The numbers travel together so the line under the table can say which of the
+/// two it is, instead of leaving the reader to guess whether to press search
+/// again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MarketNote {
+    /// Entries the table is showing.
+    pub shown: usize,
+    /// Entries across the whole index that matched the query, when the registry
+    /// reports one. The Skill market pages by cursor and reports no total.
+    pub matched: Option<usize>,
+    /// Whether the runtime had walked the registry to its last page. `false`
+    /// means the list is a window that is still widening.
+    pub exhausted: bool,
 }
 
 /// The reader's own arrangement of the session list.
@@ -8442,6 +8469,16 @@ pub enum ConfigMutation {
         candidate: Box<vibex_core::McpServerCreateRequest>,
         env_values: Vec<vibex_core::McpServerEnvEntry>,
     },
+    /// Check a registry entry's launcher before installing it.
+    ///
+    /// The entry has no record yet, so the check travels with the candidate the
+    /// registry published rather than with an identifier the authority does not
+    /// hold: the answer is about the entry the reader is looking at, not about
+    /// whatever row the cursor moved to.
+    ValidateMcpMarketEntry {
+        entry_id: String,
+        candidate: Box<vibex_core::McpServerCreateRequest>,
+    },
     // ---- Skills ---------------------------------------------------------
     CreateSkill(Box<vibex_core::SkillCreateRequest>),
     UpdateSkill(Box<vibex_core::SkillUpdateRequest>),
@@ -8503,6 +8540,7 @@ impl ConfigMutation {
             Self::ImportMcpServer { selection } => selection.discovery_id.clone(),
             Self::SearchMcpMarket { .. } => "mcp:market".to_string(),
             Self::InstallMcpMarketEntry { entry_id, .. } => entry_id.clone(),
+            Self::ValidateMcpMarketEntry { entry_id, .. } => entry_id.clone(),
             Self::CreateSkill(_) => "skill:new".to_string(),
             Self::UpdateSkill(request) => request.skill_id.as_str().to_string(),
             Self::DeleteSkill { skill_id }
@@ -8537,6 +8575,7 @@ impl ConfigMutation {
             Self::ImportMcpServer { .. } => "mcp_import",
             Self::SearchMcpMarket { .. } => "mcp_market",
             Self::InstallMcpMarketEntry { .. } => "mcp_install",
+            Self::ValidateMcpMarketEntry { .. } => "mcp_market_validate",
             Self::CreateSkill(_) => "skill_create",
             Self::UpdateSkill(_) => "skill_update",
             Self::DeleteSkill { .. } => "skill_delete",
@@ -8580,7 +8619,8 @@ impl ConfigMutation {
             }
             Self::ValidateMcpServer { .. }
             | Self::ValidateSkill { .. }
-            | Self::ValidatePrompt { .. } => Verb::Validate,
+            | Self::ValidatePrompt { .. }
+            | Self::ValidateMcpMarketEntry { .. } => Verb::Validate,
             Self::SetMcpAgentMatrix { .. } | Self::SetSkillAgentMatrix { .. } => Verb::SetAgents,
             Self::DiscoverMcpSources | Self::DiscoverSkillSources => Verb::Discover,
             Self::ImportMcpServer { .. } | Self::ImportSkill { .. } => Verb::Import,

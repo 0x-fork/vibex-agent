@@ -1715,6 +1715,7 @@ fn a_secret_prompt_never_echoes_the_secret() {
         title: "Credential".to_string(),
         field: vibex_tui::app::PromptField::ProviderSecret,
         value: "sk-super-secret-sentinel".to_string(),
+        target: Some("provider_profile_test".to_string()),
     });
     let screen = text(&render(&mut app, 120, 40));
     assert!(

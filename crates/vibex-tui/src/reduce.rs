@@ -1372,6 +1372,7 @@ impl App {
                 PromptField::NewFolderName
             },
             value: String::new(),
+            target: None,
         });
         Outcome::effects(vec![])
     }
@@ -1462,6 +1463,15 @@ impl App {
             self.pending_config_action = Some((key.to_string(), action));
             self.confirm_config_delete(key, Intent::ConfigEntryDelete);
             return Outcome::effects(vec![]);
+        }
+        // `Edit` is not a write but an editor: it opens the form on the record
+        // the menu was opened for. It resolves through the row for the same
+        // reason every other verb does — a read that lands while the menu is
+        // open must not put the form on whichever record took the cursor's
+        // place.
+        if action == crate::config_center::ConfigAction::Edit {
+            let row = self.config_row(key);
+            return self.begin_entry_form(row);
         }
         self.exec_config_action(key, action)
     }
@@ -1587,10 +1597,14 @@ impl App {
                 )
             }
             (ConfigSection::Providers, ConfigAction::Secret) => {
+                // The profile the key is for travels with the prompt: the list
+                // can be re-read while the reader is typing, and the row the
+                // cursor then points at is not the row they pressed.
                 self.overlay = Some(Overlay::Prompt {
                     title: self.strings.config_action_secret().to_string(),
                     field: PromptField::ProviderSecret,
                     value: String::new(),
+                    target: Some(key.to_string()),
                 });
                 Outcome::effects(vec![])
             }
@@ -1714,6 +1728,7 @@ impl App {
                 self.begin_config_mutation(crate::app::ConfigMutation::ValidatePrompt { prompt_id })
             }
             (ConfigSection::Catalog, ConfigAction::Install) => self.install_registry_entry(key),
+            (ConfigSection::Catalog, ConfigAction::Validate) => self.validate_registry_entry(key),
             (ConfigSection::Sources, ConfigAction::Import) => self.import_discovery(key),
             _ => Outcome::quiet(),
         }
@@ -1862,46 +1877,10 @@ impl App {
     fn install_registry_entry(&mut self, key: &str) -> Outcome {
         use crate::config_center::ConfigModule;
         if self.config_center.module == ConfigModule::Mcp {
-            let Some(entry) = self
-                .management_data
-                .mcp_market
-                .iter()
-                .find(|entry| entry.id == key)
-                .cloned()
-            else {
+            let Some(entry) = self.mcp_market_entry(key) else {
                 return Outcome::quiet();
             };
-            let env = entry
-                .env
-                .iter()
-                .map(|requirement| {
-                    let value = requirement.default_value.clone().unwrap_or_default();
-                    (requirement.name.clone(), value)
-                })
-                .collect::<Vec<_>>();
-            let candidate = vibex_core::McpServerCreateRequest {
-                display_name: entry.name.clone(),
-                transport_kind: entry.transport,
-                status: vibex_core::McpServerStatus::Enabled,
-                scope_kind: vibex_core::McpServerScopeKind::User,
-                project_id: None,
-                workspace_id: None,
-                command: entry.command.clone(),
-                args: entry.args.clone(),
-                env: env
-                    .iter()
-                    .map(|(name, value)| vibex_core::McpServerEnvEntry {
-                        name: name.clone(),
-                        value: value.clone(),
-                    })
-                    .collect(),
-                url: entry.url.clone(),
-                headers: Vec::new(),
-                description: entry.description.clone(),
-                tags: vec!["market".to_string()],
-                secret_references: Vec::new(),
-                provider_matrix: Vec::new(),
-            };
+            let candidate = mcp_market_candidate(&entry);
             let env_values = candidate.env.clone();
             return self.begin_config_mutation(crate::app::ConfigMutation::InstallMcpMarketEntry {
                 entry_id: entry.id.clone(),
@@ -1924,6 +1903,35 @@ impl App {
             owner_handle: entry.owner_handle.clone(),
             version: entry.version.clone(),
         })
+    }
+
+    /// Check one registry entry's launcher before it is installed.
+    ///
+    /// The entry has no record to name, so the candidate the registry published
+    /// travels with the request: the answer is about the entry the reader is
+    /// looking at, and the reader finds out whether it would launch before
+    /// anything is written rather than after.
+    fn validate_registry_entry(&mut self, key: &str) -> Outcome {
+        use crate::config_center::ConfigModule;
+        if self.config_center.module != ConfigModule::Mcp {
+            return Outcome::quiet();
+        }
+        let Some(entry) = self.mcp_market_entry(key) else {
+            return Outcome::quiet();
+        };
+        self.begin_config_mutation(crate::app::ConfigMutation::ValidateMcpMarketEntry {
+            entry_id: entry.id.clone(),
+            candidate: Box::new(mcp_market_candidate(&entry)),
+        })
+    }
+
+    /// One entry of the registry page the centre asked for.
+    fn mcp_market_entry(&self, key: &str) -> Option<vibex_core::McpMarketEntry> {
+        self.management_data
+            .mcp_market
+            .iter()
+            .find(|entry| entry.id == key)
+            .cloned()
     }
 
     /// Import one discovered resource, carrying the candidate the runtime
@@ -2630,14 +2638,48 @@ impl App {
                     return Err("unknown record");
                 };
                 let enabled = form.enabled_agents();
-                let matrix = server
-                    .agent_matrix
+                // The form draws every Agent the client knows about, so the
+                // matrix is rebuilt over that set: an Agent the record had
+                // never been assigned to is a switch the reader can turn on,
+                // and a matrix built from the record's own entries would drop
+                // that press on the floor. Entries the form did not draw —
+                // an Agent that has since left the roster — keep what they
+                // had rather than being swept away by an editor that never
+                // showed them.
+                let mut matrix = self
+                    .management_data
+                    .agents
                     .iter()
-                    .map(|entry| vibex_core::McpServerAgentMatrix {
-                        enabled: enabled.iter().any(|id| id == entry.agent_id.as_str()),
-                        ..entry.clone()
+                    .map(|agent| {
+                        let existing = server
+                            .agent_matrix
+                            .iter()
+                            .find(|entry| entry.agent_id == agent.id);
+                        vibex_core::McpServerAgentMatrix {
+                            agent_id: agent.id.clone(),
+                            enabled: enabled.iter().any(|id| id == agent.id.as_str()),
+                            source_kind: existing
+                                .map(|entry| entry.source_kind)
+                                .unwrap_or(vibex_core::ResourceAgentMatrixSourceKind::Manual),
+                            updated_at_ms: existing
+                                .map(|entry| entry.updated_at_ms)
+                                .unwrap_or_else(vibex_core::unix_timestamp_ms),
+                        }
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                matrix.extend(
+                    server
+                        .agent_matrix
+                        .iter()
+                        .filter(|entry| {
+                            !self
+                                .management_data
+                                .agents
+                                .iter()
+                                .any(|agent| agent.id == entry.agent_id)
+                        })
+                        .cloned(),
+                );
                 Ok(ConfigMutation::SetMcpAgentMatrix { server_id, matrix })
             }
             FormPurpose::SkillMatrix { skill_id } => {
@@ -2651,14 +2693,43 @@ impl App {
                     return Err("unknown record");
                 };
                 let enabled = form.enabled_agents();
-                let matrix = skill
-                    .agent_matrix
+                // Same rule as the MCP matrix: the form is the set, and an
+                // Agent it drew can be switched on whether or not the record
+                // already held an entry for it.
+                let mut matrix = self
+                    .management_data
+                    .agents
                     .iter()
-                    .map(|entry| vibex_core::SkillAgentMatrix {
-                        enabled: enabled.iter().any(|id| id == entry.agent_id.as_str()),
-                        ..entry.clone()
+                    .map(|agent| {
+                        let existing = skill
+                            .agent_matrix
+                            .iter()
+                            .find(|entry| entry.agent_id == agent.id);
+                        vibex_core::SkillAgentMatrix {
+                            agent_id: agent.id.clone(),
+                            enabled: enabled.iter().any(|id| id == agent.id.as_str()),
+                            source_kind: existing
+                                .map(|entry| entry.source_kind)
+                                .unwrap_or(vibex_core::ResourceAgentMatrixSourceKind::Manual),
+                            updated_at_ms: existing
+                                .map(|entry| entry.updated_at_ms)
+                                .unwrap_or_else(vibex_core::unix_timestamp_ms),
+                        }
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                matrix.extend(
+                    skill
+                        .agent_matrix
+                        .iter()
+                        .filter(|entry| {
+                            !self
+                                .management_data
+                                .agents
+                                .iter()
+                                .any(|agent| agent.id == entry.agent_id)
+                        })
+                        .cloned(),
+                );
                 Ok(ConfigMutation::SetSkillAgentMatrix { skill_id, matrix })
             }
         }
@@ -2706,6 +2777,20 @@ impl App {
         Outcome::effects(effects)
     }
 
+    /// The record a key names, as the table draws it.
+    ///
+    /// Every verb in the centre resolves through the key rather than through
+    /// the cursor, so the record it acts on is the record the reader pressed
+    /// on. A row that is no longer listed answers `None`, which is what lets a
+    /// verb that needs the record itself — opening its editor — refuse rather
+    /// than guess.
+    fn config_row(&self, key: &str) -> Option<crate::config_center::ConfigRow> {
+        self.config_center
+            .rows(&self.management_data, self.strings)
+            .into_iter()
+            .find(|row| row.key == key)
+    }
+
     /// The title of the record a key names, as the table draws it.
     ///
     /// The answer is a sentence about a record the reader can see, so it is
@@ -2713,10 +2798,7 @@ impl App {
     /// save names the form, and a record that is no longer listed falls back to
     /// the key, which is at least true.
     fn config_row_subject(&self, key: &str) -> String {
-        self.config_center
-            .rows(&self.management_data, self.strings)
-            .into_iter()
-            .find(|row| row.key == key)
+        self.config_row(key)
             .map(|row| row.title)
             .unwrap_or_else(|| key.to_string())
     }
@@ -3026,10 +3108,11 @@ impl App {
                 field,
                 value,
                 title,
+                target,
             } => match intent {
                 Intent::ConfirmOverlay => {
                     self.overlay = None;
-                    let mut outcome = self.submit_prompt(field, value, title);
+                    let mut outcome = self.submit_prompt(field, value, title, target);
                     outcome.dirty = true;
                     outcome
                 }
@@ -3407,7 +3490,13 @@ impl App {
         }
     }
 
-    fn submit_prompt(&mut self, field: PromptField, value: String, title: String) -> Outcome {
+    fn submit_prompt(
+        &mut self,
+        field: PromptField,
+        value: String,
+        title: String,
+        target: Option<String>,
+    ) -> Outcome {
         let trimmed = value.trim().to_string();
         match field {
             PromptField::NewFolderName | PromptField::RenameFolderName => {
@@ -3484,11 +3573,14 @@ impl App {
                 Outcome::effects(vec![])
             }
             PromptField::ProviderSecret => {
-                let index = self.selection_for(Scope::Providers);
-                let Some(profile) = self.management_data.providers.get(index) else {
+                // The profile the reader pressed on, named by the prompt itself
+                // rather than read back from the cursor: the list may have been
+                // re-read while they typed, and the answer belongs to the record
+                // the key was asked for.
+                let Some(profile_id) = target.as_deref().and_then(|id| parse_config_id(id).ok())
+                else {
                     return Outcome::quiet();
                 };
-                let profile_id = profile.id.clone();
                 // The drafted secret is dropped as soon as it is submitted.
                 Outcome::effects(vec![Effect::WriteProviderSecret {
                     profile_id,
@@ -4202,6 +4294,7 @@ impl App {
             title: self.strings.session_rename().to_string(),
             field: PromptField::RenameSession,
             value: title,
+            target: None,
         });
         Outcome::effects(vec![])
     }
@@ -5699,6 +5792,7 @@ impl App {
             title,
             field: PromptField::RunOptionValue,
             value,
+            target: None,
         });
         Outcome::effects(vec![])
     }
@@ -6438,6 +6532,39 @@ impl ElicitationDraft {
 /// "nothing happened" rather than writing to a guessed id.
 fn parse_config_id<T: std::str::FromStr>(value: &str) -> Result<T, &'static str> {
     value.parse().map_err(|_| "unknown record")
+}
+
+/// One registry entry as the record installing it would create.
+///
+/// The registry publishes a launcher, not a record: the scope, the status and
+/// the tag that says where it came from are this client's decisions, and both
+/// "install" and "check it first" have to make them the same way or a check
+/// would answer about a different server than the install writes.
+fn mcp_market_candidate(entry: &vibex_core::McpMarketEntry) -> vibex_core::McpServerCreateRequest {
+    vibex_core::McpServerCreateRequest {
+        display_name: entry.name.clone(),
+        transport_kind: entry.transport,
+        status: vibex_core::McpServerStatus::Enabled,
+        scope_kind: vibex_core::McpServerScopeKind::User,
+        project_id: None,
+        workspace_id: None,
+        command: entry.command.clone(),
+        args: entry.args.clone(),
+        env: entry
+            .env
+            .iter()
+            .map(|requirement| vibex_core::McpServerEnvEntry {
+                name: requirement.name.clone(),
+                value: requirement.default_value.clone().unwrap_or_default(),
+            })
+            .collect(),
+        url: entry.url.clone(),
+        headers: Vec::new(),
+        description: entry.description.clone(),
+        tags: vec!["market".to_string()],
+        secret_references: Vec::new(),
+        provider_matrix: Vec::new(),
+    }
 }
 
 /// `KEY=value` (or `Name: value`) per line, as the forms ask for them.
@@ -7537,6 +7664,7 @@ mod tests {
             title: "Notes".to_string(),
             field: PromptField::RunOptionValue,
             value: String::new(),
+            target: None,
         });
         app.perform(Intent::Back);
         assert_eq!(app.run_option_prompt, None);

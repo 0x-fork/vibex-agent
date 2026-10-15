@@ -618,6 +618,7 @@ fn handle_key(
             field,
             value,
             title,
+            target,
         } = overlay
         {
             match key.code {
@@ -628,6 +629,7 @@ fn handle_key(
                         field,
                         value,
                         title,
+                        target,
                     });
                     return Ok(false);
                 }
@@ -638,6 +640,7 @@ fn handle_key(
                         field,
                         value,
                         title,
+                        target,
                     });
                     return Ok(false);
                 }
@@ -1960,6 +1963,7 @@ fn apply_clipboard(
                     title: app.strings.image_path_title().to_string(),
                     field: crate::app::PromptField::ImagePath,
                     value: String::new(),
+                    target: None,
                 });
                 app.toast(Toast::info(app.strings.image_clipboard_empty().to_string()));
             }
@@ -2825,6 +2829,7 @@ pub fn prompt_for(app: &mut App, title: String, field: PromptField) {
         title,
         field,
         value: String::new(),
+        target: None,
     });
 }
 

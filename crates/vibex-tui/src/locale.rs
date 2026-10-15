@@ -863,6 +863,13 @@ strings! {
     config_pane_records => { "Records", "记录", "記錄" },
     config_focus => { "Focus", "焦点", "焦點" },
     config_search_hint => { "type to filter", "输入以筛选", "輸入以篩選" },
+    // The line under a registry page. A page is not a catalogue, so the reader
+    // is told how much of it they are looking at and whether the list can still
+    // grow while they watch.
+    config_registry_shown => { "showing", "已显示", "已顯示" },
+    config_registry_of => { "of", "/", "/" },
+    config_registry_entries => { "registry entries", "条注册表条目", "條註冊表條目" },
+    config_registry_indexing => { "still indexing", "仍在索引", "仍在索引" },
     config_detail => { "Details", "详情", "詳情" },
     config_no_selection => { "No record selected", "未选择记录", "未選擇記錄" },
     config_empty => { "Nothing here yet", "这里还没有内容", "這裡還沒有內容" },

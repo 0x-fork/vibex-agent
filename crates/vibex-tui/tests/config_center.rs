@@ -902,3 +902,259 @@ fn a_notice_shifts_the_verb_buttons_without_losing_the_click() {
         .expect("the press did not start the verb it was over");
     assert_eq!(pending.verb, ConfigVerb::CheckUpdate);
 }
+
+/// One Agent other than the built-in `codex`, so a matrix has two rows.
+fn second_agent() -> vibex_core::AgentSnapshotEntry {
+    serde_json::from_value(serde_json::json!({
+        "id": "claude",
+        "label": "Claude",
+        "runtimeKind": "acp",
+        "sourceKind": "builtin",
+        "added": true,
+        "enabled": true,
+        "orderIndex": 1,
+        "installed": true,
+        "configured": true,
+        "installStatus": "installed",
+        "managedInstall": {"managed": false, "status": "external"},
+        "configStatus": "configured",
+        "runtimeStatus": "ready",
+        "models": [],
+        "modes": [],
+        "capabilityHints": [],
+        "env": {},
+        "params": {},
+        "diagnostics": [],
+        "nativeConfigPaths": []
+    }))
+    .expect("agent fixture")
+}
+
+/// One model provider profile, as the Agent's own list reports it.
+fn provider_profile(id: &str, name: &str) -> vibex_core::ProviderProfileSummary {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "agentId": "codex",
+        "kind": "codex",
+        "displayName": name,
+        "status": "enabled",
+        "configuredModels": [],
+        "secretSetupState": "missing",
+        "updatedAtMs": 1
+    }))
+    .expect("provider fixture")
+}
+
+/// One registry entry, as the market page lists it.
+fn market_entry(id: &str) -> vibex_core::McpMarketEntry {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "name": "Trace tools",
+        "description": "Inspect a trace",
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@example/trace"],
+        "env": [{
+            "name": "TRACE_TOKEN",
+            "required": true,
+            "secret": true,
+            "defaultValue": "from-registry"
+        }],
+        "version": "1.0.0",
+        "author": "example",
+        "packageKind": "npm",
+        "status": "active"
+    }))
+    .expect("market fixture")
+}
+
+/// The action the menu offers, chosen the way the reader chooses it.
+fn choose_action(app: &mut App, action: ConfigAction) {
+    let Some(Overlay::EntryActions { mut entry }) = app.overlay.clone() else {
+        panic!("the action menu was not open");
+    };
+    entry.selected = entry
+        .actions
+        .iter()
+        .position(|offered| *offered == action)
+        .unwrap_or_else(|| panic!("the record does not offer {action:?}"));
+    app.overlay = Some(Overlay::EntryActions { entry });
+    app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+}
+
+/// `Edit` in the action menu is the editor, not a verb with no write behind it.
+///
+/// The menu is the surface's front door — `Enter` opens it on every record — so
+/// a verb it offers and the reducer does not answer is a key that does nothing
+/// at all. It is offered by four modules, and each of them has an editor to
+/// open.
+#[test]
+fn the_action_menu_opens_the_editor_for_the_record_it_was_opened_on() {
+    for (module, section, expected) in [
+        (ConfigModule::Mcp, ConfigSection::Servers, "Filesystem"),
+        (ConfigModule::Prompts, ConfigSection::Prompts, "Review"),
+    ] {
+        let mut app = loaded(140, 40);
+        app.show_config_module(module, Some(section));
+        app.perform(vibex_tui::action::Intent::ConfigEntryActions);
+        choose_action(&mut app, ConfigAction::Edit);
+        let Some(Overlay::Form { form }) = app.overlay.clone() else {
+            panic!("{module:?}: Edit opened no editor");
+        };
+        assert_eq!(
+            form.value("name").as_deref(),
+            Some(expected),
+            "{module:?}: the editor opened on another record"
+        );
+    }
+}
+
+/// A provider's secret is written to the profile the reader pressed on.
+///
+/// The prompt is one line of text with no room for the record it is about, so
+/// the target travels with it. Reading it back from the list cursor instead
+/// would send the key to whichever profile happened to be under the cursor when
+/// the reader pressed `Enter` — and a read landing while they type is enough to
+/// move it.
+#[test]
+fn a_provider_secret_is_written_to_the_profile_it_was_asked_for() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![
+        provider_profile("provider_first", "First"),
+        provider_profile("provider_second", "Second"),
+    ];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    let outcome = app.run_config_action_by_key("provider_second", ConfigAction::Secret);
+    assert!(outcome.effects.is_empty(), "the prompt wrote something");
+    let Some(Overlay::Prompt { target, .. }) = app.overlay.clone() else {
+        panic!("the secret prompt did not open");
+    };
+    assert_eq!(target.as_deref(), Some("provider_second"));
+
+    // The list moving under the prompt must not move the write.
+    app.set_selection(vibex_tui::keymap::Scope::Providers, 0);
+    if let Some(Overlay::Prompt { value, .. }) = app.overlay.as_mut() {
+        *value = "sk-sentinel".to_string();
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::WriteProviderSecret { profile_id, secret }] => {
+            assert_eq!(profile_id.as_str(), "provider_second");
+            assert_eq!(secret, "sk-sentinel");
+        }
+        other => panic!("the secret produced {other:?}"),
+    }
+}
+
+/// `Validate` on a registry entry checks the launcher that would be installed.
+///
+/// The entry has no record yet, so the check has to carry the candidate the
+/// registry published. A menu that offers the verb and answers nothing is worse
+/// than one that does not offer it: the reader is told the entry is fine by a
+/// client that never looked.
+#[test]
+fn a_registry_entry_can_be_checked_before_it_is_installed() {
+    let mut app = loaded(140, 40);
+    app.management_data.mcp_market = vec![market_entry("registry_trace")];
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Catalog));
+
+    let outcome = app.run_config_action_by_key("registry_trace", ConfigAction::Validate);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            assert_eq!(mutation.label(), "mcp_market_validate");
+            let vibex_tui::app::ConfigMutation::ValidateMcpMarketEntry { candidate, .. } = mutation
+            else {
+                panic!("the check did not carry a candidate: {mutation:?}");
+            };
+            assert_eq!(candidate.command.as_deref(), Some("npx"));
+            assert_eq!(
+                candidate
+                    .env
+                    .iter()
+                    .map(|entry| (entry.name.as_str(), entry.value.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![("TRACE_TOKEN", "from-registry")]
+            );
+        }
+        other => panic!("the check produced {other:?}"),
+    }
+}
+
+/// An Agent the record never held can be switched on in the matrix form.
+///
+/// The form draws every Agent the client knows about, so it is the set the
+/// matrix is rebuilt from: rebuilding it out of the record's own entries would
+/// silently drop the one press the reader made, which is the only reason they
+/// opened the form.
+#[test]
+fn the_matrix_form_enables_an_agent_the_record_did_not_hold() {
+    let mut app = loaded(140, 40);
+    app.management_data.agents = vec![agent(), second_agent()];
+    app.show_config_module(ConfigModule::Mcp, None);
+    // The fixture server is assigned to `codex` alone.
+    app.perform(vibex_tui::action::Intent::ConfigEntryActions);
+    choose_action(&mut app, ConfigAction::Matrix);
+    let Some(Overlay::Form { form }) = app.overlay.as_mut() else {
+        panic!("the matrix form did not open");
+    };
+    let field = form
+        .fields
+        .iter_mut()
+        .find(|field| field.key == "agent:claude")
+        .expect("the form did not draw the second Agent");
+    field.value = "on".to_string();
+
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::SetMcpAgentMatrix { matrix, .. } = mutation else {
+                panic!("the save was not a matrix write: {mutation:?}");
+            };
+            let claude = matrix
+                .iter()
+                .find(|entry| entry.agent_id.as_str() == "claude")
+                .expect("the Agent that was switched on is missing from the write");
+            assert!(claude.enabled);
+            // And the assignment the record already had is left as it was.
+            let codex = matrix
+                .iter()
+                .find(|entry| entry.agent_id.as_str() == "codex")
+                .expect("the existing assignment was dropped");
+            assert!(codex.enabled);
+            assert_eq!(codex.updated_at_ms, 1);
+        }
+        other => panic!("the save produced {other:?}"),
+    }
+}
+
+/// A registry page says how much of the registry it is.
+///
+/// Forty rows of a catalogue the runtime is still walking must not read as the
+/// whole of it. The line belongs to the registry areas only: the installed
+/// areas have no page behind them.
+#[test]
+fn a_registry_page_says_how_much_of_the_registry_it_covers() {
+    let mut app = loaded(140, 40);
+    app.management_data.mcp_market = vec![market_entry("registry_trace")];
+    app.management_data.market_note = Some(vibex_tui::app::MarketNote {
+        shown: 1,
+        matched: Some(312),
+        exhausted: false,
+    });
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Catalog));
+    let screen = text(&mut app, 140, 40);
+    assert!(
+        screen.contains("showing 1 of 312 registry entries"),
+        "the page did not say how much it covers:\n{screen}"
+    );
+    assert!(
+        screen.contains("still indexing"),
+        "the page claimed to be the whole registry:\n{screen}"
+    );
+
+    // The installed area has no catalogue behind it, so it has no such line.
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Servers));
+    let screen = text(&mut app, 140, 40);
+    assert!(!screen.contains("registry entries"), "{screen}");
+}
