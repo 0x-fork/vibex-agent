@@ -647,8 +647,6 @@ pub const SIDEBAR_AGENT_LOGO_SIZE: f32 = 14.0;
 pub const SIDEBAR_PROJECT_LOGO_SIZE: f32 = 16.0;
 /// Worktree and session status dot.
 pub const SIDEBAR_STATUS_DOT: f32 = 8.0;
-/// Desktop's compact spinner size for an active workspace or session.
-pub const SIDEBAR_STATUS_ICON_SIZE: f32 = 12.0;
 /// Unread-completion dot, which is deliberately smaller than a status dot.
 pub const SIDEBAR_UNREAD_DOT: f32 = 7.0;
 
