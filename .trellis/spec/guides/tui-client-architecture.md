@@ -893,6 +893,29 @@ is never a column count.
     client drawing a session list reads it as a navigation root. A client whose
     own creation reply races the announcement still ends up with a navigation row
     rather than a delegated one.
+    - *The ownership page is not that list.* A tree page's registry describes the
+      nodes on the page, and a node the page returns **without a parent edge** is
+      an ownership root — exactly the set the root list holds — so it is never
+      filed among the delegated rows. Filing it hid a row from the sidebar and,
+      because a page can describe a creation the moment its row commits while the
+      announcement waits out the event batch, registered the session the
+      announcement was about: the announcement then read as news about a row the
+      workbench already knew, so no list was ever reloaded for the row it was
+      missing. A root the workbench has not met is instead answered like an
+      announcement it cannot place — the root page is marked stale and the pass
+      woken — and the row arrives from the root list, which is the only
+      projection that adds one. A row a mutation in flight has taken off the
+      sidebar is not a reason to re-read anything: the read filters it back out
+      until the mutation settles.
+    - *A gap in the fan-out is the same news.* A creation rides the fan-out
+      stream, and no later event names the row it announced, so a receiver that
+      lagged past it lost the only notice the sidebar would have drawn: a lagged
+      fan-out re-reads the root list (`load_agent_overview`) instead of trusting
+      some unrelated action to. A remote seat needs that read for the sidebar
+      invalidation itself — a paired runtime announces a creation that way and
+      through no other event — so the invalidation is recognized where the
+      backend event is still visible, before the mapping to event types that have
+      no twin for it drops it.
 * **A running turn is what the spinner animates on.** `is_animating` is the
   single question the loop asks before repainting on its own, and it answers
   yes while a turn reads as running (`turn_reads_running`), not only while

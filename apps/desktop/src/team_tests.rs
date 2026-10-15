@@ -1780,6 +1780,15 @@ async fn team_root_page_advances_in_the_background_without_a_footer_pager(cx: &m
     let backend = Arc::new(NativeBackend::new(runtime.clone())).facade();
     workbench.update(cx, |workbench, cx| {
         workbench.backend = Some(backend);
+        // The fixture's rows are all ownership roots in the runtime's database,
+        // and the root list is what a root's row is drawn from. Adopting it
+        // first keeps this test about paging the ownership page rather than
+        // about a list that still has to be re-read for rows it never met.
+        let mut roots = workbench.sessions.clone();
+        roots.extend(workbench.delegated_sessions.values().cloned());
+        roots.sort_by(|left, right| left.id.cmp(&right.id));
+        workbench.sessions = roots;
+        workbench.delegated_sessions.clear();
         workbench.refresh_delegated_sessions(cx);
     });
     let root_page_settled = |workbench: &VibexWorkbench| {
@@ -2242,4 +2251,216 @@ fn a_committed_deletion_keeps_its_row_off_the_sidebar(cx: &mut TestAppContext) {
             "a failed deletion has to put its row back"
         );
     });
+}
+
+/// An ownership root the workbench has never met is not a delegated child.
+///
+/// The root page describes every session without an ownership edge — exactly
+/// the set the sidebar's root list draws from — and it can describe a session
+/// another client just created while the announcement that names it is still
+/// waiting out the event batch. Filing that row among the delegated ones took
+/// it off the sidebar *and* registered the session the announcement was about,
+/// so the announcement looked like news about a row the workbench already knew:
+/// nothing reloaded the list the row was missing from, and the session stayed
+/// invisible until some unrelated action happened to reload the overview.
+#[gpui::test]
+fn team_root_page_never_files_a_navigation_root_as_a_delegated_child(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    workbench.update(cx, |workbench, cx| {
+        // A session the page describes without a parent is an ownership root,
+        // and the tree page is not the list the sidebar is drawn from: the root
+        // list is marked stale so the row arrives from the projection that owns
+        // it, rather than being parked as somebody's child.
+        let created = session(5);
+        workbench.delegated_roots_dirty = false;
+        workbench.apply_delegated_page(
+            None,
+            false,
+            SessionTreePage {
+                nodes: vec![node(5, None, 0)],
+                registry: vec![created.clone()],
+                ..Default::default()
+            },
+            cx,
+        );
+        assert!(
+            !workbench
+                .delegated_sessions
+                .contains_key(created.id.as_str()),
+            "a root owns itself, so the row is nobody's child"
+        );
+        assert!(
+            workbench.delegated_roots_dirty,
+            "the list that draws the row is marked stale"
+        );
+        assert!(
+            !workbench.sessions.iter().any(|root| root.id == created.id),
+            "the page describes ownership; the root list adds the row"
+        );
+
+        // An announcement the workbench could not place parked the snapshot
+        // exactly there. The same page is the answer, and it has to take the
+        // row back out of the delegated registry.
+        let announced = session(6);
+        workbench.apply_desktop_event(DesktopEvent::SessionUpdated(announced.clone()), cx);
+        assert!(
+            workbench
+                .delegated_sessions
+                .contains_key(announced.id.as_str()),
+            "an announced session the workbench cannot place is parked"
+        );
+        workbench.delegated_roots_dirty = false;
+        workbench.apply_delegated_page(
+            None,
+            false,
+            SessionTreePage {
+                nodes: vec![node(6, None, 0)],
+                registry: vec![announced.clone()],
+                ..Default::default()
+            },
+            cx,
+        );
+        assert!(
+            !workbench
+                .delegated_sessions
+                .contains_key(announced.id.as_str()),
+            "the ownership edge settles what the announcement could not"
+        );
+        assert!(workbench.delegated_roots_dirty);
+
+        // A child of the page keeps its registry entry: that map is what the
+        // branch draws its rows from, and it is not a root list row.
+        let parent = session(5).id.to_string();
+        let child = session(7);
+        workbench.delegated_roots_dirty = false;
+        workbench.apply_delegated_page(
+            Some(parent),
+            false,
+            SessionTreePage {
+                nodes: vec![node(7, Some(5), 0)],
+                registry: vec![child.clone()],
+                ..Default::default()
+            },
+            cx,
+        );
+        assert!(
+            workbench.delegated_sessions.contains_key(child.id.as_str()),
+            "a delegated child is registered under its parent"
+        );
+        assert!(
+            !workbench.delegated_roots_dirty,
+            "a child is not a row the root list has to be re-read for"
+        );
+
+        // A row the workbench is deliberately hiding is not one either: a
+        // deletion in flight filters it back out of every read, so re-reading
+        // would only be told the same thing until the mutation settles.
+        let deleting = session(8);
+        workbench
+            .pending_session_deletion_ids
+            .insert(deleting.id.to_string());
+        workbench.delegated_roots_dirty = false;
+        workbench.apply_delegated_page(
+            None,
+            false,
+            SessionTreePage {
+                nodes: vec![node(8, None, 0)],
+                registry: vec![deleting],
+                ..Default::default()
+            },
+            cx,
+        );
+        assert!(
+            !workbench.delegated_roots_dirty,
+            "a row a mutation took off the sidebar is not a stale list"
+        );
+    });
+}
+
+/// A fanout gap re-reads the list it may have dropped a row from.
+///
+/// The creation announcement rides the fanout stream, and no later event names
+/// the row it announced: a receiver that lagged past it lost the only notice
+/// the sidebar would have drawn, and the notification the timeline still
+/// raised left the reader looking at a session that was not in the list. A
+/// timeline gap is answered on the timeline it was seen on and is not a reason
+/// to re-read the session list.
+#[gpui::test]
+fn team_fanout_gap_reloads_the_session_list(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    workbench.update(cx, |workbench, cx| {
+        let before = workbench.agent_overview_generation;
+        workbench.apply_desktop_event(
+            DesktopEvent::Lagged {
+                stream: DesktopEventStream::Fanout,
+                skipped: 2,
+                refetch: AuthoritativeRefetch::for_stream(DesktopEventStream::Fanout),
+            },
+            cx,
+        );
+        assert_eq!(
+            workbench.agent_overview_generation,
+            before.wrapping_add(1),
+            "a creation the fanout dropped is only found in the root list"
+        );
+
+        let before = workbench.agent_overview_generation;
+        workbench.apply_desktop_event(
+            DesktopEvent::Lagged {
+                stream: DesktopEventStream::Timeline,
+                skipped: 2,
+                refetch: AuthoritativeRefetch::for_stream(DesktopEventStream::Timeline),
+            },
+            cx,
+        );
+        assert_eq!(
+            workbench.agent_overview_generation, before,
+            "a timeline gap is answered by the timeline"
+        );
+
+        // A remote authority's sidebar domain reports the same gap, and the
+        // invalidation the gap swallowed is the creation's only notice: the
+        // mapped event has to re-read the list it staled.
+        let before = workbench.agent_overview_generation;
+        let gap = map_backend_event(BackendEvent::Lagged {
+            stream: BackendEventStream::Fanout,
+            skipped: 0,
+            refetch: vibex_backend::BackendRefetch {
+                session_id: None,
+                timeline: false,
+                runtime: false,
+                runtime_selection: false,
+                projection: Some(BackendProjection::Sidebar),
+            },
+            observed_live: true,
+        })
+        .expect("a lagged fan-out is a desktop event");
+        workbench.apply_desktop_event(gap, cx);
+        assert_eq!(
+            workbench.agent_overview_generation,
+            before.wrapping_add(1),
+            "a sidebar gap is a creation the list has to be re-read for"
+        );
+    });
+}
+
+/// A remote authority's sidebar invalidation is a creation's only notice.
+///
+/// The authority fans the committed snapshot out to the clients that share its
+/// event stream and publishes this projection invalidation for the clients that
+/// do not, so a client driving a paired runtime draws a session created
+/// elsewhere only because it re-read the list on this event. The invalidation
+/// has no desktop twin, so it is recognized before the mapping that would drop
+/// it as an event with nothing to apply.
+#[test]
+fn a_remote_sidebar_invalidation_is_recognized() {
+    assert!(backend_event_invalidates_sidebar(
+        &BackendEvent::ProjectionInvalidated(BackendProjection::Sidebar)
+    ));
+    assert!(!backend_event_invalidates_sidebar(
+        &BackendEvent::ProjectionInvalidated(BackendProjection::Management)
+    ));
+    assert!(!backend_event_invalidates_sidebar(
+        &BackendEvent::ProjectionInvalidated(BackendProjection::Usage)
+    ));
 }

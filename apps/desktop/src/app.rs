@@ -3983,6 +3983,23 @@ pub(crate) fn remote_error_into_vibex(error: BackendError) -> vibex_core::VibexE
     vibex_core::VibexError::new(vibex_core::ErrorCategory::Remote, error.code, error.message)
 }
 
+/// Whether a backend event is the sidebar invalidation only a remote client
+/// receives.
+///
+/// A remote authority announces a session another client created this way and
+/// through no other event: the snapshot it fans out reaches the clients that
+/// share its event stream, and this projection invalidation is what the clients
+/// that do not — like this shell when it drives a paired runtime — are told to
+/// re-read for. A *gap* in the same projection needs no arm of its own: it
+/// arrives as a lagged fan-out, and that is already answered by re-reading the
+/// session list.
+fn backend_event_invalidates_sidebar(event: &BackendEvent) -> bool {
+    matches!(
+        event,
+        BackendEvent::ProjectionInvalidated(BackendProjection::Sidebar)
+    )
+}
+
 /// Maps a backend event onto its identical desktop twin. The payload types
 /// are the same `vibex_core` contracts the native event bridge passes
 /// through, so this is a lossless 1:1 conversion except for variants the
@@ -4048,6 +4065,14 @@ enum RuntimeUiSignal {
     RemoteReconnecting,
     /// The runtime this shell drives published a new name.
     RuntimeRenamed(String),
+    /// The authority invalidated the sidebar projection a remote client draws.
+    ///
+    /// A remote authority announces a session another client created this way
+    /// and through no other event — the ownership tree it pushes carries no
+    /// creation — so the list this shell is drawing is re-read when this
+    /// arrives. Its arrangement is the shell's own and is not what the
+    /// authority is speaking about.
+    SidebarInvalidated,
     Shutdown,
 }
 
@@ -14184,6 +14209,20 @@ impl VibexWorkbench {
                         // fact, so there is nothing to re-render here.
                     }
                     Ok(Some(event)) => {
+                        // A remote authority announces a session another client
+                        // created as a sidebar invalidation, never as a session
+                        // snapshot. This shell is a remote client when it drives
+                        // one, so the same news has to reload the list it draws
+                        // — a notification raised from the timeline that follows
+                        // is not a row.
+                        if backend_event_invalidates_sidebar(&event)
+                            && signal_tx
+                                .send(RuntimeUiSignal::SidebarInvalidated)
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
                         let Some(desktop_event) = map_backend_event(event) else {
                             continue;
                         };
@@ -14337,6 +14376,17 @@ impl VibexWorkbench {
                         self.apply_live_timeline_batch(std::mem::take(&mut timeline_events), cx);
                     }
                     dirty |= self.apply_runtime_rename(&display_name, cx);
+                }
+                RuntimeUiSignal::SidebarInvalidated => {
+                    if !timeline_events.is_empty() {
+                        self.apply_live_timeline_batch(std::mem::take(&mut timeline_events), cx);
+                    }
+                    // The invalidation is the whole message: it does not say
+                    // which row changed, and it is the only notice a creation
+                    // gets, so the authoritative list is re-read rather than
+                    // patched.
+                    self.load_agent_overview(cx);
+                    dirty = true;
                 }
             }
         }
@@ -16789,6 +16839,31 @@ impl VibexWorkbench {
             );
             self.delegated_tree.remove(&id);
         }
+        // Whether the ownership tree places each of the page's sessions under a
+        // parent. That edge is the only honest answer to "is this session a
+        // navigation row": the root list the sidebar is drawn from holds
+        // exactly the sessions without one, while a session with one belongs to
+        // its parent's branch and is deliberately absent from that list.
+        //
+        // The registry used to treat every row it had not met yet as a
+        // delegated one. That hid a navigation root from the sidebar *and*
+        // registered the session an announcement was about, because a tree page
+        // can describe a creation the moment its row commits while the
+        // announcement waits out the event batch — so the announcement looked
+        // like news about a row the workbench already knew, nothing reloaded
+        // the list the row was missing from, and a session created in the TUI
+        // stayed invisible until some unrelated action reloaded the overview.
+        let ownership: BTreeMap<String, bool> = result
+            .nodes
+            .iter()
+            .chain(result.ancestors.iter())
+            .map(|node| {
+                (
+                    node.session_ref.id.clone(),
+                    node.parent_session_ref.is_some(),
+                )
+            })
+            .collect();
         for node in result.nodes.into_iter().chain(result.ancestors) {
             if node.parent_session_ref.is_some() {
                 self.sessions
@@ -16798,11 +16873,45 @@ impl VibexWorkbench {
                 .insert(node.session_ref.id.clone(), node);
         }
         for session in result.registry {
-            if self.registered_session(session.id.as_str()).is_none()
-                && !self.session_hidden_from_sidebar(session.id.as_str())
-            {
-                self.delegated_sessions
-                    .insert(session.id.as_str().to_string(), session.clone());
+            match ownership.get(session.id.as_str()) {
+                // A session the page places under a parent is a delegated
+                // child, and the registry is what its branch draws the row
+                // from. Metadata the page did not describe carries no ownership
+                // answer of its own, so it keeps the classification the
+                // workbench already had rather than being read as a root.
+                Some(true) | None => {
+                    if self.registered_session(session.id.as_str()).is_none()
+                        && !self.session_hidden_from_sidebar(session.id.as_str())
+                    {
+                        self.delegated_sessions
+                            .insert(session.id.as_str().to_string(), session.clone());
+                    }
+                }
+                // A node the tree returned without a parent is an ownership
+                // root — the same sessions the authoritative root list holds.
+                // The page is not that list, so a row the workbench does not
+                // have is not added from it: only the root list can tell a
+                // creation another client announced from a child whose
+                // ownership edge has not been committed yet. The list is marked
+                // stale and the pass is woken, exactly as an announced session
+                // the workbench cannot place marks it.
+                Some(false) => {
+                    if self.session_hidden_from_sidebar(session.id.as_str()) {
+                        // A mutation in flight took this row off the sidebar,
+                        // and the read that answers it filters the row back
+                        // out — not a reason to re-read anything.
+                        continue;
+                    }
+                    // Whatever parked the snapshot — an announcement it could
+                    // not place, a group that named it — the tree has answered:
+                    // this session owns itself.
+                    self.delegated_sessions.remove(session.id.as_str());
+                    if !self.sessions.iter().any(|root| root.id == session.id) {
+                        self.delegated_roots_dirty = true;
+                        self.delegated_refresh_wake.notify_one();
+                        continue;
+                    }
+                }
             }
             self.upsert_session_snapshot(session);
         }
@@ -23793,6 +23902,15 @@ impl VibexWorkbench {
                     let visible = self.ui_state.workbench.active_tab == "usage";
                     self.usage_view
                         .update(cx, |usage, cx| usage.invalidate(visible, cx));
+                }
+                // The fanout is the stream a creation rides. A gap in it means
+                // a session snapshot that no later event names was dropped —
+                // and with it the row the sidebar should have drawn — so the
+                // authoritative root list is re-read rather than patched. The
+                // same gap can swallow the ids a committed deletion published,
+                // which is the other reason this list is the one to refetch.
+                if matches!(stream, DesktopEventStream::Fanout) {
+                    self.load_agent_overview(cx);
                 }
                 true
             }
