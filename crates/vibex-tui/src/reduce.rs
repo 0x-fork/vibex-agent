@@ -243,6 +243,11 @@ impl App {
             }
             Intent::SelectPrevious => self.move_selection(-1),
             Intent::SelectNext => self.move_selection(1),
+            // `←`/`→` move across the row's own buttons rather than along the
+            // list: the two axes do different jobs, and the buttons are the only
+            // thing beside the list's cursor.
+            Intent::SessionControlPrevious => self.step_session_control(-1),
+            Intent::SessionControlNext => self.step_session_control(1),
             Intent::ScrollPageUp => {
                 if self.page == Page::Management {
                     // The detail pane has no cursor: the page keys move it
@@ -352,6 +357,15 @@ impl App {
 
             // ---- sessions -------------------------------------------------
             Intent::OpenSelectedSession => {
+                // The keyboard may have stepped onto one of the row's own
+                // buttons; `Enter` then presses it rather than opening the row
+                // behind it. A row the keyboard has not stepped into opens as it
+                // always has.
+                if self.page == Page::Sessions
+                    && let Some(outcome) = self.activate_session_control()
+                {
+                    return outcome;
+                }
                 let rows = self.sidebar_rows();
                 let index = self.selection_for(Scope::Sessions);
                 let Some(row) = rows.get(index).cloned() else {
@@ -371,18 +385,12 @@ impl App {
                 // The controller issues the load ticket before the fetch, so
                 // the snapshot is applied in the generation it was requested
                 // for and live events for the session stop being stale.
+                //
+                // Opening a session is a request to work in it, so the keyboard
+                // lands in the composer: `open_session` did that when it moved
+                // the page, and there is no second "enter the workbench" step to
+                // take.
                 self.open_session_effects(session_id)
-            }
-            Intent::EnterSession => {
-                let outcome = self.perform(Intent::OpenSelectedSession);
-                if !outcome.effects.is_empty() {
-                    // Landing on the session view is a request to work in it, so
-                    // the caret goes back into the composer: navigating set the
-                    // focus to the page itself.
-                    self.select_session_destination();
-                    self.focus = Focus::Composer;
-                }
-                outcome
             }
             Intent::NewSession => {
                 // The list shows rows, and its cursor is on one of them: `n`
@@ -3742,6 +3750,9 @@ impl App {
         if self.page == Page::Devices {
             return self.move_device_selection(delta);
         }
+        if self.page == Page::Sessions {
+            return self.move_session_selection(delta);
+        }
         let count = self.page_row_count();
         if count == 0 {
             return Outcome::quiet();
@@ -3768,6 +3779,114 @@ impl App {
             self.scroll.offset = offset;
         }
         Outcome::effects(vec![])
+    }
+
+    /// Move the session list's cursor, one row above the first for the page's
+    /// own action row.
+    ///
+    /// That line is not one of `sidebar_rows`, so it has no index the list can
+    /// count to; it is [`crate::app::SESSION_ACTION_ROW`], a step above row 0,
+    /// and the two arrows walk onto it the way they walk onto any row. Landing
+    /// on it puts the keyboard on its first control, so `Enter` starts a session
+    /// without a second press.
+    fn move_session_selection(&mut self, delta: i64) -> Outcome {
+        let rows = self.sidebar_rows();
+        if self.session_cursor_is_actions() {
+            // The action row is the end of the list: there is nothing above it,
+            // and down steps back onto the first row — when there is one.
+            if delta > 0 && !rows.is_empty() {
+                self.set_selection(Scope::Sessions, 0);
+            }
+            return Outcome::effects(vec![]);
+        }
+        let next = self.selection_for(Scope::Sessions) as i64 + delta;
+        if next < 0 {
+            self.set_selection(Scope::Sessions, crate::app::SESSION_ACTION_ROW);
+            // The row opens on its first control, so `Enter` does what the row
+            // says it does without the reader having to step right first.
+            self.session_row_action = self
+                .session_action_row_intents()
+                .first()
+                .map(|intent| (crate::app::SESSION_ACTION_ROW, *intent));
+            return Outcome::effects(vec![]);
+        }
+        let next = next.min(rows.len().saturating_sub(1) as i64) as usize;
+        self.set_selection(Scope::Sessions, next);
+        Outcome::effects(vec![])
+    }
+
+    /// Move the keyboard across the buttons of the row the session cursor is on.
+    ///
+    /// `→` steps into the cluster at its first button and then walks right,
+    /// stopping at the last; `←` steps in at the last and walks left, and from
+    /// the first button it steps back out onto the row. The page's action row
+    /// has two controls and no list to walk, so there the two keys toggle
+    /// between them — which is what its own line promises.
+    fn step_session_control(&mut self, delta: i64) -> Outcome {
+        if self.page != Page::Sessions {
+            return Outcome::quiet();
+        }
+        let cursor = self.selection_for(Scope::Sessions);
+        let intents = if cursor == crate::app::SESSION_ACTION_ROW {
+            self.session_action_row_intents()
+        } else {
+            self.sidebar_row_button_intents(cursor)
+        };
+        if intents.is_empty() {
+            return Outcome::quiet();
+        }
+        let current = self
+            .session_row_action
+            .filter(|(row, _)| *row == cursor)
+            .and_then(|(_, intent)| intents.iter().position(|candidate| *candidate == intent));
+        if cursor == crate::app::SESSION_ACTION_ROW {
+            let at = current.unwrap_or(0) as i64;
+            let next = (at + delta).rem_euclid(intents.len() as i64) as usize;
+            self.session_row_action = Some((cursor, intents[next]));
+            return Outcome::effects(vec![]);
+        }
+        let next = match (current, delta.is_negative()) {
+            // Left from the first button steps back out onto the row, which is
+            // the way out of the cluster without leaving the row.
+            (Some(0), true) => {
+                self.session_row_action = None;
+                return Outcome::effects(vec![]);
+            }
+            (None, true) => intents.len() - 1,
+            (None, false) => 0,
+            (Some(index), _) => (index as i64 + delta).clamp(0, intents.len() as i64 - 1) as usize,
+        };
+        self.session_row_action = Some((cursor, intents[next]));
+        Outcome::effects(vec![])
+    }
+
+    /// Press the button the session list's keyboard cursor has stepped onto.
+    ///
+    /// `Enter` on the page's own action row starts a session even though the
+    /// cursor may have been moved off its control: the row's first control is
+    /// what the row is for, and its line says so. Anywhere else `None` means the
+    /// cursor is only on the row, and the caller opens it instead.
+    fn activate_session_control(&mut self) -> Option<Outcome> {
+        let cursor = self.selection_for(Scope::Sessions);
+        let focused = self
+            .session_row_action
+            .filter(|(row, _)| *row == cursor)
+            .map(|(_, intent)| intent);
+        let intents = if cursor == crate::app::SESSION_ACTION_ROW {
+            self.session_action_row_intents()
+        } else {
+            self.sidebar_row_button_intents(cursor)
+        };
+        let intent = match focused {
+            Some(intent) if intents.contains(&intent) => intent,
+            _ if cursor == crate::app::SESSION_ACTION_ROW => Intent::NewSession,
+            _ => return None,
+        };
+        // The press is the gesture: the row keeps its cursor, but not the
+        // button, so a second `Enter` cannot run the same verb again on
+        // whichever row a refresh or a deletion has since put under it.
+        self.session_row_action = None;
+        Some(self.perform(intent))
     }
 
     /// Move inside the configuration centre, where the same two keys mean
@@ -6501,7 +6620,7 @@ mod tests {
     }
 
     #[test]
-    fn entering_a_session_from_the_list_takes_the_keyboard_into_the_composer() {
+    fn opening_a_session_from_the_list_takes_the_keyboard_into_the_composer() {
         let mut app = capable_app();
         app.agent
             .apply_sessions(Ok(vec![openable_session("session_enter0001")]))
@@ -6509,10 +6628,10 @@ mod tests {
         app.navigate_to(Page::Sessions);
         // Row 0 is the workspace heading; the session is one below it.
         app.set_selection(crate::keymap::Scope::Sessions, 1);
-        let outcome = app.perform(Intent::EnterSession);
+        let outcome = app.perform(Intent::OpenSelectedSession);
         assert!(
             !outcome.effects.is_empty(),
-            "entering the session issued no load: {outcome:?}"
+            "opening the session issued no load: {outcome:?}"
         );
         assert_eq!(app.page, Page::Agent);
         assert_eq!(
@@ -8917,6 +9036,161 @@ mod tests {
         assert!(rows[1].pinned, "the pin did not reach the row");
         assert!(
             app.session_is_unread(&vibex_core::VibexSessionId::parse("session_org000001").unwrap())
+        );
+    }
+
+    /// The page's own action row is one step above the first list row: `↑` from
+    /// the top reaches it and `↓` steps back onto the list.
+    #[test]
+    fn the_session_cursor_walks_onto_the_pages_action_row() {
+        let mut app = arranged_app();
+        app.set_selection(Scope::Sessions, 0);
+        assert!(!app.session_cursor_is_actions());
+
+        app.perform(Intent::SelectPrevious);
+        assert!(
+            app.session_cursor_is_actions(),
+            "up from the first row did not reach the action row"
+        );
+        assert_eq!(
+            app.session_row_action,
+            Some((crate::app::SESSION_ACTION_ROW, Intent::NewSession)),
+            "the action row did not open on its first control"
+        );
+
+        // `→` switches to the workspace control and `→` again comes back: with
+        // two controls the two keys toggle, which is what the line promises.
+        app.perform(Intent::SessionControlNext);
+        assert_eq!(
+            app.session_row_action,
+            Some((crate::app::SESSION_ACTION_ROW, Intent::SwitchWorkspace))
+        );
+        app.perform(Intent::SessionControlNext);
+        assert_eq!(
+            app.session_row_action,
+            Some((crate::app::SESSION_ACTION_ROW, Intent::NewSession))
+        );
+        app.perform(Intent::SessionControlPrevious);
+        assert_eq!(
+            app.session_row_action,
+            Some((crate::app::SESSION_ACTION_ROW, Intent::SwitchWorkspace))
+        );
+
+        // Down steps back onto the first row and leaves the button behind.
+        app.perform(Intent::SelectNext);
+        assert_eq!(app.selection_for(Scope::Sessions), 0);
+        assert_eq!(app.session_row_action, None);
+        assert!(!app.session_cursor_is_actions());
+    }
+
+    /// `Enter` on the action row runs the control the cursor has reached: `+ New
+    /// session` opens the composing page, and the workspace control opens the
+    /// directory picker.
+    #[test]
+    fn enter_on_the_action_row_runs_the_control_it_names() {
+        let mut app = arranged_app();
+        app.set_selection(Scope::Sessions, 0);
+        app.perform(Intent::SelectPrevious);
+        app.perform(Intent::OpenSelectedSession);
+        assert_eq!(
+            app.page,
+            Page::NewSession,
+            "the first control is new session"
+        );
+        assert_eq!(
+            app.session_row_action, None,
+            "the press left the button armed"
+        );
+
+        app.navigate_to(Page::Sessions);
+        app.set_selection(Scope::Sessions, 0);
+        app.perform(Intent::SelectPrevious);
+        app.perform(Intent::SessionControlNext);
+        app.perform(Intent::OpenSelectedSession);
+        assert!(
+            matches!(app.overlay, Some(Overlay::WorkspacePicker { .. })),
+            "the workspace control did not open the picker: {:?}",
+            app.overlay
+        );
+        assert_eq!(
+            app.session_row_action, None,
+            "the press left the button armed"
+        );
+    }
+
+    /// `→` steps onto a row's own buttons and walks them, `←` walks back and
+    /// steps out onto the row, and `Enter` presses whatever the cursor reached.
+    #[test]
+    fn the_row_buttons_are_reached_with_the_arrows_and_pressed_with_enter() {
+        let mut app = arranged_app();
+        app.live = crate::app::LiveState::Ready;
+        let rows = app.sidebar_rows();
+        let session_row = rows
+            .iter()
+            .position(|row| row.session_id.is_some())
+            .expect("the arrangement holds no session");
+        app.set_selection(Scope::Sessions, session_row);
+        let buttons = app.sidebar_row_button_intents(session_row);
+        assert_eq!(buttons.first(), Some(&Intent::PinSession));
+        assert_eq!(buttons.last(), Some(&Intent::DeleteSession));
+
+        // `→` steps in at the first button, then walks right.
+        app.perform(Intent::SessionControlNext);
+        assert_eq!(
+            app.session_row_action,
+            Some((session_row, Intent::PinSession))
+        );
+        app.perform(Intent::SessionControlNext);
+        assert_eq!(
+            app.session_row_action,
+            Some((session_row, Intent::ToggleAutoContinue))
+        );
+        // `←` walks back, and from the first button it steps out onto the row.
+        app.perform(Intent::SessionControlPrevious);
+        assert_eq!(
+            app.session_row_action,
+            Some((session_row, Intent::PinSession))
+        );
+        app.perform(Intent::SessionControlPrevious);
+        assert_eq!(
+            app.session_row_action, None,
+            "left did not leave the cluster"
+        );
+        // `←` from the row steps in at the last button, so both keys are ways
+        // into the cluster.
+        app.perform(Intent::SessionControlPrevious);
+        assert_eq!(
+            app.session_row_action,
+            Some((session_row, Intent::DeleteSession))
+        );
+
+        // `Enter` presses the button the cursor reached rather than opening the
+        // row, and the button is not left armed for a second press.
+        app.perform(Intent::SessionControlPrevious);
+        app.perform(Intent::SessionControlPrevious);
+        app.perform(Intent::SessionControlPrevious);
+        assert_eq!(
+            app.session_row_action,
+            Some((session_row, Intent::BeginRenameSession))
+        );
+        let label = app.sidebar_rows()[session_row].label.clone();
+        app.perform(Intent::OpenSelectedSession);
+        match app.overlay.clone() {
+            Some(Overlay::Prompt {
+                field: crate::app::PromptField::RenameSession,
+                value,
+                ..
+            }) => assert_eq!(value, label, "the rename prompt names another session"),
+            other => panic!("the rename button opened {other:?}"),
+        }
+        assert_eq!(
+            app.session_row_action, None,
+            "the press left the button armed"
+        );
+        assert_eq!(
+            app.page,
+            Page::Sessions,
+            "pressing a row button opened the row"
         );
     }
 

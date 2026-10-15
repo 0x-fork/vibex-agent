@@ -4272,6 +4272,140 @@ mod tests {
         }
     }
 
+    /// The keyboard's focus on a row's controls is drawn where the pointer's is:
+    /// the button `←`/`→` have stepped onto is lit, and the page's own action row
+    /// wears the selection band while the cursor is on it.
+    #[test]
+    fn the_keyboard_lights_the_control_it_has_stepped_onto() {
+        use crate::action::Intent;
+        use ratatui::style::Modifier;
+        let mut app = test_app(100, 30);
+        app.agent
+            .apply_sessions(Ok(vec![vibex_core::AgentSession {
+                id: vibex_core::VibexSessionId::parse("session_lit000001")
+                    .expect("valid session id"),
+                title: "lightable".to_string(),
+                project_id: vibex_core::ProjectId::new(),
+                workspace_id: vibex_core::WorkspaceId::new(),
+                workspace_root: "/tmp/vibex-lit-workspace".to_string(),
+                workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+                agent_id: vibex_core::AgentId::parse("claude").expect("valid agent id"),
+                state: vibex_core::AgentSessionState::Idle,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                last_message_at_ms: 1,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            }]))
+            .expect("apply");
+        app.navigate_to(Page::Sessions);
+        // Row 0 is the workspace heading; the session is under it.
+        app.set_selection(crate::keymap::Scope::Sessions, 1);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let draw =
+            |app: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>| {
+                terminal
+                    .draw(|frame| crate::view::render(frame, app))
+                    .expect("the session list draws");
+            };
+        draw(&mut app, &mut terminal);
+        let control = |app: &App, row: usize, intent: Intent| {
+            app.regions
+                .row_actions
+                .iter()
+                .find(|control| control.row == row && control.intent == intent)
+                .map(|control| control.rect)
+                .unwrap_or_else(|| panic!("row {row} published no {intent:?} control"))
+        };
+        let bold =
+            |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>, column: u16, row: u16| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((column, row))
+                    .is_some_and(|cell| cell.style().add_modifier.contains(Modifier::BOLD))
+            };
+        // The cursor's row draws its cluster, but no button is the reader's yet.
+        let pin = control(&app, 1, Intent::PinSession);
+        assert!(
+            !bold(&terminal, pin.x, pin.y),
+            "a button nobody had reached was lit"
+        );
+
+        // `→` steps onto the cluster, and the button it reached is lit.
+        app.perform(Intent::SessionControlNext);
+        draw(&mut app, &mut terminal);
+        let pin = control(&app, 1, Intent::PinSession);
+        assert!(
+            bold(&terminal, pin.x, pin.y),
+            "the button the keyboard reached is not lit"
+        );
+
+        // `↑` from the first row puts the cursor on the page's action row: it
+        // wears the selection band and `+ New session` is lit, because `Enter`
+        // there starts a session.
+        app.set_selection(crate::keymap::Scope::Sessions, 0);
+        app.perform(Intent::SelectPrevious);
+        draw(&mut app, &mut terminal);
+        let buffer = terminal.backend().buffer();
+        let line = |row: u16| -> String {
+            (0..buffer.area.width)
+                .map(|column| {
+                    buffer
+                        .cell((column, row))
+                        .map(|cell| cell.symbol())
+                        .unwrap_or(" ")
+                })
+                .collect()
+        };
+        let action_row = (0..buffer.area.height)
+            .find(|row| line(*row).contains("New session"))
+            .expect("the action row is not on screen");
+        let text = line(action_row);
+        let label_column = text.find("New session").expect("the label is there") as u16;
+        let band = app.theme.roles.surface_highlight;
+        assert_eq!(
+            buffer
+                .cell((label_column, action_row))
+                .and_then(|cell| cell.style().bg),
+            Some(band),
+            "the action row does not wear the selection band:\n{text}"
+        );
+        assert!(
+            bold(&terminal, label_column, action_row),
+            "the action row did not light its first control"
+        );
+
+        // `→` moves the light to the workspace control on the right.
+        app.perform(Intent::SessionControlNext);
+        draw(&mut app, &mut terminal);
+        let buffer = terminal.backend().buffer();
+        let line = |row: u16| -> String {
+            (0..buffer.area.width)
+                .map(|column| {
+                    buffer
+                        .cell((column, row))
+                        .map(|cell| cell.symbol())
+                        .unwrap_or(" ")
+                })
+                .collect()
+        };
+        let text = line(action_row);
+        let workspace_column = text
+            .find("Workspace")
+            .expect("the workspace control is there") as u16;
+        assert!(
+            bold(&terminal, workspace_column, action_row),
+            "the workspace control is not lit:\n{text}"
+        );
+        assert!(
+            !bold(&terminal, label_column, action_row),
+            "both controls are lit at once:\n{text}"
+        );
+    }
+
     /// A row's controls describe the frame that drew them: a click after the
     /// list has left the screen lands on nothing, not on the button that used
     /// to be there.

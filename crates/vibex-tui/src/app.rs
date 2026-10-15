@@ -858,6 +858,15 @@ pub struct FailedCreation {
     pub creation: PendingCreation,
 }
 
+/// The row index the session list's own action row answers to.
+///
+/// `+ New session` and the workspace hint beside it are drawn above the list
+/// rather than as one of its rows, so they have no index in `sidebar_rows`;
+/// this gives the line one no real row can take. It is also `-1` when the
+/// cursor steps as a signed number, which is what makes `Up` from the first row
+/// land on it and `Down` from it land back on the first.
+pub const SESSION_ACTION_ROW: usize = usize::MAX;
+
 /// The whole application.
 pub struct App {
     pub facade: BackendFacade,
@@ -990,6 +999,23 @@ pub struct App {
     /// Lines the session list shows, published by the frame that drew it: the
     /// window is what a page key and the wheel step through.
     pub session_band_rows: usize,
+    /// Columns the session list drew in, published by the frame that drew it.
+    ///
+    /// How much of a session row's button cluster fits is a question about the
+    /// columns the row has, and the frame is the only thing that knows them. The
+    /// keyboard asks the same function the frame drew the cluster with, so the
+    /// button it can reach is the button the reader can see.
+    pub session_band_width: usize,
+    /// The row of the session list the keyboard has stepped onto, and the button
+    /// inside it the cursor has reached.
+    ///
+    /// `←`/`→` step onto a row's own buttons and across them; `Enter` then
+    /// presses the button the cursor reached rather than opening the row behind
+    /// it. The index and the intent travel together so a refresh that reorders
+    /// the list cannot make the press act on whichever row took the cursor's
+    /// place — the same contract the pointer's own hover keeps. The page's
+    /// action row above the list carries [`SESSION_ACTION_ROW`] as its index.
+    pub session_row_action: Option<(usize, crate::action::Intent)>,
     /// The first line of the session list the page draws, snapped to a row.
     ///
     /// The list is taller than the window it sits in, so it scrolls by line
@@ -1792,6 +1818,8 @@ impl App {
             viewport: (120, 40),
             transcript_band_rows: 20,
             session_band_rows: 12,
+            session_band_width: 80,
+            session_row_action: None,
             session_scroll: 0,
             session_scroll_manual: false,
             regions: FrameRegions::default(),
@@ -3345,8 +3373,53 @@ impl App {
             // The cursor owns the window again: whatever moved it, the reader
             // is now looking at a row and the list has to show it.
             self.session_scroll_manual = false;
+            // And it is on a row rather than on one of that row's buttons:
+            // whatever moved it — an arrow, a click, the palette — the keyboard
+            // starts the row over instead of pressing a button the reader has
+            // left behind.
+            self.session_row_action = None;
         }
         self.selection.insert(scope, value);
+    }
+
+    /// Whether the session list's cursor is on the page's own action row.
+    pub fn session_cursor_is_actions(&self) -> bool {
+        self.selection_for(Scope::Sessions) == SESSION_ACTION_ROW
+    }
+
+    /// The buttons the session page's own action row offers the keyboard, in
+    /// the order it draws them.
+    ///
+    /// `+ New session` is always drawn; the workspace control is there while a
+    /// key names it, which is the same condition the frame draws its hint under.
+    pub fn session_action_row_intents(&self) -> Vec<crate::action::Intent> {
+        let mut intents = vec![crate::action::Intent::NewSession];
+        if self
+            .keymap
+            .chord_for(crate::action::Intent::SwitchWorkspace)
+            .is_some()
+        {
+            intents.push(crate::action::Intent::SwitchWorkspace);
+        }
+        intents
+    }
+
+    /// The buttons one list row offers the keyboard, in the order the frame
+    /// draws them.
+    ///
+    /// The frame and the keyboard answer from the same function, so a terminal
+    /// too narrow to hold a row's whole cluster drops the same leading verbs for
+    /// both: the button the keyboard can reach is the button the reader can see.
+    pub fn sidebar_row_button_intents(&self, index: usize) -> Vec<crate::action::Intent> {
+        let rows = self.sidebar_rows();
+        let Some(row) = rows.get(index) else {
+            return Vec::new();
+        };
+        if row.session_id.is_none() {
+            return crate::view::heading_button_intents(row);
+        }
+        let indent = usize::from(row.depth) * crate::view::SESSION_ROW_INDENT;
+        crate::view::session_row_button_intents(self.session_band_width, indent)
     }
 
     /// Whether a point is inside a rect the last frame published.

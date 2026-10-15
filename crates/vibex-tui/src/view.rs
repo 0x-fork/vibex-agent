@@ -325,8 +325,7 @@ pub const fn palette_group(intent: Intent) -> PaletteGroup {
         | Intent::UnarchiveSession
         | Intent::DeleteSession
         | Intent::SwitchWorkspace
-        | Intent::OpenSelectedSession
-        | Intent::EnterSession => PaletteGroup::Session,
+        | Intent::OpenSelectedSession => PaletteGroup::Session,
         Intent::OpenBlockDetails
         | Intent::CopyBlockBody
         | Intent::CopyBlockMetadata
@@ -1102,7 +1101,13 @@ fn render_session_view(
     // A terminal too short for chrome and a row keeps the rows instead: three
     // rows of chrome over two rows of list can only show a heading, and a
     // heading the reader cannot open is worth less than the session under it.
+    // The page's own action row goes with the rest of the chrome, so a cursor
+    // that had walked onto it steps back onto the list: a line nobody drew
+    // cannot be where the reader is.
     if page.height < list_offset + 2 {
+        if app.session_cursor_is_actions() {
+            app.set_selection(Scope::Sessions, 0);
+        }
         render_session_rows(frame, page, &list, app, theme, strings);
         return;
     }
@@ -1266,24 +1271,42 @@ fn render_session_actions(
         },
         Intent::NewSession,
     ));
-    let hovered = app.hovered_hint == Some(Intent::NewSession);
-    let button_style = if hovered {
-        Style::default()
-            .fg(theme.roles.foreground)
-            .bg(theme.roles.surface_highlight)
-            .add_modifier(Modifier::BOLD)
+    let hovered = app.hovered_hint;
+    // The action row is a row like any other while the cursor is on it: it wears
+    // the selection band, and the control `←`/`→` have stepped onto is lit the
+    // way the pointer lights one. `+ New session` is lit while merely *on* the
+    // row, because `Enter` starts a session there without a second press.
+    let on_row = app.session_cursor_is_actions();
+    let focused = app
+        .session_row_action
+        .filter(|(row, _)| *row == crate::app::SESSION_ACTION_ROW)
+        .map(|(_, intent)| intent);
+    let lit = |intent: Intent| hovered == Some(intent) || focused == Some(intent);
+    let band = on_row.then_some(theme.roles.surface_highlight);
+    let dressed = |style: Style| match band {
+        Some(band) => style.bg(band),
+        None => style,
+    };
+    let button_style = if lit(Intent::NewSession) {
+        dressed(
+            Style::default()
+                .fg(theme.roles.foreground)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if on_row {
+        dressed(Style::default().fg(theme.roles.foreground))
     } else {
         Style::default().fg(theme.roles.text_secondary)
     };
     let padding = usize::from(area.width).saturating_sub(label_width + used);
     let mut spans = vec![
         Span::styled(new_session, button_style),
-        Span::raw(" ".repeat(padding)),
+        Span::styled(" ".repeat(padding), dressed(Style::default())),
     ];
     let mut x = usize::from(area.x) + padding + label_width;
     for (index, (text, intent)) in chosen.iter().enumerate() {
         if index > 0 {
-            spans.push(Span::raw("  "));
+            spans.push(Span::styled("  ", dressed(Style::default())));
             x += 2;
         }
         let width = display_width(text);
@@ -1296,10 +1319,14 @@ fn render_session_actions(
             },
             *intent,
         ));
-        let style = if app.hovered_hint == Some(*intent) {
-            Style::default()
-                .fg(theme.roles.foreground)
-                .add_modifier(Modifier::BOLD)
+        let style = if lit(*intent) {
+            dressed(
+                Style::default()
+                    .fg(theme.roles.foreground)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if on_row {
+            dressed(Style::default().fg(theme.roles.text_secondary))
         } else {
             theme.dimmed(theme.roles.gray)
         };
@@ -1525,6 +1552,10 @@ fn render_session_rows(
         return;
     }
     let selected = app.selection_for(Scope::Sessions);
+    // The control the keyboard has stepped onto is lit the way the pointer's own
+    // is: both say "this button is the one a press would run", and the keyboard
+    // is the one that has to survive the pointer being nowhere near the row.
+    let focused_action = app.session_row_action;
     let hovered_action = app.hovered_row_action;
     let sessions = app.agent.state.sessions.value.clone().unwrap_or_default();
     let now_ms = vibex_core::unix_timestamp_ms();
@@ -1574,8 +1605,9 @@ fn render_session_rows(
             row,
             index == selected,
             app.hover == Some((Scope::Sessions, index)),
-            hovered_action
-                .filter(|(hovered_row, _)| *hovered_row == index)
+            focused_action
+                .filter(|(focused_row, _)| *focused_row == index)
+                .or_else(|| hovered_action.filter(|(hovered_row, _)| *hovered_row == index))
                 .map(|(_, intent)| intent),
             statuses.get(index),
             status_column,
@@ -1598,14 +1630,22 @@ fn render_session_rows(
     }
     let window = usize::from(area.height);
     app.session_band_rows = window;
+    app.session_band_width = usize::from(area.width);
     // The cursor's row keeps itself in sight until the reader takes the window
-    // over; a row taller than the window shows its top, not its middle.
+    // over; a row taller than the window shows its top, not its middle. A cursor
+    // on the page's own action row is above every row, so what it keeps in sight
+    // is the top of the list.
+    let anchor = if selected == crate::app::SESSION_ACTION_ROW {
+        0
+    } else {
+        selected
+    };
     if !app.session_scroll_manual
         && let Some(top) = starts
-            .get(selected.min(rows.len().saturating_sub(1)))
+            .get(anchor.min(rows.len().saturating_sub(1)))
             .copied()
     {
-        let bottom = top + heights.get(selected).copied().unwrap_or(1);
+        let bottom = top + heights.get(anchor).copied().unwrap_or(1);
         if top < app.session_scroll {
             app.session_scroll = top;
         } else if bottom > app.session_scroll.saturating_add(window) {
@@ -1719,7 +1759,7 @@ fn session_list_item(
     row: &vibex_desktop_model::AgentSidebarRow,
     selected: bool,
     hovered: bool,
-    hovered_control: Option<Intent>,
+    lit_control: Option<Intent>,
     status: Option<&SessionStatusColumn>,
     status_column: usize,
     width: usize,
@@ -1740,7 +1780,7 @@ fn session_list_item(
                 row,
                 selected,
                 hovered,
-                hovered_control,
+                lit_control,
                 width,
                 app,
                 theme,
@@ -1756,7 +1796,7 @@ fn session_list_item(
         session,
         selected,
         hovered,
-        hovered_control,
+        lit_control,
         status,
         status_column,
         width,
@@ -1853,7 +1893,7 @@ fn session_heading_line(
     row: &vibex_desktop_model::AgentSidebarRow,
     selected: bool,
     hovered: bool,
-    hovered_control: Option<Intent>,
+    lit_control: Option<Intent>,
     width: usize,
     app: &App,
     theme: &TuiTheme,
@@ -1971,7 +2011,7 @@ fn session_heading_line(
             spans.push(Span::styled(" ".repeat(ROW_CONTROL_GAP), blank));
             column += ROW_CONTROL_GAP;
         }
-        let lit = hovered_control == Some(*intent);
+        let lit = lit_control == Some(*intent);
         let color = if lit {
             theme.roles.accent_user
         } else {
@@ -2016,6 +2056,17 @@ fn heading_buttons(
         .iter()
         .filter(|(icon, _)| !(folder_without_scope && *icon == crate::sidebar_icons::Icon::New))
         .copied()
+        .collect()
+}
+
+/// The verbs a heading's buttons carry, in the order they are drawn.
+///
+/// The keyboard asks this rather than reading the icons, so the button it
+/// reaches and the button on screen are one list.
+pub(crate) fn heading_button_intents(row: &vibex_desktop_model::AgentSidebarRow) -> Vec<Intent> {
+    heading_buttons(row)
+        .into_iter()
+        .map(|(_, intent)| intent)
         .collect()
 }
 
@@ -2292,7 +2343,7 @@ fn session_row_lines(
     session: Option<&vibex_core::AgentSession>,
     selected: bool,
     hovered: bool,
-    hovered_control: Option<Intent>,
+    lit_control: Option<Intent>,
     status: Option<&SessionStatusColumn>,
     status_column: usize,
     width: usize,
@@ -2447,13 +2498,14 @@ fn session_row_lines(
             }
             // At rest the cluster is chrome, the way the desktop's own is: a
             // row of six coloured marks would shout at a reader who is only
-            // reading the list. Under the pointer the button takes the colour of
-            // the verb it is — delete is the danger colour exactly when it is
-            // about to be pressed — and that colour is also what the picture is
+            // reading the list. Under the pointer — or under the keyboard, once
+            // `←`/`→` have stepped onto the cluster — the button takes the colour
+            // of the verb it is: delete is the danger colour exactly when it is
+            // about to be pressed, and that colour is also what the picture is
             // drawn in. The mark is never drawn *in* the wash behind it: a
             // picture has no ink to fall back on, and a button rastered in the
             // terminal's own background is a button that disappears.
-            let lit = hovered_control == Some(*intent);
+            let lit = lit_control == Some(*intent);
             let colour = if lit {
                 action_colour(*icon, theme, row.pinned)
             } else {
@@ -2575,6 +2627,19 @@ fn session_row_buttons(width: usize, indent: usize) -> Vec<(crate::sidebar_icons
         buttons.remove(0);
     }
     buttons
+}
+
+/// The verbs a session row's buttons carry at this width, in the order they are
+/// drawn.
+///
+/// The keyboard asks this with the columns the frame last drew the list in, so
+/// the button it reaches is the button on screen: a terminal too narrow to hold
+/// the whole cluster hides the same leading verbs from both.
+pub(crate) fn session_row_button_intents(width: usize, indent: usize) -> Vec<Intent> {
+    session_row_buttons(width, indent)
+        .into_iter()
+        .map(|(_, intent)| intent)
+        .collect()
 }
 
 /// The colour a session row's button takes while the pointer is on it.
@@ -3592,11 +3657,17 @@ fn render_status_band(
     ));
     // A button on a session row is a picture, and a picture cannot say what it
     // does. The band is the one place a terminal has room for the sentence a
-    // tooltip would carry, so the pointer resting on a button puts the verb and
-    // the key that would have run it here, and the location comes back when the
-    // pointer leaves. The key is what the row's controls used to spell out, and
-    // it is the half a reader cannot guess from the icon.
-    if let Some((_, intent)) = app.hovered_row_action {
+    // tooltip would carry, so the pointer resting on a button — or the keyboard
+    // having stepped onto one — puts the verb and the key that would have run it
+    // here, and the location comes back when the reader moves on. The key is what
+    // the row's controls used to spell out, and it is the half a reader cannot
+    // guess from the icon. The page's action row is left out: both of its
+    // controls are words already, and the location it would displace is the
+    // workspace those controls act on.
+    let focused_control = app
+        .session_row_action
+        .filter(|(row, _)| *row != crate::app::SESSION_ACTION_ROW);
+    if let Some((_, intent)) = app.hovered_row_action.or(focused_control) {
         let mut hint = vec![Span::styled(
             intent.default_label().to_string(),
             Style::default()

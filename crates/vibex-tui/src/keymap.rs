@@ -498,7 +498,33 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Sessions,
         Chord::plain(KeyCode::Enter),
         Intent::OpenSelectedSession,
-        "Open session",
+        "Open",
+    ),
+    // The row's own buttons are reached with the arrows that move across it:
+    // `→` steps onto the cluster at its first button, `←` at its last, and the
+    // two then walk it. `Enter` presses whichever button the cursor reached,
+    // and opens the row itself while the cursor is still only on the row.
+    binding(
+        Scope::Sessions,
+        Chord::plain(KeyCode::Left),
+        Intent::SessionControlPrevious,
+        "Previous button",
+    ),
+    alias(
+        Scope::Sessions,
+        Chord::plain(KeyCode::Char('h')),
+        Intent::SessionControlPrevious,
+    ),
+    binding(
+        Scope::Sessions,
+        Chord::plain(KeyCode::Right),
+        Intent::SessionControlNext,
+        "Next button",
+    ),
+    alias(
+        Scope::Sessions,
+        Chord::plain(KeyCode::Char('l')),
+        Intent::SessionControlNext,
     ),
     binding(
         Scope::Sessions,
@@ -576,12 +602,6 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Chord::ctrl('a'),
         Intent::ToggleShowArchived,
         "Show archived",
-    ),
-    binding(
-        Scope::Sessions,
-        Chord::plain(KeyCode::Right),
-        Intent::EnterSession,
-        "Open workspace",
     ),
     binding(
         Scope::Sessions,

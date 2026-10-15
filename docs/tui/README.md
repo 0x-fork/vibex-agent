@@ -435,11 +435,14 @@ the status band above rather than being printed twice in two rows. The second is
 the one action a session list needs — `+ New session` on the left, which carries
 its own surface while the pointer rests on it — with the control that answers the
 page on the right: where the next session opens, as a bracket hint with its key
-(`[Workspace Ctrl+W]`). The chips are counted through the filter and through
-folded headings, so a collapsed group still says how much work it holds, and
-every control is a click target. The action is never the one that goes; a
-right-hand hint that does not fit whole is dropped rather than truncated, because
-half a key is a key the reader cannot use.
+(`[Workspace Ctrl+W]`). That line is a row the cursor can reach: `↑` from the
+first row walks onto it, it wears the selection band, and `←`/`→` switch the lit
+control between `+ New session` and the workspace hint — `Enter` runs whichever
+is lit, so starting a session is one step up and one press. The chips are counted
+through the filter and through folded headings, so a collapsed group still says
+how much work it holds, and every control is a click target. The action is never
+the one that goes; a right-hand hint that does not fit whole is dropped rather
+than truncated, because half a key is a key the reader cannot use.
 
 The list itself is a window over every row, measured in lines rather than in
 rows: a workspace can hold hundreds of sessions and a row can carry a detail
@@ -511,13 +514,19 @@ new one, `r` renames, `f` forks, `a` archives, `d` deletes, and `Ctrl+A`
 includes archived sessions. Nesting is drawn rather than implied: a project is
 the leftmost thing in its band, its folders and sessions start a step in, and a
 folder's own sessions a step in from the folder. The row the reader is on — the
-cursor's, or the one under the pointer — carries its two controls where the age
-is: `R` renames and `D` deletes. The control *is* the chord the key bar and the
-`?` help name — there is no tooltip to hover in a terminal, so a mark that did
-not name the key would only be a puzzle — which also means a rebind renames the
-button. The age is not drawn under them — one column does not answer "when" and
-"act on this" at once — and it comes back when the reader moves on. A click on
-either control runs the same action as the key.
+cursor's, or the one under the pointer — carries its own buttons at the right
+edge, along the row the way the desktop's action cluster runs: pin,
+auto-continue, rename, fork, archive, delete. `←`/`→` step the keyboard onto
+that cluster — `→` at its first button, `←` at its last, which is also the way
+back out onto the row from the first — and the button the cursor has reached is
+lit the way the pointer lights one, with its verb and key named in the status
+band. `Enter` presses the button the cursor reached, and opens the row while the
+cursor is only on the row itself; the press never stays armed, so a second
+`Enter` cannot land on whichever session a deletion has since put under the
+cursor. The age is not drawn under the buttons — one column does not answer
+"when" and "act on this" at once — and it comes back when the reader moves on. A
+click on a button runs the same action as the key, on the row the button was
+drawn for.
 
 ### Auto-continue
 

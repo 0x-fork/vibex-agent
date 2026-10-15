@@ -75,8 +75,9 @@ intents! {
     ShowDetails => { scope: Global, id: "show_details", label: "Details", help: "Open the details panel for the selection." },
 
     // ---- sessions -------------------------------------------------------
-    OpenSelectedSession => { scope: Sessions, id: "session_open", label: "Open", help: "Open the selected session." },
-    EnterSession => { scope: Sessions, id: "session_enter", label: "Enter", help: "Move into the session's workbench." },
+    OpenSelectedSession => { scope: Sessions, id: "session_open", label: "Open", help: "Open the selected row, or press the button the row's cursor has reached." },
+    SessionControlPrevious => { scope: Sessions, id: "session_control_previous", label: "Previous button", help: "Step leftwards across the row's own action buttons." },
+    SessionControlNext => { scope: Sessions, id: "session_control_next", label: "Next button", help: "Step rightwards across the row's own action buttons." },
     NewSession => { scope: Sessions, id: "session_new", label: "New", help: "Create a session in a workspace you pick." },
     BeginRenameSession => { scope: Sessions, id: "session_rename", label: "Rename", help: "Rename the selected session." },
     ForkSession => { scope: Sessions, id: "session_fork", label: "Fork", help: "Copy the session up to a chosen point." },
@@ -301,6 +302,8 @@ impl Intent {
                 | Intent::GotoManagement
                 | Intent::SelectPrevious
                 | Intent::SelectNext
+                | Intent::SessionControlPrevious
+                | Intent::SessionControlNext
                 | Intent::ScrollPageUp
                 | Intent::ScrollPageDown
                 | Intent::ScrollHalfPageUp
