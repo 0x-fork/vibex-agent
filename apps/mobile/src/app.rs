@@ -7297,6 +7297,11 @@ impl MobileApp {
                 .cloned()
                 .unwrap_or_default();
             let base_indent = row.indent;
+            // A child stands inside its parent's branch, so it keeps the parent's
+            // column — the guide column in front of its own Agent logo is what
+            // indents it — and its depth keeps it inside the worktree card the
+            // parent belongs to, which is where the desktop draws it.
+            let child_depth = row.depth + 1;
             let project_id = row.project_id.clone();
             let workspace_id = row.workspace_id.clone();
             expanded.push(row);
@@ -7307,8 +7312,8 @@ impl MobileApp {
                 expanded.push(SidebarRow {
                     item: SidebarOrganizationItem::Session(child_id.as_str().to_string()),
                     kind: SidebarRowKind::Session,
-                    depth: 0,
-                    indent: base_indent + theme::SIDEBAR_ICON_TITLE_GAP,
+                    depth: child_depth,
+                    indent: base_indent,
                     label: child.title.clone(),
                     project_id: project_id.clone(),
                     workspace_id: workspace_id.clone(),
@@ -21403,6 +21408,24 @@ impl MobileApp {
             })
     }
 
+    /// Whether a delegated row's branch runs on past it, or `None` when the row
+    /// does not hang off one.
+    ///
+    /// The phone draws one level of the ownership tree, so the answer is the
+    /// row's own column: a child with a later sibling is a row the trunk paints
+    /// through, and the branch's last child stops its trunk at the elbow. The
+    /// siblings come from the page the row was built from, and the node the page
+    /// named is what says whose child it is.
+    fn delegated_branch_continues(&self, session_id: &str) -> Option<bool> {
+        let node = self.delegated_nodes.get(session_id)?;
+        let parent = node.parent_session_ref.as_ref()?;
+        let siblings = self.delegated_children.get(parent.id.as_str())?;
+        Some(branch_continues(
+            &node.session_ref,
+            siblings.last().map(|sibling| &sibling.session_ref),
+        ))
+    }
+
     fn render_sidebar_session_row(
         &self,
         row: &SidebarRow,
@@ -21463,6 +21486,51 @@ impl MobileApp {
         } else {
             (0.0, theme::SIDEBAR_LIST_PADDING)
         };
+        // A delegated row hangs off the row above it on the desktop's guide:
+        // the branch is drawn, not padded, so the parent's Agent logo reads as
+        // the point the line leaves from.
+        let branch = delegated_child
+            .then(|| self.delegated_branch_continues(session_id.as_str()))
+            .flatten();
+        // A session that owns others offers them here rather than at its leading
+        // edge: that edge belongs to the Agent logo, which is the column the
+        // branch above hangs from. The desktop reveals the toggle on hover and
+        // the phone has no hover, so it stays drawn.
+        let disclosure = (!self.sidebar_batch_mode
+            && self.delegated_parents.contains(session_id.as_str()))
+        .then(|| {
+            let toggle_id = session_id.as_str().to_string();
+            let expanded = self.delegated_expanded.contains(session_id.as_str());
+            div()
+                .id(format!("mobile-session-children-{}", row.id()))
+                .size(px(20.0))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(theme::RADIUS_CONTROL))
+                .cursor_pointer()
+                .aria_label(locale::text("Sub-sessions", "子会话", "子工作階段").to_string())
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_delegated_children(toggle_id.clone(), cx);
+                    }),
+                )
+                .child(
+                    svg()
+                        .path(if expanded {
+                            "icons/chevrons-down-up.svg"
+                        } else {
+                            "icons/chevrons-right.svg"
+                        })
+                        .size(px(14.0))
+                        .text_color(theme::sidebar_foreground(0.58)),
+                )
+                .into_any_element()
+        });
         div()
             .id(format!("mobile-session-row-{}", row.id()))
             .relative()
@@ -21492,6 +21560,9 @@ impl MobileApp {
                     }
                 }),
             )
+            .when_some(branch, |body, continues| {
+                body.child(sidebar_branch_guide(session_id.as_str(), continues))
+            })
             .child(
                 div()
                     .flex_1()
@@ -21537,49 +21608,9 @@ impl MobileApp {
                                 }),
                         )
                     })
-                    // A session that owns others offers them here: the ordinary
-                    // list omits owned children, so this is where they are.
-                    .when(
-                        !self.sidebar_batch_mode
-                            && self.delegated_parents.contains(session_id.as_str()),
-                        |title| {
-                            let toggle_id = session_id.as_str().to_string();
-                            let expanded = self.delegated_expanded.contains(session_id.as_str());
-                            title.child(
-                                div()
-                                    .id(format!("mobile-session-children-{}", row.id()))
-                                    .size(px(20.0))
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .cursor_pointer()
-                                    .aria_label(
-                                        locale::text("Sub-sessions", "子会话", "子工作階段")
-                                            .to_string(),
-                                    )
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.toggle_delegated_children(toggle_id.clone(), cx);
-                                        }),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path(if expanded {
-                                                "icons/chevron-down.svg"
-                                            } else {
-                                                "icons/chevron-right.svg"
-                                            })
-                                            .size(px(12.0))
-                                            .text_color(theme::sidebar_foreground(0.58)),
-                                    ),
-                            )
-                        },
-                    )
+                    // The leading edge carries the Agent mark and nothing else,
+                    // so a parent row and its child start from one column and the
+                    // branch can hang from the mark above it.
                     .when(!self.sidebar_batch_mode, |title| {
                         title.child(sidebar_agent_logo(&agent_identity, is_selected))
                     })
@@ -21600,6 +21631,7 @@ impl MobileApp {
                             .child(row.label.clone()),
                     ),
             )
+            .when_some(disclosure, |row, disclosure| row.child(disclosure))
             .child(
                 div()
                     // A pin takes a fixed 20px out of this column, so the column
@@ -28279,6 +28311,73 @@ fn sidebar_agent_logo(identity: &str, active: bool) -> gpui::AnyElement {
     )
 }
 
+/// Whether the trunk a delegated row hangs from runs on past it.
+///
+/// The page the row was drawn from orders its siblings, so a row that is not its
+/// parent's last child is one the trunk paints through to reach the next; the
+/// branch's last child stops it at the elbow. A page that cannot place the row
+/// keeps the line, which is the honest answer for a page that was cut short.
+fn branch_continues(
+    row: &vibex_core::VibexUseRef,
+    last_sibling: Option<&vibex_core::VibexUseRef>,
+) -> bool {
+    last_sibling != Some(row)
+}
+
+/// One column of the guide a delegated session row hangs from.
+///
+/// The column starts where the parent row's Agent logo starts, so the one-pixel
+/// trunk inside it lands on that logo's center: the branch reads as leaving the
+/// logo above it, and the elbow turns off the trunk into the child's own logo,
+/// which is where the row's own leading gap begins. `continues` is whether a
+/// later sibling follows this child: every other row paints its trunk through
+/// the whole height so the line reaches the next one, while a branch's last
+/// child stops it at the elbow.
+///
+/// The row names the line's two halves the way the desktop's guide does, so a
+/// test can ask the painted layout where the branch actually landed instead of
+/// re-deriving it from the constants.
+fn sidebar_branch_guide(session_id: &str, continues: bool) -> gpui::AnyElement {
+    let trunk = theme::sidebar_tree_guide();
+    let row_height = f32::from(theme::sidebar_row_height());
+    div()
+        .relative()
+        .flex_shrink_0()
+        .w(px(theme::SIDEBAR_DELEGATED_GUIDE_WIDTH))
+        .h_full()
+        .child(
+            div()
+                .debug_selector({
+                    let selector = format!("mobile-delegated-trunk-{session_id}");
+                    move || selector.clone()
+                })
+                .absolute()
+                .left(px(theme::SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET))
+                .top_0()
+                .w(px(1.0))
+                .h(px(if continues {
+                    row_height
+                } else {
+                    row_height / 2.0
+                }))
+                .bg(trunk),
+        )
+        .child(
+            div()
+                .debug_selector({
+                    let selector = format!("mobile-delegated-elbow-{session_id}");
+                    move || selector.clone()
+                })
+                .absolute()
+                .left(px(theme::SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET))
+                .top(px(row_height / 2.0))
+                .w(px(theme::SIDEBAR_DELEGATED_GUIDE_ELBOW_WIDTH))
+                .h(px(1.0))
+                .bg(trunk),
+        )
+        .into_any_element()
+}
+
 fn sidebar_running_indicator(color: gpui::Hsla) -> gpui::AnyElement {
     svg()
         .path("icons/loader-circle.svg")
@@ -29568,6 +29667,144 @@ mod tests {
                 .code,
             "mobile_runtime_feature_value_too_long"
         );
+    }
+
+    /// A delegated session hangs off the row above it on a drawn branch, not on
+    /// padding, so the parent's Agent logo is the point the line leaves from.
+    ///
+    /// The row keeps its leading edge for the Agent mark and offers its branch
+    /// from the trailing edge instead: the phone has no hover to reveal a toggle
+    /// with, so the control stays drawn, and the desktop's own pair of chevrons
+    /// says the same thing there.
+    #[test]
+    fn a_delegated_session_hangs_off_a_drawn_branch() {
+        let source = include_str!("app.rs");
+        let row = renderer_source(source, "render_sidebar_session_row");
+        assert!(row.contains(".when_some(branch, |body, continues| {"));
+        assert!(row.contains("body.child(sidebar_branch_guide(session_id.as_str(), continues))"));
+        assert!(
+            row.contains(".when_some(disclosure, |row, disclosure| row.child(disclosure))"),
+            "the branch's disclosure belongs after the title, not before the mark"
+        );
+        assert!(
+            !row.contains("\"icons/chevron-down.svg\"")
+                && !row.contains("\"icons/chevron-right.svg\""),
+            "the leading edge keeps the Agent mark; the disclosure wears the desktop's pair"
+        );
+        let logo = source
+            .split_once("fn sidebar_branch_guide")
+            .map(|(_, tail)| tail.split_once("\nfn ").map_or(tail, |(body, _)| body))
+            .expect("the branch guide should stay inspectable");
+        assert!(logo.contains("theme::SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET"));
+        assert!(logo.contains("theme::SIDEBAR_DELEGATED_GUIDE_ELBOW_WIDTH"));
+        assert!(
+            logo.contains("row_height / 2.0"),
+            "a branch's last child stops its trunk at the elbow"
+        );
+    }
+
+    /// A branch's last child is where its trunk stops; every earlier child paints
+    /// the line on to the next row, and a page that cannot place the row keeps it
+    /// rather than cutting the branch short.
+    #[test]
+    fn a_branch_trunk_stops_at_its_last_child() {
+        let first = vibex_core::VibexUseRef::session(
+            &VibexSessionId::parse("session_first").expect("valid session id"),
+        );
+        let last = vibex_core::VibexUseRef::session(
+            &VibexSessionId::parse("session_last").expect("valid session id"),
+        );
+        assert!(branch_continues(&first, Some(&last)));
+        assert!(!branch_continues(&last, Some(&last)));
+        assert!(branch_continues(&first, None));
+    }
+
+    /// The two rows a branch joins, laid out the way the list lays them out: one
+    /// row height, one leading column, the same leading gap. Nothing else about
+    /// the rows matters to the line, which is what lets the probe answer where
+    /// the trunk and the elbow actually landed.
+    struct BranchGuideProbe;
+
+    impl Render for BranchGuideProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let row_height = theme::sidebar_row_height();
+            let logo = gpui::black();
+            let row = |id: &'static str, guide: Option<gpui::AnyElement>| {
+                div()
+                    .debug_selector(move || id.to_string())
+                    .h(row_height)
+                    .flex()
+                    .items_center()
+                    .pl(px(theme::SIDEBAR_SESSION_CONTENT_INSET))
+                    .gap(px(theme::SIDEBAR_ICON_TITLE_GAP))
+                    .children(guide)
+                    .child(
+                        div()
+                            .debug_selector(move || format!("{id}-logo"))
+                            .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
+                            .bg(logo),
+                    )
+            };
+            div()
+                .flex()
+                .flex_col()
+                .w(px(320.0))
+                .child(row("probe-parent-row", None))
+                .child(row(
+                    "mobile-probe-child-row",
+                    Some(sidebar_branch_guide("probe", false)),
+                ))
+        }
+    }
+
+    /// The branch is a drawn line, so where it lands is the whole of whether it
+    /// reads: the trunk has to sit on the parent row's Agent logo center and the
+    /// elbow has to stop exactly where the child's own logo begins.
+    #[gpui::test]
+    fn the_branch_guide_lands_on_both_agent_logos(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| BranchGuideProbe);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let parent = cx
+            .debug_bounds("probe-parent-row-logo")
+            .expect("the parent's Agent mark");
+        let child = cx
+            .debug_bounds("mobile-probe-child-row-logo")
+            .expect("the child's Agent mark");
+        let row = cx
+            .debug_bounds("mobile-probe-child-row")
+            .expect("the child's row");
+        let trunk = cx
+            .debug_bounds("mobile-delegated-trunk-probe")
+            .expect("the trunk");
+        let elbow = cx
+            .debug_bounds("mobile-delegated-elbow-probe")
+            .expect("the elbow");
+
+        // The trunk leaves the row above it at that row's Agent mark center, and
+        // the elbow ends where the child's own mark starts: one line, no gap and
+        // no overshoot into either mark. Text-sized rows land on fractions of a
+        // pixel, so each end is allowed the half pixel the layout may round by.
+        let lands_on =
+            |left: Pixels, right: Pixels| (f32::from(left) - f32::from(right)).abs() <= 0.5;
+        assert!(lands_on(
+            trunk.origin.x,
+            parent.origin.x + px(theme::SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET)
+        ));
+        assert!(lands_on(elbow.origin.x + elbow.size.width, child.origin.x));
+        // The elbow turns at the middle of the child's row, which is where both
+        // the mark and the title are centered.
+        assert!(lands_on(
+            elbow.origin.y,
+            row.origin.y + row.size.height / 2.0
+        ));
+        // The last child's trunk stops at its elbow instead of running on into
+        // whatever row the list draws next.
+        assert!(lands_on(trunk.origin.y, row.origin.y));
+        assert!(lands_on(trunk.origin.y + trunk.size.height, elbow.origin.y));
     }
 
     #[test]

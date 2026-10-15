@@ -556,6 +556,31 @@ pub const SIDEBAR_WORKSPACE_SESSION_INDENT: f32 = 20.0;
 pub const SIDEBAR_FOLDER_CHILD_INDENT: f32 = 18.0;
 /// Where a folder draws the guide line down its child column.
 pub const SIDEBAR_FOLDER_GUIDE_OFFSET: f32 = 7.0;
+/// Width of one level of the ownership tree's guide column.
+///
+/// A delegated session hangs off the session above it: the column starts exactly
+/// where that row's Agent logo starts, a one-pixel trunk runs down it and an
+/// elbow turns off the trunk into the child's own logo. The constants are the
+/// desktop sidebar's, so the two trees draw the same branch.
+pub const SIDEBAR_DELEGATED_GUIDE_WIDTH: f32 = 16.0;
+/// Where the trunk runs inside its guide column.
+///
+/// The column starts on the parent row's Agent logo, so the trunk's own edge
+/// lands on that logo's center: the branch reads as leaving the logo above it,
+/// and the one-pixel line stays on a pixel boundary instead of blurring across
+/// a half pixel.
+pub const SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET: f32 = SIDEBAR_AGENT_LOGO_SIZE / 2.0;
+/// Gap between a delegated row's guide column and its own Agent logo.
+///
+/// It is the row's own leading gap, which the elbow measures itself against.
+pub const SIDEBAR_DELEGATED_ROW_GAP: f32 = SIDEBAR_ICON_TITLE_GAP;
+/// How far the elbow reaches past the trunk.
+///
+/// The trunk has to cross the rest of its own column and the row's gap, which
+/// ends the elbow exactly where the child's Agent logo begins.
+pub const SIDEBAR_DELEGATED_GUIDE_ELBOW_WIDTH: f32 = SIDEBAR_DELEGATED_GUIDE_WIDTH
+    + SIDEBAR_DELEGATED_ROW_GAP
+    - SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET;
 /// A session row starts its content past the card overhang instead of hanging
 /// into it the way project and worktree rows do.
 pub const SIDEBAR_SESSION_CONTENT_INSET: f32 = 8.0;
@@ -1229,6 +1254,26 @@ mod tests {
         // A larger step keeps growing the row.
         assert!(
             sidebar_row_height_for(rem_base_for(115)) > sidebar_row_height_for(rem_base_for(100))
+        );
+    }
+
+    /// One level of the delegated tree is the desktop's 16px guide column, and
+    /// the elbow it turns into the child has to end where that child's Agent logo
+    /// begins: one uninterrupted line from the parent's mark to its child's, with
+    /// no gap that reads as a break and no overshoot into the mark itself.
+    #[test]
+    fn a_branch_elbow_reaches_the_child_agent_logo() {
+        assert_eq!(SIDEBAR_DELEGATED_GUIDE_WIDTH, 16.0);
+        assert_eq!(
+            SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET,
+            SIDEBAR_AGENT_LOGO_SIZE / 2.0
+        );
+        // The gap the elbow crosses is the leading gap the row already leaves,
+        // not a second number that could drift away from it.
+        assert_eq!(SIDEBAR_DELEGATED_ROW_GAP, SIDEBAR_ICON_TITLE_GAP);
+        assert_eq!(
+            SIDEBAR_DELEGATED_GUIDE_TRUNK_OFFSET + SIDEBAR_DELEGATED_GUIDE_ELBOW_WIDTH,
+            SIDEBAR_DELEGATED_GUIDE_WIDTH + SIDEBAR_ICON_TITLE_GAP
         );
     }
 }

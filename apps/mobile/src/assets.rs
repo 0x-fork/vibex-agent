@@ -36,6 +36,7 @@ const ICONS: &[&str] = &[
     "icons/chevron-right.svg",
     "icons/chevron-left.svg",
     "icons/chevron-down.svg",
+    "icons/chevrons-right.svg",
     "icons/message-square.svg",
     "icons/pin.svg",
     "icons/crosshair.svg",
@@ -532,6 +533,11 @@ impl AssetSource for MobileAssets {
             "icons/undo.svg" => Some(include_bytes!("../assets/icons/undo.svg")),
             "icons/chevrons-down-up.svg" => Some(include_bytes!(
                 "../../desktop/assets/icons/chevrons-down-up.svg"
+            )),
+            // The pair the desktop's sidebar toggles a delegated branch with, so
+            // the phone's toggle wears the same glyph the desktop's does.
+            "icons/chevrons-right.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/chevrons-right.svg"
             )),
             "icons/file-code.svg" => {
                 Some(include_bytes!("../../desktop/assets/icons/file-code.svg"))
