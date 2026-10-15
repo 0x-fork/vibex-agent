@@ -363,8 +363,15 @@ mod tests {
         let events = normalize_agent_event(AgentEventEnricherKind::Codex, &input);
         match &events[0].event {
             crate::CanonicalAgentEvent::FileOperation(file) => {
-                assert_eq!(file.old_text.as_deref(), Some("before"));
-                assert_eq!(file.new_text.as_deref(), Some("after"));
+                // A diff that arrives only as content still carries both sides,
+                // as the rendered patch: that is what the durable payload keeps,
+                // and what a reader draws.
+                let patch = file
+                    .patch
+                    .as_ref()
+                    .expect("an edit keeps its rendered patch");
+                assert!(patch.text.contains("-before"), "{}", patch.text);
+                assert!(patch.text.contains("+after"), "{}", patch.text);
             }
             other => panic!("expected file operation, got {other:?}"),
         }

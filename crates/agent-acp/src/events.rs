@@ -1506,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn acp_v1_diffs_infer_file_lifecycle_and_preserve_empty_text() {
+    fn acp_v1_diffs_infer_file_lifecycle_from_an_empty_replacement() {
         let mut event = input("diff", json!({}));
         event.content = Some(json!([
             {
@@ -1552,14 +1552,25 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(files.len(), 5);
+        // The lifecycle is inferred from both sides before they are dropped, so
+        // an empty replacement is a value here rather than an absence: a file
+        // created empty is a write, and an edit that clears its contents stays
+        // an edit instead of reading as a delete.
         assert_eq!(files[0].operation, FileOperationKind::Write);
         assert_eq!(files[1].operation, FileOperationKind::Write);
-        assert_eq!(files[1].new_text.as_deref(), Some(""));
         assert_eq!(files[2].operation, FileOperationKind::Edit);
         assert_eq!(files[3].operation, FileOperationKind::Delete);
-        assert_eq!(files[3].new_text.as_deref(), Some(""));
         assert_eq!(files[4].operation, FileOperationKind::Edit);
-        assert_eq!(files[4].new_text.as_deref(), Some(""));
+        // What the durable payload keeps is the rendered patch, not the two
+        // snapshots. A file created empty has nothing to render, and a file
+        // cleared to empty renders the line that went away.
+        assert!(files[1].patch.is_none());
+        let cleared = files[4].patch.as_ref().expect("a cleared file has a patch");
+        assert!(cleared.text.contains("-clear me"), "{}", cleared.text);
+        for file in &files {
+            assert_eq!(file.old_text, None);
+            assert_eq!(file.new_text, None);
+        }
     }
 
     #[test]
