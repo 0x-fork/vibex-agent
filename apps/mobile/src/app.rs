@@ -52,7 +52,7 @@ use vibex_desktop_model::{
     RuntimeCascadeProjection, SidebarHierarchyMode, SidebarOrganizationItem,
     SidebarOrganizationView, SidebarProjectLogo, SidebarProjectLogoColor, SidebarState,
     ThemeSelection, TimelineConversationTurn, TimelineModel, TimelineProcessActivityGroup,
-    TimelineRow, TimelineRowKind,
+    TimelineRow, TimelineRowKind, WorktreeLifecycleDisplayState,
 };
 use vibex_remote_client::{
     ClientDeviceIdentity, RemoteConnectionState, RemoteLifecycleSignal, WebRemoteBackend,
@@ -7754,6 +7754,11 @@ impl MobileApp {
                         .sidebar_view
                         .collapsed_workspace_ids
                         .contains(&workspace_id),
+                    lifecycle: self
+                        .sidebar_view
+                        .worktree_lifecycle
+                        .get(&workspace_id)
+                        .copied(),
                 }
             })
             .collect()
@@ -7819,6 +7824,7 @@ impl MobileApp {
                         .or_else(|| child.agent_id.as_ref().map(|id| id.as_str().to_string())),
                     child_count: child.child_count,
                     running_count: 0,
+                    lifecycle: None,
                     collapsed: false,
                     pinned: false,
                     selected: self
@@ -22234,6 +22240,7 @@ impl MobileApp {
                 group.when_some(row.state, |group, state| {
                     group.child(sidebar_workspace_status_indicator(
                         Some(state),
+                        None,
                         ElementId::from(format!("mobile-group-mark-{}", row.id())),
                     ))
                 })
@@ -22458,8 +22465,12 @@ impl MobileApp {
             || self.sidebar_selected_workspace_id.as_deref() == Some(workspace_id.as_str());
         let status_indicator = sidebar_workspace_status_indicator(
             row.state,
+            row.lifecycle,
             ElementId::from(format!("mobile-sidebar-workspace-mark-{workspace_id}")),
         );
+        // Where the git layer stands is the one thing about a Worktree the
+        // phone cannot see for itself, so it rides the detail line the branch
+        // already lives on.
         let detail = row.detail.clone().unwrap_or_else(|| {
             format!(
                 "{} · {}",
@@ -22471,6 +22482,12 @@ impl MobileApp {
                     .unwrap_or_default()
             )
         });
+        let detail = match row.lifecycle {
+            Some(lifecycle) => {
+                format!("{detail} · {}", sidebar_worktree_lifecycle_label(lifecycle))
+            }
+            None => detail,
+        };
         div()
             .id(format!("mobile-workspace-row-{workspace_id}"))
             .h_full()
@@ -30751,6 +30768,49 @@ fn sidebar_workspace_status_color(state: Option<AgentSessionState>) -> gpui::Hsl
     }
 }
 
+/// Where a Worktree stands, in the desktop's own words.
+fn sidebar_worktree_lifecycle_label(state: WorktreeLifecycleDisplayState) -> &'static str {
+    use WorktreeLifecycleDisplayState as State;
+    match state {
+        State::Working => locale::text("Working", "开发中", "開發中"),
+        State::Reviewing => locale::text("Reviewing", "检查中", "檢查中"),
+        State::Ready => locale::text("Ready", "可合并", "可合併"),
+        State::Queued => locale::text("Queued", "排队中", "排隊中"),
+        State::Merging => locale::text("Merging", "合并中", "合併中"),
+        State::NeedsResolution => locale::text("Conflict", "冲突", "衝突"),
+        State::Aborting => locale::text("Aborting", "中止中", "中止中"),
+        State::Archiving => locale::text("Archiving", "归档中", "封存中"),
+        State::Archived => locale::text("Archived", "已归档", "已封存"),
+        State::Restoring => locale::text("Restoring", "恢复中", "還原中"),
+        State::Discarding => locale::text("Discarding", "丢弃中", "捨棄中"),
+        State::Discarded => locale::text("Discarded", "已丢弃", "已捨棄"),
+        State::Failed => locale::text("Failed", "失败", "失敗"),
+        State::NeedsAttention => locale::text("Needs attention", "需要处理", "需要處理"),
+    }
+}
+
+/// The colour a Worktree's own state takes, in the desktop's palette.
+///
+/// The same three colours the desktop tints its branch marks with: settled work
+/// is the success colour, work in flight is the warning one, a merge is the
+/// accent, and anything the reader has to settle is the danger colour.
+fn sidebar_worktree_lifecycle_color(state: WorktreeLifecycleDisplayState) -> gpui::Hsla {
+    use WorktreeLifecycleDisplayState as State;
+    match state {
+        State::Ready => theme::accent_green(),
+        State::Reviewing
+        | State::Queued
+        | State::Archiving
+        | State::Restoring
+        | State::Discarding => theme::accent_yellow(),
+        State::Merging => theme::primary(),
+        State::NeedsResolution | State::Aborting | State::Failed | State::NeedsAttention => {
+            theme::accent_red()
+        }
+        State::Working | State::Archived | State::Discarded => theme::sidebar_foreground(0.48),
+    }
+}
+
 fn sidebar_status_dot(color: gpui::Hsla) -> gpui::AnyElement {
     div()
         .size(px(theme::SIDEBAR_STATUS_DOT))
@@ -31474,9 +31534,16 @@ fn sidebar_session_running_color(auto_continue_enabled: bool) -> gpui::Hsla {
 
 fn sidebar_workspace_status_indicator(
     state: Option<AgentSessionState>,
+    lifecycle: Option<WorktreeLifecycleDisplayState>,
     id: ElementId,
 ) -> gpui::AnyElement {
-    let color = sidebar_workspace_status_color(state);
+    // A Worktree whose sessions are all quiet still reports where its git layer
+    // stands: ready to merge, merging, or stuck. That is the one state the
+    // aggregate cannot see, so it colours the mark the aggregate leaves dim.
+    let color = match (state, lifecycle) {
+        (None, Some(lifecycle)) => sidebar_worktree_lifecycle_color(lifecycle),
+        _ => sidebar_workspace_status_color(state),
+    };
     match state {
         Some(AgentSessionState::Running | AgentSessionState::Initializing) => {
             sidebar_running_indicator(id, color)
@@ -36306,6 +36373,7 @@ fn session_opened(cx: &mut Context<Self>) {
             detail: None,
             child_count: 2,
             running_count: 0,
+            lifecycle: None,
             collapsed: false,
             pinned: false,
             selected: false,
@@ -37657,6 +37725,46 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             reschedule.contains("unix_timestamp_ms() + seconds * 1_000"),
             "and moving it counts from now, the way the desktop's countdown does"
+        );
+    }
+
+    /// Every state a Worktree can be in has words and a colour of its own.
+    #[test]
+    fn a_worktrees_state_is_named_and_coloured() {
+        use WorktreeLifecycleDisplayState as State;
+        for state in [
+            State::Working,
+            State::Reviewing,
+            State::Ready,
+            State::Queued,
+            State::Merging,
+            State::NeedsResolution,
+            State::Aborting,
+            State::Archiving,
+            State::Archived,
+            State::Restoring,
+            State::Discarding,
+            State::Discarded,
+            State::Failed,
+            State::NeedsAttention,
+        ] {
+            assert!(
+                !sidebar_worktree_lifecycle_label(state).is_empty(),
+                "{state:?} needs words"
+            );
+        }
+        assert_ne!(
+            sidebar_worktree_lifecycle_color(State::Ready),
+            sidebar_worktree_lifecycle_color(State::Failed),
+            "a Worktree that is ready and one that is stuck cannot look alike"
+        );
+
+        // The row says it in the line the branch already lives on.
+        let source = include_str!("app.rs");
+        let row = renderer_source(source, "render_sidebar_workspace_row");
+        assert!(
+            row.contains("sidebar_worktree_lifecycle_label(lifecycle)"),
+            "the git layer's own state rides the detail line"
         );
     }
 

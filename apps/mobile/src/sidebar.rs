@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use vibex_core::{AgentSession, AgentSessionState, VibexSessionId, WorkspaceMode};
 use vibex_desktop_model::{
     SidebarHierarchyMode, SidebarOrganizationItem, SidebarOrganizationView,
-    sidebar_project_items_for_workspace, sidebar_root_items,
+    WorktreeLifecycleDisplayState, sidebar_project_items_for_workspace, sidebar_root_items,
 };
 
 use crate::theme;
@@ -57,6 +57,9 @@ pub struct SidebarRow {
     /// Number of direct children represented by the row. Projects use this for
     /// the workspace count badge; workspace rows use it for their session count.
     pub child_count: usize,
+    /// Where the managed Worktree this row stands for is, when the Desktop's
+    /// git layer says. Only a workspace row carries one.
+    pub lifecycle: Option<WorktreeLifecycleDisplayState>,
     /// Sessions of this row that are working right now. A project row reports
     /// it so a collapsed project still says that something inside it is busy;
     /// the desktop draws the same count in words at its trailing edge.
@@ -110,6 +113,10 @@ pub struct SidebarWorkspace {
     pub branch: Option<String>,
     pub mode: WorkspaceMode,
     pub collapsed: bool,
+    /// Where the managed Worktree stands, when the Desktop's git layer says.
+    /// A phone cannot see git, so this is the only sign that a Worktree is
+    /// merging, ready, or stuck.
+    pub lifecycle: Option<WorktreeLifecycleDisplayState>,
 }
 
 pub struct SidebarRowInput<'a> {
@@ -223,11 +230,14 @@ fn ordered_sessions<'a>(
 fn workspace_status(
     sessions: &[&AgentSession],
     view: &SidebarOrganizationView,
+    lifecycle: Option<WorktreeLifecycleDisplayState>,
 ) -> (Option<AgentSessionState>, bool) {
-    let running = sessions.iter().any(|session| session_working(session));
+    let running =
+        sessions.iter().any(|session| session_working(session)) || lifecycle_running(lifecycle);
     let error = sessions
         .iter()
-        .any(|session| session.state == AgentSessionState::Error);
+        .any(|session| session.state == AgentSessionState::Error)
+        || lifecycle_error(lifecycle);
     let needs_input = sessions
         .iter()
         .any(|session| session.state == AgentSessionState::NeedsInput);
@@ -455,6 +465,7 @@ fn push_root_children(
                     // The list is the unfiltered one, so a search does not move
                     // the total.
                     child_count: sessions_by_project.get(&project_id).map_or(0, Vec::len),
+                    lifecycle: None,
                     running_count: sessions_by_project.get(&project_id).map_or(0, |sessions| {
                         sessions
                             .iter()
@@ -513,6 +524,7 @@ fn push_root_children(
                     detail: None,
                     child_count: 0,
                     running_count: 0,
+                    lifecycle: None,
                     collapsed,
                     pinned: false,
                     selected: false,
@@ -631,6 +643,7 @@ fn push_project_children(
                     detail: None,
                     child_count: 0,
                     running_count: 0,
+                    lifecycle: None,
                     collapsed,
                     pinned: false,
                     selected: false,
@@ -763,9 +776,10 @@ fn push_project_children(
                     .iter()
                     .any(|session| session.id == *selected)
             }),
-            state: workspace_status(&workspace_sessions, input.view).0,
+            lifecycle: workspace.lifecycle,
+            state: workspace_status(&workspace_sessions, input.view, workspace.lifecycle).0,
             session_id: None,
-            unread: workspace_status(&workspace_sessions, input.view).1,
+            unread: workspace_status(&workspace_sessions, input.view, workspace.lifecycle).1,
             auto_continue: false,
             auto_continue_paused: false,
             delegated_child: false,
@@ -854,6 +868,7 @@ fn push_workspace_children(
                     detail: None,
                     child_count: 0,
                     running_count: 0,
+                    lifecycle: None,
                     collapsed,
                     pinned: false,
                     selected: false,
@@ -947,6 +962,7 @@ fn push_group_rows(
         detail: None,
         child_count: members.len(),
         running_count: 0,
+        lifecycle: None,
         collapsed,
         pinned: group.pinned,
         selected: input
@@ -1001,7 +1017,45 @@ fn group_status(
     members: &[&AgentSession],
     view: &SidebarOrganizationView,
 ) -> Option<AgentSessionState> {
-    workspace_status(members, view).0
+    // A group is not a Worktree: it has no git layer of its own to report.
+    workspace_status(members, view, None).0
+}
+
+/// Whether the git layer is working on this Worktree right now.
+///
+/// The set is the desktop's: a Worktree being reviewed, queued, merged,
+/// aborted, archived, restored, or discarded is busy, and its row says so even
+/// when none of its sessions are.
+fn lifecycle_running(state: Option<WorktreeLifecycleDisplayState>) -> bool {
+    matches!(
+        state,
+        Some(
+            WorktreeLifecycleDisplayState::Reviewing
+                | WorktreeLifecycleDisplayState::Queued
+                | WorktreeLifecycleDisplayState::Merging
+                | WorktreeLifecycleDisplayState::Aborting
+                | WorktreeLifecycleDisplayState::Archiving
+                | WorktreeLifecycleDisplayState::Restoring
+                | WorktreeLifecycleDisplayState::Discarding
+        )
+    )
+}
+
+/// Whether the git layer has stopped on something the reader has to settle.
+///
+/// `Aborting` is in both sets on the desktop — it is work that is running and
+/// work that will need the reader if it fails — and the two questions are asked
+/// separately, so it is in both here too.
+fn lifecycle_error(state: Option<WorktreeLifecycleDisplayState>) -> bool {
+    matches!(
+        state,
+        Some(
+            WorktreeLifecycleDisplayState::NeedsResolution
+                | WorktreeLifecycleDisplayState::Aborting
+                | WorktreeLifecycleDisplayState::Failed
+                | WorktreeLifecycleDisplayState::NeedsAttention
+        )
+    )
 }
 
 fn session_row(
@@ -1023,6 +1077,7 @@ fn session_row(
         detail: None,
         child_count: 0,
         running_count: 0,
+        lifecycle: None,
         collapsed: false,
         pinned: input.view.pinned_session_ids.contains(&session_id),
         selected: input
@@ -1063,6 +1118,7 @@ fn empty_workspace_row(
         detail: None,
         child_count: 0,
         running_count: 0,
+        lifecycle: None,
         collapsed: false,
         pinned: false,
         selected: false,
@@ -1306,6 +1362,7 @@ mod tests {
             detail: None,
             child_count: 0,
             running_count: 0,
+            lifecycle: None,
             collapsed: false,
             pinned: false,
             selected: false,
@@ -1316,6 +1373,48 @@ mod tests {
             auto_continue_paused: false,
             delegated_child: false,
         }
+    }
+
+    /// A Worktree's own git state counts as its own row's state.
+    ///
+    /// The phone cannot see git, so a Worktree that is merging or stuck would
+    /// otherwise look exactly like a quiet one; the desktop folds the same two
+    /// sets into the same aggregate.
+    #[test]
+    fn a_worktrees_git_state_counts_as_its_own() {
+        let view = SidebarOrganizationView::default();
+        let empty: Vec<&AgentSession> = Vec::new();
+
+        assert_eq!(
+            workspace_status(&empty, &view, Some(WorktreeLifecycleDisplayState::Merging)).0,
+            Some(AgentSessionState::Running),
+            "a merge in flight is work in progress"
+        );
+        assert_eq!(
+            workspace_status(&empty, &view, Some(WorktreeLifecycleDisplayState::Failed)).0,
+            Some(AgentSessionState::Error)
+        );
+        assert_eq!(
+            workspace_status(
+                &empty,
+                &view,
+                Some(WorktreeLifecycleDisplayState::NeedsResolution)
+            )
+            .0,
+            Some(AgentSessionState::Error),
+            "a conflict is the reader's to settle"
+        );
+        assert_eq!(
+            workspace_status(&empty, &view, Some(WorktreeLifecycleDisplayState::Aborting)).0,
+            Some(AgentSessionState::Error),
+            "work that is aborting is running work that may need the reader"
+        );
+        assert_eq!(
+            workspace_status(&empty, &view, Some(WorktreeLifecycleDisplayState::Ready)).0,
+            None,
+            "a Worktree that is merely ready reports nothing on its own"
+        );
+        assert_eq!(workspace_status(&empty, &view, None).0, None);
     }
 
     /// A collapsed group reports its members the way a worktree does.
@@ -1382,6 +1481,7 @@ mod tests {
             branch: None,
             mode: WorkspaceMode::CurrentCheckout,
             collapsed: false,
+            lifecycle: None,
         }];
         let mut working = session("session-b", "project", "Working");
         working.state = AgentSessionState::Running;
@@ -1587,6 +1687,7 @@ mod tests {
             branch: Some("feature/mobile-sidebar".to_string()),
             mode: WorkspaceMode::CurrentCheckout,
             collapsed: false,
+            lifecycle: None,
         }];
         let sessions = vec![session("session-a", "project", "Hello")];
         let rows = sidebar_rows(SidebarRowInput {
@@ -1626,6 +1727,7 @@ mod tests {
             branch: Some("main".to_string()),
             mode: WorkspaceMode::CurrentCheckout,
             collapsed: false,
+            lifecycle: None,
         }];
         let rows = sidebar_rows(SidebarRowInput {
             view: &view,
@@ -1694,6 +1796,7 @@ mod tests {
             branch: Some("main".to_string()),
             mode: WorkspaceMode::CurrentCheckout,
             collapsed: false,
+            lifecycle: None,
         }];
         let sessions = vec![session("session-a", "project", "Hello")];
         let rows = sidebar_rows(SidebarRowInput {
@@ -1736,6 +1839,7 @@ mod tests {
             branch: None,
             mode: WorkspaceMode::CurrentCheckout,
             collapsed: false,
+            lifecycle: None,
         }];
         let sessions = vec![session("session-a", "project", "Hello")];
         let rows = sidebar_rows(SidebarRowInput {
@@ -1768,6 +1872,7 @@ mod tests {
             branch: None,
             mode: WorkspaceMode::CurrentCheckout,
             collapsed: false,
+            lifecycle: None,
         }];
         let sessions = vec![session("session-a", "project", "Hello")];
         let rows = sidebar_rows(SidebarRowInput {
@@ -2027,6 +2132,7 @@ mod tests {
             branch: Some("main".to_string()),
             mode: WorkspaceMode::CurrentCheckout,
             collapsed: false,
+            lifecycle: None,
         }];
         let sessions = vec![session("session-a", "project", "Hello")];
         let rows = sidebar_rows(SidebarRowInput {
