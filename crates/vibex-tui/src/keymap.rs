@@ -20,6 +20,8 @@ use std::str::FromStr;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 
+use crate::locale::Strings;
+
 /// A single key press with its relevant modifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Chord {
@@ -355,11 +357,23 @@ pub struct Binding {
     pub scope: Scope,
     pub chord: Chord,
     pub intent: Intent,
-    /// Help text. `None` marks a hidden alias: dispatchable, never advertised.
-    pub label: Option<&'static str>,
+    /// The locale key that names this row, or `None` for a hidden alias:
+    /// dispatchable, never advertised.
+    ///
+    /// It is an accessor rather than a string so the row is drawn in whatever
+    /// language the session resolved to. Which words a row uses is still the
+    /// table's decision, not the renderer's, which is what lets `Search` on the
+    /// runtime switcher be `Filter` on a list without either surface spelling
+    /// it out.
+    pub label: Option<fn(Strings) -> &'static str>,
 }
 
-const fn binding(scope: Scope, chord: Chord, intent: Intent, label: &'static str) -> Binding {
+const fn binding(
+    scope: Scope,
+    chord: Chord,
+    intent: Intent,
+    label: fn(Strings) -> &'static str,
+) -> Binding {
     Binding {
         scope,
         chord,
@@ -398,7 +412,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Global,
         Chord::ctrl('p'),
         Intent::OpenCommandPalette,
-        "Command palette",
+        |strings| strings.row_command_palette(),
     ),
     alias(
         Scope::Global,
@@ -409,13 +423,13 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Global,
         Chord::plain(KeyCode::Char('?')),
         Intent::ToggleHelp,
-        "Contextual help",
+        |strings| strings.row_contextual_help(),
     ),
     binding(
         Scope::Global,
         Chord::plain(KeyCode::F(1)),
         Intent::OpenSettings,
-        "Settings",
+        |strings| Intent::OpenSettings.label(strings),
     ),
     alias(Scope::Global, Chord::ctrl(','), Intent::OpenSettings),
     // `Quit` has no chord on purpose. `Ctrl+C` already owns leaving — the first
@@ -427,56 +441,61 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Global,
         Chord::plain(KeyCode::Esc),
         Intent::Back,
-        "Back / close",
+        |strings| strings.row_back_close(),
     ),
     binding(
         Scope::Global,
         Chord::plain(KeyCode::Tab),
         Intent::FocusNext,
-        "Next pane",
+        |strings| Intent::FocusNext.label(strings),
     ),
     alias(
         Scope::Global,
         Chord::plain(KeyCode::BackTab),
         Intent::FocusPrevious,
     ),
-    binding(Scope::Global, Chord::ctrl('r'), Intent::Refresh, "Refresh"),
+    binding(
+        Scope::Global,
+        Chord::ctrl('r'),
+        Intent::Refresh,
+        |strings| Intent::Refresh.label(strings),
+    ),
     binding(
         Scope::Global,
         Chord::ctrl('c'),
         Intent::ContextualCancel,
-        "Cancel / interrupt",
+        |strings| strings.row_cancel_interrupt(),
     ),
     binding(
         Scope::Global,
         Chord::plain(KeyCode::Char('1')),
         Intent::GotoSessions,
-        "Sessions",
+        |strings| Intent::GotoSessions.label(strings),
     ),
     binding(
         Scope::Global,
         Chord::plain(KeyCode::Char('2')),
         Intent::GotoManagement,
-        "Management",
+        |strings| Intent::GotoManagement.label(strings),
     ),
     binding(
         Scope::Global,
         Chord::plain(KeyCode::Char('4')),
         Intent::OpenSettings,
-        "Settings",
+        |strings| Intent::OpenSettings.label(strings),
     ),
     binding(
         Scope::Global,
         Chord::plain(KeyCode::Char('5')),
         Intent::ToggleHelp,
-        "Help",
+        |strings| Intent::ToggleHelp.label(strings),
     ),
     // ---- sessions -------------------------------------------------------
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Up),
         Intent::SelectPrevious,
-        "Previous",
+        |strings| Intent::SelectPrevious.label(strings),
     ),
     alias(
         Scope::Sessions,
@@ -487,7 +506,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Sessions,
         Chord::plain(KeyCode::Down),
         Intent::SelectNext,
-        "Next",
+        |strings| Intent::SelectNext.label(strings),
     ),
     alias(
         Scope::Sessions,
@@ -498,7 +517,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Sessions,
         Chord::plain(KeyCode::Enter),
         Intent::OpenSelectedSession,
-        "Open",
+        |strings| Intent::OpenSelectedSession.label(strings),
     ),
     // The row's own buttons are reached with the arrows that move across it:
     // `→` steps onto the cluster at its first button, `←` at its last, and the
@@ -508,7 +527,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Sessions,
         Chord::plain(KeyCode::Left),
         Intent::SessionControlPrevious,
-        "Previous button",
+        |strings| Intent::SessionControlPrevious.label(strings),
     ),
     alias(
         Scope::Sessions,
@@ -519,7 +538,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Sessions,
         Chord::plain(KeyCode::Right),
         Intent::SessionControlNext,
-        "Next button",
+        |strings| Intent::SessionControlNext.label(strings),
     ),
     alias(
         Scope::Sessions,
@@ -530,7 +549,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Sessions,
         Chord::plain(KeyCode::Char('n')),
         Intent::NewSession,
-        "New session",
+        |strings| strings.row_new_session(),
     ),
     // A heading's own verbs live behind one key, the way the desktop keeps them
     // behind its action button: a project and a folder each have four or five,
@@ -539,49 +558,49 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Sessions,
         Chord::plain(KeyCode::Char('m')),
         Intent::SidebarRowActions,
-        "Heading actions",
+        |strings| strings.row_heading_actions(),
     ),
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char('/')),
         Intent::BeginFilter,
-        "Filter",
+        |strings| Intent::BeginFilter.label(strings),
     ),
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char('r')),
         Intent::BeginRenameSession,
-        "Rename",
+        |strings| Intent::BeginRenameSession.label(strings),
     ),
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char('f')),
         Intent::ForkSession,
-        "Fork session",
+        |strings| strings.row_fork_session(),
     ),
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char('a')),
         Intent::ArchiveSession,
-        "Archive",
+        |strings| Intent::ArchiveSession.label(strings),
     ),
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char('d')),
         Intent::DeleteSession,
-        "Delete",
+        |strings| Intent::DeleteSession.label(strings),
     ),
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char('e')),
         Intent::ToggleSessionCard,
-        "Details",
+        |strings| Intent::ToggleSessionCard.label(strings),
     ),
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char('c')),
         Intent::CollapseSessionCards,
-        "Close cards",
+        |strings| Intent::CollapseSessionCards.label(strings),
     ),
     // A branch of delegated sub-sessions folds on one key, the way the heading
     // above it folds on one click; `z` is free here and reads as "fold".
@@ -589,43 +608,43 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Sessions,
         Chord::plain(KeyCode::Char('z')),
         Intent::ToggleChildBranch,
-        "Sub-sessions",
+        |strings| Intent::ToggleChildBranch.label(strings),
     ),
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char('y')),
         Intent::CopySessionRow,
-        "Copy",
+        |strings| Intent::CopySessionRow.label(strings),
     ),
     binding(
         Scope::Sessions,
         Chord::ctrl('a'),
         Intent::ToggleShowArchived,
-        "Show archived",
+        |strings| strings.row_show_archived(),
     ),
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char('p')),
         Intent::PinSession,
-        "Pin",
+        |strings| Intent::PinSession.label(strings),
     ),
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char('t')),
         Intent::ToggleAutoContinue,
-        "Auto-continue",
+        |strings| Intent::ToggleAutoContinue.label(strings),
     ),
     binding(
         Scope::Sessions,
         Chord::new(KeyCode::Up, KeyModifiers::ALT),
         Intent::MoveSessionUp,
-        "Move up",
+        |strings| Intent::MoveSessionUp.label(strings),
     ),
     binding(
         Scope::Sessions,
         Chord::new(KeyCode::Down, KeyModifiers::ALT),
         Intent::MoveSessionDown,
-        "Move down",
+        |strings| Intent::MoveSessionDown.label(strings),
     ),
     // ---- agent (transcript) ---------------------------------------------
     // The session list is a digit in the global table, which the composer
@@ -638,37 +657,37 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Agent,
         Chord::plain(KeyCode::PageUp),
         Intent::ScrollPageUp,
-        "Page up",
+        |strings| Intent::ScrollPageUp.label(strings),
     ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::PageDown),
         Intent::ScrollPageDown,
-        "Page down",
+        |strings| Intent::ScrollPageDown.label(strings),
     ),
     binding(
         Scope::Agent,
         Chord::ctrl('u'),
         Intent::ScrollHalfPageUp,
-        "Half page up",
+        |strings| strings.row_half_page_up(),
     ),
     binding(
         Scope::Agent,
         Chord::ctrl('d'),
         Intent::ScrollHalfPageDown,
-        "Half page down",
+        |strings| strings.row_half_page_down(),
     ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::End),
         Intent::ScrollToBottom,
-        "Bottom (follow)",
+        |strings| strings.row_bottom_follow(),
     ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::Home),
         Intent::ScrollToTop,
-        "Top",
+        |strings| Intent::ScrollToTop.label(strings),
     ),
     // `u` is free in this scope and reads as "up one page of history"; the
     // scroll keys around it are all taken already.
@@ -676,25 +695,25 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Agent,
         Chord::plain(KeyCode::Char('u')),
         Intent::LoadOlderHistory,
-        "Older history",
+        |strings| Intent::LoadOlderHistory.label(strings),
     ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::Char('e')),
         Intent::ToggleBlockExpanded,
-        "Expand block",
+        |strings| strings.row_expand_block(),
     ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::F(2)),
         Intent::ToggleAllBlocksExpanded,
-        "Expand all",
+        |strings| Intent::ToggleAllBlocksExpanded.label(strings),
     ),
     binding(
         Scope::Agent,
         Chord::ctrl('e'),
         Intent::ToggleReasoningExpanded,
-        "Toggle reasoning",
+        |strings| strings.row_toggle_reasoning(),
     ),
     // The countdown to a continuation is only visible while the reader is in
     // the session, so the key that stops it has to work there too.
@@ -702,43 +721,43 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Agent,
         Chord::plain(KeyCode::Char('t')),
         Intent::ToggleAutoContinue,
-        "Auto-continue",
+        |strings| Intent::ToggleAutoContinue.label(strings),
     ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::Char('y')),
         Intent::CopyBlockBody,
-        "Copy block",
+        |strings| strings.row_copy_block(),
     ),
     binding(
         Scope::Agent,
         Chord::ctrl('y'),
         Intent::CopyBlockMetadata,
-        "Copy metadata",
+        |strings| strings.row_copy_metadata(),
     ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::Enter),
         Intent::OpenBlockDetails,
-        "Block details",
+        |strings| strings.row_block_details(),
     ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::Char('i')),
         Intent::FocusComposer,
-        "Write a message",
+        |strings| strings.row_write_a_message(),
     ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::F(6)),
         Intent::ContinueTurn,
-        "Continue turn",
+        |strings| strings.row_continue_turn(),
     ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::Char('/')),
         Intent::BeginTranscriptSearch,
-        "Find",
+        |strings| Intent::BeginTranscriptSearch.label(strings),
     ),
     // The queue's own keys. `Alt` keeps them out of the way of the transcript,
     // and every one of them no-ops when nothing is queued.
@@ -746,13 +765,13 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Agent,
         Chord::new(KeyCode::Up, KeyModifiers::ALT),
         Intent::QueueSelectPrevious,
-        "Queue up",
+        |strings| Intent::QueueSelectPrevious.label(strings),
     ),
     binding(
         Scope::Agent,
         Chord::new(KeyCode::Down, KeyModifiers::ALT),
         Intent::QueueSelectNext,
-        "Queue down",
+        |strings| Intent::QueueSelectNext.label(strings),
     ),
     alias(
         Scope::Agent,
@@ -778,7 +797,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Agent,
         Chord::new(KeyCode::Enter, KeyModifiers::ALT),
         Intent::QueueSendNow,
-        "Send now",
+        |strings| Intent::QueueSendNow.label(strings),
     ),
     // The clock button the Desktop puts beside the Composer. `Alt` keeps it out
     // of the way of the transcript, and it no-ops on a page with no draft.
@@ -786,37 +805,37 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Agent,
         Chord::new(KeyCode::Char('s'), KeyModifiers::ALT),
         Intent::ScheduleMessage,
-        "Schedule send",
+        |strings| strings.row_schedule_send(),
     ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::Char('n')),
         Intent::SearchNext,
-        "Next match",
+        |strings| Intent::SearchNext.label(strings),
     ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::Char('p')),
         Intent::SearchPrevious,
-        "Prev match",
+        |strings| Intent::SearchPrevious.label(strings),
     ),
     binding(
         Scope::Agent,
         Chord::new(KeyCode::Char('d'), KeyModifiers::ALT),
         Intent::ToggleDock,
-        "Dock",
+        |strings| Intent::ToggleDock.label(strings),
     ),
     binding(
         Scope::Agent,
         Chord::new(KeyCode::Char('g'), KeyModifiers::ALT),
         Intent::DockActivate,
-        "Dock open",
+        |strings| Intent::DockActivate.label(strings),
     ),
     binding(
         Scope::Agent,
         Chord::new(KeyCode::Char('h'), KeyModifiers::ALT),
         Intent::DockHideDone,
-        "Hide done",
+        |strings| Intent::DockHideDone.label(strings),
     ),
     // The ownership tree is walked with the arrows that mean "in" and "back":
     // into the sessions this one delegated, and back to the one that delegated
@@ -826,20 +845,20 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Agent,
         Chord::new(KeyCode::Right, KeyModifiers::ALT),
         Intent::OpenChildSessions,
-        "Sub-sessions",
+        |strings| Intent::OpenChildSessions.label(strings),
     ),
     binding(
         Scope::Agent,
         Chord::new(KeyCode::Left, KeyModifiers::ALT),
         Intent::GotoParentSession,
-        "Main session",
+        |strings| Intent::GotoParentSession.label(strings),
     ),
     // ---- composer -------------------------------------------------------
     binding(
         Scope::Composer,
         Chord::plain(KeyCode::Enter),
         Intent::SubmitComposer,
-        "Send",
+        |strings| Intent::SubmitComposer.label(strings),
     ),
     // Two chords for the one action, and the second is not a convenience: a
     // terminal that does not implement the keyboard protocol sends `Shift+Enter`
@@ -851,49 +870,49 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Composer,
         Chord::new(KeyCode::Enter, KeyModifiers::SHIFT),
         Intent::InsertNewline,
-        "Newline",
+        |strings| Intent::InsertNewline.label(strings),
     ),
     binding(
         Scope::Composer,
         Chord::ctrl('j'),
         Intent::InsertNewline,
-        "Newline (any terminal)",
+        |strings| strings.row_newline_any_terminal(),
     ),
     binding(
         Scope::Composer,
         Chord::ctrl('m'),
         Intent::ToggleMultiline,
-        "Multiline mode",
+        |strings| strings.row_multiline_mode(),
     ),
     binding(
         Scope::Composer,
         Chord::plain(KeyCode::Up),
         Intent::ComposerHistoryPrevious,
-        "Previous message",
+        |strings| strings.row_previous_message(),
     ),
     binding(
         Scope::Composer,
         Chord::plain(KeyCode::Down),
         Intent::ComposerHistoryNext,
-        "Next message",
+        |strings| strings.row_next_message(),
     ),
     binding(
         Scope::Composer,
         Chord::ctrl('o'),
         Intent::EditComposerExternally,
-        "Edit in $EDITOR",
+        |strings| strings.row_edit_in_editor(),
     ),
     binding(
         Scope::Composer,
         Chord::ctrl('b'),
         Intent::BackgroundRunningCommand,
-        "Send to background",
+        |strings| strings.row_send_to_background(),
     ),
     binding(
         Scope::Composer,
         Chord::ctrl('s'),
         Intent::SteerRunningTurn,
-        "Steer running turn",
+        |strings| strings.row_steer_running_turn(),
     ),
     // The completion drawer is walked with the arrow keys while it is open;
     // these two are the explicit chords, and they deliberately stay off
@@ -904,25 +923,25 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Composer,
         Chord::new(KeyCode::Up, KeyModifiers::ALT),
         Intent::CompletionPrevious,
-        "Previous completion",
+        |strings| strings.row_previous_completion(),
     ),
     binding(
         Scope::Composer,
         Chord::new(KeyCode::Down, KeyModifiers::ALT),
         Intent::CompletionNext,
-        "Next completion",
+        |strings| strings.row_next_completion(),
     ),
     binding(
         Scope::Composer,
         Chord::plain(KeyCode::Tab),
         Intent::CompletionAccept,
-        "Accept completion",
+        |strings| strings.row_accept_completion(),
     ),
     binding(
         Scope::Composer,
         Chord::ctrl('w'),
         Intent::DeleteWordBefore,
-        "Delete word",
+        |strings| Intent::DeleteWordBefore.label(strings),
     ),
     alias(
         Scope::Composer,
@@ -938,38 +957,43 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Composer,
         Chord::new(KeyCode::Char('d'), KeyModifiers::ALT),
         Intent::DeleteWordAfter,
-        "Kill word",
+        |strings| Intent::DeleteWordAfter.label(strings),
     ),
     binding(
         Scope::Composer,
         Chord::ctrl('k'),
         Intent::KillToLineEnd,
-        "Kill to end",
+        |strings| Intent::KillToLineEnd.label(strings),
     ),
     binding(
         Scope::Composer,
         Chord::ctrl('u'),
         Intent::KillToLineStart,
-        "Kill to start",
+        |strings| Intent::KillToLineStart.label(strings),
     ),
-    binding(Scope::Composer, Chord::ctrl('y'), Intent::YankKill, "Yank"),
+    binding(
+        Scope::Composer,
+        Chord::ctrl('y'),
+        Intent::YankKill,
+        |strings| Intent::YankKill.label(strings),
+    ),
     binding(
         Scope::Composer,
         Chord::ctrl('z'),
         Intent::ComposerUndo,
-        "Undo",
+        |strings| Intent::ComposerUndo.label(strings),
     ),
     binding(
         Scope::Composer,
         Chord::new(KeyCode::Char('z'), KeyModifiers::ALT),
         Intent::ComposerRedo,
-        "Redo",
+        |strings| Intent::ComposerRedo.label(strings),
     ),
     binding(
         Scope::Composer,
         Chord::new(KeyCode::Char('b'), KeyModifiers::ALT),
         Intent::ComposerWordLeft,
-        "Word left",
+        |strings| Intent::ComposerWordLeft.label(strings),
     ),
     alias(
         Scope::Composer,
@@ -980,7 +1004,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Composer,
         Chord::new(KeyCode::Char('f'), KeyModifiers::ALT),
         Intent::ComposerWordRight,
-        "Word right",
+        |strings| Intent::ComposerWordRight.label(strings),
     ),
     alias(
         Scope::Composer,
@@ -991,13 +1015,13 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Composer,
         Chord::ctrl('a'),
         Intent::ComposerLineStart,
-        "Line start",
+        |strings| Intent::ComposerLineStart.label(strings),
     ),
     binding(
         Scope::Composer,
         Chord::ctrl('e'),
         Intent::ComposerLineEnd,
-        "Line end",
+        |strings| Intent::ComposerLineEnd.label(strings),
     ),
     // `Ctrl+A` already owns line-start in this scope, so the whole-draft
     // selection gets the Alt layer, which is where the composer keeps its
@@ -1006,7 +1030,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Composer,
         Chord::new(KeyCode::Char('i'), KeyModifiers::ALT),
         Intent::AttachImage,
-        "Image",
+        |strings| Intent::AttachImage.label(strings),
     ),
     // The reader's own paste gesture. A terminal in bracketed-paste mode never
     // sends this key — it pastes the text itself — so the binding only fires on
@@ -1016,19 +1040,19 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Composer,
         Chord::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
         Intent::PasteClipboard,
-        "Paste",
+        |strings| Intent::PasteClipboard.label(strings),
     ),
     binding(
         Scope::Composer,
         Chord::new(KeyCode::Char('a'), KeyModifiers::ALT),
         Intent::SelectAllDraft,
-        "Select all",
+        |strings| Intent::SelectAllDraft.label(strings),
     ),
     binding(
         Scope::Composer,
         Chord::new(KeyCode::Char('c'), KeyModifiers::ALT),
         Intent::CopyDraftSelection,
-        "Copy draft",
+        |strings| Intent::CopyDraftSelection.label(strings),
     ),
     // The global navigation keys are single characters, so a page whose
     // composer owns the keyboard cannot reach the session list with them —
@@ -1039,7 +1063,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Composer,
         Chord::ctrl('l'),
         Intent::GotoSessions,
-        "Sessions",
+        |strings| Intent::GotoSessions.label(strings),
     ),
     // ---- overlays -------------------------------------------------------
     // Climbing out of a directory is part of browsing it, so the picker keeps
@@ -1053,13 +1077,13 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Overlay,
         Chord::plain(KeyCode::Esc),
         Intent::CloseOverlay,
-        "Close",
+        |strings| Intent::CloseOverlay.label(strings),
     ),
     binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Enter),
         Intent::ConfirmOverlay,
-        "Confirm",
+        |strings| Intent::ConfirmOverlay.label(strings),
     ),
     // The configuration form's one write key. It is an overlay-wide chord
     // because `Ctrl+S` means "save" in every form this client will grow.
@@ -1067,7 +1091,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Overlay,
         Chord::ctrl('s'),
         Intent::ConfigFormSave,
-        "Save",
+        |strings| Intent::ConfigFormSave.label(strings),
     ),
     // Voiding a deadline is not deleting the message, so it is a keystroke of
     // its own rather than the overlay's destructive one.
@@ -1075,13 +1099,13 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Overlay,
         Chord::ctrl('x'),
         Intent::ScheduleClear,
-        "Clear schedule",
+        |strings| strings.row_clear_schedule(),
     ),
     binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Tab),
         Intent::OverlayNextField,
-        "Next field",
+        |strings| Intent::OverlayNextField.label(strings),
     ),
     alias(
         Scope::Overlay,
@@ -1092,7 +1116,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Overlay,
         Chord::plain(KeyCode::Up),
         Intent::SelectPrevious,
-        "Previous",
+        |strings| Intent::SelectPrevious.label(strings),
     ),
     // `j`/`k` are the list keys every other surface in this client answers to,
     // and the switcher is a list: an overlay that types takes its characters
@@ -1133,7 +1157,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Overlay,
         Chord::plain(KeyCode::Down),
         Intent::SelectNext,
-        "Next",
+        |strings| Intent::SelectNext.label(strings),
     ),
     // ---- the runtime switcher --------------------------------------------
     // A scope of its own because the overlay scope already spends `←`/`→` on
@@ -1144,7 +1168,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Runtime,
         Chord::plain(KeyCode::Left),
         Intent::OverlayFoldClosed,
-        "Fold",
+        |strings| Intent::OverlayFoldClosed.label(strings),
     ),
     alias(
         Scope::Runtime,
@@ -1155,7 +1179,7 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Runtime,
         Chord::plain(KeyCode::Right),
         Intent::OverlayFoldOpen,
-        "Expand",
+        |strings| Intent::OverlayFoldOpen.label(strings),
     ),
     alias(
         Scope::Runtime,
@@ -1166,25 +1190,25 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Runtime,
         Chord::plain(KeyCode::Char('/')),
         Intent::BeginFilter,
-        "Search",
+        |strings| strings.row_search(),
     ),
     binding(
         Scope::Runtime,
         Chord::plain(KeyCode::Char('*')),
         Intent::StarRuntimeModel,
-        "Star",
+        |strings| Intent::StarRuntimeModel.label(strings),
     ),
     binding(
         Scope::Runtime,
         Chord::plain(KeyCode::Char('a')),
         Intent::ManageRuntimeAccount,
-        "Account",
+        |strings| Intent::ManageRuntimeAccount.label(strings),
     ),
     binding(
         Scope::Runtime,
         Chord::plain(KeyCode::Char('r')),
         Intent::ResetRunOption,
-        "Reset",
+        |strings| Intent::ResetRunOption.label(strings),
     ),
     // ---- the configuration centre ----------------------------------------
     // One scope for the whole centre: the module tabs, the area rail, the
@@ -1194,122 +1218,122 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Management,
         Chord::plain(KeyCode::Up),
         Intent::SelectPrevious,
-        "Previous",
+        |strings| Intent::SelectPrevious.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Down),
         Intent::SelectNext,
-        "Next",
+        |strings| Intent::SelectNext.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('k')),
         Intent::SelectPrevious,
-        "Previous",
+        |strings| Intent::SelectPrevious.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('j')),
         Intent::SelectNext,
-        "Next",
+        |strings| Intent::SelectNext.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('h')),
         Intent::ConfigPanePrevious,
-        "Pane",
+        |strings| Intent::ConfigPanePrevious.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('l')),
         Intent::ConfigPaneNext,
-        "Pane",
+        |strings| Intent::ConfigPaneNext.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Left),
         Intent::ConfigPanePrevious,
-        "Pane",
+        |strings| Intent::ConfigPanePrevious.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Right),
         Intent::ConfigPaneNext,
-        "Pane",
+        |strings| Intent::ConfigPaneNext.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Tab),
         Intent::ConfigSectionNext,
-        "Area",
+        |strings| Intent::ConfigSectionNext.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::BackTab),
         Intent::ConfigSectionPrevious,
-        "Area",
+        |strings| Intent::ConfigSectionPrevious.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Enter),
         Intent::ConfigEntryActions,
-        "Actions",
+        |strings| Intent::ConfigEntryActions.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char(' ')),
         Intent::ToggleSelectedEntry,
-        "Enable / disable",
+        |strings| strings.row_enable_disable(),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('e')),
         Intent::EditSelectedEntry,
-        "Edit",
+        |strings| Intent::EditSelectedEntry.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('n')),
         Intent::ConfigEntryCreate,
-        "New",
+        |strings| Intent::ConfigEntryCreate.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('d')),
         Intent::ConfigEntryDelete,
-        "Delete",
+        |strings| Intent::ConfigEntryDelete.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('r')),
         Intent::ReloadManagement,
-        "Reload",
+        |strings| Intent::ReloadManagement.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('[')),
         Intent::ConfigModulePrevious,
-        "Module",
+        |strings| Intent::ConfigModulePrevious.label(strings),
     ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char(']')),
         Intent::ConfigModuleNext,
-        "Module",
+        |strings| Intent::ConfigModuleNext.label(strings),
     ),
     // ---- devices ---------------------------------------------------------
     binding(
         Scope::Devices,
         Chord::plain(KeyCode::Up),
         Intent::SelectPrevious,
-        "Previous",
+        |strings| Intent::SelectPrevious.label(strings),
     ),
     binding(
         Scope::Devices,
         Chord::plain(KeyCode::Down),
         Intent::SelectNext,
-        "Next",
+        |strings| Intent::SelectNext.label(strings),
     ),
     // The two halves of the page are one press apart, the way the
     // configuration centre's modules are: the tabs are a strip, not a pane the
@@ -1318,80 +1342,80 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Devices,
         Chord::plain(KeyCode::Left),
         Intent::DevicesTabPrevious,
-        "Tab",
+        |strings| Intent::DevicesTabPrevious.label(strings),
     ),
     binding(
         Scope::Devices,
         Chord::plain(KeyCode::Right),
         Intent::DevicesTabNext,
-        "Tab",
+        |strings| Intent::DevicesTabNext.label(strings),
     ),
     binding(
         Scope::Devices,
         Chord::plain(KeyCode::Enter),
         Intent::ActivateDevicePairing,
-        "Open",
+        |strings| Intent::ActivateDevicePairing.label(strings),
     ),
     binding(
         Scope::Devices,
         Chord::plain(KeyCode::Char('a')),
         Intent::AllowLanPairing,
-        "Allow",
+        |strings| Intent::AllowLanPairing.label(strings),
     ),
     binding(
         Scope::Devices,
         Chord::plain(KeyCode::Char('r')),
         Intent::RefuseLanPairing,
-        "Refuse",
+        |strings| Intent::RefuseLanPairing.label(strings),
     ),
     binding(
         Scope::Devices,
         Chord::plain(KeyCode::Char('x')),
         Intent::RevokeSelectedDevice,
-        "Revoke",
+        |strings| Intent::RevokeSelectedDevice.label(strings),
     ),
     binding(
         Scope::Devices,
         Chord::plain(KeyCode::Char('u')),
         Intent::OpenDeviceAudit,
-        "Audit log",
+        |strings| strings.row_audit_log(),
     ),
     // ---- settings --------------------------------------------------------
     binding(
         Scope::Settings,
         Chord::plain(KeyCode::Up),
         Intent::SelectPrevious,
-        "Previous",
+        |strings| Intent::SelectPrevious.label(strings),
     ),
     binding(
         Scope::Settings,
         Chord::plain(KeyCode::Down),
         Intent::SelectNext,
-        "Next",
+        |strings| Intent::SelectNext.label(strings),
     ),
     binding(
         Scope::Settings,
         Chord::plain(KeyCode::Enter),
         Intent::ActivateSetting,
-        "Change",
+        |strings| Intent::ActivateSetting.label(strings),
     ),
     binding(
         Scope::Settings,
         Chord::plain(KeyCode::Left),
         Intent::SettingPrevious,
-        "Previous value",
+        |strings| Intent::SettingPrevious.label(strings),
     ),
     binding(
         Scope::Settings,
         Chord::plain(KeyCode::Right),
         Intent::SettingNext,
-        "Next value",
+        |strings| Intent::SettingNext.label(strings),
     ),
     binding(
         Scope::Settings,
         Chord::plain(KeyCode::Char('/')),
         Intent::BeginFilter,
-        "Filter",
+        |strings| Intent::BeginFilter.label(strings),
     ),
     alias(
         Scope::Settings,
@@ -1402,69 +1426,69 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Settings,
         Chord::plain(KeyCode::Char('d')),
         Intent::ResetSetting,
-        "Reset",
+        |strings| Intent::ResetSetting.label(strings),
     ),
     binding(
         Scope::Settings,
         Chord::plain(KeyCode::F(9)),
         Intent::ReloadKeymap,
-        "Reload key bindings",
+        |strings| strings.row_reload_key_bindings(),
     ),
     // ---- help ------------------------------------------------------------
     binding(
         Scope::Help,
         Chord::plain(KeyCode::Up),
         Intent::SelectPrevious,
-        "Previous",
+        |strings| Intent::SelectPrevious.label(strings),
     ),
     binding(
         Scope::Help,
         Chord::plain(KeyCode::Down),
         Intent::SelectNext,
-        "Next",
+        |strings| Intent::SelectNext.label(strings),
     ),
     binding(
         Scope::Help,
         Chord::plain(KeyCode::PageUp),
         Intent::ScrollPageUp,
-        "Page up",
+        |strings| Intent::ScrollPageUp.label(strings),
     ),
     binding(
         Scope::Help,
         Chord::plain(KeyCode::PageDown),
         Intent::ScrollPageDown,
-        "Page down",
+        |strings| Intent::ScrollPageDown.label(strings),
     ),
     binding(
         Scope::Help,
         Chord::plain(KeyCode::Home),
         Intent::ScrollToTop,
-        "Top",
+        |strings| Intent::ScrollToTop.label(strings),
     ),
     binding(
         Scope::Help,
         Chord::plain(KeyCode::End),
         Intent::ScrollToBottom,
-        "Bottom",
+        |strings| Intent::ScrollToBottom.label(strings),
     ),
     binding(
         Scope::Help,
         Chord::plain(KeyCode::Char('/')),
         Intent::BeginFilter,
-        "Search help",
+        |strings| strings.row_search_help(),
     ),
     // ---- shared intents that also need a visible home --------------------
     binding(
         Scope::Global,
         Chord::ctrl('t'),
         Intent::TakeOverHome,
-        "Take over",
+        |strings| Intent::TakeOverHome.label(strings),
     ),
     binding(
         Scope::Global,
         Chord::ctrl('b'),
         Intent::ToggleSidebar,
-        "Sidebar",
+        |strings| Intent::ToggleSidebar.label(strings),
     ),
     alias(
         Scope::Global,
@@ -1475,57 +1499,57 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Global,
         Chord::ctrl('w'),
         Intent::SwitchWorkspace,
-        "Workspace",
+        |strings| Intent::SwitchWorkspace.label(strings),
     ),
     binding(
         Scope::Global,
         Chord::ctrl('g'),
         Intent::SwitchAgentRuntime,
-        "Runtime",
+        |strings| Intent::SwitchAgentRuntime.label(strings),
     ),
     binding(
         Scope::Global,
         Chord::plain(KeyCode::F(5)),
         Intent::ProbeAgentRuntime,
-        "Probe runtimes",
+        |strings| strings.row_probe_runtimes(),
     ),
     binding(
         Scope::Global,
         Chord::plain(KeyCode::Delete),
         Intent::ClearFilter,
-        "Clear filter",
+        |strings| Intent::ClearFilter.label(strings),
     ),
     // ---- workspace browser -----------------------------------------------
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char('b')),
         Intent::OpenWorkspaceBrowser,
-        "Browse dirs",
+        |strings| strings.row_browse_dirs(),
     ),
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char('u')),
         Intent::WorkspaceBrowseUp,
-        "Parent dir",
+        |strings| strings.row_parent_dir(),
     ),
     binding(
         Scope::Sessions,
         Chord::plain(KeyCode::Char(' ')),
         Intent::WorkspaceBrowseSelect,
-        "Use dir",
+        |strings| strings.row_use_dir(),
     ),
     // ---- approval card and elicitation form ------------------------------
     binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Char('a')),
         Intent::ApprovalApprove,
-        "Allow",
+        |strings| Intent::ApprovalApprove.label(strings),
     ),
     binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Char('d')),
         Intent::ApprovalDeny,
-        "Deny",
+        |strings| Intent::ApprovalDeny.label(strings),
     ),
     // The elicitation form types into its answer fields, so `d` is a letter
     // there while one is open for typing. Refusing the question is a chord no
@@ -1536,43 +1560,43 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Scope::Overlay,
         Chord::ctrl('a'),
         Intent::ApprovalAlways,
-        "Always",
+        |strings| Intent::ApprovalAlways.label(strings),
     ),
     binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Char('n')),
         Intent::ApprovalFocusNext,
-        "Next option",
+        |strings| Intent::ApprovalFocusNext.label(strings),
     ),
     binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Char('s')),
         Intent::ElicitationSubmit,
-        "Submit answers",
+        |strings| strings.row_submit_answers(),
     ),
     binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Left),
         Intent::ElicitationFieldPrevious,
-        "Prev question",
+        |strings| strings.row_prev_question(),
     ),
     binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Right),
         Intent::ElicitationFieldNext,
-        "Next question",
+        |strings| strings.row_next_question(),
     ),
     binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Char(' ')),
         Intent::OverlayToggleValue,
-        "Toggle",
+        |strings| Intent::OverlayToggleValue.label(strings),
     ),
     binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Char('p')),
         Intent::PaletteRun,
-        "Run command",
+        |strings| strings.row_run_command(),
     ),
     alias(
         Scope::Overlay,
@@ -1690,7 +1714,7 @@ impl Keymap {
                 scope: intent.default_scope(),
                 chord,
                 intent,
-                label: Some(intent.default_label()),
+                label: Some(intent.label_fn()),
             });
         }
         self.overrides.insert(intent, chord);
@@ -1939,6 +1963,52 @@ mod tests {
             assert!(bound || listed, "{} has no way in", intent.id());
             assert_eq!(Intent::from_id(intent.id()), Some(*intent));
         }
+    }
+
+    #[test]
+    fn every_advertised_row_is_named_in_every_language() {
+        // The key bar, the cheatsheet and the key editor read a binding's name
+        // through its locale accessor, so a row whose accessor answers with an
+        // empty string would draw a chord with nothing beside it. The three
+        // languages are written in one table and reached by name, which is what
+        // makes a missing translation a compile error; this pins that every row
+        // has a real name in each of them.
+        for binding in DEFAULT_BINDINGS {
+            let Some(label) = binding.label else { continue };
+            for locale in [
+                crate::locale::Locale::En,
+                crate::locale::Locale::ZhCn,
+                crate::locale::Locale::ZhTw,
+            ] {
+                let strings = Strings::for_locale(locale);
+                let name = label(strings);
+                assert!(
+                    !name.is_empty(),
+                    "{} {} has no name in {locale:?}",
+                    binding.scope.id(),
+                    binding.chord
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_that_needs_its_own_words_keeps_them() {
+        // Most rows borrow the action's name, but a handful are bound in two
+        // scopes where the action means something different — `Ctrl+/` filters a
+        // list and searches the runtime switcher. Those carry a row accessor of
+        // their own, and it has to differ from the action's default or the
+        // distinction the row draws is lost.
+        let search = DEFAULT_BINDINGS
+            .iter()
+            .find(|binding| {
+                binding.scope == Scope::Runtime && binding.intent == Intent::BeginFilter
+            })
+            .and_then(|binding| binding.label)
+            .expect("the runtime switcher searches");
+        let en = Strings::for_locale(crate::locale::Locale::En);
+        assert_eq!(search(en), "Search");
+        assert_ne!(search(en), Intent::BeginFilter.label(en));
     }
 
     #[test]

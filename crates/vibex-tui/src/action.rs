@@ -10,9 +10,10 @@
 //! four.
 
 use crate::keymap::Scope;
+use crate::locale::Strings;
 
 macro_rules! intents {
-    ($( $variant:ident => { scope: $scope:ident, id: $id:expr, label: $label:expr, help: $help:expr } ),* $(,)?) => {
+    ($( $variant:ident => { scope: $scope:ident, id: $id:expr, label: $label:ident, help: $help:ident } ),* $(,)?) => {
         /// A user-triggered action.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub enum Intent {
@@ -33,14 +34,28 @@ macro_rules! intents {
                 match self { $( Intent::$variant => Scope::$scope ),* }
             }
 
-            /// Short label shown in the key bar and the help panel.
-            pub const fn default_label(self) -> &'static str {
-                match self { $( Intent::$variant => $label ),* }
+            /// Short label shown in the key bar and the help panel, in the
+            /// language this session resolved to.
+            ///
+            /// The words live in the locale table rather than beside the action,
+            /// so the three languages cannot drift and a new action is a compile
+            /// error until all of them name it.
+            pub const fn label(self, strings: Strings) -> &'static str {
+                match self { $( Intent::$variant => strings.$label() ),* }
             }
 
-            /// One-line explanation shown in `?` help.
-            pub const fn help(self) -> &'static str {
-                match self { $( Intent::$variant => $help ),* }
+            /// One-line explanation shown in `?` help, in the reader's language.
+            pub const fn help(self, strings: Strings) -> &'static str {
+                match self { $( Intent::$variant => strings.$help() ),* }
+            }
+
+            /// [`Self::label`] as a plain function pointer.
+            ///
+            /// A binding carries the way to name its row rather than the name,
+            /// so the same action can be drawn in whichever language the
+            /// session resolved to; a `fn` is what fits in a `const` table.
+            pub const fn label_fn(self) -> fn(Strings) -> &'static str {
+                match self { $( Intent::$variant => |strings| strings.$label() ),* }
             }
         }
     };
@@ -48,185 +63,185 @@ macro_rules! intents {
 
 intents! {
     // ---- global ---------------------------------------------------------
-    OpenCommandPalette => { scope: Global, id: "command_palette", label: "Commands", help: "Fuzzy-search every page and action." },
-    ToggleHelp => { scope: Global, id: "help", label: "Help", help: "Show the keys and concepts for whatever has focus right now." },
-    OpenSettings => { scope: Global, id: "open_settings", label: "Settings", help: "Theme, language, icons, colour and key bindings." },
-    RequestQuit => { scope: Global, id: "quit", label: "Quit", help: "Leave the TUI and restore the terminal. The palette is the only way to ask for it by name." },
-    Back => { scope: Global, id: "back", label: "Back", help: "Close the overlay, then the panel, then the page. Never quits." },
-    FocusNext => { scope: Global, id: "focus_next", label: "Next pane", help: "Move focus between sidebar, main area, details and composer." },
-    FocusPrevious => { scope: Global, id: "focus_previous", label: "Previous pane", help: "Move focus backwards." },
-    Refresh => { scope: Global, id: "refresh", label: "Refresh", help: "Re-read the current page from the runtime." },
-    ContextualCancel => { scope: Global, id: "cancel", label: "Cancel", help: "Clear the input, else interrupt the running turn, else offer to quit." },
-    GotoSessions => { scope: Global, id: "goto_sessions", label: "Sessions", help: "Jump to the session list." },
-    GotoManagement => { scope: Global, id: "goto_management", label: "Management", help: "Jump to the management index." },
-    ToggleSidebar => { scope: Global, id: "toggle_sidebar", label: "Sidebar", help: "Collapse or show the sidebar." },
-    ReloadKeymap => { scope: Global, id: "reload_keymap", label: "Reload keys", help: "Re-read ~/.vibex/tui-keys.toml." },
-    TakeOverHome => { scope: Global, id: "take_over_home", label: "Take over", help: "Start the runtime in this terminal instead of waiting for the one that owns this home." },
+    OpenCommandPalette => { scope: Global, id: "command_palette", label: label_command_palette, help: help_command_palette },
+    ToggleHelp => { scope: Global, id: "help", label: label_help, help: help_help },
+    OpenSettings => { scope: Global, id: "open_settings", label: label_open_settings, help: help_open_settings },
+    RequestQuit => { scope: Global, id: "quit", label: label_quit, help: help_quit },
+    Back => { scope: Global, id: "back", label: label_back, help: help_back },
+    FocusNext => { scope: Global, id: "focus_next", label: label_focus_next, help: help_focus_next },
+    FocusPrevious => { scope: Global, id: "focus_previous", label: label_focus_previous, help: help_focus_previous },
+    Refresh => { scope: Global, id: "refresh", label: label_refresh, help: help_refresh },
+    ContextualCancel => { scope: Global, id: "cancel", label: label_cancel, help: help_cancel },
+    GotoSessions => { scope: Global, id: "goto_sessions", label: label_goto_sessions, help: help_goto_sessions },
+    GotoManagement => { scope: Global, id: "goto_management", label: label_goto_management, help: help_goto_management },
+    ToggleSidebar => { scope: Global, id: "toggle_sidebar", label: label_toggle_sidebar, help: help_toggle_sidebar },
+    ReloadKeymap => { scope: Global, id: "reload_keymap", label: label_reload_keymap, help: help_reload_keymap },
+    TakeOverHome => { scope: Global, id: "take_over_home", label: label_take_over_home, help: help_take_over_home },
 
     // ---- list motion shared by every page --------------------------------
-    SelectPrevious => { scope: Global, id: "select_previous", label: "Previous", help: "Move the selection up." },
-    SelectNext => { scope: Global, id: "select_next", label: "Next", help: "Move the selection down." },
-    ScrollPageUp => { scope: Global, id: "scroll_page_up", label: "Page up", help: "Scroll one page up." },
-    ScrollPageDown => { scope: Global, id: "scroll_page_down", label: "Page down", help: "Scroll one page down." },
-    ScrollHalfPageUp => { scope: Global, id: "scroll_half_up", label: "Half up", help: "Scroll half a page up." },
-    ScrollHalfPageDown => { scope: Global, id: "scroll_half_down", label: "Half down", help: "Scroll half a page down." },
-    ScrollToTop => { scope: Global, id: "scroll_top", label: "Top", help: "Jump to the first item." },
-    ScrollToBottom => { scope: Global, id: "scroll_bottom", label: "Bottom", help: "Jump to the last item and resume following." },
-    ShowDetails => { scope: Global, id: "show_details", label: "Details", help: "Open the details panel for the selection." },
+    SelectPrevious => { scope: Global, id: "select_previous", label: label_select_previous, help: help_select_previous },
+    SelectNext => { scope: Global, id: "select_next", label: label_select_next, help: help_select_next },
+    ScrollPageUp => { scope: Global, id: "scroll_page_up", label: label_scroll_page_up, help: help_scroll_page_up },
+    ScrollPageDown => { scope: Global, id: "scroll_page_down", label: label_scroll_page_down, help: help_scroll_page_down },
+    ScrollHalfPageUp => { scope: Global, id: "scroll_half_up", label: label_scroll_half_up, help: help_scroll_half_up },
+    ScrollHalfPageDown => { scope: Global, id: "scroll_half_down", label: label_scroll_half_down, help: help_scroll_half_down },
+    ScrollToTop => { scope: Global, id: "scroll_top", label: label_scroll_top, help: help_scroll_top },
+    ScrollToBottom => { scope: Global, id: "scroll_bottom", label: label_scroll_bottom, help: help_scroll_bottom },
+    ShowDetails => { scope: Global, id: "show_details", label: label_show_details, help: help_show_details },
 
     // ---- sessions -------------------------------------------------------
-    OpenSelectedSession => { scope: Sessions, id: "session_open", label: "Open", help: "Open the selected row, or press the button the row's cursor has reached." },
-    SessionControlPrevious => { scope: Sessions, id: "session_control_previous", label: "Previous button", help: "Step leftwards across the row's own action buttons." },
-    SessionControlNext => { scope: Sessions, id: "session_control_next", label: "Next button", help: "Step rightwards across the row's own action buttons." },
-    NewSession => { scope: Sessions, id: "session_new", label: "New", help: "Create a session in a workspace you pick." },
-    BeginRenameSession => { scope: Sessions, id: "session_rename", label: "Rename", help: "Rename the selected session." },
-    ForkSession => { scope: Sessions, id: "session_fork", label: "Fork", help: "Copy the session up to a chosen point." },
-    ArchiveSession => { scope: Sessions, id: "session_archive", label: "Archive", help: "Archive the selected session, or restore it when it is already archived." },
-    UnarchiveSession => { scope: Sessions, id: "session_unarchive", label: "Restore", help: "Restore the selected archived session to the list." },
-    DeleteSession => { scope: Sessions, id: "session_delete", label: "Delete", help: "Permanently delete the selected session." },
-    ToggleShowArchived => { scope: Sessions, id: "session_show_archived", label: "Archived", help: "Include archived sessions in the list." },
-    ToggleSessionCard => { scope: Sessions, id: "session_card_toggle", label: "Details", help: "Open or close the selected session's detail card." },
-    CollapseSessionCards => { scope: Sessions, id: "session_card_collapse", label: "Close cards", help: "Close every open session detail card." },
-    SidebarRowActions => { scope: Sessions, id: "sidebar_row_actions", label: "Actions", help: "Open everything the highlighted project or folder can do." },
-    ToggleChildBranch => { scope: Sessions, id: "session_children_toggle", label: "Sub-sessions", help: "Fold or unfold the selected session's delegated sub-sessions." },
-    CopySessionRow => { scope: Sessions, id: "session_copy", label: "Copy", help: "Copy the selected session's details to the clipboard." },
-    PinSession => { scope: Sessions, id: "session_pin", label: "Pin", help: "Keep the selected session above the rest of the list." },
-    ToggleAutoContinue => { scope: Sessions, id: "session_auto_continue", label: "Auto-continue", help: "Let the selected session continue itself when a turn stops without an answer." },
-    MoveSessionUp => { scope: Sessions, id: "session_move_up", label: "Move up", help: "Move the selected session one place earlier in the list." },
-    MoveSessionDown => { scope: Sessions, id: "session_move_down", label: "Move down", help: "Move the selected session one place later in the list." },
-    SwitchWorkspace => { scope: Sessions, id: "workspace_switch", label: "Workspace", help: "Change the workspace used for new sessions." },
-    OpenWorkspaceBrowser => { scope: Sessions, id: "workspace_browse", label: "Browse", help: "List directories on the authority host." },
-    WorkspaceBrowseUp => { scope: Sessions, id: "workspace_up", label: "Parent", help: "Go to the parent directory." },
-    WorkspaceBrowseSelect => { scope: Sessions, id: "workspace_select", label: "Use directory", help: "Work in the highlighted directory, else the one the picker is showing." },
+    OpenSelectedSession => { scope: Sessions, id: "session_open", label: label_session_open, help: help_session_open },
+    SessionControlPrevious => { scope: Sessions, id: "session_control_previous", label: label_session_control_previous, help: help_session_control_previous },
+    SessionControlNext => { scope: Sessions, id: "session_control_next", label: label_session_control_next, help: help_session_control_next },
+    NewSession => { scope: Sessions, id: "session_new", label: label_session_new, help: help_session_new },
+    BeginRenameSession => { scope: Sessions, id: "session_rename", label: label_session_rename, help: help_session_rename },
+    ForkSession => { scope: Sessions, id: "session_fork", label: label_session_fork, help: help_session_fork },
+    ArchiveSession => { scope: Sessions, id: "session_archive", label: label_session_archive, help: help_session_archive },
+    UnarchiveSession => { scope: Sessions, id: "session_unarchive", label: label_session_unarchive, help: help_session_unarchive },
+    DeleteSession => { scope: Sessions, id: "session_delete", label: label_session_delete, help: help_session_delete },
+    ToggleShowArchived => { scope: Sessions, id: "session_show_archived", label: label_session_show_archived, help: help_session_show_archived },
+    ToggleSessionCard => { scope: Sessions, id: "session_card_toggle", label: label_session_card_toggle, help: help_session_card_toggle },
+    CollapseSessionCards => { scope: Sessions, id: "session_card_collapse", label: label_session_card_collapse, help: help_session_card_collapse },
+    SidebarRowActions => { scope: Sessions, id: "sidebar_row_actions", label: label_sidebar_row_actions, help: help_sidebar_row_actions },
+    ToggleChildBranch => { scope: Sessions, id: "session_children_toggle", label: label_session_children_toggle, help: help_session_children_toggle },
+    CopySessionRow => { scope: Sessions, id: "session_copy", label: label_session_copy, help: help_session_copy },
+    PinSession => { scope: Sessions, id: "session_pin", label: label_session_pin, help: help_session_pin },
+    ToggleAutoContinue => { scope: Sessions, id: "session_auto_continue", label: label_session_auto_continue, help: help_session_auto_continue },
+    MoveSessionUp => { scope: Sessions, id: "session_move_up", label: label_session_move_up, help: help_session_move_up },
+    MoveSessionDown => { scope: Sessions, id: "session_move_down", label: label_session_move_down, help: help_session_move_down },
+    SwitchWorkspace => { scope: Sessions, id: "workspace_switch", label: label_workspace_switch, help: help_workspace_switch },
+    OpenWorkspaceBrowser => { scope: Sessions, id: "workspace_browse", label: label_workspace_browse, help: help_workspace_browse },
+    WorkspaceBrowseUp => { scope: Sessions, id: "workspace_up", label: label_workspace_up, help: help_workspace_up },
+    WorkspaceBrowseSelect => { scope: Sessions, id: "workspace_select", label: label_workspace_select, help: help_workspace_select },
 
     // ---- agent transcript -----------------------------------------------
-    FocusComposer => { scope: Agent, id: "composer_focus", label: "Write", help: "Put the cursor in the message composer." },
-    ContinueTurn => { scope: Agent, id: "turn_continue", label: "Continue", help: "Ask the Agent to continue an unfinished turn." },
-    ToggleBlockExpanded => { scope: Agent, id: "block_toggle", label: "Expand", help: "Expand or collapse the selected transcript block." },
-    ToggleAllBlocksExpanded => { scope: Agent, id: "block_toggle_all", label: "Expand all", help: "Expand or collapse every collapsible block." },
-    ToggleReasoningExpanded => { scope: Agent, id: "reasoning_toggle", label: "Reasoning", help: "Show or hide the Agent's reasoning." },
-    CopyBlockBody => { scope: Agent, id: "block_copy", label: "Copy", help: "Copy the selected block's body to the clipboard." },
-    CopyBlockMetadata => { scope: Agent, id: "block_copy_meta", label: "Copy meta", help: "Copy the command, path or id attached to the block." },
-    OpenBlockDetails => { scope: Agent, id: "block_details", label: "Details", help: "Open the diff, terminal output or full text for the block." },
-    SwitchAgentRuntime => { scope: Agent, id: "runtime_switch", label: "Runtime", help: "Choose the Agent, its model and the run options it publishes." },
-    ProbeAgentRuntime => { scope: Agent, id: "runtime_probe", label: "Probe", help: "Ask the runtime to re-discover available Agents." },
-    BeginTranscriptSearch => { scope: Agent, id: "transcript_search", label: "Find", help: "Search the transcript with a regular expression." },
-    ToggleDock => { scope: Agent, id: "dock_toggle", label: "Dock", help: "Show or hide the panel of running agents, the plan and held messages." },
-    DockActivate => { scope: Agent, id: "dock_activate", label: "Dock open", help: "Open the highlighted dock row: jump to it, or fold its section." },
-    OpenChildSessions => { scope: Agent, id: "session_children_open", label: "Sub-sessions", help: "Open the sub-session the open one delegated, or pick from the dock when it delegated several." },
-    GotoParentSession => { scope: Agent, id: "session_parent", label: "Main session", help: "Go back to the session that delegated this one." },
-    DockHideDone => { scope: Agent, id: "dock_hide_done", label: "Hide done", help: "Hide finished agents and completed plan steps in the dock." },
-    LoadOlderHistory => { scope: Agent, id: "history_older", label: "Older history", help: "Fetch the page of history above the oldest loaded one." },
-    QueueSelectPrevious => { scope: Agent, id: "queue_previous", label: "Queue up", help: "Move the queue cursor to the message above." },
-    QueueSelectNext => { scope: Agent, id: "queue_next", label: "Queue down", help: "Move the queue cursor to the message below." },
-    QueueEditSelected => { scope: Agent, id: "queue_edit", label: "Queue edit", help: "Pull the queued message back into the composer." },
-    QueueDeleteSelected => { scope: Agent, id: "queue_delete", label: "Queue drop", help: "Remove the queued message." },
-    QueueMoveUp => { scope: Agent, id: "queue_move_up", label: "Queue raise", help: "Send the queued message one turn earlier." },
-    QueueMoveDown => { scope: Agent, id: "queue_move_down", label: "Queue lower", help: "Send the queued message one turn later." },
-    QueueSendNow => { scope: Agent, id: "queue_send_now", label: "Send now", help: "Interrupt the turn and send the queued message immediately." },
-    ScheduleMessage => { scope: Agent, id: "message_schedule", label: "Schedule", help: "Give the draft a send time; until the clock reaches it the message waits in the queue." },
-    SearchNext => { scope: Agent, id: "search_next", label: "Next match", help: "Jump to the next match, wrapping at the end." },
-    SearchPrevious => { scope: Agent, id: "search_previous", label: "Prev match", help: "Jump to the previous match, wrapping at the start." },
+    FocusComposer => { scope: Agent, id: "composer_focus", label: label_composer_focus, help: help_composer_focus },
+    ContinueTurn => { scope: Agent, id: "turn_continue", label: label_turn_continue, help: help_turn_continue },
+    ToggleBlockExpanded => { scope: Agent, id: "block_toggle", label: label_block_toggle, help: help_block_toggle },
+    ToggleAllBlocksExpanded => { scope: Agent, id: "block_toggle_all", label: label_block_toggle_all, help: help_block_toggle_all },
+    ToggleReasoningExpanded => { scope: Agent, id: "reasoning_toggle", label: label_reasoning_toggle, help: help_reasoning_toggle },
+    CopyBlockBody => { scope: Agent, id: "block_copy", label: label_block_copy, help: help_block_copy },
+    CopyBlockMetadata => { scope: Agent, id: "block_copy_meta", label: label_block_copy_meta, help: help_block_copy_meta },
+    OpenBlockDetails => { scope: Agent, id: "block_details", label: label_block_details, help: help_block_details },
+    SwitchAgentRuntime => { scope: Agent, id: "runtime_switch", label: label_runtime_switch, help: help_runtime_switch },
+    ProbeAgentRuntime => { scope: Agent, id: "runtime_probe", label: label_runtime_probe, help: help_runtime_probe },
+    BeginTranscriptSearch => { scope: Agent, id: "transcript_search", label: label_transcript_search, help: help_transcript_search },
+    ToggleDock => { scope: Agent, id: "dock_toggle", label: label_dock_toggle, help: help_dock_toggle },
+    DockActivate => { scope: Agent, id: "dock_activate", label: label_dock_activate, help: help_dock_activate },
+    OpenChildSessions => { scope: Agent, id: "session_children_open", label: label_session_children_open, help: help_session_children_open },
+    GotoParentSession => { scope: Agent, id: "session_parent", label: label_session_parent, help: help_session_parent },
+    DockHideDone => { scope: Agent, id: "dock_hide_done", label: label_dock_hide_done, help: help_dock_hide_done },
+    LoadOlderHistory => { scope: Agent, id: "history_older", label: label_history_older, help: help_history_older },
+    QueueSelectPrevious => { scope: Agent, id: "queue_previous", label: label_queue_previous, help: help_queue_previous },
+    QueueSelectNext => { scope: Agent, id: "queue_next", label: label_queue_next, help: help_queue_next },
+    QueueEditSelected => { scope: Agent, id: "queue_edit", label: label_queue_edit, help: help_queue_edit },
+    QueueDeleteSelected => { scope: Agent, id: "queue_delete", label: label_queue_delete, help: help_queue_delete },
+    QueueMoveUp => { scope: Agent, id: "queue_move_up", label: label_queue_move_up, help: help_queue_move_up },
+    QueueMoveDown => { scope: Agent, id: "queue_move_down", label: label_queue_move_down, help: help_queue_move_down },
+    QueueSendNow => { scope: Agent, id: "queue_send_now", label: label_queue_send_now, help: help_queue_send_now },
+    ScheduleMessage => { scope: Agent, id: "message_schedule", label: label_message_schedule, help: help_message_schedule },
+    SearchNext => { scope: Agent, id: "search_next", label: label_search_next, help: help_search_next },
+    SearchPrevious => { scope: Agent, id: "search_previous", label: label_search_previous, help: help_search_previous },
 
     // ---- composer -------------------------------------------------------
-    SubmitComposer => { scope: Composer, id: "composer_submit", label: "Send", help: "Send the draft as a new turn." },
-    InsertNewline => { scope: Composer, id: "composer_newline", label: "Newline", help: "Insert a line break without sending." },
-    ToggleMultiline => { scope: Composer, id: "composer_multiline", label: "Multiline", help: "Toggle multi-line editing." },
-    ComposerHistoryPrevious => { scope: Composer, id: "composer_history_prev", label: "Prev sent", help: "Recall the previous message you sent." },
-    ComposerHistoryNext => { scope: Composer, id: "composer_history_next", label: "Next sent", help: "Move forward through sent messages." },
-    EditComposerExternally => { scope: Composer, id: "composer_editor", label: "$EDITOR", help: "Edit the draft in your editor, then return." },
-    BackgroundRunningCommand => { scope: Composer, id: "composer_background", label: "Background", help: "Move the running foreground command to the background." },
-    SteerRunningTurn => { scope: Composer, id: "composer_steer", label: "Steer", help: "Inject the draft into the running turn without interrupting it." },
-    CompletionNext => { scope: Composer, id: "completion_next", label: "Next match", help: "Highlight the next completion." },
-    CompletionPrevious => { scope: Composer, id: "completion_previous", label: "Prev match", help: "Highlight the previous completion." },
-    CompletionAccept => { scope: Composer, id: "completion_accept", label: "Accept", help: "Insert the highlighted completion." },
-    CompletionCancel => { scope: Composer, id: "completion_cancel", label: "Dismiss", help: "Close the completion menu." },
-    DeleteWordBefore => { scope: Composer, id: "composer_delete_word", label: "Delete word", help: "Delete the word before the cursor." },
-    DeleteWordAfter => { scope: Composer, id: "composer_delete_word_after", label: "Kill word", help: "Delete the word after the cursor into the kill buffer." },
-    DeleteWordBackward => { scope: Composer, id: "composer_delete_word_backward", label: "Kill word back", help: "Delete the word before the cursor into the kill buffer." },
-    KillToLineEnd => { scope: Composer, id: "composer_kill_to_end", label: "Kill to end", help: "Cut from the cursor to the end of the line." },
-    KillToLineStart => { scope: Composer, id: "composer_kill_to_start", label: "Kill to start", help: "Cut from the start of the line to the cursor." },
-    YankKill => { scope: Composer, id: "composer_yank", label: "Yank", help: "Put the last cut text back at the cursor." },
-    ComposerUndo => { scope: Composer, id: "composer_undo", label: "Undo", help: "Undo the last edit to the draft." },
-    ComposerRedo => { scope: Composer, id: "composer_redo", label: "Redo", help: "Redo an undone edit." },
-    ComposerWordLeft => { scope: Composer, id: "composer_word_left", label: "Word left", help: "Move the cursor to the start of the previous word." },
-    ComposerWordRight => { scope: Composer, id: "composer_word_right", label: "Word right", help: "Move the cursor past the end of the next word." },
-    ComposerLineStart => { scope: Composer, id: "composer_line_start", label: "Line start", help: "Move the cursor to the start of the line." },
-    ComposerLineEnd => { scope: Composer, id: "composer_line_end", label: "Line end", help: "Move the cursor to the end of the line." },
-    AttachImage => { scope: Composer, id: "composer_image", label: "Image", help: "Attach an image from the clipboard, or name a file to attach." },
-    PasteClipboard => { scope: Composer, id: "composer_paste", label: "Paste", help: "Paste the clipboard: an image becomes an attachment, text goes into the draft." },
-    SelectAllDraft => { scope: Composer, id: "composer_select_all", label: "Select all", help: "Select the whole draft so typing replaces it." },
-    CopyDraftSelection => { scope: Composer, id: "composer_copy_draft", label: "Copy draft", help: "Copy the selected part of the draft to the clipboard." },
+    SubmitComposer => { scope: Composer, id: "composer_submit", label: label_composer_submit, help: help_composer_submit },
+    InsertNewline => { scope: Composer, id: "composer_newline", label: label_composer_newline, help: help_composer_newline },
+    ToggleMultiline => { scope: Composer, id: "composer_multiline", label: label_composer_multiline, help: help_composer_multiline },
+    ComposerHistoryPrevious => { scope: Composer, id: "composer_history_prev", label: label_composer_history_prev, help: help_composer_history_prev },
+    ComposerHistoryNext => { scope: Composer, id: "composer_history_next", label: label_composer_history_next, help: help_composer_history_next },
+    EditComposerExternally => { scope: Composer, id: "composer_editor", label: label_composer_editor, help: help_composer_editor },
+    BackgroundRunningCommand => { scope: Composer, id: "composer_background", label: label_composer_background, help: help_composer_background },
+    SteerRunningTurn => { scope: Composer, id: "composer_steer", label: label_composer_steer, help: help_composer_steer },
+    CompletionNext => { scope: Composer, id: "completion_next", label: label_completion_next, help: help_completion_next },
+    CompletionPrevious => { scope: Composer, id: "completion_previous", label: label_completion_previous, help: help_completion_previous },
+    CompletionAccept => { scope: Composer, id: "completion_accept", label: label_completion_accept, help: help_completion_accept },
+    CompletionCancel => { scope: Composer, id: "completion_cancel", label: label_completion_cancel, help: help_completion_cancel },
+    DeleteWordBefore => { scope: Composer, id: "composer_delete_word", label: label_composer_delete_word, help: help_composer_delete_word },
+    DeleteWordAfter => { scope: Composer, id: "composer_delete_word_after", label: label_composer_delete_word_after, help: help_composer_delete_word_after },
+    DeleteWordBackward => { scope: Composer, id: "composer_delete_word_backward", label: label_composer_delete_word_backward, help: help_composer_delete_word_backward },
+    KillToLineEnd => { scope: Composer, id: "composer_kill_to_end", label: label_composer_kill_to_end, help: help_composer_kill_to_end },
+    KillToLineStart => { scope: Composer, id: "composer_kill_to_start", label: label_composer_kill_to_start, help: help_composer_kill_to_start },
+    YankKill => { scope: Composer, id: "composer_yank", label: label_composer_yank, help: help_composer_yank },
+    ComposerUndo => { scope: Composer, id: "composer_undo", label: label_composer_undo, help: help_composer_undo },
+    ComposerRedo => { scope: Composer, id: "composer_redo", label: label_composer_redo, help: help_composer_redo },
+    ComposerWordLeft => { scope: Composer, id: "composer_word_left", label: label_composer_word_left, help: help_composer_word_left },
+    ComposerWordRight => { scope: Composer, id: "composer_word_right", label: label_composer_word_right, help: help_composer_word_right },
+    ComposerLineStart => { scope: Composer, id: "composer_line_start", label: label_composer_line_start, help: help_composer_line_start },
+    ComposerLineEnd => { scope: Composer, id: "composer_line_end", label: label_composer_line_end, help: help_composer_line_end },
+    AttachImage => { scope: Composer, id: "composer_image", label: label_composer_image, help: help_composer_image },
+    PasteClipboard => { scope: Composer, id: "composer_paste", label: label_composer_paste, help: help_composer_paste },
+    SelectAllDraft => { scope: Composer, id: "composer_select_all", label: label_composer_select_all, help: help_composer_select_all },
+    CopyDraftSelection => { scope: Composer, id: "composer_copy_draft", label: label_composer_copy_draft, help: help_composer_copy_draft },
 
     // ---- overlays -------------------------------------------------------
-    CloseOverlay => { scope: Overlay, id: "overlay_close", label: "Close", help: "Dismiss this overlay without applying anything." },
-    ConfirmOverlay => { scope: Overlay, id: "overlay_confirm", label: "Confirm", help: "Apply this overlay's value." },
-    OverlayNextField => { scope: Overlay, id: "overlay_next_field", label: "Next field", help: "Move to the next form field." },
-    OverlayPreviousField => { scope: Overlay, id: "overlay_prev_field", label: "Prev field", help: "Move to the previous form field." },
-    OverlayToggleValue => { scope: Overlay, id: "overlay_toggle", label: "Toggle", help: "Flip a boolean field or a multi-select option." },
-    ScheduleClear => { scope: Overlay, id: "schedule_clear", label: "Clear", help: "Void the draft's send time and keep the message." },
-    PaletteRun => { scope: Overlay, id: "palette_run", label: "Run", help: "Run the highlighted command." },
+    CloseOverlay => { scope: Overlay, id: "overlay_close", label: label_overlay_close, help: help_overlay_close },
+    ConfirmOverlay => { scope: Overlay, id: "overlay_confirm", label: label_overlay_confirm, help: help_overlay_confirm },
+    OverlayNextField => { scope: Overlay, id: "overlay_next_field", label: label_overlay_next_field, help: help_overlay_next_field },
+    OverlayPreviousField => { scope: Overlay, id: "overlay_prev_field", label: label_overlay_prev_field, help: help_overlay_prev_field },
+    OverlayToggleValue => { scope: Overlay, id: "overlay_toggle", label: label_overlay_toggle, help: help_overlay_toggle },
+    ScheduleClear => { scope: Overlay, id: "schedule_clear", label: label_schedule_clear, help: help_schedule_clear },
+    PaletteRun => { scope: Overlay, id: "palette_run", label: label_palette_run, help: help_palette_run },
 
     // ---- the runtime switcher -------------------------------------------
     // These live in the overlay scope rather than a switcher-only one because
     // every other overlay ignores what it does not use, and one shared scope is
     // what keeps the switcher's keys remappable from the same file.
-    OverlayFoldOpen => { scope: Overlay, id: "overlay_fold_open", label: "Expand", help: "Expand the highlighted group, or step into it." },
-    OverlayFoldClosed => { scope: Overlay, id: "overlay_fold_close", label: "Fold", help: "Fold the highlighted group, or step out to its heading." },
-    StarRuntimeModel => { scope: Overlay, id: "overlay_star_model", label: "Star", help: "Star or unstar the highlighted model in the runtime switcher." },
-    ManageRuntimeAccount => { scope: Overlay, id: "overlay_manage_account", label: "Account", help: "Open the highlighted runtime's Agent account in the management pages." },
-    ResetRunOption => { scope: Overlay, id: "overlay_reset_run_option", label: "Reset", help: "Stage the highlighted run option back to the Agent's own default." },
+    OverlayFoldOpen => { scope: Overlay, id: "overlay_fold_open", label: label_overlay_fold_open, help: help_overlay_fold_open },
+    OverlayFoldClosed => { scope: Overlay, id: "overlay_fold_close", label: label_overlay_fold_close, help: help_overlay_fold_close },
+    StarRuntimeModel => { scope: Overlay, id: "overlay_star_model", label: label_overlay_star_model, help: help_overlay_star_model },
+    ManageRuntimeAccount => { scope: Overlay, id: "overlay_manage_account", label: label_overlay_manage_account, help: help_overlay_manage_account },
+    ResetRunOption => { scope: Overlay, id: "overlay_reset_run_option", label: label_overlay_reset_run_option, help: help_overlay_reset_run_option },
 
     // ---- approvals ------------------------------------------------------
-    ApprovalApprove => { scope: Overlay, id: "approval_approve", label: "Allow", help: "Approve the pending request." },
-    ApprovalDeny => { scope: Overlay, id: "approval_deny", label: "Deny", help: "Refuse the pending request." },
-    ApprovalAlways => { scope: Overlay, id: "approval_always", label: "Always", help: "Approve and remember for the rest of this session." },
-    ApprovalFocusNext => { scope: Overlay, id: "approval_next", label: "Next option", help: "Move between the request's allowed responses." },
-    ElicitationSubmit => { scope: Overlay, id: "elicitation_submit", label: "Submit", help: "Send the answers back to the Agent." },
-    ElicitationFieldNext => { scope: Overlay, id: "elicitation_next", label: "Next field", help: "Move to the next question." },
-    ElicitationFieldPrevious => { scope: Overlay, id: "elicitation_prev", label: "Prev field", help: "Move to the previous question." },
+    ApprovalApprove => { scope: Overlay, id: "approval_approve", label: label_approval_approve, help: help_approval_approve },
+    ApprovalDeny => { scope: Overlay, id: "approval_deny", label: label_approval_deny, help: help_approval_deny },
+    ApprovalAlways => { scope: Overlay, id: "approval_always", label: label_approval_always, help: help_approval_always },
+    ApprovalFocusNext => { scope: Overlay, id: "approval_next", label: label_approval_next, help: help_approval_next },
+    ElicitationSubmit => { scope: Overlay, id: "elicitation_submit", label: label_elicitation_submit, help: help_elicitation_submit },
+    ElicitationFieldNext => { scope: Overlay, id: "elicitation_next", label: label_elicitation_next, help: help_elicitation_next },
+    ElicitationFieldPrevious => { scope: Overlay, id: "elicitation_prev", label: label_elicitation_prev, help: help_elicitation_prev },
 
 
 
 
     // ---- management -----------------------------------------------------
-    ToggleSelectedEntry => { scope: Management, id: "management_toggle", label: "Toggle", help: "Enable or disable the highlighted entry." },
-    EditSelectedEntry => { scope: Management, id: "management_edit", label: "Edit", help: "Edit the highlighted entry." },
-    ReloadManagement => { scope: Management, id: "management_reload", label: "Reload", help: "Re-read this management section." },
+    ToggleSelectedEntry => { scope: Management, id: "management_toggle", label: label_management_toggle, help: help_management_toggle },
+    EditSelectedEntry => { scope: Management, id: "management_edit", label: label_management_edit, help: help_management_edit },
+    ReloadManagement => { scope: Management, id: "management_reload", label: label_management_reload, help: help_management_reload },
 
     // ---- configuration centre -------------------------------------------
-    ConfigModulePrevious => { scope: Global, id: "config_module_previous", label: "Module", help: "Move to the previous configuration module (Agent, MCP, Skills, Prompts)." },
-    ConfigModuleNext => { scope: Global, id: "config_module_next", label: "Module", help: "Move to the next configuration module." },
-    ConfigSectionPrevious => { scope: Management, id: "config_section_previous", label: "Area", help: "Move to the previous function area of this module." },
-    ConfigSectionNext => { scope: Management, id: "config_section_next", label: "Area", help: "Move to the next function area of this module." },
-    ConfigPaneNext => { scope: Management, id: "config_pane_next", label: "Pane", help: "Move the keyboard between the modules, the areas, the records and the details." },
-    ConfigPanePrevious => { scope: Management, id: "config_pane_previous", label: "Pane", help: "Move the keyboard backwards between the panes." },
-    ConfigEntryActions => { scope: Management, id: "config_entry_actions", label: "Actions", help: "Open everything the highlighted record can do." },
-    ConfigEntryCreate => { scope: Management, id: "config_entry_create", label: "New", help: "Create a record in this area." },
-    ConfigEntryDelete => { scope: Management, id: "config_entry_delete", label: "Delete", help: "Delete the highlighted record." },
-    ConfigFormSave => { scope: Overlay, id: "config_form_save", label: "Save", help: "Write the form to the runtime." },
-    GotoDevices => { scope: Global, id: "goto_devices", label: "Pairing and devices", help: "Paired devices, pairing codes and the audit log." },
+    ConfigModulePrevious => { scope: Global, id: "config_module_previous", label: label_config_module_previous, help: help_config_module_previous },
+    ConfigModuleNext => { scope: Global, id: "config_module_next", label: label_config_module_next, help: help_config_module_next },
+    ConfigSectionPrevious => { scope: Management, id: "config_section_previous", label: label_config_section_previous, help: help_config_section_previous },
+    ConfigSectionNext => { scope: Management, id: "config_section_next", label: label_config_section_next, help: help_config_section_next },
+    ConfigPaneNext => { scope: Management, id: "config_pane_next", label: label_config_pane_next, help: help_config_pane_next },
+    ConfigPanePrevious => { scope: Management, id: "config_pane_previous", label: label_config_pane_previous, help: help_config_pane_previous },
+    ConfigEntryActions => { scope: Management, id: "config_entry_actions", label: label_config_entry_actions, help: help_config_entry_actions },
+    ConfigEntryCreate => { scope: Management, id: "config_entry_create", label: label_config_entry_create, help: help_config_entry_create },
+    ConfigEntryDelete => { scope: Management, id: "config_entry_delete", label: label_config_entry_delete, help: help_config_entry_delete },
+    ConfigFormSave => { scope: Overlay, id: "config_form_save", label: label_config_form_save, help: help_config_form_save },
+    GotoDevices => { scope: Global, id: "goto_devices", label: label_goto_devices, help: help_goto_devices },
 
     // ---- providers ------------------------------------------------------
 
     // ---- devices --------------------------------------------------------
-    ActivateDevicePairing => { scope: Devices, id: "device_pair_activate", label: "Open", help: "Open the highlighted way to pair a device." },
-    DevicesTabNext => { scope: Devices, id: "device_tab_next", label: "Tab", help: "Move to the other half of the devices page." },
-    DevicesTabPrevious => { scope: Devices, id: "device_tab_previous", label: "Tab", help: "Move to the other half of the devices page." },
-    AllowLanPairing => { scope: Devices, id: "device_lan_allow", label: "Allow", help: "Approve the device that asked to pair on this network." },
-    RefuseLanPairing => { scope: Devices, id: "device_lan_refuse", label: "Refuse", help: "Refuse the device that asked to pair on this network." },
-    RevokeSelectedDevice => { scope: Devices, id: "device_revoke", label: "Revoke", help: "Revoke the highlighted device's access." },
-    OpenDeviceAudit => { scope: Devices, id: "device_audit", label: "Audit", help: "Show the remote-protocol audit trail." },
+    ActivateDevicePairing => { scope: Devices, id: "device_pair_activate", label: label_device_pair_activate, help: help_device_pair_activate },
+    DevicesTabNext => { scope: Devices, id: "device_tab_next", label: label_device_tab_next, help: help_device_tab_next },
+    DevicesTabPrevious => { scope: Devices, id: "device_tab_previous", label: label_device_tab_previous, help: help_device_tab_previous },
+    AllowLanPairing => { scope: Devices, id: "device_lan_allow", label: label_device_lan_allow, help: help_device_lan_allow },
+    RefuseLanPairing => { scope: Devices, id: "device_lan_refuse", label: label_device_lan_refuse, help: help_device_lan_refuse },
+    RevokeSelectedDevice => { scope: Devices, id: "device_revoke", label: label_device_revoke, help: help_device_revoke },
+    OpenDeviceAudit => { scope: Devices, id: "device_audit", label: label_device_audit, help: help_device_audit },
 
     // ---- settings -------------------------------------------------------
-    ActivateSetting => { scope: Settings, id: "setting_activate", label: "Change", help: "Change the highlighted setting." },
-    SettingPrevious => { scope: Settings, id: "setting_previous", label: "Previous value", help: "Step the setting backwards." },
-    SettingNext => { scope: Settings, id: "setting_next", label: "Next value", help: "Step the setting forwards." },
-    ResetSetting => { scope: Settings, id: "setting_reset", label: "Reset", help: "Reset the highlighted setting to its default after a confirmation." },
+    ActivateSetting => { scope: Settings, id: "setting_activate", label: label_setting_activate, help: help_setting_activate },
+    SettingPrevious => { scope: Settings, id: "setting_previous", label: label_setting_previous, help: help_setting_previous },
+    SettingNext => { scope: Settings, id: "setting_next", label: label_setting_next, help: help_setting_next },
+    ResetSetting => { scope: Settings, id: "setting_reset", label: label_setting_reset, help: help_setting_reset },
 
     // ---- filters (shared) ------------------------------------------------
-    BeginFilter => { scope: Global, id: "filter_begin", label: "Filter", help: "Type to filter the current list." },
-    ClearFilter => { scope: Global, id: "filter_clear", label: "Clear filter", help: "Remove the active filter." },
+    BeginFilter => { scope: Global, id: "filter_begin", label: label_filter_begin, help: help_filter_begin },
+    ClearFilter => { scope: Global, id: "filter_clear", label: label_filter_clear, help: help_filter_clear },
 }
 
 impl Intent {
@@ -390,16 +405,69 @@ mod tests {
     }
 
     #[test]
-    fn labels_and_help_are_present() {
+    fn labels_and_help_are_present_in_every_language() {
+        // The three languages live in one locale table and are reached through
+        // these accessors, so a missing translation is a compile error. What
+        // this pins is that the copy is real: every action is named and
+        // explained in each language, and the explanation is a sentence there
+        // too — which is the rule the English-only version of this test kept.
+        let languages = [
+            crate::locale::Locale::En,
+            crate::locale::Locale::ZhCn,
+            crate::locale::Locale::ZhTw,
+        ];
         for intent in Intent::ALL {
-            assert!(!intent.default_label().is_empty(), "{}", intent.id());
-            assert!(!intent.help().is_empty(), "{}", intent.id());
-            assert!(
-                intent.help().ends_with('.'),
-                "{} help should be a sentence",
-                intent.id()
-            );
+            for locale in languages {
+                let strings = Strings::for_locale(locale);
+                let label = intent.label(strings);
+                let help = intent.help(strings);
+                assert!(
+                    !label.is_empty(),
+                    "{} has no label in {locale:?}",
+                    intent.id()
+                );
+                assert!(
+                    !help.is_empty(),
+                    "{} has no help in {locale:?}",
+                    intent.id()
+                );
+                assert!(
+                    help.ends_with('.') || help.ends_with('。'),
+                    "{} help should be a sentence in {locale:?}: {help}",
+                    intent.id()
+                );
+            }
         }
+    }
+
+    #[test]
+    fn every_action_is_named_in_chinese() {
+        // A translation that is still the English words is a translation nobody
+        // wrote. Three actions are the same string in every language on
+        // purpose: `Quit` is the key's own verb, `$EDITOR` names the reader's
+        // editor, and `Runtime` names the Agent runtime the product calls by
+        // that name in all three.
+        let en = Strings::for_locale(crate::locale::Locale::En);
+        let cn = Strings::for_locale(crate::locale::Locale::ZhCn);
+        let tw = Strings::for_locale(crate::locale::Locale::ZhTw);
+        let untranslated = Intent::ALL
+            .iter()
+            .filter(|intent| {
+                !matches!(
+                    intent,
+                    Intent::RequestQuit
+                        | Intent::EditComposerExternally
+                        | Intent::SwitchAgentRuntime
+                )
+            })
+            .filter(|intent| intent.label(cn) == intent.label(en))
+            .filter(|intent| intent.label(tw) == intent.label(en))
+            .map(|intent| intent.id())
+            .collect::<Vec<_>>();
+        assert!(
+            untranslated.is_empty(),
+            "these actions keep their English label in Chinese: {untranslated:?}"
+        );
     }
 
     #[test]

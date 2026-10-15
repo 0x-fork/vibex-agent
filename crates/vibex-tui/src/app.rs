@@ -3794,6 +3794,22 @@ impl App {
         vec![self.page.scope(), Scope::Global]
     }
 
+    /// What a binding is called, in the language this session resolved to.
+    ///
+    /// A binding's label is an accessor rather than a string so one action can
+    /// be named differently where it means something different — `Filter` on a
+    /// list is `Search` on the runtime switcher — while both stay in the locale
+    /// table. Resolving it here keeps that indirection out of every renderer
+    /// and keeps the search boxes matching the words on screen: a reader who
+    /// types 折叠 is looking at rows labelled 折叠, not at rows spelled
+    /// `Expand`.
+    pub fn binding_label(&self, binding: &Binding) -> &'static str {
+        binding
+            .label
+            .map(|label| label(self.strings))
+            .unwrap_or_default()
+    }
+
     /// The bindings the key bar and the help page may name right now, one per
     /// intent, paired with the scope each answers in.
     ///

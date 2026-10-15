@@ -16,6 +16,15 @@ use vibex_tui::theme::{ColorCapability, ColorMode, GlyphMode};
 use vibex_tui::{Locale, SeatKind, Strings};
 
 fn app(columns: u16, rows: u16) -> App {
+    app_in(Locale::En, columns, rows)
+}
+
+/// The same application, resolved in `locale`.
+///
+/// Product copy is read from `App::strings`, so a test that wants to prove the
+/// help text follows the reader's language has to build the app that way rather
+/// than translate a string by hand.
+fn app_in(locale: Locale, columns: u16, rows: u16) -> App {
     let mut app = App::new(
         DisconnectedBackend::facade(),
         AppOptions {
@@ -26,7 +35,7 @@ fn app(columns: u16, rows: u16) -> App {
             },
             theme_id: Some("vibex-dark".to_string()),
             mode: vibex_ui::GpuiThemeMode::Dark,
-            locale: Locale::En,
+            locale,
             // No arrangement file: a test must never write into the runner's
             // home directory, and each test wants a clean list.
             sidebar_path: None,
@@ -10680,10 +10689,12 @@ fn an_ownership_verb_is_only_named_when_it_has_a_subject() {
     assert!(!advertises(&app, Intent::OpenChildSessions));
     assert!(!advertises(&app, Intent::GotoParentSession));
     let rows = vibex_tui::view::shortcut_rows(&app, "", &std::collections::BTreeSet::new());
+    // The cheatsheet names its rows through the locale, so the check reads the
+    // same accessor the renderer does rather than the raw table.
     let labelled = rows
         .iter()
         .filter_map(|row| row.binding)
-        .filter_map(|binding| binding.label)
+        .map(|binding| app.binding_label(binding))
         .collect::<Vec<_>>();
     for label in ["Sub-sessions", "Main session"] {
         assert!(
@@ -11102,4 +11113,173 @@ fn a_modal_keeps_the_marks_it_does_not_cover() {
         control.is_empty(),
         "opening the dialog moved a picture: {control:?}"
     );
+}
+
+/// The screen with the blank continuation cells a wide glyph leaves behind
+/// removed, so a CJK assertion compares words rather than cells.
+///
+/// `TestBackend` writes a wide glyph into its own cell and leaves the next one
+/// blank; joining the cells therefore puts a space between every pair of
+/// Chinese characters. A reader sees `命令面板`; the buffer spells `命 令 面 板`.
+fn flat(screen: &str) -> String {
+    screen.replace(' ', "")
+}
+
+/// The `?` help text follows the reader's language, not just the chrome.
+///
+/// The category headers were translated before the rows under them were: the
+/// overlay read as a translated skeleton whose every binding was still English.
+/// These assert the body copy — the words beside a chord and the sentence that
+/// explains it — in both Chinese locales, because a table that only translated
+/// one of them would look finished in a spot check and be unusable in the other.
+///
+/// Only the rows the window actually shows are asserted on: the cheatsheet
+/// scrolls to the selection, so a row below the fold is not evidence about what
+/// the screen says.
+#[test]
+fn the_help_text_names_every_key_in_chinese() {
+    for locale in [Locale::ZhCn, Locale::ZhTw] {
+        let mut app = app_in(locale, 120, 40);
+        app.perform(vibex_tui::action::Intent::ToggleHelp);
+        // The first screenful, which is what the overlay opens on. The names
+        // are read before the frame is drawn so the borrow ends with the walk.
+        let rows = vibex_tui::view::shortcut_rows(&app, "", &std::collections::BTreeSet::new());
+        let visible = rows
+            .iter()
+            .filter_map(|row| row.binding)
+            .take(6)
+            .map(|binding| {
+                (
+                    app.binding_label(binding).to_string(),
+                    binding
+                        .label
+                        .map(|label| label(Strings::for_locale(Locale::En)))
+                        .unwrap_or_default()
+                        .to_string(),
+                    binding.intent.id(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let screen = text(&render(&mut app, 120, 40));
+        let flattened = flat(&screen);
+        assert!(
+            flattened.contains(&flat(app.strings.help_title())),
+            "{locale:?}: the page is not titled in the reader's language:\n{screen}"
+        );
+        for (label, _, id) in &visible {
+            assert!(
+                flattened.contains(&flat(label)),
+                "{locale:?}: the visible row `{label}` ({id}) is not drawn:\n{screen}"
+            );
+        }
+        // A row drawn in English while its Chinese name exists is the exact
+        // half-translated state this test is here to catch.
+        let leaked = visible
+            .iter()
+            .filter(|(localized, english, _)| localized != english)
+            .map(|(_, english, _)| english)
+            .filter(|english| flattened.contains(&flat(english)))
+            .collect::<Vec<_>>();
+        assert!(
+            leaked.is_empty(),
+            "{locale:?}: these rows kept their English labels: {leaked:?}\n{screen}"
+        );
+    }
+}
+
+/// The explanation under the selected row is translated with the row.
+///
+/// The cheatsheet prints the selected action's one-line help beneath it, which
+/// is the part a reader actually reads to learn a key. It comes from a separate
+/// locale table from the label, so it can be translated while the row above it
+/// is not, or the reverse — and either half missing makes the overlay lie about
+/// the language it is in. The first binding row is selected because the window
+/// opens at the top, which is where its explanation is drawn.
+#[test]
+fn the_selected_rows_explanation_is_translated() {
+    let mut app = app_in(Locale::ZhCn, 120, 40);
+    app.perform(vibex_tui::action::Intent::ToggleHelp);
+    let rows = vibex_tui::view::shortcut_rows(&app, "", &std::collections::BTreeSet::new());
+    let index = rows
+        .iter()
+        .position(|row| row.binding.is_some())
+        .expect("the cheatsheet has binding rows");
+    let intent = rows[index].binding.expect("just checked").intent;
+    app.overlay = Some(vibex_tui::app::Overlay::Help {
+        query: String::new(),
+        selected: index,
+        collapsed: std::collections::BTreeSet::new(),
+    });
+    let screen = text(&render(&mut app, 120, 40));
+    let explanation = intent.help(app.strings);
+    assert!(
+        flat(&screen).contains(&flat(explanation)),
+        "the explanation for {} is not in the reader's language:\n{screen}",
+        intent.id()
+    );
+    assert!(
+        !flat(&screen).contains(&flat(intent.help(Strings::for_locale(Locale::En)))),
+        "the English explanation for {} survived translation:\n{screen}",
+        intent.id()
+    );
+}
+
+/// Searching the cheatsheet matches the words on screen.
+///
+/// The search compares the query against what each row draws. When the rows are
+/// translated but the filter still matches the English labels, typing the word
+/// a reader can actually see returns nothing — the filter and the screen
+/// disagree about what the row is called.
+#[test]
+fn the_cheatsheet_filters_on_the_words_it_shows() {
+    let mut app = app_in(Locale::ZhCn, 120, 40);
+    app.perform(vibex_tui::action::Intent::ToggleHelp);
+    let rename = vibex_tui::action::Intent::BeginRenameSession.label(app.strings);
+    let rows = vibex_tui::view::shortcut_rows(&app, rename, &std::collections::BTreeSet::new());
+    assert!(
+        rows.iter().any(|row| {
+            row.binding.is_some_and(|binding| {
+                binding.intent == vibex_tui::action::Intent::BeginRenameSession
+            })
+        }),
+        "searching for `{rename}` found nothing, so the filter is matching English"
+    );
+    // And the words that are actually drawn come from the locale table, not the
+    // English default.
+    let labelled = rows
+        .iter()
+        .filter_map(|row| row.binding)
+        .map(|binding| app.binding_label(binding))
+        .collect::<Vec<_>>();
+    assert!(
+        labelled.contains(&rename),
+        "the matched row is not labelled `{rename}`: {labelled:?}"
+    );
+}
+
+/// The key bar's words follow the reader's language too.
+///
+/// The bar is drawn from the same binding table as the cheatsheet but on a
+/// different surface, so a label that is localised in one and not the other is
+/// a translation that only half landed. The bar is the surface a reader sees
+/// without asking for anything, so it is the one they notice first.
+#[test]
+fn the_key_bar_is_localized() {
+    let mut app = app_in(Locale::ZhCn, 160, 40);
+    app.perform(vibex_tui::action::Intent::GotoSessions);
+    app.focus = vibex_tui::app::Focus::Main;
+    let screen = text(&render(&mut app, 160, 40));
+    let flattened = flat(&screen);
+    // The bar names the session list and the command palette in the reader's
+    // language; both are always advertised.
+    for intent in [
+        vibex_tui::action::Intent::OpenCommandPalette,
+        vibex_tui::action::Intent::GotoSessions,
+    ] {
+        let label = intent.label(app.strings);
+        assert!(
+            flattened.contains(&flat(label)),
+            "the key bar does not name `{label}` in Chinese:\n{screen}"
+        );
+    }
 }

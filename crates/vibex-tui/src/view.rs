@@ -195,7 +195,7 @@ fn palette_label(intent: Intent, strings: Strings) -> &'static str {
         Intent::ReloadKeymap => strings.palette_cmd_reload_keys(),
         Intent::Refresh => strings.palette_cmd_refresh(),
         Intent::RequestQuit => strings.palette_cmd_quit(),
-        _ => intent.default_label(),
+        _ => intent.label(strings),
     }
 }
 
@@ -218,7 +218,7 @@ fn palette_hint(intent: Intent, strings: Strings) -> &'static str {
         Intent::ReloadKeymap => strings.palette_hint_reload_keys(),
         Intent::Refresh => strings.palette_hint_refresh(),
         Intent::RequestQuit => strings.palette_hint_quit(),
-        _ => intent.help(),
+        _ => intent.help(strings),
     }
 }
 
@@ -3694,7 +3694,7 @@ fn render_status_band(
         .filter(|(row, _)| app.page == Page::Sessions && *row != crate::app::SESSION_ACTION_ROW);
     if let Some((_, intent)) = app.hovered_row_action.or(focused_control) {
         let mut hint = vec![Span::styled(
-            intent.default_label().to_string(),
+            intent.label(strings).to_string(),
             Style::default()
                 .fg(theme.roles.foreground)
                 .add_modifier(Modifier::BOLD),
@@ -7010,13 +7010,9 @@ fn render_help(
         .filter(|binding| {
             needle.is_empty()
                 || binding.chord.display().to_lowercase().contains(&needle)
-                || binding
-                    .label
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .contains(&needle)
+                || app.binding_label(binding).to_lowercase().contains(&needle)
                 || binding.intent.id().contains(&needle)
-                || binding.intent.help().to_lowercase().contains(&needle)
+                || binding.intent.help(app.strings).to_lowercase().contains(&needle)
         })
         .collect::<Vec<_>>();
     if bindings.is_empty() {
@@ -7028,7 +7024,7 @@ fn render_help(
         .map(|binding| {
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{:<14}", binding.chord.display()), theme.accent()),
-                Span::styled(binding.label.unwrap_or_default().to_string(), theme.base()),
+                Span::styled(app.binding_label(binding).to_string(), theme.base()),
             ]))
         })
         .collect::<Vec<_>>();
@@ -7111,13 +7107,9 @@ pub fn key_editor_rows<'a>(app: &'a App, query: &str) -> Vec<KeyRow<'a>> {
             return true;
         }
         binding.chord.display().to_lowercase().contains(&needle)
-            || binding
-                .label
-                .unwrap_or_default()
-                .to_lowercase()
-                .contains(&needle)
+            || app.binding_label(binding).to_lowercase().contains(&needle)
             || binding.intent.id().contains(&needle)
-            || binding.intent.help().to_lowercase().contains(&needle)
+            || binding.intent.help(app.strings).to_lowercase().contains(&needle)
             || binding.scope.id().contains(&needle)
     };
     let mut rows = Vec::new();
@@ -7193,13 +7185,9 @@ pub fn shortcut_rows<'a>(
             .filter(|binding| {
                 needle.is_empty()
                     || binding.chord.display().to_lowercase().contains(&needle)
-                    || binding
-                        .label
-                        .unwrap_or_default()
-                        .to_lowercase()
-                        .contains(&needle)
+                    || app.binding_label(binding).to_lowercase().contains(&needle)
                     || binding.intent.id().contains(&needle)
-                    || binding.intent.help().to_lowercase().contains(&needle)
+                    || binding.intent.help(app.strings).to_lowercase().contains(&needle)
                     || binding.scope.id().contains(&needle)
             })
             .collect::<Vec<_>>();
@@ -7266,7 +7254,7 @@ fn render_shortcut_cheatsheet(
             }
             None => {
                 let Some(binding) = row.binding else { continue };
-                let label = binding.label.unwrap_or_default();
+                let label = app.binding_label(binding);
                 let style = if active {
                     theme.selected()
                 } else {
@@ -7287,7 +7275,7 @@ fn render_shortcut_cheatsheet(
                     lines.push(Line::from(vec![
                         Span::styled("      ", Style::default()),
                         Span::styled(
-                            binding.intent.help().to_string(),
+                            binding.intent.help(strings).to_string(),
                             Style::default()
                                 .fg(theme.roles.gray)
                                 .add_modifier(Modifier::ITALIC),
@@ -7357,7 +7345,7 @@ fn render_keys_editor(
             ])),
             None => {
                 let Some(binding) = row.binding else { continue };
-                let label = binding.label.unwrap_or_default();
+                let label = app.binding_label(binding);
                 let style = if active {
                     theme.selected()
                 } else {
@@ -7521,7 +7509,8 @@ fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiT
         if scope != Scope::Global {
             continue;
         }
-        if let Some(label) = binding.label {
+        if binding.label.is_some() {
+            let label = app.binding_label(binding);
             reserved +=
                 (display_width(&binding.chord.display()) + 1 + display_width(label) + 5) as u16;
         }
@@ -7531,12 +7520,12 @@ fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiT
         }
     }
     for (scope, binding) in app.advertised_keys() {
-        if let Some(label) = binding.label
+        if binding.label.is_some()
             && !labels
                 .iter()
                 .any(|(_, hinted, _)| *hinted == binding.intent)
         {
-            labels.push((scope, binding.intent, label));
+            labels.push((scope, binding.intent, app.binding_label(binding)));
         }
     }
     let mut spans = vec![Span::raw(" ")];
