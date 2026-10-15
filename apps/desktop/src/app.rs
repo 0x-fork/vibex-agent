@@ -4150,6 +4150,19 @@ fn session_snapshot_sidebar_changed(previous: Option<&AgentSession>, next: &Agen
         || previous.deleted_at_ms != next.deleted_at_ms
 }
 
+/// Whether a session belongs on the navigation sidebar.
+///
+/// A session is a row while it is neither deleted nor archived. The archived
+/// half is not cosmetic: the authoritative root list the sidebar is drawn from
+/// filters `archived_at_ms IS NULL` in SQL, so an archived session is absent
+/// from it by construction. A live snapshot is the one other way a row can
+/// enter the list, and it has to answer the same question, or a session another
+/// client archived for the reader stays on this sidebar wearing an "Archived"
+/// badge instead of leaving the way a local archive takes it off.
+fn session_belongs_on_sidebar(session: &AgentSession) -> bool {
+    session.deleted_at_ms.is_none() && session.archived_at_ms.is_none()
+}
+
 /// How a mutation took a session row off the sidebar before the runtime
 /// answered.
 ///
@@ -15403,6 +15416,23 @@ impl VibexWorkbench {
         {
             return;
         }
+        // A snapshot can be the first account of another client's archive, and
+        // the sidebar is not where an archived session lives: the authoritative
+        // root list stands under the same rule. Without this the row the TUI
+        // archived stayed drawn here with an "Archived" badge, because a live
+        // snapshot is the one row source that never consulted `archived_at_ms`.
+        // Dropping the row also drops the state that parked it — a queued send
+        // or a probe for a session that can no longer take one — so the row
+        // leaves exactly as the reader's own archive leaves it. The runtime's
+        // session bridge publishes the sidebar invalidation for the broadcast
+        // that carried the archive, so remote clients are told from the same
+        // event rather than from this teardown.
+        if !session_belongs_on_sidebar(&session) {
+            self.forget_session_row(session.id.as_str());
+            self.reconcile_sidebar_state();
+            self.queue_ui_state();
+            return;
+        }
         let session = self.reconcile_pending_new_session_title(session);
         let delegated = (self.delegated_sessions.contains_key(session.id.as_str())
             && !self.sessions.iter().any(|root| root.id == session.id))
@@ -23860,6 +23890,23 @@ impl VibexWorkbench {
                 // delegated registry write its unknown branch performs — stops
                 // here for a session the sidebar is hiding.
                 let hidden = self.session_hidden_from_sidebar(session.id.as_str());
+                // A live snapshot is the one row source that is not the
+                // authoritative root list, so it is also how another client's
+                // archive first reaches this workbench. The root list omits an
+                // archived session (and a deleted one) by construction; the
+                // snapshot has to answer the same question here, before the
+                // unknown branch below parks it among the delegated rows.
+                // Otherwise the row the TUI archived stayed drawn with an
+                // "Archived" badge, off no list but this one.
+                if !session_belongs_on_sidebar(&session) {
+                    let row_dropped = !hidden;
+                    if row_dropped {
+                        self.forget_session_row(session.id.as_str());
+                        self.reconcile_sidebar_state();
+                        self.queue_ui_state();
+                    }
+                    return row_dropped;
+                }
                 let previous_session = self.registered_session(session.id.as_str());
                 let sidebar_changed =
                     !hidden && session_snapshot_sidebar_changed(previous_session, &session);
@@ -35544,10 +35591,30 @@ impl VibexWorkbench {
                 .optimistically_archived_session_ids
                 .extend(session_ids.iter().cloned()),
         }
+        for session_id in session_ids {
+            self.forget_session_row(session_id);
+        }
+        self.reconcile_sidebar_state();
+        self.publish_sidebar_invalidation();
+        self.queue_ui_state();
+    }
+
+    /// Takes one session off every list and pane the workbench draws.
+    ///
+    /// This is the single teardown a row leaving the sidebar runs, whether the
+    /// reader asked for the archive or another client's archive arrived as a
+    /// snapshot: the row drops out of the root list, the delegated registry and
+    /// the ownership tree, the cached panes and queued sends that named it go
+    /// with it, and the page the reader was on is navigated to the New Session
+    /// home. It deliberately does not touch the mutation bookkeeping — an
+    /// archive and a deletion hide their row through different sets — nor the
+    /// sidebar reconciliation, which the caller runs once for the whole batch.
+    fn forget_session_row(&mut self, session_id: &str) {
+        let session_ids = BTreeSet::from([session_id.to_string()]);
         let removing_selected_session = self
             .selected_session_id
             .as_ref()
-            .is_some_and(|session_id| session_ids.contains(session_id.as_str()));
+            .is_some_and(|selected| session_ids.contains(selected.as_str()));
         self.sessions
             .retain(|session| !session_ids.contains(session.id.as_str()));
         self.delegated_sessions
@@ -35629,9 +35696,6 @@ impl VibexWorkbench {
                 self.session_removal_new_session_pending = true;
             }
         }
-        self.reconcile_sidebar_state();
-        self.publish_sidebar_invalidation();
-        self.queue_ui_state();
     }
 
     fn confirm_delete_project(
@@ -88229,40 +88293,49 @@ mod tests {
 
         let optimistic_state = source
             .split_once("    fn optimistically_remove_sessions(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn confirm_delete_project("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn forget_session_row("))
             .map(|(body, _)| body)
             .expect("optimistic session removal should remain inspectable");
-        assert!(optimistic_state.contains("self.sessions\n            .retain"));
         // The row is hidden by the set that matches the removal: a deletion's
-        // bookkeeping outlives the mutation, an archive's does not.
+        // bookkeeping outlives the mutation, an archive's does not. The teardown
+        // itself is shared with the live snapshot an archive elsewhere arrives
+        // as, so it lives in `forget_session_row` below.
         assert!(optimistic_state.contains("optimistically_removed_session_ids"));
         assert!(optimistic_state.contains("optimistically_archived_session_ids"));
-        assert!(optimistic_state.contains(
+        assert!(optimistic_state.contains("self.forget_session_row(session_id);"));
+        assert!(optimistic_state.contains("self.reconcile_sidebar_state();"));
+        assert!(optimistic_state.contains("self.publish_sidebar_invalidation();"));
+
+        let teardown = source
+            .split_once("    fn forget_session_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn confirm_delete_project("))
+            .map(|(body, _)| body)
+            .expect("the session row teardown should remain inspectable");
+        assert!(teardown.contains("self.sessions\n            .retain"));
+        assert!(teardown.contains(
             "self.session_views
             .retain"
         ));
-        assert!(optimistic_state.contains(
+        assert!(teardown.contains(
             "self.session_view_lru
             .retain"
         ));
-        assert!(optimistic_state.contains("self.selected_session_id = None;"));
-        assert!(optimistic_state.contains("self.session_views\n            .retain"));
-        assert!(optimistic_state.contains("self.reconcile_sidebar_state();"));
-        assert!(optimistic_state.contains("self.reconcile_sidebar_state();"));
+        assert!(teardown.contains("self.selected_session_id = None;"));
+        assert!(teardown.contains("self.session_views\n            .retain"));
         // A removal that takes the page the reader is on hands the workbench
         // the New Session home, and only from the tab that was showing it.
-        let selection_cleared = optimistic_state
+        let selection_cleared = teardown
             .find("self.selected_session_id = None;")
             .expect("removal should clear the removed session's selection");
-        let home_opened = optimistic_state
+        let home_opened = teardown
             .find("self.new_session_open = true;")
             .expect("removal should open the New Session home");
-        let deferred = optimistic_state
+        let deferred = teardown
             .find("self.session_removal_new_session_pending = true;")
             .expect("the window-aware half of the navigation should be deferred");
         assert!(selection_cleared < home_opened);
         assert!(home_opened < deferred);
-        assert!(optimistic_state.contains("session_removal_opens_new_session_home("));
+        assert!(teardown.contains("session_removal_opens_new_session_home("));
 
         let completion = source
             .split_once("    fn finish_optimistic_session_deletion(")
@@ -88495,7 +88568,7 @@ mod tests {
         assert!(!child_label.contains("self.sessions"));
 
         let optimistic_delete = source
-            .split_once("    fn optimistically_remove_sessions(")
+            .split_once("    fn forget_session_row(")
             .and_then(|(_, tail)| tail.split_once("\n    fn confirm_delete_project("))
             .map(|(body, _)| body)
             .expect("optimistic deletion should remain inspectable");
@@ -92184,7 +92257,7 @@ mod tests {
         assert!(take_remote.contains("self.composer_drafts.consume(message.session_id.as_str());"));
 
         let removal = source
-            .split_once("    fn optimistically_remove_sessions(")
+            .split_once("    fn forget_session_row(")
             .and_then(|(_, tail)| tail.split_once("\n    fn confirm_delete_project("))
             .map(|(body, _)| body)
             .expect("session removal should remain inspectable");

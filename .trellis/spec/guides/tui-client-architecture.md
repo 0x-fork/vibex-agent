@@ -877,6 +877,21 @@ is never a column count.
     drop a row that then survived. A client that owns a Desktop drives the deletion
     through the same tombstone the local delete uses, so no read racing the
     deletion can rebuild the row.
+  - *Archiving a session.* An archive keeps the row in the database but takes it
+    off the sidebar, so it rides the ordinary session-update snapshot: the
+    manager publishes the archived session on `subscribe_session_updates`, and the
+    runtime fans it out as `DesktopEvent::SessionUpdated` beside the sidebar
+    invalidation a remote client re-reads for. The authoritative root list omits
+    an archived row by construction (`archived_at_ms IS NULL`), so a client that
+    owns a Desktop — the seat that receives the snapshot — must apply the same
+    rule to it. A live snapshot is the one row source that is not that list: one
+    the sidebar accepts unconditionally is how a session the TUI archived stayed
+    drawn on the Desktop with an "Archived" badge instead of leaving the way the
+    reader's own archive takes it off. The in-process client therefore drops a
+    snapshot that is not `deleted_at_ms.is_none() && archived_at_ms.is_none()` —
+    through the same row teardown the optimistic removal uses — before it can be
+    added or parked among the delegated rows, and a snapshot with the archive
+    cleared is free to put the row back, exactly as the restore is.
   - *Creating a session.* A creation adds a row no client's list has yet, and the
     caller's reply reaches nobody else, so the manager publishes the committed
     snapshot on the session-update stream (`subscribe_session_updates`) — the

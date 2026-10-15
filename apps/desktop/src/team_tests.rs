@@ -2125,6 +2125,98 @@ async fn team_immediate_delegation_keeps_context_and_retries_the_same_gesture(
     assert_ne!(first.idempotency_key, changed.idempotency_key);
 }
 
+/// An archive that arrives from another client takes the row off the sidebar.
+///
+/// The reader's own archive removes the row optimistically and reloads a root
+/// list that filters `archived_at_ms IS NULL` in SQL, so the session is gone by
+/// construction. A session the TUI archived reaches this workbench through no
+/// list at all: it arrives as a live `SessionUpdated` snapshot, which used to be
+/// accepted unconditionally and drawn with an "Archived" badge. The snapshot now
+/// answers the same visibility question the authoritative list answers, and the
+/// row leaves the way a local archive takes it off.
+#[gpui::test]
+fn an_archive_from_another_client_takes_the_row_off_the_sidebar(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 2);
+    workbench.update(cx, |workbench, cx| {
+        assert!(
+            workbench
+                .sessions
+                .iter()
+                .any(|root| root.id == session(0).id),
+            "the fixture should start with the root row on the sidebar"
+        );
+
+        let mut archived = session(0);
+        archived.state = AgentSessionState::Archived;
+        archived.archived_at_ms = Some(42);
+        archived.updated_at_ms = 42;
+        workbench.apply_desktop_event(DesktopEvent::SessionUpdated(archived), cx);
+        assert!(
+            !workbench
+                .sessions
+                .iter()
+                .any(|root| root.id == session(0).id),
+            "an archived snapshot must take the row off the root list"
+        );
+        assert!(
+            workbench
+                .registered_session(session(0).id.as_str())
+                .is_none(),
+            "the archived row must not be parked as a delegated one either"
+        );
+        assert!(
+            !workbench
+                .sidebar_workspace_groups("")
+                .iter()
+                .flat_map(|group| group.compact_sessions.iter())
+                .any(|listed| listed.id == session(0).id),
+            "the sidebar must not draw a row the reader archived elsewhere"
+        );
+        // Archiving is not deleting: no deletion tombstone is involved, because
+        // the runtime still holds the session for the archived page to restore.
+        assert!(
+            !workbench
+                .deleted_session_ids
+                .contains(session(0).id.as_str())
+        );
+
+        // A session the workbench has never met is not parked as a delegated
+        // row when the snapshot says it is archived: the unknown branch would
+        // otherwise register the row and wake the ownership pass for a session
+        // no root list is ever going to carry.
+        let unseen = session(7);
+        let mut archived_unseen = unseen.clone();
+        archived_unseen.state = AgentSessionState::Archived;
+        archived_unseen.archived_at_ms = Some(43);
+        archived_unseen.updated_at_ms = 43;
+        workbench.apply_desktop_event(DesktopEvent::SessionUpdated(archived_unseen), cx);
+        assert!(
+            workbench.registered_session(unseen.id.as_str()).is_none(),
+            "an archived snapshot is not a creation to park and re-read for"
+        );
+
+        // The archive is reversible: the snapshot with the archive cleared is
+        // not dropped by the visibility rule, so the row the restore puts back
+        // reaches the sidebar again.
+        workbench.upsert_session_snapshot(session(0));
+        assert!(
+            workbench
+                .sessions
+                .iter()
+                .any(|root| root.id == session(0).id),
+            "a restored snapshot has to be free to put the row back"
+        );
+        assert!(
+            workbench
+                .sidebar_workspace_groups("")
+                .iter()
+                .flat_map(|group| group.compact_sessions.iter())
+                .any(|listed| listed.id == session(0).id),
+            "the restored row belongs on the sidebar again"
+        );
+    });
+}
+
 /// An archive hides a session row only while its mutation is in flight.
 ///
 /// Archiving is reversible and the restore is authoritative, so the optimistic
