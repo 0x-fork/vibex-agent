@@ -7397,17 +7397,7 @@ impl App {
                     && !block.body.trim().is_empty()
             })
             .map(|block| block.body.clone())
-            .collect::<Vec<_>>();
-        // A send the runtime has not echoed yet is a message the reader has
-        // already sent, and it is projected as a row of the transcript. It
-        // comes last because that is where the echo will land.
-        if let Some(pending) = self.pending_send_for_active() {
-            let text = pending.row(self.strings).body;
-            if !text.trim().is_empty() {
-                entries.push(text);
-            }
-        }
-        entries
+            .collect()
     }
 
     /// Step the composer's `Up`/`Down` walk over the session's messages.
