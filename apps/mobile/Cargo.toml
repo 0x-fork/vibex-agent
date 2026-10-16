@@ -92,6 +92,10 @@ rustls-platform-verifier = "0.7"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+# The kit's touch-selection menu is queried through its observation registry
+# (`gpui_base::test_support`), which its own feature turns on in both the kit
+# and the base it wraps.
+gpui-component = { workspace = true, features = ["test-support"] }
 # Update fixtures describe the same semver releases the desktop updater reads.
 semver.workspace = true
 tempfile = "3"

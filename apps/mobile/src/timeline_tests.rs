@@ -254,6 +254,107 @@ fn press(cx: &mut VisualTestContext, key: &str) {
     draw(cx);
 }
 
+/// Long-presses the first word of the fixture's answer and returns what the
+/// gesture selected.
+///
+/// The probe draws one user message above the answer, so the press lands on the
+/// answer's first line; the returned text is what says the press found text at
+/// all, rather than a gap between rows.
+fn long_press_answer_word(cx: &mut VisualTestContext) -> String {
+    let probe = cx
+        .debug_bounds("timeline-probe")
+        .expect("the timeline probe is drawn");
+    let position = gpui::point(probe.left() + px(20.0), probe.top() + px(100.0));
+    for phase in [gpui::TouchPhase::Started, gpui::TouchPhase::Ended] {
+        cx.simulate_event(gpui::LongPressEvent {
+            phase,
+            start_position: position,
+            position,
+        });
+        draw(cx);
+    }
+    cx.update(gpui_base::TextSelection::selected_text)
+}
+
+/// A long press over a message leaves the kit's copy menu; pressing Copy has to
+/// put the selected word on the clipboard, which is what pasting into another
+/// application reads.
+///
+/// The press is identified by where it is rather than by what it says: the
+/// labels follow the language setting, and this test is not about them.
+#[gpui::test]
+fn pressing_copy_in_the_touch_menu_reaches_the_clipboard(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (_app, _probe, cx) = open_timeline(
+        cx,
+        data_dir.path(),
+        vec![TimelinePayload::AgentMessage(
+            vibex_core::AgentMessagePayload {
+                text: "quick select value".into(),
+                is_final: true,
+            },
+        )],
+    );
+
+    assert_eq!(
+        long_press_answer_word(cx).trim(),
+        "quick",
+        "the press should select the answer's first word"
+    );
+    // Read-only text offers Copy and Select All, in that order.
+    let items = crate::test_support::touch_menu_items(cx);
+    assert_eq!(
+        items.len(),
+        2,
+        "read-only text offers Copy and Select All: {:?}",
+        items.iter().map(|(label, _)| label).collect::<Vec<_>>()
+    );
+
+    cx.simulate_click(items[0].1.center(), Modifiers::none());
+    draw(cx);
+
+    assert_eq!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .as_deref(),
+        Some("quick")
+    );
+    assert!(
+        crate::test_support::touch_menu_items(cx).is_empty(),
+        "the menu should close once it has acted"
+    );
+}
+
+/// Those buttons belong to the kit, so their labels come from the kit's own
+/// translation table; the language setting has to reach it, or a phone set to
+/// Chinese still shows English under its finger.
+#[gpui::test]
+fn the_touch_menu_over_a_message_follows_the_language_setting(cx: &mut TestAppContext) {
+    crate::locale::set_preference(crate::locale::LanguagePreference::ZhCn);
+    let data_dir = tempfile::tempdir().unwrap();
+    let (_app, _probe, cx) = open_timeline(
+        cx,
+        data_dir.path(),
+        vec![TimelinePayload::AgentMessage(
+            vibex_core::AgentMessagePayload {
+                text: "quick select value".into(),
+                is_final: true,
+            },
+        )],
+    );
+
+    assert_eq!(long_press_answer_word(cx).trim(), "quick");
+    let labels = crate::test_support::touch_menu_items(cx)
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect::<Vec<_>>();
+    // Restore before asserting: a failure must not leave the process — and the
+    // tests running beside this one — on a language the user never picked.
+    crate::locale::set_preference(crate::locale::LanguagePreference::System);
+
+    assert_eq!(labels, vec!["复制".to_string(), "全选".to_string()]);
+}
+
 #[gpui::test]
 fn live_activity_groups_honor_touch_and_keyboard_choices_across_refresh(cx: &mut TestAppContext) {
     let data_dir = tempfile::tempdir().unwrap();

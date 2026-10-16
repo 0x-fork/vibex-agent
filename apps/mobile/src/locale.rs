@@ -73,16 +73,27 @@ const PREFERENCE_ZH_TW: u8 = 3;
 
 static OVERRIDE: AtomicU8 = AtomicU8::new(PREFERENCE_SYSTEM);
 
+/// The locale the kit's own strings were last set to, or `NONE` before the
+/// first sync. Its strings come from `rust-i18n`, a process global this module
+/// otherwise never touches, and it is written only when the answer changes.
+static KIT_LOCALE: AtomicU8 = AtomicU8::new(NONE);
+
+const NONE: u8 = u8::MAX;
+
 /// Applies the persisted language preference for this process. Called once at
 /// startup and whenever the user changes the setting.
 pub fn set_preference(preference: LanguagePreference) {
-    let encoded = match preference {
+    OVERRIDE.store(encode(preference), Ordering::Relaxed);
+    apply_kit_locale(current());
+}
+
+fn encode(preference: LanguagePreference) -> u8 {
+    match preference {
         LanguagePreference::System => PREFERENCE_SYSTEM,
         LanguagePreference::En => PREFERENCE_EN,
         LanguagePreference::ZhCn => PREFERENCE_ZH_CN,
         LanguagePreference::ZhTw => PREFERENCE_ZH_TW,
-    };
-    OVERRIDE.store(encoded, Ordering::Relaxed);
+    }
 }
 
 pub fn preference() -> LanguagePreference {
@@ -97,9 +108,30 @@ pub fn preference() -> LanguagePreference {
 /// The locale every string lookup resolves through: the stored mobile
 /// preference when one exists, otherwise the device language.
 pub fn current() -> Locale {
-    preference().resolved(
+    let locale = preference().resolved(
         *SYSTEM_LOCALE.get_or_init(|| Locale::from_system_tag(sys_locale::get_locale().as_deref())),
-    )
+    );
+    apply_kit_locale(locale);
+    locale
+}
+
+/// Keeps the kit's own copy — the touch-selection menu a long press leaves over
+/// text is the one a phone meets most — in the language this module resolves.
+///
+/// The kit reads those strings through `rust-i18n`, a process global rather
+/// than this resolver, and an unsynced one stays English under a Chinese UI
+/// however translated the app's own strings are. The desktop makes the same
+/// call from its `apply_locale`; the answer is cached because `current()` is
+/// read on every lookup.
+fn apply_kit_locale(locale: Locale) {
+    let encoded = match locale {
+        Locale::En => PREFERENCE_EN,
+        Locale::ZhCn => PREFERENCE_ZH_CN,
+        Locale::ZhTw => PREFERENCE_ZH_TW,
+    };
+    if KIT_LOCALE.swap(encoded, Ordering::Relaxed) != encoded {
+        gpui_component::set_locale(locale.tag());
+    }
 }
 
 pub const fn text_for(
@@ -427,5 +459,22 @@ mod tests {
             common_for(Locale::ZhCn, "provider supplied label"),
             "provider supplied label"
         );
+    }
+
+    /// The kit draws its own chrome — the copy menu a long press leaves over
+    /// text is the one a phone sees most — out of `rust-i18n`, so the language
+    /// setting has to reach that global and not only this module.
+    #[test]
+    fn changing_the_language_also_sets_the_kit_locale() {
+        for (preference, tag) in [
+            (LanguagePreference::ZhCn, "zh-CN"),
+            (LanguagePreference::ZhTw, "zh-TW"),
+            (LanguagePreference::En, "en"),
+        ] {
+            set_preference(preference);
+            assert_eq!(&*gpui_component::locale(), tag);
+        }
+        // Leave the process on the device language, the way it starts.
+        set_preference(LanguagePreference::System);
     }
 }

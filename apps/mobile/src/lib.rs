@@ -31,6 +31,8 @@ mod share;
 mod shortcut;
 mod sidebar;
 mod storage;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod toast;
 mod update;

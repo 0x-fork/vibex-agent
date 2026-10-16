@@ -31,6 +31,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "apps/mobile/android/app/build.gradle",
     "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java",
     "apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java",
+    "apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiClipboard.java",
     "apps/mobile/android/app/src/main/res/values/styles.xml",
     "apps/mobile/android/app/src/main/res/xml/file_paths.xml",
     "apps/mobile/ios/project.yml",
@@ -63,6 +64,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   const androidBuild = read("apps/mobile/android/app/build.gradle");
   const androidActivity = read("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java");
   const androidScanner = read("apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java");
+  const androidClipboard = read("apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiClipboard.java");
   const androidStyles = read("apps/mobile/android/app/src/main/res/values/styles.xml");
   const androidUpdatePaths = read("apps/mobile/android/app/src/main/res/xml/file_paths.xml");
   const androidBridge = read("apps/mobile/src/android_bridge.rs");
@@ -229,6 +231,19 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(androidScanner.includes("CameraSelector.DEFAULT_BACK_CAMERA"), "android_qr_scanner_camera_missing");
   assert(androidStyles.includes("ScannerTheme"), "android_qr_scanner_theme_missing");
   assert(!androidScanner.includes("debugPairingQr"), "android_qr_scanner_debug_injection_present");
+  // The platform layer reaches the Android clipboard by loading this class from
+  // the host Activity's loader, so its package, name and three static entry
+  // points are a JNI contract: without them every copy stays inside the app.
+  assert(androidClipboard.includes("package dev.gpui.mobile;"), "android_clipboard_package_missing");
+  assert(androidClipboard.includes("class GpuiClipboard"), "android_clipboard_class_missing");
+  for (const entry of ["setText(Activity activity, String text)", "getText(Activity activity)", "hasText(Activity activity)"]) {
+    assert(androidClipboard.includes(entry), `android_clipboard_entry_missing:${entry}`);
+  }
+  assert(androidClipboard.includes("ClipboardManager"), "android_clipboard_manager_missing");
+  assert(
+    androidClipboard.includes("setPrimaryClip"),
+    "android_clipboard_never_reaches_the_system_clipboard"
+  );
   assert(
     androidSettings.includes("it.name == 'rustls-platform-verifier-android'"),
     "android_tls_verifier_cargo_metadata_lookup_missing"
@@ -390,6 +405,7 @@ function runSelfTest() {
     ["apps/mobile/android/app/build.gradle", source("apps/mobile/android/app/build.gradle")],
     ["apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java", source("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java")],
     ["apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java", source("apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java")],
+    ["apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiClipboard.java", source("apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiClipboard.java")],
     ["apps/mobile/android/app/src/main/res/values/styles.xml", source("apps/mobile/android/app/src/main/res/values/styles.xml")],
     ["apps/mobile/android/app/src/main/res/xml/file_paths.xml", source("apps/mobile/android/app/src/main/res/xml/file_paths.xml")],
     ["apps/mobile/ios/project.yml", source("apps/mobile/ios/project.yml")],
@@ -606,6 +622,12 @@ function runSelfTest() {
     "public void installUpdatePackage",
     "public void installMissingPackage",
     "native_mobile_checker_self_test_accepted_missing_update_install_bridge"
+  );
+  expectRejected(
+    "apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiClipboard.java",
+    "public static void setText(Activity activity, String text)",
+    "public static void putText(Activity activity, String text)",
+    "native_mobile_checker_self_test_accepted_renamed_clipboard_entry_point"
   );
 }
 

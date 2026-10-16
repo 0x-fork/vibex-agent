@@ -34193,6 +34193,13 @@ mod tests {
         });
     }
 
+    /// Draws one frame of a window opened by `add_rooted_window_view`.
+    fn draw_rooted_window(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
     fn click_mobile_control(cx: &mut gpui::VisualTestContext, selector: &'static str) {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
@@ -38779,6 +38786,80 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             label.contains("vibex"),
             "the entry has to say where the draft goes: {label}"
+        );
+    }
+
+    /// The composer's touch menu is the kit's, so its Copy has to reach the
+    /// clipboard through the input's own action — the path a keyboard copy
+    /// takes — and not merely close the menu.
+    ///
+    /// The item is identified by where the bar puts it rather than by what it
+    /// says: the labels follow the language setting, and this test is not
+    /// about them.
+    #[gpui::test]
+    fn copying_from_the_composers_touch_menu_reaches_the_clipboard(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app.composer_input.update(cx, |input, cx| {
+                input.set_value("quick select value", window, cx);
+                input.focus(window, cx);
+            });
+            app
+        });
+        cx.run_until_parked();
+        draw_rooted_window(cx);
+
+        // Where the caret for "select" is drawn is where a finger has to land
+        // to take that word.
+        let position = app
+            .read_with(cx, |app, cx| {
+                app.composer_input
+                    .read(cx)
+                    .range_to_bounds(&(6..6))
+                    .map(|bounds| bounds.origin)
+            })
+            .expect("the composer should be laid out");
+        for phase in [gpui::TouchPhase::Started, gpui::TouchPhase::Ended] {
+            cx.simulate_event(gpui::LongPressEvent {
+                phase,
+                start_position: position,
+                position,
+            });
+            draw_rooted_window(cx);
+        }
+
+        // An editable field offers Cut, Copy, Paste and Select All, in that
+        // order, so Copy is the second item.
+        let items = crate::test_support::touch_menu_items(cx);
+        assert_eq!(
+            items.len(),
+            4,
+            "the composer should offer Cut, Copy, Paste and Select All: {:?}",
+            items.iter().map(|(label, _)| label).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            app.read_with(cx, |app, cx| app
+                .composer_input
+                .read(cx)
+                .selected_text()
+                .to_string()),
+            "select",
+            "the press should select the word under it"
+        );
+
+        cx.simulate_click(items[1].1.center(), gpui::Modifiers::none());
+        draw_rooted_window(cx);
+
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("select")
         );
     }
 }
