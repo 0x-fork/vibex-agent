@@ -4391,6 +4391,7 @@ impl DeviceBackend for NativeBackend {
             runtime.ensure_accepting_actions()?;
             runtime
                 .management()
+                .remote()
                 .runtime_display_name()
                 .map_err(Into::into)
         })
