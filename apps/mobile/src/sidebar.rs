@@ -60,10 +60,6 @@ pub struct SidebarRow {
     /// Where the managed Worktree this row stands for is, when the Desktop's
     /// git layer says. Only a workspace row carries one.
     pub lifecycle: Option<WorktreeLifecycleDisplayState>,
-    /// Sessions of this row that are working right now. A project row reports
-    /// it so a collapsed project still says that something inside it is busy;
-    /// the desktop draws the same count in words at its trailing edge.
-    pub running_count: usize,
     pub collapsed: bool,
     pub pinned: bool,
     pub selected: bool,
@@ -466,12 +462,6 @@ fn push_root_children(
                     // the total.
                     child_count: sessions_by_project.get(&project_id).map_or(0, Vec::len),
                     lifecycle: None,
-                    running_count: sessions_by_project.get(&project_id).map_or(0, |sessions| {
-                        sessions
-                            .iter()
-                            .filter(|session| session_working(session))
-                            .count()
-                    }),
                     collapsed,
                     pinned: false,
                     selected,
@@ -523,7 +513,6 @@ fn push_root_children(
                     workspace_id: folder.workspace_id.clone(),
                     detail: None,
                     child_count: 0,
-                    running_count: 0,
                     lifecycle: None,
                     collapsed,
                     pinned: false,
@@ -642,7 +631,6 @@ fn push_project_children(
                     workspace_id: folder.workspace_id.clone(),
                     detail: None,
                     child_count: 0,
-                    running_count: 0,
                     lifecycle: None,
                     collapsed,
                     pinned: false,
@@ -768,7 +756,6 @@ fn push_project_children(
                 .clone()
                 .or_else(|| Some(workspace.detail.clone())),
             child_count: workspace_sessions.len(),
-            running_count: 0,
             collapsed: workspace.collapsed,
             pinned: false,
             selected: input.selected_session_id.is_some_and(|selected| {
@@ -867,7 +854,6 @@ fn push_workspace_children(
                     workspace_id: Some(workspace_id.to_string()),
                     detail: None,
                     child_count: 0,
-                    running_count: 0,
                     lifecycle: None,
                     collapsed,
                     pinned: false,
@@ -961,7 +947,6 @@ fn push_group_rows(
         workspace_id: Some(group.workspace_id.clone()),
         detail: None,
         child_count: members.len(),
-        running_count: 0,
         lifecycle: None,
         collapsed,
         pinned: group.pinned,
@@ -1076,7 +1061,6 @@ fn session_row(
         workspace_id: Some(session.workspace_id.as_str().to_string()),
         detail: None,
         child_count: 0,
-        running_count: 0,
         lifecycle: None,
         collapsed: false,
         pinned: input.view.pinned_session_ids.contains(&session_id),
@@ -1117,7 +1101,6 @@ fn empty_workspace_row(
         workspace_id: Some(workspace_id.to_string()),
         detail: None,
         child_count: 0,
-        running_count: 0,
         lifecycle: None,
         collapsed: false,
         pinned: false,
@@ -1361,7 +1344,6 @@ mod tests {
             workspace_id: None,
             detail: None,
             child_count: 0,
-            running_count: 0,
             lifecycle: None,
             collapsed: false,
             pinned: false,
@@ -1459,15 +1441,15 @@ mod tests {
         );
     }
 
-    /// A project's badge reports its sessions, and its mark reports the ones
-    /// that are working — the same two numbers the desktop's project row shows.
+    /// A project's badge reports its sessions — the same number the desktop's
+    /// project row shows.
     ///
     /// The badge used to count the project's Worktrees, which read as a session
     /// total beside a session list: one Worktree holding three sessions showed
-    /// a "1". Neither number follows a search, because the desktop's summaries
-    /// do not either.
+    /// a "1". The number does not follow a search, because the desktop's
+    /// summaries do not either.
     #[test]
-    fn a_project_reports_its_sessions_and_the_ones_that_are_working() {
+    fn a_project_reports_its_sessions() {
         let view = SidebarOrganizationView::default();
         let projects = vec![SidebarProject {
             id: "project_project".to_string(),
@@ -1504,10 +1486,6 @@ mod tests {
             project.child_count, 3,
             "the badge counts sessions, not the one Worktree that holds them"
         );
-        assert_eq!(
-            project.running_count, 2,
-            "a session that is starting up is working too"
-        );
 
         // A search narrows the rows, not the project's summary.
         let searched = sidebar_rows(SidebarRowInput {
@@ -1523,7 +1501,6 @@ mod tests {
             .find(|row| row.kind == SidebarRowKind::Project)
             .expect("the project row survives a matching search");
         assert_eq!(project.child_count, 3);
-        assert_eq!(project.running_count, 2);
     }
 
     #[test]

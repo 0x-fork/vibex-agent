@@ -8209,7 +8209,6 @@ impl MobileApp {
                         .clone()
                         .or_else(|| child.agent_id.as_ref().map(|id| id.as_str().to_string())),
                     child_count: child.child_count,
-                    running_count: 0,
                     lifecycle: None,
                     collapsed: false,
                     pinned: false,
@@ -23046,37 +23045,6 @@ impl MobileApp {
                             .child(row.child_count.to_string()),
                     ),
             )
-            // A collapsed project still says that something inside it is
-            // working. The desktop prints the count in words at the row's
-            // trailing edge; the phone has no room for them, so the number
-            // rides the mark a working session leads with — parked, because a
-            // project row summarizes the rows below it rather than working
-            // itself, and a second animation per project buys nothing.
-            .when(row.running_count > 0, |project| {
-                let running_label = format!(
-                    "{} {}",
-                    row.running_count,
-                    locale::text("running", "运行中", "執行中")
-                );
-                project.child(
-                    div()
-                        .id(format!("mobile-project-running-{}", row.id()))
-                        .aria_label(running_label)
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .gap(px(2.0))
-                        .text_size(theme::font_sidebar_meta())
-                        .text_color(theme::sidebar_session_meta())
-                        .child(
-                            div()
-                                .size(px(16.0))
-                                .flex_shrink_0()
-                                .child(sidebar_activity_mark(theme::primary(), None)),
-                        )
-                        .child(row.running_count.to_string()),
-                )
-            })
             // Always visible: a phone has no hover state to reveal it.
             .child(
                 div()
@@ -36275,7 +36243,6 @@ mod tests {
                     workspace_id: None,
                     detail: None,
                     child_count: 2,
-                    running_count: 0,
                     lifecycle: None,
                     collapsed: false,
                     pinned: false,
@@ -37482,7 +37449,6 @@ fn session_opened(cx: &mut Context<Self>) {
             workspace_id: None,
             detail: None,
             child_count: 2,
-            running_count: 0,
             lifecycle: None,
             collapsed: false,
             pinned: false,
