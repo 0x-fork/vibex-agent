@@ -1847,6 +1847,21 @@ pub fn market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 )
+                // How many of the variables the entry names have to be filled
+                // in: a card whose variables are all optional is a different
+                // decision from one that will not start without two of them.
+                .detail(
+                    strings.config_market_env_required(),
+                    format!(
+                        "{} / {}",
+                        entry
+                            .env
+                            .iter()
+                            .filter(|requirement| requirement.required)
+                            .count(),
+                        entry.env.len()
+                    ),
+                )
                 .detail(
                     strings.config_field_package(),
                     entry.package_kind.clone().unwrap_or_default(),

@@ -716,6 +716,44 @@ pub struct ManagementData {
     pub mcp_discoveries: Vec<vibex_core::McpServerDiscovery>,
     pub skill_discoveries: Vec<vibex_core::SkillDiscovery>,
     pub backups: Vec<vibex_core::BackupCreateOutcome>,
+    /// The areas an answer has already landed for, as `module/section`.
+    ///
+    /// An empty list and a list nobody has read yet look the same on screen,
+    /// and they are not the same thing: one is an area with nothing in it and
+    /// the other is an area that has not been asked. The difference is the
+    /// skeleton the page draws while it waits.
+    pub read: std::collections::BTreeSet<String>,
+}
+
+impl ManagementData {
+    /// Whether an area has been read at least once.
+    pub fn has_read(
+        &self,
+        module: crate::config_center::ConfigModule,
+        section: crate::config_center::ConfigSection,
+    ) -> bool {
+        self.read.contains(&read_key(module, section))
+    }
+
+    /// Record that an area's answer has landed, whatever it said.
+    pub fn mark_read(
+        &mut self,
+        module: crate::config_center::ConfigModule,
+        section: crate::config_center::ConfigSection,
+    ) {
+        self.read.insert(read_key(module, section));
+    }
+}
+
+/// One area's identity in the read set.
+///
+/// The market is one section of two modules, so the module is part of the key:
+/// the MCP catalog and the Skill catalog are two lists that share a name.
+fn read_key(
+    module: crate::config_center::ConfigModule,
+    section: crate::config_center::ConfigSection,
+) -> String {
+    format!("{}/{}", module.key(), section.key())
 }
 
 /// How much of a registry one page of it covers.
@@ -1079,6 +1117,9 @@ pub struct App {
     /// the cursor's index, so an answer that arrives after a refresh still
     /// names the record the question was asked about.
     pub pending_config_action: Option<(String, crate::config_center::ConfigAction)>,
+    /// The form a discard question is holding, so answering "no" gives back
+    /// what the reader typed rather than the empty form they started with.
+    pub pending_form: Option<crate::config_center::ConfigForm>,
     /// The heading a menu action was chosen for, waiting for the question that
     /// guards it. It is carried as the row's own id and the verb rather than as
     /// the cursor's index, for the same reason the record above is: a list that
@@ -1933,6 +1974,7 @@ impl App {
             },
             management_data: ManagementData::default(),
             pending_provider_open: None,
+            pending_form: None,
             config_center: crate::config_center::ConfigCenter::default(),
             device_center: crate::device_center::DeviceCenter::default(),
             pending_config_action: None,

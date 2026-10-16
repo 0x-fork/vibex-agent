@@ -1136,6 +1136,12 @@ impl App {
             Intent::ConfigFormSave => Outcome::quiet(),
             // The form's own key, reaching here only when no form is open.
             Intent::ConfigFormCopy => Outcome::quiet(),
+            // Confirmed: the form is dropped, and with it the edits it held.
+            Intent::ConfigFormDiscard => {
+                self.pending_form = None;
+                self.overlay = None;
+                Outcome::effects(vec![])
+            }
             Intent::ConfigModels => self.open_model_editor(),
             Intent::ConfigImport => self.open_native_import(),
             Intent::ConfigExport => self.open_native_export(),
@@ -4226,6 +4232,21 @@ impl App {
                 ) {
                     self.pending_config_action = None;
                 }
+                // A form the reader has typed into is not thrown away on one
+                // press: everything else in this client can be done again, and
+                // what was typed cannot.
+                if let Some(Overlay::Form { form }) = self.overlay.as_ref()
+                    && form.dirty()
+                {
+                    let form = form.clone();
+                    self.pending_form = Some(form);
+                    self.overlay = Some(Overlay::Confirm {
+                        title: self.strings.config_discard_title().to_string(),
+                        body: self.strings.config_discard_body().to_string(),
+                        confirm: Intent::ConfigFormDiscard,
+                    });
+                    return Outcome::effects(vec![]);
+                }
                 self.overlay = match self.overlay.take() {
                     // The account panel's sign-out question is one level inside
                     // it: `Esc` gives up the question before it gives up the
@@ -4234,6 +4255,12 @@ impl App {
                         view.confirming_sign_out = false;
                         Some(Overlay::AgentAuth { view })
                     }
+                    // Backing out of the discard question returns the form
+                    // rather than the surface behind it.
+                    Some(Overlay::Confirm {
+                        confirm: Intent::ConfigFormDiscard,
+                        ..
+                    }) => self.pending_form.take().map(|form| Overlay::Form { form }),
                     Some(Overlay::RunOptionValues { row, .. }) => Some(Overlay::RuntimePicker {
                         view: RuntimePickerView::Options,
                         selected: row,

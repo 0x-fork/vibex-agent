@@ -1963,6 +1963,12 @@ fn color_less_mode_still_renders_every_label() {
 fn the_selection_marker_follows_the_scope() {
     let mut app = app(120, 40);
     app.perform(vibex_tui::action::Intent::GotoManagement);
+    // An area nobody has read draws the rows it is waiting for, so the answer
+    // that leaves it empty is what this test is about.
+    app.management_data.mark_read(
+        vibex_tui::config_center::ConfigModule::Agent,
+        vibex_tui::config_center::ConfigSection::Agents,
+    );
     // The configuration centre keeps its own cursor per area, so moving to the
     // second record and redrawing must light the row under the reader rather
     // than the first one.

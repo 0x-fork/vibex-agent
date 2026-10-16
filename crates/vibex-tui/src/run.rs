@@ -2498,6 +2498,10 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         AppMessage::Profiles(result) => match result {
             Ok(profiles) => {
                 app.management_data.providers = profiles;
+                app.management_data.mark_read(
+                    crate::config_center::ConfigModule::Agent,
+                    crate::config_center::ConfigSection::Providers,
+                );
                 app.live = LiveState::Ready;
             }
             Err(error) => app.toast(Toast::danger(error.message)),
@@ -2716,6 +2720,10 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         AppMessage::Agents(result) => match result {
             Ok(agents) => {
                 app.management_data.agents = agents;
+                app.management_data.mark_read(
+                    crate::config_center::ConfigModule::Agent,
+                    crate::config_center::ConfigSection::Agents,
+                );
                 app.live = LiveState::Ready;
                 // The switcher sends a reader here for one Agent's account, and
                 // the list it needs only arrives now: without this the page
@@ -2789,6 +2797,11 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 }
             }
             app.management_data.market_note = note;
+            // The market is one area of two modules, so the answer is recorded
+            // against the module that asked: the Skill catalog is not read just
+            // because the MCP one was.
+            app.management_data
+                .mark_read(module, crate::config_center::ConfigSection::Catalog);
             // A registry that answered with fewer pages than the reader is on —
             // a search that matched less, a window that shrank — leaves the
             // page pointing past the end of its own answer, so it is put back
@@ -2803,22 +2816,54 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             Ok(servers) => {
                 app.management_data.mcp = servers;
                 app.live = LiveState::Ready;
+                app.management_data.mark_read(
+                    crate::config_center::ConfigModule::Mcp,
+                    crate::config_center::ConfigSection::Servers,
+                );
             }
-            Err(error) => app.toast(Toast::danger(error.message)),
+            // An area with a refusal in it is not an area that is still being
+            // read, so the skeleton goes when the answer does — either way.
+            Err(error) => {
+                app.toast(Toast::danger(error.message));
+                app.management_data.mark_read(
+                    crate::config_center::ConfigModule::Mcp,
+                    crate::config_center::ConfigSection::Servers,
+                );
+            }
         },
         AppMessage::Skills(result) => match result {
             Ok(skills) => {
                 app.management_data.skills = skills;
                 app.live = LiveState::Ready;
+                app.management_data.mark_read(
+                    crate::config_center::ConfigModule::Skills,
+                    crate::config_center::ConfigSection::Installed,
+                );
             }
-            Err(error) => app.toast(Toast::danger(error.message)),
+            Err(error) => {
+                app.toast(Toast::danger(error.message));
+                app.management_data.mark_read(
+                    crate::config_center::ConfigModule::Skills,
+                    crate::config_center::ConfigSection::Installed,
+                );
+            }
         },
         AppMessage::Prompts(result) => match result {
             Ok(prompts) => {
                 app.management_data.prompts = prompts;
                 app.live = LiveState::Ready;
+                app.management_data.mark_read(
+                    crate::config_center::ConfigModule::Prompts,
+                    crate::config_center::ConfigSection::Prompts,
+                );
             }
-            Err(error) => app.toast(Toast::danger(error.message)),
+            Err(error) => {
+                app.toast(Toast::danger(error.message));
+                app.management_data.mark_read(
+                    crate::config_center::ConfigModule::Prompts,
+                    crate::config_center::ConfigSection::Prompts,
+                );
+            }
         },
         AppMessage::Completions { ticket, result } => {
             if !app.accepts_composer_ticket(&ticket)

@@ -5622,18 +5622,47 @@ fn render_config_table(
     }
     let body_top = lines.len() as u16;
     if rows.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{}  {}",
-                " ".repeat(TABLE_PREFIX),
-                if app.config_center.filter.trim().is_empty() {
-                    strings.config_empty()
-                } else {
-                    strings.config_no_matches()
+        // An empty list and a list nobody has read yet look the same on screen
+        // and are not the same thing: one is an area with nothing in it, and
+        // the other is an area that has not been asked. The second draws the
+        // shape of the rows it is waiting for, so the reader can tell "still
+        // coming" from "there is nothing here".
+        if app
+            .management_data
+            .has_read(app.config_center.module, app.config_center.section)
+        {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{}  {}",
+                    " ".repeat(TABLE_PREFIX),
+                    if app.config_center.filter.trim().is_empty() {
+                        strings.config_empty()
+                    } else {
+                        strings.config_no_matches()
+                    }
+                ),
+                Style::default().fg(theme.roles.gray_dim),
+            )));
+        } else {
+            let dim = Style::default().fg(theme.roles.gray_dim);
+            for index in 0..SKELETON_ROWS {
+                // The first line carries the word; the rest are the shape of
+                // the rows that are coming, at the widths the table uses.
+                let mut spans = vec![Span::styled(" ".repeat(TABLE_PREFIX), dim)];
+                for width in [24usize, 14, 12, 10] {
+                    spans.push(Span::styled("░".repeat(width.min(24)), dim));
+                    spans.push(Span::raw("  "));
                 }
-            ),
-            Style::default().fg(theme.roles.gray_dim),
-        )));
+                if index == 0 {
+                    spans.pop();
+                    spans.push(Span::styled(
+                        strings.config_reading().to_string(),
+                        dim.add_modifier(Modifier::ITALIC),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
     }
     let selected = app.config_center.cursor(rows.len());
     let window = area.height.saturating_sub(body_top) as usize;
@@ -5859,6 +5888,12 @@ fn push_registry_segment(
 /// It is drawn from the numbers rather than stored as a sentence so the three
 /// languages can spell it, and what is on screen is the rows themselves: a page
 /// the client cut is described by what it cut rather than by what it fetched.
+/// How many placeholder rows an area that has not answered yet draws.
+///
+/// It is the number of rows the desktop's skeleton cards stand in for, so the
+/// list does not jump when the answer lands.
+const SKELETON_ROWS: usize = 6;
+
 fn registry_note(app: &App, shown: usize, strings: Strings) -> Option<String> {
     let note = app.management_data.market_note.as_ref()?;
     // A registry that refused is the state the list is in, so it is drawn where

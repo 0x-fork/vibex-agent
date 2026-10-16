@@ -402,6 +402,10 @@ fn the_filter_narrows_the_table_and_says_so_when_nothing_matches() {
             .len(),
         0
     );
+    // An empty table is what an answer left behind, so the area is read before
+    // the empty state is the thing on screen.
+    app.management_data
+        .mark_read(ConfigModule::Mcp, ConfigSection::Servers);
     let screen = text(&mut app, 140, 40);
     assert!(screen.contains("No matches"), "{screen}");
     // Clearing it brings the record back.
@@ -448,6 +452,10 @@ fn a_narrow_terminal_still_draws_the_centre() {
 fn the_default_centre_is_empty_rather_than_wrong() {
     let mut app = app(120, 40);
     app.perform(vibex_tui::action::Intent::GotoManagement);
+    // The centre opens on an area nobody has read yet; the empty state is what
+    // the answer leaves when it has nothing to put there.
+    app.management_data
+        .mark_read(ConfigModule::Agent, ConfigSection::Agents);
     let screen = text(&mut app, 120, 40);
     assert!(screen.contains("Nothing here yet"), "{screen}");
     assert!(
@@ -3411,5 +3419,137 @@ fn paging_past_the_last_page_asks_the_registry_for_more() {
     assert!(
         outcome.effects.is_empty(),
         "a page was asked for at the end"
+    );
+}
+
+/// An area nobody has read yet draws the rows it is waiting for.
+///
+/// An empty list and a list that has not been asked look the same on screen and
+/// are not the same thing, so the unanswered one draws the shape of its rows
+/// with the word on it. The answer — even a refusal — takes the skeleton away,
+/// because an area with an error in it is not an area that is still loading.
+#[test]
+fn an_area_that_has_not_answered_yet_draws_its_skeleton() {
+    let mut app = loaded(140, 40);
+    // An area that has not answered has no rows yet, which is what the skeleton
+    // stands in for.
+    app.management_data.mcp.clear();
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Servers));
+
+    let screen = text(&mut app, 140, 40);
+    assert!(
+        screen.contains("Reading…"),
+        "the area drew nothing to say it was reading:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Nothing here yet"),
+        "an unasked area claimed to be empty:\n{screen}"
+    );
+
+    // The answer takes it away, whatever the answer said.
+    app.management_data
+        .mark_read(ConfigModule::Mcp, ConfigSection::Servers);
+    let screen = text(&mut app, 140, 40);
+    assert!(
+        !screen.contains("Reading…"),
+        "the skeleton outlived the answer:\n{screen}"
+    );
+
+    // And the answer is recorded per area: the Skill catalog is not read just
+    // because the MCP one was.
+    app.management_data
+        .mark_read(ConfigModule::Mcp, ConfigSection::Catalog);
+    assert!(
+        app.management_data
+            .has_read(ConfigModule::Mcp, ConfigSection::Catalog)
+    );
+    assert!(
+        !app.management_data
+            .has_read(ConfigModule::Skills, ConfigSection::Catalog),
+        "the Skill catalog was marked read by the MCP one"
+    );
+    assert!(
+        !app.management_data
+            .has_read(ConfigModule::Skills, ConfigSection::Installed)
+    );
+}
+
+/// A market card says how many of its variables have to be filled in.
+#[test]
+fn a_market_card_counts_the_variables_it_needs() {
+    let mut app = loaded(140, 40);
+    let mut entry = market_entry("entry_trace");
+    entry.env.push(
+        serde_json::from_value(serde_json::json!({
+            "name": "TRACE_HOST",
+            "required": false
+        }))
+        .expect("requirement"),
+    );
+    app.management_data.mcp_market = vec![entry];
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Catalog));
+
+    let rows = vibex_tui::config_center::market_rows(&app.management_data, app.strings);
+    let counted = rows[0]
+        .detail
+        .iter()
+        .find(|(label, _)| label == "Variables required")
+        .map(|(_, value)| value.clone());
+    assert_eq!(
+        counted.as_deref(),
+        Some("1 / 2"),
+        "the card did not count what it requires: {:?}",
+        rows[0].detail
+    );
+}
+
+/// A form the reader has typed into is not thrown away on one press.
+///
+/// Everything else in this centre can be done again; what was typed cannot, so
+/// `Esc` asks before it discards, and answering "no" gives the form back with
+/// the reader's own values in it.
+#[test]
+fn a_half_written_form_is_not_discarded_without_asking() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.management_data.provider_detail = Some(provider_profile_detail());
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    app.perform(vibex_tui::action::Intent::EditSelectedEntry);
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        form.field_mut("default_model").unwrap().value = "gpt-6".to_string();
+    }
+
+    // `Esc` asks rather than discarding.
+    app.perform(vibex_tui::action::Intent::Back);
+    let Some(Overlay::Confirm { title, confirm, .. }) = app.overlay.clone() else {
+        panic!("a typed-into form closed without asking");
+    };
+    assert!(
+        title.contains("Discard"),
+        "the question was not the question: {title}"
+    );
+    assert_eq!(confirm, vibex_tui::action::Intent::ConfigFormDiscard);
+
+    // Answering "no" gives the form back with the typed value still in it.
+    app.perform(vibex_tui::action::Intent::Back);
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("backing out of the question dropped the form");
+    };
+    assert_eq!(form.value("default_model").as_deref(), Some("gpt-6"));
+
+    // A form nobody has typed into is not worth a question.
+    let untouched = vibex_tui::config_center::agent_auth_method_form(
+        "codex",
+        "chatgpt",
+        "Sign in",
+        &[],
+        app.strings,
+    );
+    app.overlay = Some(Overlay::Form { form: untouched });
+    app.perform(vibex_tui::action::Intent::Back);
+    assert!(
+        app.overlay.is_none(),
+        "an untouched form asked about discarding"
     );
 }

@@ -1319,6 +1319,15 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     // `c` copies the line a form is about to write, which is the one thing on
     // it the reader cannot select with the pointer. It is only the copy while
     // no field is being typed into: inside an edit it is the letter.
+    // `Ctrl+Q` throws a half-written form away. It is behind a confirmation, so
+    // it is a chord rather than a letter: no reader should lose a form to a key
+    // they pressed while reaching for something else.
+    binding(
+        Scope::Overlay,
+        Chord::ctrl('q'),
+        Intent::ConfigFormDiscard,
+        |strings| Intent::ConfigFormDiscard.label(strings),
+    ),
     binding(
         Scope::Overlay,
         Chord::plain(KeyCode::Char('c')),

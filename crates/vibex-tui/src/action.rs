@@ -221,6 +221,7 @@ intents! {
     ConfigEntryDelete => { scope: Management, id: "config_entry_delete", label: label_config_entry_delete, help: help_config_entry_delete },
     ConfigFormSave => { scope: Overlay, id: "config_form_save", label: label_config_form_save, help: help_config_form_save },
     ConfigFormCopy => { scope: Overlay, id: "config_form_copy", label: label_config_form_copy, help: help_config_form_copy },
+    ConfigFormDiscard => { scope: Overlay, id: "config_form_discard", label: label_config_form_discard, help: help_config_form_discard },
     ConfigModels => { scope: Management, id: "config_models", label: label_config_models, help: help_config_models },
     ConfigImport => { scope: Management, id: "config_import", label: label_config_import, help: help_config_import },
     ConfigExport => { scope: Management, id: "config_export", label: label_config_export, help: help_config_export },
