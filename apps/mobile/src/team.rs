@@ -9,7 +9,6 @@ use vibex_core::{
 
 impl MobileApp {
     pub(super) fn open_team(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.team_error = None;
         self.team_cancel_confirmation = None;
         let Some(session_id) = self
             .controller
@@ -47,9 +46,32 @@ impl MobileApp {
                     {
                         return;
                     }
+                    let mut refresh_failed = false;
                     let reload = this.team_controller.as_mut().is_some_and(|team| {
-                        team.apply(&ticket, result) && team.has_pending_refresh()
+                        let applied = team.apply(&ticket, result);
+                        // A refresh that failed while tasks were already on
+                        // screen is news about this attempt, not a state of the
+                        // page: it goes to the hint layer instead of holding a
+                        // strip over the list. The empty-team failure stays a
+                        // status line, because there the panel has nothing else
+                        // to say and the header's Refresh is the way out.
+                        refresh_failed = applied
+                            && team.state().phase == AsyncPhase::Failed
+                            && team
+                                .snapshot()
+                                .is_some_and(|snapshot| !snapshot.tasks.is_empty());
+                        applied && team.has_pending_refresh()
                     });
+                    if refresh_failed {
+                        this.hint(
+                            Tone::Error,
+                            locale::text(
+                                "Couldn’t refresh team",
+                                "无法刷新团队",
+                                "無法重新整理團隊",
+                            ),
+                        );
+                    }
                     if reload && this.overlay == Some(MobileOverlay::Team) {
                         this.refresh_team(false, cx);
                     }
@@ -91,7 +113,6 @@ impl MobileApp {
             expected_revision: Some(task.revision),
         };
         self.team_busy = true;
-        self.team_error = None;
         self.team_cancel_confirmation = None;
         let requested_backend = backend.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -120,7 +141,7 @@ impl MobileApp {
                         return;
                     }
                     if let Err(error) = result {
-                        this.team_error = Some(error.message);
+                        this.hint(Tone::Error, error.message);
                     }
                     this.refresh_team(false, cx);
                     cx.notify();
@@ -154,7 +175,6 @@ impl MobileApp {
             return;
         }
         self.team_busy = true;
-        self.team_error = None;
         let requested_backend = backend.clone();
         let request = TeamAcknowledgeRequest {
             session_id: session_id.clone(),
@@ -186,7 +206,7 @@ impl MobileApp {
                         return;
                     }
                     if let Err(error) = result {
-                        this.team_error = Some(error.message);
+                        this.hint(Tone::Error, error.message);
                     }
                     this.refresh_team(false, cx);
                     cx.notify();
@@ -219,14 +239,6 @@ impl MobileApp {
                 Some(refresh),
                 cx,
             ))
-            .children(self.team_error.as_ref().map(|error| {
-                div()
-                    .px_4()
-                    .py_2()
-                    .text_size(theme::font_detail())
-                    .text_color(theme::accent_red())
-                    .child(error.clone())
-            }))
             .when(count == 0, |root| {
                 root.child(
                     div()
@@ -267,23 +279,6 @@ impl MobileApp {
                     .min_h_0(),
                 )
             })
-            .when(
-                team.is_some_and(|team| team.state().phase == AsyncPhase::Failed) && count > 0,
-                |root| {
-                    root.child(
-                        div()
-                            .px_4()
-                            .py_2()
-                            .text_size(theme::font_detail())
-                            .text_color(theme::accent_red())
-                            .child(locale::text(
-                                "Couldn’t refresh team",
-                                "无法刷新团队",
-                                "無法重新整理團隊",
-                            )),
-                    )
-                },
-            )
             .when(team.is_some_and(|team| !team.is_mutable()), |root| {
                 root.child(
                     div()
