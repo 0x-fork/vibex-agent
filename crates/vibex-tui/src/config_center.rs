@@ -4782,3 +4782,317 @@ fn write_header_override(headers: &[(String, ProviderHeaderValue)]) -> String {
     }
     serde_json::Value::Object(object).to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The row projections are pure, so the rules they carry can be checked
+    /// without a terminal: what a reader sees is decided here, and the frame is
+    /// only the way it is drawn.
+    fn strings() -> Strings {
+        Strings::for_locale(crate::locale::Locale::En)
+    }
+
+    fn agent(id: &str, added: bool, enabled: bool, order: i64) -> vibex_core::AgentSnapshotEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "label": id,
+            "runtimeKind": "acp",
+            "sourceKind": "builtin",
+            "added": added,
+            "enabled": enabled,
+            "orderIndex": order,
+            "installed": true,
+            "configured": true,
+            "installStatus": "installed",
+            "managedInstall": {"managed": true, "status": "installed"},
+            "configStatus": "configured",
+            "runtimeStatus": "ready",
+            "models": [],
+            "modes": [],
+            "capabilityHints": [],
+            "env": {},
+            "params": {},
+            "diagnostics": [],
+            "nativeConfigPaths": []
+        }))
+        .expect("agent fixture")
+    }
+
+    /// The roster is three groups, in the order the desktop shows them.
+    #[test]
+    fn the_roster_sorts_by_group_then_place_then_id() {
+        let data = ManagementData {
+            agents: vec![
+                agent("gemini", false, false, 0),
+                agent("kimi", true, false, 5),
+                agent("cursor", true, true, 2),
+                agent("codex", true, true, 1),
+                // Two records claiming one place still have an order.
+                agent("claude", true, true, 1),
+            ],
+            ..Default::default()
+        };
+        let rows = agent_rows(&data, strings());
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            vec!["claude", "codex", "cursor", "kimi", "gemini"],
+            "the roster is not grouped, ordered and tie-broken"
+        );
+    }
+
+    /// The group is a function of the record, and it is what the sort and the
+    /// chip both read.
+    #[test]
+    fn the_group_is_the_roster_s_own_three() {
+        assert_eq!(agent_group(&agent("codex", true, true, 0)), 0);
+        assert_eq!(agent_group(&agent("codex", true, false, 0)), 1);
+        assert_eq!(agent_group(&agent("codex", false, true, 0)), 2);
+        assert_eq!(
+            agent_group(&agent("codex", false, false, 0)),
+            2,
+            "an Agent the roster does not hold is in the third group whether or not it is switched on"
+        );
+    }
+
+    /// A card's count is the first one the registry published rather than a
+    /// zero it filled in.
+    #[test]
+    fn a_skill_card_counts_what_the_registry_published() {
+        let mut entry: vibex_core::SkillMarketEntry = serde_json::from_value(serde_json::json!({
+            "id": "o/demo",
+            "slug": "demo",
+            "name": "Demo",
+            "installs": 0,
+            "downloads": 0,
+            "stars": 0
+        }))
+        .expect("entry");
+        assert_eq!(skill_reach(&entry), "0");
+        entry.downloads = 9;
+        assert_eq!(skill_reach(&entry), "9", "downloads did not stand in");
+        entry.installs = 3;
+        assert_eq!(skill_reach(&entry), "3", "installs did not win");
+    }
+
+    /// The header options round-trip through the runtime's own JSON shape:
+    /// a variable stays a variable and a literal stays a literal.
+    #[test]
+    fn the_header_override_round_trips() {
+        let written = write_header_override(&[
+            (
+                "X-Trace".to_string(),
+                ProviderHeaderValue::Literal("on".to_string()),
+            ),
+            (
+                "x-opencode-session".to_string(),
+                ProviderHeaderValue::Variable(vibex_core::ModelProviderHeaderVariable::SessionId),
+            ),
+        ]);
+        let read = parse_header_override(&written);
+        assert_eq!(read.len(), 2);
+        assert!(read.contains(&(
+            "X-Trace".to_string(),
+            ProviderHeaderValue::Literal("on".to_string())
+        )));
+        assert!(read.contains(&(
+            "x-opencode-session".to_string(),
+            ProviderHeaderValue::Variable(vibex_core::ModelProviderHeaderVariable::SessionId)
+        )));
+
+        // Anything that is not the shape it writes is skipped rather than
+        // guessed at, so a hand-edited option cannot become a header.
+        assert!(parse_header_override("not json").is_empty());
+        assert!(parse_header_override("{\"X\": 7}").is_empty());
+        assert!(parse_header_override("{\"X\": {\"variable\": \"nope\"}}").is_empty());
+    }
+
+    /// The form owns three option keys and leaves every other entry where it
+    /// was: a field that wrote the whole bag would delete a record it never
+    /// showed the reader.
+    #[test]
+    fn the_form_replaces_its_own_options_and_keeps_the_rest() {
+        let stored = vibex_core::ProviderOptions {
+            schema_version: 1,
+            entries: vec![
+                vibex_core::ProviderBindingMetadata {
+                    key: "nativeSource".to_string(),
+                    value: "cc-switch".to_string(),
+                },
+                vibex_core::ProviderBindingMetadata {
+                    key: PROVIDER_OPTION_WEBSITE.to_string(),
+                    value: "https://old".to_string(),
+                },
+                vibex_core::ProviderBindingMetadata {
+                    key: "protocolBaseUrl.anthropic_messages".to_string(),
+                    value: "https://old-anthropic".to_string(),
+                },
+            ],
+        };
+        let draft = ProviderOptionsDraft {
+            website: "https://new".to_string(),
+            headers: vec![(
+                "X-Trace".to_string(),
+                ProviderHeaderValue::Literal("on".to_string()),
+            )],
+            protocol_urls: vec![],
+        };
+        let applied = draft.apply(&stored);
+        let entry = |key: &str| {
+            applied
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .map(|entry| entry.value.as_str())
+        };
+        assert_eq!(
+            entry("nativeSource"),
+            Some("cc-switch"),
+            "an unowned key went"
+        );
+        assert_eq!(entry(PROVIDER_OPTION_WEBSITE), Some("https://new"));
+        assert_eq!(
+            entry("protocolBaseUrl.anthropic_messages"),
+            None,
+            "a protocol address the form no longer names was left behind"
+        );
+        assert!(entry(PROVIDER_OPTION_HEADERS).is_some());
+    }
+
+    /// The gateway that routes by session gets the header it reads, and a
+    /// header that is already there is not added twice.
+    #[test]
+    fn the_zen_gateway_gets_its_session_header_once() {
+        let mut draft = ProviderOptionsDraft::default();
+        assert!(!draft.wants_session_header(Some("https://api.example/v1")));
+        assert!(draft.wants_session_header(Some("https://opencode.ai/zen/go/v1")));
+        draft.with_session_header();
+        draft.with_session_header();
+        assert_eq!(
+            draft.headers.len(),
+            1,
+            "the session header was declared twice"
+        );
+        assert_eq!(draft.headers[0].1.displayed(), "{{session_id}}");
+    }
+
+    /// A cycle walks its list and comes back to the start.
+    #[test]
+    fn a_cycle_walks_every_entry_and_wraps() {
+        let modes = native_export_modes();
+        let mut current = modes[0];
+        for expected in modes.iter().skip(1) {
+            current = cycle(&modes, current);
+            assert_eq!(current, *expected);
+        }
+        assert_eq!(cycle(&modes, current), modes[0], "the cycle did not wrap");
+    }
+
+    /// The custom Agent form is refused before the write, with the rule it
+    /// broke, and the request it makes is what the reader typed.
+    #[test]
+    fn the_custom_agent_form_checks_before_it_writes() {
+        let strings = strings();
+        let fill = |id: &str, label: &str, command: &str, env: &str| {
+            let mut form = custom_agent_form(strings);
+            form.field_mut("agent_id").unwrap().value = id.to_string();
+            form.field_mut("label").unwrap().value = label.to_string();
+            form.field_mut("command").unwrap().value = command.to_string();
+            form.field_mut("args").unwrap().value = "  --acp   --verbose ".to_string();
+            form.field_mut("env").unwrap().value = env.to_string();
+            form
+        };
+
+        assert!(custom_agent_request(&fill("My Agent", "A", "/bin/a", ""), strings).is_err());
+        assert!(custom_agent_request(&fill("my-agent", "", "/bin/a", ""), strings).is_err());
+        assert!(
+            custom_agent_request(&fill("my-agent", "A", "", ""), strings).is_err(),
+            "an empty command was accepted"
+        );
+        assert!(custom_agent_request(&fill("my-agent", "A", "/bin/a", "TOKEN"), strings).is_err());
+        assert!(
+            custom_agent_request(&fill("my-agent", "A", "/bin/a", "1TOKEN=x"), strings).is_err(),
+            "a variable name that is not one was accepted"
+        );
+
+        let request = custom_agent_request(
+            &fill("my-agent", "A", "/bin/a", " TOKEN = secret \n\nX_Y=1\n"),
+            strings,
+        )
+        .expect("a well-formed form");
+        assert_eq!(request.agent_id.as_str(), "my-agent");
+        assert_eq!(request.command.command, "/bin/a");
+        assert_eq!(
+            request.command.args,
+            vec!["--acp", "--verbose"],
+            "the arguments were not split the way a shell reads them"
+        );
+        assert_eq!(request.env.get("TOKEN").map(String::as_str), Some("secret"));
+        assert_eq!(request.env.get("X_Y").map(String::as_str), Some("1"));
+    }
+
+    /// An Agent's install page is the authority's own answer first, and the
+    /// vendor table only for the Agents whose entry carries none.
+    #[test]
+    fn an_agents_install_page_prefers_the_snapshot() {
+        let mut published = agent("opencode", true, true, 0);
+        published.params = serde_json::json!({"installUrl": "https://example.test/opencode"});
+        assert_eq!(
+            vibex_core::agent_install_url(&published),
+            Some("https://example.test/opencode")
+        );
+
+        let mut cline = agent("cline", true, true, 0);
+        cline.label = "Cline".to_string();
+        assert_eq!(
+            vibex_core::agent_install_url(&cline),
+            Some("https://cline.bot/cli")
+        );
+
+        let mut unknown = agent("something-nobody-knows", true, true, 0);
+        unknown.label = "Unlisted".to_string();
+        assert_eq!(vibex_core::agent_install_url(&unknown), None);
+
+        // An empty published value falls through to the table rather than
+        // sending the reader to a blank page.
+        cline.params = serde_json::json!({"installUrl": "  "});
+        assert_eq!(
+            vibex_core::agent_install_url(&cline),
+            Some("https://cline.bot/cli")
+        );
+    }
+
+    /// The three panes are the ones the surface draws, in reading order, and
+    /// the walk wraps.
+    #[test]
+    fn the_zone_walk_covers_every_pane_and_wraps() {
+        let mut center = ConfigCenter::default();
+        assert_eq!(center.zone, ConfigZone::Rows);
+        let mut walked = vec![center.zone];
+        for _ in 0..ConfigZone::ALL.len() {
+            center.step_zone(1);
+            walked.push(center.zone);
+        }
+        assert_eq!(walked.len(), ConfigZone::ALL.len() + 1);
+        // Every pane is reached, whatever order the walk starts in.
+        for zone in ConfigZone::ALL {
+            assert!(
+                walked.contains(&zone),
+                "{zone:?} was never reached by the walk"
+            );
+        }
+        assert_eq!(
+            walked[0],
+            walked[ConfigZone::ALL.len()],
+            "the walk did not wrap"
+        );
+
+        center.step_zone(-1);
+        assert_eq!(
+            center.zone,
+            ConfigZone::ALL[ConfigZone::ALL.len() - 2],
+            "the walk backwards is not the reverse"
+        );
+    }
+}
