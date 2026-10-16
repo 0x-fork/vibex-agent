@@ -1,7 +1,9 @@
 use super::*;
 use crate::sidebar_organization::{SessionGroupPresentationRequest, SidebarOrganizationBridge};
 use vibex_config_switch::ProviderConfigService;
-use vibex_core::{AgentSessionSafety, WorkspaceMode};
+use vibex_core::{
+    AgentSessionSafety, ElicitationRequest, ElicitationRequestStatus, RequestId, WorkspaceMode,
+};
 
 struct Fixture {
     service: Arc<VibexUseService>,
@@ -93,6 +95,26 @@ impl Fixture {
             None,
         )
         .unwrap();
+    }
+
+    /// The task a parent handed to the child, in the phase the child runs in.
+    fn running_task(&self, parent: &AgentSession, child: &AgentSession) -> AgentDelegation {
+        let mut conn = self.service.open().unwrap();
+        let mut task = AgentDelegation::single_turn_legacy(
+            parent.id.clone(),
+            "running-task",
+            "Review changes",
+            "Check the behavior and report the result",
+            Some(parent.agent_id.clone()),
+            AgentDelegationStatus::Running,
+            unix_timestamp_ms(),
+        );
+        task.child_session_id = Some(child.id.clone());
+        task.root_session_id = Some(parent.id.clone());
+        match AgentDelegationRepository::reserve_or_get(&mut conn, &task, 8).unwrap() {
+            vibex_db::AgentDelegationReservation::Claimed(task) => task,
+            other => panic!("expected a new task, got {other:?}"),
+        }
     }
 
     fn user_group(&self, owner: &AgentSession) -> GroupPresentationRecord {
@@ -318,6 +340,65 @@ async fn human_tree_pages_keep_ownership_and_direct_navigation_ancestors() {
         ]
     );
     assert_eq!(direct.registry.len(), 3);
+}
+
+/// The counts under a row describe the branch the row is hiding.
+///
+/// The session itself is not one of its descendants: a leaf that counted its
+/// own running task or its own pending request painted "1 running" or "1
+/// waiting" beside a session that owns nothing, which reads as a sub-session
+/// nobody can open. The row already reports its own state, and the counts
+/// belong to whoever owns the session, so the parent keeps reporting them.
+#[tokio::test]
+async fn branch_counts_name_descendants_and_never_the_session_itself() {
+    let fixture = Fixture::new();
+    let parent = fixture.session("Parent");
+    let child = fixture.session("Worker");
+    fixture.own(&parent, &child);
+    let task = fixture.running_task(&parent, &child);
+    assert_eq!(task.phase(), DelegationTaskPhase::Active);
+    ElicitationRepository::insert_request(
+        &fixture.service.open().unwrap(),
+        &ElicitationRequest {
+            id: RequestId::new(),
+            session_id: child.id.clone(),
+            provider_request_id: None,
+            tool_call_id: None,
+            message: "Which target?".to_string(),
+            title: Some("Target".to_string()),
+            description: None,
+            fields: Vec::new(),
+            status: ElicitationRequestStatus::Pending,
+            requested_at_ms: unix_timestamp_ms(),
+        },
+    )
+    .unwrap();
+
+    // The child is running and parked on the question, and both are its own
+    // state: it hides no branch, so it counts no descendants.
+    let leaf = fixture
+        .service
+        .session_tree_node(&child.id)
+        .unwrap()
+        .expect("the child should have a node");
+    assert_eq!(leaf.child_count, 0);
+    assert_eq!(leaf.active_descendants, 0);
+    assert_eq!(leaf.blocked_descendants, 0);
+    assert!(matches!(
+        leaf.blocked_on,
+        Some(DelegationBlockedOn::Question { .. })
+    ));
+
+    // The parent still counts both, so a folded branch keeps saying that
+    // someone inside it is running and someone needs the reader.
+    let root = fixture
+        .service
+        .session_tree_node(&parent.id)
+        .unwrap()
+        .expect("the parent should have a node");
+    assert_eq!(root.child_count, 1);
+    assert_eq!(root.active_descendants, 1);
+    assert_eq!(root.blocked_descendants, 1);
 }
 
 #[test]

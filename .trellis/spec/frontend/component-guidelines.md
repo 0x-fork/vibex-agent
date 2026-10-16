@@ -768,6 +768,14 @@ title out of column for a toggle that expanded to nothing. The disclosure
 reappears on the parent's row as soon as the branch loads, which opening any of
 its children already does.
 
+The line a row paints about its branch is held to that same rule: its counts are
+the session's descendants, and never the session itself. A row's own running
+task and its own pending request are its own state, already drawn by its status
+column, so the ownership walk seeds from the session's children rather than from
+the session. Seeding from the session put "1 waiting" under a leaf whose own
+approval request was pending, which read as a sub-session nobody could open; a
+parent still reports the child that waits, which is what the line is for.
+
 The ownership tree behind those disclosures pages itself, and the sidebar never
 pages it on the reader's behalf. The root page describes sessions the session
 list already holds, so it advances one page per background pass and draws no

@@ -4252,11 +4252,14 @@ impl VibexUseService {
         }))
     }
 
-    /// Running and blocked counts across a node's whole subtree.
+    /// Running and blocked counts across a session's descendants.
     ///
     /// These counts are how a collapsed branch keeps showing that something
     /// inside it needs the user, instead of hiding a pending permission request
-    /// behind a closed disclosure.
+    /// behind a closed disclosure. The session itself is not one of its own
+    /// descendants: its own running task and its own pending request are already
+    /// reported by its row, and counting them here would paint a sub-session
+    /// that does not exist beside a session that owns nothing.
     fn subtree_activity(
         &self,
         conn: &DbConnection,
@@ -4264,10 +4267,15 @@ impl VibexUseService {
     ) -> VibexResult<(usize, usize)> {
         // Aggregate in SQLite rather than loading each descendant's task and
         // permission payloads. UNION deduplicates corrupt cycles; ownership
-        // traversal never decodes a transcript or allocates a Rust forest.
+        // traversal never decodes a transcript or allocates a Rust forest. The
+        // seed is the session's own children, not the session, so the walk
+        // visits exactly the descendants — and a corrupt edge leading back to
+        // the session cannot re-add it.
         conn.query_row(
             "WITH RECURSIVE subtree(session_id) AS (
-                SELECT ?1 UNION
+                SELECT edge.child_session_id FROM session_ownership_edges edge
+                    WHERE edge.parent_session_id = ?1
+                UNION
                 SELECT edge.child_session_id FROM session_ownership_edges edge
                 JOIN subtree parent ON edge.parent_session_id = parent.session_id
              ) SELECT
@@ -4278,7 +4286,7 @@ impl VibexUseService {
                   OR EXISTS(SELECT 1 FROM elicitation_requests question
                     WHERE question.session_id = s.session_id AND question.status = 'pending')), 0)
              FROM subtree JOIN agent_sessions s USING(session_id)
-             WHERE s.deleted_at_ms IS NULL",
+             WHERE s.deleted_at_ms IS NULL AND s.session_id <> ?1",
             rusqlite::params![session_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )

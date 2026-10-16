@@ -2347,9 +2347,15 @@ pub struct SessionTreeNode {
     pub has_more_children: bool,
     #[serde(default)]
     pub blocked_on: Option<DelegationBlockedOn>,
-    /// Running executions anywhere in this node's subtree.
+    /// Running executions among this node's descendants.
+    ///
+    /// The node's own running task is reported by its row, not counted here.
     pub active_descendants: usize,
-    /// Pending attention requests anywhere in this node's subtree.
+    /// Pending attention requests among this node's descendants.
+    ///
+    /// The node's own pending request is reported by [`Self::blocked_on`], not
+    /// counted here: a leaf with no children must not look like a branch that
+    /// is hiding a sub-session nobody can open.
     pub blocked_descendants: usize,
     /// Task the child session is currently working on, when one is active.
     #[serde(default)]
