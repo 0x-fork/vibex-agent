@@ -168,10 +168,19 @@ theme::apply_appearance(appearance: &AppearanceUiState, backdrop: theme::Backdro
   bottom layer: an opaque plate of the theme's page color, the image, then the
   veil the `dim_percent` preference mixes from that same page color. A window is
   never translucent to whatever sits behind it.
-- The containers of the theme fade while an image is behind them
-  (`vibex_ui::let_wallpaper_through`): the page and the chrome that frames it
-  more, the panels and plates on it less. Ink, lines, status colors, selection
-  plates, and cards keep the authored color. The window's own base plate — the
+- The containers of the theme fade while an image is behind them, on both paint
+  paths: `vibex_ui::let_wallpaper_through(theme, is_dark)` for the framework's
+  roles, and `theme::semantic_color` for the roles the workbench paints from the
+  shared catalog (a card, the composer, the right rail). The page and the chrome
+  that frames it fade to the same alpha in both appearances, so the two modes
+  read as the same glass over the same image; the plates that sit on the page
+  fade a step less, and further still in a light appearance, where a white plate
+  has no tone of its own to separate it from the page. Scrollbar tracks and
+  thumbs are plates and fade with them.
+- Ink, lines, status colors, selection plates, and the hairline an input is
+  outlined with keep the authored color. A card keeps it in a dark appearance —
+  where the page and the plates are already separated by tone — and fades in a
+  light one, where they are the same white. The window's own base plate — the
   legacy `background` token the framework paints `Root` from — is restored to
   the authored color after the pass, because the framework realigns a legacy
   token to its color on any edit that changes the color.
@@ -214,13 +223,15 @@ theme::apply_appearance(appearance: &AppearanceUiState, backdrop: theme::Backdro
 
 - `vibex-desktop-model` covers legacy decode, name validation, dimension and
   veil bounds, and JSON round-trip for `background_image`.
-- `vibex-ui` covers the surface fade: containers fade, ink and selection plates
-  keep the authored color, legacy tokens are untouched, and the pass is
+- `vibex-ui` covers the surface fade per appearance: containers fade, the light
+  plates a dark appearance keeps authored fade too, ink, lines, and selection
+  plates keep the authored color, legacy tokens are untouched, and the pass is
   idempotent.
 - `vibex-desktop` imports raster fixtures, asserts a stable content-addressed
   name, rejects unsupported and undecodable files, and covers resolution for a
-  missing home, a traversal-like name, and a deleted file; the appearance pass
-  is covered for both backdrops, including the restored window plate.
+  missing home, a traversal-like name, and a deleted file; the appearance pass is
+  covered for both backdrops and both appearances, on both paint paths — the
+  framework roles and the catalog roles — including the restored window plate.
 - Run `cargo test -p vibex-desktop-model --locked`, the targeted desktop tests,
   and `cargo fmt --all -- --check` before commit.
 
@@ -232,11 +243,17 @@ theme::apply_appearance(appearance: &AppearanceUiState, backdrop: theme::Backdro
 appearance.background_image.file = Some(selected_path.display().to_string());
 theme::apply_appearance(&appearance, Backdrop::Wallpaper, Some(window), cx);
 
-// Correct: persist a managed name, paint the image over an opaque plate, and
-// keep the window's own plate authored.
+// Wrong: a container painted from the catalog keeps the authored color while
+// the panels around it fade, which reads as a flat block on the wallpaper.
+let card = theme::semantic_color_for(theme, "card");
+
+// Correct: persist a managed name, paint the image over an opaque plate, keep
+// the window's own plate authored, and read every container through the
+// paint-time helper that applies the wallpaper policy.
 appearance.background_image.file = Some(appearance_background::import(&selected_path, home)?);
 let backdrop = theme::Backdrop::for_wallpaper(appearance_background::resolve(Some(home), &appearance.background_image).is_some());
 theme::apply_appearance(&appearance, backdrop, Some(window), cx);
+let card = theme::semantic_color("card", cx.theme().is_dark());
 ```
 
 ## Scenario: Native First-Launch Locale

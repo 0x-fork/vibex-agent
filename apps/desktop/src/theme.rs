@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::typography::apply_code_font_weight;
 use gpui::{App, Hsla, Window, px};
@@ -65,6 +65,28 @@ const UNSET: usize = usize::MAX;
 
 static ACTIVE_LIGHT: AtomicUsize = AtomicUsize::new(UNSET);
 static ACTIVE_DARK: AtomicUsize = AtomicUsize::new(UNSET);
+
+/// Whether a wallpaper is painted behind the surfaces.
+///
+/// Mirrored alongside the catalog position, for the same reason: a container
+/// color is read at paint time through [`semantic_color`], which has no `App`
+/// handle to consult. The surfaces the workbench paints come from both places —
+/// the framework's theme and the shared catalog — and only the catalog path can
+/// be resolved here, so this is what keeps a card from staying opaque while the
+/// panel behind it lets the image through.
+static WALLPAPER: AtomicBool = AtomicBool::new(false);
+
+/// Point the paint-time palette at the backdrop it is drawing over.
+///
+/// Called by [`apply_appearance`] before it reads any token, next to
+/// [`set_active_selection`] and for the same reason.
+fn set_wallpaper_backdrop(backdrop: Backdrop) {
+    WALLPAPER.store(backdrop.is_wallpaper(), Ordering::Relaxed);
+}
+
+fn wallpaper_backdrop() -> bool {
+    WALLPAPER.load(Ordering::Relaxed)
+}
 
 fn mode_slot(mode: GpuiThemeMode) -> &'static AtomicUsize {
     match mode {
@@ -246,8 +268,11 @@ pub fn apply_appearance(
     }
     // Install the selection before any token is read: everything below — the
     // highlight theme, the component colors, the washes — resolves against the
-    // variant this points at, and so does every paint after it.
+    // variant this points at, and so does every paint after it. The backdrop
+    // goes with it, because whether a container lets an image through is part
+    // of the color it resolves to.
     set_active_selection(&appearance.theme_selection);
+    set_wallpaper_backdrop(backdrop);
     // Keep gpui's global animation flag in step with the user preference: the
     // vendored gpui snaps every `with_animation` element (modal slides, menu
     // fades, entrance lifts) to its end state and schedules no frames while it
@@ -378,9 +403,11 @@ pub fn apply_appearance(
         vibex_ui::apply_component_palette(theme, active_theme(model_mode(is_dark)));
         // A wallpaper is painted behind the workbench, so the container roles
         // have to let it through — after the palette bridge, which derives its
-        // own container roles from the ones mapped above.
+        // own container roles from the ones mapped above. The roles the catalog
+        // owns rather than the framework have already faded, on the way through
+        // `semantic_color`; setting the same alpha again lands on one color.
         if backdrop.is_wallpaper() {
-            vibex_ui::let_wallpaper_through(theme);
+            vibex_ui::let_wallpaper_through(theme, is_dark);
         }
     });
     if backdrop.is_wallpaper() {
@@ -407,14 +434,26 @@ pub fn scaled_font_size(size: u16, window_scale_percent: u16) -> gpui::Pixels {
     px(f32::from(size) * f32::from(window_scale_percent) / 100.0)
 }
 
+/// Read a semantic token from the palette currently active for `dark`.
+///
+/// Most containers in the workbench are painted from the catalog directly rather
+/// than from the framework's theme, so this is where a wallpaper reaches them:
+/// a container role comes back with the alpha its tier takes, and every other
+/// role — ink, lines, status colors, selection plates — is exactly what the
+/// palette authored.
 pub(crate) fn semantic_color(name: &str, dark: bool) -> Hsla {
-    semantic_color_for(active_theme(model_mode(dark)), name)
+    let color = semantic_color_for(active_theme(model_mode(dark)), name);
+    if wallpaper_backdrop() {
+        return vibex_ui::wallpaper_surface(name, color, dark);
+    }
+    color
 }
 
-/// Read a semantic token from one specific theme.
+/// Read a semantic token from one specific theme, as that theme authored it.
 ///
 /// Used by previews that must paint a palette other than the active one —
-/// theme pickers above all, which show every candidate at once.
+/// theme pickers above all, which show every candidate at once — and by the
+/// paint-time path that applies the wallpaper policy itself.
 pub fn semantic_color_for(theme: &GpuiThemeDefinition, name: &str) -> Hsla {
     let token = catalog_token(theme, name)
         .unwrap_or_else(|| panic!("missing generated GPUI semantic token: {name}"));
@@ -478,6 +517,7 @@ mod tests {
     struct SlotRestore {
         light: usize,
         dark: usize,
+        wallpaper: bool,
     }
 
     impl SlotRestore {
@@ -485,6 +525,7 @@ mod tests {
             Self {
                 light: mode_slot(GpuiThemeMode::Light).load(Ordering::Relaxed),
                 dark: mode_slot(GpuiThemeMode::Dark).load(Ordering::Relaxed),
+                wallpaper: wallpaper_backdrop(),
             }
         }
     }
@@ -493,6 +534,7 @@ mod tests {
         fn drop(&mut self) {
             mode_slot(GpuiThemeMode::Light).store(self.light, Ordering::Relaxed);
             mode_slot(GpuiThemeMode::Dark).store(self.dark, Ordering::Relaxed);
+            WALLPAPER.store(self.wallpaper, Ordering::Relaxed);
         }
     }
 
@@ -501,55 +543,109 @@ mod tests {
     /// them — and the window's own plate stays the authored page color, because
     /// a translucent base plate would let the desktop behind the window show
     /// through it.
+    ///
+    /// Both appearances are covered because the alphas differ between them, and
+    /// both paint paths are: the framework's theme roles and the catalog roles
+    /// the workbench paints its cards and panels from.
     #[gpui::test]
     fn a_wallpaper_backdrop_fades_containers_and_keeps_the_window_plate_opaque(
         cx: &mut gpui::TestAppContext,
     ) {
         let _guard = slot_guard();
+        let _slots = SlotRestore::capture();
         cx.update(gpui_component::init);
-        let appearance = AppearanceUiState {
-            theme: ThemeMode::Dark,
-            ..Default::default()
-        };
-        let authored = semantic_color_for(active_theme(GpuiThemeMode::Dark), "background");
 
-        cx.update(|cx| apply_appearance(&appearance, Backdrop::Theme, None, cx));
-        cx.update(|cx| {
-            let theme = Theme::global(cx);
-            assert_eq!(
-                theme.background.a, authored.a,
-                "without a wallpaper the page keeps the authored color"
-            );
-            assert_eq!(theme.sidebar.a, semantic_color("sidebar", true).a);
-        });
+        for (mode, dark) in [(ThemeMode::Dark, true), (ThemeMode::Light, false)] {
+            let appearance = AppearanceUiState {
+                theme: mode,
+                ..Default::default()
+            };
+            let surfaces = vibex_ui::WallpaperSurfaces::for_appearance(dark);
+            let authored = semantic_color_for(active_theme(model_mode(dark)), "background");
+            let catalog = active_theme(model_mode(dark));
 
-        cx.update(|cx| apply_appearance(&appearance, Backdrop::Wallpaper, None, cx));
-        cx.update(|cx| {
-            let theme = Theme::global(cx);
-            assert_eq!(
-                theme.background.a,
-                vibex_ui::WALLPAPER_BASE_ALPHA,
-                "the page has to let the image through"
-            );
-            assert_eq!(theme.sidebar.a, vibex_ui::WALLPAPER_BASE_ALPHA);
-            assert_eq!(theme.group_box.a, vibex_ui::WALLPAPER_RAISED_ALPHA);
-            assert_eq!(
-                theme.foreground,
-                semantic_color("foreground", true),
-                "text keeps the authored ink"
-            );
-            assert_eq!(
-                page_plate(true),
-                authored,
-                "the plate the image sits on is the authored page color"
-            );
-            assert_eq!(wallpaper_veil(true, 40).a, 0.4);
-            assert_eq!(wallpaper_veil(true, 400).a, 1.0);
-            assert_eq!(
-                theme.tokens.background.color.a, authored.a,
-                "the legacy plate the framework paints a window from must stay opaque"
-            );
-        });
+            cx.update(|cx| apply_appearance(&appearance, Backdrop::Theme, None, cx));
+            cx.update(|cx| {
+                let theme = Theme::global(cx);
+                assert_eq!(
+                    theme.background.a, authored.a,
+                    "{mode:?}: without a wallpaper the page keeps the authored color"
+                );
+                assert_eq!(
+                    semantic_color("card", dark).a,
+                    semantic_color_for(catalog, "card").a,
+                    "{mode:?}: without a wallpaper a card keeps the authored color"
+                );
+            });
+
+            cx.update(|cx| apply_appearance(&appearance, Backdrop::Wallpaper, None, cx));
+            cx.update(|cx| {
+                let theme = Theme::global(cx);
+                assert_eq!(
+                    theme.background.a, surfaces.base,
+                    "{mode:?}: the page has to let the image through"
+                );
+                assert_eq!(theme.sidebar.a, surfaces.base);
+                assert_eq!(theme.group_box.a, surfaces.raised);
+                assert_eq!(
+                    theme.scrollbar.a, surfaces.raised,
+                    "{mode:?}: a scrollbar track is a plate, not an edge"
+                );
+                assert_eq!(
+                    theme.foreground,
+                    semantic_color_for(catalog, "foreground"),
+                    "{mode:?}: text keeps the authored ink"
+                );
+                assert_eq!(
+                    theme.border,
+                    semantic_color_for(catalog, "border"),
+                    "{mode:?}: borders keep the authored hairline"
+                );
+
+                // The catalog is the other paint path: a card, the composer,
+                // and the right rail are painted from it, so they fade by the
+                // same rule the framework roles do.
+                let authored_alpha = |role: &str| semantic_color_for(catalog, role).a;
+                assert_eq!(
+                    semantic_color("right-rail-surface", dark).a,
+                    surfaces.base,
+                    "{mode:?}: the right rail is chrome"
+                );
+                assert_eq!(
+                    semantic_color("muted-foreground", dark).a,
+                    authored_alpha("muted-foreground"),
+                    "{mode:?}: ink is never a container"
+                );
+                if dark {
+                    // A dark appearance separates its page from its plates by
+                    // tone already, so the plates keep the authored color.
+                    assert_eq!(semantic_color("card", dark).a, authored_alpha("card"));
+                    assert_eq!(
+                        semantic_color("composer-surface", dark).a,
+                        authored_alpha("composer-surface")
+                    );
+                } else {
+                    assert_eq!(
+                        semantic_color("card", dark).a,
+                        surfaces.raised,
+                        "{mode:?}: a light plate the color of the page has to fade"
+                    );
+                    assert_eq!(semantic_color("composer-surface", dark).a, surfaces.raised);
+                }
+
+                assert_eq!(
+                    page_plate(dark),
+                    authored,
+                    "{mode:?}: the plate the image sits on is the authored page color"
+                );
+                assert_eq!(wallpaper_veil(dark, 40).a, 0.4);
+                assert_eq!(wallpaper_veil(dark, 400).a, 1.0);
+                assert_eq!(
+                    theme.tokens.background.color.a, authored.a,
+                    "{mode:?}: the legacy plate the framework paints a window from must stay opaque"
+                );
+            });
+        }
     }
 
     #[gpui::test]

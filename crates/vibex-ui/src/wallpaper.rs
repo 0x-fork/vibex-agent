@@ -2,21 +2,30 @@
 //!
 //! The desktop paints a user image behind the workbench and then paints the
 //! theme over it, so an opaque palette would hide the image completely. While a
-//! wallpaper is behind them, the roles that are *containers* take an alpha: the
-//! page and the chrome that frames it at [`WALLPAPER_BASE_ALPHA`], the panels
-//! and plates that sit on the page at the more opaque
-//! [`WALLPAPER_RAISED_ALPHA`].
+//! wallpaper is behind them, the roles that are *containers* take an alpha, in
+//! two tiers: the page and the chrome that frames it, then the panels and plates
+//! that sit on the page.
 //!
 //! Three rules keep the result predictable:
 //!
-//! - Only containers fade. Ink, lines, status colors, borders, and selection
-//!   plates keep the authored color, so text over a wallpaper is exactly as
-//!   legible as text over the page, and a selected row never turns into a hole.
-//! - Cards keep the authored plate too. A card is where long-form content
-//!   reads, and the page around it already lets the image through.
+//! - Only containers fade. Ink, lines, status colors, borders, selection plates,
+//!   and the hairline an input is outlined with keep the authored color, so text
+//!   over a wallpaper is exactly as legible as text over the page, a selected
+//!   row never turns into a hole, and a field keeps its edge.
 //! - The fade *sets* an alpha rather than multiplying one, so the pass is
 //!   idempotent: a client that maps a role and a framework bridge that maps the
 //!   same role land on the same color.
+//! - The page and the chrome fades by the same amount in both appearances, so
+//!   the two modes read as the same glass over the same image. The plates fade
+//!   further in a light appearance, where a white plate has no tone of its own
+//!   to separate it from the page.
+//!
+//! A light appearance also fades the plates that a dark one keeps authored —
+//! cards, the composer, the right rail. There the page, the cards, and the
+//! plates are all the same white, so a plate that kept its color would sit on
+//! the wallpaper as a flat rectangle with no depth at all; a dark appearance
+//! separates them by tone already, and keeping its plates solid is what its
+//! tuning was built around.
 //!
 //! The legacy component tokens are left alone here, but the framework realigns
 //! them to their colors on any edit that changes a color, so the fade reaches
@@ -26,25 +35,131 @@
 //! hints, and notifications read their plate from a token as well, which is
 //! what keeps them readable over any image.
 
+use gpui::Hsla;
 use gpui_component::Theme;
 
-/// Alpha for the page and the chrome that frames it: the window background, the
-/// sidebar, the title bar, the status bar, and an accordion's body.
-pub const WALLPAPER_BASE_ALPHA: f32 = 0.55;
+/// The alphas a wallpaper's surfaces take, per appearance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WallpaperSurfaces {
+    /// The page and the chrome that frames it: the window background, the
+    /// sidebar, the title bar, the status bar, an accordion's body.
+    pub base: f32,
+    /// The panels and plates that sit on the page: group boxes, popovers, lists,
+    /// tables, tab bars, and the secondary/muted/scrollbar plates.
+    ///
+    /// The page's alpha plus a step, because a plate paints on top of the page
+    /// and the two compound: what reads as glass at one layer reads as a wash at
+    /// two.
+    pub raised: f32,
+}
 
-/// Alpha for the panels and plates that sit on the page: group boxes, popovers,
-/// lists, tables, tab bars, inputs, and the secondary/muted plates.
+impl WallpaperSurfaces {
+    /// The tiers a dark appearance paints with.
+    pub const DARK: Self = Self {
+        base: 0.55,
+        raised: 0.72,
+    };
+
+    /// The tiers a light appearance paints with.
+    ///
+    /// The page keeps the dark appearance's alpha — the two modes should read as
+    /// the same glass over the same image, and the veil mixed from the page color
+    /// already keeps ink crisp at that alpha. The plates sit higher: a dark plate
+    /// separates itself from a bright image by tone, while a white one has no
+    /// tone of its own, so at the dark alpha it would read as a grey wash rather
+    /// than as frosted glass.
+    pub const LIGHT: Self = Self {
+        base: 0.55,
+        raised: 0.84,
+    };
+
+    pub fn for_appearance(is_dark: bool) -> Self {
+        if is_dark { Self::DARK } else { Self::LIGHT }
+    }
+}
+
+/// Which tier a container role belongs to, if it is a container at all.
 ///
-/// More opaque than the page because these are one layer closer to the reader,
-/// and a surface nested inside another one compounds the transparency.
-pub const WALLPAPER_RAISED_ALPHA: f32 = 0.72;
+/// The role is named the way each layer names it: the shared catalog uses
+/// kebab-case (`table-head`), the framework's color fields use snake_case
+/// (`table_head`), and both spellings have to resolve to one policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    Base,
+    Raised,
+    /// A plate a light appearance fades and a dark one leaves authored.
+    RaisedLight,
+}
 
-/// Fades the theme's container roles so a wallpaper behind them shows through.
+fn tier(role: &str) -> Option<Tier> {
+    match role {
+        // The page itself and the chrome that frames it.
+        "background" | "right-rail-surface" | "right_rail_surface" | "accordion" | "sidebar"
+        | "status-bar" | "status_bar" | "title-bar" | "title_bar" => Some(Tier::Base),
+        // Panels and plates that sit on the page.
+        "group-box"
+        | "group_box"
+        | "popover"
+        | "list"
+        | "list-head"
+        | "list_head"
+        | "table"
+        | "table-head"
+        | "table_head"
+        | "table-foot"
+        | "table_foot"
+        | "tab-bar"
+        | "tab_bar"
+        | "tab-bar-segmented"
+        | "tab_bar_segmented"
+        | "secondary"
+        | "muted"
+        | "scrollbar"
+        | "scrollbar-thumb"
+        | "scrollbar_thumb"
+        | "scrollbar-thumb-hover"
+        | "scrollbar_thumb_hover" => Some(Tier::Raised),
+        "card" | "composer-surface" | "composer_surface" | "composer-queue" | "composer_queue" => {
+            Some(Tier::RaisedLight)
+        }
+        _ => None,
+    }
+}
+
+/// The alpha `role` takes while a wallpaper is behind the surfaces, or `None`
+/// when the role is ink, a line, or a status color and keeps its own.
+///
+/// Read at paint time by a client whose surfaces are painted from the shared
+/// catalog rather than from the framework's theme, so a card and a panel over
+/// the same wallpaper fade by the same rule.
+pub fn wallpaper_surface_alpha(role: &str, is_dark: bool) -> Option<f32> {
+    let surfaces = WallpaperSurfaces::for_appearance(is_dark);
+    match tier(role)? {
+        Tier::Base => Some(surfaces.base),
+        Tier::Raised => Some(surfaces.raised),
+        Tier::RaisedLight if !is_dark => Some(surfaces.raised),
+        Tier::RaisedLight => None,
+    }
+}
+
+/// `color` with the alpha a wallpaper surface takes, or unchanged for a role
+/// that is not a container.
+pub fn wallpaper_surface(role: &str, color: Hsla, is_dark: bool) -> Hsla {
+    match wallpaper_surface_alpha(role, is_dark) {
+        Some(alpha) => color.alpha(alpha),
+        None => color,
+    }
+}
+
+/// Fades the framework theme's container roles so a wallpaper behind them shows
+/// through.
 ///
 /// Called by the appearance pass after the component palette is filled in, and
 /// only while a wallpaper is actually painted. Applying it to a theme twice is
 /// the same as applying it once.
-pub fn let_wallpaper_through(theme: &mut Theme) {
+pub fn let_wallpaper_through(theme: &mut Theme, is_dark: bool) {
+    let surfaces = WallpaperSurfaces::for_appearance(is_dark);
+
     macro_rules! fade_to {
         ($alpha:expr; $($field:ident),* $(,)?) => {
             $(
@@ -54,8 +169,7 @@ pub fn let_wallpaper_through(theme: &mut Theme) {
     }
 
     fade_to!(
-        WALLPAPER_BASE_ALPHA;
-        // The page itself and the chrome that frames it.
+        surfaces.base;
         background,
         accordion,
         sidebar,
@@ -64,8 +178,7 @@ pub fn let_wallpaper_through(theme: &mut Theme) {
     );
 
     fade_to!(
-        WALLPAPER_RAISED_ALPHA;
-        // Panels and plates that sit on the page.
+        surfaces.raised;
         group_box,
         popover,
         list,
@@ -77,7 +190,9 @@ pub fn let_wallpaper_through(theme: &mut Theme) {
         tab_bar_segmented,
         secondary,
         muted,
-        input,
+        scrollbar,
+        scrollbar_thumb,
+        scrollbar_thumb_hover,
     );
 }
 
@@ -107,7 +222,9 @@ mod tests {
             &mut theme.colors.tab_bar_segmented,
             &mut theme.colors.secondary,
             &mut theme.colors.muted,
-            &mut theme.colors.input,
+            &mut theme.colors.scrollbar,
+            &mut theme.colors.scrollbar_thumb,
+            &mut theme.colors.scrollbar_thumb_hover,
         ] {
             *color = white();
         }
@@ -116,28 +233,86 @@ mod tests {
 
     #[test]
     fn containers_fade_and_ink_keeps_the_authored_color() {
-        let mut theme = opaque_theme();
-        let foreground = theme.colors.foreground;
-        let border = theme.colors.border;
-        let primary = theme.colors.primary;
-        let list_active = theme.colors.list_active;
-        let card_like = theme.colors.group_box_foreground;
+        for (is_dark, surfaces) in [
+            (true, WallpaperSurfaces::DARK),
+            (false, WallpaperSurfaces::LIGHT),
+        ] {
+            let mut theme = opaque_theme();
+            let foreground = theme.colors.foreground;
+            let border = theme.colors.border;
+            let primary = theme.colors.primary;
+            let list_active = theme.colors.list_active;
+            let input = theme.colors.input;
+            let text = theme.colors.group_box_foreground;
 
-        let_wallpaper_through(&mut theme);
+            let_wallpaper_through(&mut theme, is_dark);
 
-        assert_eq!(theme.colors.background.a, WALLPAPER_BASE_ALPHA);
-        assert_eq!(theme.colors.sidebar.a, WALLPAPER_BASE_ALPHA);
-        assert_eq!(theme.colors.title_bar.a, WALLPAPER_BASE_ALPHA);
-        assert_eq!(theme.colors.group_box.a, WALLPAPER_RAISED_ALPHA);
-        assert_eq!(theme.colors.popover.a, WALLPAPER_RAISED_ALPHA);
-        assert_eq!(theme.colors.input.a, WALLPAPER_RAISED_ALPHA);
+            assert_eq!(theme.colors.background.a, surfaces.base);
+            assert_eq!(theme.colors.sidebar.a, surfaces.base);
+            assert_eq!(theme.colors.title_bar.a, surfaces.base);
+            assert_eq!(theme.colors.group_box.a, surfaces.raised);
+            assert_eq!(theme.colors.popover.a, surfaces.raised);
+            assert_eq!(theme.colors.scrollbar.a, surfaces.raised);
+            assert_eq!(theme.colors.scrollbar_thumb.a, surfaces.raised);
 
-        // Ink, lines, accents, and a selected row's plate are not containers.
-        assert_eq!(theme.colors.foreground, foreground);
-        assert_eq!(theme.colors.border, border);
-        assert_eq!(theme.colors.primary, primary);
-        assert_eq!(theme.colors.list_active, list_active);
-        assert_eq!(theme.colors.group_box_foreground, card_like);
+            // Ink, lines, accents, a selected row's plate, and the hairline a
+            // field is outlined with are not containers.
+            assert_eq!(theme.colors.foreground, foreground);
+            assert_eq!(theme.colors.border, border);
+            assert_eq!(theme.colors.primary, primary);
+            assert_eq!(theme.colors.list_active, list_active);
+            assert_eq!(theme.colors.input, input, "a field keeps its edge");
+            assert_eq!(theme.colors.group_box_foreground, text);
+        }
+    }
+
+    /// A light appearance fades the plates that a dark one keeps authored: in
+    /// light they are the same white as the page, so a solid one would sit on
+    /// the wallpaper as a flat rectangle.
+    #[test]
+    fn a_light_appearance_fades_the_plates_a_dark_one_keeps() {
+        for role in ["card", "composer-surface", "composer-queue"] {
+            let color = white();
+            assert_eq!(
+                wallpaper_surface(role, color, true),
+                color,
+                "{role} stays authored in a dark appearance"
+            );
+            assert_eq!(
+                wallpaper_surface(role, color, false).a,
+                WallpaperSurfaces::LIGHT.raised,
+                "{role} fades in a light appearance"
+            );
+        }
+    }
+
+    #[test]
+    fn only_containers_take_a_wallpaper_alpha() {
+        for role in [
+            "foreground",
+            "muted-foreground",
+            "border",
+            "sidebar-border",
+            "input",
+            "ring",
+            "primary",
+            "destructive",
+            "select",
+            "list-active",
+            "sidebar-accent",
+            "chart-2",
+        ] {
+            assert_eq!(
+                wallpaper_surface(role, white(), true),
+                white(),
+                "{role} is not a container"
+            );
+            assert_eq!(wallpaper_surface(role, white(), false), white());
+        }
+        for role in ["background", "sidebar", "table-head", "table_head"] {
+            assert!(wallpaper_surface_alpha(role, true).is_some());
+            assert!(wallpaper_surface_alpha(role, false).is_some());
+        }
     }
 
     /// The legacy tokens are what the framework paints a window's base plate and
@@ -149,7 +324,7 @@ mod tests {
         let background = theme.tokens.background.color;
         let popover = theme.tokens.popover.color;
 
-        let_wallpaper_through(&mut theme);
+        let_wallpaper_through(&mut theme, true);
 
         assert_eq!(theme.tokens.background.color, background);
         assert_eq!(theme.tokens.popover.color, popover);
@@ -160,12 +335,15 @@ mod tests {
     /// multiplying it is what makes that safe.
     #[test]
     fn fading_twice_lands_on_the_same_color() {
-        let mut once = opaque_theme();
-        let_wallpaper_through(&mut once);
-        let mut twice = once.clone();
-        let_wallpaper_through(&mut twice);
+        for is_dark in [true, false] {
+            let mut once = opaque_theme();
+            let_wallpaper_through(&mut once, is_dark);
+            let mut twice = once.clone();
+            let_wallpaper_through(&mut twice, is_dark);
 
-        assert_eq!(twice.colors.background, once.colors.background);
-        assert_eq!(twice.colors.group_box, once.colors.group_box);
+            assert_eq!(twice.colors.background, once.colors.background);
+            assert_eq!(twice.colors.group_box, once.colors.group_box);
+            assert_eq!(twice.colors.scrollbar_thumb, once.colors.scrollbar_thumb);
+        }
     }
 }
