@@ -1181,6 +1181,8 @@ impl App {
             | Intent::ConfigModelRemove
             | Intent::ConfigModelFetch
             | Intent::ConfigModelEdit
+            | Intent::ConfigModelEnableAll
+            | Intent::ConfigModelDisableAll
             | Intent::ConfigImportRefresh
             | Intent::ConfigExportSource
             | Intent::ConfigExportMode
@@ -2663,6 +2665,36 @@ impl App {
             // A Model the endpoint listed but the profile does not declare is
             // offered by this press rather than being a row that cannot be
             // acted on: the catalogue is a menu, not a report.
+            // The whole list at once. Offering every Model the catalogue lists
+            // is one press rather than one per row, because a catalogue is a
+            // menu and a reader who wants all of it has already decided.
+            Intent::ConfigModelEnableAll => {
+                let catalogue = self.management_data.provider_models.clone();
+                let models = self.models_with(&view, |models| {
+                    for model in catalogue {
+                        match models.iter_mut().find(|held| held.id == model.id) {
+                            Some(held) => held.enabled = true,
+                            None => {
+                                let mut offered = model;
+                                offered.enabled = true;
+                                models.push(offered);
+                            }
+                        }
+                    }
+                });
+                self.write_models(view, models)
+            }
+            // Disabling is about what the profile holds: a Model it does not
+            // hold has nothing to switch off, and adding one to switch it off
+            // would be the opposite of what was asked.
+            Intent::ConfigModelDisableAll => {
+                let models = self.models_with(&view, |models| {
+                    for model in models.iter_mut() {
+                        model.enabled = false;
+                    }
+                });
+                self.write_models(view, models)
+            }
             Intent::ConfigModelToggle => {
                 let Some(row) = rows.get(selected) else {
                     return Outcome::quiet();

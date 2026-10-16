@@ -231,6 +231,8 @@ intents! {
     ConfigModelRemove => { scope: Overlay, id: "config_model_remove", label: label_config_model_remove, help: help_config_model_remove },
     ConfigModelFetch => { scope: Overlay, id: "config_model_fetch", label: label_config_model_fetch, help: help_config_model_fetch },
     ConfigModelEdit => { scope: Overlay, id: "config_model_edit", label: label_config_model_edit, help: help_config_model_edit },
+    ConfigModelEnableAll => { scope: Overlay, id: "config_model_enable_all", label: label_config_model_enable_all, help: help_config_model_enable_all },
+    ConfigModelDisableAll => { scope: Overlay, id: "config_model_disable_all", label: label_config_model_disable_all, help: help_config_model_disable_all },
     ConfigImportRefresh => { scope: Overlay, id: "config_import_refresh", label: label_management_reload, help: help_config_import },
     ConfigExportSource => { scope: Overlay, id: "config_export_source", label: label_config_export, help: help_config_export },
     ConfigExportMode => { scope: Overlay, id: "config_export_mode", label: label_config_export, help: help_config_export },

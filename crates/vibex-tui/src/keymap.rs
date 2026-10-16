@@ -1437,6 +1437,21 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::ConfigModelEdit,
         |strings| Intent::ConfigModelEdit.label(strings),
     ),
+    // The whole list at once. The desktop offers the same three (a select-all
+    // beside these two); selecting and enabling are one press here because a
+    // Model the profile does not hold has nothing to enable.
+    binding(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('y')),
+        Intent::ConfigModelEnableAll,
+        |strings| Intent::ConfigModelEnableAll.label(strings),
+    ),
+    binding(
+        Scope::Overlay,
+        Chord::plain(KeyCode::Char('z')),
+        Intent::ConfigModelDisableAll,
+        |strings| Intent::ConfigModelDisableAll.label(strings),
+    ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('t')),

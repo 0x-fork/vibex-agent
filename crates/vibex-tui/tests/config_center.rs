@@ -4144,3 +4144,101 @@ fn record_verbs_answer_for_the_pane_the_reader_is_in() {
         "the rows stopped acting after the walk back"
     );
 }
+
+/// The whole Model list can be offered or withdrawn at once.
+///
+/// The desktop offers the same three presses (a select-all beside these two);
+/// selecting and enabling are one press here because a Model the profile does
+/// not hold has nothing to enable. Disabling is about what the profile holds: a
+/// Model it does not hold has nothing to switch off, and adding one to switch
+/// it off would be the opposite of what was asked.
+#[test]
+fn the_whole_model_list_is_offered_or_withdrawn_at_once() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.management_data.provider_detail = Some(provider_profile_detail());
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+    app.perform(vibex_tui::action::Intent::ConfigModels);
+
+    // The catalogue lists two Models; the profile holds one of them.
+    let model = |id: &str| {
+        serde_json::from_value::<vibex_core::ProviderConfiguredModel>(serde_json::json!({
+            "id": id,
+            "enabled": false,
+            "capabilities": {}
+        }))
+        .expect("model fixture")
+    };
+    let offered = model("gpt-5");
+    let extra = model("gpt-5-mini");
+    app.management_data.provider_models = vec![offered, extra];
+
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigModelEnableAll);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::UpdateProviderProfile {
+                configured_models: Some(models),
+                ..
+            } = mutation
+            else {
+                panic!("the press did not write the list: {mutation:?}");
+            };
+            assert_eq!(models.len(), 2, "the catalogue was not all offered");
+            assert!(
+                models.iter().all(|model| model.enabled),
+                "a Model the catalogue lists was not enabled"
+            );
+        }
+        other => panic!("offering everything produced {other:?}"),
+    }
+
+    // Disabling leaves the list as it is and switches every Model off.
+    app.config_center.pending.clear();
+    app.overlay = Some(Overlay::Models {
+        view: vibex_tui::config_center::ModelListView {
+            agent_id: "codex".to_string(),
+            profile_id: "provider_first".to_string(),
+            title: "First".to_string(),
+            selected: 0,
+            notice: None,
+        },
+    });
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigModelDisableAll);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::UpdateProviderProfile {
+                configured_models: Some(models),
+                ..
+            } = mutation
+            else {
+                panic!("the press did not write the list: {mutation:?}");
+            };
+            assert!(
+                models.iter().all(|model| !model.enabled),
+                "a Model was left enabled"
+            );
+        }
+        other => panic!("withdrawing everything produced {other:?}"),
+    }
+}
+
+/// An empty table says how to get its rows back.
+#[test]
+fn an_empty_table_offers_the_way_out_of_the_filter() {
+    let mut app = loaded(140, 40);
+    app.management_data.mcp.clear();
+    app.management_data
+        .mark_read(ConfigModule::Mcp, ConfigSection::Servers);
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Servers));
+    app.config_center.filter = "nothing matches this".to_string();
+
+    let screen = text(&mut app, 140, 40);
+    assert!(
+        screen.contains("Delete clears the filter"),
+        "the empty table did not say how to clear the filter:\n{screen}"
+    );
+
+    // And the key it names does clear it.
+    app.perform(vibex_tui::action::Intent::ClearFilter);
+    assert!(app.config_center.filter.is_empty());
+}

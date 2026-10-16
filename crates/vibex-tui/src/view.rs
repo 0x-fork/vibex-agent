@@ -5677,7 +5677,9 @@ fn render_config_table(
                     if app.config_center.filter.trim().is_empty() {
                         strings.config_empty()
                     } else {
-                        strings.config_no_matches()
+                        // The way out of a filter nobody remembers setting is
+                        // the one thing an empty table owes the reader.
+                        strings.config_hint_no_matches()
                     }
                 ),
                 Style::default().fg(theme.roles.gray_dim),
