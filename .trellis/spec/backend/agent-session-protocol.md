@@ -4046,6 +4046,16 @@ is written back in the dual shape.
   only after a successful response, no explicit conflicting value, the same
   mutation revision, and a fresh `SessionAttachmentRegistry::apply_current`
   fence check. A stale response has no attachment or transient-store effect.
+  An Agent-pushed `config_option_update` reports effective values and replaces
+  the option catalogue; it is not a competing writer, so it consumes no
+  revision. Otherwise the update an Agent publishes before it answers the
+  request that caused it would invalidate that request's own confirmation.
+- A patch applies one field at a time, and each field is planned and checked
+  against the options the Agent advertises at that moment, because one field can
+  publish options the previous state did not carry (OpenCode adds a Model's
+  reasoning-effort option with the selection that creates it). A field that
+  cannot be applied leaves the fields after it untouched and reported as
+  no-ops instead of judging them against options it would have changed.
 - Field order is deterministic: Model, Reasoning Effort, Mode, then generic
   canonical keys in ascending order. Partial wire success keeps confirmed
   effective fields and leaves failed fields preferred-only; ACP effects are not

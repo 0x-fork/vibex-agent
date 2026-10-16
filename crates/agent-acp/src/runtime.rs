@@ -4408,13 +4408,16 @@ impl AcpSessionAttachment {
                         }
                     }
                 }
-                let effective_changed = previous.effective_model != next.effective_model
-                    || previous.effective_mode != next.effective_mode
-                    || previous.effective_reasoning_effort != next.effective_reasoning_effort
-                    || previous.config_values != next.config_values;
-                if effective_changed {
-                    next.state_revision = next.state_revision.saturating_add(1);
-                }
+                // An Agent-pushed option update reports effective values; it is
+                // not a competing writer. `state_revision` fences mutations
+                // against each other — a semantic preferred change consumes one
+                // revision for its whole patch — so an update that arrives
+                // while a mutation is on the wire must not consume one, or the
+                // confirmation that mutation is waiting for reads as stale.
+                // OpenCode publishes the option set its Model selection created
+                // exactly that way, before it answers the selection. The
+                // effective values and the generation marker below still
+                // advance, so a converged report stays usable.
                 next.applied_activation_generation = None;
                 next.mark_generation_if_converged(generation);
                 state.session_runtime_config_state = next.clone();
@@ -25732,6 +25735,55 @@ for line in sys.stdin:
                         },
                     },
                 })
+            if effort_on_model_switch:
+                # Exactly OpenCode's answer to a Model selection: the complete
+                # option set the selected Model created, published as an
+                # unsolicited update *before* the answer and repeated in it, so
+                # the effort exists even though `session/new` advertised none.
+                # The effort starts at the Model's own default, not at whatever
+                # the caller asked for.
+                model_switch_options = [
+                    {
+                        "id": "model",
+                        "category": "model",
+                        "label": "Model",
+                        "type": "select",
+                        "currentValue": model_id,
+                        "options": [
+                            {"value": model_1, "label": "Model 1"},
+                            {"value": model_2, "label": "Model 2"},
+                        ],
+                    },
+                    {
+                        "id": "autoApply",
+                        "label": "Auto apply",
+                        "type": "boolean",
+                        "currentValue": True,
+                        "defaultValue": False,
+                    },
+                    {
+                        "id": "effort",
+                        "category": "thought_level",
+                        "label": "Effort",
+                        "type": "select",
+                        "currentValue": thought_levels[0],
+                        "options": [
+                            {"value": value, "label": value.title()}
+                            for value in thought_levels
+                        ],
+                    },
+                ]
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "config_option_update",
+                            "configOptions": model_switch_options,
+                        },
+                    },
+                })
             result = {
                 "sessionId": session_id,
                 "models": {
@@ -25743,23 +25795,7 @@ for line in sys.stdin:
                 },
             }
             if effort_on_model_switch:
-                # Exactly OpenCode's answer to a Model selection: the option set
-                # the selected Model published, so the effort exists even though
-                # `session/new` advertised none. OpenCode also pushes an
-                # unsolicited `config_option_update`; that update is not modelled
-                # here because a committed attachment rewrites its runtime
-                # configuration revision on it, which is a separate fence.
-                result["configOptions"] = [{
-                    "id": "effort",
-                    "category": "thought_level",
-                    "label": "Effort",
-                    "type": "select",
-                    "currentValue": thought_levels[-1],
-                    "options": [
-                        {"value": value, "label": value.title()}
-                        for value in thought_levels
-                    ],
-                }]
+                result["configOptions"] = model_switch_options
             send({"jsonrpc": "2.0", "id": mid, "result": result})
     elif method == "session/set_mode":
         session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
@@ -32625,6 +32661,7 @@ for line in sys.stdin:
                 .all(|outcome| outcome.status == SessionRuntimeConfigApplyStatus::Applied),
             "{result:#?}"
         );
+        assert!(result.state.is_converged(), "{result:#?}");
         assert_eq!(result.state.state_revision, 1, "{result:#?}");
         assert_eq!(
             result.state.effective_model.as_deref(),
