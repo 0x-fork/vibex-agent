@@ -1109,10 +1109,10 @@ fn render_session_view(
     // The button belongs to the page's own chrome — it is what the title is
     // there for — so one row of air is what keeps it under the title without
     // reading as the next line of the same sentence. The list below it is a
-    // different kind of thing, and two rows are what stop the button from
+    // different kind of thing, and one row is enough to stop the button from
     // reading as the list's first row.
     const ACTION_AIR_ABOVE: u16 = 1;
-    const ACTION_AIR_BELOW: u16 = 2;
+    const ACTION_AIR_BELOW: u16 = 1;
     let list_offset = 1 + ACTION_AIR_ABOVE + 1 + ACTION_AIR_BELOW;
     // A terminal too short for chrome and a row keeps the rows instead: three
     // rows of chrome over two rows of list can only show a heading, and a

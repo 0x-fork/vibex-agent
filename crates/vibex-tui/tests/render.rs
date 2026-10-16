@@ -9981,6 +9981,7 @@ fn the_session_list_draws_the_arrangement_the_desktop_published() {
         workspace_order: std::collections::BTreeMap::new(),
         project_appearances: std::collections::BTreeMap::new(),
         worktree_titles: std::collections::BTreeMap::new(),
+        worktree_lifecycle: std::collections::BTreeMap::new(),
         project_new_session_locations: std::collections::BTreeMap::new(),
         auto_continue_project_ids: Vec::new(),
         auto_continue_session_overrides: std::collections::BTreeMap::new(),
@@ -10226,16 +10227,15 @@ fn the_session_list_summarises_itself_and_offers_a_new_session() {
         .find(|(_, intent)| *intent == vibex_tui::action::Intent::NewSession)
         .map(|(rect, _)| *rect)
         .expect("the new-session button is not clickable");
-    // Two rows of air under the action are what keep the button off the list,
-    // and the row between them is the one the reader's eye uses to tell a button
-    // from a row.
+    // One row of air under the action is what keeps the button off the list,
+    // and that row is the one the reader's eye uses to tell a button from a row.
     let list = app
         .regions
         .list
         .as_ref()
         .expect("the list published no rect");
     assert!(
-        button.width > 0 && button.y + 3 == list.rect.y,
+        button.width > 0 && button.y + 2 == list.rect.y,
         "the button is not a band above the list: {button:?} {:?}",
         list.rect
     );
@@ -10369,7 +10369,7 @@ fn the_session_list_is_not_drawn_inside_a_frame() {
         );
     }
     // The page's own chrome is the first thing in the band: the name, a row of
-    // air, the action, two more, then the list. The button belongs with the
+    // air, the action, one more, then the list. The button belongs with the
     // title it serves; the list below it is a different kind of thing.
     let lines = screen.lines().collect::<Vec<_>>();
     let named = lines
@@ -10384,14 +10384,12 @@ fn the_session_list_is_not_drawn_inside_a_frame() {
         lines[named + 2].contains("+ New session"),
         "the action is not under the page's name:\n{screen}"
     );
-    for air in [3, 4] {
-        assert!(
-            lines[named + air].trim().is_empty(),
-            "there is no air under the action:\n{screen}"
-        );
-    }
     assert!(
-        lines[named + 5].trim_start().starts_with('▾'),
+        lines[named + 3].trim().is_empty(),
+        "there is no air under the action:\n{screen}"
+    );
+    assert!(
+        lines[named + 4].trim_start().starts_with('▾'),
         "the list does not start under the page's own chrome:\n{screen}"
     );
 }
@@ -11317,6 +11315,7 @@ fn a_folder_rows_action_button_offers_what_a_folder_can_do() {
         workspace_order: std::collections::BTreeMap::new(),
         project_appearances: std::collections::BTreeMap::new(),
         worktree_titles: std::collections::BTreeMap::new(),
+        worktree_lifecycle: std::collections::BTreeMap::new(),
         project_new_session_locations: std::collections::BTreeMap::new(),
         auto_continue_project_ids: Vec::new(),
         auto_continue_session_overrides: std::collections::BTreeMap::new(),
