@@ -79,8 +79,6 @@ pub enum SheetKey {
     SettingsPalette,
     /// Go to a line in the file on screen.
     FileGoto,
-    /// What a file search reads: names, or the files' contents.
-    FileSearchMode,
     /// The branch a history filter is scoped to.
     GitBranches,
     /// The author or date a history filter is scoped to.

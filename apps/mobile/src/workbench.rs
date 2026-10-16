@@ -222,13 +222,33 @@ enum MobileFileSearchMode {
 }
 
 impl MobileFileSearchMode {
-    /// The two halves of the switch, in the order the row lays them out.
-    const ALL: [Self; 2] = [Self::Name, Self::Content];
-
+    /// The word the control reads, and the mode a tap switches away from.
     fn label(self) -> &'static str {
         match self {
-            Self::Name => "Name",
-            Self::Content => "Content",
+            Self::Name => locale::text("Name", "名称", "名稱"),
+            Self::Content => locale::text("Content", "内容", "內容"),
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Self::Name => Self::Content,
+            Self::Content => Self::Name,
+        }
+    }
+
+    /// What a tap will do, which is what the control announces to a reader who
+    /// cannot see the word it is showing.
+    fn toggle_label(self) -> &'static str {
+        match self {
+            Self::Name => locale::text(
+                "Switch to content search",
+                "切换为内容搜索",
+                "切換為內容搜尋",
+            ),
+            Self::Content => {
+                locale::text("Switch to name search", "切换为名称搜索", "切換為名稱搜尋")
+            }
         }
     }
 }
@@ -268,9 +288,6 @@ pub struct MobileWorkbench {
     /// Installed on first paint so the keyboard's action key submits a search.
     file_search_subscription: Option<gpui::Subscription>,
     file_search_mode: MobileFileSearchMode,
-    /// The chooser that switch opens: the mode a query reads, as one control
-    /// and a list rather than two buttons competing for the row.
-    file_search_mode_sheet_open: bool,
     file_editor_input: Option<Entity<EditorState>>,
     /// A chosen file takes over the whole Files surface as its own screen
     /// with a back button, instead of rendering inline under the tree.
@@ -479,7 +496,6 @@ impl MobileWorkbench {
             file_search_input: None,
             file_search_subscription: None,
             file_search_mode: MobileFileSearchMode::Name,
-            file_search_mode_sheet_open: false,
             file_editor_input: None,
             file_screen_open: false,
             git_commit_input: None,
@@ -580,9 +596,9 @@ impl MobileWorkbench {
         // tab is not a place work is expected to be parked unsaved.
         if surface != WorkbenchSurface::Files {
             self.save_active_file(cx);
-            // The file's own sheets belong to the surface that opens them, so
-            // they come down with it instead of rising over the next one.
-            self.close_file_sheets(cx);
+            // The file's own sheet belongs to the surface that opens it, so it
+            // comes down with it instead of rising over the next one.
+            self.close_file_goto(cx);
         }
         if self.surface == WorkbenchSurface::Terminal && surface != WorkbenchSurface::Terminal {
             self.stop_terminal_poll();
@@ -782,11 +798,6 @@ impl MobileWorkbench {
                     this.file_editor_path = Some(ticket.path.clone());
                     this.pending_file_editor_content = Some(content.clone());
                     this.file_screen_open = true;
-                    // The mode chooser belongs to the tree's toolbar, and the
-                    // tree has just been replaced by the file it opened.
-                    if this.file_search_mode_sheet_open {
-                        this.close_sheet(SheetKey::FileSearchMode, cx);
-                    }
                     if preview_kind == FilePreviewKind::Markdown {
                         let revision = this
                             .files
@@ -922,16 +933,13 @@ impl MobileWorkbench {
         cx.notify();
     }
 
-    /// Brings down the sheets the Files surface raises.
+    /// Brings down the go-to-line sheet.
     ///
-    /// Both are drawn by that surface, so a reader who leaves it must not find
-    /// one of them waiting on the page they moved to.
-    fn close_file_sheets(&mut self, cx: &mut Context<Self>) {
+    /// It is drawn by the Files surface, so a reader who leaves that surface
+    /// must not find it waiting on the page they moved to.
+    fn close_file_goto(&mut self, cx: &mut Context<Self>) {
         if self.file_goto_open {
             self.close_sheet(SheetKey::FileGoto, cx);
-        }
-        if self.file_search_mode_sheet_open {
-            self.close_sheet(SheetKey::FileSearchMode, cx);
         }
     }
 
@@ -1109,15 +1117,21 @@ impl MobileWorkbench {
         cx.notify();
     }
 
-    /// Picks what the file search reads.
+    /// Switches what the file search reads, in place.
+    ///
+    /// A control that reads its own value and swaps it on a tap: the mode is a
+    /// two-state setting, and a list to choose between two states is a panel
+    /// the reader has to dismiss.
+    fn toggle_file_search_mode(&mut self, cx: &mut Context<Self>) {
+        self.choose_file_search_mode(self.file_search_mode.toggled(), cx);
+    }
+
+    /// Sets what the file search reads.
     ///
     /// Switching to the mode already in force is a no-op, and picking the other
     /// one re-runs the query: the reader changed what the same words mean, so
     /// the list has to answer the question they now think they asked.
     fn choose_file_search_mode(&mut self, mode: MobileFileSearchMode, cx: &mut Context<Self>) {
-        // The chooser's own answer closes it, whichever row was taken: a list
-        // that stays up after the reader has decided is asking again.
-        self.close_sheet(SheetKey::FileSearchMode, cx);
         if self.file_search_mode == mode {
             return;
         }
@@ -1219,7 +1233,7 @@ impl MobileWorkbench {
         self.file_screen_open = false;
         // The go-to-line sheet has nothing to point at once the buffer is off
         // screen, and it is drawn by the screen that is closing.
-        self.close_file_sheets(cx);
+        self.close_file_goto(cx);
         cx.notify();
     }
 
@@ -1801,7 +1815,6 @@ impl MobileWorkbench {
         }
         match key {
             SheetKey::FileGoto => self.file_goto_open = false,
-            SheetKey::FileSearchMode => self.file_search_mode_sheet_open = false,
             SheetKey::GitBranches => self.git_branch_sheet_open = false,
             SheetKey::GitFilter => {
                 self.git_author_sheet_open = false;
@@ -3672,42 +3685,13 @@ impl MobileWorkbench {
     }
 
     /// The Files surface: the tree, or the file the tree opened, under the
-    /// sheets those two screens raise.
-    ///
-    /// The sheets are drawn here rather than inside either screen because the
-    /// surface is what they cover and what they belong to: the mode chooser is
-    /// raised by the tree's toolbar, the go-to-line prompt by the viewer's
-    /// header, and both come down when the rail leaves Files.
+    /// prompt the viewer's header raises.
     fn render_files(&mut self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let body = if self.file_screen_open {
             self.render_file_screen(window, cx)
         } else {
             self.render_file_tree(cx)
         };
-        let mode_sheet = self.sheet.presentation(
-            SheetKey::FileSearchMode,
-            self.file_search_mode_sheet_open,
-            crate::bottom_sheet::sheet_size(window),
-        );
-        let mode_scroll = self.sheet.body_scroll(SheetKey::FileSearchMode);
-        let mode_sheet = mode_sheet.map(|presentation| {
-            self.render_choice_sheet(
-                ChoiceSheet {
-                    key: SheetKey::FileSearchMode,
-                    debug_id: "file-search-mode-sheet",
-                    title: locale::text("Search in", "搜索范围", "搜尋範圍"),
-                    rows: MobileFileSearchMode::ALL
-                        .into_iter()
-                        .map(|mode| (mode, locale::common(mode.label()).to_string()))
-                        .collect(),
-                    selected: self.file_search_mode,
-                    choose: |this, mode, cx| this.choose_file_search_mode(mode, cx),
-                },
-                presentation,
-                mode_scroll,
-                cx,
-            )
-        });
         let discard_prompt = self
             .file_discard_prompt
             .is_some()
@@ -3719,7 +3703,6 @@ impl MobileWorkbench {
             .flex_col()
             .when_some(discard_prompt, |root, prompt| root.child(prompt))
             .child(div().flex_1().min_h_0().relative().child(body))
-            .when_some(mode_sheet, |root, sheet| root.child(sheet))
             .into_any_element()
     }
 
@@ -5057,12 +5040,12 @@ impl MobileWorkbench {
                                 ))
                             }),
                     )
-                    // One control, not a switch between two: what a query reads
-                    // is a setting the reader changes now and then, so it is
-                    // drawn as the value in force with a caret that opens the
-                    // list. Two labeled halves spent the row on a choice the
-                    // reader was not making, and each of them read as a button
-                    // sitting in the way of the field.
+                    // One control that swaps its own value: what a query reads
+                    // is a two-state setting, so a tap flips it rather than
+                    // opening a list to pick the other state from. The word it
+                    // shows is the mode in force — two labeled halves spent the
+                    // row on a choice the reader was not making, and each read
+                    // as a button in the way of the field.
                     .child(
                         div()
                             .id("file-search-mode")
@@ -5072,33 +5055,18 @@ impl MobileWorkbench {
                             .rounded(px(theme::RADIUS_CONTROL))
                             .flex()
                             .items_center()
-                            .gap(px(4.0))
                             .cursor_pointer()
-                            .aria_label(locale::text(
-                                "What the search reads",
-                                "搜索范围",
-                                "搜尋範圍",
-                            ))
+                            .aria_label(self.file_search_mode.toggle_label())
                             .active(|style| style.bg(theme::row_pressed_bg()))
                             .on_mouse_up(
                                 MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.file_search_mode_sheet_open = true;
-                                    cx.notify();
-                                }),
+                                cx.listener(|this, _, _, cx| this.toggle_file_search_mode(cx)),
                             )
                             .child(
                                 div()
                                     .text_size(theme::font_caption())
                                     .text_color(theme::text_secondary())
                                     .child(self.file_search_mode.label()),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/chevron-down.svg")
-                                    .size(px(12.0))
-                                    .flex_shrink_0()
-                                    .text_color(theme::text_muted()),
                             ),
                     )
                     .child(
@@ -9692,14 +9660,27 @@ mod tests {
 
     #[test]
     fn mobile_workbench_file_and_git_mappings_follow_desktop_labels() {
-        // The chooser lists one row per mode, so the list is the contract
-        // between what the row offers and what the query can mean.
+        // The control shows its own value and swaps it on a tap, so the pair it
+        // flips between is the contract between what the row offers and what
+        // the query can mean.
         assert_eq!(
-            MobileFileSearchMode::ALL,
-            [MobileFileSearchMode::Name, MobileFileSearchMode::Content]
+            MobileFileSearchMode::Name.toggled(),
+            MobileFileSearchMode::Content
         );
-        assert_eq!(MobileFileSearchMode::Name.label(), "Name");
-        assert_eq!(MobileFileSearchMode::Content.label(), "Content");
+        assert_eq!(
+            MobileFileSearchMode::Content.toggled(),
+            MobileFileSearchMode::Name,
+            "the toggle is its own inverse: two states, one tap apart"
+        );
+        assert_ne!(
+            MobileFileSearchMode::Name.toggle_label(),
+            MobileFileSearchMode::Content.toggle_label(),
+            "a tap that announces the same thing in both states says nothing"
+        );
+        assert_ne!(
+            MobileFileSearchMode::Name.label(),
+            MobileFileSearchMode::Content.label()
+        );
         assert_eq!(git_change_label_mobile(GitChangeKind::Added), "A");
         assert_eq!(git_change_label_mobile(GitChangeKind::Deleted), "D");
         assert_eq!(git_change_label_mobile(GitChangeKind::Untracked), "U");
@@ -9770,7 +9751,7 @@ mod tests {
     /// and who takes it down — because either one alone leaves the sheet
     /// reachable from a surface it does not belong to.
     #[test]
-    fn the_files_surface_draws_and_drops_its_own_sheets() {
+    fn the_files_surface_draws_and_drops_its_own_sheet() {
         let source = include_str!("workbench.rs");
         let body = |name: &str| {
             let start = ["\n    fn ", "\n    pub fn "]
@@ -9787,42 +9768,37 @@ mod tests {
             &tail[..end]
         };
 
-        let files = body("render_files");
         assert!(
-            files.contains("SheetKey::FileSearchMode") && files.contains("render_choice_sheet"),
-            "the surface raises the search mode's chooser itself"
-        );
-        assert!(
-            body("render_file_screen").contains("render_file_goto_prompt"),
-            "and the file screen draws the prompt its own header opens"
+            body("render_file_screen").contains("render_file_goto_prompt")
+                && body("render_file_screen").contains("SheetKey::FileGoto"),
+            "the file screen draws the prompt its own header opens"
         );
         assert!(
             !body("render_git_panel").contains("SheetKey::FileGoto"),
             "the Git surface must not carry the file viewer's sheet"
         );
         assert!(
-            body("close_file_sheets").contains("SheetKey::FileGoto")
-                && body("close_file_sheets").contains("SheetKey::FileSearchMode"),
-            "both sheets belong to the surface and are dropped with it"
+            body("close_file_goto").contains("SheetKey::FileGoto"),
+            "the sheet belongs to the surface and is dropped with it"
         );
         assert!(
-            body("close_file_screen").contains("close_file_sheets"),
-            "leaving the file takes its sheets down with it"
+            body("close_file_screen").contains("close_file_goto"),
+            "leaving the file takes its sheet down with it"
         );
         assert!(
-            body("set_surface").contains("close_file_sheets"),
-            "a surface the sheets do not belong to must not inherit them"
+            body("set_surface").contains("close_file_goto"),
+            "a surface the sheet does not belong to must not inherit it"
         );
     }
 
-    /// One control opens the mode list; the list is not a control itself.
+    /// The mode control swaps its own value; it does not open a list.
     ///
     /// The mode was two labeled halves in the toolbar, which put a choice the
     /// reader was not making in the row beside the field they were typing in.
-    /// It is now the value in force with a caret, and this pins that the row no
-    /// longer lays out both modes side by side.
+    /// It is now the value in force, and a tap flips it — with no panel to
+    /// dismiss and no second tap to make.
     #[test]
-    fn the_search_mode_is_chosen_from_one_control() {
+    fn a_tap_on_the_search_mode_swaps_it_in_place() {
         let source = include_str!("workbench.rs");
         let toolbar = source
             .split_once("fn render_file_tree(")
@@ -9830,12 +9806,17 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the file tree panel should remain inspectable");
         assert!(
-            toolbar.contains("file_search_mode_sheet_open = true"),
-            "the control in the toolbar opens the chooser"
+            toolbar.contains("toggle_file_search_mode"),
+            "the control in the toolbar flips the mode itself"
         );
         assert!(
-            !toolbar.contains("MobileFileSearchMode::ALL"),
-            "and does not draw one button per mode"
+            toolbar.contains("self.file_search_mode.label()"),
+            "and reads the mode it is in"
+        );
+        assert!(
+            !toolbar.contains("file_search_mode_sheet_open")
+                && !toolbar.contains("SheetKey::FileSearchMode"),
+            "no sheet is raised for a two-state setting"
         );
     }
 

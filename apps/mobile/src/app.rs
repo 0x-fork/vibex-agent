@@ -12401,7 +12401,6 @@ impl MobileApp {
             SheetKey::SettingsPalette => self.settings_palette_open = false,
             // The workbench owns its own sheets.
             SheetKey::FileGoto
-            | SheetKey::FileSearchMode
             | SheetKey::GitBranches
             | SheetKey::GitFilter
             | SheetKey::WorktreeConfirmation
