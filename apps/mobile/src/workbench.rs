@@ -564,6 +564,9 @@ impl MobileWorkbench {
         // tab is not a place work is expected to be parked unsaved.
         if surface != WorkbenchSurface::Files {
             self.save_active_file(cx);
+            // The file's own sheets belong to the surface that opens them, so
+            // they come down with it instead of rising over the next one.
+            self.close_file_goto(cx);
         }
         if self.surface == WorkbenchSurface::Terminal && surface != WorkbenchSurface::Terminal {
             self.stop_terminal_poll();
@@ -1188,6 +1191,9 @@ impl MobileWorkbench {
         // told only when the write failed.
         self.save_active_file(cx);
         self.file_screen_open = false;
+        // The go-to-line sheet has nothing to point at once the buffer is off
+        // screen, and it is drawn by the screen that is closing.
+        self.close_file_goto(cx);
         cx.notify();
     }
 
@@ -3615,9 +3621,9 @@ impl MobileWorkbench {
         cx.notify();
     }
 
-    fn render_files(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_files(&mut self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let body = if self.file_screen_open {
-            self.render_file_screen(cx)
+            self.render_file_screen(window, cx)
         } else {
             self.render_file_tree(cx)
         };
@@ -3695,7 +3701,7 @@ impl MobileWorkbench {
     /// it. Its chrome is two hairlines and one button, because a reader who
     /// opened a file came for the file: every rounded box above or beside the
     /// buffer is a line of source they cannot see.
-    fn render_file_screen(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_file_screen(&mut self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let view = self.files.state.view();
         let has_conflict = view.status == FileEditorStatus::Conflict;
         let can_write = self
@@ -3794,6 +3800,12 @@ impl MobileWorkbench {
 
         div()
             .size_full()
+            // The go-to-line sheet is drawn here, by the screen whose header
+            // opens it. It used to be drawn at the foot of the Git surface's
+            // tree, so tapping the glyph set the sheet's flag and painted
+            // nothing until the reader left Files — at which point it appeared
+            // over a surface that had never asked for it.
+            .relative()
             .flex()
             .flex_col()
             .bg(theme::workbench_panel_bg())
@@ -3967,6 +3979,14 @@ impl MobileWorkbench {
                             button.on_mouse_up(MouseButton::Left, cx.listener(Self::save_file))
                         }),
                     ),
+            )
+            .when_some(
+                self.sheet.presentation(
+                    SheetKey::FileGoto,
+                    self.file_goto_open,
+                    crate::bottom_sheet::sheet_size(window),
+                ),
+                |screen, presentation| screen.child(self.render_file_goto_prompt(presentation, cx)),
             )
             .into_any_element()
     }
@@ -5305,9 +5325,6 @@ impl MobileWorkbench {
             sheet_size,
         );
         let filter_scroll = self.sheet.body_scroll(SheetKey::GitFilter);
-        let goto_sheet =
-            self.sheet
-                .presentation(SheetKey::FileGoto, self.file_goto_open, sheet_size);
         let worktree_sheet = self.sheet.presentation(
             SheetKey::WorktreeConfirmation,
             self.worktree_confirmation.is_some(),
@@ -5800,9 +5817,6 @@ impl MobileWorkbench {
                     None => root,
                 },
             )
-            .when_some(goto_sheet, |root, presentation| {
-                root.child(self.render_file_goto_prompt(presentation, cx))
-            })
             .when_some(worktree_sheet, |root, presentation| {
                 root.child(self.render_worktree_confirmation(presentation, cx))
             })
@@ -7942,7 +7956,7 @@ impl Render for MobileWorkbench {
                 )
             })
             .child(div().flex_1().min_h_0().child(match surface {
-                WorkbenchSurface::Files => self.render_files(cx),
+                WorkbenchSurface::Files => self.render_files(window, cx),
                 WorkbenchSurface::Git => self.render_git(window, cx),
                 WorkbenchSurface::Terminal => self.render_terminal(cx),
             }))
@@ -9613,6 +9627,59 @@ mod tests {
         let workbench = include_str!("workbench.rs");
         assert!(workbench.contains("\"close-right-rail\""));
         assert!(workbench.contains("fn render_header("));
+    }
+
+    /// A sheet is drawn by the surface whose control opens it.
+    ///
+    /// The go-to-line sheet lived at the foot of the Git surface's render, so
+    /// its glyph in the file header set the flag and painted nothing; the
+    /// sheet only appeared once the reader switched surfaces, over a page that
+    /// had never asked for it. Both halves are asserted here — who draws it,
+    /// and who takes it down — because either one alone leaves the sheet
+    /// reachable from a surface it does not belong to.
+    #[test]
+    fn the_go_to_line_sheet_is_drawn_by_the_screen_that_opens_it() {
+        let source = include_str!("workbench.rs");
+        let body = |name: &str| {
+            let start = ["\n    fn ", "\n    pub fn "]
+                .iter()
+                .filter_map(|prefix| source.find(&format!("{prefix}{name}(")))
+                .min()
+                .unwrap_or_else(|| panic!("{name} should remain inspectable"));
+            let tail = &source[start + 1..];
+            let end = ["\n    fn ", "\n    pub fn "]
+                .iter()
+                .filter_map(|prefix| tail.find(prefix))
+                .min()
+                .unwrap_or(tail.len());
+            &tail[..end]
+        };
+
+        let files = body("render_file_screen");
+        assert!(
+            files.contains("SheetKey::FileGoto"),
+            "the file screen has to present the sheet its header opens"
+        );
+        assert!(
+            files.contains("render_file_goto_prompt"),
+            "and draw the prompt inside itself rather than in another surface"
+        );
+        assert!(
+            !body("render_git_panel").contains("SheetKey::FileGoto"),
+            "the Git surface must not carry the file viewer's sheet"
+        );
+        assert!(
+            body("close_file_screen").contains("close_file_goto"),
+            "leaving the file takes its sheet down with it"
+        );
+        assert!(
+            body("set_surface").contains("close_file_goto"),
+            "a surface the sheet does not belong to must not inherit it"
+        );
+        assert!(
+            body("render_files").contains("render_file_screen"),
+            "the file screen is the Files surface, so the sheet travels with it"
+        );
     }
 
     /// A close control that reports to nobody is a dead button.
