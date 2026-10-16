@@ -276,20 +276,25 @@ fn the_action_menu_is_built_from_the_record_it_was_opened_on() {
         panic!("the action menu did not open");
     };
     assert_eq!(entry.row_key, "codex");
-    // A managed Agent can be installed, updated, rolled back and uninstalled;
-    // an external one cannot, which is why the menu is per record.
+    // A managed Agent can be updated, rolled back and uninstalled; an external
+    // one cannot, which is why the menu is per record. This Agent is at a
+    // published version, so the verb is the upgrade rather than a first
+    // install — the two run the same call and the label is what differs.
     for action in [
-        ConfigAction::Install,
+        ConfigAction::Upgrade,
         ConfigAction::CheckUpdate,
         ConfigAction::Rollback,
         ConfigAction::Toggle,
-        ConfigAction::Install,
     ] {
         assert!(
             entry.actions.contains(&action),
             "the Agent menu lost {action:?}"
         );
     }
+    assert!(
+        !entry.actions.contains(&ConfigAction::Install),
+        "an Agent already at a published version was offered a first install"
+    );
     let screen = text(&mut app, 140, 40);
     assert!(screen.contains("Roll back"), "{screen}");
 }
@@ -3678,4 +3683,97 @@ fn an_install_is_watched_until_the_authority_stops_working() {
             .is_some_and(|toast| format!("{toast:?}").contains("the download was refused")),
         "the failure did not carry the authority's reason"
     );
+}
+
+/// A custom ACP Agent is registered from nothing, and the form is the authority
+/// on what can be registered.
+///
+/// It is the one record in this centre with nothing behind it: the Agent does
+/// not exist until the authority writes it, so every field is the reader's and
+/// the checks are the desktop's own — the id is what everything else keys the
+/// Agent by, and an environment that is not `KEY=value` is refused with the
+/// reason on the form rather than after a round trip.
+#[test]
+fn a_custom_agent_is_registered_from_a_form() {
+    let mut app = loaded(140, 40);
+    app.capabilities.management = vibex_backend::DomainCapabilities::available([
+        vibex_backend::BackendOperation::ManagementAgents,
+    ]);
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+
+    // `n` opens the form, selected row or not.
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigEntryCreate);
+    assert!(outcome.effects.is_empty(), "the form ran something");
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("`n` opened no form on the Agents area");
+    };
+    for field in ["agent_id", "label", "command", "args", "env"] {
+        assert!(form.field(field).is_some(), "the form has no {field} field");
+    }
+
+    // An id that is not a kebab-case Agent id is refused before the write.
+    let fill = |app: &mut App, id: &str, env: &str| {
+        if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+            form.field_mut("agent_id").unwrap().value = id.to_string();
+            form.field_mut("label").unwrap().value = "My Agent".to_string();
+            form.field_mut("command").unwrap().value = "/usr/bin/my-agent".to_string();
+            form.field_mut("args").unwrap().value = "--acp --verbose".to_string();
+            form.field_mut("env").unwrap().value = env.to_string();
+        }
+    };
+    fill(&mut app, "My Agent", "");
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    assert!(outcome.effects.is_empty(), "a bad id was written");
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the form closed on a bad id");
+    };
+    assert_eq!(
+        form.error.as_deref(),
+        Some("Use a lowercase kebab-case Agent id")
+    );
+
+    // A value that is not KEY=value is refused too.
+    fill(&mut app, "my-agent", "TOKEN");
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    assert!(outcome.effects.is_empty(), "a bad environment was written");
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the form closed on a bad environment");
+    };
+    assert_eq!(
+        form.error.as_deref(),
+        Some("Environment variables must use KEY=value, one per line")
+    );
+
+    // A name that is not a variable name is refused with its own reason.
+    fill(&mut app, "my-agent", "1TOKEN=secret");
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    assert!(outcome.effects.is_empty(), "a bad name was written");
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the form closed on a bad variable name");
+    };
+    assert_eq!(
+        form.error.as_deref(),
+        Some("Environment variable names may contain letters, digits, and underscores")
+    );
+
+    // And the request is what the reader typed, split the way it is written.
+    fill(&mut app, "my-agent", "TOKEN=secret\nPATH_SUFFIX=/opt/bin");
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::CreateCustomAgent(request) = mutation else {
+                panic!("the save was not a registration: {mutation:?}");
+            };
+            assert_eq!(request.agent_id.as_str(), "my-agent");
+            assert_eq!(request.label, "My Agent");
+            assert_eq!(request.command.command, "/usr/bin/my-agent");
+            assert_eq!(request.command.args, vec!["--acp", "--verbose"]);
+            assert_eq!(request.env.get("TOKEN").map(String::as_str), Some("secret"));
+            assert_eq!(
+                request.env.get("PATH_SUFFIX").map(String::as_str),
+                Some("/opt/bin")
+            );
+        }
+        other => panic!("the save produced {other:?}"),
+    }
 }

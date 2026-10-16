@@ -711,6 +711,18 @@ impl Dispatch {
                 )
                 .await
             }
+            M::CreateCustomAgent(request) => {
+                let request = vibex_backend::MutationRequest::new(*request);
+                self.facade
+                    .management()
+                    .create_custom_agent(request)
+                    .await
+                    .map(|_| crate::app::MutationOutcome::Verdict {
+                        passed: true,
+                        warned: false,
+                        message: String::new(),
+                    })
+            }
             M::AuthenticateAgentMethod {
                 agent_id,
                 method_id,
@@ -1741,6 +1753,17 @@ impl Dispatch {
                     .await;
                 self.send(AppMessage::AgentAuthLogoutPreview(result.map(Box::new)));
             }
+            Effect::DiscoverLocalAgents => {
+                let result = self
+                    .discover_local_agents()
+                    .await
+                    .map(|found| crate::app::MutationOutcome::Discovered { found });
+                self.send(AppMessage::Mutation {
+                    key: "agent_discovery".to_string(),
+                    record: Some("agents".to_string()),
+                    result,
+                });
+            }
             Effect::LoadAgentAuthCatalog { agent_id } => {
                 // The context is seeded first: a runtime that has never been
                 // asked holds none, and the methods are advertised against one.
@@ -2679,6 +2702,79 @@ impl Dispatch {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Probe this machine for the Agent CLIs that have not been added yet.
+    ///
+    /// One pass, in the order the desktop runs it: a candidate is added without
+    /// being enabled, the machine is asked whether the CLI is there, and only
+    /// one that answered is enabled. An Agent that was added and left disabled
+    /// is the honest answer for a CLI that is not installed — the reader can
+    /// still install it, and nothing claims to be ready that is not.
+    async fn discover_local_agents(&self) -> BackendResult<usize> {
+        let request = vibex_core::AgentListRequest {
+            include_disabled: true,
+        };
+        let candidates = match self.facade.management().list_agents(request).await {
+            Ok(response) => response
+                .agents
+                .into_iter()
+                .filter(|agent| !agent.added)
+                .map(|agent| agent.id)
+                .collect::<Vec<_>>(),
+            Err(error) => return Err(error),
+        };
+        let mut found = 0_usize;
+        for agent_id in candidates {
+            let add = vibex_backend::MutationRequest::new(vibex_core::AgentUpdateConfigRequest {
+                agent_id: agent_id.clone(),
+                added: Some(true),
+                // Added switched off: an Agent the machine does not have is one
+                // the reader has not agreed to run.
+                enabled: Some(false),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: None,
+                env: None,
+                params: None,
+            });
+            self.facade.management().update_agent_config(add).await?;
+            let refreshed = self
+                .facade
+                .management()
+                .refresh_agent_snapshot(vibex_core::AgentRefreshSnapshotRequest {
+                    agent_id: agent_id.clone(),
+                    cwd_scope: None,
+                })
+                .await?;
+            if !refreshed.agent.installed {
+                continue;
+            }
+            let enable =
+                vibex_backend::MutationRequest::new(vibex_core::AgentUpdateConfigRequest {
+                    agent_id: agent_id.clone(),
+                    added: None,
+                    enabled: Some(true),
+                    label_override: None,
+                    description_override: None,
+                    order_index: None,
+                    command: None,
+                    env: None,
+                    params: None,
+                });
+            self.facade.management().update_agent_config(enable).await?;
+            // The runtime options are what the Agent's own CLI advertises; a
+            // probe that fails is not a discovery that failed, so it is the one
+            // step whose error is not returned.
+            let probe =
+                vibex_backend::MutationRequest::new(vibex_core::AgentRuntimeOptionProbeRequest {
+                    agent_id: agent_id.clone(),
+                });
+            let _ = self.facade.agent().probe_agent_runtime_options(probe).await;
+            found = found.saturating_add(1);
+        }
+        Ok(found)
     }
 
     /// The Agent's default provider profile, which is where a sign-in method's

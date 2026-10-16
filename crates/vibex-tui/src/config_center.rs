@@ -258,6 +258,8 @@ pub enum ConfigAction {
     OpenPage,
     /// Install a market entry that is already installed.
     Reinstall,
+    /// Move a managed Agent onto the version the authority published.
+    Upgrade,
     /// Move a profile one place earlier in its Agent's order.
     MoveUp,
     /// Move a profile one place later in its Agent's order.
@@ -294,6 +296,7 @@ impl ConfigAction {
             Self::Discover => strings.config_action_discover(),
             Self::OpenPage => strings.config_action_open_page(),
             Self::Reinstall => strings.config_action_reinstall(),
+            Self::Upgrade => strings.config_action_upgrade(),
             Self::MoveUp => strings.config_action_move_up(),
             Self::MoveDown => strings.config_action_move_down(),
         }
@@ -1396,7 +1399,20 @@ pub fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                 ConfigAction::Logout,
             ];
             if agent.managed_install.managed {
-                actions.insert(0, ConfigAction::Install);
+                // An Agent the authority already has at a newer version is
+                // upgraded rather than installed again: the two run the same
+                // call, and the verb the reader presses should be the one that
+                // describes what it does.
+                actions.insert(
+                    0,
+                    if agent.managed_install.status
+                        == vibex_core::AgentManagedInstallStatus::UpdateAvailable
+                    {
+                        ConfigAction::Upgrade
+                    } else {
+                        ConfigAction::Install
+                    },
+                );
                 actions.insert(1, ConfigAction::CheckUpdate);
                 if agent.installed {
                     actions.insert(2, ConfigAction::Rollback);
@@ -2379,6 +2395,8 @@ pub enum FormPurpose {
     NewProviderProfile {
         source: Option<Box<vibex_core::ProviderProfile>>,
     },
+    /// A custom ACP Agent, from nothing.
+    NewCustomAgent,
     /// A Skill from the registry, and the Agents that should receive it.
     SkillMarketInstall {
         entry_id: String,
@@ -3823,6 +3841,91 @@ pub struct SkillPreviewView {
     pub scroll: usize,
     pub loading: bool,
     pub notice: Option<(String, ConfigTone)>,
+}
+
+/// The form a custom ACP Agent is registered with.
+///
+/// It is the one record in this centre that has nothing behind it: the Agent
+/// does not exist until the authority writes it, so every field is the
+/// reader's and the validation is the desktop's own — a lowercase kebab-case
+/// id, a display name and a command that are not empty, and an environment in
+/// `KEY=value` lines.
+pub fn custom_agent_form(strings: Strings) -> ConfigForm {
+    ConfigForm::new(
+        FormPurpose::NewCustomAgent,
+        strings.config_form_new_agent(),
+        vec![
+            FormField::text("agent_id", strings.config_field_agent_id(), String::new())
+                .hint(strings.config_hint_agent_id()),
+            FormField::text("label", strings.config_field_display_name(), String::new()),
+            FormField::text(
+                "description",
+                strings.config_field_description(),
+                String::new(),
+            ),
+            FormField::text("command", strings.config_field_command(), String::new()),
+            FormField::text("args", strings.config_field_arguments(), String::new())
+                .hint(strings.config_hint_arguments()),
+            FormField::multiline("env", strings.config_field_env_pairs(), String::new())
+                .hint(strings.config_hint_env_pairs()),
+        ],
+    )
+}
+
+/// The request a custom Agent form describes, or the reason it cannot be made.
+pub fn custom_agent_request(
+    form: &ConfigForm,
+    strings: Strings,
+) -> Result<vibex_core::CustomAgentCreateRequest, &'static str> {
+    let id = form.value("agent_id").unwrap_or_default();
+    let label = form.value("label").unwrap_or_default();
+    let command = form.value("command").unwrap_or_default();
+    // The id is the Agent's identity: everything that names it later — a
+    // profile, a session, a config file — is keyed by it, so it is checked
+    // here rather than left for the authority to refuse.
+    let Ok(agent_id) = vibex_core::AgentId::parse(id) else {
+        return Err(strings.config_form_error_agent_id());
+    };
+    if label.is_empty() || command.is_empty() {
+        return Err(strings.config_form_error_agent_required());
+    }
+    let mut env = std::collections::BTreeMap::new();
+    for line in form.value("env").unwrap_or_default().lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(strings.config_form_error_env_pairs());
+        };
+        let key = key.trim();
+        let named = key.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
+        });
+        if key.is_empty() || !named {
+            return Err(strings.config_form_error_env_name());
+        }
+        env.insert(key.to_string(), value.trim().to_string());
+    }
+    let description = form.value("description").unwrap_or_default();
+    Ok(vibex_core::CustomAgentCreateRequest {
+        agent_id,
+        label,
+        description: (!description.is_empty()).then_some(description),
+        command: vibex_core::AgentCommandConfig {
+            command,
+            // Arguments are what the reader typed, split the way a shell would
+            // read them; a command that needs quoting is a command this form
+            // cannot express, and the reader can put it in a wrapper script.
+            args: form
+                .value("args")
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(ToString::to_string)
+                .collect(),
+        },
+        env,
+    })
 }
 
 /// The form a Skill install asks for.

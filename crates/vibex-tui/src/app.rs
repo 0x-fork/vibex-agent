@@ -8756,6 +8756,8 @@ pub enum ConfigMutation {
         /// than a formality.
         confirmed_affected_session_count: usize,
     },
+    /// Register a custom ACP Agent.
+    CreateCustomAgent(Box<vibex_core::CustomAgentCreateRequest>),
     /// Sign in with one of an Agent's methods, storing what it collects first.
     AuthenticateAgentMethod {
         agent_id: vibex_core::AgentId,
@@ -8891,6 +8893,7 @@ impl ConfigMutation {
             Self::UpdateProviderProfile { profile_id, .. }
             | Self::DeleteProviderProfile { profile_id, .. } => profile_id.as_str().to_string(),
             Self::AuthenticateAgentMethod { agent_id, .. } => agent_id.as_str().to_string(),
+            Self::CreateCustomAgent(request) => request.agent_id.as_str().to_string(),
             Self::LogoutAgentAuthContext {
                 auth_context_id, ..
             } => auth_context_id.clone(),
@@ -8932,6 +8935,7 @@ impl ConfigMutation {
             Self::CheckAgentUpdate { .. } => "agent_update_check",
             Self::RollbackAgent { .. } => "agent_rollback",
             Self::AuthenticateAgentMethod { .. } => "agent_auth_sign_in",
+            Self::CreateCustomAgent(_) => "custom_agent_create",
             Self::LogoutAgentAuthContext { .. } => "agent_auth_sign_out",
             Self::CreateProviderProfile(_) => "provider_profile_create",
             Self::ApplyNativeExport { .. } => "provider_native_export_apply",
@@ -8983,6 +8987,7 @@ impl ConfigMutation {
             Self::CheckAgentUpdate { .. } => Verb::CheckUpdate,
             Self::RollbackAgent { .. } => Verb::Rollback,
             Self::AuthenticateAgentMethod { .. } => Verb::SignIn,
+            Self::CreateCustomAgent(_) => Verb::Create,
             Self::LogoutAgentAuthContext { .. } => Verb::SignOut,
             Self::CreateProviderProfile(_) => Verb::Create,
             Self::ApplyNativeExport { .. } => Verb::Save,

@@ -1611,7 +1611,9 @@ impl App {
                 };
                 self.begin_config_mutation(request)
             }
-            (ConfigSection::Agents, ConfigAction::Install) => {
+            // An upgrade is the same call as an install: what differs is the
+            // verb the reader pressed and the version the authority moves to.
+            (ConfigSection::Agents, ConfigAction::Install | ConfigAction::Upgrade) => {
                 let Some(agent) = self
                     .management_data
                     .agents
@@ -2028,6 +2030,13 @@ impl App {
             (ConfigModule::Prompts, ConfigSection::Prompts) => {
                 let prompt = key.and_then(|key| self.prompt(key)).cloned();
                 Some(crate::config_center::prompt_form(prompt.as_ref(), strings))
+            }
+            // `n` on the Agents area registers an Agent rather than editing
+            // one: the roster's own records are the machine's, and the only
+            // Agent a reader can make is an ACP one they name themselves. A
+            // selected row does not change that, so this branch ignores it.
+            (ConfigModule::Agent, ConfigSection::Agents) => {
+                Some(crate::config_center::custom_agent_form(strings))
             }
             (ConfigModule::Agent, ConfigSection::Providers) => {
                 let profile = key
@@ -3715,6 +3724,9 @@ impl App {
                     provider_options: None,
                 })
             }
+            FormPurpose::NewCustomAgent => Ok(ConfigMutation::CreateCustomAgent(Box::new(
+                crate::config_center::custom_agent_request(form, strings)?,
+            ))),
             FormPurpose::SkillMarketInstall {
                 entry_id,
                 slug,
