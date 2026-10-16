@@ -4645,6 +4645,14 @@ async fn process_device_management_rpc(
             request.auth.clone(),
             RemoteActionClass::MutateDeviceManagement,
         ),
+        RemoteDeviceRequest::RestoreDevice(request) => (
+            request.auth.clone(),
+            RemoteActionClass::MutateDeviceManagement,
+        ),
+        RemoteDeviceRequest::DeleteDevice(request) => (
+            request.auth.clone(),
+            RemoteActionClass::MutateDeviceManagement,
+        ),
         RemoteDeviceRequest::RenameDevice(request) => (
             request.auth.clone(),
             RemoteActionClass::MutateDeviceManagement,
@@ -4811,6 +4819,35 @@ async fn process_device_management_rpc(
                 RemoteCloseReason {
                     code: RemoteCloseCode::DeviceRevoked,
                     message: "remote device was revoked".to_string(),
+                    retry: RemoteRetryClass::Never,
+                },
+            );
+            serde_json::to_value(detail)
+        }
+        RemoteDeviceRequest::RestoreDevice(request) => {
+            let mut detail = RemoteTrustService::restore_device(&connection, request.request)?;
+            detail.public_key = None;
+            serde_json::to_value(detail)
+        }
+        RemoteDeviceRequest::DeleteDevice(request) => {
+            let device_id = request.request.device_id.clone();
+            if auth.device_id == device_id {
+                return Err(VibexError::new(
+                    ErrorCategory::Permission,
+                    "remote_device_self_delete_forbidden",
+                    "a remote device cannot forget its own connection",
+                ));
+            }
+            let mut detail = RemoteTrustService::delete_device(&connection, request.request)?;
+            detail.public_key = None;
+            // A forgotten device is not a device with a revoked grant: the row
+            // is gone, so leaving its sockets open would leave a connection the
+            // trust store no longer knows how to authorise on its next call.
+            state.registry.disconnect_device(
+                &device_id,
+                RemoteCloseReason {
+                    code: RemoteCloseCode::DeviceRevoked,
+                    message: "remote device was deleted".to_string(),
                     retry: RemoteRetryClass::Never,
                 },
             );

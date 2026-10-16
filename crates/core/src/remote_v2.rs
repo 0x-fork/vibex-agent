@@ -6,9 +6,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CorrelationId, DeviceId, ErrorCategory, EventId, RemoteActionClass, RemoteAuthProof,
-    RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteOperationKind,
-    RemoteRenameDeviceRequest, RemoteRenameRuntimeRequest, RemoteRevokeDeviceRequest, RequestId,
-    VibexError, unix_timestamp_ms,
+    RemoteDeleteDeviceRequest, RemoteDeviceDetail, RemoteDevicePermissionLevel,
+    RemoteOperationKind, RemoteRenameDeviceRequest, RemoteRenameRuntimeRequest,
+    RemoteRestoreDeviceRequest, RemoteRevokeDeviceRequest, RequestId, VibexError,
+    unix_timestamp_ms,
 };
 
 macro_rules! impl_unknown_safe_enum {
@@ -1362,6 +1363,8 @@ pub enum RemoteDeviceOperationKind {
     PairingPublications,
     PairingOfferStatus,
     RevokeDevice,
+    RestoreDevice,
+    DeleteDevice,
     RenameDevice,
     RenameRuntime,
     ListAudit,
@@ -1663,6 +1666,53 @@ impl fmt::Debug for RemoteDeviceRenameRequest {
     }
 }
 
+/// Returns a revoked device to service.
+///
+/// Revoking is reversible by design — a revoked record keeps the grant it
+/// holds, so the client reconnects without pairing again — and that promise is
+/// only worth anything if the other side can ask for it. The local owner could
+/// already; this is what lets a paired client do the same.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceRestoreRequest {
+    pub auth: RemoteAuthProof,
+    pub request: RemoteRestoreDeviceRequest,
+}
+
+impl fmt::Debug for RemoteDeviceRestoreRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteDeviceRestoreRequest")
+            .field("auth", &self.auth)
+            .field("device_id", &self.request.device_id)
+            .field("has_reason", &self.request.reason.is_some())
+            .finish()
+    }
+}
+
+/// Forgets a paired device, revoking its grant first when it still holds one.
+///
+/// Deleting is not revoking: the row goes away rather than turning inactive, so
+/// the audit history keeps the device id it recorded while the trust store stops
+/// knowing the device. The runtime disconnects it as part of the same call.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceDeleteRequest {
+    pub auth: RemoteAuthProof,
+    pub request: RemoteDeleteDeviceRequest,
+}
+
+impl fmt::Debug for RemoteDeviceDeleteRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteDeviceDeleteRequest")
+            .field("auth", &self.auth)
+            .field("device_id", &self.request.device_id)
+            .field("has_reason", &self.request.reason.is_some())
+            .finish()
+    }
+}
+
 /// Renames the runtime itself.
 ///
 /// The runtime is the authority for its own name, so this is how a client makes
@@ -1737,6 +1787,10 @@ pub enum RemoteDeviceRequest {
     /// Reads whether an offer this client minted is still live.
     PairingOfferStatus(RemoteDevicePairingOfferStatusRequest),
     RevokeDevice(RemoteDeviceRevokeRequest),
+    /// Returns a revoked device to service with the grant it already holds.
+    RestoreDevice(RemoteDeviceRestoreRequest),
+    /// Forgets a paired device and disconnects it.
+    DeleteDevice(RemoteDeviceDeleteRequest),
     RenameDevice(RemoteDeviceRenameRequest),
     RenameRuntime(RemoteDeviceRenameRuntimeRequest),
     ListAudit(RemoteDeviceAuditListRequest),
@@ -1831,6 +1885,8 @@ impl RemoteDeviceRequest {
             Self::PairingPublications(_) => RemoteDeviceOperationKind::PairingPublications,
             Self::PairingOfferStatus(_) => RemoteDeviceOperationKind::PairingOfferStatus,
             Self::RevokeDevice(_) => RemoteDeviceOperationKind::RevokeDevice,
+            Self::RestoreDevice(_) => RemoteDeviceOperationKind::RestoreDevice,
+            Self::DeleteDevice(_) => RemoteDeviceOperationKind::DeleteDevice,
             Self::RenameDevice(_) => RemoteDeviceOperationKind::RenameDevice,
             Self::RenameRuntime(_) => RemoteDeviceOperationKind::RenameRuntime,
             Self::ListAudit(_) => RemoteDeviceOperationKind::ListAudit,
@@ -2336,6 +2392,55 @@ mod tests {
             assert!(!debug.contains("device-auth-token-sentinel"));
             assert!(!debug.contains("private-route.invalid"));
             assert!(!debug.contains("private-revoke-reason-sentinel"));
+        }
+    }
+
+    #[test]
+    fn the_trust_store_mutations_round_trip_and_name_their_operation() {
+        let auth = RemoteAuthProof {
+            device_id: DeviceId::parse("device_admin").unwrap(),
+            auth_token: "device-auth-token-sentinel".to_string(),
+        };
+        let restore = RemoteDeviceRequest::RestoreDevice(RemoteDeviceRestoreRequest {
+            auth: auth.clone(),
+            request: RemoteRestoreDeviceRequest {
+                device_id: DeviceId::parse("device_target").unwrap(),
+                reason: Some("private-restore-reason-sentinel".to_string()),
+            },
+        });
+        assert_eq!(
+            restore.operation_kind(),
+            RemoteDeviceOperationKind::RestoreDevice
+        );
+        let decoded: RemoteDeviceRequest =
+            serde_json::from_value(serde_json::to_value(&restore).expect("encode"))
+                .expect("decode");
+        assert_eq!(decoded, restore);
+
+        let delete = RemoteDeviceRequest::DeleteDevice(RemoteDeviceDeleteRequest {
+            auth,
+            request: RemoteDeleteDeviceRequest {
+                device_id: DeviceId::parse("device_target").unwrap(),
+                reason: Some("private-delete-reason-sentinel".to_string()),
+            },
+        });
+        assert_eq!(
+            delete.operation_kind(),
+            RemoteDeviceOperationKind::DeleteDevice
+        );
+        let decoded: RemoteDeviceRequest =
+            serde_json::from_value(serde_json::to_value(&delete).expect("encode")).expect("decode");
+        assert_eq!(decoded, delete);
+
+        // The proof and the reason are both sensitive: the debug line says they
+        // are there without saying what they are.
+        for debug in [format!("{restore:?}"), format!("{delete:?}")] {
+            assert!(!debug.contains("device-auth-token-sentinel"), "{debug}");
+            assert!(
+                !debug.contains("private-restore-reason-sentinel"),
+                "{debug}"
+            );
+            assert!(!debug.contains("private-delete-reason-sentinel"), "{debug}");
         }
     }
 

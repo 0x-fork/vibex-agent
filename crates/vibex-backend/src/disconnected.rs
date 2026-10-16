@@ -1540,6 +1540,20 @@ impl DeviceBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn restore_device(
+        &self,
+        _request: MutationRequest<vibex_core::RemoteRestoreDeviceRequest>,
+    ) -> BackendFuture<'_, RemoteDeviceDetail> {
+        disconnected_future!()
+    }
+
+    fn delete_device(
+        &self,
+        _request: MutationRequest<vibex_core::RemoteDeleteDeviceRequest>,
+    ) -> BackendFuture<'_, RemoteDeviceDetail> {
+        disconnected_future!()
+    }
+
     fn pairing_publications(
         &self,
     ) -> BackendFuture<'_, Vec<vibex_core::RemotePairingPublicationSummary>> {

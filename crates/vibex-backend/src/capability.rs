@@ -133,6 +133,11 @@ pub enum BackendOperation {
     /// revoke a device is not automatically the one who decides what a runtime
     /// calls itself in every other client's list.
     DeviceRename,
+    /// Returns a revoked device to service, with the grant it already holds.
+    DeviceRestore,
+    /// Forgets a paired device. Destructive, and not the same decision as
+    /// revoking one: the record goes away rather than turning inactive.
+    DeviceDelete,
     DeviceAudit,
     /// Authority-local recovery: diagnostic export and database backup.
     RecoveryDiagnosticsExport,
@@ -354,6 +359,8 @@ impl BackendCapabilitySnapshot {
                 DevicePairingPublications,
                 DeviceRevoke,
                 DeviceRename,
+                DeviceRestore,
+                DeviceDelete,
                 DeviceAudit,
                 RecoveryDiagnosticsExport,
                 RecoveryBackupCreate,

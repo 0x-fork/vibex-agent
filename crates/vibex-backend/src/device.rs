@@ -82,6 +82,27 @@ pub trait DeviceBackend: BackendBound {
         request: MutationRequest<RemoteRevokeDeviceRequest>,
     ) -> BackendFuture<'_, RemoteDeviceDetail>;
 
+    /// Returns a revoked device to service with the grant it already holds.
+    ///
+    /// Revoking is reversible, and this is the verb that makes the promise
+    /// real: the stored grant is kept, so a client that still holds the
+    /// credential it was paired with reconnects without pairing again.
+    fn restore_device(
+        &self,
+        request: MutationRequest<vibex_core::RemoteRestoreDeviceRequest>,
+    ) -> BackendFuture<'_, RemoteDeviceDetail>;
+
+    /// Forgets a paired device, revoking its grant first when it still holds
+    /// one and disconnecting it.
+    ///
+    /// Not the same as revoking: the record goes away, so the device is not
+    /// merely inactive — and the audit history keeps the id it recorded while
+    /// the trust store stops knowing the device.
+    fn delete_device(
+        &self,
+        request: MutationRequest<vibex_core::RemoteDeleteDeviceRequest>,
+    ) -> BackendFuture<'_, RemoteDeviceDetail>;
+
     /// Renames a paired device in the runtime's trust store. The runtime owns
     /// the name, so the renamed device reads it back from its next handshake.
     fn rename_device(

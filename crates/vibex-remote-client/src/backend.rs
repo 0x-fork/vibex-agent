@@ -6808,6 +6808,58 @@ impl DeviceBackend for WebRemoteBackend {
         })
     }
 
+    fn restore_device(
+        &self,
+        request: MutationRequest<vibex_core::RemoteRestoreDeviceRequest>,
+    ) -> BackendFuture<'_, RemoteDeviceDetail> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteDeviceRequest::RestoreDevice(vibex_core::RemoteDeviceRestoreRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            decode(value)
+        })
+    }
+
+    fn delete_device(
+        &self,
+        request: MutationRequest<vibex_core::RemoteDeleteDeviceRequest>,
+    ) -> BackendFuture<'_, RemoteDeviceDetail> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteDeviceRequest::DeleteDevice(vibex_core::RemoteDeviceDeleteRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            decode(value)
+        })
+    }
+
     fn rename_device(
         &self,
         request: MutationRequest<RemoteRenameDeviceRequest>,
@@ -7405,6 +7457,14 @@ fn remote_capabilities_for_grant(
                 ),
                 (
                     BackendOperation::DeviceRename,
+                    permits(RemoteActionClass::MutateDeviceManagement),
+                ),
+                (
+                    BackendOperation::DeviceRestore,
+                    permits(RemoteActionClass::MutateDeviceManagement),
+                ),
+                (
+                    BackendOperation::DeviceDelete,
                     permits(RemoteActionClass::MutateDeviceManagement),
                 ),
                 (

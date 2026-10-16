@@ -2092,6 +2092,20 @@ mod tests {
             error_future()
         }
 
+        fn restore_device(
+            &self,
+            _request: MutationRequest<vibex_core::RemoteRestoreDeviceRequest>,
+        ) -> BackendFuture<'_, RemoteDeviceDetail> {
+            error_future()
+        }
+
+        fn delete_device(
+            &self,
+            _request: MutationRequest<vibex_core::RemoteDeleteDeviceRequest>,
+        ) -> BackendFuture<'_, RemoteDeviceDetail> {
+            error_future()
+        }
+
         fn pairing_publications(
             &self,
         ) -> BackendFuture<'_, Vec<vibex_core::RemotePairingPublicationSummary>> {

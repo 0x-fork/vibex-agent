@@ -4395,6 +4395,38 @@ impl DeviceBackend for NativeBackend {
         })
     }
 
+    fn restore_device(
+        &self,
+        request: MutationRequest<vibex_core::RemoteRestoreDeviceRequest>,
+    ) -> BackendFuture<'_, RemoteDeviceDetail> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .remote()
+                .restore_device(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn delete_device(
+        &self,
+        request: MutationRequest<vibex_core::RemoteDeleteDeviceRequest>,
+    ) -> BackendFuture<'_, RemoteDeviceDetail> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .remote()
+                .delete_device(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
     fn rename_device(
         &self,
         request: MutationRequest<RemoteRenameDeviceRequest>,
