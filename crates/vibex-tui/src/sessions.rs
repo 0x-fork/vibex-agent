@@ -834,6 +834,15 @@ pub fn nest_child_rows(
 /// after it" — `true` means the trunk in that column runs on past this row, and
 /// `false` means the column closes here.
 ///
+/// A column is only drawn while the row that owns its level draws a branch of
+/// its own. A session's row is not always a delegated one: the arrangement puts
+/// a session at depth 2 when its project sits inside a folder, and that row
+/// spends its leading columns on the selection bar rather than on a guide. A
+/// trunk in that row's column would then arrive from no line above and reach
+/// none below — the one thing a reader cannot tell a tree line from — so the
+/// walk stops at the first level whose row is delegated, and a row one level
+/// above such a session hangs from its elbow alone.
+///
 /// The answer is read from the flat rows rather than the ownership pages, which
 /// is what makes a folded branch come out right: a folded sibling is not on the
 /// list, so the trunk above the last row the reader can see stops where the eye
@@ -848,19 +857,32 @@ pub fn branch_shape(rows: &[AgentSidebarRow], index: usize) -> Vec<bool> {
         // session mark above it to hang an elbow from.
         return Vec::new();
     }
-    (0..usize::from(depth) - 1)
-        .take(BRANCH_DEPTH_LIMIT)
-        .map(|step| {
-            let level = depth - step as u8;
-            // The first row at or above this level after the row says whether
-            // the session at `level` has a sibling: a row *at* the level is one,
-            // and a row above it means the subtree ended.
+    let mut shape = Vec::new();
+    for step in 0..(usize::from(depth) - 1).min(BRANCH_DEPTH_LIMIT) {
+        let level = depth - step as u8;
+        // Every level but the row's own needs the row that owns it to draw a
+        // guide: rows are nested depth-first, so the nearest row above at this
+        // depth is the ancestor the column would hang from.
+        if step > 0
+            && !rows[..index]
+                .iter()
+                .rev()
+                .find(|row| row.depth == level)
+                .is_some_and(|row| row.delegated)
+        {
+            break;
+        }
+        // The first row at or above this level after the row says whether
+        // the session at `level` has a sibling: a row *at* the level is one,
+        // and a row above it means the subtree ended.
+        shape.push(
             rows.iter()
                 .skip(index + 1)
                 .find(|row| row.depth <= level)
-                .is_some_and(|row| row.depth == level)
-        })
-        .collect()
+                .is_some_and(|row| row.depth == level),
+        );
+    }
+    shape
 }
 
 /// How deep the renderer will draw a delegated branch.
@@ -1074,6 +1096,7 @@ mod tests {
             workspace_order: BTreeMap::new(),
             project_appearances: BTreeMap::new(),
             worktree_titles: BTreeMap::new(),
+            worktree_lifecycle: BTreeMap::new(),
             project_location_preferences: BTreeMap::new(),
             auto_continue_project_ids: BTreeSet::new(),
             auto_continue_session_overrides: BTreeMap::new(),
@@ -1610,15 +1633,12 @@ mod tests {
         assert_eq!(nested[3].depth, 3);
     }
 
-    #[test]
-    fn a_trunk_runs_past_a_row_only_while_a_sibling_follows_it() {
-        // Three workers under one owner, the last of them with a child of its
-        // own. Depth 2 rows are the owner's children; depth 3 is the helper.
-        let rows = vec![(1u8, false), (2, false), (2, true), (3, true), (2, true)];
-        let rows = rows
-            .into_iter()
+    /// A list of session rows from `(depth, delegated)` pairs, for the branch
+    /// readings below.
+    fn branch_rows(spec: &[(u8, bool)]) -> Vec<AgentSidebarRow> {
+        spec.iter()
             .enumerate()
-            .map(|(index, (depth, delegated))| AgentSidebarRow {
+            .map(|(index, &(depth, delegated))| AgentSidebarRow {
                 id: format!("row-{index}"),
                 kind: AgentSidebarRowKind::Session,
                 project_id: "project_vibex".to_string(),
@@ -1636,7 +1656,14 @@ mod tests {
                 delegated,
                 child_count: 0,
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    #[test]
+    fn a_trunk_runs_past_a_row_only_while_a_sibling_follows_it() {
+        // Three workers under one owner, the last of them with a child of its
+        // own. Depth 2 rows are the owner's children; depth 3 is the helper.
+        let rows = branch_rows(&[(1, false), (2, false), (2, true), (3, true), (2, true)]);
         // The first child has siblings after it, so its trunk runs on.
         assert_eq!(branch_shape(&rows, 1), vec![true]);
         // The second has the sibling that follows it, and so does the last: a
@@ -1649,5 +1676,24 @@ mod tests {
         assert_eq!(branch_shape(&rows, 3), vec![false, true]);
         // A row under a heading owns no drawn branch.
         assert!(branch_shape(&rows, 0).is_empty());
+    }
+
+    /// A column is only drawn while the row that owns its level draws a branch.
+    ///
+    /// The arrangement nests a session at depth 2 when its project sits inside a
+    /// folder, and that row spends its leading columns on the selection bar: it
+    /// has no elbow for a trunk to leave. A worker under such a session hangs
+    /// from its own elbow alone, however many sessions of that level follow it —
+    /// a line in their column would arrive from no row above that drew one.
+    #[test]
+    fn a_branch_never_holds_a_column_its_own_row_draws_nothing_in() {
+        // A project row, a session inside a folder, that session's worker, and
+        // the project's next session.
+        let rows = branch_rows(&[(1, false), (2, false), (3, true), (2, false)]);
+        assert_eq!(branch_shape(&rows, 2), vec![false], "the worker's guide");
+        // The same worker under a *delegated* parent keeps the column: its
+        // parent draws an elbow there, and the parent's next sibling one too.
+        let rows = branch_rows(&[(1, false), (2, true), (3, true), (2, true)]);
+        assert_eq!(branch_shape(&rows, 2), vec![false, true], "under a worker");
     }
 }

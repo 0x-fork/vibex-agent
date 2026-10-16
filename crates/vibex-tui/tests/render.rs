@@ -10909,6 +10909,139 @@ fn the_session_list_nests_a_sessions_delegated_workers() {
     );
 }
 
+/// A worker under a session the arrangement nested inside a folder.
+///
+/// A session that lives in one of its project's folders is at depth 2 while
+/// remaining a root row: it draws the selection bar, never a branch. The worker
+/// under it lands at depth 3, where the guide's columns are one level too deep
+/// for that session to have drawn a line — and the worker must still draw the
+/// elbow alone, or the branch would carry a trunk from a row that never drew
+/// one.
+#[test]
+fn a_delegated_row_under_a_folder_nested_session_hangs_from_its_elbow() {
+    use vibex_tui::action::Intent;
+    let mut owner = seeded_session("session_owner0002", "the owner");
+    owner.last_message_at_ms = 1_759_251_200_000;
+    let mut next = seeded_session("session_next0002", "the next session");
+    next.project_id = owner.project_id.clone();
+    next.workspace_id = owner.workspace_id.clone();
+    next.workspace_root = owner.workspace_root.clone();
+    next.last_message_at_ms = 1_759_251_100_000;
+    let mut worker = seeded_session("session_worker002", "the worker");
+    worker.project_id = owner.project_id.clone();
+    worker.workspace_id = owner.workspace_id.clone();
+    worker.workspace_root = owner.workspace_root.clone();
+    let project_id = owner.project_id.as_str().to_string();
+    let owner_id = owner.id.clone();
+    let worker_id = worker.id.clone();
+    let registry = vec![owner.clone(), worker.clone(), next.clone()];
+
+    // The reader's own arrangement: one folder of the project holding both
+    // sessions, so their rows sit one level in from the project.
+    let snapshot = vibex_core::RemoteSidebarOrganizationSnapshot {
+        revision: 3,
+        folders: vec![vibex_core::RemoteSidebarFolder {
+            id: "folder-work".to_string(),
+            name: "work".to_string(),
+            project_id: Some(project_id.clone()),
+            workspace_id: None,
+            auto_archive_after_days: None,
+        }],
+        groups: Vec::new(),
+        placements: vec![
+            vibex_core::RemoteSidebarPlacement {
+                item: vibex_core::RemoteSidebarItemRef {
+                    kind: vibex_core::RemoteSidebarItemKind::Folder,
+                    id: "folder-work".to_string(),
+                },
+                parent_folder_id: None,
+            },
+            vibex_core::RemoteSidebarPlacement {
+                item: vibex_core::RemoteSidebarItemRef {
+                    kind: vibex_core::RemoteSidebarItemKind::Session,
+                    id: "session_owner0002".to_string(),
+                },
+                parent_folder_id: Some("folder-work".to_string()),
+            },
+            vibex_core::RemoteSidebarPlacement {
+                item: vibex_core::RemoteSidebarItemRef {
+                    kind: vibex_core::RemoteSidebarItemKind::Session,
+                    id: "session_next0002".to_string(),
+                },
+                parent_folder_id: Some("folder-work".to_string()),
+            },
+        ],
+        collapsed_folder_ids: Vec::new(),
+        collapsed_group_ids: Vec::new(),
+        collapsed_project_ids: Vec::new(),
+        collapsed_workspace_ids: Vec::new(),
+        pinned_session_ids: Vec::new(),
+        session_order: vec![
+            "session_owner0002".to_string(),
+            "session_next0002".to_string(),
+        ],
+        session_order_anchored_at_ms: i64::MAX,
+        hierarchy_mode: vibex_core::RemoteSidebarHierarchyMode::Compact,
+        project_order: Vec::new(),
+        workspace_order: std::collections::BTreeMap::new(),
+        project_appearances: std::collections::BTreeMap::new(),
+        worktree_titles: std::collections::BTreeMap::new(),
+        worktree_lifecycle: std::collections::BTreeMap::new(),
+        project_new_session_locations: std::collections::BTreeMap::new(),
+        auto_continue_project_ids: Vec::new(),
+        auto_continue_session_overrides: std::collections::BTreeMap::new(),
+        auto_continue_session_ids: Vec::new(),
+        auto_continue_paused_session_ids: Vec::new(),
+        unread_session_ids: Vec::new(),
+        scheduled_sends: Vec::new(),
+    };
+
+    let mut app = app(120, 40);
+    app.perform(Intent::GotoSessions);
+    app.agent
+        .apply_sessions(Ok(vec![owner, next]))
+        .expect("sessions apply");
+    assert!(app.apply_sidebar_organization(&snapshot));
+    app.children.apply(
+        Some(&owner_id),
+        false,
+        1_000,
+        tree_page(
+            vec![tree_node("session_worker002", Some("session_owner0002"), 0)],
+            registry,
+        ),
+    );
+    let screen = text(&render(&mut app, 120, 40));
+    // The premise of the shape: the folder put the sessions a level below their
+    // project, and those rows draw no branch of their own.
+    let owner_row = session_row(&app, &owner_id);
+    assert_eq!(
+        app.sidebar_rows()[owner_row].depth,
+        2,
+        "the arrangement did not nest the sessions inside the folder:\n{screen}"
+    );
+    assert!(
+        !app.sidebar_rows()[owner_row].delegated,
+        "a session inside a folder is drawn as a delegated row:\n{screen}"
+    );
+    assert_eq!(
+        app.sidebar_rows()[session_row(&app, &worker_id)].depth,
+        3,
+        "the worker is not drawn one level below its owner:\n{screen}"
+    );
+    let line = screen
+        .lines()
+        .find(|line| line.contains("the worker"))
+        .unwrap_or_else(|| panic!("the list hid the delegated worker:\n{screen}"));
+    let elbow = line
+        .find(['└', '├'])
+        .unwrap_or_else(|| panic!("the worker row lost its elbow:\n{line}"));
+    assert!(
+        !line[..elbow].contains('│'),
+        "a trunk was drawn in a column no row draws a line in:\n{line}"
+    );
+}
+
 /// A session's own child hangs from its elbow and from nothing else.
 ///
 /// The child's level is the last one the branch has, so there is no column

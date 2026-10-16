@@ -10308,6 +10308,7 @@ mod tests {
             workspace_order: std::collections::BTreeMap::new(),
             project_appearances: std::collections::BTreeMap::new(),
             worktree_titles: std::collections::BTreeMap::new(),
+            worktree_lifecycle: std::collections::BTreeMap::new(),
             project_new_session_locations: std::collections::BTreeMap::new(),
             auto_continue_project_ids: Vec::new(),
             auto_continue_session_overrides: std::collections::BTreeMap::new(),
