@@ -1745,6 +1745,10 @@ pub struct MobileApp {
     new_session_attachments: Vec<MessageAttachment>,
     /// The `@` references the new-session first message names.
     new_session_armed_mentions: Vec<VibexUseMention>,
+    /// The executable `/` command the new-session first message names, if any.
+    /// The session does not exist yet, so the command cannot run until the
+    /// submission creates it; it is carried to that moment instead.
+    new_session_armed_command: Option<AgentCommandEntry>,
     /// The composer's un-sent work changed since the last write to disk.
     composer_state_dirty: bool,
     /// The debounce timer for that write, replaced per burst of edits.
@@ -1826,6 +1830,16 @@ impl Focusable for MobileApp {
 /// phone prompt that carries more than a handful is a mistake, and every byte
 /// is base64 on the wire.
 const MOBILE_MAX_COMPOSER_ATTACHMENTS: usize = 8;
+
+/// How far the prompt fields grow before they scroll.
+///
+/// The grid the phone uses is one that a thumb can revisit, so the field grows
+/// to six lines and then scrolls — past that the composer would start pushing
+/// the conversation off the screen. Both the session composer and the
+/// new-session page's first message share these, so a long draft looks the same
+/// on either page.
+const MOBILE_COMPOSER_MIN_ROWS: usize = 1;
+const MOBILE_COMPOSER_MAX_ROWS: usize = 6;
 
 /// One member of the open session's group, as the tab strip draws it.
 type MobileSessionGroupTabs = (
@@ -1915,10 +1929,12 @@ enum ComposerSuggestionKind {
     Command,
     Mention,
     Skill,
-    /// The same `@` list, drawn for the new-session page's first message. It
-    /// has its own identity because both fields can be on screen at once, and
-    /// two elements may not share an id.
+    /// The same lists drawn for the new-session page's first message. They have
+    /// their own identity because both pages' fields can be on screen at once,
+    /// and two elements may not share an id.
     NewSessionMention,
+    NewSessionCommand,
+    NewSessionSkill,
 }
 
 impl ComposerSuggestionKind {
@@ -1928,6 +1944,8 @@ impl ComposerSuggestionKind {
             Self::Mention => "mobile-composer-mentions",
             Self::Skill => "mobile-composer-skills",
             Self::NewSessionMention => "mobile-new-session-mentions",
+            Self::NewSessionCommand => "mobile-new-session-commands",
+            Self::NewSessionSkill => "mobile-new-session-skills",
         }
     }
 
@@ -1948,6 +1966,100 @@ fn skill_prefix(text: &str) -> Option<&str> {
     let token = text.split_whitespace().last()?;
     let remainder = token.strip_prefix('$')?;
     (!remainder.contains('$')).then_some(remainder)
+}
+
+/// The `/` entries one draft should offer, from an already-loaded catalogue.
+///
+/// Free rather than a method because both pages ask the same question of their
+/// own field and the same catalogue; only the field differs.
+fn command_suggestions_for(catalogue: &[AgentCommandEntry], draft: &str) -> Vec<AgentCommandEntry> {
+    let Some(prefix) = slash_command_prefix(draft) else {
+        return Vec::new();
+    };
+    let needle = prefix.to_lowercase();
+    catalogue
+        .iter()
+        .filter(|entry| entry.trigger == AgentCommandTrigger::Slash)
+        .filter(|entry| {
+            let name = entry
+                .command_name
+                .clone()
+                .unwrap_or_else(|| entry.label.clone())
+                .to_lowercase();
+            needle.is_empty()
+                || name.contains(&needle)
+                || entry.label.to_lowercase().contains(&needle)
+        })
+        .take(8)
+        .cloned()
+        .collect()
+}
+
+/// The `$` skill entries one draft should offer.
+fn skill_suggestions_for(catalogue: &[AgentCommandEntry], draft: &str) -> Vec<AgentCommandEntry> {
+    let Some(prefix) = skill_prefix(draft) else {
+        return Vec::new();
+    };
+    let needle = prefix.to_lowercase();
+    catalogue
+        .iter()
+        .filter(|entry| entry.trigger == AgentCommandTrigger::Dollar)
+        .filter(|entry| {
+            let name = entry
+                .command_name
+                .clone()
+                .unwrap_or_else(|| entry.label.clone())
+                .trim_start_matches('$')
+                .to_lowercase();
+            needle.is_empty()
+                || name.contains(&needle)
+                || entry.label.to_lowercase().contains(&needle)
+        })
+        .take(8)
+        .cloned()
+        .collect()
+}
+
+/// The `@` reference entries one draft should offer.
+///
+/// A row is offered when choosing it does something: a collaborator or session
+/// becomes a typed reference, and a workspace file inserts its path. Only an
+/// entry that resolves to neither is dropped, so the list is never a row of
+/// labels that would do nothing when tapped.
+fn mention_suggestions_for(catalogue: &[AgentCommandEntry], draft: &str) -> Vec<AgentCommandEntry> {
+    let Some(prefix) = mention_prefix(draft) else {
+        return Vec::new();
+    };
+    let needle = prefix.to_lowercase();
+    let mut mentions: Vec<AgentCommandEntry> = Vec::new();
+    for entry in catalogue
+        .iter()
+        .filter(|entry| entry.trigger == AgentCommandTrigger::Mention)
+    {
+        if composer_entry_mention(entry).is_none() && entry.reference_path.is_none() {
+            continue;
+        }
+        let label = entry.label.trim_start_matches('@').to_lowercase();
+        let name = entry
+            .command_name
+            .clone()
+            .unwrap_or_else(|| entry.label.clone())
+            .to_lowercase();
+        if !needle.is_empty() && !label.contains(&needle) && !name.contains(&needle) {
+            continue;
+        }
+        if mentions
+            .iter()
+            .any(|existing| existing.label == entry.label)
+        {
+            continue;
+        }
+        mentions.push(entry.clone());
+        if mentions.len() >= 8 {
+            break;
+        }
+    }
+    mentions
 }
 
 /// The `@` reference behind one suggestion entry, when it has one.
@@ -1994,6 +2106,28 @@ fn is_executable_command_source(entry: &AgentCommandEntry) -> bool {
         entry.source_kind,
         AgentCommandSourceKind::Provider | AgentCommandSourceKind::Prompt
     ) && entry.execution_behavior != AgentCommandExecutionBehavior::None
+}
+
+/// Whether the draft still names the command that was armed for it.
+///
+/// The typed text is authoritative: an armed command whose `/name` the reader
+/// has since edited away must not run, or a command they removed from the draft
+/// would still execute. Mirrors the desktop's own check so both shells resolve
+/// the same draft the same way.
+fn command_entry_matches_draft(text: &str, entry: Option<&AgentCommandEntry>) -> bool {
+    let Some(entry) = entry else {
+        return false;
+    };
+    if !is_executable_command_source(entry) || entry.trigger != AgentCommandTrigger::Slash {
+        return false;
+    }
+    let Some((command_name, _)) = parse_slash_command_invocation(text) else {
+        return false;
+    };
+    entry
+        .command_name
+        .as_deref()
+        .is_none_or(|entry_name| entry_name == command_name)
 }
 
 /// The plan the latest turn of a session currently stands on.
@@ -2974,7 +3108,7 @@ impl MobileApp {
         let composer_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder(composer_placeholder())
-                .auto_grow(1, 6)
+                .auto_grow(MOBILE_COMPOSER_MIN_ROWS, MOBILE_COMPOSER_MAX_ROWS)
         });
         // The selection toolbar is its own view: it floats over the whole
         // window, and the composer only hands it the long press that opens it.
@@ -3158,11 +3292,14 @@ impl MobileApp {
             }),
             new_session_prompt_input: cx.new(|cx| {
                 // The first message *is* the session, so it gets a textarea that
-                // grows with the message rather than a one-line field. The
-                // placeholder doubles as the only place the three suggestion
-                // characters are introduced, which is how the desktop teaches
-                // them too.
-                TextareaState::new(window, cx).placeholder(composer_placeholder())
+                // grows with the message rather than a one-line field — the same
+                // growth the session composer has, or the two pages disagree
+                // about what a long first message looks like. The placeholder
+                // doubles as the only place the three suggestion characters are
+                // introduced, which is how the desktop teaches them too.
+                TextareaState::new(window, cx)
+                    .placeholder(composer_placeholder())
+                    .auto_grow(MOBILE_COMPOSER_MIN_ROWS, MOBILE_COMPOSER_MAX_ROWS)
             }),
             worktree_path_browser: None,
             new_session_worktree_name_input: cx.new(|cx| {
@@ -3250,6 +3387,7 @@ impl MobileApp {
             attach_menu_target: AttachmentTarget::Composer,
             new_session_attachments: Vec::new(),
             new_session_armed_mentions: Vec::new(),
+            new_session_armed_command: None,
             composer_state_dirty: false,
             composer_state_flush_task: None,
             _composer_change_subscription: composer_change_subscription,
@@ -5562,7 +5700,7 @@ impl MobileApp {
         self.runtime_draft = Some(selection);
         self.runtime_switch_error = None;
         self.sync_runtime_feature_inputs();
-        self.commit_new_session_runtime_draft();
+        self.commit_new_session_runtime_draft(cx);
         cx.notify();
     }
 
@@ -5570,12 +5708,20 @@ impl MobileApp {
     /// while its sheet is open *is* the choice: the draft lands on the page as
     /// it changes. The session page keeps the explicit apply, because switching
     /// a running session's runtime is a mutation the authority has to accept.
-    fn commit_new_session_runtime_draft(&mut self) {
+    fn commit_new_session_runtime_draft(&mut self, cx: &mut Context<Self>) {
         if self.runtime_options_target != RuntimeOptionsTarget::NewSession {
             return;
         }
         if let Some(draft) = self.runtime_draft.clone() {
+            let changed = self.new_session_runtime.as_ref() != Some(&draft);
             self.new_session_runtime = Some(draft);
+            // The catalogue belongs to the Agent, so a new choice re-scopes the
+            // `/`, `@` and `$` lists on the page along with the model list. Only
+            // a real change re-reads it; re-setting the same draft would ask the
+            // authority the same question again.
+            if changed {
+                self.refresh_composer_commands(cx);
+            }
         }
     }
 
@@ -5584,7 +5730,7 @@ impl MobileApp {
             draft.reasoning_effort = None;
         }
         self.runtime_switch_error = None;
-        self.commit_new_session_runtime_draft();
+        self.commit_new_session_runtime_draft(cx);
         cx.notify();
     }
 
@@ -5593,7 +5739,7 @@ impl MobileApp {
             draft.mode_id = None;
         }
         self.runtime_switch_error = None;
-        self.commit_new_session_runtime_draft();
+        self.commit_new_session_runtime_draft(cx);
         cx.notify();
     }
 
@@ -5614,7 +5760,7 @@ impl MobileApp {
             }
         }
         self.runtime_switch_error = None;
-        self.commit_new_session_runtime_draft();
+        self.commit_new_session_runtime_draft(cx);
         cx.notify();
     }
 
@@ -6217,6 +6363,11 @@ impl MobileApp {
         if needs_runtime_catalog {
             self.refresh_runtime_options(cx);
         }
+        // The page's first message opens the same `/`, `@` and `$` lists the
+        // session composer does, and those lists come from the Agent's
+        // catalogue. There is no session yet to trigger the usual load, so the
+        // page asks for it here.
+        self.refresh_composer_commands(cx);
         cx.notify();
     }
 
@@ -6312,6 +6463,15 @@ impl MobileApp {
             .to_string();
         let attachments = self.new_session_attachments.clone();
         let restore_attachments = attachments.clone();
+        // An executable command chosen on this page runs against the session
+        // this submission creates: the session does not exist until then, so it
+        // is carried here and executed in place of the ordinary first message.
+        // A draft that no longer names the command drops it, the same way the
+        // session composer checks its own armed command before use.
+        let armed_command = self
+            .new_session_armed_command
+            .clone()
+            .filter(|entry| command_entry_matches_draft(&prompt, Some(entry)));
         let mentions = std::mem::take(&mut self.new_session_armed_mentions)
             .into_iter()
             .filter(|mention| {
@@ -6441,28 +6601,56 @@ impl MobileApp {
                 safety: None,
             });
             let session = backend.create_session(request).await?;
-            let prompt_result = if prompt.is_empty() && attachments.is_empty() {
-                None
-            } else {
-                Some(
-                    backend
-                        .send_message(MutationRequest::new(SendAgentMessageRequest {
-                            mentions,
-                            session_id: session.id.clone(),
-                            message_idempotency_key: RequestId::new().into_string(),
-                            desired_runtime: runtime.clone(),
-                            text: prompt,
-                            attachments,
-                            reasoning_effort: runtime.reasoning_effort.clone(),
-                            correlation_id: None,
-                            delivery: UserMessageDelivery::Prompt,
-                            prompt_context: None,
-                            provenance: vibex_core::MessageProvenance::HumanInput,
-                        }))
-                        .await
-                        .map(|_| ()),
-                )
+            // A chosen provider command runs before any message: `/plan` and
+            // `/permission` change the session's mode, and a first message sent
+            // ahead of them would be answered under the old one. The session is
+            // the one just created, so the execution is addressed to it.
+            let command_result = match armed_command.as_ref() {
+                Some(entry) => {
+                    let (command_name, arguments) =
+                        parse_slash_command_invocation(&prompt).unwrap_or((String::new(), None));
+                    let request = MutationRequest::new(AgentCommandExecuteRequest {
+                        session_id: session.id.clone(),
+                        command_id: Some(entry.id.clone()),
+                        trigger: AgentCommandTrigger::Slash,
+                        source_kind: entry.source_kind,
+                        command_text: prompt.trim().to_string(),
+                        command_name: Some(command_name),
+                        arguments,
+                        prompt_id: entry.prompt_id.clone(),
+                        attachments: Vec::new(),
+                        reasoning_effort: None,
+                        correlation_id: None,
+                    });
+                    Some(backend.execute_agent_command(request).await.map(|_| ()))
+                }
+                None => None,
             };
+            let prompt_result =
+                if armed_command.is_some() || (prompt.is_empty() && attachments.is_empty()) {
+                    // An executed command is the whole first message; the ordinary
+                    // send is skipped so `/plan` does not also arrive as text.
+                    command_result
+                } else {
+                    Some(
+                        backend
+                            .send_message(MutationRequest::new(SendAgentMessageRequest {
+                                mentions,
+                                session_id: session.id.clone(),
+                                message_idempotency_key: RequestId::new().into_string(),
+                                desired_runtime: runtime.clone(),
+                                text: prompt,
+                                attachments,
+                                reasoning_effort: runtime.reasoning_effort.clone(),
+                                correlation_id: None,
+                                delivery: UserMessageDelivery::Prompt,
+                                prompt_context: None,
+                                provenance: vibex_core::MessageProvenance::HumanInput,
+                            }))
+                            .await
+                            .map(|_| ()),
+                    )
+                };
             Ok::<_, BackendError>((session, prompt_result))
         });
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
@@ -6475,6 +6663,7 @@ impl MobileApp {
                         this.new_session_runtime = None;
                         this.new_session_attachments.clear();
                         this.new_session_armed_mentions.clear();
+                        this.new_session_armed_command = None;
                         this.dismiss_overlay(None, cx);
                         this.refresh_sessions(cx);
                         this.file_new_session_in_folder(&session, cx);
@@ -7215,34 +7404,72 @@ impl MobileApp {
         (members.len() >= 2).then(|| (group.clone(), members))
     }
 
-    /// Loads the `/` commands and `@` references the open session's Agent
-    /// advertises.
+    /// Loads the `/` commands, `@` references and `$` skills the relevant
+    /// Agent advertises.
     ///
     /// A runtime that does not implement discovery simply answers with nothing,
     /// so a failure here is silent: the composer just has no suggestions. What
     /// matters is that `/plan` and `/permission` reach the authority when the
     /// user types them, and that an `@` names a real collaborator rather than a
     /// word the model has to guess at.
+    ///
+    /// The request carries the provider profile, not just the Agent id: a
+    /// runtime that owns a provider-config service resolves a provider's static
+    /// catalogue (Codex, DeepSeek Harness) through the profile, and a request
+    /// without one is answered with nothing. That omission is why `/` and `$`
+    /// opened an empty panel on a paired phone while the same Agent listed its
+    /// commands on the desktop.
     fn refresh_composer_commands(&mut self, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
+        };
+        // Prefer the new-session page's own runtime while it is open: it is the
+        // Agent the session about to be created will run, and it can differ from
+        // the session behind the page. Otherwise the open session's runtime is
+        // the one whose vocabulary the composer is completing.
+        let new_session_open = self.new_session_open && self.new_session_runtime.is_some();
+        let session_selection = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.runtime_selection.value.as_ref())
+            .map(|state| &state.desired);
+        let selection = if new_session_open {
+            self.new_session_runtime.clone()
+        } else {
+            session_selection.cloned()
         };
         let selected = self
             .controller
             .as_ref()
             .and_then(|controller| controller.state.selected_session_id.clone());
+        let (agent_id, provider_profile_id) = match selection.as_ref() {
+            Some(selection) => (
+                Some(selection.agent_id.clone()),
+                selection.provider_profile_id().cloned(),
+            ),
+            None => (
+                self.controller
+                    .as_ref()
+                    .and_then(|controller| controller.state.active_session.value.as_ref())
+                    .map(|session| session.agent_id.clone()),
+                None,
+            ),
+        };
+        // The new-session page has no session yet, so its `@` list is scoped by
+        // the workspace the session will run in rather than by a session id.
+        let session_id = (!new_session_open).then(|| selected.clone()).flatten();
+        let workspace_id = if new_session_open {
+            self.new_session_workspace_id
+                .as_deref()
+                .and_then(|id| vibex_core::WorkspaceId::parse(id).ok())
+        } else {
+            self.controller
+                .as_ref()
+                .and_then(|controller| controller.state.active_session.value.as_ref())
+                .map(|session| session.workspace_id.clone())
+        };
         self.composer_commands_generation = self.composer_commands_generation.wrapping_add(1);
         let generation = self.composer_commands_generation;
-        let agent_id = self
-            .controller
-            .as_ref()
-            .and_then(|controller| controller.state.active_session.value.as_ref())
-            .map(|session| session.agent_id.clone());
-        let workspace_id = self
-            .controller
-            .as_ref()
-            .and_then(|controller| controller.state.active_session.value.as_ref())
-            .map(|session| session.workspace_id.clone());
         // The catalogue is a remote read, so it belongs on the Tokio runtime:
         // a `vibex-remote-client` future builds its timer from the runtime
         // context it is polled in, and the GPUI foreground executor has none.
@@ -7252,8 +7479,8 @@ impl MobileApp {
             backend
                 .discover_agent_commands(AgentCommandDiscoverRequest {
                     agent_id,
-                    provider_profile_id: None,
-                    session_id: selected.clone(),
+                    provider_profile_id,
+                    session_id: session_id.clone(),
                     workspace_id,
                     // Both triggers in one read: the suggestion panel decides
                     // which list to show from the character being typed.
@@ -7282,26 +7509,7 @@ impl MobileApp {
     /// typing a command name.
     fn composer_command_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
         let draft = self.composer_input.read(cx).value().to_string();
-        let Some(prefix) = slash_command_prefix(&draft) else {
-            return Vec::new();
-        };
-        let needle = prefix.to_lowercase();
-        self.composer_commands
-            .iter()
-            .filter(|entry| entry.trigger == AgentCommandTrigger::Slash)
-            .filter(|entry| {
-                let name = entry
-                    .command_name
-                    .clone()
-                    .unwrap_or_else(|| entry.label.clone())
-                    .to_lowercase();
-                needle.is_empty()
-                    || name.contains(&needle)
-                    || entry.label.to_lowercase().contains(&needle)
-            })
-            .take(8)
-            .cloned()
-            .collect()
+        command_suggestions_for(&self.composer_commands, &draft)
     }
 
     /// The suggestion panel's contents for a `$` being typed.
@@ -7311,67 +7519,32 @@ impl MobileApp {
     /// phone adds no vocabulary of its own.
     fn composer_skill_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
         let draft = self.composer_input.read(cx).value().to_string();
-        let Some(prefix) = skill_prefix(&draft) else {
-            return Vec::new();
-        };
-        let needle = prefix.to_lowercase();
-        self.composer_commands
-            .iter()
-            .filter(|entry| entry.trigger == AgentCommandTrigger::Dollar)
-            .filter(|entry| {
-                let name = entry
-                    .command_name
-                    .clone()
-                    .unwrap_or_else(|| entry.label.clone())
-                    .trim_start_matches('$')
-                    .to_lowercase();
-                needle.is_empty()
-                    || name.contains(&needle)
-                    || entry.label.to_lowercase().contains(&needle)
-            })
-            .take(8)
-            .cloned()
-            .collect()
+        skill_suggestions_for(&self.composer_commands, &draft)
+    }
+
+    /// The new-session page's `/` list.
+    ///
+    /// The page's first message can open a command the same way a session's can
+    /// — `/plan` and `/permission` are provider commands, and the desktop lets
+    /// the reader reach them before a session exists. The phone did not, so a
+    /// `/` typed on this page did nothing at all.
+    fn new_session_command_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
+        let draft = self.new_session_prompt_input.read(cx).value().to_string();
+        command_suggestions_for(&self.composer_commands, &draft)
+    }
+
+    /// The new-session page's `$` list, from the same catalogue as the session
+    /// composer's.
+    fn new_session_skill_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
+        let draft = self.new_session_prompt_input.read(cx).value().to_string();
+        skill_suggestions_for(&self.composer_commands, &draft)
     }
 
     /// The suggestion panel's contents for an `@` typed in the new-session
     /// page's first message.
     fn new_session_mention_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
         let draft = self.new_session_prompt_input.read(cx).value().to_string();
-        let Some(prefix) = mention_prefix(&draft) else {
-            return Vec::new();
-        };
-        let needle = prefix.to_lowercase();
-        let mut mentions: Vec<AgentCommandEntry> = Vec::new();
-        for entry in self
-            .composer_commands
-            .iter()
-            .filter(|entry| entry.trigger == AgentCommandTrigger::Mention)
-        {
-            if composer_entry_mention(entry).is_none() {
-                continue;
-            }
-            let label = entry.label.trim_start_matches('@').to_lowercase();
-            let name = entry
-                .command_name
-                .clone()
-                .unwrap_or_else(|| entry.label.clone())
-                .to_lowercase();
-            if !needle.is_empty() && !label.contains(&needle) && !name.contains(&needle) {
-                continue;
-            }
-            if mentions
-                .iter()
-                .any(|existing| existing.label == entry.label)
-            {
-                continue;
-            }
-            mentions.push(entry.clone());
-            if mentions.len() >= 8 {
-                break;
-            }
-        }
-        mentions
+        mention_suggestions_for(&self.composer_commands, &draft)
     }
 
     /// Applies one `@` reference to the new-session first message.
@@ -7381,9 +7554,9 @@ impl MobileApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(mention) = composer_entry_mention(&entry) else {
-            return;
-        };
+        // A workspace file has no `VibexUseMention`: it is inserted as its own
+        // path and only a collaborator or conversation is remembered.
+        let mention = composer_entry_mention(&entry);
         let draft = self.new_session_prompt_input.read(cx).value().to_string();
         let trimmed = draft.trim_end();
         let kept = trimmed
@@ -7394,13 +7567,67 @@ impl MobileApp {
         let next = format!("{kept}{}", entry.insertion_text);
         self.new_session_prompt_input
             .update(cx, |input, cx| input.set_value(next, window, cx));
-        if !self
-            .new_session_armed_mentions
-            .iter()
-            .any(|existing| existing.reference == mention.reference)
+        if let Some(mention) = mention
+            && !self
+                .new_session_armed_mentions
+                .iter()
+                .any(|existing| existing.reference == mention.reference)
         {
             self.new_session_armed_mentions.push(mention);
         }
+        crate::platform::show_keyboard();
+        cx.notify();
+    }
+
+    /// Applies one `/` command to the new-session first message.
+    ///
+    /// An executable command is remembered for the submission: the page creates
+    /// the session and then sends the first message, and the command has to
+    /// reach the authority as a command execution rather than as its `/name`
+    /// text. A command with no execution behaviour inserts its text like a
+    /// phrase, the same as the session composer does.
+    fn choose_new_session_command(
+        &mut self,
+        entry: AgentCommandEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if is_executable_command_source(&entry) {
+            let name = entry
+                .command_name
+                .clone()
+                .unwrap_or_else(|| entry.label.clone());
+            self.new_session_armed_command = Some(entry);
+            self.new_session_prompt_input.update(cx, |input, cx| {
+                input.set_value(format!("/{name} "), window, cx)
+            });
+        } else {
+            self.new_session_armed_command = None;
+            self.new_session_prompt_input.update(cx, |input, cx| {
+                input.set_value(entry.insertion_text.clone(), window, cx)
+            });
+        }
+        crate::platform::show_keyboard();
+        cx.notify();
+    }
+
+    /// Applies one `$` skill to the new-session first message: the typed token
+    /// becomes the skill's own invocation, which is what the Agent reads.
+    fn choose_new_session_skill(
+        &mut self,
+        entry: AgentCommandEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = entry
+            .command_name
+            .clone()
+            .unwrap_or_else(|| entry.label.clone());
+        let name = name.trim_start_matches('$').to_string();
+        self.new_session_armed_command = None;
+        self.new_session_prompt_input.update(cx, |input, cx| {
+            input.set_value(format!("${name} "), window, cx)
+        });
         crate::platform::show_keyboard();
         cx.notify();
     }
@@ -7502,9 +7729,10 @@ impl MobileApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(mention) = composer_entry_mention(&entry) else {
-            return;
-        };
+        // A workspace file carries no `VibexUseMention` — it is inserted as its
+        // own path, which is what the Agent reads — so the reference is optional
+        // and only a collaborator or conversation is remembered for the send.
+        let mention = composer_entry_mention(&entry);
         let draft = self.composer_input.read(cx).value().to_string();
         let trimmed = draft.trim_end();
         let kept = trimmed
@@ -7513,12 +7741,14 @@ impl MobileApp {
             .unwrap_or_default()
             .to_string();
         let next = format!("{kept}{}", entry.insertion_text);
-        self.composer_armed_mentions.retain(|existing| {
-            existing.reference != mention.reference
-                || existing.kind != mention.kind
-                || existing.agent_id != mention.agent_id
-        });
-        self.composer_armed_mentions.push(mention);
+        if let Some(mention) = mention {
+            self.composer_armed_mentions.retain(|existing| {
+                existing.reference != mention.reference
+                    || existing.kind != mention.kind
+                    || existing.agent_id != mention.agent_id
+            });
+            self.composer_armed_mentions.push(mention);
+        }
         self.composer_input
             .update(cx, |input, cx| input.set_value(next, window, cx));
         crate::platform::show_keyboard();
@@ -9586,10 +9816,15 @@ impl MobileApp {
             // name and path: the next session is a different piece of work.
             self.new_session_attachments.clear();
             self.new_session_armed_mentions.clear();
+            self.new_session_armed_command = None;
             self.pending_input_writes
                 .push((InputField::NewSessionWorktreeName, String::new()));
             self.pending_input_writes
                 .push((InputField::NewSessionWorktreePath, String::new()));
+            // The catalogue on screen belonged to the page's Agent. Closing the
+            // page hands the composer back to the session, so the session's own
+            // vocabulary is read again rather than left as the page's.
+            self.refresh_composer_commands(cx);
         }
         self.overlay = None;
         self.overlay_returns_to_drawer = false;
@@ -20519,6 +20754,7 @@ impl MobileApp {
                             .child(
                                 Textarea::new(&self.composer_input)
                                     .appearance(false)
+                                    .text_size(theme::font_body())
                                     // The long press hook is the only signal the
                                     // platform gives for "the user selected this
                                     // word": open the touch toolbar instead of the
@@ -20772,16 +21008,24 @@ impl MobileApp {
                     .children(entries.iter().map(|entry| {
                         let entry = entry.clone();
                         let mention = kind.is_mention();
-                        let executable = kind == ComposerSuggestionKind::Command
-                            && is_executable_command_source(&entry);
+                        let executable = matches!(
+                            kind,
+                            ComposerSuggestionKind::Command
+                                | ComposerSuggestionKind::NewSessionCommand
+                        ) && is_executable_command_source(&entry);
                         let destructive = entry.destructive;
                         let label = entry.label.clone();
-                        // A collaborator's row is described by the account it
-                        // runs as and the model it runs, both written by the
-                        // runtime; the account is the one name this client says
-                        // for itself.
-                        let description =
-                            entry.description.as_deref().map(runtime_attribution_line);
+                        // A file reference shows the path behind its name; every
+                        // other reference shows the description the authority
+                        // wrote — a collaborator's account and model, a
+                        // session's Agent — because those have no path and the
+                        // configurations of one Agent are otherwise identical
+                        // rows. The same split the desktop draws.
+                        let description = entry
+                            .reference_path
+                            .clone()
+                            .filter(|_| entry.source_kind == AgentCommandSourceKind::Reference)
+                            .or_else(|| entry.description.as_deref().map(runtime_attribution_line));
                         let name = entry
                             .command_name
                             .clone()
@@ -20789,10 +21033,12 @@ impl MobileApp {
                         let leading = match kind {
                             ComposerSuggestionKind::Mention
                             | ComposerSuggestionKind::NewSessionMention => entry.label.clone(),
-                            ComposerSuggestionKind::Skill => {
+                            ComposerSuggestionKind::Skill
+                            | ComposerSuggestionKind::NewSessionSkill => {
                                 format!("${}", name.trim_start_matches('$'))
                             }
-                            ComposerSuggestionKind::Command => format!("/{name}"),
+                            ComposerSuggestionKind::Command
+                            | ComposerSuggestionKind::NewSessionCommand => format!("/{name}"),
                         };
                         div()
                             .id(format!("composer-suggestion:{}", entry.id))
@@ -20818,8 +21064,14 @@ impl MobileApp {
                                     ComposerSuggestionKind::Skill => {
                                         this.choose_composer_skill(entry.clone(), window, cx)
                                     }
+                                    ComposerSuggestionKind::NewSessionSkill => {
+                                        this.choose_new_session_skill(entry.clone(), window, cx)
+                                    }
                                     ComposerSuggestionKind::Command => {
                                         this.choose_composer_command(entry.clone(), window, cx)
+                                    }
+                                    ComposerSuggestionKind::NewSessionCommand => {
+                                        this.choose_new_session_command(entry.clone(), window, cx)
                                     }
                                 }),
                             )
@@ -26955,6 +27207,8 @@ impl MobileApp {
         let runtime_summary = runtime_selection_summary(runtime_catalog, runtime_selection);
         let prompt = self.new_session_prompt_input.read(cx).value();
         let new_session_mentions = self.new_session_mention_suggestions(cx);
+        let new_session_commands = self.new_session_command_suggestions(cx);
+        let new_session_skills = self.new_session_skill_suggestions(cx);
         // A first message may be a file on its own, the same way a prompt in
         // the composer may be: the field being empty is not the same as there
         // being nothing to send.
@@ -27143,13 +27397,33 @@ impl MobileApp {
                                             )
                                             .child(
                                                 Textarea::new(&self.new_session_prompt_input)
-                                                    .appearance(false),
+                                                    .appearance(false)
+                                                    .text_size(theme::font_body()),
                                             ),
                                     )
+                                    // The first message opens the same three lists
+                                    // the session composer does — `/` commands, `@`
+                                    // references, `$` skills — so a trigger typed
+                                    // before the session exists behaves the way it
+                                    // will once it does.
+                                    .when(!new_session_commands.is_empty(), |card| {
+                                        card.child(self.render_composer_suggestion_panel(
+                                            &new_session_commands,
+                                            ComposerSuggestionKind::NewSessionCommand,
+                                            cx,
+                                        ))
+                                    })
                                     .when(!new_session_mentions.is_empty(), |card| {
                                         card.child(self.render_composer_suggestion_panel(
                                             &new_session_mentions,
                                             ComposerSuggestionKind::NewSessionMention,
+                                            cx,
+                                        ))
+                                    })
+                                    .when(!new_session_skills.is_empty(), |card| {
+                                        card.child(self.render_composer_suggestion_panel(
+                                            &new_session_skills,
+                                            ComposerSuggestionKind::NewSessionSkill,
                                             cx,
                                         ))
                                     })
@@ -33066,11 +33340,11 @@ mod tests {
         app.update(cx, |app, cx| {
             app.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
             app.runtime_draft = Some(chosen.clone());
-            app.commit_new_session_runtime_draft();
+            app.commit_new_session_runtime_draft(cx);
             assert!(app.new_session_runtime.is_none());
 
             app.runtime_options_target = RuntimeOptionsTarget::NewSession;
-            app.commit_new_session_runtime_draft();
+            app.commit_new_session_runtime_draft(cx);
             assert_eq!(app.new_session_runtime.as_ref(), Some(&chosen));
 
             // Closing the sheet leaves the page's own draft in place and the
@@ -33582,11 +33856,14 @@ mod tests {
             ComposerSuggestionKind::Mention.element_id(),
             ComposerSuggestionKind::Skill.element_id(),
             ComposerSuggestionKind::NewSessionMention.element_id(),
+            ComposerSuggestionKind::NewSessionCommand.element_id(),
+            ComposerSuggestionKind::NewSessionSkill.element_id(),
         ];
         let unique = ids.iter().collect::<BTreeSet<_>>();
         assert_eq!(unique.len(), ids.len());
         assert!(ComposerSuggestionKind::NewSessionMention.is_mention());
         assert!(!ComposerSuggestionKind::Skill.is_mention());
+        assert!(!ComposerSuggestionKind::NewSessionSkill.is_mention());
     }
 
     #[test]
@@ -38582,10 +38859,9 @@ fn session_opened(cx: &mut Context<Self>) {
     /// The composer and the new-session prompt teach the triggers in the room
     /// one line has.
     ///
-    /// The desktop placeholder names the same three characters and stops, but
-    /// its sentence carries a redundant preamble and a history hint that a
-    /// phone field would only truncate. Both mobile fields share one string so
-    /// the two pages cannot drift.
+    /// Both mobile fields share one string so the two pages cannot drift, and
+    /// that string is the desktop's own vocabulary with the key-only history
+    /// hint dropped.
     #[test]
     fn the_composer_placeholder_matches_the_desktop_hint() {
         let placeholder = composer_placeholder();
@@ -38611,6 +38887,157 @@ fn session_opened(cx: &mut Context<Self>) {
             2,
             "both the session and the new-session fields should use the shared hint"
         );
+    }
+
+    /// Both prompt fields grow with their text, and neither is the kit's small
+    /// default.
+    ///
+    /// The new-session field had no growth at all, so its third line was hidden
+    /// while the session composer's was not; and both were left at the kit's
+    /// muted `Medium` size, which is smaller than every other line of the app.
+    #[test]
+    fn both_prompt_fields_grow_and_read_at_body_size() {
+        let source = include_str!("app.rs");
+        let (body, _) = source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module should stay last");
+
+        assert_eq!(
+            body.matches(".auto_grow(MOBILE_COMPOSER_MIN_ROWS, MOBILE_COMPOSER_MAX_ROWS)")
+                .count(),
+            2,
+            "the session and new-session fields share one growth range"
+        );
+        assert!(
+            body.matches(".text_size(theme::font_body())").count() >= 2,
+            "both prompt fields read at body size"
+        );
+        // The one the kit would otherwise pick is its own `Medium` step.
+        assert!(
+            !body.contains(".auto_grow(1, 1)"),
+            "the new-session field must not be pinned to a single row"
+        );
+    }
+
+    /// The new-session page offers all three trigger lists, not just `@`.
+    ///
+    /// The page's first message had only a mention list, so a `/` or `$` typed
+    /// before the session existed opened nothing. The desktop reaches provider
+    /// commands from this page, and the phone now does too.
+    #[test]
+    fn the_new_session_page_opens_every_trigger_list() {
+        let source = include_str!("app.rs");
+        let page = renderer_source(source, "render_new_session");
+        for kind in [
+            "ComposerSuggestionKind::NewSessionCommand",
+            "ComposerSuggestionKind::NewSessionMention",
+            "ComposerSuggestionKind::NewSessionSkill",
+        ] {
+            assert!(
+                page.contains(kind),
+                "the new-session page should draw {kind}"
+            );
+        }
+
+        // The catalogue is fetched for the page and for a runtime change, or
+        // the lists above would always be empty.
+        assert!(
+            source.contains("self.refresh_composer_commands(cx);"),
+            "the page has to load the Agent's catalogue"
+        );
+    }
+
+    /// A command chosen before the session exists runs against that session.
+    #[test]
+    fn a_new_session_command_runs_once_the_session_is_created() {
+        let source = include_str!("app.rs");
+        let submit = renderer_source(source, "submit_new_session");
+
+        assert!(
+            submit.contains("new_session_armed_command")
+                && submit.contains("execute_agent_command"),
+            "the armed command is executed against the session the page creates"
+        );
+        assert!(
+            submit.contains("command_entry_matches_draft(&prompt"),
+            "a draft that no longer names the command must not run it"
+        );
+        assert!(
+            submit.contains("armed_command.is_some()"),
+            "the command replaces the ordinary first message rather than joining it"
+        );
+    }
+
+    /// A trigger offers its own kind of entry, and `@` keeps workspace files.
+    ///
+    /// The three lists are the same gesture with a different character in
+    /// front, and `@` is the one that carries both references and files. A file
+    /// entry has no `VibexUseMention` — it inserts its own path — so a filter
+    /// that only accepted mention-shaped rows silently dropped every file, and
+    /// `@` looked broken for the case it is used most.
+    #[test]
+    fn each_trigger_selects_its_own_entries() {
+        let entry = |id: &str, trigger: AgentCommandTrigger, label: &str| AgentCommandEntry {
+            id: id.to_string(),
+            trigger,
+            source_kind: AgentCommandSourceKind::Provider,
+            label: label.to_string(),
+            description: None,
+            insertion_text: format!("{label} "),
+            command_name: Some(label.trim_start_matches(['/', '$']).to_string()),
+            provider_kind: None,
+            prompt_id: None,
+            skill_id: None,
+            reference_path: None,
+            selection_behavior: vibex_core::AgentCommandSelectionBehavior::Insert,
+            execution_behavior: vibex_core::AgentCommandExecutionBehavior::ProviderCommand,
+            destructive: false,
+            metadata: Vec::new(),
+        };
+        let mut file = entry("file", AgentCommandTrigger::Mention, "@lib.rs");
+        file.source_kind = AgentCommandSourceKind::Reference;
+        file.reference_path = Some("crates/lib.rs".to_string());
+        let catalogue = vec![
+            entry("cmd", AgentCommandTrigger::Slash, "/review"),
+            entry("skill", AgentCommandTrigger::Dollar, "$deploy"),
+            file,
+        ];
+
+        assert_eq!(
+            command_suggestions_for(&catalogue, "/re").len(),
+            1,
+            "a slash lists the commands"
+        );
+        assert_eq!(
+            skill_suggestions_for(&catalogue, "$de").len(),
+            1,
+            "a dollar lists the skills"
+        );
+        let mentions = mention_suggestions_for(&catalogue, "@li");
+        assert_eq!(mentions.len(), 1, "an at-sign lists the references");
+        assert_eq!(
+            mentions[0].reference_path.as_deref(),
+            Some("crates/lib.rs"),
+            "the workspace file is what the at-sign is for"
+        );
+
+        // A token that has been completed with a space is prose, not a trigger.
+        for (text, empty) in [
+            (
+                "/re done",
+                command_suggestions_for(&catalogue, "/re done").is_empty(),
+            ),
+            (
+                "$de done",
+                skill_suggestions_for(&catalogue, "$de done").is_empty(),
+            ),
+            (
+                "@li done",
+                mention_suggestions_for(&catalogue, "@li done").is_empty(),
+            ),
+        ] {
+            assert!(empty, "{text:?} is no longer typing the trigger");
+        }
     }
 
     /// Send and Stop are one control, and Stop is the fallback state.
