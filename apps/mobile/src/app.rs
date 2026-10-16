@@ -2462,14 +2462,37 @@ enum LongPressTarget {
     NewSessionModels,
 }
 
-/// One pill inside a prompt card's control row.
+/// The composer's placeholder, shared by the session page and the new-session
+/// page.
 ///
-/// The pill is what the reader sees, the row is what the reader aims at: a chip
-/// is one compact line inside a full touch target, so the card stays short
-/// without asking the thumb to be precise. A chip carries the value it is set
-/// to rather than a label for it — the model, the permission, the place the
-/// session will run — because on this page the value is the thing being
-/// decided.
+/// It is the desktop's composer hint in the desktop's own vocabulary — / for
+/// commands, @ for workspace files, $ for skills — with the trailing ↑/↓
+/// history shortcut dropped, because a phone recalls history from a button
+/// rather than a key. The desktop's *new-session* sentence is too long for a
+/// phone field: with "描述你的任务，或…" in front it truncates mid-word, which is
+/// exactly what the mobile field used to do.
+///
+/// The session field used to say only "Message Vibex", which named the object
+/// but never the triggers. One short, shared line teaches the same three
+/// characters on both pages and reads as the same product as the desktop.
+fn composer_placeholder() -> &'static str {
+    locale::text(
+        "Type / for commands, @ for workspace files, $ for skills",
+        "输入 / 唤出命令，@ 引用工作区文件，$ 调用 Skill",
+        "輸入 / 喚出命令，@ 引用工作區檔案，$ 呼叫 Skill",
+    )
+}
+
+/// One option inside a prompt card's control row.
+///
+/// The option is what the reader sees, the row is what the reader aims at: a
+/// chip is one compact line inside a full touch target, so the card stays short
+/// without asking the thumb to be precise. It is deliberately bare — an icon
+/// and the value, with no capsule behind them — because the card already frames
+/// it and a row of filled pills competes with the message above. A chip carries
+/// the value it is set to rather than a label for it — the model, the
+/// permission, the place the session will run — because on this page the value
+/// is the thing being decided.
 fn composer_chip(
     id: &'static str,
     icon: gpui::AnyElement,
@@ -2511,9 +2534,8 @@ fn composer_chip(
                 .h(px(theme::CHIP_HEIGHT))
                 .max_w_full()
                 .min_w_0()
-                .px(px(theme::SPACING_MD))
-                .rounded_full()
-                .bg(theme::bg_card_dim())
+                .px(px(theme::SPACING_XS))
+                .rounded(px(theme::RADIUS_CONTROL))
                 .flex()
                 .items_center()
                 .gap(px(theme::SPACING_XS))
@@ -2528,7 +2550,7 @@ fn composer_chip(
                         .text_color(if warn {
                             theme::accent_yellow()
                         } else {
-                            theme::text_primary()
+                            theme::text_secondary()
                         })
                         .child(value),
                 ),
@@ -2602,15 +2624,30 @@ fn composer_icon_button(
         )
 }
 
-/// The prompt card's send control.
+/// What the prompt card's single primary control does right now.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComposerPrimaryAction {
+    /// Send what the reader wrote, queueing it against a running turn.
+    Send,
+    /// A turn is running with nothing typed: the only action is to stop it.
+    Stop,
+}
+
+/// The prompt card's one primary control.
 ///
-/// It carries the page's primary action, so its three states are the whole
-/// story: filled while there is something to send, dimmed while there is not,
-/// and a spinner while the session is being created and the rest of the card
-/// is only reporting that fact.
-fn composer_send_button(
+/// Send and Stop used to be two controls, which cost the row a slot and split
+/// one commitment across two targets. They are one button now: with an empty
+/// field while a turn runs it stops the turn, and otherwise it sends — holding
+/// the message against the running turn rather than shouting over it, the same
+/// choice the desktop's primary action makes.
+///
+/// Its states are the whole story: filled while there is something to do, a
+/// stop plate while a turn can be stopped, and a spinner while the session is
+/// being created and the rest of the card is only reporting that fact.
+fn composer_primary_button(
     id: &'static str,
     aria: String,
+    action: ComposerPrimaryAction,
     enabled: bool,
     busy: bool,
     handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
@@ -2632,10 +2669,21 @@ fn composer_send_button(
                 .color(theme::text_secondary()),
         );
     }
+    // Send is the solid primary commitment. Stop is the desktop's danger
+    // treatment rather than a second solid plate: a soft tinted target with the
+    // destructive colour in the mark, so halting does not read as the page's
+    // default action.
+    let (plate, mark) = match (action, enabled) {
+        (ComposerPrimaryAction::Send, true) => (theme::primary(), theme::primary_foreground()),
+        (ComposerPrimaryAction::Stop, true) => {
+            (theme::accent_red().opacity(0.16), theme::accent_red())
+        }
+        (_, false) => (theme::bg_card_dim(), theme::text_muted()),
+    };
     button
         .when(enabled, |button| {
             button
-                .bg(theme::primary())
+                .bg(plate)
                 .cursor_pointer()
                 .active(|style| style.opacity(0.75))
                 .on_mouse_up(MouseButton::Left, handler)
@@ -2643,16 +2691,21 @@ fn composer_send_button(
         .when(!enabled, |button| {
             button.bg(theme::bg_card_dim()).opacity(0.55)
         })
-        .child(
-            svg()
+        .child(match action {
+            ComposerPrimaryAction::Send => svg()
                 .path("icons/send.svg")
                 .size(px(theme::ICON_MD))
-                .text_color(if enabled {
-                    theme::primary_foreground()
-                } else {
-                    theme::text_muted()
-                }),
-        )
+                .text_color(mark)
+                .into_any_element(),
+            // The stop mark is drawn rather than stroked: a filled square is the
+            // media convention for "halt", and it stays legible at this size
+            // where the outlined glyph reads as another rounded icon.
+            ComposerPrimaryAction::Stop => div()
+                .size(px(11.0))
+                .rounded(px(2.0))
+                .bg(mark)
+                .into_any_element(),
+        })
 }
 
 fn settings_hint_note(text: &'static str) -> gpui::AnyElement {
@@ -2920,11 +2973,7 @@ impl MobileApp {
             });
         let composer_input = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder(locale::text(
-                    "Message Vibex",
-                    "发送消息给 Vibex",
-                    "傳送訊息給 Vibex",
-                ))
+                .placeholder(composer_placeholder())
                 .auto_grow(1, 6)
         });
         // The selection toolbar is its own view: it floats over the whole
@@ -3113,11 +3162,7 @@ impl MobileApp {
                 // placeholder doubles as the only place the three suggestion
                 // characters are introduced, which is how the desktop teaches
                 // them too.
-                TextareaState::new(window, cx).placeholder(locale::text(
-                    "Describe a task, or type / for commands, @ for files, $ for skills",
-                    "描述你的任务，或输入 / 唤出命令、@ 引用文件、$ 调用 Skill",
-                    "描述你的任務，或輸入 / 喚出命令、@ 引用檔案、$ 呼叫 Skill",
-                ))
+                TextareaState::new(window, cx).placeholder(composer_placeholder())
             }),
             worktree_path_browser: None,
             new_session_worktree_name_input: cx.new(|cx| {
@@ -20321,6 +20366,16 @@ impl MobileApp {
         let editing_message = self.composer_message_edit.is_some();
         let history_enabled = !self.operation_busy && !turns.is_empty();
         let stop_enabled = state.is_some() && !self.operation_busy && !runtime_switch_pending;
+        // The single primary control is Stop only while a turn runs and there
+        // is nothing to send; the moment the reader writes anything it is Send
+        // again, so the field and the button never disagree about the action.
+        let primary_stop = running && !has_content;
+        // The clock is a permanent resident of the card's top-right corner
+        // whenever a session is open, so the field's clearance and the control
+        // itself do not jump as the reader types. It only becomes armed — and
+        // only opens the sheet — once there is something to schedule.
+        let schedule_shown = state.is_some() && !editing_message;
+        let schedule_enabled = schedule_shown && has_content;
         let usage_fraction = self.token_usage.as_ref().and_then(token_usage_fraction);
         let usage_percent = usage_fraction.unwrap_or(0.0) * 100.0;
         let usage_color = match usage_fraction {
@@ -20442,6 +20497,7 @@ impl MobileApp {
             // and the ring the second, on the line the reader is already using.
             .child(
                 div()
+                    .relative()
                     .min_h(px(52.0))
                     .rounded(px(theme::RADIUS_COMPOSER))
                     .border_1()
@@ -20454,6 +20510,9 @@ impl MobileApp {
                     .child(
                         div()
                             .w_full()
+                            // Keep the typed line clear of the schedule control
+                            // parked in the card's top-right corner.
+                            .when(schedule_shown, |field| field.pr(px(theme::TOUCH_TARGET)))
                             .min_h(px(theme::TOUCH_TARGET))
                             .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                             .child(
@@ -20484,14 +20543,20 @@ impl MobileApp {
                             .gap(px(theme::SPACING_XS))
                             // The attach menu offers the two things a phone can
                             // hand over: a photo the host scales down, or a file
-                            // it carries whole.
-                            .child(composer_icon_button(
-                                "attach-file",
-                                "icons/plus.svg",
-                                locale::text("Attach a file", "添加附件", "新增附件").to_string(),
-                                attach_enabled,
-                                cx.listener(Self::open_composer_attach_menu),
-                            ))
+                            // it carries whole. It sits against the card's own
+                            // leading inset rather than a control row's, so the
+                            // options beside it keep their full width.
+                            .child(
+                                composer_icon_button(
+                                    "attach-file",
+                                    "icons/plus.svg",
+                                    locale::text("Attach a file", "添加附件", "新增附件")
+                                        .to_string(),
+                                    attach_enabled,
+                                    cx.listener(Self::open_composer_attach_menu),
+                                )
+                                .ml(px(-theme::SPACING_SM)),
+                            )
                             // The model is the chip's whole story here: the mode
                             // the session is running under was chosen when it
                             // started, and the sheet behind this chip is where
@@ -20513,10 +20578,11 @@ impl MobileApp {
                                 .min_w_0(),
                             )
                             // Recall rather than retype: the prompts already sent
-                            // in this session are one tap away.
+                            // in this session are one tap away. The arrow is not
+                            // a clock — the clock belongs to scheduling now.
                             .child(composer_icon_button(
                                 "composer-history",
-                                "icons/clock.svg",
+                                "icons/rotate-ccw.svg",
                                 locale::text("Earlier messages", "历史消息", "歷史訊息")
                                     .to_string(),
                                 history_enabled,
@@ -20557,63 +20623,69 @@ impl MobileApp {
                                             }),
                                     ),
                             )
-                            // Stop is its own control while a turn runs. It used
-                            // to replace Send, which left the user with no way to
-                            // say anything to a turn that was already going: now
-                            // Send steers the running turn and Stop pauses it.
-                            .when(running, |row| {
-                                row.child(
-                                    div()
-                                        .id("stop-turn")
-                                        .size(px(theme::TOUCH_TARGET))
-                                        .flex_shrink_0()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .aria_label(locale::common("Stop"))
-                                        .rounded_full()
-                                        .when(stop_enabled, |button| {
-                                            button
-                                                .cursor_pointer()
-                                                .active(|style| style.bg(theme::row_pressed_bg()))
-                                                .on_mouse_up(
-                                                    MouseButton::Left,
-                                                    cx.listener(Self::interrupt),
-                                                )
-                                        })
-                                        .when(!stop_enabled, |button| button.opacity(0.45))
-                                        .child(
-                                            svg()
-                                                .path("icons/stop.svg")
-                                                .size(px(theme::ICON_MD))
-                                                .text_color(if stop_enabled {
-                                                    theme::accent_red()
-                                                } else {
-                                                    theme::text_muted()
-                                                }),
-                                        ),
+                            // Send and Stop are the same target, so the row keeps
+                            // one slot for the page's commitment. With an empty
+                            // field and a turn running it stops the turn; with
+                            // anything written it sends — queueing the message
+                            // against the running turn rather than replacing the
+                            // control the reader needs to speak.
+                            .child(if primary_stop {
+                                composer_primary_button(
+                                    "stop-turn",
+                                    locale::common("Stop").to_string(),
+                                    ComposerPrimaryAction::Stop,
+                                    stop_enabled,
+                                    false,
+                                    cx.listener(Self::interrupt),
                                 )
-                            })
-                            // Scheduling is the one thing a phone cannot do for
-                            // itself: the queue belongs to the desktop, so the
-                            // message travels there and waits. The control only
-                            // appears with something to send, so an empty
-                            // composer stays as wide as it was.
-                            .when(has_content && state.is_some() && !editing_message, |row| {
-                                row.child(
-                                    div()
-                                        .id("schedule-message")
-                                        .debug_selector(|| "schedule-message".to_string())
-                                        .aria_label(
-                                            locale::text("Schedule send", "定时发送", "定時傳送")
-                                                .to_string(),
+                            } else {
+                                composer_primary_button(
+                                    "send-message",
+                                    if editing_message {
+                                        locale::text("Replace message", "替换消息", "取代訊息")
+                                            .to_string()
+                                    } else if running {
+                                        locale::text(
+                                            "Steer the turn",
+                                            "引导当前回合",
+                                            "引導目前回合",
                                         )
-                                        .size(px(theme::TOUCH_TARGET))
-                                        .flex_shrink_0()
-                                        .rounded_full()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
+                                        .to_string()
+                                    } else {
+                                        locale::common("Send").to_string()
+                                    },
+                                    ComposerPrimaryAction::Send,
+                                    send_enabled,
+                                    false,
+                                    cx.listener(Self::send_message),
+                                )
+                            }),
+                    )
+                    // Scheduling is the one thing a phone cannot do for itself:
+                    // the queue belongs to the desktop, so the message travels
+                    // there and waits. It lives in the card's top-right corner,
+                    // the same corner the desktop keeps it in, and stays there
+                    // for as long as the session is: dimmed until there is
+                    // something to schedule, so the corner never shifts.
+                    .when(schedule_shown, |card| {
+                        card.child(
+                            div()
+                                .id("schedule-message")
+                                .debug_selector(|| "schedule-message".to_string())
+                                .aria_label(
+                                    locale::text("Schedule send", "定时发送", "定時傳送")
+                                        .to_string(),
+                                )
+                                .absolute()
+                                .top(px(theme::SPACING_SM))
+                                .right(px(theme::SPACING_SM))
+                                .size(px(theme::TOUCH_TARGET))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(schedule_enabled, |clock| {
+                                    clock
                                         .cursor_pointer()
                                         .active(|style| style.bg(theme::row_pressed_bg()))
                                         .on_mouse_up(
@@ -20622,30 +20694,20 @@ impl MobileApp {
                                                 this.begin_composer_schedule(cx)
                                             }),
                                         )
-                                        .child(
-                                            svg()
-                                                .path("icons/clock.svg")
-                                                .size(px(theme::ICON_MD))
-                                                .text_color(theme::text_secondary()),
-                                        ),
-                                )
-                            })
-                            .child(composer_send_button(
-                                "send-message",
-                                if editing_message {
-                                    locale::text("Replace message", "替换消息", "取代訊息")
-                                        .to_string()
-                                } else if running {
-                                    locale::text("Steer the turn", "引导当前回合", "引導目前回合")
-                                        .to_string()
-                                } else {
-                                    locale::common("Send").to_string()
-                                },
-                                send_enabled,
-                                false,
-                                cx.listener(Self::send_message),
-                            )),
-                    ),
+                                })
+                                .when(!schedule_enabled, |clock| clock.opacity(0.42))
+                                .child(
+                                    svg()
+                                        .path("icons/clock.svg")
+                                        .size(px(theme::ICON_MD))
+                                        .text_color(if schedule_enabled {
+                                            theme::text_secondary()
+                                        } else {
+                                            theme::text_muted()
+                                        }),
+                                ),
+                        )
+                    }),
             )
     }
 
@@ -27107,18 +27169,21 @@ impl MobileApp {
                                             .flex()
                                             .items_center()
                                             .gap(px(theme::SPACING_XS))
-                                            .child(composer_icon_button(
-                                                "mobile-new-session-attach",
-                                                "icons/plus.svg",
-                                                locale::text(
-                                                    "Attach a file",
-                                                    "添加附件",
-                                                    "新增附件",
+                                            .child(
+                                                composer_icon_button(
+                                                    "mobile-new-session-attach",
+                                                    "icons/plus.svg",
+                                                    locale::text(
+                                                        "Attach a file",
+                                                        "添加附件",
+                                                        "新增附件",
+                                                    )
+                                                    .to_string(),
+                                                    !busy,
+                                                    cx.listener(Self::open_new_session_attach_menu),
                                                 )
-                                                .to_string(),
-                                                !busy,
-                                                cx.listener(Self::open_new_session_attach_menu),
-                                            ))
+                                                .ml(px(-theme::SPACING_SM)),
+                                            )
                                             .child(
                                                 composer_chip(
                                                     "mobile-new-session-model",
@@ -27147,9 +27212,10 @@ impl MobileApp {
                                                 ComposerChipAction::NewSessionPermission,
                                                 cx,
                                             ))
-                                            .child(composer_send_button(
+                                            .child(composer_primary_button(
                                                 "mobile-new-session-submit",
                                                 locale::common("Start session").to_string(),
+                                                ComposerPrimaryAction::Send,
                                                 can_submit && runtime_ready,
                                                 busy,
                                                 cx.listener(Self::submit_new_session),
@@ -38502,6 +38568,101 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             open.contains("unix_timestamp_ms() + 60 * 60 * 1_000"),
             "and starts an hour out, the first deadline worth offering"
+        );
+    }
+
+    /// The composer and the new-session prompt teach the triggers in the room
+    /// one line has.
+    ///
+    /// The desktop placeholder names the same three characters and stops, but
+    /// its sentence carries a redundant preamble and a history hint that a
+    /// phone field would only truncate. Both mobile fields share one string so
+    /// the two pages cannot drift.
+    #[test]
+    fn the_composer_placeholder_matches_the_desktop_hint() {
+        let placeholder = composer_placeholder();
+        for trigger in ["/", "@", "$"] {
+            assert!(
+                placeholder.contains(trigger),
+                "{placeholder:?} should name the {trigger} trigger"
+            );
+        }
+        assert!(
+            !placeholder.contains("Describe a task"),
+            "the preamble the desktop keeps is one line too many on a phone"
+        );
+
+        let source = include_str!("app.rs");
+        // Count the call sites in the crate body, before the test module's own
+        // references to the same name would inflate the total.
+        let (body, _) = source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module should stay last");
+        assert_eq!(
+            body.matches(".placeholder(composer_placeholder())").count(),
+            2,
+            "both the session and the new-session fields should use the shared hint"
+        );
+    }
+
+    /// Send and Stop are one control, and Stop is the fallback state.
+    ///
+    /// They used to be two buttons that each took a slot, which pressed the
+    /// options beside them; merging them gives the row back that space. The
+    /// merged button stops only while a turn runs and nothing is written, so
+    /// typing while the Agent works still steers it.
+    #[test]
+    fn one_primary_control_sends_and_stops() {
+        let source = include_str!("app.rs");
+        let composer = renderer_source(source, "render_composer");
+
+        assert!(
+            composer.contains("if primary_stop {"),
+            "the primary control picks its action from one condition"
+        );
+        assert!(
+            composer.contains("ComposerPrimaryAction::Stop")
+                && composer.contains("ComposerPrimaryAction::Send"),
+            "and the two actions are the same target"
+        );
+        assert!(
+            composer.matches("composer_primary_button(").count() == 2,
+            "the row draws exactly one primary control, whichever action it takes"
+        );
+
+        let (_, helper) = source
+            .split_once("\nfn composer_primary_button(")
+            .expect("the merged primary control stays a free function");
+        let helper = &helper[..helper.find("\n}\n").unwrap_or(helper.len())];
+        assert!(
+            helper.contains("theme::accent_red()") && helper.contains("icons/send.svg"),
+            "Send is solid primary and Stop carries the destructive colour"
+        );
+    }
+
+    /// The composer's clock schedules; recall moved to its own mark.
+    ///
+    /// The control used to open the history sheet, which is not what a clock
+    /// means and not where the desktop keeps it. The history control now wears
+    /// the recall arrow, and the clock is the schedule control parked in the
+    /// card's top-right corner.
+    #[test]
+    fn the_clock_schedules_and_recall_wears_its_own_mark() {
+        let source = include_str!("app.rs");
+        let composer = renderer_source(source, "render_composer");
+
+        assert!(
+            composer.contains("\"composer-history\"") && composer.contains("icons/rotate-ccw.svg"),
+            "recall is the arrow, not the clock"
+        );
+        assert!(
+            composer.contains(".id(\"schedule-message\")")
+                && composer.contains("this.begin_composer_schedule(cx)"),
+            "the clock opens the schedule sheet"
+        );
+        assert!(
+            composer.contains("this.open_composer_history(window, cx)"),
+            "and a clock tap never opens the history sheet"
         );
     }
 
