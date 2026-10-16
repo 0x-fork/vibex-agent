@@ -5933,6 +5933,9 @@ fn push_registry_segment(
 /// list does not jump when the answer lands.
 const SKELETON_ROWS: usize = 6;
 
+/// How far the detail pane's own lines are indented.
+const DETAIL_PREFIX: usize = 2;
+
 fn registry_note(app: &App, shown: usize, strings: Strings) -> Option<String> {
     let note = app.management_data.market_note.as_ref()?;
     // A registry that refused is the state the list is in, so it is drawn where
@@ -6077,6 +6080,18 @@ fn render_config_detail(
             Style::default().fg(theme.roles.gray_dim),
         ),
     ]));
+    // The badge the row wears, on the pane too: the table and the pane are one
+    // record read two ways, and a reader whose eyes are in the pane should not
+    // have to look back at the row to find out what state it is in.
+    if !row.chip.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(" ".repeat(DETAIL_PREFIX), Style::default()),
+            Span::styled(
+                format!(" {} ", row.chip),
+                chip_style(row.tone, theme).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
     if let Some(summary) = &row.summary {
         for line in textwrap(summary, usize::from(area.width).saturating_sub(4)) {
             lines.push(Line::from(Span::styled(

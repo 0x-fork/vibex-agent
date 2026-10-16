@@ -1387,10 +1387,14 @@ pub fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
     // the ones the roster does not hold. A stable sort keeps the authority's
     // own order inside each group.
     let mut ordered = data.agents.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|agent| match (agent.added, agent.enabled) {
-        (true, true) => 0,
-        (true, false) => 1,
-        (false, _) => 2,
+    // The group first, then the order the authority holds — which every client
+    // reads, so the arrangement is shared rather than local to this one — and
+    // the id last so two records that claim the same place still have one.
+    ordered.sort_by(|left, right| {
+        agent_group(left)
+            .cmp(&agent_group(right))
+            .then(left.order_index.cmp(&right.order_index))
+            .then(left.id.as_str().cmp(right.id.as_str()))
     });
     ordered
         .into_iter()
@@ -1444,6 +1448,10 @@ pub fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                     ConfigAction::AddToRoster
                 },
             );
+            // The two places are offered on every row: a row at the end of its
+            // group has nowhere to go, and the reducer is where that is known.
+            actions.push(ConfigAction::MoveUp);
+            actions.push(ConfigAction::MoveDown);
             if agent.managed_install.managed {
                 // An Agent the authority already has at a newer version is
                 // upgraded rather than installed again: the two run the same
@@ -2058,6 +2066,19 @@ pub fn skill_market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigR
                 }])
         })
         .collect()
+}
+
+/// Which of the roster's three groups an Agent is in, as a sort key.
+///
+/// Enabled first, then added but switched off, then the ones the roster does
+/// not hold — the order the desktop shows them in, so the two clients list the
+/// same roster the same way.
+pub fn agent_group(agent: &vibex_core::AgentSnapshotEntry) -> u8 {
+    match (agent.added, agent.enabled) {
+        (true, true) => 0,
+        (true, false) => 1,
+        (false, _) => 2,
+    }
 }
 
 /// How far a registry Skill has reached, by the first count it publishes.

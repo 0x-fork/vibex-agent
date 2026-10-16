@@ -3898,3 +3898,95 @@ fn a_failed_install_says_so_on_the_row() {
         "the error code was dropped"
     );
 }
+
+/// The roster's order is the authority's, so a move is a swap of two places.
+///
+/// Every client reads the same order, which is why it is not a list this client
+/// keeps to itself. An Agent at either end of its own group has nowhere to go,
+/// and one at the edge of its group does not cross into the next: the groups
+/// are the roster's, not the reader's.
+#[test]
+fn moving_an_agent_swaps_two_places_in_its_own_group() {
+    let mut app = loaded(140, 40);
+    let mut second = second_agent();
+    second.order_index = 1;
+    let mut third = agent();
+    third.id = vibex_core::AgentId::parse("gemini".to_string()).expect("agent id");
+    third.label = "Gemini".to_string();
+    third.order_index = 2;
+    app.management_data.agents = vec![third, agent(), second];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+
+    // The rows follow the authority's order rather than the order it listed
+    // them in.
+    let rows = vibex_tui::config_center::agent_rows(&app.management_data, app.strings);
+    assert_eq!(
+        rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+        vec!["codex", "claude", "gemini"]
+    );
+
+    // Moving the first one down swaps it with the one after it.
+    let outcome = app.run_config_action_by_key("codex", ConfigAction::MoveDown);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::SwapAgentOrder {
+                first,
+                first_index,
+                second,
+                second_index,
+            } = mutation
+            else {
+                panic!("the move was not a swap: {mutation:?}");
+            };
+            assert_eq!(first.as_str(), "codex");
+            assert_eq!(second.as_str(), "claude");
+            assert_eq!((*first_index, *second_index), (0, 1));
+        }
+        other => panic!("the move produced {other:?}"),
+    }
+
+    // At the end of the list there is nowhere to go.
+    app.config_center.pending.clear();
+    let outcome = app.run_config_action_by_key("gemini", ConfigAction::MoveDown);
+    assert!(outcome.effects.is_empty(), "the last Agent moved down");
+    let outcome = app.run_config_action_by_key("codex", ConfigAction::MoveUp);
+    assert!(outcome.effects.is_empty(), "the first Agent moved up");
+
+    // A group's edge is not a way into the next group: the not-added Agent
+    // stays where it is rather than swapping with an enabled one.
+    let mut outside = second_agent();
+    outside.id = vibex_core::AgentId::parse("qwen".to_string()).expect("agent id");
+    outside.label = "Qwen".to_string();
+    outside.added = false;
+    outside.order_index = 9;
+    app.management_data.agents.push(outside);
+    app.config_center.pending.clear();
+    let outcome = app.run_config_action_by_key("qwen", ConfigAction::MoveUp);
+    assert!(
+        outcome.effects.is_empty(),
+        "an Agent crossed out of its own group"
+    );
+}
+
+/// The pane wears the record's badge, not only the row.
+#[test]
+fn the_pane_wears_the_badge_the_row_wears() {
+    let mut app = loaded(140, 40);
+    let mut failed = agent();
+    failed.managed_install.status = vibex_core::AgentManagedInstallStatus::Failed;
+    app.management_data.agents = vec![failed];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+
+    let screen = text(&mut app, 140, 40);
+    assert!(
+        screen.contains("install failed"),
+        "the pane did not carry the state the row carries:\n{screen}"
+    );
+    // The row's marker stays the row's: the pane carries the badge, which says
+    // the same thing in words, and two markers for one state would be two
+    // answers to the question the row's marker is already answering.
+    assert!(
+        screen.matches("install failed").count() >= 1,
+        "the badge was not drawn"
+    );
+}

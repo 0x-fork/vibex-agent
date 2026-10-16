@@ -711,6 +711,17 @@ impl Dispatch {
                 )
                 .await
             }
+            M::SwapAgentOrder {
+                first,
+                first_index,
+                second,
+                second_index,
+            } => {
+                // Two writes, one answer: the roster is a list, and a swap that
+                // landed only half of itself would be an order nobody chose.
+                self.swap_agent_order(first, first_index, second, second_index)
+                    .await
+            }
             M::SetAgentAdded { agent_id, added } => {
                 // The roster is what the reader wants to see; nothing on disk
                 // changes either way, which is why this is not install or
@@ -2797,6 +2808,38 @@ impl Dispatch {
             found = found.saturating_add(1);
         }
         Ok(found)
+    }
+
+    /// Exchange two Agents' places in the roster.
+    async fn swap_agent_order(
+        &self,
+        first: vibex_core::AgentId,
+        first_index: i64,
+        second: vibex_core::AgentId,
+        second_index: i64,
+    ) -> BackendResult<crate::app::MutationOutcome> {
+        let place = |agent_id: vibex_core::AgentId, order_index: i64| {
+            vibex_backend::MutationRequest::new(vibex_core::AgentUpdateConfigRequest {
+                agent_id,
+                added: None,
+                enabled: None,
+                label_override: None,
+                description_override: None,
+                order_index: Some(order_index),
+                command: None,
+                env: None,
+                params: None,
+            })
+        };
+        self.facade
+            .management()
+            .update_agent_config(place(first, second_index))
+            .await?;
+        self.facade
+            .management()
+            .update_agent_config(place(second, first_index))
+            .await?;
+        Ok(crate::app::MutationOutcome::Plain)
     }
 
     /// The Agent's default provider profile, which is where a sign-in method's

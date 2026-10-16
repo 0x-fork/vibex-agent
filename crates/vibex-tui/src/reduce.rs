@@ -1705,6 +1705,8 @@ impl App {
                     added: false,
                 })
             }
+            (ConfigSection::Agents, ConfigAction::MoveUp) => self.move_agent(key, -1),
+            (ConfigSection::Agents, ConfigAction::MoveDown) => self.move_agent(key, 1),
             (ConfigSection::Agents, ConfigAction::Auth) => self.open_agent_auth(key),
             (ConfigSection::Agents, ConfigAction::Logout) => {
                 let Some(agent_id) = self.agent_id(key) else {
@@ -2236,6 +2238,55 @@ impl App {
                 Outcome::quiet()
             }
         }
+    }
+
+    /// Move one Agent a place earlier or later among the ones it shares a
+    /// group with.
+    ///
+    /// The order is the authority's — every client reads it — so the move is a
+    /// swap of two records' places rather than a list this client keeps to
+    /// itself. An Agent at either end of its own group has nowhere to go, and
+    /// one at the edge of its group does not cross into the next: the groups
+    /// are the roster's, not the reader's.
+    fn move_agent(&mut self, key: &str, delta: isize) -> Outcome {
+        let Some(agent) = self
+            .management_data
+            .agents
+            .iter()
+            .find(|agent| agent.id.as_str() == key)
+            .cloned()
+        else {
+            return Outcome::quiet();
+        };
+        let group = crate::config_center::agent_group(&agent);
+        let mut siblings = self
+            .management_data
+            .agents
+            .iter()
+            .filter(|candidate| crate::config_center::agent_group(candidate) == group)
+            .collect::<Vec<_>>();
+        siblings.sort_by(|left, right| {
+            left.order_index
+                .cmp(&right.order_index)
+                .then(left.id.as_str().cmp(right.id.as_str()))
+        });
+        let Some(index) = siblings
+            .iter()
+            .position(|candidate| candidate.id == agent.id)
+        else {
+            return Outcome::quiet();
+        };
+        let next = index.saturating_add_signed(delta);
+        if next == index || next >= siblings.len() {
+            return Outcome::quiet();
+        }
+        let other = siblings[next];
+        self.begin_config_mutation(crate::app::ConfigMutation::SwapAgentOrder {
+            first: agent.id.clone(),
+            first_index: agent.order_index,
+            second: other.id.clone(),
+            second_index: other.order_index,
+        })
     }
 
     /// Start watching what the authority does with a managed install.

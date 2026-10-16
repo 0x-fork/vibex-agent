@@ -8756,6 +8756,13 @@ pub enum ConfigMutation {
         /// than a formality.
         confirmed_affected_session_count: usize,
     },
+    /// Exchange two Agents' places in the roster.
+    SwapAgentOrder {
+        first: vibex_core::AgentId,
+        first_index: i64,
+        second: vibex_core::AgentId,
+        second_index: i64,
+    },
     /// Take an Agent into the roster, or out of it.
     SetAgentAdded {
         agent_id: vibex_core::AgentId,
@@ -8900,6 +8907,7 @@ impl ConfigMutation {
             Self::AuthenticateAgentMethod { agent_id, .. } => agent_id.as_str().to_string(),
             Self::CreateCustomAgent(request) => request.agent_id.as_str().to_string(),
             Self::SetAgentAdded { agent_id, .. } => agent_id.as_str().to_string(),
+            Self::SwapAgentOrder { first, .. } => first.as_str().to_string(),
             Self::LogoutAgentAuthContext {
                 auth_context_id, ..
             } => auth_context_id.clone(),
@@ -8943,6 +8951,7 @@ impl ConfigMutation {
             Self::AuthenticateAgentMethod { .. } => "agent_auth_sign_in",
             Self::CreateCustomAgent(_) => "custom_agent_create",
             Self::SetAgentAdded { .. } => "agent_roster",
+            Self::SwapAgentOrder { .. } => "agent_roster_order",
             Self::LogoutAgentAuthContext { .. } => "agent_auth_sign_out",
             Self::CreateProviderProfile(_) => "provider_profile_create",
             Self::ApplyNativeExport { .. } => "provider_native_export_apply",
@@ -8995,6 +9004,7 @@ impl ConfigMutation {
             Self::RollbackAgent { .. } => Verb::Rollback,
             Self::AuthenticateAgentMethod { .. } => Verb::SignIn,
             Self::CreateCustomAgent(_) => Verb::Create,
+            Self::SwapAgentOrder { .. } => Verb::Save,
             Self::SetAgentAdded { added, .. } => {
                 if *added {
                     Verb::Add
