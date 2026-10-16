@@ -12108,6 +12108,52 @@ impl VibexWorkbench {
                                 }
                             }
                         }
+                        if let vibex_core::RemoteSidebarOrganizationMutation::EnqueueScheduledSend {
+                            session_id,
+                            text,
+                            attachments,
+                            mentions,
+                            scheduled_at_ms,
+                        } = &mutation
+                        {
+                            // The queue is this shell's, so a client's scheduled
+                            // send is taken here: the message waits where every
+                            // other held message waits, and the clock that keeps
+                            // it is the same one. A client that asked for an hour
+                            // it cannot enforce has asked the holder to.
+                            if let Ok(session_id) = VibexSessionId::parse(session_id)
+                                && let Some(desired_runtime) =
+                                    self.runtime_selection_for_session(&session_id)
+                            {
+                                self.composer_queue_serial =
+                                    self.composer_queue_serial.saturating_add(1).max(1);
+                                self.composer_queue.push(ComposerQueueMessage {
+                                    id: self.composer_queue_serial,
+                                    session_id,
+                                    desired_runtime,
+                                    text: text.clone(),
+                                    attachments: attachments.clone(),
+                                    command_invocation: None,
+                                    scheduled_at_ms: Some(*scheduled_at_ms),
+                                    mentions: mentions.clone(),
+                                });
+                                // The clock is the shell's, so the message is
+                                // armed on the window that owns it rather than on
+                                // whichever pass happened to accept the write.
+                                if let Some(handle) = self.window_handle {
+                                    let entity = cx.weak_entity();
+                                    let _ = cx.update_window(handle, move |_, window, cx| {
+                                        let _ = entity.update(cx, |this, cx| {
+                                            this.start_message_schedule_timer(window, cx);
+                                            cx.notify();
+                                        });
+                                    });
+                                }
+                                self.publish_sidebar_invalidation();
+                                self.composer_queue_changed();
+                                cx.notify();
+                            }
+                        }
                         if effect.unread
                             && let vibex_core::RemoteSidebarOrganizationMutation::SetSessionsUnread {
                                 session_ids,

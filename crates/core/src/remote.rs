@@ -105,7 +105,7 @@ use crate::terminal::{
 use crate::time::unix_timestamp_ms;
 use crate::timeline::{TimelineItem, TimelinePage};
 use crate::workspace::{OpenWorkspaceRequest, ProjectWorkspaceSummary};
-use crate::{FetchTimelineItemRequest, MessageAttachment};
+use crate::{FetchTimelineItemRequest, MessageAttachment, VibexUseMention};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -4859,6 +4859,21 @@ pub enum RemoteSidebarOrganizationMutation {
     SetSessionAutoContinue {
         session_id: String,
         enabled: bool,
+    },
+    /// Queues a message the holder will send at a later hour.
+    ///
+    /// The holder's own queue is what waits, so the message outlives the client
+    /// that asked for it: a phone that goes away leaves the send behind, and the
+    /// deadline is absolute for the same reason the queue's own is — a countdown
+    /// would have to be re-based by every reader.
+    EnqueueScheduledSend {
+        session_id: String,
+        text: String,
+        #[serde(default)]
+        attachments: Vec<MessageAttachment>,
+        #[serde(default)]
+        mentions: Vec<VibexUseMention>,
+        scheduled_at_ms: i64,
     },
     /// Suspends or lifts the automatic continuation of the listed sessions.
     ///

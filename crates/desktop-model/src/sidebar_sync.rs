@@ -921,6 +921,14 @@ impl SidebarOrganizationView {
                 }
                 SidebarMutationEffect::NAVIGATION.into()
             }
+            RemoteSidebarOrganizationMutation::EnqueueScheduledSend { session_id, .. } => {
+                if !session_projects.contains_key(session_id) {
+                    return Err(SidebarMutationRejection::Rejected);
+                }
+                // The queue belongs to the shell, so the view has nothing to
+                // move: the effect is what tells the shell to take the message.
+                SidebarMutationEffect::ENQUEUE.into()
+            }
             RemoteSidebarOrganizationMutation::CreateGroup {
                 name,
                 project_id,
@@ -1328,6 +1336,9 @@ pub struct SidebarMutationEffect {
     /// The holder's queue changed: a deadline was moved or taken away, and the
     /// message it names is still the queue's to send.
     pub scheduled: bool,
+    /// The holder's queue has a message to take: a client asked for a send at a
+    /// later hour, and only the shell that owns the queue can accept it.
+    pub enqueue: bool,
     /// The unread marks changed: another client read sessions the authority was
     /// still badging, and its own readers must stop badging them too.
     pub unread: bool,
@@ -1338,25 +1349,36 @@ impl SidebarMutationEffect {
         organization: true,
         navigation: false,
         scheduled: false,
+        enqueue: false,
         unread: false,
     };
     pub const NAVIGATION: Self = Self {
         organization: false,
         navigation: true,
         scheduled: false,
+        enqueue: false,
         unread: false,
     };
     pub const SCHEDULED: Self = Self {
         organization: false,
         navigation: false,
         scheduled: true,
+        enqueue: false,
         unread: false,
     };
     pub const UNREAD: Self = Self {
         organization: false,
         navigation: false,
         scheduled: false,
+        enqueue: false,
         unread: true,
+    };
+    pub const ENQUEUE: Self = Self {
+        organization: false,
+        navigation: false,
+        scheduled: false,
+        enqueue: true,
+        unread: false,
     };
 }
 
@@ -1808,6 +1830,53 @@ mod tests {
                 "unused",
             )
             .is_err()
+        );
+    }
+
+    /// A client's scheduled send is accepted for a session the project knows,
+    /// and only the shell that owns the queue can take it.
+    #[test]
+    fn a_remote_scheduled_send_asks_the_shell_to_take_it() {
+        let mut view = SidebarOrganizationView::default();
+        let outcome = view
+            .apply_remote(
+                &RemoteSidebarOrganizationMutation::EnqueueScheduledSend {
+                    session_id: "session-a".to_string(),
+                    text: "ship it".to_string(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                    scheduled_at_ms: 1_800_000_000_000,
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .expect("a session of the project is legal");
+        let SidebarMutationOutcome::Applied(effect) = outcome else {
+            panic!("an enqueue should report an applied effect");
+        };
+        assert!(
+            effect.enqueue && !effect.organization && !effect.navigation,
+            "the queue is the shell's, so the view has nothing of its own to move"
+        );
+
+        assert!(
+            view.apply_remote(
+                &RemoteSidebarOrganizationMutation::EnqueueScheduledSend {
+                    session_id: "session-gone".to_string(),
+                    text: "ship it".to_string(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                    scheduled_at_ms: 1_800_000_000_000,
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .is_err(),
+            "a session the project does not know is refused"
         );
     }
 
