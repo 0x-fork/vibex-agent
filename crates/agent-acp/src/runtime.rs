@@ -14150,6 +14150,35 @@ impl AcpRuntimeClient {
         Ok(())
     }
 
+    /// Returns the session-config planner for the options the Agent currently
+    /// advertises, layered over the operation evidence the previous planner has
+    /// already learned.
+    ///
+    /// A patch is applied field by field, and one field can widen the option
+    /// set the next one is judged against: OpenCode only publishes its `effort`
+    /// (thought level) option once a Model that carries reasoning variants has
+    /// been selected. Replacing only the option catalogue keeps capability
+    /// negatives, extensions, and aliases intact, and storing the result keeps
+    /// later live mutations on the same options.
+    fn refreshed_session_config_planner(
+        &self,
+        payload: &AcpSessionAttachment,
+        planner: SessionConfigPlanner,
+    ) -> SessionConfigPlanner {
+        let options = payload.state.lock().ok().and_then(|state| {
+            state
+                .session_config_state
+                .as_ref()
+                .map(|discovery| discovery.options.clone())
+        });
+        let Some(options) = options else {
+            return planner;
+        };
+        let planner = planner.with_options(options);
+        payload.set_session_config_planner(planner.clone());
+        planner
+    }
+
     async fn apply_runtime_config_mutation(
         &self,
         attachment: &AcpAttachmentHandle,
@@ -14227,8 +14256,50 @@ impl AcpRuntimeClient {
             ));
         };
 
-        let mut plans = Vec::with_capacity(fields.len());
+        if fields.is_empty() {
+            return Ok(SessionRuntimeConfigMutationResult {
+                state: current_state,
+                outcomes: Vec::new(),
+            });
+        }
+
+        let generation = attachment.fence().activation_generation as i64;
+        // Commit the patch's preferences before its first wire request so every
+        // field confirms against one revision, and so a field that fails still
+        // leaves its preference recorded for a later replay.
+        let mut preferred_state = payload.runtime_config_state();
+        let mut preferred_changed = false;
         for field in &fields {
+            if runtime_config_preferred_value(&preferred_state, field) != field.value {
+                set_runtime_config_preferred(&mut preferred_state, field);
+                preferred_changed = true;
+            }
+        }
+        if preferred_changed {
+            preferred_state.state_revision = preferred_state
+                .state_revision
+                .checked_add(1)
+                .ok_or_else(|| {
+                    VibexError::conflict(
+                        "acp_session_config_revision_exhausted",
+                        "session runtime config revision is exhausted",
+                    )
+                })?;
+            preferred_state.applied_activation_generation = None;
+            preferred_state.mark_generation_if_converged(generation);
+            self.store_runtime_config_state(attachment, &preferred_state, mutation_mode)?;
+        }
+
+        let mut outcomes = Vec::with_capacity(fields.len());
+        // Apply one field at a time, judging each field against the options the
+        // Agent advertises at that moment: applying a field can publish options
+        // the previous state did not carry. OpenCode only adds its `effort`
+        // (thought level) option once a Model with reasoning variants has been
+        // selected, so a patch that selects that Model and an effort cannot be
+        // validated against the option set discovered before the Model switch.
+        for (index, field) in fields.iter().enumerate() {
+            planner = self.refreshed_session_config_planner(&payload, planner);
+
             if field.value.is_some()
                 && !(allow_unadvertised_selection
                     && matches!(
@@ -14237,145 +14308,70 @@ impl AcpRuntimeClient {
                     ))
                 && !runtime_config_value_is_advertised(&payload, &planner, field)
             {
-                return Ok(SessionRuntimeConfigMutationResult {
-                    state: current_state,
-                    outcomes: fields
-                        .iter()
-                        .map(|item| {
-                            runtime_config_outcome(
-                                item,
-                                if item.key == field.key {
-                                    SessionRuntimeConfigApplyStatus::Unavailable
-                                } else {
-                                    SessionRuntimeConfigApplyStatus::NoOp
-                                },
-                                None,
-                                Some("acp_session_config_value_unavailable"),
-                            )
-                        })
-                        .collect(),
-                });
+                outcomes.push(runtime_config_outcome(
+                    field,
+                    SessionRuntimeConfigApplyStatus::Unavailable,
+                    None,
+                    Some("acp_session_config_value_unavailable"),
+                ));
+                outcomes.extend(untouched_runtime_config_outcomes(&fields[index + 1..]));
+                break;
             }
-            let effective = runtime_config_field_value(&current_state, field);
+            let next_state = payload.runtime_config_state();
+            let effective = runtime_config_field_value(&next_state, field);
             if field.value.is_none() && effective.is_some() {
                 let plan = planner
                     .plan(&field.as_planner_request())
                     .map_err(canonical_key_error)?;
                 if !matches!(plan, SessionConfigPlan::RestartAndResume) {
-                    return Ok(SessionRuntimeConfigMutationResult {
-                        state: current_state,
-                        outcomes: fields
-                            .iter()
-                            .map(|item| {
-                                runtime_config_outcome(
-                                    item,
-                                    if item.key == field.key {
-                                        SessionRuntimeConfigApplyStatus::Unavailable
-                                    } else {
-                                        SessionRuntimeConfigApplyStatus::NoOp
-                                    },
-                                    None,
-                                    Some("acp_session_config_clear_unsupported"),
-                                )
-                            })
-                            .collect(),
-                    });
+                    outcomes.push(runtime_config_outcome(
+                        field,
+                        SessionRuntimeConfigApplyStatus::Unavailable,
+                        None,
+                        Some("acp_session_config_clear_unsupported"),
+                    ));
+                    outcomes.extend(untouched_runtime_config_outcomes(&fields[index + 1..]));
+                    break;
                 }
-                plans.push((field.clone(), plan));
-                continue;
+                outcomes.push(runtime_config_outcome(
+                    field,
+                    SessionRuntimeConfigApplyStatus::RestartRequired,
+                    Some(&plan),
+                    Some("acp_session_config_restart_required"),
+                ));
+                outcomes.extend(untouched_runtime_config_outcomes(&fields[index + 1..]));
+                break;
             }
-            let plan = planner
+            let mut plan = planner
                 .plan(&field.as_planner_request())
                 .map_err(canonical_key_error)?;
             if matches!(plan, SessionConfigPlan::Unavailable) && effective != field.value {
-                return Ok(SessionRuntimeConfigMutationResult {
-                    state: current_state,
-                    outcomes: fields
-                        .iter()
-                        .map(|item| {
-                            runtime_config_outcome(
-                                item,
-                                if item.key == field.key {
-                                    SessionRuntimeConfigApplyStatus::Unavailable
-                                } else {
-                                    SessionRuntimeConfigApplyStatus::NoOp
-                                },
-                                None,
-                                Some("acp_session_config_unavailable"),
-                            )
-                        })
-                        .collect(),
-                });
+                outcomes.push(runtime_config_outcome(
+                    field,
+                    SessionRuntimeConfigApplyStatus::Unavailable,
+                    None,
+                    Some("acp_session_config_unavailable"),
+                ));
+                outcomes.extend(untouched_runtime_config_outcomes(&fields[index + 1..]));
+                break;
             }
-            plans.push((field.clone(), plan));
-        }
-
-        if fields.is_empty() {
-            return Ok(SessionRuntimeConfigMutationResult {
-                state: current_state,
-                outcomes: Vec::new(),
-            });
-        }
-
-        let mut next_state = current_state.clone();
-        let mut preferred_changed = false;
-        for field in &fields {
-            if runtime_config_preferred_value(&next_state, field) != field.value {
-                set_runtime_config_preferred(&mut next_state, field);
-                preferred_changed = true;
-            }
-        }
-        if preferred_changed {
-            next_state.state_revision =
-                next_state.state_revision.checked_add(1).ok_or_else(|| {
-                    VibexError::conflict(
-                        "acp_session_config_revision_exhausted",
-                        "session runtime config revision is exhausted",
-                    )
-                })?;
-            next_state.applied_activation_generation = None;
-            next_state
-                .mark_generation_if_converged(attachment.fence().activation_generation as i64);
-            self.store_runtime_config_state(attachment, &next_state, mutation_mode)?;
-        }
-        let mutation_revision = next_state.state_revision;
-
-        let mut outcomes = Vec::with_capacity(fields.len());
-        for (field, mut plan) in plans {
-            let effective = runtime_config_field_value(&next_state, &field);
             if effective == field.value {
                 outcomes.push(runtime_config_outcome(
-                    &field,
+                    field,
                     SessionRuntimeConfigApplyStatus::NoOp,
                     Some(&plan),
                     None,
                 ));
                 continue;
             }
-            if field.value.is_none() {
-                outcomes.push(runtime_config_outcome(
-                    &field,
-                    if matches!(plan, SessionConfigPlan::RestartAndResume) {
-                        SessionRuntimeConfigApplyStatus::RestartRequired
-                    } else {
-                        SessionRuntimeConfigApplyStatus::Unavailable
-                    },
-                    Some(&plan),
-                    Some(if matches!(plan, SessionConfigPlan::RestartAndResume) {
-                        "acp_session_config_restart_required"
-                    } else {
-                        "acp_session_config_clear_unsupported"
-                    }),
-                ));
-                continue;
-            }
+            let mutation_revision = next_state.state_revision;
 
             let mut attempted_fallback = false;
             loop {
                 match &plan {
                     SessionConfigPlan::RestartAndResume => {
                         outcomes.push(runtime_config_outcome(
-                            &field,
+                            field,
                             SessionRuntimeConfigApplyStatus::RestartRequired,
                             Some(&plan),
                             Some("acp_session_config_restart_required"),
@@ -14384,7 +14380,7 @@ impl AcpRuntimeClient {
                     }
                     SessionConfigPlan::Unavailable => {
                         outcomes.push(runtime_config_outcome(
-                            &field,
+                            field,
                             SessionRuntimeConfigApplyStatus::Unavailable,
                             Some(&plan),
                             Some("acp_session_config_unavailable"),
@@ -14400,7 +14396,7 @@ impl AcpRuntimeClient {
                             .send_runtime_config_plan(
                                 &process,
                                 &payload.native_session_id,
-                                &field,
+                                field,
                                 &plan,
                                 option_kind.as_ref(),
                                 next_state.effective_model.as_deref(),
@@ -14414,15 +14410,15 @@ impl AcpRuntimeClient {
                                 // Agent that does not substitute keeps the
                                 // mismatch error.
                                 let substituted = runtime_config_substituted_model(
-                                    &process, &field, &plan, &response,
+                                    &process, field, &plan, &response,
                                 );
                                 if substituted.is_none()
                                     && let Some(error_code) = runtime_config_response_conflict(
-                                        &process, &response, &field, &plan,
+                                        &process, &response, field, &plan,
                                     )
                                 {
                                     outcomes.push(runtime_config_outcome(
-                                        &field,
+                                        field,
                                         SessionRuntimeConfigApplyStatus::Failed,
                                         Some(&plan),
                                         Some(error_code),
@@ -14431,16 +14427,15 @@ impl AcpRuntimeClient {
                                 }
                                 match self.confirm_runtime_config_field(
                                     attachment,
-                                    &field,
+                                    field,
                                     mutation_revision,
                                     &response,
                                     mutation_mode,
                                     substituted.as_deref(),
                                 )? {
-                                    RuntimeConfigConfirmation::Applied(state) => {
-                                        next_state = state;
+                                    RuntimeConfigConfirmation::Applied(_) => {
                                         outcomes.push(runtime_config_outcome(
-                                            &field,
+                                            field,
                                             SessionRuntimeConfigApplyStatus::Applied,
                                             Some(&plan),
                                             None,
@@ -14461,19 +14456,17 @@ impl AcpRuntimeClient {
                                             );
                                         }
                                     }
-                                    RuntimeConfigConfirmation::Stale(state) => {
-                                        next_state = state;
+                                    RuntimeConfigConfirmation::Stale(_) => {
                                         outcomes.push(runtime_config_outcome(
-                                            &field,
+                                            field,
                                             SessionRuntimeConfigApplyStatus::StaleConfirmation,
                                             Some(&plan),
                                             Some("acp_session_config_confirmation_stale"),
                                         ));
                                     }
-                                    RuntimeConfigConfirmation::ReconciliationRequired(state) => {
-                                        next_state = state;
+                                    RuntimeConfigConfirmation::ReconciliationRequired(_) => {
                                         outcomes.push(runtime_config_outcome(
-                                            &field,
+                                            field,
                                             SessionRuntimeConfigApplyStatus::ReconciliationRequired,
                                             Some(&plan),
                                             Some("acp_session_config_state_persist_failed"),
@@ -14500,7 +14493,7 @@ impl AcpRuntimeClient {
                             }
                             Err(error) => {
                                 outcomes.push(runtime_config_outcome(
-                                    &field,
+                                    field,
                                     SessionRuntimeConfigApplyStatus::Failed,
                                     Some(&plan),
                                     Some(error.code.as_str()),
@@ -14515,11 +14508,9 @@ impl AcpRuntimeClient {
 
         let mut final_state = payload.runtime_config_state();
         if final_state.is_converged()
-            && final_state.applied_activation_generation
-                != Some(attachment.fence().activation_generation as i64)
+            && final_state.applied_activation_generation != Some(generation)
         {
-            final_state
-                .mark_generation_if_converged(attachment.fence().activation_generation as i64);
+            final_state.mark_generation_if_converged(generation);
             self.store_runtime_config_state(attachment, &final_state, mutation_mode)?;
         }
         Ok(SessionRuntimeConfigMutationResult {
@@ -16131,6 +16122,20 @@ fn runtime_config_outcome(
             .map(str::to_string),
         error_code: error_code.map(str::to_string),
     }
+}
+
+/// Reports the fields of a patch that were left untouched after an earlier
+/// field could not be applied. Their options may only become available once the
+/// blocked field is resolved, so they are neither applied nor failed.
+fn untouched_runtime_config_outcomes(
+    fields: &[RuntimeConfigField],
+) -> Vec<SessionRuntimeConfigFieldOutcome> {
+    fields
+        .iter()
+        .map(|field| {
+            runtime_config_outcome(field, SessionRuntimeConfigApplyStatus::NoOp, None, None)
+        })
+        .collect()
 }
 
 /// The Model an Agent reported instead of the one that was requested, when the
@@ -25305,6 +25310,10 @@ pending_empty_prompt_id = None
 request_log_path = os.environ.get("VIBEX_MOCK_ACP_REQUEST_LOG")
 set_model_mode = os.environ.get("VIBEX_MOCK_ACP_SET_MODEL_MODE", "supported")
 model_config_updates = os.environ.get("VIBEX_MOCK_ACP_MODEL_CONFIG_UPDATES") == "true"
+# OpenCode shape: the reasoning-effort option does not exist until a Model that
+# carries reasoning variants has been selected, so `session/new` publishes none
+# and the option appears with the response that selects the Model.
+effort_on_model_switch = os.environ.get("VIBEX_MOCK_ACP_EFFORT_ON_MODEL_SWITCH") == "true"
 mode_config_update = os.environ.get("VIBEX_MOCK_ACP_MODE_CONFIG_UPDATE") == "true"
 post_session_config_update = (
     os.environ.get("VIBEX_MOCK_ACP_POST_SESSION_CONFIG_UPDATE") == "true"
@@ -25615,7 +25624,7 @@ for line in sys.stdin:
                 "defaultValue": False,
             },
         ]
-        if not post_session_config_update:
+        if not post_session_config_update and not effort_on_model_switch:
             config_options.append(effort_option)
         session_result = {
             "sessionId": session_id,
@@ -25696,12 +25705,12 @@ for line in sys.stdin:
                 "error": {"code": -32003, "message": "permission denied"},
             })
         else:
+            thought_levels = (
+                ["none", "on"]
+                if model_id == model_2
+                else ["none", "high", "max"]
+            )
             if model_config_updates:
-                thought_levels = (
-                    ["none", "on"]
-                    if model_id == model_2
-                    else ["none", "high", "max"]
-                )
                 send({
                     "jsonrpc": "2.0",
                     "method": "session/update",
@@ -25723,20 +25732,35 @@ for line in sys.stdin:
                         },
                     },
                 })
-            send({
-                "jsonrpc": "2.0",
-                "id": mid,
-                "result": {
-                    "sessionId": session_id,
-                    "models": {
-                        "availableModels": [
-                            {"modelId": model_1},
-                            {"modelId": model_2},
-                        ],
-                        "currentModelId": model_id,
-                    },
+            result = {
+                "sessionId": session_id,
+                "models": {
+                    "availableModels": [
+                        {"modelId": model_1},
+                        {"modelId": model_2},
+                    ],
+                    "currentModelId": model_id,
                 },
-            })
+            }
+            if effort_on_model_switch:
+                # Exactly OpenCode's answer to a Model selection: the option set
+                # the selected Model published, so the effort exists even though
+                # `session/new` advertised none. OpenCode also pushes an
+                # unsolicited `config_option_update`; that update is not modelled
+                # here because a committed attachment rewrites its runtime
+                # configuration revision on it, which is a separate fence.
+                result["configOptions"] = [{
+                    "id": "effort",
+                    "category": "thought_level",
+                    "label": "Effort",
+                    "type": "select",
+                    "currentValue": thought_levels[-1],
+                    "options": [
+                        {"value": value, "label": value.title()}
+                        for value in thought_levels
+                    ],
+                }]
+            send({"jsonrpc": "2.0", "id": mid, "result": result})
     elif method == "session/set_mode":
         session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
         mode_id = msg.get("params", {}).get("modeId", "build")
@@ -25800,7 +25824,7 @@ for line in sys.stdin:
                 ],
             })
         options = [option]
-        if config_id == "model" and model_config_updates:
+        if config_id == "model" and (model_config_updates or effort_on_model_switch):
             thought_levels = ["none", "on"] if value == model_2 else ["none", "high", "max"]
             auto_apply = value == model_1
             options.extend([
@@ -26752,6 +26776,29 @@ for line in sys.stdin:
                 value: Some("true".to_string()),
                 secret_lookup_key: None,
                 redacted_hint: "mock model config updates".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        /// Makes the mock publish its reasoning-effort option the way OpenCode
+        /// does: `session/new` advertises none, and the option appears only with
+        /// the response that selects a Model carrying reasoning variants.
+        fn enable_effort_on_model_switch(&self) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_EFFORT_ON_MODEL_SWITCH".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some("true".to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock effort on model switch".to_string(),
             });
             service
                 .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
@@ -32510,6 +32557,103 @@ for line in sys.stdin:
                 .unwrap()
                 .contains_key(&binding_id)
         );
+        fixture.cleanup();
+    }
+
+    /// OpenCode publishes its reasoning-effort option only once a Model that
+    /// carries reasoning variants has been selected, and it answers that
+    /// selection with the options the Model published. A new OpenCode session
+    /// failed with `runtime_switch_configuration_unavailable` when the
+    /// selection named such a Model and an effort: the effort was judged
+    /// against the option set discovered before the Model switch, which had no
+    /// effort at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_runtime_config_applies_the_effort_its_model_switch_publishes() {
+        let Some(fixture) = MockAcpFixture::create("runtime-config-deferred-effort") else {
+            return;
+        };
+        fixture.enable_effort_on_model_switch();
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let attachment = client.current_attachment(&session_id).unwrap();
+        assert!(
+            attachment
+                .payload()
+                .session_config_planner()
+                .unwrap()
+                .option_for_key(
+                    &crate::session_config::CanonicalSessionConfigKey::parse(
+                        crate::session_config::CANONICAL_REASONING_EFFORT,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .is_none(),
+            "the Agent must not advertise an effort option before a Model is selected"
+        );
+
+        let state = attachment.payload().runtime_config_state();
+        let result = client
+            .update_session_runtime_config(SessionRuntimeConfigMutationRequest {
+                session_id: session_id.clone(),
+                expected_revision: state.state_revision,
+                expected_binding_id: attachment.binding_id().clone(),
+                expected_activation_generation: attachment.fence().activation_generation as i64,
+                patch: SessionRuntimeConfigPatch {
+                    model_id: Some("mock/model-2".to_string()),
+                    reasoning_effort: Some("on".to_string()),
+                    mode_id: Some("review".to_string()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert!(
+            result
+                .outcomes
+                .iter()
+                .all(|outcome| outcome.status == SessionRuntimeConfigApplyStatus::Applied),
+            "{result:#?}"
+        );
+        assert_eq!(result.state.state_revision, 1, "{result:#?}");
+        assert_eq!(
+            result.state.effective_model.as_deref(),
+            Some("mock/model-2")
+        );
+        assert_eq!(
+            result.state.effective_reasoning_effort.as_deref(),
+            Some("on")
+        );
+        assert_eq!(result.state.effective_mode.as_deref(), Some("review"));
+
+        // The effort request must follow the Model selection that published it.
+        let requests = fixture.request_log();
+        let model_index = requests
+            .iter()
+            .position(|request| request["method"] == "session/set_model")
+            .expect("the Model switch must reach ACP");
+        let effort_index = requests
+            .iter()
+            .position(|request| {
+                request["method"] == "session/set_config_option"
+                    && request["params"]["configId"] == "effort"
+            })
+            .expect("the effort switch must reach ACP");
+        assert!(model_index < effort_index, "{requests:#?}");
+        assert_eq!(requests[effort_index]["params"]["value"], "on");
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
         fixture.cleanup();
     }
 
