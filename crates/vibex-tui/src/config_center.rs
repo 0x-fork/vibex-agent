@@ -260,6 +260,10 @@ pub enum ConfigAction {
     Reinstall,
     /// Move a managed Agent onto the version the authority published.
     Upgrade,
+    /// Take an Agent into the roster the reader works with.
+    AddToRoster,
+    /// Take an Agent out of it, without uninstalling anything.
+    RemoveFromRoster,
     /// Move a profile one place earlier in its Agent's order.
     MoveUp,
     /// Move a profile one place later in its Agent's order.
@@ -297,6 +301,8 @@ impl ConfigAction {
             Self::OpenPage => strings.config_action_open_page(),
             Self::Reinstall => strings.config_action_reinstall(),
             Self::Upgrade => strings.config_action_upgrade(),
+            Self::AddToRoster => strings.config_action_add_roster(),
+            Self::RemoveFromRoster => strings.config_action_remove_roster(),
             Self::MoveUp => strings.config_action_move_up(),
             Self::MoveDown => strings.config_action_move_down(),
         }
@@ -847,6 +853,10 @@ pub enum ConfigVerb {
     SetAgents,
     Discover,
     Search,
+    /// Taking a record into the set the reader works with.
+    Add,
+    /// Taking it out again, without destroying anything.
+    Remove,
 }
 
 impl ConfigVerb {
@@ -873,6 +883,8 @@ impl ConfigVerb {
             Self::SetAgents => strings.config_running_matrix(),
             Self::Discover => strings.config_running_discover(),
             Self::Search => strings.config_running_search(),
+            Self::Add => strings.config_running_roster_add(),
+            Self::Remove => strings.config_running_roster_remove(),
         }
     }
 
@@ -900,6 +912,8 @@ impl ConfigVerb {
             Self::SetAgents => strings.config_done_matrix(),
             Self::Discover => strings.config_done_discover(),
             Self::Search => strings.config_done_search(),
+            Self::Add => strings.config_done_roster_add(),
+            Self::Remove => strings.config_done_roster_remove(),
         }
     }
 
@@ -932,6 +946,8 @@ impl ConfigVerb {
             Self::SetAgents => strings.config_noun_matrix(),
             Self::Discover => strings.config_noun_discover(),
             Self::Search => strings.config_noun_search(),
+            Self::Add => strings.config_noun_roster_add(),
+            Self::Remove => strings.config_noun_roster_remove(),
         }
     }
 }
@@ -1367,8 +1383,17 @@ fn managed_line(agent: &vibex_core::AgentSnapshotEntry, strings: Strings) -> Str
 }
 
 pub fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
-    data.agents
-        .iter()
+    // The three groups are contiguous: enabled first, then added-but-off, then
+    // the ones the roster does not hold. A stable sort keeps the authority's
+    // own order inside each group.
+    let mut ordered = data.agents.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|agent| match (agent.added, agent.enabled) {
+        (true, true) => 0,
+        (true, false) => 1,
+        (false, _) => 2,
+    });
+    ordered
+        .into_iter()
         // The desktop hides the integrations Vibex is not ready to expose, and
         // the two clients read the same roster: an Agent the desktop will not
         // show is one the reader cannot meet in the TUI either. A Custom Agent
@@ -1392,12 +1417,33 @@ pub fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                 AgentRuntimeStatus::Disabled => strings.config_state_disabled(),
                 AgentRuntimeStatus::Unknown => strings.config_state_unknown(),
             };
+            // The roster is three groups, and which one an Agent is in is the
+            // first thing the reader needs: an Agent that is not added is one
+            // they have not agreed to run, and an Agent added but switched off
+            // is one they have. The group is a column and the rows are sorted
+            // by it, so the three are contiguous rather than interleaved.
+            let roster = match (agent.added, agent.enabled) {
+                (true, true) => strings.config_roster_enabled(),
+                (true, false) => strings.config_roster_added_disabled(),
+                (false, _) => strings.config_roster_not_added(),
+            };
             let mut actions = vec![
                 ConfigAction::Toggle,
                 ConfigAction::RefreshSnapshot,
                 ConfigAction::Auth,
                 ConfigAction::Logout,
             ];
+            // Joining and leaving are the roster's own two verbs: taking an
+            // Agent out is not an uninstall, and adding one is not an install —
+            // the reader is saying what they want to see, not what is on disk.
+            actions.insert(
+                0,
+                if agent.added {
+                    ConfigAction::RemoveFromRoster
+                } else {
+                    ConfigAction::AddToRoster
+                },
+            );
             if agent.managed_install.managed {
                 // An Agent the authority already has at a newer version is
                 // upgraded rather than installed again: the two run the same
@@ -1438,12 +1484,24 @@ pub fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                 .cell(auth.label(strings))
                 .cell(agent.models.len().to_string())
                 .chip(
-                    if agent.enabled {
+                    if agent.managed_install.status == AgentManagedInstallStatus::Failed {
+                        strings.config_managed_failed()
+                    } else if !agent.added {
+                        // Not in the roster is a different thing from in it and
+                        // switched off, and the chip is where the difference is
+                        // read at a glance: the three groups are contiguous and
+                        // the chip names which one the row is in.
+                        strings.config_roster_not_added()
+                    } else if agent.enabled {
                         strings.config_state_enabled()
                     } else {
                         strings.config_state_disabled()
                     },
-                    if agent.enabled {
+                    if agent.managed_install.status == AgentManagedInstallStatus::Failed {
+                        ConfigTone::Bad
+                    } else if !agent.added {
+                        ConfigTone::Warn
+                    } else if agent.enabled {
                         runtime_tone(agent.runtime_status)
                     } else {
                         ConfigTone::Muted
@@ -1473,6 +1531,19 @@ pub fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                     ),
                 )
                 .detail(strings.config_field_version(), managed_line(agent, strings))
+                // A failure the reader cannot see is a failure they will meet
+                // again: the authority's own words are kept on the record, and
+                // the row is where they are read.
+                .detail(strings.config_col_roster(), roster)
+                .detail(
+                    strings.config_field_last_error(),
+                    agent
+                        .managed_install
+                        .last_error_message
+                        .clone()
+                        .or_else(|| agent.managed_install.last_error_code.clone())
+                        .unwrap_or_default(),
+                )
                 // The models the Agent advertises come before the flags: a
                 // detail pane scrolls, and what a reader opens this one for is
                 // what the Agent can run rather than whether it is configured.

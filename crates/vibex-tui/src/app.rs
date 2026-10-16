@@ -8756,6 +8756,11 @@ pub enum ConfigMutation {
         /// than a formality.
         confirmed_affected_session_count: usize,
     },
+    /// Take an Agent into the roster, or out of it.
+    SetAgentAdded {
+        agent_id: vibex_core::AgentId,
+        added: bool,
+    },
     /// Register a custom ACP Agent.
     CreateCustomAgent(Box<vibex_core::CustomAgentCreateRequest>),
     /// Sign in with one of an Agent's methods, storing what it collects first.
@@ -8894,6 +8899,7 @@ impl ConfigMutation {
             | Self::DeleteProviderProfile { profile_id, .. } => profile_id.as_str().to_string(),
             Self::AuthenticateAgentMethod { agent_id, .. } => agent_id.as_str().to_string(),
             Self::CreateCustomAgent(request) => request.agent_id.as_str().to_string(),
+            Self::SetAgentAdded { agent_id, .. } => agent_id.as_str().to_string(),
             Self::LogoutAgentAuthContext {
                 auth_context_id, ..
             } => auth_context_id.clone(),
@@ -8936,6 +8942,7 @@ impl ConfigMutation {
             Self::RollbackAgent { .. } => "agent_rollback",
             Self::AuthenticateAgentMethod { .. } => "agent_auth_sign_in",
             Self::CreateCustomAgent(_) => "custom_agent_create",
+            Self::SetAgentAdded { .. } => "agent_roster",
             Self::LogoutAgentAuthContext { .. } => "agent_auth_sign_out",
             Self::CreateProviderProfile(_) => "provider_profile_create",
             Self::ApplyNativeExport { .. } => "provider_native_export_apply",
@@ -8988,6 +8995,13 @@ impl ConfigMutation {
             Self::RollbackAgent { .. } => Verb::Rollback,
             Self::AuthenticateAgentMethod { .. } => Verb::SignIn,
             Self::CreateCustomAgent(_) => Verb::Create,
+            Self::SetAgentAdded { added, .. } => {
+                if *added {
+                    Verb::Add
+                } else {
+                    Verb::Remove
+                }
+            }
             Self::LogoutAgentAuthContext { .. } => Verb::SignOut,
             Self::CreateProviderProfile(_) => Verb::Create,
             Self::ApplyNativeExport { .. } => Verb::Save,

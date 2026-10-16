@@ -711,6 +711,28 @@ impl Dispatch {
                 )
                 .await
             }
+            M::SetAgentAdded { agent_id, added } => {
+                // The roster is what the reader wants to see; nothing on disk
+                // changes either way, which is why this is not install or
+                // uninstall.
+                let request =
+                    vibex_backend::MutationRequest::new(vibex_core::AgentUpdateConfigRequest {
+                        agent_id,
+                        added: Some(added),
+                        enabled: None,
+                        label_override: None,
+                        description_override: None,
+                        order_index: None,
+                        command: None,
+                        env: None,
+                        params: None,
+                    });
+                self.facade
+                    .management()
+                    .update_agent_config(request)
+                    .await
+                    .map(|_| crate::app::MutationOutcome::Plain)
+            }
             M::CreateCustomAgent(request) => {
                 let request = vibex_backend::MutationRequest::new(*request);
                 self.facade

@@ -3777,3 +3777,124 @@ fn a_custom_agent_is_registered_from_a_form() {
         other => panic!("the save produced {other:?}"),
     }
 }
+
+/// The roster is three groups, and joining or leaving it is not an install.
+///
+/// Which group an Agent is in is the first thing the reader needs: an Agent the
+/// roster does not hold is one they have not agreed to see, and one added but
+/// switched off is one they have. Adding and removing say what the reader wants
+/// to work with and touch nothing on disk, which is why neither is an install.
+#[test]
+fn the_roster_is_three_groups_and_two_verbs() {
+    let mut app = loaded(140, 40);
+    let mut added_off = second_agent();
+    added_off.enabled = false;
+    let mut not_added = second_agent();
+    not_added.id = vibex_core::AgentId::parse("gemini".to_string()).expect("agent id");
+    not_added.label = "Gemini".to_string();
+    not_added.added = false;
+    app.management_data.agents = vec![not_added, added_off, agent()];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+
+    let rows = vibex_tui::config_center::agent_rows(&app.management_data, app.strings);
+    assert_eq!(
+        rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+        vec!["codex", "claude", "gemini"],
+        "the three groups are not contiguous"
+    );
+    assert_eq!(
+        rows.iter().map(|row| row.chip.as_str()).collect::<Vec<_>>(),
+        vec!["Enabled", "Disabled", "Not added"],
+        "the group was not named on the row"
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| {
+                row.detail
+                    .iter()
+                    .find(|(label, _)| label == "Roster")
+                    .map(|(_, value)| value.as_str())
+                    .unwrap_or("")
+            })
+            .collect::<Vec<_>>(),
+        vec!["Enabled", "Added", "Not added"],
+        "the group was not named in full"
+    );
+
+    // Each row offers the verb its group calls for.
+    let actions = |key: &str| {
+        rows.iter()
+            .find(|row| row.key == key)
+            .map(|row| row.actions.clone())
+            .unwrap_or_default()
+    };
+    assert!(actions("codex").contains(&ConfigAction::RemoveFromRoster));
+    assert!(!actions("codex").contains(&ConfigAction::AddToRoster));
+    assert!(actions("gemini").contains(&ConfigAction::AddToRoster));
+    assert!(!actions("gemini").contains(&ConfigAction::RemoveFromRoster));
+
+    // Joining writes the roster and nothing else.
+    let outcome = app.run_config_action_by_key("gemini", ConfigAction::AddToRoster);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::SetAgentAdded { agent_id, added } = mutation else {
+                panic!("joining the roster was something else: {mutation:?}");
+            };
+            assert_eq!(agent_id.as_str(), "gemini");
+            assert!(added, "the wrong direction was written");
+        }
+        other => panic!("joining the roster produced {other:?}"),
+    }
+
+    app.config_center.pending.clear();
+    let outcome = app.run_config_action_by_key("codex", ConfigAction::RemoveFromRoster);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::SetAgentAdded { added, .. } = mutation else {
+                panic!("leaving the roster was something else: {mutation:?}");
+            };
+            assert!(!added, "the wrong direction was written");
+        }
+        other => panic!("leaving the roster produced {other:?}"),
+    }
+}
+
+/// A failed managed install says so on the row, in the authority's own words.
+///
+/// A failure the reader cannot see is one they will meet again: the authority
+/// keeps what it said, and the row is where it is read.
+#[test]
+fn a_failed_install_says_so_on_the_row() {
+    let mut app = loaded(140, 40);
+    let mut failed = agent();
+    failed.managed_install.status = vibex_core::AgentManagedInstallStatus::Failed;
+    failed.managed_install.last_error_code = Some("npm_unreachable".to_string());
+    failed.managed_install.last_error_message = Some("the registry timed out".to_string());
+    app.management_data.agents = vec![failed];
+
+    let rows = vibex_tui::config_center::agent_rows(&app.management_data, app.strings);
+    assert_eq!(rows[0].chip, "install failed");
+    assert_eq!(rows[0].tone, vibex_tui::config_center::ConfigTone::Bad);
+    assert!(
+        rows[0]
+            .detail
+            .iter()
+            .any(|(label, value)| label == "Last error" && value == "the registry timed out"),
+        "the authority's own words were not kept: {:#?}",
+        rows[0].detail
+    );
+
+    // Without a message the code is still worth more than nothing.
+    let mut coded = agent();
+    coded.managed_install.status = vibex_core::AgentManagedInstallStatus::Failed;
+    coded.managed_install.last_error_code = Some("npm_unreachable".to_string());
+    app.management_data.agents = vec![coded];
+    let rows = vibex_tui::config_center::agent_rows(&app.management_data, app.strings);
+    assert!(
+        rows[0]
+            .detail
+            .iter()
+            .any(|(_, value)| value == "npm_unreachable"),
+        "the error code was dropped"
+    );
+}

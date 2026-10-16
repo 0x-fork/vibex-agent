@@ -1687,6 +1687,24 @@ impl App {
                     Effect::UninstallAgent { agent_id },
                 )
             }
+            (ConfigSection::Agents, ConfigAction::AddToRoster) => {
+                let Some(agent_id) = self.agent_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.begin_config_mutation(crate::app::ConfigMutation::SetAgentAdded {
+                    agent_id,
+                    added: true,
+                })
+            }
+            (ConfigSection::Agents, ConfigAction::RemoveFromRoster) => {
+                let Some(agent_id) = self.agent_id(key) else {
+                    return Outcome::quiet();
+                };
+                self.begin_config_mutation(crate::app::ConfigMutation::SetAgentAdded {
+                    agent_id,
+                    added: false,
+                })
+            }
             (ConfigSection::Agents, ConfigAction::Auth) => self.open_agent_auth(key),
             (ConfigSection::Agents, ConfigAction::Logout) => {
                 let Some(agent_id) = self.agent_id(key) else {
