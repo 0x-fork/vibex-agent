@@ -14625,17 +14625,15 @@ impl MobileApp {
             .bg(theme::bg_card())
             .flex()
             .items_center()
-            .gap(px(theme::SPACING_XS))
+            // The field and its controls read as one bar: the phone has no room
+            // for a search box nested inside the toolbar, so the toolbar itself
+            // is the field.
             .child(
                 div()
                     .h(px(36.0))
                     .min_w_0()
                     .flex_1()
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_primary())
-                    .px_2()
+                    .min_w(px(0.0))
                     .flex()
                     .items_center()
                     .gap_1()
@@ -14643,6 +14641,7 @@ impl MobileApp {
                         svg()
                             .path("icons/search.svg")
                             .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
                             .text_color(theme::text_muted()),
                     )
                     .child(
@@ -14682,7 +14681,7 @@ impl MobileApp {
             .child(
                 timeline_action_button(
                     "timeline-find-previous",
-                    "icons/chevron-down.svg",
+                    "icons/chevron-up.svg",
                     locale::text("Previous match", "上一个匹配", "上一個符合"),
                 )
                 .when(count > 0, |button| {
@@ -18030,34 +18029,31 @@ impl MobileApp {
         state: Option<AgentSessionState>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // A state the user has to act on is named, not just tinted: the phone
-        // used to draw a 6px dot and leave the reader to guess which of the
-        // session states it stood for.
-        let (status_color, status_label) = match state {
-            Some(AgentSessionState::Running) => {
-                (theme::accent_success(), locale::common("Running"))
-            }
-            Some(AgentSessionState::NeedsInput) => (
-                theme::accent_yellow(),
-                locale::text("Needs you", "需要你操作", "需要你操作"),
-            ),
-            Some(AgentSessionState::Error) => (theme::accent_red(), locale::common("Failed")),
-            Some(AgentSessionState::Idle) => (theme::text_muted(), locale::common("Idle")),
-            Some(AgentSessionState::Archived) => (theme::text_muted(), locale::common("Archived")),
-            Some(_) => (theme::text_muted(), locale::common("Closed")),
-            None => (theme::accent_yellow(), locale::common("No session")),
-        };
-        let (badge, terminal_running) = self
+        let terminal_running = self
             .workbench
             .as_ref()
-            .map(|workbench| {
-                let workbench = workbench.read(cx);
-                (
-                    workbench.right_rail_badge(),
-                    workbench.terminal_is_running(),
-                )
-            })
-            .unwrap_or((0, false));
+            .is_some_and(|workbench| workbench.read(cx).terminal_is_running());
+        // The session's state reads the same way it does on the left screen's
+        // session row: the same mark in the same colour, on the title's trailing
+        // edge. The phone used to spell the state out on a line of its own, which
+        // cost the header a second line and made the drawer and the page describe
+        // one session two different ways.
+        let auto_continue = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.as_ref())
+            .is_some_and(|selected| {
+                self.sidebar_view
+                    .auto_continue_session_ids
+                    .contains(selected.as_str())
+            });
+        let status_mark = state.map(|state| {
+            sidebar_session_status_indicator(
+                state,
+                auto_continue,
+                ElementId::from("mobile-header-session-state"),
+            )
+        });
         div()
             .h(px(theme::HEADER_HEIGHT))
             .flex_shrink_0()
@@ -18088,13 +18084,14 @@ impl MobileApp {
                 div()
                     .flex_1()
                     .min_w_0()
+                    .px(px(theme::SPACING_XS))
                     .flex()
-                    .flex_col()
-                    .justify_center()
                     .items_center()
+                    .justify_center()
+                    .gap(px(theme::SPACING_XS))
                     .child(
                         div()
-                            .max_w_full()
+                            .min_w_0()
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
@@ -18103,25 +18100,7 @@ impl MobileApp {
                             .text_color(theme::text_primary())
                             .child(title.to_string()),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(theme::SPACING_XS))
-                            .child(
-                                div()
-                                    .size(px(theme::ICON_STATUS))
-                                    .flex_shrink_0()
-                                    .rounded_full()
-                                    .bg(status_color),
-                            )
-                            .child(
-                                div()
-                                    .text_size(theme::font_micro())
-                                    .text_color(status_color)
-                                    .child(status_label),
-                            ),
-                    ),
+                    .children(status_mark),
             )
             .child(
                 div()
@@ -18154,41 +18133,6 @@ impl MobileApp {
                             .text_color(theme::text_secondary()),
                     ),
             )
-            .child(
-                div()
-                    .id("refresh-session")
-                    .size(px(theme::HEADER_BUTTON_SIZE))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .aria_label(locale::common("Refresh"))
-                    .active(|style| style.bg(theme::row_pressed_bg()))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::refresh))
-                    .child(
-                        svg()
-                            .path("icons/refresh.svg")
-                            .size(px(theme::ICON_SM))
-                            .text_color(theme::text_muted()),
-                    ),
-            )
-            .when(
-                self.team_controller
-                    .as_ref()
-                    .is_some_and(|team| team.is_supported()),
-                |header| {
-                    header.child(
-                        Button::new("open-team")
-                            .ghost()
-                            .h(px(theme::HEADER_BUTTON_SIZE))
-                            .label(locale::text("Team…", "团队…", "團隊…"))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.open_team(window, cx)),
-                            ),
-                    )
-                },
-            )
             // The right rail's only entry point. It was reachable exclusively
             // from an unhinted swipe; a phone user has no reason to discover
             // that a screen with Files, Git, and a terminal exists at all.
@@ -18213,32 +18157,16 @@ impl MobileApp {
                         svg()
                             .path("icons/panel-right.svg")
                             .size(px(theme::ICON_MD))
-                            .text_color(if terminal_running || badge > 0 {
+                            .text_color(if terminal_running {
                                 theme::text_primary()
                             } else {
                                 theme::text_secondary()
                             }),
                     )
-                    .when(badge > 0, |button| {
-                        button.child(
-                            div()
-                                .absolute()
-                                .top(px(8.0))
-                                .right(px(6.0))
-                                .min_w(px(16.0))
-                                .h(px(16.0))
-                                .px(px(3.0))
-                                .rounded_full()
-                                .bg(theme::accent_blue())
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_size(theme::font_micro())
-                                .text_color(theme::bg_primary())
-                                .child(badge.min(99).to_string()),
-                        )
-                    })
-                    .when(terminal_running && badge == 0, |button| {
+                    // A running terminal earns the one dot, which is a state and
+                    // not a count. The changed-file count used to sit here as a
+                    // number, and a phone header is not a place to read one.
+                    .when(terminal_running, |button| {
                         button.child(
                             div()
                                 .absolute()
@@ -21003,8 +20931,6 @@ impl MobileApp {
             runtime_selection.is_some_and(|selection| !selection.config_values.is_empty());
         div()
             .flex_shrink_0()
-            .border_t_1()
-            .border_color(theme::border_subtle())
             .bg(theme::bg_primary())
             .p(px(theme::SPACING_MD))
             // Slash-command suggestions sit directly above the field they are

@@ -36,6 +36,7 @@ const ICONS: &[&str] = &[
     "icons/chevron-right.svg",
     "icons/chevron-left.svg",
     "icons/chevron-down.svg",
+    "icons/chevron-up.svg",
     "icons/chevrons-right.svg",
     "icons/message-square.svg",
     "icons/pin.svg",
@@ -505,6 +506,7 @@ impl AssetSource for MobileAssets {
             "icons/chevron-right.svg" => Some(include_bytes!("../assets/icons/chevron-right.svg")),
             "icons/chevron-left.svg" => Some(include_bytes!("../assets/icons/chevron-left.svg")),
             "icons/chevron-down.svg" => Some(include_bytes!("../assets/icons/chevron-down.svg")),
+            "icons/chevron-up.svg" => Some(include_bytes!("../assets/icons/chevron-up.svg")),
             "icons/message-square.svg" => {
                 Some(include_bytes!("../assets/icons/message-square.svg"))
             }
