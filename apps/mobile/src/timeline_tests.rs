@@ -1076,14 +1076,16 @@ fn a_settled_question_survives_the_end_of_its_turn(cx: &mut TestAppContext) {
     let header = format!("settled-question:{row_id}");
 
     // The reader must still be able to find and open what they answered. The
-    // turn folds its activity when it completes, so the record either stays on
-    // screen or is one disclosure away.
+    // fold takes the turn's steps, not the record: a question is not activity,
+    // so it is on screen whether the turn is folded or open.
     let turn_id = _app.read_with(cx, |app, _| app.timeline_turns.last().unwrap().id.clone());
-    let visible_while_folded = cx.debug_bounds(header.clone().leak()).is_some();
-    click(cx, &format!("turn-process:{turn_id}"));
-    let visible_when_opened = cx.debug_bounds(header.clone().leak()).is_some();
     assert!(
-        visible_while_folded || visible_when_opened,
-        "the answered question stays reachable once its turn completes"
+        cx.debug_bounds(header.clone().leak()).is_some(),
+        "the answered question stays on screen once its turn completes"
+    );
+    click(cx, &format!("turn-process:{turn_id}"));
+    assert!(
+        cx.debug_bounds(header.clone().leak()).is_some(),
+        "and opening the turn's activity keeps it in view"
     );
 }

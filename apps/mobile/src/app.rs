@@ -18499,6 +18499,17 @@ impl MobileApp {
                     ),
                 )
             })
+            // The fold above is for activity. A question is not activity: it is
+            // the way back to a panel still waiting, and once answered it is the
+            // only place the answer can be read again, so it stays in sight even
+            // while the steps it arrived with are folded away.
+            .when(!expanded, |container| {
+                let records = self.render_turn_question_records(turn, cx);
+                if records.is_empty() {
+                    return container;
+                }
+                container.child(div().flex().flex_col().gap(px(2.0)).children(records))
+            })
             .when_some(conclusion_row, |container, row| {
                 // The answer gets air above it and a left rail, so it reads as
                 // the point of the turn instead of the next process line.
@@ -18875,6 +18886,30 @@ impl MobileApp {
         self.timeline_row_latest_payload(row)
             .map(timeline_payload_icon_path)
             .unwrap_or_else(|| timeline_row_icon_path(row.kind))
+    }
+
+    /// The records of the questions an Agent parked on during this turn.
+    ///
+    /// One row per request, in the order they arrived, rendered exactly as the
+    /// process stream would render them. A folded turn draws these outside the
+    /// fold: the steps that led to a question may be put away, but the question
+    /// itself is either the way back to a panel still waiting or the record of
+    /// an answer already given, and neither survives being folded.
+    fn render_turn_question_records(
+        &self,
+        turn: &TimelineConversationTurn,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        turn.process_rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    TimelineRowKind::PermissionRequest | TimelineRowKind::ElicitationRequest
+                )
+            })
+            .map(|row| self.render_timeline_row(turn, row, false, cx))
+            .collect()
     }
 
     fn render_timeline_process_rows(
