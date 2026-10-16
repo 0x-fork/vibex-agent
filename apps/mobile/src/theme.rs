@@ -695,6 +695,12 @@ pub const DRAWER_BACKDROP_OPACITY: f32 = 0.4;
 pub const DRAWER_OPEN_ANIMATION_MS: u64 = 160;
 pub const DRAWER_CLOSE_ANIMATION_MS: u64 = 100;
 
+/// How tall a sheet may be pulled open before it stops growing.
+///
+/// Not the whole page: the strip of page left above it is what says the sheet
+/// is a thing laid over the page rather than a page of its own, and it is where
+/// the reader's eye returns when they are done with it.
+pub const SHEET_EXPANDED_HEIGHT_RATIO: f32 = 0.88;
 /// How tall a bottom sheet may rise before its body scrolls instead.
 ///
 /// A sheet is a thing laid over the page, not a page of its own: whatever it
@@ -728,6 +734,11 @@ pub const SHEET_PULL_DISMISS_TRAVEL: f32 = 96.0;
 /// logical pixels per second: a short flick leaves the same way a long drag
 /// does.
 pub const SHEET_PULL_DISMISS_VELOCITY: f32 = 700.0;
+/// How fast a released pull must still be moving to settle the sheet's height
+/// the way it was going, in logical pixels per second. A flick up opens a sheet
+/// the reader only pulled part way, and a flick down closes one they only
+/// started to give back.
+pub const SHEET_EXPAND_VELOCITY: f32 = 500.0;
 /// How long after a pull lets go a tap on the scrim is ignored.
 ///
 /// The lift that ends a pull can land on the scrim itself once the panel has
