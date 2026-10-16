@@ -2485,16 +2485,7 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         },
         AppMessage::Audit(result) => match result {
             Ok(records) => {
-                let body = records
-                    .iter()
-                    .map(|record| {
-                        format!(
-                            "{}  {:?}  {:?}",
-                            record.created_at_ms, record.action, record.outcome
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let body = crate::device_center::audit_report(&records, app.strings);
                 app.management_data.audit = records;
                 app.overlay = Some(Overlay::TextView {
                     title: app.strings.devices_audit().to_string(),

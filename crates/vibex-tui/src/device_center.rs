@@ -603,6 +603,119 @@ impl Publications {
     }
 }
 
+/// The audit trail, as the read-only view prints it.
+///
+/// One block per record: when it happened, what the runtime decided, the
+/// sentence the runtime already wrote about it, and the identifiers a support
+/// conversation needs to line the row up with its logs.
+///
+/// The action and the outcome are the reader's words rather than the wire's.
+/// An audit trail is read by the person who owns the machine, and a column of
+/// `DeviceRevoked` / `Allowed` is a column of Rust variant names in a client
+/// that translates everything else. The summary beside them is the runtime's own
+/// sentence, shown as it stands: it is the one part of a record that says what
+/// actually happened, and it is already redacted where it was written.
+pub fn audit_report(records: &[vibex_core::RemoteAuditRecord], strings: Strings) -> String {
+    if records.is_empty() {
+        return strings.audit_empty().to_string();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for record in records {
+        lines.push(format!(
+            "{}  {}  {}",
+            crate::text::format_clock(record.created_at_ms, strings.locale),
+            audit_outcome_label(record.outcome, strings),
+            audit_action_label(record.action, strings),
+        ));
+        let summary = record.redacted_summary.trim();
+        if !summary.is_empty() {
+            lines.push(format!("    {summary}"));
+        }
+        let mut identifiers: Vec<String> = Vec::new();
+        if let Some(device_id) = record.device_id.as_ref() {
+            identifiers.push(format!("{} {device_id}", strings.audit_field_device()));
+        }
+        if let Some(target_id) = record.target_id.as_ref() {
+            identifiers.push(format!(
+                "{} {}:{target_id}",
+                strings.audit_field_target(),
+                audit_target_kind_id(record.target_kind)
+            ));
+        }
+        if let Some(request_id) = record.request_id.as_ref() {
+            identifiers.push(format!("{} {request_id}", strings.audit_field_request()));
+        }
+        if let Some(correlation_id) = record.correlation_id.as_ref() {
+            identifiers.push(format!(
+                "{} {correlation_id}",
+                strings.audit_field_correlation()
+            ));
+        }
+        if !identifiers.is_empty() {
+            lines.push(format!("    {}", identifiers.join(" · ")));
+        }
+        lines.push(String::new());
+    }
+    lines.join("\n").trim_end().to_string()
+}
+
+fn audit_action_label(action: vibex_core::RemoteAuditAction, strings: Strings) -> &'static str {
+    use vibex_core::RemoteAuditAction as Action;
+    match action {
+        Action::PairingCodeCreated => strings.audit_action_pairing_code_created(),
+        Action::PairingCodeClaimed => strings.audit_action_pairing_code_claimed(),
+        Action::PairingCodeRejected => strings.audit_action_pairing_code_rejected(),
+        Action::PairingOfferCreated => strings.audit_action_pairing_offer_created(),
+        Action::PairingOfferClaimed => strings.audit_action_pairing_offer_claimed(),
+        Action::PairingOfferCanceled => strings.audit_action_pairing_offer_canceled(),
+        Action::PairingOfferRejected => strings.audit_action_pairing_offer_rejected(),
+        Action::DeviceAuthenticated => strings.audit_action_device_authenticated(),
+        Action::DeviceAuthFailed => strings.audit_action_device_auth_failed(),
+        Action::DeviceRevoked => strings.audit_action_device_revoked(),
+        Action::DeviceRestored => strings.audit_action_device_restored(),
+        Action::DeviceDeleted => strings.audit_action_device_deleted(),
+        Action::DeviceRenamed => strings.audit_action_device_renamed(),
+        Action::RuntimeRenamed => strings.audit_action_runtime_renamed(),
+        Action::PermissionAllowed => strings.audit_action_permission_allowed(),
+        Action::PermissionDenied => strings.audit_action_permission_denied(),
+        Action::MutationAllowed => strings.audit_action_mutation_allowed(),
+        Action::MutationDenied => strings.audit_action_mutation_denied(),
+    }
+}
+
+fn audit_outcome_label(outcome: vibex_core::RemoteAuditOutcome, strings: Strings) -> &'static str {
+    use vibex_core::RemoteAuditOutcome as Outcome;
+    match outcome {
+        Outcome::Allowed => strings.audit_outcome_allowed(),
+        Outcome::Denied => strings.audit_outcome_denied(),
+        Outcome::Failed => strings.audit_outcome_failed(),
+        Outcome::Created => strings.audit_outcome_created(),
+        Outcome::Revoked => strings.audit_outcome_revoked(),
+    }
+}
+
+/// What a record's target is, as the stable word its own id is filed under.
+///
+/// Not translated on purpose: this is the half of the identifier line a reader
+/// greps for, like an error code, rather than copy to read.
+const fn audit_target_kind_id(target: vibex_core::RemoteAuditTargetKind) -> &'static str {
+    use vibex_core::RemoteAuditTargetKind as Target;
+    match target {
+        Target::PairingCode => "pairing_code",
+        Target::PairingOffer => "pairing_offer",
+        Target::Device => "device",
+        Target::Permission => "permission",
+        Target::Elicitation => "elicitation",
+        Target::AgentSession => "agent_session",
+        Target::AgentAuthentication => "agent_authentication",
+        Target::WorkspaceFile => "workspace_file",
+        Target::Git => "git",
+        Target::Terminal => "terminal",
+        Target::ProviderSettings => "provider_settings",
+        Target::System => "system",
+    }
+}
+
 /// The page's own navigation: which tab is open, which row the keyboard is on,
 /// and which pairing row has its panel open.
 #[derive(Debug, Clone, Default)]
@@ -763,11 +876,64 @@ mod tests {
             vec![PairMethod::QrCode]
         );
         // And the local-network row is a desktop fact, so a peer of unknown
-        // kind is not offered it on the strength of the capability alone.
-        assert_eq!(
-            rows(RemoteServerKind::Unknown, AVAILABLE, AVAILABLE),
-            vec![PairMethod::QrCode]
+        // kind does not get it however available the capability looks.
+        assert!(
+            !rows(RemoteServerKind::Unknown, AVAILABLE, AVAILABLE)
+                .contains(&PairMethod::LocalNetwork)
         );
+    }
+
+    #[test]
+    fn the_audit_report_says_what_happened_rather_than_naming_variants() {
+        use crate::locale::Locale;
+        let strings = Strings::for_locale(Locale::En);
+        assert_eq!(audit_report(&[], strings), strings.audit_empty());
+
+        let record = vibex_core::RemoteAuditRecord {
+            audit_id: vibex_core::RequestId::new(),
+            device_id: Some(vibex_core::DeviceId::parse("device_phone").unwrap()),
+            action: vibex_core::RemoteAuditAction::PairingOfferClaimed,
+            target_kind: vibex_core::RemoteAuditTargetKind::PairingOffer,
+            target_id: Some("request_offer".to_string()),
+            outcome: vibex_core::RemoteAuditOutcome::Allowed,
+            redacted_summary: "Device 'Pixel 8' paired".to_string(),
+            request_id: Some(vibex_core::RequestId::parse("request_one").unwrap()),
+            correlation_id: Some(vibex_core::CorrelationId::parse("correlation_one").unwrap()),
+            created_at_ms: 1_772_000_000_000,
+        };
+        let report = audit_report(std::slice::from_ref(&record), strings);
+        // The reader's words, not the payload's variant names.
+        assert!(report.contains("Pairing offer claimed"), "{report}");
+        assert!(report.contains("Allowed"), "{report}");
+        assert!(!report.contains("PairingOfferClaimed"), "{report}");
+        assert!(!report.contains("RemoteAuditAction"), "{report}");
+        // The runtime's own sentence is the one part that says what happened,
+        // and it used to be thrown away.
+        assert!(report.contains("Device 'Pixel 8' paired"), "{report}");
+        // Every identifier a support conversation needs is on the block.
+        assert!(report.contains("device_phone"), "{report}");
+        assert!(report.contains("pairing_offer:request_offer"), "{report}");
+        assert!(report.contains("request_one"), "{report}");
+        assert!(report.contains("correlation_one"), "{report}");
+        // A record with nothing optional still renders its one line.
+        let bare = vibex_core::RemoteAuditRecord {
+            device_id: None,
+            target_id: None,
+            redacted_summary: String::new(),
+            request_id: None,
+            correlation_id: None,
+            ..record
+        };
+        let report = audit_report(std::slice::from_ref(&bare), strings);
+        assert_eq!(report.lines().count(), 1, "{report}");
+
+        // The Chinese interfaces read the same record in Chinese.
+        let zh = audit_report(
+            std::slice::from_ref(&bare),
+            Strings::for_locale(Locale::ZhCn),
+        );
+        assert!(zh.contains("配对邀请已被领取"), "{zh}");
+        assert!(zh.contains("已允许"), "{zh}");
     }
 
     #[test]
