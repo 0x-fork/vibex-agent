@@ -4137,6 +4137,18 @@ fn timeline_batch_requires_auto_continue_refresh(events: &[TimelineLiveEvent]) -
     })
 }
 
+/// The turn verdict a freshly loaded timeline may pin to its session revision.
+///
+/// A page cut to a turn window can end mid-turn — the row that would prove the
+/// turn ended may simply not be in the window that was read — so only a final
+/// answer is evidence the turn completed. Anything else leaves the revision to
+/// the authority's completion probe instead of caching an "abnormal stop" no
+/// later event can revise, which is the reading that keeps a queued auto-send
+/// from ever leaving.
+fn authoritative_loaded_turn_status(items: &[TimelineItem]) -> Option<bool> {
+    (latest_timeline_turn_ended_normally(items) == Some(true)).then_some(true)
+}
+
 /// Session snapshots also carry the latest timeline timestamp. That timestamp
 /// changes for every streamed item, but it does not change the sidebar shape.
 /// Keep the comparison focused on fields that can affect the sidebar so a
@@ -9272,15 +9284,6 @@ pub struct VibexWorkbench {
     /// is what the revision records. Without it a snapshot read before the
     /// dispatch could be mistaken for the dispatch's own settle.
     pending_agent_turn_revisions: BTreeMap<String, i64>,
-    /// Sessions whose locally dispatched turn the authority has since admitted
-    /// by reporting `Running`/`NeedsInput`.
-    ///
-    /// Only an admitted turn can settle, so this is the other half of the
-    /// answer: the flag is dropped once the authority reports a settled state
-    /// for a turn it was seen to admit. A native steer arms the flag from a
-    /// turn that is already running, and nothing else in that path would ever
-    /// clear it.
-    pending_agent_turn_admitted: BTreeSet<String>,
     unread_agent_completion_session_ids: BTreeSet<String>,
     /// The highest final-answer sequence already accounted for per session.
     ///
@@ -10721,7 +10724,6 @@ impl VibexWorkbench {
             fork_session_pending: false,
             pending_agent_turn_session_ids: BTreeSet::new(),
             pending_agent_turn_revisions: BTreeMap::new(),
-            pending_agent_turn_admitted: BTreeSet::new(),
             unread_agent_completion_session_ids: BTreeSet::new(),
             unread_completion_watermarks: BTreeMap::new(),
             pending_user_request_ids: BTreeMap::new(),
@@ -14955,6 +14957,13 @@ impl VibexWorkbench {
                             // dispatch whose turn it shows settled is answered
                             // here rather than by the submission that armed it.
                             this.reconcile_pending_agent_turns();
+                            // The list replaces every row at once, so it never
+                            // passes through the per-snapshot wake below. A
+                            // settle that reached this shell only through this
+                            // read — the remote client's invalidation, or a
+                            // lagged fanout that swallowed the snapshot — has to
+                            // wake a waiting auto-send here.
+                            this.wake_composer_queue_after_overview();
                             // The delegated children are read after the root
                             // list, from the runtime's ownership edges, so a
                             // child that is not a navigation row still has a
@@ -15736,28 +15745,12 @@ impl VibexWorkbench {
             // The flag speaks for the dispatch that armed it, so it is pinned to
             // the revision the client held then: only a snapshot the authority
             // wrote afterwards can answer it, and a snapshot read before the
-            // dispatch cannot be mistaken for its settle. A dispatch that joins
-            // a turn the authority is already running — a native steer — has
-            // been admitted by definition and only has its settle left.
-            let (revision, admitted) =
-                self.registered_session(session_id.as_str())
-                    .map_or((0, false), |session| {
-                        (
-                            session.updated_at_ms,
-                            matches!(
-                                session.state,
-                                AgentSessionState::Running | AgentSessionState::NeedsInput
-                            ),
-                        )
-                    });
+            // dispatch cannot be mistaken for its settle.
+            let revision = self
+                .registered_session(session_id.as_str())
+                .map_or(0, |session| session.updated_at_ms);
             self.pending_agent_turn_revisions
                 .insert(session_id.as_str().to_string(), revision);
-            if admitted {
-                self.pending_agent_turn_admitted
-                    .insert(session_id.as_str().to_string());
-            } else {
-                self.pending_agent_turn_admitted.remove(session_id.as_str());
-            }
             self.auto_continue_paused_turn_session_ids
                 .remove(session_id.as_str());
             self.auto_continue_handled_turns.remove(session_id.as_str());
@@ -15771,7 +15764,6 @@ impl VibexWorkbench {
                 .remove(session_id.as_str());
             self.pending_agent_turn_revisions
                 .remove(session_id.as_str());
-            self.pending_agent_turn_admitted.remove(session_id.as_str());
         }
         if self.selected_session_id.as_ref() == Some(session_id) {
             self.agent_turn_pending = pending;
@@ -15791,23 +15783,28 @@ impl VibexWorkbench {
     /// admits it, and that optimism is only answered by the authority's own
     /// settle. The flag is armed with the revision the dispatch started from, so
     /// a snapshot answers it only once the authority has moved past that
-    /// revision: the turn has to be seen admitted (`Running`/`NeedsInput`) and
-    /// then settled. Without this the flag outlives the turn whenever the
+    /// revision. Without this the flag outlives the turn whenever the
     /// submission's own future is slower than the settle — collapsing a long
     /// turn's streamed rows is unbounded work — and the sidebar keeps painting a
     /// finished turn as running while the row's own state already reads idle.
-    /// It is also the only answer a native steer can get: the message joins a
-    /// turn no local submission owns, so nothing else would ever clear the flag.
+    ///
+    /// The revision is the whole answer, and it has to be: a settled snapshot
+    /// the authority wrote after the dispatch *is* the turn's boundary whether or
+    /// not this client ever happened to see the `Running` revision in between.
+    /// Requiring an observed admission pinned the flag forever for a client that
+    /// follows the sidebar projection rather than every snapshot (a fast turn, or
+    /// a remote reader whose only settle is the list) — and because the flag is
+    /// what holds the one global pre-send queue fence, one such session froze
+    /// every other session's queued auto-sends with it.
     fn reconcile_pending_agent_turn(&mut self, session: &AgentSession) -> bool {
         let key = session.id.as_str();
         if !self.pending_agent_turn_session_ids.contains(key) {
             return false;
         }
         match session.state {
-            AgentSessionState::Running | AgentSessionState::NeedsInput => {
-                self.pending_agent_turn_admitted.insert(key.to_string());
-                false
-            }
+            // A turn the authority is running has not settled, so the flag
+            // stays; the revision records the dispatch it has to move past.
+            AgentSessionState::Running | AgentSessionState::NeedsInput => false,
             // `Initializing` is the runtime being prepared, not a turn the
             // authority admitted: the dispatch it was armed for is still ahead.
             AgentSessionState::Initializing => false,
@@ -15815,11 +15812,10 @@ impl VibexWorkbench {
             | AgentSessionState::Error
             | AgentSessionState::Closed
             | AgentSessionState::Archived => {
-                let answered = self.pending_agent_turn_admitted.contains(key)
-                    && self
-                        .pending_agent_turn_revisions
-                        .get(key)
-                        .is_none_or(|armed| session.updated_at_ms > *armed);
+                let answered = self
+                    .pending_agent_turn_revisions
+                    .get(key)
+                    .is_none_or(|armed| session.updated_at_ms > *armed);
                 if answered {
                     self.set_session_turn_pending(&session.id, false);
                 }
@@ -15983,6 +15979,55 @@ impl VibexWorkbench {
         if holds_an_entry || holds_the_fence {
             self.composer_queue_ready_after_continuation_session_ids
                 .insert(session_id.as_str().to_string());
+        }
+    }
+
+    /// Wakes a waiting auto-send for the rows an authoritative overview replaced.
+    ///
+    /// The list is the whole story for a client that draws the sidebar
+    /// projection rather than per-session snapshots, so a settle can reach this
+    /// shell only here — another client archived or stopped a turn, or a lagged
+    /// fanout swallowed the very snapshot the queue was waiting on. These rows
+    /// never pass through [`Self::upsert_session_snapshot`], so a probe answer
+    /// pinned to a superseded revision is dropped and the queue is re-armed to
+    /// ask the revision the list actually shows.
+    fn wake_composer_queue_after_overview(&mut self) {
+        let mut referenced = self
+            .composer_queue
+            .iter()
+            .map(|message| message.session_id.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(fence) = self.composer_queue_dispatch_fence.as_ref() {
+            referenced.insert(fence.session_id.clone());
+        }
+        for session_id in referenced {
+            let Some((state, revision)) = self
+                .registered_session(session_id.as_str())
+                .map(|session| (session.state, session.updated_at_ms))
+            else {
+                continue;
+            };
+            let superseded = self
+                .auto_continue_turn_statuses
+                .get(session_id.as_str())
+                .is_some_and(|status| status.session_updated_at_ms != revision);
+            if superseded {
+                self.auto_continue_turn_statuses.remove(session_id.as_str());
+                self.auto_continue_probe_attempts
+                    .remove(session_id.as_str());
+                self.auto_continue_probe_tasks.remove(session_id.as_str());
+                self.cancel_auto_continue_countdown(&session_id);
+            }
+            // A settled revision nobody has judged yet is what the queue is
+            // waiting for; the re-evaluation probes it and a normal completion
+            // hands the head over.
+            let unjudged = matches!(state, AgentSessionState::Idle | AgentSessionState::Error)
+                && self
+                    .cached_auto_continue_turn_status(&session_id, revision)
+                    .is_none();
+            if superseded || unjudged {
+                self.mark_composer_queue_for_recheck(&session_id);
+            }
         }
     }
 
@@ -23049,7 +23094,7 @@ impl VibexWorkbench {
                             // waiting for a probe that this load just replaced.
                             if let Some(session_updated_at_ms) = load_revision {
                                 let ended_normally =
-                                    latest_timeline_turn_ended_normally(&this.timeline.items);
+                                    authoritative_loaded_turn_status(&this.timeline.items);
                                 this.cache_auto_continue_turn_status(
                                     &session_id,
                                     session_updated_at_ms,
@@ -23189,7 +23234,7 @@ impl VibexWorkbench {
                             }
                             if let Some(session_updated_at_ms) = load_revision {
                                 let ended_normally =
-                                    latest_timeline_turn_ended_normally(&this.timeline.items);
+                                    authoritative_loaded_turn_status(&this.timeline.items);
                                 this.cache_auto_continue_turn_status(
                                     &session_id,
                                     session_updated_at_ms,
@@ -32338,8 +32383,6 @@ impl VibexWorkbench {
                         // turn the authority is running, so that turn's settle
                         // is the only answer this flag can get — no submission
                         // of ours owns it.
-                        this.pending_agent_turn_admitted
-                            .insert(session_id.as_str().to_string());
                         this.reconcile_sidebar_state();
                         this.publish_sidebar_invalidation();
                         this.composer_queue_changed();
@@ -36130,8 +36173,6 @@ impl VibexWorkbench {
             .retain(|session_id| !session_ids.contains(session_id));
         self.pending_agent_turn_revisions
             .retain(|session_id, _| !session_ids.contains(session_id));
-        self.pending_agent_turn_admitted
-            .retain(|session_id| !session_ids.contains(session_id));
         self.unread_agent_completion_session_ids
             .retain(|session_id| !session_ids.contains(session_id));
         self.unread_completion_watermarks
@@ -90333,13 +90374,19 @@ mod tests {
         assert!(!selection.contains("latest_timeline_turn_ended_normally"));
         assert!(!selection.contains("cache_auto_continue_turn_status"));
 
+        // The load paths judge the turn with the guarded helper: a page cut to
+        // a turn window can end mid-turn, so only a final answer may be cached.
+        // Caching a bare `false` there pins an abnormal stop to the settled
+        // revision, which is what keeps a queued auto-send from leaving.
         let authoritative_load = source
             .split_once("    fn load_agent_session_timeline(")
             .and_then(|(_, tail)| tail.split_once("\n    fn refresh_selected_agent_timeline("))
             .map(|(body, _)| body)
             .expect("authoritative timeline load should remain inspectable");
-        assert!(authoritative_load.contains("latest_timeline_turn_ended_normally"));
+        assert!(authoritative_load.contains("authoritative_loaded_turn_status"));
         assert!(authoritative_load.contains("cache_auto_continue_turn_status"));
+        assert!(!authoritative_load.contains("latest_timeline_turn_ended_normally"));
+        assert!(source.contains("fn authoritative_loaded_turn_status("));
     }
 
     #[test]

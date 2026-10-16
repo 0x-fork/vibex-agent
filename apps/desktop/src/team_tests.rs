@@ -1556,6 +1556,43 @@ fn a_preparing_runtime_keeps_the_dispatch_optimism(cx: &mut TestAppContext) {
     );
 }
 
+/// A settle the workbench never saw admitted still answers the dispatch.
+///
+/// The turn can run and finish between two snapshots this client sees — a fast
+/// turn, or a reader whose only session news is the authoritative list. The
+/// settled snapshot the authority wrote after the dispatch is the turn's
+/// boundary either way. Requiring an observed `Running` in between pinned the
+/// flag forever, and because the flag holds the one global pre-send queue
+/// fence, one such session froze every queued auto-send behind it.
+#[gpui::test]
+fn a_settle_without_an_observed_admission_answers_the_dispatch(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    let session_id = session(0).id.clone();
+    let mut idle = session(0);
+    idle.state = AgentSessionState::Idle;
+    idle.updated_at_ms = 10;
+    let mut settled = idle.clone();
+    settled.updated_at_ms = 40;
+
+    workbench.update(cx, |workbench, _| {
+        workbench.upsert_session_snapshot(idle.clone());
+        workbench.set_session_turn_pending(&session_id, true);
+    });
+    assert!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .session_turn_pending(&session_id)),
+        "the dispatch has not been answered by a snapshot from before it"
+    );
+    workbench.update(cx, |workbench, _| {
+        workbench.upsert_session_snapshot(settled.clone());
+    });
+    assert!(
+        !workbench.read_with(cx, |workbench, _| workbench
+            .session_turn_pending(&session_id)),
+        "the settle the authority wrote after the dispatch ends the optimism"
+    );
+}
+
 #[gpui::test]
 fn team_presentation_recovers_missing_groups_preserves_manual_layout_and_respects_authority(
     cx: &mut TestAppContext,
@@ -2870,4 +2907,208 @@ fn a_remote_sidebar_invalidation_is_recognized() {
     assert!(!backend_event_invalidates_sidebar(
         &BackendEvent::ProjectionInvalidated(BackendProjection::Usage)
     ));
+}
+
+/// One timeline row for a verdict test: the loader only reads `kind`, `source`,
+/// and the payload, so the rest is filled with the defaults an append would use.
+fn timeline_row(
+    session_id: &VibexSessionId,
+    sequence: i64,
+    source: TimelineSource,
+    payload: TimelinePayload,
+) -> TimelineItem {
+    TimelineItem {
+        id: TimelineItemId::new(),
+        session_id: session_id.clone(),
+        sequence,
+        timestamp_ms: sequence,
+        source,
+        kind: payload.kind(),
+        correlation_id: None,
+        provider_correlation_id: None,
+        redaction_state: TimelineRedactionState::None,
+        execution_attribution: None,
+        payload_depth: vibex_core::TimelinePayloadDepth::Detail,
+        payload,
+    }
+}
+
+/// A timeline page that ends mid-turn may not pin an "abnormal stop" verdict.
+///
+/// The load paths read a turn-window page, so the final answer that proves a
+/// normal completion is routinely cut off with the rows below it. Caching that
+/// reading against the session's settled revision latches a verdict no later
+/// event can revise, which is exactly what keeps an auto-send in the pre-send
+/// queue from ever leaving after the turn ended normally.
+#[gpui::test]
+fn a_loaded_page_never_pins_an_unconfirmed_stop_to_a_settled_revision(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    cx.update(|_, cx| {
+        workbench.update(cx, |workbench, cx| {
+            let session_id = session(0).id.clone();
+            let revision = session(0).updated_at_ms;
+            // The page ends mid-turn: the answer is not in this window.
+            let items = vec![timeline_row(
+                &session_id,
+                1,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                    text: "do the work".into(),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+            )];
+            assert_eq!(authoritative_loaded_turn_status(&items), None);
+            workbench.cache_auto_continue_turn_status(&session_id, revision, None, cx);
+            workbench.composer_queue = vec![head_queue_message(1, &session_id, None)];
+            // The unjudged revision is what the shell's real queue does with
+            // `None`: it waits, and the head must still leave once the
+            // authority's probe answers normally.
+            workbench.cache_auto_continue_turn_status(&session_id, revision, Some(true), cx);
+            assert!(
+                workbench
+                    .cached_auto_continue_turn_status(&session_id, revision)
+                    .is_some_and(|status| status.ended_normally == Some(true)),
+                "a normal completion is the only verdict the queue may act on"
+            );
+        });
+    });
+}
+
+/// A normal completion the page fully contains is still cached as `true`.
+#[test]
+fn a_loaded_page_caches_the_normal_completion_it_can_see() {
+    let session_id = VibexSessionId::new();
+    let items = vec![
+        timeline_row(
+            &session_id,
+            1,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                text: "do the work".into(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+        ),
+        timeline_row(
+            &session_id,
+            2,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: "done".into(),
+                is_final: true,
+            }),
+        ),
+    ];
+    assert_eq!(authoritative_loaded_turn_status(&items), Some(true));
+}
+
+/// An authoritative whole-list read wakes a queue waiting on a settled row.
+///
+/// A client that draws the sidebar projection never sees the per-session
+/// snapshot the queue was waiting on, so the settle reaches it only through the
+/// list. The replaced row has a newer revision than the one the queue holds a
+/// probe answer for, and the queue has to ask for the current revision instead
+/// of waiting forever on the superseded one.
+#[gpui::test]
+fn an_authoritative_overview_read_wakes_a_waiting_auto_send(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    cx.update(|_, cx| {
+        workbench.update(cx, |workbench, _| {
+            let session_id = session(0).id.clone();
+            // A verdict pinned to a revision the list has already moved past.
+            workbench.auto_continue_turn_statuses.insert(
+                session_id.to_string(),
+                AutoContinueTurnStatus {
+                    session_updated_at_ms: session(0).updated_at_ms,
+                    ended_normally: Some(false),
+                },
+            );
+            workbench.composer_queue = vec![head_queue_message(1, &session_id, None)];
+            let mut settled = session(0);
+            settled.state = AgentSessionState::Idle;
+            settled.updated_at_ms = session(0).updated_at_ms + 100;
+            workbench.sessions = vec![settled];
+            workbench.wake_composer_queue_after_overview();
+            assert!(
+                workbench
+                    .cached_auto_continue_turn_status(&session_id, session(0).updated_at_ms + 100)
+                    .is_none(),
+                "the superseded verdict may not speak for the revision the list shows"
+            );
+            assert!(
+                workbench
+                    .composer_queue_ready_after_continuation_session_ids
+                    .contains(session_id.as_str()),
+                "the waiting auto-send is re-evaluated against the current revision"
+            );
+        });
+    });
+}
+
+/// A turn that settles through its own snapshot hands the queued message over.
+///
+/// This drives the real event path the reader's session takes: a dispatch arms
+/// the turn, the authority admits it, and then it settles normally. The queued
+/// auto-send behind it must leave on that settle without any further gesture —
+/// the failure the reader reported was exactly this message staying put.
+#[gpui::test]
+fn a_locally_dispatched_turn_settles_the_queued_auto_send(cx: &mut TestAppContext) {
+    let (workbench, cx, receiver) = fixture(cx, 1);
+    let session_id = session(0).id.clone();
+    cx.update(|_, cx| {
+        workbench.update(cx, |workbench, cx| {
+            let mut running = session(0);
+            running.state = AgentSessionState::Running;
+            running.updated_at_ms = 50;
+            workbench.apply_desktop_event(DesktopEvent::SessionUpdated(running.clone()), cx);
+            workbench.set_session_turn_pending(&session_id, true);
+            // A message the reader lined up while the turn was running.
+            workbench.composer_queue = vec![head_queue_message(1, &session_id, None)];
+        });
+    });
+
+    // The authority settles the turn. The settle arms the queue, and the flush
+    // the render pass runs is what hands the head over — no second gesture.
+    let mut settled = session(0);
+    settled.state = AgentSessionState::Idle;
+    settled.updated_at_ms = 70;
+    cx.update(|_, cx| {
+        workbench.update(cx, |workbench, cx| {
+            workbench.apply_desktop_event(DesktopEvent::SessionUpdated(settled.clone()), cx);
+            assert!(
+                workbench
+                    .composer_queue_ready_after_continuation_session_ids
+                    .contains(session_id.as_str()),
+                "the settle arms the waiting auto-send for re-evaluation"
+            );
+        });
+    });
+    // The queued head waits for the revision's verdict, so it leaves on the
+    // flush the render pass runs once the probe has answered — no second
+    // gesture. A headless test never paints, so the flush is driven here.
+    let mut dispatched = false;
+    for _ in 0..400 {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            workbench.update(cx, |workbench, cx| {
+                workbench.flush_composer_queue_dispatches_after_continuation(window, cx);
+            });
+        });
+        if workbench.read_with(cx, |workbench, _| workbench.composer_queue.is_empty()) {
+            dispatched = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        dispatched,
+        "the settle hands the queued auto-send on without a second gesture"
+    );
+    let sent = pump_until(cx, |_| {
+        receiver
+            .try_recv()
+            .is_ok_and(|observed| matches!(observed, Observed::Message(_)))
+    });
+    assert!(sent, "the submission path received the queued message");
 }

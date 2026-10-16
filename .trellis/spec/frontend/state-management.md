@@ -957,8 +957,18 @@ session's own state whether the turn still holds the queue.
   the completion: the final answer item. A live view's tail is routinely
   mid-turn while the session has already settled — a turn's answer arrives as
   deltas — and caching that reading would pin an "abnormal stop" to the settled
-  revision, a verdict no later event can revise. Such a revision stays uncached
-  so the authority's probe answers it, in either direction.
+  revision, a verdict no later event can revise. The same holds for the
+  timeline load paths: a page cut to a turn window routinely ends before the
+  final answer, so only `Some(true)` may be cached from a loaded view and
+  anything else leaves the revision to the authority's probe. Such a revision
+  stays uncached so the probe answers it, in either direction.
+- A settle that reaches the workbench only through an authoritative whole-list
+  read — a remote client's sidebar invalidation, or a lagged fan-out that
+  swallowed the per-session snapshot — has to wake a waiting auto-send too. The
+  list replaces every row at once and never travels the per-snapshot path, so
+  the queue re-arms for each row it references whose probe answer is pinned to
+  a superseded revision, or whose settled revision is still unjudged; the
+  next-frame re-evaluation probes the revision the list actually shows.
 - Explicit sends are the one gesture allowed to overtake the queue: the row's
   send-now/steer action promotes the message to the head and its behavior may
   leave the fence behind. A head that carries a deadline is always dispatched as
@@ -1048,10 +1058,14 @@ settled/closed/archived/untracked session — and the per-behavior admission of
 schedule waits behind it, a settled session releases a fence without any probe,
 moving an ordinary message in front of a schedule sends it, a head with no
 obtainable verdict is handed over instead of bouncing back, a refused hand-over
-is not reported as dispatched, and a live view settles a revision only for the
-completion it can see. The same file covers the optimistic dispatch projection:
+is not reported as dispatched, a live view settles a revision only for the
+completion it can see, a loaded page never pins an unconfirmed stop to a settled
+revision, an authoritative whole-list read wakes a waiting auto-send, and a
+locally dispatched turn's own settle hands the queued auto-send over. The same
+file covers the optimistic dispatch projection:
 a settle the authority published answers the flag even while its submission is
-still busy, a snapshot from before the dispatch cannot, a dispatch that joins a
+still busy, a settle with no observed admission in between still answers it, a
+snapshot from before the dispatch cannot, a dispatch that joins a
 running turn is answered by that turn, and a session still `Initializing` keeps
 the optimism. `desktop-model`
 covers the persisted queue's normalization, its bounds, and the UI-state
@@ -2279,17 +2293,22 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   skip recovery even though storage has already committed `Error`.
 - The local turn-pending projection is an answer to one dispatch, not a state of
   its own, so the authority's own settle ends it. Arm it with the session
-  revision the dispatch started from; a snapshot only answers it once the
-  authority has moved past that revision — the turn was seen admitted
-  (`Running`/`NeedsInput`) and then reported settled (`Idle`/`Error`/`Closed`/
-  `Archived`). Waiting for the submission's future instead lets the flag outlive
-  the turn whenever that future is slower than the settle, which is ordinary:
-  the runtime publishes the boundary before it compacts a long turn's streamed
-  rows, while the submission returns only after the compaction. A snapshot read
-  before the dispatch must never answer it, and a dispatch that joins a turn the
-  authority is already running — a native steer, whose `Injected` answer is
-  itself proof of admission — has no submission of ours to wait for at all. A
-  session still `Initializing` has not admitted anything yet.
+  revision the dispatch started from; a snapshot answers it once the authority
+  has moved past that revision and reports a settled state (`Idle`/`Error`/
+  `Closed`/`Archived`). The revision is the whole answer, and it has to be: a
+  settled snapshot the authority wrote after the dispatch *is* the turn's
+  boundary whether or not this client happened to see the `Running` revision in
+  between — a fast turn, or a remote reader whose only session news is the
+  authoritative list, routinely misses it. Requiring an observed admission
+  (`Running`/`NeedsInput`) pinned the flag forever for exactly those clients,
+  and because the flag is what holds the one global pre-send queue fence, one
+  such session froze every other session's queued auto-sends with it. Waiting
+  for the submission's future instead lets the flag outlive the turn whenever
+  that future is slower than the settle, which is ordinary: the runtime
+  publishes the boundary before it compacts a long turn's streamed rows, while
+  the submission returns only after the compaction. A snapshot read before the
+  dispatch must never answer it, and a session still `Initializing` has not
+  admitted anything yet.
 - After a successful submission reaches its turn boundary, automatic Composer
   queue dispatch may ignore a lagging sidebar `Running` snapshot. The local
   per-session turn-pending flag and an authoritative `NeedsInput` state remain
