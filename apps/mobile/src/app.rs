@@ -341,12 +341,11 @@ enum BackScreen {
     Overlay(MobileOverlay),
     /// A renamed/detached session with its title still open in the prompt.
     SessionAction,
-    /// The runtime selection sheet.
+    /// A runtime drawer: the Agent and its model, or one of the Agent's own
+    /// option groups.
     RuntimeOptions,
     /// A choice list the new-session page opened along its bottom edge.
     NewSessionPicker,
-    /// The new-session page's settings sheet.
-    NewSessionOptions,
     /// The Sessions drawer.
     SessionsDrawer,
     /// The Workbench drawer.
@@ -496,15 +495,64 @@ enum RuntimeOptionsTarget {
     NewSession,
 }
 
+/// Which group of the Agent's own options a drawer is showing.
+///
+/// One drawer serves all three: they are the same question — how this Agent
+/// should run — asked three times, and a phone shows one list at a time. The
+/// model itself is not one of them; it keeps the chip beside these buttons,
+/// because it is the one runtime choice whose value is worth reading at a
+/// glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeOptionPage {
+    /// How deeply the model is asked to think before it answers.
+    Reasoning,
+    /// What the session is allowed to do on the machine.
+    Mode,
+    /// The Agent's per-model session options, and — on the page that has no
+    /// session yet — the optional session title.
+    Options,
+}
+
+impl RuntimeOptionPage {
+    fn drawer_id(self) -> &'static str {
+        match self {
+            RuntimeOptionPage::Reasoning => "mobile-runtime-reasoning",
+            RuntimeOptionPage::Mode => "mobile-runtime-mode",
+            RuntimeOptionPage::Options => "mobile-runtime-features",
+        }
+    }
+
+    /// The element id of the drawer's own scrolling body. It is kept apart from
+    /// the panel's, so the two never key the same state.
+    fn body_id(self) -> &'static str {
+        match self {
+            RuntimeOptionPage::Reasoning => "mobile-runtime-reasoning-body",
+            RuntimeOptionPage::Mode => "mobile-runtime-mode-body",
+            RuntimeOptionPage::Options => "mobile-runtime-features-body",
+        }
+    }
+
+    fn heading(self) -> &'static str {
+        match self {
+            RuntimeOptionPage::Reasoning => locale::common("Reasoning"),
+            RuntimeOptionPage::Mode => locale::common("Mode"),
+            RuntimeOptionPage::Options => {
+                locale::text("Session options", "会话选项", "工作階段選項")
+            }
+        }
+    }
+}
+
 /// Which list the new-session page has open along its bottom edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NewSessionPicker {
-    /// Where the session will run: the projects the paired runtime knows about
-    /// and, under the chosen one, the workspaces it can start in.
+    /// The project the session belongs to, or none at all.
     ///
-    /// One sheet rather than one per question: the two answers belong together,
-    /// and picking a project re-scopes the list underneath it on the spot
-    /// instead of closing and making the reader open the second list.
+    /// Choosing a project also chooses the checkout it is worked in; a reader
+    /// who wants to work somewhere else answers the second chip instead.
+    Project,
+    /// Where the session will run: the project's own checkout, or a worktree
+    /// cut for it before the session starts.
     Location,
     /// The branch a new worktree is cut from.
     BaseRef,
@@ -1700,21 +1748,21 @@ pub struct MobileApp {
     attachment_preview_frame: Rc<Cell<(f32, f32)>>,
     session_action_input: Entity<InputState>,
     session_action_busy: bool,
+    /// Whether the Agent / provider / model drawer is up.
     runtime_options_open: bool,
     /// The choice list the new-session page has open, if any.
     ///
-    /// Projects and worktrees are lists, not cycles: a phone cycling through
-    /// every project to reach the fourth one is the one interaction the new
-    /// session page could not make pleasant, and the desktop picks from a list.
+    /// Projects, the place to work and the branches a worktree can be cut from
+    /// are lists, not cycles: a phone cycling through every project to reach the
+    /// fourth one is the one interaction the new session page could not make
+    /// pleasant, and the desktop picks from a list.
     new_session_picker: Option<NewSessionPicker>,
-    /// Whether the new-session page's own settings sheet is up.
+    /// Which of the Agent's own option drawers is up, if any.
     ///
-    /// It holds what the page used to spell out as rows: the optional title,
-    /// the permission the session starts with, the reasoning depth, and the
-    /// per-Agent options. The page keeps the two decisions a session cannot
-    /// start without — the Agent and the permission — on its control row, and
-    /// this sheet is where they are changed and where the rest lives.
-    new_session_options_open: bool,
+    /// One drawer at a time: reasoning, the permission mode and the model's own
+    /// session options are each a list the reader answers and closes, and the
+    /// answer is saved the moment it is given.
+    runtime_option_page: Option<RuntimeOptionPage>,
     /// The base branch a new worktree is cut from.
     ///
     /// `None` until Git has answered: the branches that matter are the ones
@@ -1737,8 +1785,6 @@ pub struct MobileApp {
     /// checkout yet. It is a choice on the location sheet rather than a project
     /// of its own: the session it creates is an ordinary one.
     new_session_temporary: bool,
-    /// When a hold last answered a press, so its release is not a tap as well.
-    long_press_at: Option<std::time::Instant>,
     /// Whether the composer's attach menu is up.
     composer_attach_menu_open: bool,
     /// Which field the attach menu is filling. The new-session page has its own
@@ -2576,33 +2622,20 @@ fn settings_danger_note(
 
 /// What a pill on a prompt card does.
 ///
-/// The tap opens the surface the pill names. A hold is the shortcut to the
-/// sheet behind it: the card carries two decisions, and holding one pill opens
-/// the other's sheet, which saves a reader who already knows what they came to
-/// change a close and a second tap.
+/// The tap opens the surface the pill names. Every question a pill asks is then
+/// answered in the drawer it opened — the Agent and its model in one, the
+/// project in another, the place to work in a third — so a pill is a way in
+/// rather than a switch, and the value it shows is always the current answer.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ComposerChipAction {
-    /// The model that answers: tap opens the model list, hold opens the session
-    /// settings.
+    /// The model that answers: opens the Agent, provider and model drawer.
     NewSessionModel,
-    /// The permission the session runs under: tap opens the session settings,
-    /// hold opens the model list.
-    NewSessionPermission,
-    /// The project and workspace pair: both open the location sheet.
-    NewSessionScope,
-    /// The checkout or worktree: both switch the mode.
+    /// The project the session belongs to, or none at all.
+    NewSessionProject,
+    /// The checkout or the worktree the session runs in.
     NewSessionLocation,
-    /// The model of an open session: both open its runtime sheet.
+    /// The model of an open session: opens its runtime drawer.
     SessionModel,
-}
-
-/// A hold that means something other than the tap.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LongPressTarget {
-    /// Holding the model pill opens the session settings sheet.
-    NewSessionSettings,
-    /// Holding the permission pill opens the model sheet.
-    NewSessionModels,
 }
 
 /// The composer's placeholder, shared by the session page and the new-session
@@ -2658,23 +2691,22 @@ fn focused_document(
 /// without asking the thumb to be precise. It is deliberately bare — an icon
 /// and the value, with no capsule behind them — because the card already frames
 /// it and a row of filled pills competes with the message above. A chip carries
-/// the value it is set to rather than a label for it — the model, the
-/// permission, the place the session will run — because on this page the value
-/// is the thing being decided.
+/// the value it is set to rather than a label for it — the model, the place the
+/// session will run — because on this page the value is the thing being decided.
+///
+/// `arrow` adds the fold-down mark the two new-session chips wear: those chips
+/// name a choice that opens a list, and the mark is what says so before the
+/// thumb finds out.
 fn composer_chip(
     id: &'static str,
     icon: gpui::AnyElement,
     value: String,
     warn: bool,
+    arrow: bool,
     action: ComposerChipAction,
     cx: &mut Context<MobileApp>,
 ) -> gpui::Stateful<gpui::Div> {
-    let hold = match action {
-        ComposerChipAction::NewSessionModel => Some(LongPressTarget::NewSessionSettings),
-        ComposerChipAction::NewSessionPermission => Some(LongPressTarget::NewSessionModels),
-        _ => None,
-    };
-    let chip = div()
+    div()
         .id(id)
         .debug_selector(move || id.to_string())
         .relative()
@@ -2685,15 +2717,9 @@ fn composer_chip(
         .cursor_pointer()
         .aria_label(value.clone())
         .active(|style| style.opacity(0.7))
-        // The release is the tap unless a hold already answered it: the finger
-        // that held this pill has been served, and serving it twice would close
-        // the sheet it just opened.
         .on_mouse_up(
             MouseButton::Left,
             cx.listener(move |this, _, window, cx| {
-                if this.take_long_press_echo() {
-                    return;
-                }
                 this.activate_composer_chip(action, window, cx);
             }),
         )
@@ -2721,37 +2747,64 @@ fn composer_chip(
                             theme::text_secondary()
                         })
                         .child(value),
-                ),
-        );
-    let Some(target) = hold else {
-        return chip;
-    };
-    // The hold is claimed where the pill is: the listener resolves the gesture
-    // against this chip's own bounds, so a press anywhere else is never its.
-    let entity = cx.weak_entity();
-    chip.child(
-        gpui::canvas(
-            |_, _, _| {},
-            move |bounds, _, window, _| {
-                window.on_mouse_event({
-                    let entity = entity.clone();
-                    move |event: &LongPressEvent,
-                          phase: DispatchPhase,
-                          window: &mut Window,
-                          cx: &mut gpui::App| {
-                        if phase != DispatchPhase::Bubble || !bounds.contains(&event.position) {
-                            return;
-                        }
-                        let _ = entity.update(cx, |this, cx| {
-                            this.on_composer_chip_long_press(target, window, cx)
-                        });
-                    }
-                });
-            },
+                )
+                .when(arrow, |line| {
+                    line.child(
+                        svg()
+                            .path("icons/chevron-down.svg")
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(theme::text_muted()),
+                    )
+                }),
         )
-        .absolute()
-        .inset_0(),
-    )
+}
+
+/// One of the Agent's own options, as the composer's control row shows it.
+///
+/// It is an icon and nothing else: the value lives in the drawer it opens, and
+/// reading four values off a phone's control row is what made the old row a
+/// wall of text the model chip had to fight for room in. The glyph alone still
+/// has to say whether the option is set or left at the Agent's default, which
+/// is what `set` is for — the mark brightens, the way a switch does, without
+/// spelling the choice out.
+fn composer_option_button(
+    id: &'static str,
+    icon: &'static str,
+    aria: String,
+    set: bool,
+    enabled: bool,
+    handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .size(px(theme::COMPOSER_OPTION_SIZE))
+        .flex_shrink_0()
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .aria_label(aria)
+        .when(enabled, |button| {
+            button
+                .cursor_pointer()
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .on_mouse_up(MouseButton::Left, handler)
+        })
+        .when(!enabled, |button| button.opacity(0.42))
+        .child(
+            svg()
+                .path(icon)
+                .size(px(theme::ICON_MD))
+                .text_color(if !enabled {
+                    theme::text_muted()
+                } else if set {
+                    theme::text_primary()
+                } else {
+                    theme::text_secondary()
+                }),
+        )
 }
 
 /// A bare icon control in a prompt card's control row: something the reader
@@ -2823,7 +2876,7 @@ fn composer_primary_button(
     let button = div()
         .id(id)
         .debug_selector(move || id.to_string())
-        .size(px(theme::TOUCH_TARGET))
+        .size(px(theme::COMPOSER_SEND_SIZE))
         .flex_shrink_0()
         .rounded_full()
         .flex()
@@ -3414,13 +3467,12 @@ impl MobileApp {
             session_action_busy: false,
             runtime_options_open: false,
             new_session_picker: None,
-            new_session_options_open: false,
+            runtime_option_page: None,
             new_session_base_ref: None,
             new_session_base_refs: Vec::new(),
             new_session_base_refs_origin: None,
             new_session_base_refs_loading: false,
             new_session_temporary: false,
-            long_press_at: None,
             composer_attach_menu_open: false,
             attach_menu_target: AttachmentTarget::Composer,
             new_session_attachments: Vec::new(),
@@ -5541,39 +5593,52 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// Opens the Agent, provider and model drawer over whichever page asked.
     fn open_runtime_options(
         &mut self,
         _: &MouseUpEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let target = if self.new_session_open {
+            RuntimeOptionsTarget::NewSession
+        } else {
+            RuntimeOptionsTarget::ActiveSession
+        };
+        self.open_runtime_drawer(target, window, cx);
+    }
+
+    /// Seeds the draft the drawers write to, and opens the model drawer.
+    ///
+    /// The draft is the one thing every runtime surface edits: the model drawer
+    /// and each of the Agent's own option drawers read the same selection and
+    /// write it back, so a choice made in one is the choice the others show the
+    /// next time they are opened.
+    fn open_runtime_drawer(
+        &mut self,
+        target: RuntimeOptionsTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.runtime_switch_busy_generation.is_some() || self.session_action.is_some() {
             return;
         }
-        let can_switch = self.backend.as_ref().is_some_and(|backend| {
-            let operation = if self.runtime_options_target == RuntimeOptionsTarget::NewSession {
-                BackendOperation::AgentCreateSession
-            } else {
-                BackendOperation::AgentSwitchRuntime
-            };
-            backend.capability_snapshot().agent.supports(operation)
-        });
-        if !can_switch {
+        let operation = if target == RuntimeOptionsTarget::NewSession {
+            BackendOperation::AgentCreateSession
+        } else {
+            BackendOperation::AgentSwitchRuntime
+        };
+        if !self
+            .backend
+            .as_ref()
+            .is_some_and(|backend| backend.capability_snapshot().agent.supports(operation))
+        {
             return;
         }
-        let Some((desired, has_catalog)) = self.controller.as_ref().and_then(|controller| {
-            controller
-                .state
-                .runtime_selection
-                .value
-                .as_ref()
-                .map(|state| {
-                    (
-                        state.desired.clone(),
-                        controller.state.runtime_options.value.is_some(),
-                    )
-                })
-        }) else {
+        if target == RuntimeOptionsTarget::NewSession && !self.new_session_open {
+            return;
+        }
+        let Some((desired, has_catalog)) = self.desired_runtime_for_drawer(target) else {
             self.fail(BackendError::loading(
                 "mobile_runtime_selection_loading",
                 locale::text(
@@ -5585,9 +5650,10 @@ impl MobileApp {
             cx.notify();
             return;
         };
-        self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
+        self.runtime_options_target = target;
         self.runtime_draft = Some(desired);
         self.runtime_options_open = true;
+        self.runtime_option_page = None;
         self.push_back_screen(BackScreen::RuntimeOptions);
         self.runtime_switch_error = None;
         let runtime_sheet_search = cx.new(|cx| {
@@ -5609,107 +5675,197 @@ impl MobileApp {
         cx.notify();
     }
 
-    fn open_new_session_runtime_options(
+    /// The selection a drawer should open on, and whether the catalogue behind
+    /// it has already arrived.
+    ///
+    /// A page with no session yet keeps its own draft on the page, so that is
+    /// what it opens on; a session page reads the selection the authority
+    /// published for it.
+    fn desired_runtime_for_drawer(
+        &self,
+        target: RuntimeOptionsTarget,
+    ) -> Option<(SessionRuntimeSelection, bool)> {
+        let controller = self.controller.as_ref()?;
+        let published = controller.state.runtime_selection.value.as_ref();
+        let desired = (target == RuntimeOptionsTarget::NewSession)
+            .then(|| self.new_session_runtime.clone())
+            .flatten()
+            .or_else(|| published.map(|state| state.desired.clone()))
+            .or_else(|| {
+                controller
+                    .state
+                    .runtime_options
+                    .value
+                    .as_ref()?
+                    .options
+                    .iter()
+                    .find(|option| option.availability == RuntimeOptionAvailability::Available)
+                    .map(|option| option.selection.clone())
+            });
+        desired.map(|desired| (desired, controller.state.runtime_options.value.is_some()))
+    }
+
+    /// Opens one of the Agent's own option drawers over the page that asked.
+    ///
+    /// The model drawer is not touched: a reader who wants a different model
+    /// taps the chip, and a reader who wants a different reasoning effort taps
+    /// the glyph beside it. Both read the same draft.
+    fn open_runtime_reasoning_drawer(
         &mut self,
         _: &MouseUpEvent,
-        window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.runtime_switch_busy_generation.is_some()
-            || !self.new_session_open
-            || !self.backend.as_ref().is_some_and(|backend| {
-                backend
-                    .capability_snapshot()
-                    .agent
-                    .supports(BackendOperation::AgentCreateSession)
-            })
+        self.open_agent_option_drawer(RuntimeOptionPage::Reasoning, cx);
+    }
+
+    fn open_runtime_mode_drawer(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_agent_option_drawer(RuntimeOptionPage::Mode, cx);
+    }
+
+    /// The drawer behind the session-options glyph: the model's own options on
+    /// a session page, and the optional session title as well on the page that
+    /// has no session yet.
+    fn open_session_options_drawer(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_agent_option_drawer(RuntimeOptionPage::Options, cx);
+    }
+
+    fn open_agent_option_drawer(&mut self, page: RuntimeOptionPage, cx: &mut Context<Self>) {
+        let target = if self.new_session_open {
+            RuntimeOptionsTarget::NewSession
+        } else {
+            RuntimeOptionsTarget::ActiveSession
+        };
+        self.open_runtime_option_page(page, target, cx);
+    }
+
+    fn open_runtime_option_page(
+        &mut self,
+        page: RuntimeOptionPage,
+        target: RuntimeOptionsTarget,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session_action.is_some() {
+            return;
+        }
+        let operation = if target == RuntimeOptionsTarget::NewSession {
+            BackendOperation::AgentCreateSession
+        } else {
+            BackendOperation::AgentSwitchRuntime
+        };
+        if !self
+            .backend
+            .as_ref()
+            .is_some_and(|backend| backend.capability_snapshot().agent.supports(operation))
         {
             return;
         }
-        let (desired, has_catalog) = self
-            .controller
-            .as_ref()
-            .map(|controller| {
-                let desired = self
-                    .new_session_runtime
-                    .clone()
-                    .or_else(|| {
-                        controller
-                            .state
-                            .runtime_selection
-                            .value
-                            .as_ref()
-                            .map(|state| state.desired.clone())
-                    })
-                    .or_else(|| {
-                        controller
-                            .state
-                            .runtime_options
-                            .value
-                            .as_ref()?
-                            .options
-                            .iter()
-                            .find(|option| {
-                                option.availability == RuntimeOptionAvailability::Available
-                            })
-                            .map(|option| option.selection.clone())
-                    });
-                (desired, controller.state.runtime_options.value.is_some())
-            })
-            .unwrap_or((None, false));
-        let Some(desired) = desired else {
+        if target == RuntimeOptionsTarget::NewSession && !self.new_session_open {
+            return;
+        }
+        let Some((desired, has_catalog)) = self.desired_runtime_for_drawer(target) else {
             self.fail(BackendError::loading(
-                "mobile_runtime_catalog_loading",
+                "mobile_runtime_selection_loading",
                 locale::text(
-                    "The desktop has not published an available Agent runtime yet.",
-                    "桌面端尚未发布可用的 Agent 运行时。",
-                    "桌面版尚未發佈可用的 Agent 執行環境。",
+                    "The session runtime selection is not available yet.",
+                    "会话运行时选择尚不可用。",
+                    "工作階段執行環境選擇尚無法使用。",
                 ),
             ));
-            self.refresh_runtime_options(cx);
             cx.notify();
             return;
         };
-        self.runtime_options_target = RuntimeOptionsTarget::NewSession;
-        self.runtime_draft = Some(desired);
-        self.runtime_options_open = true;
+        // A drawer opened from the model list keeps that list's draft: the two
+        // are one edit, and a fresh read here would drop a choice the reader
+        // just made in the other drawer.
+        if self.runtime_draft.is_none() || self.runtime_options_target != target {
+            self.runtime_draft = Some(desired);
+        }
+        self.runtime_options_target = target;
+        self.runtime_options_open = false;
+        self.runtime_option_page = Some(page);
         self.push_back_screen(BackScreen::RuntimeOptions);
         self.runtime_switch_error = None;
-        let runtime_sheet_search = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(locale::text(
-                "Search models",
-                "搜索模型",
-                "搜尋模型",
-            ))
-        });
-        self.runtime_sheet_search_subscription =
-            Some(cx.observe(&runtime_sheet_search, |_, _, cx| cx.notify()));
-        self.runtime_sheet_search = Some(runtime_sheet_search);
-        self.refresh_runtime_agents(cx);
         self.sync_runtime_feature_inputs();
-        self.anchor_runtime_agent_strip();
         if !has_catalog {
             self.refresh_runtime_options(cx);
         }
+        crate::platform::hide_keyboard();
         cx.notify();
     }
 
+    /// Closes whichever runtime drawer is up, the way its own close control
+    /// does: the panel falls, and the page's flag goes when it lands.
     fn close_runtime_options(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.runtime_switch_busy_generation.is_none() {
-            self.runtime_options_open = false;
-            self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
-            self.runtime_draft = None;
-            self.reset_runtime_search();
-            self.clear_runtime_feature_inputs();
-            self.runtime_switch_error = None;
-            cx.notify();
+        if self.runtime_options_open {
+            self.close_sheet(SheetKey::RuntimeOptions, cx);
+            return;
         }
+        if self.runtime_option_page.is_some() {
+            self.close_sheet(SheetKey::RuntimeOption, cx);
+        }
+    }
+
+    /// Closes one runtime drawer without touching the other: landing a drawer
+    /// that the page already replaced must not drop the draft behind it.
+    fn close_runtime_options_sheet(&mut self, key: SheetKey, cx: &mut Context<Self>) {
+        match key {
+            SheetKey::RuntimeOptions => self.runtime_options_open = false,
+            SheetKey::RuntimeOption => self.runtime_option_page = None,
+            _ => return,
+        }
+        self.finish_runtime_drawer(cx);
+    }
+
+    /// The end of a visit to a runtime drawer: the draft it was writing to goes
+    /// away, and a session page applies whatever the reader left in it.
+    ///
+    /// This is where a typed session option is saved: a row of choices saved the
+    /// moment it was tapped, but a text field has no such moment, so the drawer's
+    /// own close is the commit.
+    fn finish_runtime_drawer(&mut self, cx: &mut Context<Self>) {
+        if self.runtime_draft.is_some() {
+            match self.runtime_options_target {
+                // The page with no session keeps its own draft. A row of
+                // choices has already saved itself by being tapped; a text
+                // field has no such moment, so the drawer's close is where its
+                // value lands — and a refusal travels to the page, because the
+                // list that would have shown it is leaving the screen.
+                RuntimeOptionsTarget::NewSession => {
+                    if let Err(error) = self.apply_runtime_feature_inputs(cx) {
+                        self.fail(error);
+                    } else {
+                        self.commit_new_session_runtime_draft(cx);
+                    }
+                }
+                RuntimeOptionsTarget::ActiveSession => {
+                    self.commit_runtime_options(cx);
+                }
+            }
+        }
+        self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
+        self.runtime_draft = None;
+        self.reset_runtime_search();
+        self.clear_runtime_feature_inputs();
+        self.runtime_switch_error = None;
+        cx.notify();
     }
 
     fn reset_runtime_options(&mut self) {
         self.runtime_switch_generation = self.runtime_switch_generation.wrapping_add(1);
         self.runtime_switch_busy_generation = None;
         self.runtime_options_open = false;
+        self.runtime_option_page = None;
         self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
         self.runtime_draft = None;
         self.reset_runtime_search();
@@ -5768,14 +5924,28 @@ impl MobileApp {
         self.runtime_draft = Some(selection);
         self.runtime_switch_error = None;
         self.sync_runtime_feature_inputs();
-        self.commit_new_session_runtime_draft(cx);
+        self.commit_runtime_draft(cx);
         cx.notify();
     }
 
+    /// Saves the draft the reader has been editing.
+    ///
+    /// There is no apply control on either page: the drawers have no footer to
+    /// press, and a choice is the save. On the new-session page the draft lands
+    /// on the page itself — there is no session yet — and on a session page the
+    /// draft travels to the authority, which is the one mutation a runtime
+    /// switch can be.
+    fn commit_runtime_draft(&mut self, cx: &mut Context<Self>) {
+        if self.runtime_options_target == RuntimeOptionsTarget::NewSession {
+            self.commit_new_session_runtime_draft(cx);
+            return;
+        }
+        self.commit_runtime_options(cx);
+    }
+
     /// The new-session page has no session to apply a draft to, so a choice made
-    /// while its sheet is open *is* the choice: the draft lands on the page as
-    /// it changes. The session page keeps the explicit apply, because switching
-    /// a running session's runtime is a mutation the authority has to accept.
+    /// while its drawer is open *is* the choice: the draft lands on the page as
+    /// it changes.
     fn commit_new_session_runtime_draft(&mut self, cx: &mut Context<Self>) {
         if self.runtime_options_target != RuntimeOptionsTarget::NewSession {
             return;
@@ -5798,7 +5968,7 @@ impl MobileApp {
             draft.reasoning_effort = None;
         }
         self.runtime_switch_error = None;
-        self.commit_new_session_runtime_draft(cx);
+        self.commit_runtime_draft(cx);
         cx.notify();
     }
 
@@ -5807,7 +5977,7 @@ impl MobileApp {
             draft.mode_id = None;
         }
         self.runtime_switch_error = None;
-        self.commit_new_session_runtime_draft(cx);
+        self.commit_runtime_draft(cx);
         cx.notify();
     }
 
@@ -5828,7 +5998,7 @@ impl MobileApp {
             }
         }
         self.runtime_switch_error = None;
-        self.commit_new_session_runtime_draft(cx);
+        self.commit_runtime_draft(cx);
         cx.notify();
     }
 
@@ -5882,14 +6052,21 @@ impl MobileApp {
         Ok(())
     }
 
-    fn apply_runtime_options(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    /// Sends the draft to the authority, which is the only place a session's
+    /// runtime can change. There is no apply control to press: a drawer answers
+    /// a question, and the answer travels as it is given.
+    ///
+    /// A switch already in flight owns the session, so a second choice waits for
+    /// the first to land rather than racing it for the same revision — the
+    /// drawers show that busy state on the choices themselves.
+    fn commit_runtime_options(&mut self, cx: &mut Context<Self>) -> bool {
         if self.runtime_switch_busy_generation.is_some() {
-            return;
+            return false;
         }
         if let Err(error) = self.apply_runtime_feature_inputs(cx) {
             self.runtime_switch_error = Some(error);
             cx.notify();
-            return;
+            return false;
         }
         let Some((catalog, desired)) = self.controller.as_ref().and_then(|controller| {
             Some((
@@ -5897,7 +6074,7 @@ impl MobileApp {
                 self.runtime_draft.clone()?,
             ))
         }) else {
-            return;
+            return false;
         };
         if !runtime_selection_is_available(&catalog.options, &desired) {
             self.runtime_switch_error = Some(BackendError::failed(
@@ -5909,31 +6086,22 @@ impl MobileApp {
                 ),
             ));
             cx.notify();
-            return;
+            return false;
         }
 
-        if self.runtime_options_target == RuntimeOptionsTarget::NewSession {
-            self.new_session_runtime = Some(desired);
-            self.runtime_options_open = false;
-            self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
-            self.runtime_draft = None;
-            self.reset_runtime_search();
-            self.clear_runtime_feature_inputs();
-            self.runtime_switch_error = None;
-            self.hint(
-                Tone::Success,
-                locale::text(
-                    "New session runtime selected",
-                    "已选择新会话运行时",
-                    "已選擇新工作階段執行環境",
-                ),
-            );
-            cx.notify();
-            return;
+        // A drawer that was opened and closed without an answer is not a
+        // switch, and the authority should not be told it made one.
+        let current = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.runtime_selection.value.as_ref())
+            .map(|state| state.desired.clone());
+        if current.as_ref() == Some(&desired) {
+            return false;
         }
 
         let Some(backend) = self.backend.clone() else {
-            return;
+            return false;
         };
         let Some((session_id, state)) = self.controller.as_ref().and_then(|controller| {
             Some((
@@ -5941,7 +6109,7 @@ impl MobileApp {
                 controller.state.runtime_selection.value.clone()?,
             ))
         }) else {
-            return;
+            return false;
         };
 
         self.runtime_switch_generation = self.runtime_switch_generation.wrapping_add(1);
@@ -5980,11 +6148,24 @@ impl MobileApp {
                         if let Some(controller) = this.controller.as_mut() {
                             controller.state.runtime_selection.resolve(state);
                         }
-                        this.runtime_options_open = false;
-                        this.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
-                        this.runtime_draft = None;
-                        this.reset_runtime_search();
-                        this.clear_runtime_feature_inputs();
+                        // The drawer stays up. A reader who changed the mode may
+                        // want the reasoning beside it next, and a surface that
+                        // closed under the finger that just used it would send
+                        // them back through the chip to get to it.
+                        //
+                        // A drawer that did close keeps nothing: the draft it
+                        // was writing to belongs to that visit, and a draft left
+                        // behind would be committed again by the next one.
+                        if this.runtime_options_open || this.runtime_option_page.is_some() {
+                            this.runtime_draft = this
+                                .controller
+                                .as_ref()
+                                .and_then(|controller| {
+                                    controller.state.runtime_selection.value.as_ref()
+                                })
+                                .map(|state| state.desired.clone())
+                                .or_else(|| this.runtime_draft.clone());
+                        }
                         this.runtime_switch_error = None;
                         this.hint(
                             Tone::Success,
@@ -5998,6 +6179,7 @@ impl MobileApp {
         });
         self.tasks.push(task);
         cx.notify();
+        true
     }
 
     fn refresh_workspaces(&mut self, cx: &mut Context<Self>) {
@@ -9639,7 +9821,7 @@ impl MobileApp {
             self.new_session_workspace_id = None;
             self.new_session_folder_id = None;
             self.new_session_picker = None;
-            self.new_session_options_open = false;
+            self.runtime_option_page = None;
             self.forget_new_session_base_refs();
             self.new_session_temporary = false;
         }
@@ -9673,9 +9855,8 @@ impl MobileApp {
 
     fn sync_back_stack_with_ui(&mut self) {
         let session_action_open = self.session_action.is_some();
-        let runtime_options_open = self.runtime_options_open;
+        let runtime_options_open = self.runtime_options_open || self.runtime_option_page.is_some();
         let new_session_picker_open = self.new_session_picker.is_some();
-        let new_session_options_open = self.new_session_options_open;
         let settled_target = self.settled_drawer_target();
         let sidebar_search_open = self.sidebar_search_open;
         let sidebar_batch_mode = self.sidebar_batch_mode;
@@ -9701,7 +9882,6 @@ impl MobileApp {
             BackScreen::SessionAction => session_action_open,
             BackScreen::RuntimeOptions => runtime_options_open,
             BackScreen::NewSessionPicker => new_session_picker_open,
-            BackScreen::NewSessionOptions => new_session_options_open,
             BackScreen::SessionsDrawer => settled_target == DrawerPage::Sessions.open_offset(),
             BackScreen::WorkbenchDrawer => settled_target == DrawerPage::Workbench.open_offset(),
             BackScreen::SidebarSearch => sidebar_search_open,
@@ -9829,7 +10009,6 @@ impl MobileApp {
             BackScreen::NewSessionPicker => {
                 self.close_new_session_picker(&noop_mouse_up(), window, cx)
             }
-            BackScreen::NewSessionOptions => self.dismiss_new_session_options(cx),
             BackScreen::Overlay(_) => self.dismiss_overlay(Some(window), cx),
             BackScreen::SessionsDrawer | BackScreen::WorkbenchDrawer => {
                 self.start_drawer_snap(0.0, Some(window), cx)
@@ -9875,7 +10054,7 @@ impl MobileApp {
             self.new_session_workspace_id = None;
             self.new_session_folder_id = None;
             self.new_session_picker = None;
-            self.new_session_options_open = false;
+            self.runtime_option_page = None;
             self.forget_new_session_base_refs();
             self.new_session_temporary = false;
             // The first message's files and references belong to the page that
@@ -12207,6 +12386,7 @@ impl MobileApp {
                 if self.drawer_snap.is_some()
                     || self.session_action.is_some()
                     || self.runtime_options_open
+                    || self.runtime_option_page.is_some()
                     || self.overlay.is_some()
                 {
                     return;
@@ -12299,6 +12479,7 @@ impl MobileApp {
         self.overlay.is_some()
             || self.pairing_panel != PairingPanel::None
             || self.runtime_options_open
+            || self.runtime_option_page.is_some()
     }
 
     fn finish_drawer_pan(&mut self, cancelled: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -12464,7 +12645,8 @@ impl MobileApp {
             SheetKey::ComposerHistory => self.composer_history_open = false,
             SheetKey::ComposerAttach => self.composer_attach_menu_open = false,
             SheetKey::NewSessionPicker => self.new_session_picker = None,
-            SheetKey::NewSessionOptions => self.new_session_options_open = false,
+            SheetKey::RuntimeOptions => self.close_runtime_options_sheet(key, cx),
+            SheetKey::RuntimeOption => self.close_runtime_options_sheet(key, cx),
             SheetKey::SettingsPalette => self.settings_palette_open = false,
             // The workbench owns its own sheets.
             SheetKey::FileGoto
@@ -13781,12 +13963,18 @@ impl MobileApp {
             sheet_size,
         );
         let picker_scroll = self.sheet.body_scroll(SheetKey::NewSessionPicker);
-        let new_session_options_sheet = self.sheet.presentation(
-            SheetKey::NewSessionOptions,
-            self.new_session_options_open,
+        let runtime_options_sheet = self.sheet.presentation(
+            SheetKey::RuntimeOptions,
+            self.runtime_options_open,
             sheet_size,
         );
-        let options_scroll = self.sheet.body_scroll(SheetKey::NewSessionOptions);
+        let runtime_options_scroll = self.sheet.body_scroll(SheetKey::RuntimeOptions);
+        let runtime_option_sheet = self.sheet.presentation(
+            SheetKey::RuntimeOption,
+            self.runtime_option_page.is_some(),
+            sheet_size,
+        );
+        let runtime_option_scroll = self.sheet.body_scroll(SheetKey::RuntimeOption);
         let overlay_sheets = self.overlay_sheets(window);
 
         crate::scroll_capture::capture_scroll_wheel(
@@ -14053,8 +14241,12 @@ impl MobileApp {
                 .when_some(overlay, |root, overlay| {
                     root.child(self.render_mobile_overlay(overlay, overlay_sheets, window, cx))
                 })
-                .when(self.runtime_options_open, |root| {
-                    root.child(self.render_runtime_options_sheet(cx))
+                .when_some(runtime_options_sheet, |root, presentation| {
+                    root.child(self.render_runtime_options_sheet(
+                        presentation,
+                        runtime_options_scroll.clone(),
+                        cx,
+                    ))
                 })
                 .when(
                     self.new_session_picker.is_some(),
@@ -14067,10 +14259,10 @@ impl MobileApp {
                         None => root,
                     },
                 )
-                .when_some(new_session_options_sheet, |root, presentation| {
-                    root.child(self.render_new_session_options_sheet(
+                .when_some(runtime_option_sheet, |root, presentation| {
+                    root.child(self.render_runtime_option_sheet(
                         presentation,
-                        options_scroll.clone(),
+                        runtime_option_scroll.clone(),
                         cx,
                     ))
                 })
@@ -16932,7 +17124,81 @@ impl MobileApp {
     /// model list, and the remaining session options. Every band keeps a fixed
     /// viewport and scrolls its own overflow, so a long catalog never pushes
     /// the other bands around.
-    fn render_runtime_options_sheet(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The Agent, provider and model, as a drawer along the bottom edge.
+    ///
+    /// It is the same three questions the desktop's runtime menu asks in one
+    /// list: which Agent is answering, under which of its accounts, and with
+    /// which model. Everything else the runtime can be told — how deeply to
+    /// think, what it may do — is its own drawer behind its own glyph on the
+    /// control row, so this one stays a list of models rather than a page of
+    /// settings.
+    fn render_runtime_options_sheet(
+        &self,
+        presentation: SheetPresentation,
+        body: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let catalog = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.runtime_options.value.as_ref().cloned());
+        let draft = self.runtime_draft.clone();
+        let busy = self.runtime_switch_busy_generation.is_some();
+        let selection_available = catalog.as_ref().is_some_and(|catalog| {
+            draft
+                .as_ref()
+                .is_some_and(|draft| runtime_selection_is_available(&catalog.options, draft))
+        });
+        let sheet = div()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(self.render_runtime_sheet_header(
+                locale::text("Session settings", "会话设置", "工作階段設定"),
+                SheetKey::RuntimeOptions,
+                cx,
+            ))
+            .child(self.render_runtime_agent_strip(catalog.as_ref(), draft.as_ref(), busy, cx))
+            .child(self.render_runtime_search_row())
+            .child(self.render_runtime_model_list(
+                catalog.as_ref(),
+                draft.as_ref(),
+                busy,
+                &body,
+                cx,
+            ))
+            .when(catalog.is_some() && !selection_available, |sheet| {
+                sheet.child(runtime_unavailable_note())
+            })
+            .when_some(self.runtime_switch_error.as_ref(), |sheet, error| {
+                sheet.child(runtime_error_note(error))
+            });
+        bottom_sheet_shell("mobile-runtime-options", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::RuntimeOptions, cx)),
+            )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::RuntimeOptions, event, window, cx)
+            }))
+            .content(sheet)
+            .into_any_element()
+    }
+
+    /// One of the Agent's own option groups, in the drawer its glyph opens.
+    ///
+    /// There is no footer: a choice is the save. The new-session page keeps the
+    /// draft itself, and a session page sends it to the authority as it is
+    /// picked — which is why the drawer can be closed at any moment without
+    /// losing the answer.
+    fn render_runtime_option_sheet(
+        &self,
+        presentation: SheetPresentation,
+        body: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(page) = self.runtime_option_page else {
+            return div().into_any_element();
+        };
         let catalog = self
             .controller
             .as_ref()
@@ -16955,158 +17221,149 @@ impl MobileApp {
                 .as_ref()
                 .is_some_and(|draft| runtime_selection_is_available(&catalog.options, draft))
         });
-        let can_switch = self.backend.as_ref().is_some_and(|backend| {
-            let operation = if self.runtime_options_target == RuntimeOptionsTarget::NewSession {
-                BackendOperation::AgentCreateSession
-            } else {
-                BackendOperation::AgentSwitchRuntime
-            };
-            backend.capability_snapshot().agent.supports(operation)
-        });
-        let can_apply = can_switch && selection_available && !busy;
         let new_session_target = self.runtime_options_target == RuntimeOptionsTarget::NewSession;
+        let title_value = self.new_session_title_input.read(cx).value().to_string();
 
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::backdrop(0.72))
-            .pt(px(56.0))
-            .flex()
-            .flex_col()
-            .items_center()
-            .child(
-                div()
-                    .w_full()
-                    .max_w(px(520.0))
-                    .flex_1()
-                    .min_h_0()
-                    .rounded(px(theme::RADIUS_CARD))
-                    .border_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_primary())
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .child(self.render_runtime_sheet_header(busy, cx))
-                    .child(self.render_runtime_agent_strip(
-                        catalog.as_ref(),
-                        draft.as_ref(),
-                        busy,
-                        cx,
-                    ))
-                    .child(self.render_runtime_search_row())
-                    .child(self.render_runtime_model_list(
-                        catalog.as_ref(),
-                        draft.as_ref(),
-                        busy,
-                        cx,
-                    ))
-                    .child(self.render_runtime_options_list(
-                        catalog.as_ref(),
-                        draft.as_ref(),
+        let mut body_element = runtime_drawer_body(page)
+            .track_scroll(&body)
+            .overflow_y_scroll()
+            .restrict_scroll_to_axis();
+        match page {
+            RuntimeOptionPage::Reasoning => {
+                body_element = body_element.child(
+                    self.render_runtime_drawer_choices(
+                        RuntimeOptionPage::Reasoning,
                         reasoning_efforts,
-                        modes,
-                        features,
-                        selection_available,
+                        draft
+                            .as_ref()
+                            .and_then(|draft| draft.reasoning_effort.clone()),
                         busy,
                         cx,
-                    ))
-                    .when_some(self.runtime_switch_error.as_ref(), |sheet, error| {
-                        sheet.child(
+                    ),
+                );
+            }
+            RuntimeOptionPage::Mode => {
+                body_element = body_element.child(self.render_runtime_drawer_choices(
+                    RuntimeOptionPage::Mode,
+                    modes,
+                    draft.as_ref().and_then(|draft| draft.mode_id.clone()),
+                    busy,
+                    cx,
+                ));
+            }
+            RuntimeOptionPage::Options => {
+                // The page with no session yet has one option no session can
+                // have: what to call the session before its first message names
+                // it. It belongs with the model's own options because it is the
+                // same kind of thing — a setting for the session being made.
+                if new_session_target {
+                    body_element = body_element
+                        .child(runtime_section_heading(locale::text(
+                            "Title",
+                            "会话标题",
+                            "工作階段標題",
+                        )))
+                        .child(
                             div()
-                                .flex_shrink_0()
-                                .mx_3()
-                                .mb_2()
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .border_1()
-                                .border_color(theme::accent_red())
-                                .bg(theme::bg_card_dim())
-                                .p_3()
+                                .px_3()
+                                .pb_3()
+                                .flex()
+                                .flex_col()
+                                .gap(px(theme::SPACING_XS))
+                                .child(
+                                    div()
+                                        .h(px(theme::TOUCH_TARGET))
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .bg(theme::bg_card_dim())
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .when(!busy, |field| {
+                                            field.on_mouse_down(
+                                                MouseButton::Left,
+                                                resume_keyboard_on_tap,
+                                            )
+                                        })
+                                        .child(
+                                            Input::new(&self.new_session_title_input)
+                                                .appearance(false),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme::font_micro())
+                                        .text_color(theme::text_muted())
+                                        .child(if title_value.trim().is_empty() {
+                                            locale::text(
+                                                "Optional: the first message names the session when this is empty.",
+                                                "可选：留空时由第一条消息为会话命名。",
+                                                "可選：留空時由第一則訊息為工作階段命名。",
+                                            )
+                                        } else {
+                                            locale::common("Optional")
+                                        }),
+                                ),
+                        );
+                }
+                let empty = features.is_empty();
+                body_element = body_element
+                    .child(runtime_section_heading(locale::common("Session options")))
+                    .when(empty, |body| {
+                        body.child(
+                            div()
+                                .px_3()
+                                .pb_3()
                                 .text_size(theme::font_caption())
-                                .text_color(theme::accent_red())
-                                .child(error.message.clone()),
+                                .text_color(theme::text_muted())
+                                .child(locale::text(
+                                    "This Agent exposes no options for the selected model.",
+                                    "该 Agent 未为所选模型提供可配置选项。",
+                                    "此 Agent 未為所選模型提供可設定選項。",
+                                )),
                         )
                     })
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .border_t_1()
-                            .border_color(theme::border_subtle())
-                            .p_3()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            // The new-session page has already taken every choice
-                            // by the time this footer is drawn, so there is
-                            // nothing to cancel and nothing to apply: the sheet
-                            // closes, and the card behind it shows the result.
-                            .when(!new_session_target, |footer| {
-                                footer.child(
-                                    runtime_sheet_action_button(
-                                        "cancel-runtime-options",
-                                        locale::common("Cancel"),
-                                        false,
-                                    )
-                                    .when(!busy, |button| {
-                                        button
-                                            .cursor_pointer()
-                                            .active(|style| style.opacity(0.7))
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::close_runtime_options),
-                                            )
-                                    }),
-                                )
-                            })
-                            .child(
-                                runtime_sheet_action_button(
-                                    "apply-runtime-options",
-                                    if busy {
-                                        locale::common("Applying...")
-                                    } else if new_session_target {
-                                        locale::common("Done")
-                                    } else {
-                                        locale::text(
-                                            "Apply session settings",
-                                            "应用会话设置",
-                                            "套用工作階段設定",
-                                        )
-                                    },
-                                    true,
-                                )
-                                .when(can_apply && !new_session_target, |button| {
-                                    button
-                                        .cursor_pointer()
-                                        .active(|style| style.opacity(0.7))
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(Self::apply_runtime_options),
-                                        )
-                                })
-                                // Done is a dismissal, not a mutation: every
-                                // choice in this sheet already landed on the
-                                // page's draft as it was made.
-                                .when(new_session_target && !busy, |button| {
-                                    button
-                                        .cursor_pointer()
-                                        .active(|style| style.opacity(0.7))
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(Self::close_runtime_options),
-                                        )
-                                })
-                                .when(!can_apply && !new_session_target, |button| {
-                                    button.opacity(0.5)
-                                }),
-                            ),
-                    ),
+                    .children(
+                        features
+                            .into_iter()
+                            .map(|feature| self.render_runtime_feature(feature, cx)),
+                    );
+            }
+        }
+
+        let sheet = div()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(self.render_runtime_sheet_header(page.heading(), SheetKey::RuntimeOption, cx))
+            .child(body_element)
+            .when(catalog.is_some() && !selection_available, |sheet| {
+                sheet.child(runtime_unavailable_note())
+            })
+            .when_some(self.runtime_switch_error.as_ref(), |sheet, error| {
+                sheet.child(runtime_error_note(error))
+            });
+        bottom_sheet_shell(page.drawer_id(), presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::RuntimeOption, cx)),
             )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::RuntimeOption, event, window, cx)
+            }))
+            .content(sheet)
+            .into_any_element()
     }
 
-    /// Sheet header: title plus the close button. The bands below carry the
-    /// whole selection flow, so there is no cascade breadcrumb anymore.
-    fn render_runtime_sheet_header(&self, busy: bool, cx: &mut Context<Self>) -> gpui::Div {
+    /// A runtime drawer's own heading, and the control that gives the panel
+    /// back.
+    ///
+    /// Closing is always allowed, a switch in flight or not: the answer has
+    /// been given, and it travels whether or not the list is still on screen.
+    fn render_runtime_sheet_header(
+        &self,
+        title: &'static str,
+        key: SheetKey,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         div()
             .h(px(52.0))
             .flex_shrink_0()
@@ -17121,24 +17378,24 @@ impl MobileApp {
                     .min_w_0()
                     .text_size(theme::font_heading())
                     .text_color(theme::text_primary())
-                    .child(locale::text("Session settings", "会话设置", "工作階段設定")),
+                    .child(title),
             )
             .child(
                 div()
-                    .id("close-runtime-options")
+                    .id(match key {
+                        SheetKey::RuntimeOption => "close-runtime-option",
+                        _ => "close-runtime-options",
+                    })
                     .size(px(theme::TOUCH_TARGET))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .when(!busy, |button| {
-                        button
-                            .cursor_pointer()
-                            .active(|style| style.opacity(0.6))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::close_runtime_options),
-                            )
-                    })
+                    .cursor_pointer()
+                    .active(|style| style.opacity(0.6))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.close_sheet(key, cx)),
+                    )
                     .child(
                         svg()
                             .path("icons/x.svg")
@@ -17148,10 +17405,10 @@ impl MobileApp {
             )
     }
 
-    /// Band 1 — every enabled Agent as a horizontally scrolling logo strip.
-    /// Tapping a logo moves the draft to that Agent's first available option,
-    /// which re-scopes the model list below; the active logo wears an accent
-    /// bar on the strip's bottom hairline and stays scrolled into view.
+    /// Every enabled Agent as a horizontally scrolling logo strip. Tapping a
+    /// logo moves the draft to that Agent's first available option, which
+    /// re-scopes the model list below; the active logo wears an accent bar on
+    /// the strip's bottom hairline and stays scrolled into view.
     fn render_runtime_agent_strip(
         &self,
         catalog: Option<&SessionRuntimeOptionCatalog>,
@@ -17281,9 +17538,9 @@ impl MobileApp {
         self.runtime_agent_strip_scroll.scroll_to_item(index);
     }
 
-    /// Band 2 — the full-bleed search row. The query filters provider labels
-    /// and model labels inside the band below; it never leaves the selected
-    /// Agent when the strip switches.
+    /// The search row under the Agent strip. The query filters provider and
+    /// model labels in the list below; it never leaves the selected Agent when
+    /// the strip switches.
     fn render_runtime_search_row(&self) -> gpui::AnyElement {
         div()
             .flex_shrink_0()
@@ -17316,14 +17573,16 @@ impl MobileApp {
             .into_any_element()
     }
 
-    /// Band 3 — provider-grouped model list for the selected Agent, at a
-    /// fixed height so the bands above and below stay put; a long catalog
-    /// scrolls inside this band. Rows keep the desktop model brand icons.
+    /// The model list for the selected Agent, grouped by the account or
+    /// provider profile it is reached through. It takes what the panel has
+    /// left and scrolls inside it, so a long catalogue never grows the sheet
+    /// past the height it is allowed. Rows keep the desktop model brand icons.
     fn render_runtime_model_list(
         &self,
         catalog: Option<&SessionRuntimeOptionCatalog>,
         draft: Option<&SessionRuntimeSelection>,
         busy: bool,
+        body: &ScrollHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let query = self
@@ -17333,10 +17592,8 @@ impl MobileApp {
             .unwrap_or_default();
         let Some((catalog, draft)) = catalog.zip(draft) else {
             return div()
-                .flex_shrink_0()
-                .h(px(RUNTIME_SHEET_MODEL_LIST_HEIGHT))
-                .border_b_1()
-                .border_color(theme::border_subtle())
+                .flex_1()
+                .min_h_0()
                 .p_4()
                 .text_size(theme::font_caption())
                 .text_color(theme::text_muted())
@@ -17484,12 +17741,11 @@ impl MobileApp {
 
         div()
             .id("runtime-model-list")
-            .flex_shrink_0()
-            .h(px(RUNTIME_SHEET_MODEL_LIST_HEIGHT))
+            .flex_1()
+            .min_h_0()
+            .track_scroll(body)
             .overflow_y_scroll()
             .restrict_scroll_to_axis()
-            .border_b_1()
-            .border_color(theme::border_subtle())
             .pb_1()
             .when(groups.is_empty(), |list| {
                 list.child(
@@ -17509,127 +17765,58 @@ impl MobileApp {
             .into_any_element()
     }
 
-    /// Band 4 — everything beyond Agent and model: reasoning effort, mode and
-    /// per-model session options. The band fills the card's remaining height
-    /// and scrolls on its own.
-    #[allow(clippy::too_many_arguments)]
-    fn render_runtime_options_list(
+    /// One group of the Agent's own choices, as the body of its drawer.
+    ///
+    /// The Agent's default leads the row: an option the reader never set has to
+    /// be as easy to get back to as one they did, and "Default" is what the
+    /// authority reads when the value is unset.
+    fn render_runtime_drawer_choices(
         &self,
-        catalog: Option<&SessionRuntimeOptionCatalog>,
-        draft: Option<&SessionRuntimeSelection>,
-        reasoning_efforts: Vec<RuntimeCascadeChoice>,
-        modes: Vec<RuntimeCascadeChoice>,
-        features: Vec<SessionRuntimeFeature>,
-        selection_available: bool,
+        page: RuntimeOptionPage,
+        choices: Vec<RuntimeCascadeChoice>,
+        selected_value: Option<String>,
         busy: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let mut list = div()
-            .id("runtime-options-list")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .restrict_scroll_to_axis()
-            .pb_2();
-        let Some(draft) = draft else {
-            return list.into_any_element();
+        let group = match page {
+            RuntimeOptionPage::Reasoning => "reasoning",
+            RuntimeOptionPage::Mode => "mode",
+            RuntimeOptionPage::Options => "options",
         };
-        list = list
-            .when(catalog.is_some() && !selection_available, |list| {
-                list.child(
-                    div()
-                        .mx_3()
-                        .mt_3()
-                        .rounded(px(theme::RADIUS_CONTROL))
-                        .border_1()
-                        .border_color(theme::accent_yellow())
-                        .bg(theme::bg_card_dim())
-                        .p_3()
-                        .text_size(theme::font_caption())
-                        .text_color(theme::accent_yellow())
-                        .child(locale::text(
-                            "The current session settings are unavailable. Select an available option.",
-                            "当前会话设置不可用，请选择一个可用选项。",
-                            "目前工作階段設定無法使用，請選擇可用選項。",
-                        )),
+        let default = runtime_choice_button(
+            format!("runtime-{group}-drawer:default"),
+            locale::common("Default"),
+            selected_value.is_none(),
+        )
+        .when(!busy, |button| {
+            button
+                .cursor_pointer()
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| match page {
+                        RuntimeOptionPage::Reasoning => this.choose_default_runtime_reasoning(cx),
+                        RuntimeOptionPage::Mode => this.choose_default_runtime_mode(cx),
+                        // The options page has no default row of its own: each
+                        // of the Agent's options resets by its own default.
+                        RuntimeOptionPage::Options => {}
+                    }),
                 )
-            })
-            .when(!reasoning_efforts.is_empty(), |list| {
-                list.child(runtime_section_heading(locale::common("Reasoning")))
-                    .child(
-                        div()
-                            .px_3()
-                            .flex()
-                            .flex_wrap()
-                            .gap_2()
-                            .child(
-                                runtime_choice_button(
-                                    "runtime-reasoning:default",
-                                    locale::common("Default"),
-                                    draft.reasoning_effort.is_none(),
-                                )
-                                .when(!busy, |button| {
-                                    button
-                                        .cursor_pointer()
-                                        .active(|style| style.bg(theme::row_pressed_bg()))
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.choose_default_runtime_reasoning(cx)
-                                            }),
-                                        )
-                                }),
-                            )
-                            .children(reasoning_efforts.into_iter().map(|choice| {
-                                let selected = draft.reasoning_effort.as_deref()
-                                    == Some(choice.value.as_str());
-                                self.render_runtime_choice("reasoning", choice, selected, cx)
-                            })),
-                    )
-            })
-            .when(!modes.is_empty(), |list| {
-                list.child(runtime_section_heading(locale::common("Mode")))
-                    .child(
-                        div()
-                            .px_3()
-                            .flex()
-                            .flex_wrap()
-                            .gap_2()
-                            .child(
-                                runtime_choice_button(
-                                    "runtime-mode:default",
-                                    locale::common("Default"),
-                                    draft.mode_id.is_none(),
-                                )
-                                .when(!busy, |button| {
-                                    button
-                                        .cursor_pointer()
-                                        .active(|style| style.bg(theme::row_pressed_bg()))
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.choose_default_runtime_mode(cx)
-                                            }),
-                                        )
-                                }),
-                            )
-                            .children(modes.into_iter().map(|choice| {
-                                let selected =
-                                    draft.mode_id.as_deref() == Some(choice.value.as_str());
-                                self.render_runtime_choice("mode", choice, selected, cx)
-                            })),
-                    )
-            })
-            .when(!features.is_empty(), |list| {
-                list.child(runtime_section_heading(locale::common("Session options")))
-                    .children(
-                        features
-                            .into_iter()
-                            .map(|feature| self.render_runtime_feature(feature, cx)),
-                    )
-            });
-        list.into_any_element()
+        });
+        div()
+            .px_3()
+            .pb_3()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .child(default)
+            .children(choices.into_iter().map(|choice| {
+                let selected = selected_value.as_deref() == Some(choice.value.as_str());
+                self.render_runtime_choice(group, choice, selected, cx)
+            }))
+            .into_any_element()
     }
+
     fn render_runtime_choice(
         &self,
         group: &'static str,
@@ -20724,6 +20911,20 @@ impl MobileApp {
                     .clone()
                     .unwrap_or_else(|| locale::common("Default").to_string())
             });
+        // Which of the Agent's own options the control row offers, and which of
+        // them the session has been moved off the Agent's default for.
+        let projection = runtime_catalog
+            .zip(runtime_selection)
+            .map(|(catalog, selection)| RuntimeCascadeProjection::from_catalog(catalog, selection))
+            .unwrap_or_default();
+        let reasoning_offered = !projection.reasoning_efforts.is_empty();
+        let modes_offered = !projection.modes.is_empty();
+        let features_offered = !projection.features.is_empty();
+        let reasoning_set =
+            runtime_selection.is_some_and(|selection| selection.reasoning_effort.is_some());
+        let mode_set = runtime_selection.is_some_and(|selection| selection.mode_id.is_some());
+        let options_set =
+            runtime_selection.is_some_and(|selection| !selection.config_values.is_empty());
         div()
             .flex_shrink_0()
             .border_t_1()
@@ -20820,7 +21021,7 @@ impl MobileApp {
                             .child(
                                 Textarea::new(&self.composer_input)
                                     .appearance(false)
-                                    .text_size(theme::font_body())
+                                    .text_size(theme::font_composer())
                                     // The long press hook is the only signal the
                                     // platform gives for "the user selected this
                                     // word": open the touch toolbar instead of the
@@ -20843,7 +21044,6 @@ impl MobileApp {
                             .h(px(theme::TOUCH_TARGET))
                             .flex()
                             .items_center()
-                            .gap(px(theme::SPACING_XS))
                             // The attach menu offers the two things a phone can
                             // hand over: a photo the host scales down, or a file
                             // it carries whole. It sits against the card's own
@@ -20858,11 +21058,11 @@ impl MobileApp {
                                     attach_enabled,
                                     cx.listener(Self::open_composer_attach_menu),
                                 )
-                                .ml(px(-theme::SPACING_SM)),
+                                .ml(px(-theme::SPACING_MD)),
                             )
                             // The model is the chip's whole story here: the mode
                             // the session is running under was chosen when it
-                            // started, and the sheet behind this chip is where
+                            // started, and the drawer behind this chip is where
                             // either one is read or changed.
                             .child(
                                 composer_chip(
@@ -20874,12 +21074,49 @@ impl MobileApp {
                                     ),
                                     model_label,
                                     !runtime_summary.available,
+                                    false,
                                     ComposerChipAction::SessionModel,
                                     cx,
                                 )
                                 .flex_1()
                                 .min_w_0(),
                             )
+                            // The Agent's own options, as glyphs and nothing
+                            // else: the value of a reasoning effort or a
+                            // permission mode is read in the drawer it opens,
+                            // and reading four of them off the control row is
+                            // what used to squeeze the model chip out of it.
+                            .when(reasoning_offered, |row| {
+                                row.child(composer_option_button(
+                                    "composer-reasoning",
+                                    "icons/brain.svg",
+                                    locale::common("Reasoning").to_string(),
+                                    reasoning_set,
+                                    !self.operation_busy && !runtime_switch_pending,
+                                    cx.listener(Self::open_runtime_reasoning_drawer),
+                                ))
+                            })
+                            .when(modes_offered, |row| {
+                                row.child(composer_option_button(
+                                    "composer-mode",
+                                    "icons/shield-alert.svg",
+                                    locale::common("Mode").to_string(),
+                                    mode_set,
+                                    !self.operation_busy && !runtime_switch_pending,
+                                    cx.listener(Self::open_runtime_mode_drawer),
+                                ))
+                            })
+                            .when(features_offered, |row| {
+                                row.child(composer_option_button(
+                                    "composer-session-options",
+                                    "icons/sliders-horizontal.svg",
+                                    locale::text("Session options", "会话选项", "工作階段選項")
+                                        .to_string(),
+                                    options_set,
+                                    !self.operation_busy && !runtime_switch_pending,
+                                    cx.listener(Self::open_session_options_drawer),
+                                ))
+                            })
                             // Recall rather than retype: the prompts already sent
                             // in this session are one tap away. The arrow is not
                             // a clock — the clock belongs to scheduling now.
@@ -20917,13 +21154,20 @@ impl MobileApp {
                                         cx.listener(|this, _, _, cx| this.show_token_usage(cx)),
                                     )
                                     .child(
-                                        ProgressCircle::new("composer-token-ring")
-                                            .value(usage_percent)
-                                            .color(if usage_reported {
-                                                usage_color
-                                            } else {
-                                                theme::text_muted()
-                                            }),
+                                        // The ring is drawn at the card's own
+                                        // size rather than the kit's: the gauge
+                                        // is the one measure on the row, and it
+                                        // is read at a glance.
+                                        div().size(px(theme::COMPOSER_RING_SIZE)).child(
+                                            ProgressCircle::new("composer-token-ring")
+                                                .value(usage_percent)
+                                                .size_full()
+                                                .color(if usage_reported {
+                                                    usage_color
+                                                } else {
+                                                    theme::text_muted()
+                                                }),
+                                        ),
                                     ),
                             )
                             // Send and Stop are the same target, so the row keeps
@@ -26066,9 +26310,59 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// Answers "Local": the project's own checkout, and the mode that says so.
+    ///
+    /// The workspace follows the answer. A page that was pointing at one of the
+    /// project's worktrees has to come back to the checkout before the chip can
+    /// honestly call itself local, and a worktree has to be cut from that same
+    /// checkout rather than from another worktree.
+    fn pin_new_session_origin_checkout(&mut self, cx: &mut Context<Self>) {
+        let checkout = self
+            .workspace_summaries
+            .iter()
+            .filter(|summary| {
+                self.new_session_project_id
+                    .as_deref()
+                    .is_none_or(|id| summary.project.id.as_str() == id)
+            })
+            .find(|summary| summary.workspace.mode == WorkspaceMode::CurrentCheckout)
+            .map(|summary| summary.workspace.id.as_str().to_string());
+        if let Some(workspace_id) = checkout {
+            self.select_new_session_workspace(&workspace_id, cx);
+        }
+    }
+
+    fn choose_new_session_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.new_session_temporary {
+            return;
+        }
+        self.pin_new_session_origin_checkout(cx);
+        self.toggle_new_session_workspace_mode(
+            WorkspaceMode::CurrentCheckout,
+            &noop_mouse_up(),
+            window,
+            cx,
+        );
+    }
+
+    fn choose_new_session_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.supports_new_session_worktree() {
+            return;
+        }
+        self.pin_new_session_origin_checkout(cx);
+        self.toggle_new_session_workspace_mode(
+            WorkspaceMode::VibexWorktree,
+            &noop_mouse_up(),
+            window,
+            cx,
+        );
+    }
+
     fn choose_new_session_base_ref(&mut self, base_ref: String, cx: &mut Context<Self>) {
         self.new_session_base_ref = Some(base_ref);
-        self.new_session_picker = None;
+        // Back to the drawer the question was asked from: the branch is one
+        // field of the worktree, not a list of its own to be left after.
+        self.new_session_picker = Some(NewSessionPicker::Location);
         cx.notify();
     }
 
@@ -26123,16 +26417,12 @@ impl MobileApp {
         }
     }
 
-    /// Choosing a project re-scopes the workspace list under it and leaves the
-    /// sheet open: the list below is the other half of the same answer.
+    /// Choosing a project also chooses the checkout it is worked in, so the
+    /// list has answered its question and closes.
     fn choose_new_session_project(&mut self, project_id: String, cx: &mut Context<Self>) {
         self.select_new_session_project(&project_id, cx);
-        cx.notify();
-    }
-
-    fn choose_new_session_workspace(&mut self, workspace_id: String, cx: &mut Context<Self>) {
         self.new_session_picker = None;
-        self.select_new_session_workspace(&workspace_id, cx);
+        cx.notify();
     }
 
     fn toggle_new_session_workspace_mode(
@@ -26607,6 +26897,9 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match self.new_session_picker {
+            Some(NewSessionPicker::Project) => {
+                self.render_new_session_project_sheet(presentation, body_scroll, cx)
+            }
             Some(NewSessionPicker::Location) => {
                 self.render_new_session_location_sheet(presentation, body_scroll, cx)
             }
@@ -26721,46 +27014,11 @@ impl MobileApp {
             .min_h_0()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .h(px(theme::TOUCH_TARGET))
-                    .pl(px(theme::SPACING_LG))
-                    .pr(px(theme::SPACING_SM))
-                    .flex()
-                    .items_center()
-                    .gap(px(theme::SPACING_SM))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(theme::font_heading())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_primary())
-                            .child(locale::text("Base branch", "基线分支", "基線分支")),
-                    )
-                    .child(
-                        div()
-                            .id("new-session-base-ref-close")
-                            .size(px(theme::TOUCH_TARGET))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .aria_label(locale::common("Close"))
-                            .cursor_pointer()
-                            .active(|style| style.opacity(0.6))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::close_new_session_picker),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/x.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_secondary()),
-                            ),
-                    ),
-            )
+            .child(new_session_picker_header(
+                locale::text("Base branch", "基线分支", "基線分支"),
+                "new-session-base-ref-close",
+                cx,
+            ))
             .child(body);
         bottom_sheet_shell("mobile-new-session-base-ref", presentation)
             .on_dismiss(
@@ -26786,61 +27044,18 @@ impl MobileApp {
     ) {
         match action {
             ComposerChipAction::NewSessionModel => {
-                self.open_new_session_runtime_options(&noop_mouse_up(), window, cx)
+                self.open_runtime_options(&noop_mouse_up(), window, cx)
             }
-            ComposerChipAction::NewSessionPermission => {
-                self.open_new_session_options(&noop_mouse_up(), window, cx)
-            }
-            ComposerChipAction::NewSessionScope => {
-                self.open_new_session_picker(NewSessionPicker::Location, cx)
+            ComposerChipAction::NewSessionProject => {
+                self.open_new_session_picker(NewSessionPicker::Project, cx)
             }
             ComposerChipAction::NewSessionLocation => {
-                let next = if self
-                    .normalize_new_session_workspace_mode(self.new_session_workspace_mode)
-                    == WorkspaceMode::VibexWorktree
-                {
-                    WorkspaceMode::CurrentCheckout
-                } else {
-                    WorkspaceMode::VibexWorktree
-                };
-                self.toggle_new_session_workspace_mode(next, &noop_mouse_up(), window, cx)
+                self.open_new_session_picker(NewSessionPicker::Location, cx)
             }
             ComposerChipAction::SessionModel => {
                 self.open_runtime_options(&noop_mouse_up(), window, cx)
             }
         }
-    }
-
-    /// The shortcut behind a pill: the sheet the tap did not open.
-    fn on_composer_chip_long_press(
-        &mut self,
-        target: LongPressTarget,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.long_press_at = Some(std::time::Instant::now());
-        match target {
-            LongPressTarget::NewSessionSettings => {
-                self.open_new_session_options(&noop_mouse_up(), window, cx)
-            }
-            LongPressTarget::NewSessionModels => {
-                self.open_new_session_runtime_options(&noop_mouse_up(), window, cx)
-            }
-        }
-    }
-
-    /// Whether a hold just answered the press being released.
-    ///
-    /// The release after a hold is not also a tap: it is the same finger, and
-    /// the sheet it opened is already on screen. A release that never arrives —
-    /// the hold's sheet took it — costs nothing, because the answer expires with
-    /// the window rather than staying set.
-    fn take_long_press_echo(&mut self) -> bool {
-        let echo = self
-            .long_press_at
-            .is_some_and(|at| at.elapsed() < Duration::from_millis(LONG_PRESS_ECHO_MS));
-        self.long_press_at = None;
-        echo
     }
 
     /// The row that starts a session without a project.
@@ -26924,21 +27139,25 @@ impl MobileApp {
             .into_any_element()
     }
 
-    /// The project and the workspace the session will start in.
-    fn render_new_session_location_sheet(
+    /// The project a new session belongs to, or none at all.
+    ///
+    /// One question, one list: the project decides the checkout the session is
+    /// worked in, and a reader who wants to work somewhere else answers the
+    /// chip beside this one instead of picking a worktree out of the folder
+    /// tree.
+    fn render_new_session_project_sheet(
         &self,
         presentation: SheetPresentation,
         body_scroll: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let project_id = self.new_session_project_id.clone();
-        let workspace_id = self.new_session_workspace_id.clone();
-
-        let project_rows = self
+        let rows = self
             .sidebar_projects()
             .into_iter()
             .map(|project| {
-                let selected = project_id.as_deref() == Some(project.id.as_str());
+                let selected = !self.new_session_temporary
+                    && project_id.as_deref() == Some(project.id.as_str());
                 let workspaces = self
                     .workspace_summaries
                     .iter()
@@ -26953,145 +27172,20 @@ impl MobileApp {
                     ),
                 };
                 let id = project.id.clone();
-                div()
-                    .id(format!("new-session-project:{}", project.id))
-                    .flex_shrink_0()
-                    .min_h(px(theme::TOUCH_TARGET))
-                    .px(px(theme::SPACING_LG))
-                    .py(px(theme::SPACING_SM))
-                    .flex()
-                    .items_center()
-                    .gap(px(theme::SPACING_MD))
-                    .cursor_pointer()
-                    .active(|style| style.bg(theme::row_pressed_bg()))
-                    .when(selected, |row| row.bg(theme::sidebar_selected_bg()))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.choose_new_session_project(id.clone(), cx)
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(theme::font_body())
-                                    .text_color(theme::text_primary())
-                                    .child(project.label),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(theme::font_micro())
-                                    .text_color(theme::text_muted())
-                                    .child(subtitle),
-                            ),
-                    )
-                    .when(selected, |row| {
-                        row.child(
-                            svg()
-                                .path("icons/check.svg")
-                                .size(px(theme::ICON_SM))
-                                .text_color(theme::accent_green()),
-                        )
-                    })
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-
-        let workspace_rows = self
-            .workspaces
-            .iter()
-            .filter(|workspace| {
-                project_id
-                    .as_deref()
-                    .is_none_or(|id| workspace.project_id.as_str() == id)
-            })
-            .map(|workspace| {
-                let summary = self
-                    .workspace_summaries
-                    .iter()
-                    .find(|summary| summary.workspace.id.as_str() == workspace.id.as_str());
-                let title = self
-                    .sidebar_view
-                    .worktree_titles
-                    .get(workspace.id.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| workspace_label(&workspace.root_path).to_string());
-                let mut subtitle = workspace_mode_label(workspace.mode).to_string();
-                if let Some(branch) = summary
-                    .and_then(|summary| summary.git_branch.as_deref())
-                    .filter(|branch| !branch.trim().is_empty())
-                {
-                    subtitle = format!("{subtitle} · {branch}");
-                }
-                let selected = workspace_id.as_deref() == Some(workspace.id.as_str());
-                let id = workspace.id.as_str().to_string();
-                div()
-                    .id(format!("new-session-workspace:{}", workspace.id))
-                    .flex_shrink_0()
-                    .min_h(px(theme::TOUCH_TARGET))
-                    .px(px(theme::SPACING_LG))
-                    .py(px(theme::SPACING_SM))
-                    .flex()
-                    .items_center()
-                    .gap(px(theme::SPACING_MD))
-                    .cursor_pointer()
-                    .active(|style| style.bg(theme::row_pressed_bg()))
-                    .when(selected, |row| row.bg(theme::sidebar_selected_bg()))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.choose_new_session_workspace(id.clone(), cx)
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(theme::font_body())
-                                    .text_color(theme::text_primary())
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(theme::font_micro())
-                                    .text_color(theme::text_muted())
-                                    .child(subtitle),
-                            ),
-                    )
-                    .when(selected, |row| {
-                        row.child(
-                            svg()
-                                .path("icons/check.svg")
-                                .size(px(theme::ICON_SM))
-                                .text_color(theme::accent_green()),
-                        )
-                    })
-                    .into_any_element()
+                new_session_picker_row(
+                    format!("new-session-project:{}", project.id),
+                    project.label,
+                    subtitle,
+                    selected,
+                    true,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.choose_new_session_project(id.clone(), cx)
+                    }),
+                )
+                .into_any_element()
             })
             .collect::<Vec<_>>();
 
@@ -27099,53 +27193,14 @@ impl MobileApp {
             .min_h_0()
             .flex()
             .flex_col()
+            .child(new_session_picker_header(
+                locale::text("Project", "项目", "專案"),
+                "new-session-project-close",
+                cx,
+            ))
             .child(
                 div()
-                    .flex_shrink_0()
-                    .h(px(theme::TOUCH_TARGET))
-                    .pl(px(theme::SPACING_LG))
-                    .pr(px(theme::SPACING_SM))
-                    .flex()
-                    .items_center()
-                    .gap(px(theme::SPACING_SM))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(theme::font_heading())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_primary())
-                            .child(locale::text(
-                                "Project and workspace",
-                                "项目与工作区",
-                                "專案與工作區",
-                            )),
-                    )
-                    .child(
-                        div()
-                            .id("new-session-picker-close")
-                            .size(px(theme::TOUCH_TARGET))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .aria_label(locale::common("Close"))
-                            .cursor_pointer()
-                            .active(|style| style.opacity(0.6))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::close_new_session_picker),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/x.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_secondary()),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .id("new-session-picker-rows")
+                    .id("new-session-project-rows")
                     .flex_1()
                     .min_h_0()
                     .track_scroll(&body_scroll)
@@ -27154,20 +27209,10 @@ impl MobileApp {
                     .flex()
                     .flex_col()
                     .pb(px(theme::SPACING_SM))
-                    .child(runtime_section_heading(locale::text(
-                        "Project", "项目", "專案",
-                    )))
-                    .children(project_rows)
-                    .child(runtime_section_heading(locale::text(
-                        "Workspace",
-                        "工作区",
-                        "工作區",
-                    )))
-                    .children(workspace_rows)
-                    // The answer for a session that belongs to no
-                    // checkout yet. It sits under both lists because it
-                    // is the alternative to the two of them, not one
-                    // more row inside either.
+                    .children(rows)
+                    // The answer for a session that belongs to no checkout yet.
+                    // It sits under the list because it is the alternative to
+                    // every row in it, not one more project.
                     .child(runtime_section_heading(locale::text(
                         "Without a project",
                         "不使用项目",
@@ -27186,16 +27231,140 @@ impl MobileApp {
             .into_any_element()
     }
 
+    /// Where the session runs: the project's own checkout, or a worktree cut
+    /// for it before the session starts.
+    ///
+    /// The two answers are the lead of the drawer, and the worktree's own
+    /// fields follow the answer that needs them — the name it is created under,
+    /// the path it lands on, and the branch it is cut from. They are the same
+    /// shape the desktop asks for in its own location menu.
+    fn render_new_session_location_sheet(
+        &self,
+        presentation: SheetPresentation,
+        body_scroll: ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mode = self.normalize_new_session_workspace_mode(self.new_session_workspace_mode);
+        let worktree_supported = self.supports_new_session_worktree();
+        let workspace_display = self
+            .new_session_workspace_id
+            .as_deref()
+            .and_then(|id| {
+                self.workspaces
+                    .iter()
+                    .find(|workspace| workspace.id.as_str() == id)
+            })
+            .map(|workspace| {
+                let title = self
+                    .sidebar_view
+                    .worktree_titles
+                    .get(workspace.id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| workspace_label(&workspace.root_path).to_string());
+                let branch = self
+                    .workspace_summaries
+                    .iter()
+                    .find(|summary| summary.workspace.id.as_str() == workspace.id.as_str())
+                    .and_then(|summary| summary.git_branch.clone())
+                    .filter(|branch| !branch.trim().is_empty());
+                match branch {
+                    Some(branch) => format!("{title} · {branch}"),
+                    None => title,
+                }
+            })
+            .unwrap_or_else(|| {
+                locale::text("Choose a project first", "请先选择项目", "請先選擇專案").to_string()
+            });
+        let worktree_subtitle = if worktree_supported {
+            locale::text(
+                "Create a worktree for this session",
+                "为此会话新建 Worktree",
+                "為此工作階段新建 Worktree",
+            )
+            .to_string()
+        } else {
+            locale::text(
+                "This runtime cannot create a worktree",
+                "该运行时不支持创建 Worktree",
+                "此執行環境不支援建立 Worktree",
+            )
+            .to_string()
+        };
+
+        let local_row = new_session_picker_row(
+            "new-session-location:local",
+            locale::text("Local", "本地", "本機"),
+            workspace_display,
+            mode == WorkspaceMode::CurrentCheckout,
+            true,
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| this.choose_new_session_local(window, cx)),
+        );
+        let worktree_row = new_session_picker_row(
+            "new-session-location:worktree",
+            locale::text("New worktree", "新建 Worktree", "新建 Worktree"),
+            worktree_subtitle,
+            mode == WorkspaceMode::VibexWorktree,
+            worktree_supported,
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| this.choose_new_session_worktree(window, cx)),
+        );
+
+        let busy = self.new_session_busy;
+        let sheet = div()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(new_session_picker_header(
+                locale::text("Where to run", "运行位置", "執行位置"),
+                "new-session-location-close",
+                cx,
+            ))
+            .child(
+                div()
+                    .id("new-session-location-rows")
+                    .flex_1()
+                    .min_h_0()
+                    .track_scroll(&body_scroll)
+                    .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
+                    .flex()
+                    .flex_col()
+                    .pb(px(theme::SPACING_SM))
+                    .child(local_row)
+                    .child(worktree_row)
+                    // The worktree's own fields, in place, and only while a new
+                    // worktree is the answer.
+                    .when(mode == WorkspaceMode::VibexWorktree, |body| {
+                        body.child(self.render_new_session_worktree_fields(busy, cx))
+                    }),
+            );
+        bottom_sheet_shell("mobile-new-session-picker", presentation)
+            .on_dismiss(
+                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::NewSessionPicker, cx)),
+            )
+            .on_pan(cx.listener(|this, event, window, cx| {
+                this.pull_sheet(SheetKey::NewSessionPicker, event, window, cx)
+            }))
+            .content(sheet)
+            .into_any_element()
+    }
+
     /// The new-session page.
     ///
     /// The prompt card is the page: an introduction above it for orientation,
     /// the message inside it, and the row under it naming where that message
-    /// will run. Everything that shapes the session beyond those two belongs to
-    /// a sheet, and the two decisions a session cannot start without — the model
-    /// that answers and the permission it runs under — sit on the card's control
-    /// row so they are read without opening anything. The desktop's creation
-    /// panel draws the same split, which is the point: the phone used to open on
-    /// a stack of cards and a button at the far end of the screen.
+    /// will run. The card's control row carries the runtime the same way the
+    /// session composer's does — the model as the one value worth reading, the
+    /// Agent's own options as the glyphs that open them — and the two chips
+    /// under the card answer which project the session belongs to and where
+    /// that project is worked. The desktop's creation panel draws the same
+    /// split, which is the point: the phone used to open on a stack of cards and
+    /// a button at the far end of the screen.
     fn render_new_session(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         // The chip names the answer rather than the question: a temporary
         // session has no project, and saying so is more use than leaving the
@@ -27215,24 +27384,6 @@ impl MobileApp {
                     locale::text("Choose project", "选择项目", "選擇專案").to_string()
                 })
         };
-        let workspace_display = self
-            .new_session_workspace_id
-            .as_deref()
-            .and_then(|id| {
-                self.workspaces
-                    .iter()
-                    .find(|workspace| workspace.id.as_str() == id)
-            })
-            .map(|workspace| {
-                self.sidebar_view
-                    .worktree_titles
-                    .get(workspace.id.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| workspace_label(&workspace.root_path).to_string())
-            })
-            .unwrap_or_else(|| {
-                locale::text("Choose workspace", "选择工作区", "選擇工作區").to_string()
-            });
         let runtime_catalog = self
             .controller
             .as_ref()
@@ -27253,7 +27404,6 @@ impl MobileApp {
         // being nothing to send.
         let can_submit = (!prompt.trim().is_empty() || !self.new_session_attachments.is_empty())
             && !self.new_session_busy;
-        let worktree_supported = self.supports_new_session_worktree();
         let mode = self.normalize_new_session_workspace_mode(self.new_session_workspace_mode);
         let can_create_session = self.backend.as_ref().is_some_and(|backend| {
             backend
@@ -27263,10 +27413,11 @@ impl MobileApp {
         });
         let runtime_ready = runtime_summary.available && can_create_session;
         // The page is the card. Everything above it is orientation, the card is
-        // the message, and the row under it is where that message will run. The
-        // choices that used to be rows of their own now live on the card's
-        // control row or in the sheet the header opens, so the first thing the
-        // page shows is the field it is asking the reader to write in.
+        // the message, and the chips under it are where that message will run.
+        // Every runtime choice lives on the card's control row — the model as
+        // the chip it is worth reading, the Agent's own options as the glyphs
+        // that open them — so the first thing the page shows is the field it is
+        // asking the reader to write in.
         //
         // The introduction stays while the reader writes: the keyboard already
         // takes the room it needs, and a page that rearranges itself on the
@@ -27275,7 +27426,9 @@ impl MobileApp {
         let location_label = if mode == WorkspaceMode::VibexWorktree {
             locale::text("New worktree", "新建 Worktree", "新建 Worktree").to_string()
         } else {
-            locale::text("Current checkout", "当前检出", "目前檢出").to_string()
+            // The desktop's own word for the project's checkout, so a reader
+            // moving between the two clients reads the same answer.
+            locale::text("Local", "本地", "本機").to_string()
         };
         // The two decisions the card reports rather than hides: which model will
         // answer, and what the session is allowed to do. Both are read off the
@@ -27306,16 +27459,21 @@ impl MobileApp {
                     .clone()
                     .unwrap_or_else(|| locale::common("Default").to_string())
             });
-        let mode_label = runtime_catalog
+        // The Agent's own options, read the way the control row's glyphs show
+        // them: the projection says which groups this Agent offers at all, and
+        // the selection says which of them the reader has already changed from
+        // the Agent's own default.
+        let projection = runtime_catalog
             .zip(runtime_selection)
-            .and_then(|(catalog, selection)| {
-                RuntimeCascadeProjection::from_catalog(catalog, selection)
-                    .modes
-                    .into_iter()
-                    .find(|choice| selection.mode_id.as_ref() == Some(&choice.value))
-                    .map(|choice| choice.label)
-            })
-            .unwrap_or_else(|| locale::common("Default").to_string());
+            .map(|(catalog, selection)| RuntimeCascadeProjection::from_catalog(catalog, selection))
+            .unwrap_or_default();
+        let reasoning_offered = !projection.reasoning_efforts.is_empty();
+        let modes_offered = !projection.modes.is_empty();
+        let reasoning_set =
+            runtime_selection.is_some_and(|selection| selection.reasoning_effort.is_some());
+        let mode_set = runtime_selection.is_some_and(|selection| selection.mode_id.is_some());
+        let options_set =
+            runtime_selection.is_some_and(|selection| !selection.config_values.is_empty());
 
         div()
             .absolute()
@@ -27324,39 +27482,7 @@ impl MobileApp {
             .block_mouse_except_scroll()
             .flex()
             .flex_col()
-            .child(
-                self.render_overlay_header(
-                    "mobile-new-session",
-                    "New session",
-                    Some(
-                        div()
-                            .id("mobile-new-session-options")
-                            .debug_selector(|| "mobile-new-session-options".to_string())
-                            .aria_label(
-                                locale::text("Session options", "会话选项", "工作階段選項")
-                                    .to_string(),
-                            )
-                            .size(px(theme::HEADER_BUTTON_SIZE))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .active(|style| style.opacity(0.65))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::open_new_session_options),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/ellipsis.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_secondary()),
-                            )
-                            .into_any_element(),
-                    ),
-                    cx,
-                ),
-            )
+            .child(self.render_overlay_header("mobile-new-session", "New session", None, cx))
             .child(
                 div()
                     .flex_1()
@@ -27436,7 +27562,7 @@ impl MobileApp {
                                             .child(
                                                 Textarea::new(&self.new_session_prompt_input)
                                                     .appearance(false)
-                                                    .text_size(theme::font_body()),
+                                                    .text_size(theme::font_composer()),
                                             ),
                                     )
                                     // The first message opens the same three lists
@@ -27471,17 +27597,17 @@ impl MobileApp {
                                     .when(!self.new_session_attachments.is_empty(), |card| {
                                         card.child(self.render_new_session_attachments(cx))
                                     })
-                                    // The control row keeps the two choices a session
-                                    // cannot start without on the card itself: what
-                                    // answers, and what it may do. Everything else is
-                                    // one tap away in a sheet.
+                                    // The control row is the composer's own: the
+                                    // plus against the card's leading edge, the
+                                    // model chip beside it, then the Agent's own
+                                    // options as glyphs, and the single commitment
+                                    // on the right.
                                     .child(
                                         div()
                                             .w_full()
                                             .h(px(theme::TOUCH_TARGET))
                                             .flex()
                                             .items_center()
-                                            .gap(px(theme::SPACING_XS))
                                             .child(
                                                 composer_icon_button(
                                                     "mobile-new-session-attach",
@@ -27495,7 +27621,7 @@ impl MobileApp {
                                                     !busy,
                                                     cx.listener(Self::open_new_session_attach_menu),
                                                 )
-                                                .ml(px(-theme::SPACING_SM)),
+                                                .ml(px(-theme::SPACING_MD)),
                                             )
                                             .child(
                                                 composer_chip(
@@ -27507,23 +27633,50 @@ impl MobileApp {
                                                     ),
                                                     model_label,
                                                     !runtime_ready,
+                                                    false,
                                                     ComposerChipAction::NewSessionModel,
                                                     cx,
                                                 )
                                                 .flex_1()
                                                 .min_w_0(),
                                             )
-                                            .child(composer_chip(
-                                                "mobile-new-session-mode",
-                                                svg()
-                                                    .path("icons/shield-alert.svg")
-                                                    .size(px(theme::ICON_SM))
-                                                    .text_color(theme::text_muted())
-                                                    .into_any_element(),
-                                                mode_label,
-                                                false,
-                                                ComposerChipAction::NewSessionPermission,
-                                                cx,
+                                            .when(reasoning_offered, |row| {
+                                                row.child(composer_option_button(
+                                                    "mobile-new-session-reasoning",
+                                                    "icons/brain.svg",
+                                                    locale::common("Reasoning").to_string(),
+                                                    reasoning_set,
+                                                    !busy,
+                                                    cx.listener(
+                                                        Self::open_runtime_reasoning_drawer,
+                                                    ),
+                                                ))
+                                            })
+                                            .when(modes_offered, |row| {
+                                                row.child(composer_option_button(
+                                                    "mobile-new-session-mode",
+                                                    "icons/shield-alert.svg",
+                                                    locale::common("Mode").to_string(),
+                                                    mode_set,
+                                                    !busy,
+                                                    cx.listener(Self::open_runtime_mode_drawer),
+                                                ))
+                                            })
+                                            // The title and the model's own options
+                                            // share the last glyph: both are
+                                            // settings for the session being made.
+                                            .child(composer_option_button(
+                                                "mobile-new-session-options",
+                                                "icons/sliders-horizontal.svg",
+                                                locale::text(
+                                                    "Session options",
+                                                    "会话选项",
+                                                    "工作階段選項",
+                                                )
+                                                .to_string(),
+                                                options_set,
+                                                !busy,
+                                                cx.listener(Self::open_session_options_drawer),
                                             ))
                                             .child(composer_primary_button(
                                                 "mobile-new-session-submit",
@@ -27535,52 +27688,61 @@ impl MobileApp {
                                             )),
                                     ),
                             )
-                            // ── where it will run ───────────────────────────
+                            // ── the two answers under the card ──────────────
+                            // Which project it belongs to, and where that project
+                            // is worked: the project's own checkout, or a worktree
+                            // cut for the session. Each chip names its answer and
+                            // folds down into the list that changes it.
                             .child(
                                 div()
                                     .w_full()
                                     .flex()
-                                    .flex_wrap()
                                     .items_center()
-                                    .gap(px(theme::SPACING_XS))
-                                    .child(composer_chip(
-                                        "mobile-new-session-scope",
-                                        svg()
-                                            .path("icons/layers.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_muted())
-                                            .into_any_element(),
-                                        if self.new_session_temporary {
-                                            project_label.clone()
-                                        } else {
-                                            format!("{project_label} · {workspace_display}")
-                                        },
-                                        !self.new_session_temporary
-                                            && self.new_session_project_id.is_none(),
-                                        ComposerChipAction::NewSessionScope,
-                                        cx,
-                                    ))
-                                    .child(composer_chip(
-                                        "mobile-new-session-location",
-                                        svg()
-                                            .path(if mode == WorkspaceMode::VibexWorktree {
-                                                "icons/git-branch.svg"
-                                            } else {
-                                                "icons/folder-open.svg"
-                                            })
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_muted())
-                                            .into_any_element(),
-                                        location_label.clone(),
-                                        !worktree_supported,
-                                        ComposerChipAction::NewSessionLocation,
-                                        cx,
-                                    )),
+                                    .child(
+                                        composer_chip(
+                                            "mobile-new-session-project",
+                                            svg()
+                                                .path("icons/layers.svg")
+                                                .size(px(theme::ICON_SM))
+                                                .text_color(theme::text_muted())
+                                                .into_any_element(),
+                                            project_label.clone(),
+                                            !self.new_session_temporary
+                                                && self.new_session_project_id.is_none(),
+                                            true,
+                                            ComposerChipAction::NewSessionProject,
+                                            cx,
+                                        )
+                                        .flex_1()
+                                        .min_w_0(),
+                                    )
+                                    // A temporary session has no checkout, so
+                                    // there is no second answer to offer: the
+                                    // only place it can run is the authority's
+                                    // own scratch directory.
+                                    .when(!self.new_session_temporary, |row| {
+                                        row.child(
+                                            composer_chip(
+                                                "mobile-new-session-location",
+                                                svg()
+                                                    .path(if mode == WorkspaceMode::VibexWorktree {
+                                                        "icons/git-branch.svg"
+                                                    } else {
+                                                        "icons/folder-open.svg"
+                                                    })
+                                                    .size(px(theme::ICON_SM))
+                                                    .text_color(theme::text_muted())
+                                                    .into_any_element(),
+                                                location_label.clone(),
+                                                false,
+                                                true,
+                                                ComposerChipAction::NewSessionLocation,
+                                                cx,
+                                            )
+                                            .flex_shrink_0(),
+                                        )
+                                    }),
                             )
-                            // ── the worktree the session will start in ──────
-                            .when(mode == WorkspaceMode::VibexWorktree, |page| {
-                                page.child(self.render_new_session_worktree_fields(busy, cx))
-                            })
                             // A page that cannot start says so next to the control
                             // that is holding it up, rather than in a sentence the
                             // reader has to connect to a row further up.
@@ -27615,12 +27777,12 @@ impl MobileApp {
             .into_any_element()
     }
 
-    /// The worktree's own fields, in place, and only while a new worktree is
-    /// the choice.
+    /// The worktree's own fields, under the answer that needs them.
     ///
     /// They used to be a card on every visit to the page with a sentence
     /// explaining worktrees under it; a reader starting in the current checkout
-    /// needs neither, and the sentence now appears only where it applies.
+    /// needs neither, and even the reader who wants a worktree answers the
+    /// question above these fields first.
     fn render_new_session_worktree_fields(
         &self,
         busy: bool,
@@ -27628,11 +27790,8 @@ impl MobileApp {
     ) -> gpui::AnyElement {
         div()
             .w_full()
-            .rounded(px(theme::RADIUS_CARD))
-            .border_1()
-            .border_color(theme::border_subtle())
-            .bg(theme::bg_card())
-            .p(px(theme::SPACING_MD))
+            .px(px(theme::SPACING_LG))
+            .pt(px(theme::SPACING_SM))
             .flex()
             .flex_col()
             .gap(px(theme::SPACING_SM))
@@ -27782,289 +27941,6 @@ impl MobileApp {
                         "工作階段啟動前，會基於所選工作區的分支建立 Worktree。",
                     )),
             )
-            .into_any_element()
-    }
-
-    /// Opens the new-session page's settings sheet.
-    ///
-    /// The sheet edits the same draft the model sheet does, so a permission
-    /// chosen here is the permission the session is created with.
-    fn open_new_session_options(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.new_session_busy || !self.new_session_open {
-            return;
-        }
-        let desired = self
-            .new_session_runtime
-            .clone()
-            .or_else(|| {
-                self.controller.as_ref().and_then(|controller| {
-                    controller
-                        .state
-                        .runtime_selection
-                        .value
-                        .as_ref()
-                        .map(|state| state.desired.clone())
-                })
-            })
-            .or_else(|| {
-                self.controller.as_ref().and_then(|controller| {
-                    controller
-                        .state
-                        .runtime_options
-                        .value
-                        .as_ref()?
-                        .options
-                        .iter()
-                        .find(|option| option.availability == RuntimeOptionAvailability::Available)
-                        .map(|option| option.selection.clone())
-                })
-            });
-        if let Some(desired) = desired {
-            self.runtime_options_target = RuntimeOptionsTarget::NewSession;
-            self.runtime_draft = Some(desired);
-            self.sync_runtime_feature_inputs();
-        }
-        self.new_session_options_open = true;
-        self.push_back_screen(BackScreen::NewSessionOptions);
-        crate::platform::hide_keyboard();
-        cx.notify();
-    }
-
-    fn dismiss_new_session_options(&mut self, cx: &mut Context<Self>) {
-        if self.new_session_options_open {
-            self.new_session_options_open = false;
-            self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
-            self.runtime_draft = None;
-            self.clear_runtime_feature_inputs();
-            crate::platform::hide_keyboard();
-            cx.notify();
-        }
-    }
-
-    /// The new-session page's settings sheet.
-    ///
-    /// It holds what the page no longer spells out as rows of its own: the
-    /// optional title, the permission the session starts with, the reasoning
-    /// depth, and the per-Agent options. Every choice lands on the page's own
-    /// draft as it is made — there is no session yet, so there is nothing to
-    /// apply it to afterwards.
-    fn render_new_session_options_sheet(
-        &self,
-        presentation: SheetPresentation,
-        body_scroll: ScrollHandle,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        if !self.new_session_options_open {
-            return div().into_any_element();
-        }
-        let catalog = self
-            .controller
-            .as_ref()
-            .and_then(|controller| controller.state.runtime_options.value.as_ref().cloned());
-        let draft = self
-            .runtime_draft
-            .clone()
-            .or_else(|| self.new_session_runtime.clone());
-        let projection = catalog
-            .as_ref()
-            .zip(draft.as_ref())
-            .map(|(catalog, draft)| RuntimeCascadeProjection::from_catalog(catalog, draft))
-            .unwrap_or_default();
-        let RuntimeCascadeProjection {
-            reasoning_efforts,
-            modes,
-            features,
-            ..
-        } = projection;
-        let busy = self.new_session_busy || self.runtime_switch_busy_generation.is_some();
-        let title_value = self.new_session_title_input.read(cx).value().to_string();
-        let selected_mode = draft.as_ref().and_then(|draft| draft.mode_id.clone());
-        let selected_effort = draft
-            .as_ref()
-            .and_then(|draft| draft.reasoning_effort.clone());
-
-        let mut body = div()
-            .id("mobile-new-session-options-body")
-            .flex_1()
-            .min_h_0()
-            .track_scroll(&body_scroll)
-            .overflow_y_scroll()
-            .restrict_scroll_to_axis()
-            .pb(px(theme::SPACING_LG))
-            // ── the optional title ──────────────────────────────────────────
-            .child(runtime_section_heading(locale::text(
-                "Title",
-                "会话标题",
-                "工作階段標題",
-            )))
-            .child(
-                div()
-                    .px_3()
-                    .flex()
-                    .flex_col()
-                    .gap(px(theme::SPACING_XS))
-                    .child(
-                        div()
-                            .h(px(theme::TOUCH_TARGET))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .bg(theme::bg_card_dim())
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
-                            .child(Input::new(&self.new_session_title_input).appearance(false)),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme::font_micro())
-                            .text_color(theme::text_muted())
-                            .child(if title_value.trim().is_empty() {
-                                locale::text(
-                                    "Optional: the first message names the session when this is empty.",
-                                    "可选：留空时由第一条消息为会话命名。",
-                                    "可選：留空時由第一則訊息為工作階段命名。",
-                                )
-                            } else {
-                                locale::common("Optional")
-                            }),
-                    ),
-            );
-        // ── what the session may do ─────────────────────────────────────────
-        if !modes.is_empty() {
-            body = body
-                .child(runtime_section_heading(locale::common("Mode")))
-                .child(
-                    div()
-                        .px_3()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .child(
-                            runtime_choice_button(
-                                "new-session-mode:default",
-                                locale::common("Default"),
-                                selected_mode.is_none(),
-                            )
-                            .when(!busy, |button| {
-                                button
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.choose_default_runtime_mode(cx)
-                                        }),
-                                    )
-                            }),
-                        )
-                        .children(modes.into_iter().map(|choice| {
-                            let selected = selected_mode.as_deref() == Some(choice.value.as_str());
-                            self.render_runtime_choice("mode", choice, selected, cx)
-                        })),
-                );
-        }
-        if !reasoning_efforts.is_empty() {
-            body = body
-                .child(runtime_section_heading(locale::common("Reasoning")))
-                .child(
-                    div()
-                        .px_3()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .child(
-                            runtime_choice_button(
-                                "new-session-reasoning:default",
-                                locale::common("Default"),
-                                selected_effort.is_none(),
-                            )
-                            .when(!busy, |button| {
-                                button
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.choose_default_runtime_reasoning(cx)
-                                        }),
-                                    )
-                            }),
-                        )
-                        .children(reasoning_efforts.into_iter().map(|choice| {
-                            let selected =
-                                selected_effort.as_deref() == Some(choice.value.as_str());
-                            self.render_runtime_choice("reasoning", choice, selected, cx)
-                        })),
-                );
-        }
-        if !features.is_empty() {
-            body = body
-                .child(runtime_section_heading(locale::common("Session options")))
-                .children(
-                    features
-                        .into_iter()
-                        .map(|feature| self.render_runtime_feature(feature, cx)),
-                );
-        }
-
-        let sheet = div()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .h(px(theme::TOUCH_TARGET))
-                    .pl(px(theme::SPACING_LG))
-                    .pr(px(theme::SPACING_SM))
-                    .flex()
-                    .items_center()
-                    .gap(px(theme::SPACING_SM))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(theme::font_heading())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_primary())
-                            .child(locale::text("Session options", "会话选项", "工作階段選項")),
-                    )
-                    .child(
-                        div()
-                            .id("new-session-options-close")
-                            .size(px(theme::TOUCH_TARGET))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .aria_label(locale::common("Close"))
-                            .cursor_pointer()
-                            .active(|style| style.opacity(0.6))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.dismiss_new_session_options(cx)),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/x.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_secondary()),
-                            ),
-                    ),
-            )
-            .child(body);
-        bottom_sheet_shell("mobile-new-session-options", presentation)
-            .on_dismiss(
-                cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::NewSessionOptions, cx)),
-            )
-            .on_pan(cx.listener(|this, event, window, cx| {
-                this.pull_sheet(SheetKey::NewSessionOptions, event, window, cx)
-            }))
-            .content(sheet)
             .into_any_element()
     }
 
@@ -29991,6 +29867,172 @@ fn runtime_section_heading(label: impl Into<String>) -> gpui::Div {
         .child(label.into())
 }
 
+/// The heading of a list the new-session page opens along its bottom edge.
+fn new_session_picker_header(
+    title: &'static str,
+    close_id: &'static str,
+    cx: &mut Context<MobileApp>,
+) -> gpui::Div {
+    div()
+        .flex_shrink_0()
+        .h(px(theme::TOUCH_TARGET))
+        .pl(px(theme::SPACING_LG))
+        .pr(px(theme::SPACING_SM))
+        .flex()
+        .items_center()
+        .gap(px(theme::SPACING_SM))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(theme::font_heading())
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::text_primary())
+                .child(title),
+        )
+        .child(
+            div()
+                .id(close_id)
+                .size(px(theme::TOUCH_TARGET))
+                .flex()
+                .items_center()
+                .justify_center()
+                .aria_label(locale::common("Close"))
+                .cursor_pointer()
+                .active(|style| style.opacity(0.6))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(MobileApp::close_new_session_picker),
+                )
+                .child(
+                    svg()
+                        .path("icons/x.svg")
+                        .size(px(theme::ICON_SM))
+                        .text_color(theme::text_secondary()),
+                ),
+        )
+}
+
+/// One answer in a new-session list: a title, the line that explains it, and
+/// the check that says it is the answer already given.
+///
+/// The caller attaches the tap, because what a row does belongs to the list it
+/// is in — a project row re-scopes the checkout under it, a location row
+/// changes where the session runs.
+fn new_session_picker_row(
+    id: impl Into<ElementId>,
+    title: impl Into<String>,
+    subtitle: impl Into<String>,
+    selected: bool,
+    enabled: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .min_h(px(theme::TOUCH_TARGET))
+        .px(px(theme::SPACING_LG))
+        .py(px(theme::SPACING_SM))
+        .flex()
+        .items_center()
+        .gap(px(theme::SPACING_MD))
+        .when(selected, |row| row.bg(theme::sidebar_selected_bg()))
+        .when(enabled, |row| {
+            row.cursor_pointer()
+                .active(|style| style.bg(theme::row_pressed_bg()))
+        })
+        .when(!enabled, |row| row.opacity(0.45))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(theme::font_body())
+                        .text_color(theme::text_primary())
+                        .child(title.into()),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(theme::font_micro())
+                        .text_color(theme::text_muted())
+                        .child(subtitle.into()),
+                ),
+        )
+        .when(selected, |row| {
+            row.child(
+                svg()
+                    .path("icons/check.svg")
+                    .size(px(theme::ICON_SM))
+                    .text_color(theme::accent_green()),
+            )
+        })
+}
+
+/// The scrolling body of one of the Agent's option drawers.
+///
+/// It takes whatever height the panel has and no more, so a long list of
+/// options scrolls inside the sheet instead of growing it past the height a
+/// sheet is allowed.
+fn runtime_drawer_body(page: RuntimeOptionPage) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(page.body_id())
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .pt(px(theme::SPACING_MD))
+        .pb(px(theme::SPACING_SM))
+}
+
+/// The note a runtime surface shows when the selection it is describing is not
+/// one the authority can still accept.
+fn runtime_unavailable_note() -> gpui::AnyElement {
+    div()
+        .flex_shrink_0()
+        .mx_3()
+        .mb_2()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::accent_yellow())
+        .bg(theme::bg_card_dim())
+        .p_3()
+        .text_size(theme::font_caption())
+        .text_color(theme::accent_yellow())
+        .child(locale::text(
+            "The current session settings are unavailable. Select an available option.",
+            "当前会话设置不可用，请选择一个可用选项。",
+            "目前工作階段設定無法使用，請選擇可用選項。",
+        ))
+        .into_any_element()
+}
+
+/// The failure a switch reported, left in the drawer that asked for it.
+fn runtime_error_note(error: &BackendError) -> gpui::AnyElement {
+    div()
+        .flex_shrink_0()
+        .mx_3()
+        .mb_2()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::accent_red())
+        .bg(theme::bg_card_dim())
+        .p_3()
+        .text_size(theme::font_caption())
+        .text_color(theme::accent_red())
+        .child(error.message.clone())
+        .into_any_element()
+}
+
 /// The 2px accent bar marking the active Agent logo: it sits on the strip's
 /// bottom hairline (the tab is 40px inside the 52px strip, so -6px lands
 /// exactly on the border), rounded like a capsule.
@@ -31230,12 +31272,38 @@ fn sidebar_session_group_candidates(
 ///
 /// Both sheets build their entries from this, so an entry looks the same
 /// whichever surface opened it.
+///
+/// Every entry leads with its glyph. A phone menu is read at a glance and a
+/// bare stack of labels makes the reader parse each one before they can find
+/// the command they came for; the icon is the same mark the desktop puts
+/// beside the same command, so a reader who knows either shell recognizes the
+/// other. `icon` is `None` for the entries whose meaning is already carried by
+/// their label alone — a group name, or one of the archive windows.
 fn sidebar_sheet_entry(
     id: String,
     label: String,
     destructive: bool,
     checked: bool,
 ) -> gpui::Stateful<gpui::Div> {
+    sidebar_sheet_entry_with_icon(id, label, None, destructive, checked)
+}
+
+/// The same entry, with the leading glyph the desktop's menu entry wears.
+///
+/// The icon slot is fixed whether or not a glyph is drawn, so labels stay on
+/// one column down a sheet whose entries are a mix of the two.
+fn sidebar_sheet_entry_with_icon(
+    id: String,
+    label: String,
+    icon: Option<&'static str>,
+    destructive: bool,
+    checked: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let text_color = if destructive {
+        theme::accent_red()
+    } else {
+        theme::text_primary()
+    };
     div()
         .id(id)
         .h(px(theme::TOUCH_TARGET))
@@ -31247,11 +31315,30 @@ fn sidebar_sheet_entry(
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
         .text_size(theme::font_body())
-        .text_color(if destructive {
-            theme::accent_red()
-        } else {
-            theme::text_primary()
-        })
+        .text_color(text_color)
+        .child(
+            div()
+                .size(px(theme::ICON_SM))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .when_some(icon, |slot, icon| {
+                    slot.child(
+                        svg()
+                            .path(icon)
+                            .size(px(theme::ICON_SM))
+                            // A destructive entry's glyph is a promise about
+                            // what the tap destroys, so it carries the same
+                            // warning colour the label does.
+                            .text_color(if destructive {
+                                theme::accent_red()
+                            } else {
+                                theme::text_muted()
+                            }),
+                    )
+                }),
+        )
         .child(div().flex_1().min_w_0().truncate().child(label))
         // A sheet that offers a choice says which one it is on, the way the
         // desktop's menu checks the window a folder already carries.
@@ -33476,12 +33563,13 @@ mod tests {
             app.commit_new_session_runtime_draft(cx);
             assert_eq!(app.new_session_runtime.as_ref(), Some(&chosen));
 
-            // Closing the sheet leaves the page's own draft in place and the
-            // sheet flag retired, so the next open starts from the page again.
-            app.new_session_options_open = true;
-            app.push_back_screen(BackScreen::NewSessionOptions);
-            app.dismiss_new_session_options(cx);
-            assert!(!app.new_session_options_open);
+            // Closing a drawer leaves the page's own draft in place and the
+            // drawer flag retired, so the next open starts from the page again.
+            app.runtime_option_page = Some(RuntimeOptionPage::Options);
+            app.runtime_draft = Some(chosen.clone());
+            app.push_back_screen(BackScreen::RuntimeOptions);
+            app.close_runtime_options_sheet(SheetKey::RuntimeOption, cx);
+            assert!(app.runtime_option_page.is_none());
             assert!(app.runtime_draft.is_none());
             assert_eq!(app.new_session_runtime.as_ref(), Some(&chosen));
         });
@@ -36998,7 +37086,6 @@ mod tests {
             BackScreen::SessionAction => session_action_open,
             BackScreen::RuntimeOptions => false,
             BackScreen::NewSessionPicker => false,
-            BackScreen::NewSessionOptions => false,
             BackScreen::SessionsDrawer => true,
             BackScreen::WorkbenchDrawer => true,
             BackScreen::SidebarSearch => false,

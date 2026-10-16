@@ -283,6 +283,12 @@ pub const FONT_HEADING: f32 = 18.0;
 pub const FONT_BODY: f32 = 17.0;
 /// Supporting text under a primary label: row details, timeline metadata.
 pub const FONT_DETAIL: f32 = 15.0;
+/// The composer's field and the new-session page's first-message field.
+///
+/// A rung above [`FONT_BODY`]: the field is the one surface the reader writes
+/// in rather than reads, and on a phone its copy has to hold its own against
+/// the timeline above it without the reader leaning in.
+pub const FONT_COMPOSER: f32 = 19.0;
 /// Captions, chips, and button labels.
 pub const FONT_CAPTION: f32 = 14.0;
 /// Code buffers: monospace reads larger than the interface face at the same
@@ -364,6 +370,10 @@ pub fn font_detail() -> Rems {
 
 pub fn font_caption() -> Rems {
     ui_rems(FONT_CAPTION)
+}
+
+pub fn font_composer() -> Rems {
+    ui_rems(FONT_COMPOSER)
 }
 
 pub fn font_micro() -> Rems {
@@ -491,6 +501,21 @@ pub const RADIUS_PILL: f32 = 999.0;
 /// The height of the pill inside a control row. The row keeps a full touch
 /// target; only the pill the reader sees is this tall.
 pub const CHIP_HEIGHT: f32 = 32.0;
+
+/// The composer's primary control.
+///
+/// Smaller than a touch target on purpose: the round plate reads as the row's
+/// commitment, and a full 44px plate next to the model chip made the chip look
+/// like the smaller decision. The row's own height still gives the thumb the
+/// room the plate gives up.
+pub const COMPOSER_SEND_SIZE: f32 = 36.0;
+/// One runtime-option icon button in the composer's control row. Icon-only
+/// controls sit between the model chip and the row's right edge, so they are
+/// narrower than the row's other targets.
+pub const COMPOSER_OPTION_SIZE: f32 = 36.0;
+/// The context-usage ring: the one gauge on the control row, so it is drawn a
+/// step above the glyphs beside it.
+pub const COMPOSER_RING_SIZE: f32 = 26.0;
 
 pub const DRAWER_ROW_HEIGHT: f32 = 56.0;
 /// A phone row is a touch target first: the desktop's 32/40px rows put the
@@ -1314,6 +1339,7 @@ mod tests {
     fn the_ladder_descends_and_has_no_duplicate_steps() {
         let ladder = [
             (FONT_TITLE, "title"),
+            (FONT_COMPOSER, "composer"),
             (FONT_HEADING, "heading"),
             (FONT_BODY, "body"),
             (FONT_DETAIL, "detail"),
@@ -1360,13 +1386,14 @@ mod tests {
         assert_eq!(
             [
                 FONT_TITLE,
+                FONT_COMPOSER,
                 FONT_HEADING,
                 FONT_BODY,
                 FONT_DETAIL,
                 FONT_CAPTION,
                 FONT_MICRO,
             ],
-            [22.0, 18.0, 17.0, 15.0, 14.0, 13.0]
+            [22.0, 19.0, 18.0, 17.0, 15.0, 14.0, 13.0]
         );
         assert_eq!(
             [FONT_SIDEBAR_TITLE, FONT_SIDEBAR_ROW, FONT_SIDEBAR_META],

@@ -71,10 +71,14 @@ pub enum SheetKey {
     ComposerHistory,
     /// What an attach control is about to attach.
     ComposerAttach,
-    /// The project and workspace a new session starts in.
+    /// A choice list the new-session page opens: the project the session
+    /// belongs to, the place it is worked, or the branch a worktree is cut from.
     NewSessionPicker,
-    /// The new-session page's own settings.
-    NewSessionOptions,
+    /// The Agent, provider and model a session runs on.
+    RuntimeOptions,
+    /// One group of the Agent's own options — reasoning, mode, or the model's
+    /// session options — in the composer's own drawer.
+    RuntimeOption,
     /// The palette picker.
     SettingsPalette,
     /// Go to a line in the file on screen.
