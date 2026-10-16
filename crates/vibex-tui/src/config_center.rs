@@ -2063,9 +2063,11 @@ pub fn skill_market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigR
             // points at: the stored record keeps the registry identity it came
             // from, so the card can say so rather than offering a first install
             // over an installed Skill.
-            let installed = data.skills.iter().any(|skill| {
-                skill.source_uri.as_deref() == Some(format!("market:{}", entry.id).as_str())
-            });
+            let uri = market_skill_uri(entry);
+            let installed = data
+                .skills
+                .iter()
+                .any(|skill| skill.source_uri.as_deref() == Some(uri.as_str()));
             ConfigRow::new(entry.id.clone(), entry.name.clone())
                 .cell(strings.config_kind_skill())
                 .cell(entry.version.clone().unwrap_or_default())
@@ -2084,8 +2086,15 @@ pub fn skill_market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigR
                     },
                 )
                 .summary(entry.summary.clone().unwrap_or_default())
+                // The id is what a stored Skill records as its origin, and the
+                // slug is what the registry routes by; a reader comparing the
+                // card with what they have needs both.
                 .detail(strings.config_field_id(), entry.id.clone())
                 .detail(strings.config_field_slug(), entry.slug.clone())
+                .detail(
+                    strings.config_field_version(),
+                    entry.version.clone().unwrap_or_default(),
+                )
                 .detail(
                     strings.config_field_publisher(),
                     entry.owner_handle.clone().unwrap_or_default(),
@@ -2095,6 +2104,14 @@ pub fn skill_market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigR
                     strings.config_field_downloads(),
                     entry.downloads.to_string(),
                 )
+                .detail(
+                    strings.config_field_updated(),
+                    entry.updated_at.map(stamp).unwrap_or_default(),
+                )
+                // The registry publishes whole Skills, so the card ends with
+                // the endpoint its document is read from: a reader who wants
+                // the source rather than the copy has somewhere to look.
+                .detail(strings.config_field_source(), market_skill_uri(entry))
                 .actions(&[if installed {
                     ConfigAction::Reinstall
                 } else {
@@ -2115,6 +2132,15 @@ pub fn agent_group(agent: &vibex_core::AgentSnapshotEntry) -> u8 {
         (true, false) => 1,
         (false, _) => 2,
     }
+}
+
+/// The registry identity a stored Skill records when it is installed.
+///
+/// It is the same string the installed check compares against: one shape, so a
+/// card that says "installed" and a document that records its origin cannot
+/// disagree.
+pub fn market_skill_uri(entry: &vibex_core::SkillMarketEntry) -> String {
+    format!("market:{}", entry.id)
 }
 
 /// How far a registry Skill has reached, by the first count it publishes.
@@ -4854,6 +4880,47 @@ mod tests {
             2,
             "an Agent the roster does not hold is in the third group whether or not it is switched on"
         );
+    }
+
+    /// The origin a stored Skill records is the origin the card checks for:
+    /// one shape, so a card that says "installed" and a document that records
+    /// where it came from cannot disagree.
+    #[test]
+    fn a_stored_skill_records_the_origin_the_card_looks_for() {
+        let entry: vibex_core::SkillMarketEntry = serde_json::from_value(serde_json::json!({
+            "id": "awspace/pdf",
+            "slug": "pdf",
+            "name": "PDF",
+            "installs": 1,
+            "downloads": 0,
+            "stars": 0
+        }))
+        .expect("entry");
+        assert_eq!(market_skill_uri(&entry), "market:awspace/pdf");
+
+        let skill: vibex_core::Skill = serde_json::from_value(serde_json::json!({
+            "id": "skill_pdf",
+            "displayName": "PDF",
+            "sourceKind": "marketplace",
+            "status": "enabled",
+            "scopeKind": "user",
+            "sourceUri": market_skill_uri(&entry),
+            "description": "",
+            "instructions": "",
+            "tags": [],
+            "providerMatrix": [],
+            "agentMatrix": [],
+            "createdAtMs": 1,
+            "updatedAtMs": 1
+        }))
+        .expect("skill");
+        let data = ManagementData {
+            skill_market: vec![entry],
+            skills: vec![skill],
+            ..Default::default()
+        };
+        let rows = skill_market_rows(&data, strings());
+        assert_eq!(rows[0].chip, "Installed");
     }
 
     /// A card's count is the first one the registry published rather than a
