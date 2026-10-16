@@ -5668,22 +5668,40 @@ fn agent_text_append_batch(events: &[TimelineLiveEvent]) -> bool {
 
 fn update_unread_agent_completions(
     unread_session_ids: &mut BTreeSet<String>,
+    completion_watermarks: &mut BTreeMap<String, i64>,
     selected_session_id: Option<&VibexSessionId>,
     events: &[TimelineLiveEvent],
 ) -> bool {
     let previous_len = unread_session_ids.len();
     for event in events {
-        if selected_session_id == Some(&event.session_id)
-            || !timeline_live_event_is_well_formed(event)
-        {
+        if !timeline_live_event_is_well_formed(event) {
             continue;
         }
-        if matches!(
+        if !matches!(
             &event.item.payload,
             TimelinePayload::AgentMessage(message) if message.is_final
         ) {
-            unread_session_ids.insert(event.session_id.as_str().to_string());
+            continue;
         }
+        let session_id = event.session_id.as_str().to_string();
+        // The live stream and the polling fallback both deliver the same
+        // committed item, so the final answer that ended while its session was
+        // on screen can arrive a second time after the reader has switched
+        // away. That replay is not a second completion: a final answer this
+        // session has already accounted for — watched end, or already badged —
+        // leaves the mark alone. Only an answer past the watermark can raise
+        // the dot.
+        if completion_watermarks
+            .get(&session_id)
+            .is_some_and(|watermark| event.sequence <= *watermark)
+        {
+            continue;
+        }
+        completion_watermarks.insert(session_id.clone(), event.sequence);
+        if selected_session_id == Some(&event.session_id) {
+            continue;
+        }
+        unread_session_ids.insert(session_id);
     }
     unread_session_ids.len() != previous_len
 }
@@ -9264,6 +9282,13 @@ pub struct VibexWorkbench {
     /// clear it.
     pending_agent_turn_admitted: BTreeSet<String>,
     unread_agent_completion_session_ids: BTreeSet<String>,
+    /// The highest final-answer sequence already accounted for per session.
+    ///
+    /// The live event stream and the polling fallback both deliver the same
+    /// committed item, so a completion the reader watched end can be replayed
+    /// after they switch away. Without this mark that replay raised an unread
+    /// dot for a turn that was never unseen.
+    unread_completion_watermarks: BTreeMap<String, i64>,
     /// Session ids with an unresolved approval or input request, mapped to the
     /// request ids still waiting for an answer.
     ///
@@ -10698,6 +10723,7 @@ impl VibexWorkbench {
             pending_agent_turn_revisions: BTreeMap::new(),
             pending_agent_turn_admitted: BTreeSet::new(),
             unread_agent_completion_session_ids: BTreeSet::new(),
+            unread_completion_watermarks: BTreeMap::new(),
             pending_user_request_ids: BTreeMap::new(),
             notification_suppressed_session_ids: BTreeSet::new(),
             notified_timeline_sequences: BTreeMap::new(),
@@ -15395,6 +15421,8 @@ impl VibexWorkbench {
         self.pending_agent_turn_session_ids
             .retain(|id| valid_session_ids.contains(id));
         self.notified_timeline_sequences
+            .retain(|id, _| valid_session_ids.contains(id));
+        self.unread_completion_watermarks
             .retain(|id, _| valid_session_ids.contains(id));
         self.composer_queue
             .retain(|message| valid_session_ids.contains(message.session_id.as_str()));
@@ -23818,6 +23846,7 @@ impl VibexWorkbench {
         }
         let unread_changed = update_unread_agent_completions(
             &mut self.unread_agent_completion_session_ids,
+            &mut self.unread_completion_watermarks,
             self.selected_session_id.as_ref(),
             &events,
         );
@@ -36099,6 +36128,8 @@ impl VibexWorkbench {
             .retain(|session_id| !session_ids.contains(session_id));
         self.unread_agent_completion_session_ids
             .retain(|session_id| !session_ids.contains(session_id));
+        self.unread_completion_watermarks
+            .retain(|session_id, _| !session_ids.contains(session_id));
         self.pending_user_request_ids
             .retain(|session_id, _| !session_ids.contains(session_id));
         self.ui_state
@@ -84547,20 +84578,24 @@ mod tests {
             item: streaming_item,
         };
         let mut unread = BTreeSet::new();
+        let mut watermarks = BTreeMap::new();
 
         assert!(!update_unread_agent_completions(
             &mut unread,
+            &mut watermarks,
             Some(&selected_session_id),
             &[streaming_event]
         ));
         assert!(update_unread_agent_completions(
             &mut unread,
+            &mut watermarks,
             Some(&selected_session_id),
             std::slice::from_ref(&final_event)
         ));
         assert!(unread.contains(background_session_id.as_str()));
         assert!(!update_unread_agent_completions(
             &mut unread,
+            &mut watermarks,
             Some(&selected_session_id),
             std::slice::from_ref(&final_event)
         ));
@@ -84570,6 +84605,7 @@ mod tests {
         let selected_item = indexed_timeline_item(&selected_session_id, 1, "visible");
         assert!(!update_unread_agent_completions(
             &mut unread,
+            &mut watermarks,
             Some(&selected_session_id),
             &[TimelineLiveEvent {
                 session_id: selected_session_id.clone(),
@@ -84578,6 +84614,61 @@ mod tests {
             }]
         ));
         assert!(unread.is_empty());
+    }
+
+    /// A completion the reader watched end in the selected session is not news
+    /// once they switch away.
+    ///
+    /// The live stream and the polling fallback both deliver the same committed
+    /// final answer, so the item that ended on screen arrives again after the
+    /// selection has moved. The replay is not a second completion, and badging
+    /// it left a dot on a session on which the reader had just seen the turn
+    /// finish.
+    #[test]
+    fn a_replayed_completion_watched_on_screen_does_not_badge_after_switching_away() {
+        let watched_session_id = VibexSessionId::new();
+        let other_session_id = VibexSessionId::new();
+        let final_item = indexed_timeline_item(&watched_session_id, 7, "done");
+        let final_event = TimelineLiveEvent {
+            session_id: watched_session_id.clone(),
+            sequence: final_item.sequence,
+            item: final_item,
+        };
+        let mut unread = BTreeSet::new();
+        let mut watermarks = BTreeMap::new();
+
+        // The final answer lands while its session is the selected one, so it
+        // is read by the fact of being on screen.
+        assert!(!update_unread_agent_completions(
+            &mut unread,
+            &mut watermarks,
+            Some(&watched_session_id),
+            std::slice::from_ref(&final_event)
+        ));
+        assert!(unread.is_empty());
+
+        // The reader switches away, and the poll replays the same item: no dot.
+        assert!(!update_unread_agent_completions(
+            &mut unread,
+            &mut watermarks,
+            Some(&other_session_id),
+            std::slice::from_ref(&final_event)
+        ));
+        assert!(unread.is_empty());
+
+        // A genuinely later turn in that session is news, so it badges.
+        let later_item = indexed_timeline_item(&watched_session_id, 9, "second answer");
+        assert!(update_unread_agent_completions(
+            &mut unread,
+            &mut watermarks,
+            Some(&other_session_id),
+            &[TimelineLiveEvent {
+                session_id: watched_session_id.clone(),
+                sequence: later_item.sequence,
+                item: later_item,
+            }]
+        ));
+        assert!(unread.contains(watched_session_id.as_str()));
     }
 
     #[test]

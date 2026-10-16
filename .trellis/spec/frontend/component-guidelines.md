@@ -777,6 +777,17 @@ tree had more roots than one page. A branch draws its page row — loading, retr
 more children, or the refusal the branch limit produced — inside the branch,
 under the row the reader asked from.
 
+A session's unread completion dot means "the final answer landed while you were
+looking elsewhere", so the mark is raised only by a final `AgentMessage` the
+reader did not have on screen. The live event stream and the polling fallback
+both deliver the same committed item, so the two ingest paths are a genuine
+duplicate and not two completions: the row keeps a per-session high-water
+sequence for final answers, and an answer at or below it — the turn the reader
+watched end, or one already badged — leaves the dot alone. Without that
+watermark the replayed item arrives after the reader switches away and badges a
+turn they just saw finish. A genuinely later turn sits past the mark and still
+raises the dot.
+
 The running cue also reaches the session title: a sidebar row whose session is
 generating sweeps the title through `ShimmerText` at the shared timeline
 duration and spread, so the pulse in the status column and the light on the text
