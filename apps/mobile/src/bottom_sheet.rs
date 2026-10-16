@@ -402,6 +402,11 @@ impl BottomSheet {
 
     /// Feeds one sheet one platform pan.
     pub fn pull(&mut self, key: SheetKey, pan: SheetPan, travel: Pixels) -> SheetPull {
+        // Every sheet on screen watches the same page, so only the one on top
+        // answers: a pan that reached two of them would move two panels at once.
+        if self.panels.last().is_some_and(|panel| panel.key != key) {
+            return SheetPull::Ignored;
+        }
         let travel = f32::from(travel);
         let Some(index) = self.index_of(key) else {
             return SheetPull::Ignored;
@@ -815,16 +820,6 @@ impl BottomSheetShell {
                 .child(panel)
                 .into_any_element(),
         };
-        let positioner: AnyElement = match self.pan.take() {
-            Some(pan) => crate::scroll_capture::capture_scroll_wheel(
-                ElementId::Name(format!("{}-pull", self.id).into()),
-                positioner,
-                pan,
-            )
-            .into_any_element(),
-            None => positioner,
-        };
-
         let mut scrim = div()
             .id(ElementId::Name(format!("{}-scrim", self.id).into()))
             .absolute()
@@ -836,7 +831,7 @@ impl BottomSheetShell {
         if let Some(dismiss) = self.dismiss.take() {
             scrim = scrim.on_mouse_up(MouseButton::Left, dismiss);
         }
-        match motion {
+        let shell: AnyElement = match motion {
             Some(motion) => {
                 let opacity = scrim_curve(Some(motion), offset, travel);
                 scrim
@@ -852,6 +847,22 @@ impl BottomSheetShell {
                 .bg(theme::backdrop(presentation.scrim_opacity()))
                 .child(positioner)
                 .into_any_element(),
+        };
+
+        // The pull is watched from the scrim rather than from the panel. The
+        // panel is the thing the finger is dragging away from its own contact
+        // point, so a listener that travelled with it slid out from under the
+        // finger after a few pixels — the higher up the panel the finger
+        // landed, the sooner the drag died mid-gesture. The scrim covers the
+        // page and never moves.
+        match self.pan.take() {
+            Some(pan) => crate::scroll_capture::capture_scroll_wheel(
+                ElementId::Name(format!("{}-pull", self.id).into()),
+                shell,
+                pan,
+            )
+            .into_any_element(),
+            None => shell,
         }
     }
 }
