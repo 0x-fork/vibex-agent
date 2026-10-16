@@ -23,6 +23,13 @@
 //!   must re-enable it.
 //! * **The ledger.** The redacted record of what was attempted, with its
 //!   verification state, so a reader never has to trust a summary.
+//!
+//! The panel draws in two shells. The window shell is the full surface. The
+//! floating shell is a small strip that stays in view while the reader works
+//! somewhere else; it drops the ledger and the platform note, keeps the target
+//! and the stop, and can be expanded back in one press. Both shells render the
+//! same state, and the choice between them is a persisted decision the settings
+//! page also exposes.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,11 +42,14 @@ use gpui::{
 use gpui_component::ActiveTheme;
 use image::Frame;
 use vibex_core::{
-    ComputerActionRecord, ComputerAvailability, ComputerExecutionSource, ComputerFrame,
-    ComputerOperationStatus, ComputerPlatform, ComputerSession, ComputerSessionId,
-    ComputerSessionState, unix_timestamp_ms,
+    ComputerActionKind, ComputerActionRecord, ComputerAvailability, ComputerExecutionSource,
+    ComputerFrame, ComputerOperationStatus, ComputerPlatform, ComputerSession, ComputerSessionId,
+    ComputerSessionState, ComputerUnavailableReason, unix_timestamp_ms,
 };
+use vibex_desktop_model::ComputerPanelMode;
 use vibex_desktop_runtime::ComputerRuntime;
+
+use crate::locale;
 
 /// A frame after decoding, in the layout `RenderImage` wants.
 struct DecodedComputerFrame {
@@ -51,6 +61,9 @@ struct DecodedComputerFrame {
 pub enum ComputerSurfaceEvent {
     /// The panel wants to be closed.
     Closed,
+    /// The reader asked for a different shell. The owner reopens the panel in
+    /// the requested mode, since the shell is a property of the window.
+    ModeRequested(ComputerPanelMode),
 }
 
 /// What the panel is doing.
@@ -68,6 +81,9 @@ pub struct ComputerSurface {
     /// The Tokio handle the runtime's service must be polled inside. GPUI's
     /// executor has no reactor, so every call goes through this.
     tokio: tokio::runtime::Handle,
+    /// The shell this instance draws. The window owns the choice; the panel
+    /// only renders it.
+    mode: ComputerPanelMode,
     session_id: Option<ComputerSessionId>,
     session: Option<ComputerSession>,
     availability: Option<ComputerAvailability>,
@@ -88,15 +104,26 @@ pub struct ComputerSurface {
 impl EventEmitter<ComputerSurfaceEvent> for ComputerSurface {}
 
 impl ComputerSurface {
-    /// Builds the panel and starts its subscriptions.
+    /// Builds the panel in the full window shell and starts its subscriptions.
     pub fn new(
         runtime: Arc<ComputerRuntime>,
         tokio: tokio::runtime::Handle,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_in(runtime, tokio, ComputerPanelMode::Window, cx)
+    }
+
+    /// Builds the panel in the requested shell and starts its subscriptions.
+    pub fn new_in(
+        runtime: Arc<ComputerRuntime>,
+        tokio: tokio::runtime::Handle,
+        mode: ComputerPanelMode,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut surface = Self {
             runtime,
             tokio,
+            mode,
             session_id: None,
             session: None,
             availability: None,
@@ -113,6 +140,11 @@ impl ComputerSurface {
         };
         surface.start(cx);
         surface
+    }
+
+    /// The shell this instance draws.
+    pub fn mode(&self) -> ComputerPanelMode {
+        self.mode
     }
 
     /// Runs one runtime future on the runtime's own Tokio executor.
@@ -242,20 +274,34 @@ impl ComputerSurface {
 
     /// The emergency stop. One press reaches the terminal state.
     pub fn stop(&mut self, cx: &mut Context<Self>) {
-        let stop = self
-            .runtime
-            .stop("the user pressed stop in the computer panel");
+        let reason = locale::text(
+            "the user pressed stop in the computer panel",
+            "用户在电脑操作面板按下了停止",
+            "使用者在電腦操作面板按下了停止",
+        );
+        let stop = self.runtime.stop(reason);
         match self.run(stop) {
             Ok(()) => {
-                self.stopped_reason = Some("stopped by the user".to_string());
-                self.message = Some(
-                    "Computer use is stopped. Queued input was dropped and held keys were \
-                     released. Use Re-enable to let the Agent act again."
+                self.stopped_reason = Some(
+                    locale::text("Stopped by the user", "已被用户停止", "已被使用者停止")
                         .to_string(),
+                );
+                self.message = Some(
+                    locale::text(
+                        "Computer use is stopped. Queued input was dropped and held keys were \
+                         released. Use Re-enable to let the Agent act again.",
+                        "电脑操作已停止：排队中的输入已丢弃，按住的键已释放。使用“重新启用”让 Agent 再次操作。",
+                        "電腦操作已停止：排隊中的輸入已丟棄，按住的鍵已釋放。使用「重新啟用」讓 Agent 再次操作。",
+                    )
+                    .to_string(),
                 );
             }
             Err(error) => {
-                self.message = Some(format!("Stop failed: {}", error.message));
+                self.message = Some(format!(
+                    "{}{}",
+                    locale::text("Stop failed: ", "停止失败：", "停止失敗："),
+                    error.message
+                ));
             }
         }
         self.refresh(cx);
@@ -266,15 +312,30 @@ impl ComputerSurface {
         let Some(session_id) = self.session_id.clone() else {
             return;
         };
-        let pause = self
-            .runtime
-            .pause(&session_id, "the user paused computer use in the panel");
+        let reason = locale::text(
+            "the user paused computer use in the panel",
+            "用户在电脑操作面板中暂停了操作",
+            "使用者在電腦操作面板中暫停了操作",
+        );
+        let pause = self.runtime.pause(&session_id, reason);
         match self.run(pause) {
             Ok(()) => {
-                self.message =
-                    Some("Paused. Agent desktop calls refuse until you resume.".to_string())
+                self.message = Some(
+                    locale::text(
+                        "Paused. Agent desktop calls refuse until you resume.",
+                        "已暂停。在你恢复之前，Agent 的桌面调用都会被拒绝。",
+                        "已暫停。在你恢復之前，Agent 的桌面呼叫都會被拒絕。",
+                    )
+                    .to_string(),
+                )
             }
-            Err(error) => self.message = Some(format!("Pause failed: {}", error.message)),
+            Err(error) => {
+                self.message = Some(format!(
+                    "{}{}",
+                    locale::text("Pause failed: ", "暂停失败：", "暫停失敗："),
+                    error.message
+                ))
+            }
         }
         self.refresh(cx);
     }
@@ -287,16 +348,27 @@ impl ComputerSurface {
         let resume = self.runtime.resume(&session_id);
         match self.run(resume) {
             Ok(()) => self.message = None,
-            Err(error) => self.message = Some(format!("Re-enable failed: {}", error.message)),
+            Err(error) => {
+                self.message = Some(format!(
+                    "{}{}",
+                    locale::text("Re-enable failed: ", "重新启用失败：", "重新啟用失敗："),
+                    error.message
+                ))
+            }
         }
         self.refresh(cx);
     }
 
-    /// The reason computer use cannot run here, when it cannot.
+    /// Asks the owner to reopen the panel in the other shell.
+    fn request_mode(&mut self, mode: ComputerPanelMode, cx: &mut Context<Self>) {
+        cx.emit(ComputerSurfaceEvent::ModeRequested(mode));
+    }
+
+    /// The named reason computer use cannot run here, in the reader's language.
     fn unavailable_line(&self) -> Option<String> {
         let availability = self.availability.as_ref()?;
         let reason = availability.unavailable_reason?;
-        let mut line = reason.as_str().replace('_', " ");
+        let mut line = unavailable_reason_label(reason).to_string();
         if let Some(detail) = &availability.detail {
             line.push_str(&format!(" — {detail}"));
         }
@@ -313,18 +385,22 @@ impl ComputerSurface {
             .as_ref()
             .and_then(|availability| availability.unavailable_reason)
         {
-            Some(_) => "Computer use is not available here",
-            None => "Computer use",
+            Some(_) => locale::text(
+                "Computer use is not available here",
+                "此处无法使用电脑操作",
+                "此處無法使用電腦操作",
+            ),
+            None => locale::text("Computer use", "电脑操作", "電腦操作"),
         };
         let engine = availability
             .as_ref()
             .and_then(|availability| availability.engine.clone())
-            .unwrap_or_else(|| "engine unknown".to_string());
+            .unwrap_or_else(|| locale::text("engine unknown", "引擎未知", "引擎未知").to_string());
         let platform = availability
             .as_ref()
             .map(|availability| availability.platform)
             .unwrap_or(ComputerPlatform::Unknown);
-        div()
+        let mut header = div()
             .flex()
             .flex_col()
             .gap_1()
@@ -340,7 +416,7 @@ impl ComputerSurface {
                     .text_color(cx.theme().muted_foreground)
                     .child(SharedString::from(format!(
                         "{} · {engine}",
-                        platform.as_str()
+                        platform_label(platform)
                     ))),
             )
             .when_some(self.unavailable_line(), |this, line| {
@@ -350,15 +426,54 @@ impl ComputerSurface {
                         .text_color(rgb(0xd97706))
                         .child(SharedString::from(line)),
                 )
-            })
-            .children(availability.and_then(|availability| {
-                (!availability.support.note.is_empty()).then(|| {
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(SharedString::from(availability.support.note))
-                })
-            }))
+            });
+        // The floating shell keeps the header to one compact line and puts the
+        // expand control beside the title, so the strip stays small.
+        if self.mode.is_floating() {
+            header = header.child(self.render_mode_toggle(cx));
+        } else {
+            header = header
+                .children(availability.clone().and_then(|availability| {
+                    (!availability.support.note.is_empty()).then(|| {
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(SharedString::from(availability.support.note))
+                    })
+                }))
+                .child(self.render_mode_toggle(cx));
+        }
+        header.into_any_element()
+    }
+
+    /// The control that moves the panel between the window and floating shells.
+    fn render_mode_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (id, label, next) = if self.mode.is_floating() {
+            (
+                "computer-panel-expand",
+                locale::text("Open full window", "打开完整窗口", "開啟完整視窗"),
+                ComputerPanelMode::Window,
+            )
+        } else {
+            (
+                "computer-panel-float",
+                locale::text("Float on top", "浮动在最前", "浮動在最前"),
+                ComputerPanelMode::Floating,
+            )
+        };
+        div()
+            .id(id)
+            .mt_1()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(cx.theme().secondary)
+            .text_sm()
+            .cursor_pointer()
+            .on_click(
+                cx.listener(move |surface, _event, _window, cx| surface.request_mode(next, cx)),
+            )
+            .child(SharedString::from(label))
             .into_any_element()
     }
 
@@ -368,7 +483,14 @@ impl ComputerSurface {
             .as_ref()
             .and_then(|session| session.target.as_ref())
             .map(|app| app.label())
-            .unwrap_or_else(|| "No application is being driven".to_string());
+            .unwrap_or_else(|| {
+                locale::text(
+                    "No application is being driven",
+                    "当前没有正在操作的应用",
+                    "目前沒有正在操作的应用",
+                )
+                .to_string()
+            });
         let driving = self
             .session
             .as_ref()
@@ -382,7 +504,11 @@ impl ComputerSurface {
                 div()
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
-                    .child(SharedString::from("Operating:")),
+                    .child(SharedString::from(locale::text(
+                        "Operating:",
+                        "正在操作：",
+                        "正在操作：",
+                    ))),
             )
             .child(
                 div()
@@ -429,7 +555,11 @@ impl ComputerSurface {
                     .font_weight(FontWeight::SEMIBOLD)
                     .cursor_pointer()
                     .on_click(cx.listener(|surface, _event, _window, cx| surface.stop(cx)))
-                    .child(SharedString::from("Stop computer use")),
+                    .child(SharedString::from(locale::text(
+                        "Stop computer use",
+                        "停止电脑操作",
+                        "停止電腦操作",
+                    ))),
             )
             .when(can_pause, |this| {
                 this.child(
@@ -441,7 +571,7 @@ impl ComputerSurface {
                         .bg(cx.theme().secondary)
                         .cursor_pointer()
                         .on_click(cx.listener(|surface, _event, _window, cx| surface.pause(cx)))
-                        .child(SharedString::from("Pause")),
+                        .child(SharedString::from(locale::text("Pause", "暂停", "暫停"))),
                 )
             })
             .when(can_resume, |this| {
@@ -454,7 +584,11 @@ impl ComputerSurface {
                         .bg(cx.theme().secondary)
                         .cursor_pointer()
                         .on_click(cx.listener(|surface, _event, _window, cx| surface.resume(cx)))
-                        .child(SharedString::from("Re-enable")),
+                        .child(SharedString::from(locale::text(
+                            "Re-enable",
+                            "重新启用",
+                            "重新啟用",
+                        ))),
                 )
             })
             .into_any_element()
@@ -468,16 +602,32 @@ impl ComputerSurface {
             .clone()
             .or_else(|| self.unavailable_line())
             .or_else(|| match phase {
-                SurfacePhase::Connecting => {
-                    Some("Waiting for the first frame of the desktop.".to_string())
-                }
+                SurfacePhase::Connecting => Some(
+                    locale::text(
+                        "Waiting for the first frame of the desktop.",
+                        "正在等待桌面的第一帧画面。",
+                        "正在等待桌面的第一幀畫面。",
+                    )
+                    .to_string(),
+                ),
                 _ => None,
             })
-            .unwrap_or_else(|| "The desktop is live.".to_string());
+            .unwrap_or_else(|| {
+                locale::text(
+                    "The desktop is live.",
+                    "桌面已在实时显示。",
+                    "桌面已在即時顯示。",
+                )
+                .to_string()
+            });
         div()
             .relative()
             .flex_1()
-            .min_h(px(240.0))
+            .min_h(px(if self.mode.is_floating() {
+                160.0
+            } else {
+                240.0
+            }))
             .w_full()
             .overflow_hidden()
             .rounded_md()
@@ -522,8 +672,8 @@ impl ComputerSurface {
                     ComputerOperationStatus::Unknown => cx.theme().muted_foreground,
                 };
                 let source = match record.execution_source {
-                    ComputerExecutionSource::Agent => "agent",
-                    ComputerExecutionSource::User => "you",
+                    ComputerExecutionSource::Agent => locale::text("agent", "Agent", "Agent"),
+                    ComputerExecutionSource::User => locale::text("you", "你", "你"),
                 };
                 div()
                     .flex()
@@ -536,7 +686,11 @@ impl ComputerSurface {
                             .items_center()
                             .gap_2()
                             .child(div().text_xs().text_color(colour).child(SharedString::from(
-                                if verified { "verified" } else { "unverified" },
+                                if verified {
+                                    locale::text("verified", "已验证", "已驗證")
+                                } else {
+                                    locale::text("unverified", "未验证", "未驗證")
+                                },
                             )))
                             .child(
                                 div()
@@ -545,7 +699,7 @@ impl ComputerSurface {
                                     .child(SharedString::from(format!(
                                         "{} · {} · {}",
                                         source,
-                                        record.kind.as_str(),
+                                        action_kind_label(record.kind),
                                         relative_time(record.at_ms, now)
                                     ))),
                             ),
@@ -566,14 +720,22 @@ impl ComputerSurface {
                 div()
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
-                    .child(SharedString::from("What the Agent did")),
+                    .child(SharedString::from(locale::text(
+                        "What the Agent did",
+                        "Agent 做了什么",
+                        "Agent 做了什麼",
+                    ))),
             )
             .when(entries.is_empty(), |this| {
                 this.child(
                     div()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(SharedString::from("No desktop actions yet.")),
+                        .child(SharedString::from(locale::text(
+                            "No desktop actions yet.",
+                            "还没有桌面操作。",
+                            "還沒有桌面操作。",
+                        ))),
                 )
             })
             .children(entries)
@@ -589,19 +751,26 @@ impl Render for ComputerSurface {
         for image in std::mem::take(&mut self.pending_drop) {
             let _ = window.drop_image(image);
         }
-        div()
+        let floating = self.mode.is_floating();
+        let mut root = div()
             .id("computer-surface")
             .flex()
             .flex_col()
             .size_full()
-            .gap_3()
-            .p_4()
             .bg(cx.theme().background)
+            .when(floating, |this| this.gap_2().p_3())
+            .when(!floating, |this| this.gap_3().p_4())
             .child(self.render_header(cx))
             .child(self.render_target(cx))
             .child(self.render_controls(cx))
-            .child(self.render_stage(cx))
-            .child(self.render_ledger(cx))
+            .child(self.render_stage(cx));
+        // The floating shell drops the ledger: the strip exists to keep the
+        // desktop and the stop in view, and a scrolling history would undo the
+        // point of a small window. The full window keeps it.
+        if !floating {
+            root = root.child(self.render_ledger(cx));
+        }
+        root
     }
 }
 
@@ -611,21 +780,116 @@ fn computer_tier_for_panel() -> vibex_core::ComputerToolTier {
     vibex_core::ComputerToolTier::Visual
 }
 
+/// The platform name in the reader's language.
+fn platform_label(platform: ComputerPlatform) -> &'static str {
+    match platform {
+        ComputerPlatform::Macos => locale::text("macOS", "macOS", "macOS"),
+        ComputerPlatform::Windows => locale::text("Windows", "Windows", "Windows"),
+        ComputerPlatform::LinuxX11 => locale::text("Linux (X11)", "Linux（X11）", "Linux（X11）"),
+        ComputerPlatform::LinuxWayland => {
+            locale::text("Linux (Wayland)", "Linux（Wayland）", "Linux（Wayland）")
+        }
+        ComputerPlatform::Unknown => locale::text("unknown", "未知", "未知"),
+    }
+}
+
+/// Why computer use cannot run, in the reader's language.
+fn unavailable_reason_label(reason: ComputerUnavailableReason) -> &'static str {
+    match reason {
+        ComputerUnavailableReason::NoDesktopSession => locale::text(
+            "this machine has no desktop session",
+            "本机没有可操作的桌面会话",
+            "本機沒有可操作的桌面工作階段",
+        ),
+        ComputerUnavailableReason::AccessibilityBridgeMissing => locale::text(
+            "the accessibility bridge is not running",
+            "无障碍总线没有运行",
+            "無障礙匯流排沒有執行",
+        ),
+        ComputerUnavailableReason::PlatformUnsupported => locale::text(
+            "this platform cannot be driven",
+            "本平台不支持被操作",
+            "本平台不支援被操作",
+        ),
+        ComputerUnavailableReason::EngineMissing => {
+            locale::text("the engine did not start", "引擎没有启动", "引擎沒有啟動")
+        }
+        ComputerUnavailableReason::PermissionPending => locale::text(
+            "the system permission is not granted yet",
+            "系统权限尚未授予",
+            "系統權限尚未授予",
+        ),
+        ComputerUnavailableReason::PermissionRestartRequired => locale::text(
+            "the system permission needs a restart",
+            "系统权限需要重启后生效",
+            "系統權限需要重新啟動後生效",
+        ),
+        ComputerUnavailableReason::RunningAsRoot => locale::text(
+            "the runtime is running as root",
+            "runtime 以 root 身份运行",
+            "runtime 以 root 身分執行",
+        ),
+        ComputerUnavailableReason::RemoteRuntimeUnsupported => locale::text(
+            "the paired runtime is remote",
+            "配对的 runtime 在远端",
+            "配對的 runtime 在遠端",
+        ),
+        ComputerUnavailableReason::FeatureDisabled => locale::text(
+            "computer use is switched off",
+            "电脑操作已被关闭",
+            "電腦操作已被關閉",
+        ),
+    }
+}
+
+/// A short label for one ledger entry's action kind.
+///
+/// A kind this build does not know is shown as `other`, because the enum is
+/// unknown-safe and a newer runtime's entry must still be listable.
+fn action_kind_label(kind: ComputerActionKind) -> &'static str {
+    match kind {
+        ComputerActionKind::ListApps => locale::text("apps", "应用列表", "應用清單"),
+        ComputerActionKind::LaunchApp => locale::text("launch", "启动", "啟動"),
+        ComputerActionKind::KillApp => locale::text("quit", "退出", "結束"),
+        ComputerActionKind::GetAppState => locale::text("observe", "读取界面", "讀取介面"),
+        ComputerActionKind::Click => locale::text("click", "点击", "點擊"),
+        ComputerActionKind::TypeText => locale::text("type", "输入", "輸入"),
+        ComputerActionKind::SetValue => locale::text("set", "写入", "寫入"),
+        ComputerActionKind::PressKey => locale::text("key", "按键", "按鍵"),
+        ComputerActionKind::Scroll => locale::text("scroll", "滚动", "捲動"),
+        ComputerActionKind::Screenshot => locale::text("screenshot", "截图", "截圖"),
+        ComputerActionKind::Permissions => locale::text("permissions", "权限", "權限"),
+        ComputerActionKind::Verify => locale::text("verify", "验证", "驗證"),
+        ComputerActionKind::ClipboardRead => locale::text("clipboard read", "读剪贴板", "讀剪貼板"),
+        ComputerActionKind::ClipboardWrite => {
+            locale::text("clipboard write", "写剪贴板", "寫剪貼板")
+        }
+        ComputerActionKind::Stop => locale::text("stop", "停止", "停止"),
+        ComputerActionKind::Pause => locale::text("pause", "暂停", "暫停"),
+        ComputerActionKind::Resume => locale::text("resume", "恢复", "恢復"),
+        ComputerActionKind::Unknown => locale::text("other", "其他", "其他"),
+    }
+}
+
 /// A relative-time label, in the same shape the browser panel uses.
 fn relative_time(at_ms: i64, now_ms: i64) -> String {
     let delta = now_ms.saturating_sub(at_ms);
     if delta < 1_000 {
-        return "just now".to_string();
+        return locale::text("just now", "刚刚", "剛剛").to_string();
     }
     let seconds = delta / 1_000;
     if seconds < 60 {
-        return format!("{seconds}s ago");
+        return format!("{seconds}{}", locale::text("s ago", " 秒前", " 秒前"));
     }
     let minutes = seconds / 60;
     if minutes < 60 {
-        return format!("{minutes}m ago");
+        return format!("{minutes}{}", locale::text("m ago", " 分钟前", " 分鐘前"));
     }
-    format!("{}h ago", minutes / 60)
+    format!(
+        "{}{}",
+        minutes / 60,
+        locale::text("h ago", " 小时前", " 小時前")
+    )
 }
 
 /// Decodes an encoded desktop frame into the BGRA layout `RenderImage` wants.
@@ -675,10 +939,89 @@ mod tests {
 
     #[test]
     fn relative_time_reads_in_human_units() {
+        // The labels follow the active locale; English is the process default.
         assert_eq!(relative_time(1_000, 1_500), "just now");
         assert_eq!(relative_time(0, 5_000), "5s ago");
         assert_eq!(relative_time(0, 120_000), "2m ago");
         assert_eq!(relative_time(0, 7_200_000), "2h ago");
+    }
+
+    #[test]
+    fn every_action_kind_has_a_label() {
+        // A raw `as_str()` token would be an English-only leak into the panel;
+        // every kind the drawer can receive has a localized label instead.
+        for kind in [
+            ComputerActionKind::ListApps,
+            ComputerActionKind::LaunchApp,
+            ComputerActionKind::KillApp,
+            ComputerActionKind::GetAppState,
+            ComputerActionKind::Click,
+            ComputerActionKind::TypeText,
+            ComputerActionKind::SetValue,
+            ComputerActionKind::PressKey,
+            ComputerActionKind::Scroll,
+            ComputerActionKind::Screenshot,
+            ComputerActionKind::Permissions,
+            ComputerActionKind::Verify,
+            ComputerActionKind::ClipboardRead,
+            ComputerActionKind::ClipboardWrite,
+            ComputerActionKind::Stop,
+            ComputerActionKind::Pause,
+            ComputerActionKind::Resume,
+            ComputerActionKind::Unknown,
+        ] {
+            let label = action_kind_label(kind);
+            assert!(!label.is_empty(), "{kind:?} has no label");
+            assert_ne!(label, kind.as_str(), "{kind:?} fell back to its raw token");
+        }
+    }
+
+    #[test]
+    fn the_panel_follows_the_selected_locale() {
+        // The process-wide locale is what `text()` reads, so switching it is
+        // exactly what a language change does to the panel. Restore English at
+        // the end so the rest of the suite sees the default.
+        use crate::locale::{self, ResolvedLocale};
+        use vibex_desktop_model::LocaleMode;
+
+        locale::apply_locale(LocaleMode::ZhCn);
+        assert_eq!(action_kind_label(ComputerActionKind::Click), "点击");
+        assert_eq!(platform_label(ComputerPlatform::Macos), "macOS");
+        assert_eq!(relative_time(0, 5_000), "5 秒前");
+
+        locale::apply_locale(LocaleMode::ZhTw);
+        assert_eq!(action_kind_label(ComputerActionKind::Click), "點擊");
+
+        locale::apply_locale(LocaleMode::En);
+        assert_eq!(action_kind_label(ComputerActionKind::Click), "click");
+        assert_eq!(relative_time(0, 5_000), "5s ago");
+        assert_eq!(locale::current_locale(), ResolvedLocale::En);
+    }
+
+    #[test]
+    fn every_unavailable_reason_and_platform_has_a_label() {
+        for reason in [
+            ComputerUnavailableReason::NoDesktopSession,
+            ComputerUnavailableReason::AccessibilityBridgeMissing,
+            ComputerUnavailableReason::PlatformUnsupported,
+            ComputerUnavailableReason::EngineMissing,
+            ComputerUnavailableReason::PermissionPending,
+            ComputerUnavailableReason::PermissionRestartRequired,
+            ComputerUnavailableReason::RunningAsRoot,
+            ComputerUnavailableReason::RemoteRuntimeUnsupported,
+            ComputerUnavailableReason::FeatureDisabled,
+        ] {
+            assert!(!unavailable_reason_label(reason).is_empty());
+        }
+        for platform in [
+            ComputerPlatform::Macos,
+            ComputerPlatform::Windows,
+            ComputerPlatform::LinuxX11,
+            ComputerPlatform::LinuxWayland,
+            ComputerPlatform::Unknown,
+        ] {
+            assert!(!platform_label(platform).is_empty());
+        }
     }
 
     #[test]

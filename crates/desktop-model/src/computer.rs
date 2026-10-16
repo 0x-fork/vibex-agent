@@ -18,6 +18,36 @@ use vibex_core::{
     normalize_call_timeout_ms,
 };
 
+/// Which shell the computer-use panel opens in.
+///
+/// The panel is the human's half of the feature, so how it is hosted is a
+/// persisted decision rather than a per-open one: a reader who wants the desktop
+/// in the corner of their screen should get that every time, not have to ask
+/// again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ComputerPanelMode {
+    /// A normal, resizable window.
+    #[default]
+    Window,
+    /// A small window that stays above other windows where the platform
+    /// supports it, for keeping the desktop in view while working elsewhere.
+    Floating,
+}
+
+impl ComputerPanelMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Window => "window",
+            Self::Floating => "floating",
+        }
+    }
+
+    pub fn is_floating(self) -> bool {
+        matches!(self, Self::Floating)
+    }
+}
+
 /// The decisions the settings own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +55,9 @@ pub struct ComputerUiState {
     /// Whether the feature may start at all. Default `false`.
     #[serde(default)]
     pub enabled: bool,
+    /// Which shell the panel opens in. Default [`ComputerPanelMode::Window`].
+    #[serde(default)]
+    pub panel_mode: ComputerPanelMode,
     /// How much approval the Agent needs. Default "ask".
     #[serde(default)]
     pub approval_policy: ComputerApprovalPolicy,
@@ -57,6 +90,7 @@ impl Default for ComputerUiState {
     fn default() -> Self {
         Self {
             enabled: false,
+            panel_mode: ComputerPanelMode::Window,
             approval_policy: ComputerApprovalPolicy::Ask,
             allow_self_target: false,
             call_timeout_ms: COMPUTER_CALL_TIMEOUT_DEFAULT_MS,
@@ -133,6 +167,7 @@ mod tests {
     fn the_state_round_trips_through_json() {
         let state = ComputerUiState {
             enabled: true,
+            panel_mode: ComputerPanelMode::Floating,
             approval_policy: ComputerApprovalPolicy::Allow,
             allow_self_target: true,
             call_timeout_ms: 120_000,
@@ -142,6 +177,17 @@ mod tests {
         let decoded: ComputerUiState = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, state);
         assert_eq!(state.policy_label(), "allow");
+        assert_eq!(state.panel_mode.as_str(), "floating");
+        assert!(state.panel_mode.is_floating());
+    }
+
+    #[test]
+    fn the_panel_shell_defaults_to_a_normal_window_and_survives_a_missing_field() {
+        let state = ComputerUiState::default();
+        assert_eq!(state.panel_mode, ComputerPanelMode::Window);
+        assert!(!state.panel_mode.is_floating());
+        let from_disk: ComputerUiState = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_disk.panel_mode, ComputerPanelMode::Window);
     }
 
     #[test]
