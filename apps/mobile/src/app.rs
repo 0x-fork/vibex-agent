@@ -802,6 +802,8 @@ enum InputField {
     NewSessionWorktreeName,
     NewSessionWorktreePath,
     SidebarName,
+    /// The hour a rescheduled send is moved to.
+    SidebarRescheduleTime,
     SessionAction,
     /// The runtime rename sheet's field.
     HostName,
@@ -1622,6 +1624,11 @@ pub struct MobileApp {
     /// The queued send being moved: its session and the holder's queue entry,
     /// which is what an edit addresses.
     sidebar_reschedule_menu: Option<(String, u64)>,
+    /// Which day the absolute half of the reschedule sheet points at: today,
+    /// tomorrow, or the day after.
+    sidebar_reschedule_day: u8,
+    /// The hour the reader typed there, as `HH:MM`.
+    sidebar_reschedule_time: Entity<InputState>,
     sidebar_name_prompt: Option<SidebarNamePrompt>,
     sidebar_name_input: Entity<InputState>,
     /// The Desktop's sidebar tree, mirrored so the phone renders the layout the
@@ -3130,6 +3137,10 @@ impl MobileApp {
             sidebar_root_menu: false,
             sidebar_folder_archive_menu: None,
             sidebar_reschedule_menu: None,
+            sidebar_reschedule_day: 0,
+            sidebar_reschedule_time: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text("09:00", "09:00", "09:00"))
+            }),
             sidebar_name_prompt: None,
             sidebar_name_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(locale::text(
@@ -14560,15 +14571,19 @@ impl MobileApp {
                     );
                     let reschedule_session_id = session_id.as_str().to_string();
                     let reschedule_message_id = send.message_id;
+                    let seeded_at_ms = send.scheduled_at_ms;
                     sheet = entry(
                         sheet,
                         "mobile-row-menu-reschedule-scheduled",
                         locale::text("Send later instead", "改期发送", "改期傳送").to_string(),
                         false,
                         Box::new(move |this, _, cx| {
-                            this.sidebar_reschedule_menu =
-                                Some((reschedule_session_id.clone(), reschedule_message_id));
-                            cx.notify();
+                            this.begin_reschedule_menu(
+                                reschedule_session_id.clone(),
+                                reschedule_message_id,
+                                seeded_at_ms,
+                                cx,
+                            );
                         }),
                     );
                 }
@@ -15170,6 +15185,26 @@ impl MobileApp {
         )
     }
 
+    /// Opens the reschedule sheet on the hour the send already waits for.
+    ///
+    /// The reader who came to nudge a deadline by ten minutes should not have to
+    /// retype the hour it is already set to, so the sheet starts where the send
+    /// is: its own day among the chips, and its own `HH:MM` in the field.
+    fn begin_reschedule_menu(
+        &mut self,
+        session_id: String,
+        message_id: u64,
+        at_ms: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let (day, time) = mobile_reschedule_seed(at_ms);
+        self.sidebar_reschedule_day = day;
+        self.pending_input_writes
+            .push((InputField::SidebarRescheduleTime, time));
+        self.sidebar_reschedule_menu = Some((session_id, message_id));
+        cx.notify();
+    }
+
     /// The hours a waiting send can be moved to.
     ///
     /// The desktop opens a calendar and a clock, and its countdown mode takes
@@ -15213,6 +15248,87 @@ impl MobileApp {
                 ),
             );
         }
+        // The absolute half: the desktop opens a calendar and a clock, and a
+        // sheet has room for the two things a reader actually names — which day,
+        // and what hour — so the day is a row of chips and the hour is typed.
+        sheet = sheet.child(div().h(px(1.0)).my_1().bg(theme::border_subtle()));
+        let mut days = div().flex().items_center().gap(px(2.0));
+        for (offset, label) in MOBILE_RESCHEDULE_DAYS {
+            let selected = self.sidebar_reschedule_day == offset;
+            days = days.child(
+                div()
+                    .id(format!("mobile-reschedule-day-{offset}"))
+                    .h(px(theme::TOUCH_TARGET))
+                    .px_3()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .when(selected, |chip| chip.bg(theme::sidebar_selected_bg()))
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .text_size(theme::font_body())
+                    .text_color(if selected {
+                        theme::text_primary()
+                    } else {
+                        theme::sidebar_text_muted()
+                    })
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.sidebar_reschedule_day = offset;
+                            cx.notify();
+                        }),
+                    )
+                    .child(label),
+            );
+        }
+        sheet = sheet.child(days).child(
+            div()
+                .h(px(theme::TOUCH_TARGET))
+                .rounded(px(theme::RADIUS_CONTROL))
+                .border_1()
+                .border_color(theme::border_default())
+                .bg(theme::bg_primary())
+                .px_3()
+                .flex()
+                .items_center()
+                .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
+                .child(Input::new(&self.sidebar_reschedule_time).appearance(false)),
+        );
+        let typed = self.sidebar_reschedule_time.read(cx).value().to_string();
+        let absolute = mobile_absolute_deadline(self.sidebar_reschedule_day, &typed);
+        let confirm_session_id = session_id.to_string();
+        sheet = sheet.child(
+            sidebar_sheet_entry(
+                "mobile-reschedule-confirm".to_string(),
+                mobile_absolute_deadline_label(self.sidebar_reschedule_day, &typed),
+                false,
+                false,
+            )
+            .opacity(if absolute.is_some() { 1.0 } else { 0.4 })
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    let typed = this.sidebar_reschedule_time.read(cx).value().to_string();
+                    let Some(at_ms) = mobile_absolute_deadline(this.sidebar_reschedule_day, &typed)
+                    else {
+                        return;
+                    };
+                    this.close_sheet(SheetKey::SidebarRescheduleMenu, cx);
+                    this.send_sidebar_mutation(
+                        RemoteSidebarOrganizationMutation::SetScheduledSend {
+                            session_id: confirm_session_id.clone(),
+                            message_id,
+                            scheduled_at_ms: Some(at_ms),
+                        },
+                        false,
+                        cx,
+                    );
+                }),
+            ),
+        );
         self.render_drawer_sheet(
             DrawerSheet {
                 key: SheetKey::SidebarRescheduleMenu,
@@ -24750,6 +24866,7 @@ impl Render for MobileApp {
                 InputField::NewSessionWorktreeName => &self.new_session_worktree_name_input,
                 InputField::NewSessionWorktreePath => &self.new_session_worktree_path_input,
                 InputField::SidebarName => &self.sidebar_name_input,
+                InputField::SidebarRescheduleTime => &self.sidebar_reschedule_time,
                 InputField::SessionAction => &self.session_action_input,
                 InputField::HostName => &self.host_name_input,
             };
@@ -30477,6 +30594,61 @@ fn sidebar_sheet_entry(
                     .text_color(theme::primary()),
             )
         })
+}
+
+/// The days the absolute half of the reschedule sheet offers, as offsets from
+/// today. A phone is not where a send is scheduled a month out, and the desktop
+/// keeps the calendar for that.
+const MOBILE_RESCHEDULE_DAYS: [(u8, &str); 3] = [(0, "今天"), (1, "明天"), (2, "后天")];
+
+/// The day and hour a deadline falls on, as the sheet's own controls read it.
+fn mobile_reschedule_seed(at_ms: i64) -> (u8, String) {
+    let Some(local) = chrono::DateTime::from_timestamp_millis(at_ms)
+        .map(|time| time.with_timezone(&chrono::Local))
+    else {
+        return (0, String::new());
+    };
+    let today = chrono::Local::now().date_naive();
+    let offset = (local.date_naive() - today).num_days().clamp(0, 2) as u8;
+    (offset, local.format("%H:%M").to_string())
+}
+
+/// The absolute hour a typed `HH:MM` names on the chosen day.
+///
+/// `None` when the text is not a time, or when the hour it names has already
+/// passed: a deadline in the past is a send that would leave at once, which is
+/// what sending the message plainly is for.
+fn mobile_absolute_deadline(day_offset: u8, typed: &str) -> Option<i64> {
+    let (hour, minute) = typed.trim().split_once(':')?;
+    let hour = hour.trim().parse::<u32>().ok()?;
+    let minute = minute.trim().parse::<u32>().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    let date = chrono::Local::now()
+        .date_naive()
+        .checked_add_days(chrono::Days::new(u64::from(day_offset)))?;
+    let naive = date.and_hms_opt(hour, minute, 0)?;
+    let local = naive.and_local_timezone(chrono::Local).single()?;
+    let at_ms = local.timestamp_millis();
+    (at_ms > unix_timestamp_ms()).then_some(at_ms)
+}
+
+/// The confirm entry's own words: the day the chips point at, and the hour.
+fn mobile_absolute_deadline_label(day_offset: u8, typed: &str) -> String {
+    let day = match day_offset {
+        0 => locale::text("today", "今天", "今天"),
+        1 => locale::text("tomorrow", "明天", "明天"),
+        _ => locale::text("the day after", "后天", "後天"),
+    };
+    let time = typed.trim();
+    if time.is_empty() {
+        return format!("{} {day}", locale::text("Send at", "在", "在"));
+    }
+    match locale::current() {
+        Locale::En => format!("Send at {time} {day}"),
+        Locale::ZhCn | Locale::ZhTw => format!("在{day} {time} 发送"),
+    }
 }
 
 /// The hours a waiting send can be moved to, as countdowns from now.
@@ -37895,6 +38067,79 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             workspace.contains("// A Worktree's own aggregate is not a setting of its own"),
             "and a Worktree does not: the desktop forces it off there too"
+        );
+    }
+
+    /// The absolute half of the reschedule sheet reads and refuses a typed hour.
+    #[test]
+    fn a_typed_hour_names_a_deadline_only_when_it_is_still_ahead() {
+        // A time later today, and the same time tomorrow, are both deadlines.
+        use chrono::Timelike as _;
+        let now = chrono::Local::now();
+        let later = (now + chrono::Duration::minutes(30))
+            .format("%H:%M")
+            .to_string();
+        if now.hour() < 23 {
+            assert!(
+                mobile_absolute_deadline(0, &later).is_some(),
+                "a time still ahead today is a deadline"
+            );
+        }
+        assert!(
+            mobile_absolute_deadline(1, "09:00").is_some(),
+            "the same hour tomorrow is always ahead"
+        );
+
+        // Text that is not a time, and an hour that has gone, are both refused:
+        // a deadline in the past would be a send that leaves at once.
+        assert_eq!(mobile_absolute_deadline(0, ""), None);
+        assert_eq!(mobile_absolute_deadline(0, "soon"), None);
+        assert_eq!(mobile_absolute_deadline(0, "24:00"), None);
+        assert_eq!(mobile_absolute_deadline(0, "09:60"), None);
+        let earlier = (now - chrono::Duration::minutes(30))
+            .format("%H:%M")
+            .to_string();
+        if now.hour() > 0 {
+            assert_eq!(
+                mobile_absolute_deadline(0, &earlier),
+                None,
+                "an hour that has passed today is not a deadline"
+            );
+        }
+
+        // The confirm entry names the day it points at.
+        assert!(mobile_absolute_deadline_label(1, "09:00").contains("09:00"));
+        assert_ne!(
+            mobile_absolute_deadline_label(0, "09:00"),
+            mobile_absolute_deadline_label(1, "09:00"),
+            "today and tomorrow cannot read the same"
+        );
+    }
+
+    /// The sheet opens on the hour the send already waits for.
+    #[test]
+    fn the_reschedule_sheet_starts_where_the_send_is() {
+        let at = chrono::Local::now() + chrono::Duration::days(1) + chrono::Duration::hours(2);
+        let (day, time) = mobile_reschedule_seed(at.timestamp_millis());
+        assert_eq!(day, 1, "tomorrow is the day the chips should point at");
+        assert_eq!(time, at.format("%H:%M").to_string());
+
+        // A deadline further out than the chips reach clamps to the last one,
+        // and one already past reads as today.
+        let far = chrono::Local::now() + chrono::Duration::days(9);
+        assert_eq!(mobile_reschedule_seed(far.timestamp_millis()).0, 2);
+        let past = chrono::Local::now() - chrono::Duration::days(2);
+        assert_eq!(mobile_reschedule_seed(past.timestamp_millis()).0, 0);
+
+        let source = include_str!("app.rs");
+        let sheet = renderer_source(source, "render_reschedule_menu");
+        assert!(
+            sheet.contains("mobile_absolute_deadline(this.sidebar_reschedule_day"),
+            "the typed hour is what the confirm entry sends"
+        );
+        assert!(
+            sheet.contains("MOBILE_RESCHEDULE_DAYS"),
+            "and the day chips are the other half of it"
         );
     }
 
