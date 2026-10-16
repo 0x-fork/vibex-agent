@@ -743,6 +743,19 @@ enum SidebarNamePrompt {
     },
 }
 
+/// What the schedule sheet is arming.
+///
+/// One sheet, because the question is the same either way — which day, and what
+/// hour — and only the answer differs: a held send is moved, and the composer's
+/// own message is queued for the first time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MobileScheduleTarget {
+    /// A send the holder's queue already holds, addressed by its queue entry.
+    Move { session_id: String, message_id: u64 },
+    /// The message in the composer, which the holder will queue.
+    Compose { session_id: String },
+}
+
 /// The membership editor for one session group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MobileGroupMembersEditor {
@@ -1621,9 +1634,9 @@ pub struct MobileApp {
     /// rather than a command, so it opens a sheet of its own instead of sitting
     /// in the folder's list.
     sidebar_folder_archive_menu: Option<String>,
-    /// The queued send being moved: its session and the holder's queue entry,
-    /// which is what an edit addresses.
-    sidebar_reschedule_menu: Option<(String, u64)>,
+    /// What the schedule sheet is arming: a send the holder's queue already
+    /// holds, or the message the composer is holding.
+    sidebar_reschedule_menu: Option<MobileScheduleTarget>,
     /// Which day the absolute half of the reschedule sheet points at: today,
     /// tomorrow, or the day after.
     sidebar_reschedule_day: u8,
@@ -13632,19 +13645,17 @@ impl MobileApp {
                         None => root,
                     },
                 )
-                .when_some(
-                    self.sidebar_reschedule_menu.clone(),
-                    |root, (session_id, message_id)| match reschedule_sheet {
+                .when_some(self.sidebar_reschedule_menu.clone(), |root, target| {
+                    match reschedule_sheet {
                         Some(presentation) => root.child(self.render_reschedule_menu(
-                            &session_id,
-                            message_id,
+                            &target,
                             presentation,
                             reschedule_scroll.clone(),
                             cx,
                         )),
                         None => root,
-                    },
-                )
+                    }
+                })
                 .when_some(name_prompt, |root, prompt| {
                     root.child(self.render_folder_name_prompt(&prompt, cx))
                 })
@@ -15185,6 +15196,95 @@ impl MobileApp {
         )
     }
 
+    /// Arms whatever the sheet is pointing at: moves a held send, or queues the
+    /// composer's own message.
+    ///
+    /// The two answers differ in where the message comes from — the holder's
+    /// queue, or the field the reader just typed in — and in nothing else, which
+    /// is why one sheet asks the question.
+    fn arm_scheduled_send(
+        &mut self,
+        target: &MobileScheduleTarget,
+        at_ms: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            MobileScheduleTarget::Move {
+                session_id,
+                message_id,
+            } => {
+                self.send_sidebar_mutation(
+                    RemoteSidebarOrganizationMutation::SetScheduledSend {
+                        session_id: session_id.clone(),
+                        message_id: *message_id,
+                        scheduled_at_ms: Some(at_ms),
+                    },
+                    false,
+                    cx,
+                );
+            }
+            MobileScheduleTarget::Compose { session_id } => {
+                let text = self.composer_input.read(cx).value().trim().to_string();
+                if text.is_empty() && self.composer_attachments.is_empty() {
+                    return;
+                }
+                let attachments = std::mem::take(&mut self.composer_attachments);
+                let mentions = self.armed_mentions(cx);
+                self.composer_armed_mentions.clear();
+                self.composer_armed_command = None;
+                // The draft became the queued message, so the store must not
+                // hand it back when the session is shown again.
+                self.composer_drafts.remove(session_id.as_str());
+                self.composer_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.send_sidebar_mutation(
+                    RemoteSidebarOrganizationMutation::EnqueueScheduledSend {
+                        session_id: session_id.clone(),
+                        text,
+                        attachments,
+                        mentions,
+                        scheduled_at_ms: at_ms,
+                    },
+                    false,
+                    cx,
+                );
+                self.hint(
+                    Tone::Info,
+                    locale::text(
+                        "Scheduled on the desktop that holds the queue",
+                        "已在持有队列的桌面端排期",
+                        "已在持有佇列的桌面端排期",
+                    ),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// Opens the schedule sheet on the composer's own message.
+    ///
+    /// The hour it starts at is an hour from now, which is the first deadline a
+    /// reader who has just typed a message is likely to want; the day chips and
+    /// the field are there to move it.
+    fn begin_composer_schedule(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        let (day, time) = mobile_reschedule_seed(unix_timestamp_ms() + 60 * 60 * 1_000);
+        self.sidebar_reschedule_day = day;
+        self.pending_input_writes
+            .push((InputField::SidebarRescheduleTime, time));
+        self.sidebar_reschedule_menu = Some(MobileScheduleTarget::Compose {
+            session_id: session_id.as_str().to_string(),
+        });
+        cx.notify();
+    }
+
     /// Opens the reschedule sheet on the hour the send already waits for.
     ///
     /// The reader who came to nudge a deadline by ten minutes should not have to
@@ -15201,7 +15301,10 @@ impl MobileApp {
         self.sidebar_reschedule_day = day;
         self.pending_input_writes
             .push((InputField::SidebarRescheduleTime, time));
-        self.sidebar_reschedule_menu = Some((session_id, message_id));
+        self.sidebar_reschedule_menu = Some(MobileScheduleTarget::Move {
+            session_id,
+            message_id,
+        });
         cx.notify();
     }
 
@@ -15214,15 +15317,14 @@ impl MobileApp {
     /// the session and the message travel together.
     fn render_reschedule_menu(
         &self,
-        session_id: &str,
-        message_id: u64,
+        target: &MobileScheduleTarget,
         presentation: SheetPresentation,
         body_scroll: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let mut sheet = div().p_2().flex().flex_col().gap(px(2.0));
         for seconds in MOBILE_RESCHEDULE_CHOICES {
-            let session_id = session_id.to_string();
+            let target = target.clone();
             sheet = sheet.child(
                 sidebar_sheet_entry(
                     format!("mobile-reschedule-{seconds}"),
@@ -15232,18 +15334,11 @@ impl MobileApp {
                 )
                 .on_mouse_up(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
+                    cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
+                        let at_ms = unix_timestamp_ms() + seconds * 1_000;
                         this.close_sheet(SheetKey::SidebarRescheduleMenu, cx);
-                        this.send_sidebar_mutation(
-                            RemoteSidebarOrganizationMutation::SetScheduledSend {
-                                session_id: session_id.clone(),
-                                message_id,
-                                scheduled_at_ms: Some(unix_timestamp_ms() + seconds * 1_000),
-                            },
-                            false,
-                            cx,
-                        );
+                        this.arm_scheduled_send(&target, at_ms, window, cx);
                     }),
                 ),
             );
@@ -15298,7 +15393,7 @@ impl MobileApp {
         );
         let typed = self.sidebar_reschedule_time.read(cx).value().to_string();
         let absolute = mobile_absolute_deadline(self.sidebar_reschedule_day, &typed);
-        let confirm_session_id = session_id.to_string();
+        let confirm_target = target.clone();
         sheet = sheet.child(
             sidebar_sheet_entry(
                 "mobile-reschedule-confirm".to_string(),
@@ -15309,7 +15404,7 @@ impl MobileApp {
             .opacity(if absolute.is_some() { 1.0 } else { 0.4 })
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
+                cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     let typed = this.sidebar_reschedule_time.read(cx).value().to_string();
                     let Some(at_ms) = mobile_absolute_deadline(this.sidebar_reschedule_day, &typed)
@@ -15317,23 +15412,21 @@ impl MobileApp {
                         return;
                     };
                     this.close_sheet(SheetKey::SidebarRescheduleMenu, cx);
-                    this.send_sidebar_mutation(
-                        RemoteSidebarOrganizationMutation::SetScheduledSend {
-                            session_id: confirm_session_id.clone(),
-                            message_id,
-                            scheduled_at_ms: Some(at_ms),
-                        },
-                        false,
-                        cx,
-                    );
+                    this.arm_scheduled_send(&confirm_target, at_ms, window, cx);
                 }),
             ),
         );
+        let title = match target {
+            MobileScheduleTarget::Move { .. } => locale::text("Send later", "稍后发送", "稍後傳送"),
+            MobileScheduleTarget::Compose { .. } => {
+                locale::text("Schedule send", "定时发送", "定時傳送")
+            }
+        };
         self.render_drawer_sheet(
             DrawerSheet {
                 key: SheetKey::SidebarRescheduleMenu,
                 id_prefix: "mobile-reschedule-menu",
-                title: locale::text("Send later", "稍后发送", "稍後傳送"),
+                title,
             },
             presentation,
             body_scroll,
@@ -20467,6 +20560,42 @@ impl MobileApp {
                                                 } else {
                                                     theme::text_muted()
                                                 }),
+                                        ),
+                                )
+                            })
+                            // Scheduling is the one thing a phone cannot do for
+                            // itself: the queue belongs to the desktop, so the
+                            // message travels there and waits. The control only
+                            // appears with something to send, so an empty
+                            // composer stays as wide as it was.
+                            .when(has_content && state.is_some() && !editing_message, |row| {
+                                row.child(
+                                    div()
+                                        .id("schedule-message")
+                                        .debug_selector(|| "schedule-message".to_string())
+                                        .aria_label(
+                                            locale::text("Schedule send", "定时发送", "定時傳送")
+                                                .to_string(),
+                                        )
+                                        .size(px(theme::TOUCH_TARGET))
+                                        .flex_shrink_0()
+                                        .rounded_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.begin_composer_schedule(cx)
+                                            }),
+                                        )
+                                        .child(
+                                            svg()
+                                                .path("icons/clock.svg")
+                                                .size(px(theme::ICON_MD))
+                                                .text_color(theme::text_secondary()),
                                         ),
                                 )
                             })
@@ -38140,6 +38269,49 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             sheet.contains("MOBILE_RESCHEDULE_DAYS"),
             "and the day chips are the other half of it"
+        );
+    }
+
+    /// The composer's own message can be queued for an hour, not just sent.
+    ///
+    /// Scheduling lived in the holder's composer, so a phone that could only
+    /// move a deadline it already had could not ask for one at all.
+    #[test]
+    fn the_composer_can_queue_its_message_for_an_hour() {
+        let source = include_str!("app.rs");
+        assert!(
+            source.contains("mobile-row-menu-reschedule-scheduled")
+                && source.contains("schedule-message"),
+            "the row's held send and the composer's own message both open the sheet"
+        );
+
+        let arm = renderer_source(source, "arm_scheduled_send");
+        assert!(
+            arm.contains("EnqueueScheduledSend"),
+            "the composer's message travels as a queue entry"
+        );
+        assert!(
+            arm.contains("SetScheduledSend"),
+            "and a held send is moved, not queued twice"
+        );
+        assert!(
+            arm.contains("std::mem::take(&mut self.composer_attachments)")
+                && arm.contains("self.armed_mentions(cx)"),
+            "the message travels whole: its words, its pictures, and its references"
+        );
+        assert!(
+            arm.contains("self.composer_drafts.remove(session_id.as_str())"),
+            "and the draft is consumed by the send it became"
+        );
+
+        let open = renderer_source(source, "begin_composer_schedule");
+        assert!(
+            open.contains("MobileScheduleTarget::Compose"),
+            "the sheet is opened pointing at the composer"
+        );
+        assert!(
+            open.contains("unix_timestamp_ms() + 60 * 60 * 1_000"),
+            "and starts an hour out, the first deadline worth offering"
         );
     }
 
