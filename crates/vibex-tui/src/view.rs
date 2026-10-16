@@ -5620,6 +5620,31 @@ fn render_config_table(
     if let Some(spans) = render_registry_bar(area, app, rows.len(), theme, strings) {
         lines.push(Line::from(spans));
     }
+    // A read that refused is the state the area is in, so it is drawn where the
+    // area is rather than toasted once: the reader who looked away would
+    // otherwise find an empty table and no reason for it, and the key that asks
+    // again is named rather than left to be guessed.
+    if let Some((code, message)) = app
+        .management_data
+        .read_error(app.config_center.module, app.config_center.section)
+    {
+        lines.push(Line::from(vec![
+            Span::styled(" ".repeat(TABLE_PREFIX), Style::default()),
+            Span::styled(
+                format!(" {} ", strings.config_read_failed()),
+                chip_style(crate::config_center::ConfigTone::Bad, theme)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{code} · {message}"),
+                Style::default().fg(theme.roles.gray_bright),
+            ),
+            Span::styled(
+                format!("  {}", strings.config_read_retry()),
+                Style::default().fg(theme.roles.gray_dim),
+            ),
+        ]));
+    }
     // The install card. A managed install is one the reader cannot see happen:
     // it runs on the authority, and without this the row would simply change
     // under them a while later with nothing in between.

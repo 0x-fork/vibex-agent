@@ -930,6 +930,8 @@ strings! {
     config_action_enable_all => { "Enable all", "全部启用", "全部啟用" },
     config_action_disable_all => { "Disable all", "全部禁用", "全部停用" },
     config_hint_no_matches => { "No matches · Delete clears the filter", "没有匹配项 · Delete 清除过滤", "沒有符合項目 · Delete 清除篩選" },
+    config_read_failed => { "The read failed", "读取失败", "讀取失敗" },
+    config_read_retry => { "r asks again", "按 r 重试", "按 r 重試" },
     label_config_model_enable_all => { "Enable all Models", "启用全部模型", "啟用全部模型" },
     label_config_model_disable_all => { "Disable all Models", "禁用全部模型", "停用全部模型" },
     help_config_model_enable_all => { "Offer every Model the catalogue lists.", "提供目录中列出的全部模型。", "提供目錄中列出的全部模型。" },

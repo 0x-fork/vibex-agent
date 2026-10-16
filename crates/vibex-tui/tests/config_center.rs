@@ -4242,3 +4242,49 @@ fn an_empty_table_offers_the_way_out_of_the_filter() {
     app.perform(vibex_tui::action::Intent::ClearFilter);
     assert!(app.config_center.filter.is_empty());
 }
+
+/// A read that refused is the state the area is in, and the way to ask again is
+/// drawn with it.
+///
+/// A toast is gone before a reader who looked away can read it. An area that
+/// refused and then answers clears the failure, because the state it described
+/// has changed.
+#[test]
+fn a_failed_read_is_a_state_the_area_is_in() {
+    let mut app = loaded(140, 40);
+    app.management_data.mcp.clear();
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Servers));
+
+    // The area has not answered yet: the skeleton, not a failure.
+    let screen = text(&mut app, 140, 40);
+    assert!(!screen.contains("The read failed"), "{screen}");
+
+    app.management_data.mark_read_failed(
+        ConfigModule::Mcp,
+        ConfigSection::Servers,
+        "mcp_unavailable".to_string(),
+        "the runtime served no MCP list".to_string(),
+    );
+    let screen = text(&mut app, 140, 40);
+    assert!(
+        screen.contains("The read failed")
+            && screen.contains("mcp_unavailable")
+            && screen.contains("the runtime served no MCP list"),
+        "the area did not say what it said:\n{screen}"
+    );
+    assert!(
+        screen.contains("r asks again"),
+        "the area did not name the way to ask again:\n{screen}"
+    );
+
+    // Asking again is the key the state names, and an answer clears it.
+    let outcome = app.perform(vibex_tui::action::Intent::ReloadManagement);
+    assert!(!outcome.effects.is_empty(), "the retry asked for nothing");
+    app.management_data
+        .mark_read(ConfigModule::Mcp, ConfigSection::Servers);
+    let screen = text(&mut app, 140, 40);
+    assert!(
+        !screen.contains("The read failed"),
+        "the failure outlived the answer that replaced it:\n{screen}"
+    );
+}

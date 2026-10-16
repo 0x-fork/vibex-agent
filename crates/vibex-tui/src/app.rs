@@ -718,6 +718,12 @@ pub struct ManagementData {
     pub mcp_discoveries: Vec<vibex_core::McpServerDiscovery>,
     pub skill_discoveries: Vec<vibex_core::SkillDiscovery>,
     pub backups: Vec<vibex_core::BackupCreateOutcome>,
+    /// The last read failure per area, as `module/section`.
+    ///
+    /// A toast is gone before a reader who looked away can read it, and an area
+    /// that refused is the state the area is in: it keeps the reason, and the
+    /// key that asks again is drawn with it.
+    pub read_errors: std::collections::BTreeMap<String, (String, String)>,
     /// The areas an answer has already landed for, as `module/section`.
     ///
     /// An empty list and a list nobody has read yet look the same on screen,
@@ -737,13 +743,40 @@ impl ManagementData {
         self.read.contains(&read_key(module, section))
     }
 
-    /// Record that an area's answer has landed, whatever it said.
+    /// Record that an area's answer landed, and that it was an answer.
+    ///
+    /// A read that arrived clears whatever the last one said when it refused:
+    /// the failure is a state the area is in, and the state has just changed.
     pub fn mark_read(
         &mut self,
         module: crate::config_center::ConfigModule,
         section: crate::config_center::ConfigSection,
     ) {
-        self.read.insert(read_key(module, section));
+        let key = read_key(module, section);
+        self.read_errors.remove(&key);
+        self.read.insert(key);
+    }
+
+    /// Record that an area's read refused, with what it said.
+    pub fn mark_read_failed(
+        &mut self,
+        module: crate::config_center::ConfigModule,
+        section: crate::config_center::ConfigSection,
+        code: String,
+        message: String,
+    ) {
+        let key = read_key(module, section);
+        self.read.insert(key.clone());
+        self.read_errors.insert(key, (code, message));
+    }
+
+    /// What an area's last read said when it refused.
+    pub fn read_error(
+        &self,
+        module: crate::config_center::ConfigModule,
+        section: crate::config_center::ConfigSection,
+    ) -> Option<&(String, String)> {
+        self.read_errors.get(&read_key(module, section))
     }
 }
 

@@ -2504,7 +2504,15 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 );
                 app.live = LiveState::Ready;
             }
-            Err(error) => app.toast(Toast::danger(error.message)),
+            Err(error) => {
+                app.toast(Toast::danger(error.message.clone()));
+                app.management_data.mark_read_failed(
+                    crate::config_center::ConfigModule::Agent,
+                    crate::config_center::ConfigSection::Providers,
+                    error.code,
+                    error.message,
+                );
+            }
         },
         AppMessage::ProviderTest(result) => match result {
             Ok(tested) => {
@@ -2752,7 +2760,15 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                     app.set_selection(crate::keymap::Scope::Management, index);
                 }
             }
-            Err(error) => app.toast(Toast::danger(error.message)),
+            Err(error) => {
+                app.toast(Toast::danger(error.message.clone()));
+                app.management_data.mark_read_failed(
+                    crate::config_center::ConfigModule::Agent,
+                    crate::config_center::ConfigSection::Agents,
+                    error.code,
+                    error.message,
+                );
+            }
         },
         AppMessage::AgentAuth { result, open } => match result {
             Ok(contexts) => {
@@ -2828,6 +2844,7 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         }
         AppMessage::Mcp(result) => match result {
             Ok(servers) => {
+                app.management_data.read_errors.remove("mcp/servers");
                 app.management_data.mcp = servers;
                 app.live = LiveState::Ready;
                 app.management_data.mark_read(
@@ -2838,10 +2855,12 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             // An area with a refusal in it is not an area that is still being
             // read, so the skeleton goes when the answer does — either way.
             Err(error) => {
-                app.toast(Toast::danger(error.message));
-                app.management_data.mark_read(
+                app.toast(Toast::danger(error.message.clone()));
+                app.management_data.mark_read_failed(
                     crate::config_center::ConfigModule::Mcp,
                     crate::config_center::ConfigSection::Servers,
+                    error.code,
+                    error.message,
                 );
             }
         },
@@ -2855,10 +2874,12 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 );
             }
             Err(error) => {
-                app.toast(Toast::danger(error.message));
-                app.management_data.mark_read(
+                app.toast(Toast::danger(error.message.clone()));
+                app.management_data.mark_read_failed(
                     crate::config_center::ConfigModule::Skills,
                     crate::config_center::ConfigSection::Installed,
+                    error.code,
+                    error.message,
                 );
             }
         },
@@ -2872,10 +2893,12 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 );
             }
             Err(error) => {
-                app.toast(Toast::danger(error.message));
-                app.management_data.mark_read(
+                app.toast(Toast::danger(error.message.clone()));
+                app.management_data.mark_read_failed(
                     crate::config_center::ConfigModule::Prompts,
                     crate::config_center::ConfigSection::Prompts,
+                    error.code,
+                    error.message,
                 );
             }
         },
