@@ -36,20 +36,20 @@ use vibex_core::{
     AgentTimelineReasoningDisplayMode, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationOption,
     ElicitationRequest, ElicitationResolution, ElicitationResolutionAction,
-    ForkAgentSessionRequest,
-    GitWorktreeCreateRequest, GoalPhase, GoalSnapshot, HumanDelegationRequest, MessageAttachment,
-    OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PermissionRiskCategory,
-    PlanStepPayload, PlanStepStatus, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState,
-    RemoteServerKind, RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
+    ForkAgentSessionRequest, GitWorktreeCreateRequest, GoalPhase, GoalSnapshot,
+    HumanDelegationRequest, MessageAttachment, OpenWorkspaceRequest, PermissionResolution,
+    PermissionResponseKind, PermissionRiskCategory, PlanStepPayload, PlanStepStatus,
+    RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteServerKind,
+    RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
     RemoteSidebarOrganizationMutation, RenameAgentSessionRequest, ReplaceUserMessagePayload,
     RequestId, ResolvePermissionRequest, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
     RuntimeAuthSourceSummary, RuntimeModelSelection, RuntimeOptionAvailability,
     RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
     SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
     SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelineItemKind,
-    TimelinePayload, TimelineRedactionState, TimelineSource, UserMessageDelivery,
-    UserMessagePayload, VibexSessionId, VibexUseMention, VibexUseRef, WorkspaceMode,
-    WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
+    TimelineLiveEvent, TimelinePayload, TimelineRedactionState, TimelineSource,
+    UserMessageDelivery, UserMessagePayload, VibexSessionId, VibexUseMention, VibexUseRef,
+    WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     ActiveGoal, NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice,
@@ -768,6 +768,18 @@ const ATTACHMENT_PREVIEW_ZOOM_STEP: f32 = 1.5;
 #[derive(Debug, Clone, PartialEq)]
 struct SidebarRowMenu {
     row: SidebarRow,
+}
+
+/// What a container's batch checkbox shows for the sessions underneath it.
+///
+/// The desktop resolves the same three states for a project or folder row, and
+/// the phone mirrors it so one checkbox means the same thing on either shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarBatchCheck {
+    Unchecked,
+    Checked,
+    /// Some, but not all, of the container's sessions are selected.
+    Indeterminate,
 }
 
 /// What an entry of a bottom sheet does when tapped. Boxed so a sheet can build
@@ -1619,6 +1631,16 @@ pub struct MobileApp {
     workspaces: Vec<WorkspaceRecord>,
     workspace_summaries: Vec<WorkspaceSummary>,
     sidebar_state: SidebarState,
+    /// The approval and elicitation requests each session is still waiting on,
+    /// by session id.
+    ///
+    /// The persisted state parks a session in `NeedsInput` only once the
+    /// authority writes it; a request that arrives while the provider turn is
+    /// still open leaves the session `Running`, so the row's own state alone
+    /// cannot say that the Agent has stopped on the reader. This index is built
+    /// from the same live stream the desktop reads, and a session is "waiting"
+    /// while its entry is non-empty.
+    pending_user_requests: BTreeMap<String, BTreeSet<String>>,
     overlay: Option<MobileOverlay>,
     /// Retain every parent so runtime sheets return through the pairing page
     /// even when it was opened from another overlay such as Settings.
@@ -3340,6 +3362,7 @@ impl MobileApp {
             workspaces: Vec::new(),
             workspace_summaries: Vec::new(),
             sidebar_state: SidebarState::default(),
+            pending_user_requests: BTreeMap::new(),
             overlay: None,
             overlay_parents: Vec::new(),
             overlay_returns_to_drawer: false,
@@ -4626,6 +4649,18 @@ impl MobileApp {
                 BackendEvent::Timeline(_) | BackendEvent::SessionUpdated(_)
             );
             let session_update = matches!(&event, BackendEvent::SessionUpdated(_));
+            // The row's waiting state is driven by the requests themselves, not
+            // by the persisted session state, because the request item can
+            // arrive while the provider turn is still `Running`. This runs
+            // before the event is handed to the controller, which consumes it.
+            if let BackendEvent::Timeline(live) = &event {
+                needs_repaint |= self.track_pending_user_request(live);
+            }
+            if let BackendEvent::SessionsRemoved(removed) = &event {
+                for session_id in removed {
+                    self.pending_user_requests.remove(session_id.as_str());
+                }
+            }
             let decision = self
                 .controller
                 .as_mut()
@@ -7241,10 +7276,10 @@ impl MobileApp {
         self.timeline_metadata_tip = None;
         self.attachment_preview = None;
         self.attachment_preview_loading = None;
-        self.sidebar_state.selected_ids.clear();
-        self.sidebar_state
-            .selected_ids
-            .insert(session_id.as_str().to_string());
+        // Opening a session is not a batch selection. This used to clear the
+        // set and insert the opened session into it, so a session was force
+        // checked the moment it was opened and every other check was dropped.
+        // The desktop keeps the two apart, and so does the phone now.
         // Switching away is the last chance to keep this conversation for the
         // next cold start: the controller drops its projection on the way out.
         let previous_session = self
@@ -8984,16 +9019,13 @@ impl MobileApp {
             self.sidebar_projects_initialized = true;
             BTreeSet::new()
         };
-        self.sidebar_state.selected_ids.clear();
-        if let Some(selected) = self
-            .controller
-            .as_ref()
-            .and_then(|controller| controller.state.selected_session_id.as_ref())
-        {
-            self.sidebar_state
-                .selected_ids
-                .insert(selected.as_str().to_string());
-        }
+        // `selected_ids` is the batch selection, not the open session. This
+        // projection runs on every session refresh — a poll, an event, a
+        // reconnect — and it used to clear the set and re-seed it with the open
+        // session, so a tick a few seconds after a tap silently unchecked
+        // everything the reader had picked. The set is left exactly as the
+        // reader left it; `reconcile` above has already dropped ids that no
+        // longer exist.
     }
 
     fn reset_sidebar_ui(&mut self) {
@@ -9146,6 +9178,62 @@ impl MobileApp {
             self.sidebar_state.toggle_selected(session_id);
             cx.notify();
         }
+    }
+
+    /// Every session a project row governs: the whole project, folded or not.
+    ///
+    /// A project's checkbox speaks for the rows it holds, so it is answered by
+    /// the authoritative session list rather than by the visible projection —
+    /// a collapsed project would otherwise govern nothing.
+    fn sidebar_project_batch_ids(&self, project_id: &str) -> Vec<String> {
+        sidebar_project_batch_ids(self.sessions(), project_id)
+    }
+
+    /// Every session a folder row governs, at any depth.
+    fn sidebar_folder_batch_ids(&self, folder_id: &str) -> Vec<String> {
+        sidebar_folder_batch_ids(&self.sidebar_view.organization, self.sessions(), folder_id)
+    }
+
+    /// What a container's checkbox shows: all, none, or some of its sessions.
+    fn sidebar_batch_state(&self, ids: &[String]) -> SidebarBatchCheck {
+        if ids.is_empty() {
+            return SidebarBatchCheck::Unchecked;
+        }
+        let selected = ids
+            .iter()
+            .filter(|id| self.sidebar_state.selected_ids.contains(*id))
+            .count();
+        if selected == 0 {
+            SidebarBatchCheck::Unchecked
+        } else if selected == ids.len() {
+            SidebarBatchCheck::Checked
+        } else {
+            SidebarBatchCheck::Indeterminate
+        }
+    }
+
+    /// Checks every session a project or folder row governs, or clears them all
+    /// when every one is already checked.
+    ///
+    /// All-or-nothing, exactly as the desktop's container checkbox behaves: a
+    /// partial selection counts as unchecked, so the first tap completes it and
+    /// the second clears it. A selection outside the container is left alone,
+    /// which is what lets a reader build one out of several folders.
+    fn toggle_sidebar_batch_ids(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        if ids.is_empty() {
+            return;
+        }
+        let all_selected = ids
+            .iter()
+            .all(|id| self.sidebar_state.selected_ids.contains(id));
+        for id in ids {
+            if all_selected {
+                self.sidebar_state.selected_ids.remove(&id);
+            } else {
+                self.sidebar_state.selected_ids.insert(id);
+            }
+        }
+        cx.notify();
     }
 
     /// Asks before a batch delete. The single-session path always confirmed;
@@ -9445,6 +9533,24 @@ impl MobileApp {
         }
         let (project_id, workspace_id) = scope?;
         (members.len() >= 2).then_some((project_id, workspace_id, members))
+    }
+
+    /// Folds one live timeline item into the per-session waiting index.
+    ///
+    /// The desktop keeps the same index, and for the same reason: a permission
+    /// or elicitation request arrives while the provider turn is still open, so
+    /// it is the earliest reliable signal that the Agent stopped on the reader.
+    /// A resolution, or a new non-steer prompt, retires the session's entry.
+    /// Returns whether the index changed, so the caller knows to repaint.
+    fn track_pending_user_request(&mut self, event: &TimelineLiveEvent) -> bool {
+        track_pending_user_request(&mut self.pending_user_requests, event)
+    }
+
+    /// Whether the row for `session_id` should report that the Agent is parked
+    /// on the reader: its persisted state says so, or a request is still open
+    /// while the turn that raised it is running.
+    fn session_awaits_user_input(&self, session_id: &str, state: AgentSessionState) -> bool {
+        session_awaits_user_input(state, &self.pending_user_requests, session_id)
     }
 
     /// The hour a queued send still waits for, when the row reports one.
@@ -22395,6 +22501,55 @@ impl MobileApp {
             .child(icon)
     }
 
+    /// A batch-mode checkbox for a session row.
+    ///
+    /// A single session is never partially selected, so the row's own mark only
+    /// ever reads checked or unchecked; the tri-state is the container rows'.
+    fn sidebar_batch_checkbox(
+        id: impl Into<ElementId>,
+        label: &'static str,
+        state: SidebarBatchCheck,
+    ) -> gpui::Stateful<gpui::Div> {
+        let checked = state != SidebarBatchCheck::Unchecked;
+        div()
+            .id(id)
+            .aria_label(label.to_string())
+            .size(px(20.0))
+            .flex_shrink_0()
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(if checked {
+                theme::primary()
+            } else {
+                theme::border_default()
+            })
+            .bg(if checked {
+                theme::primary()
+            } else {
+                theme::bg_primary()
+            })
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(state == SidebarBatchCheck::Checked, |mark| {
+                mark.child(
+                    svg()
+                        .path("icons/check.svg")
+                        .size(px(14.0))
+                        .text_color(theme::primary_foreground()),
+                )
+            })
+            .when(state == SidebarBatchCheck::Indeterminate, |mark| {
+                mark.child(
+                    div()
+                        .w(px(10.0))
+                        .h(px(2.0))
+                        .rounded_full()
+                        .bg(theme::primary_foreground()),
+                )
+            })
+    }
+
     fn render_sidebar_folder_row(
         &self,
         row: &SidebarRow,
@@ -22452,6 +22607,8 @@ impl MobileApp {
             )
             .into_any_element()
         };
+        let folder_batch_ids = self.sidebar_folder_batch_ids(&folder_id);
+        let folder_batch_state = self.sidebar_batch_state(&folder_batch_ids);
         div()
             .id(format!("mobile-folder-row-{folder_id}"))
             .h_full()
@@ -22472,11 +22629,47 @@ impl MobileApp {
             }))
             .cursor_pointer()
             .active(|style| style.bg(theme::row_pressed_bg()))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| this.toggle_folder(folder_id.clone(), cx)),
-            )
-            .child(folder_icon)
+            .on_mouse_up(MouseButton::Left, {
+                let toggle_id = folder_id.clone();
+                cx.listener(move |this, _, _, cx| this.toggle_folder(toggle_id.clone(), cx))
+            })
+            // In batch mode the folder's leading slot becomes the checkbox that
+            // governs everything filed under it, the way the desktop swaps its
+            // folder mark for the selection control.
+            .when(self.sidebar_batch_mode, |row_element| {
+                let toggle_ids = folder_batch_ids.clone();
+                let enabled = !folder_batch_ids.is_empty();
+                row_element.child(
+                    div()
+                        // The same leading slot the folder mark occupied, so the
+                        // name holds its column when the mark swaps out.
+                        .size(px(theme::SIDEBAR_ICON_SLOT))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(!enabled, |slot| slot.opacity(0.38))
+                        .child(
+                            Self::sidebar_batch_checkbox(
+                                format!("mobile-folder-check-{folder_id}"),
+                                locale::text("Select folder", "选择文件夹", "選擇資料夾"),
+                                folder_batch_state,
+                            )
+                            .when(enabled, |checkbox| {
+                                checkbox.cursor_pointer().on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_sidebar_batch_ids(toggle_ids.clone(), cx);
+                                    }),
+                                )
+                            }),
+                        ),
+                )
+            })
+            .when(!self.sidebar_batch_mode, |row_element| {
+                row_element.child(folder_icon)
+            })
             .child(
                 div()
                     .flex_1()
@@ -22682,6 +22875,11 @@ impl MobileApp {
                 .agent
                 .supports(BackendOperation::AgentCreateSession)
         });
+        // The container checkbox speaks for every session the project owns, and
+        // in batch mode it replaces the project logo in the leading slot the way
+        // the desktop swaps its own mark for the selection control.
+        let project_batch_ids = self.sidebar_project_batch_ids(&project_id);
+        let project_batch_state = self.sidebar_batch_state(&project_batch_ids);
         div()
             .id(format!("mobile-project-row-{project_id}"))
             .h_full()
@@ -22698,17 +22896,51 @@ impl MobileApp {
             .active(|style| style.bg(theme::row_pressed_bg()))
             // The whole row is the expander, the way the desktop's is; the phone
             // simply has no hover state to reveal a separate chevron button.
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| this.toggle_project(project_id.clone(), cx)),
-            )
-            .child(Self::sidebar_icon_slot(
-                svg()
-                    .path(project_icon_path)
-                    .size(px(theme::SIDEBAR_PROJECT_LOGO_SIZE))
-                    .text_color(project_icon_color)
-                    .into_any_element(),
-            ))
+            .on_mouse_up(MouseButton::Left, {
+                let toggle_id = project_id.clone();
+                cx.listener(move |this, _, _, cx| this.toggle_project(toggle_id.clone(), cx))
+            })
+            .when(!self.sidebar_batch_mode, |row_element| {
+                row_element.child(Self::sidebar_icon_slot(
+                    svg()
+                        .path(project_icon_path)
+                        .size(px(theme::SIDEBAR_PROJECT_LOGO_SIZE))
+                        .text_color(project_icon_color)
+                        .into_any_element(),
+                ))
+            })
+            .when(self.sidebar_batch_mode, |row_element| {
+                let toggle_ids = project_batch_ids.clone();
+                let enabled = !project_batch_ids.is_empty();
+                row_element.child(
+                    div()
+                        // The checkbox stands in the same slot the project mark
+                        // occupied, so switching in and out of batch mode does
+                        // not shift the name.
+                        .size(px(theme::SIDEBAR_ICON_SLOT))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(!enabled, |slot| slot.opacity(0.38))
+                        .child(
+                            Self::sidebar_batch_checkbox(
+                                format!("mobile-project-check-{project_id}"),
+                                locale::text("Select project", "选择项目", "選擇專案"),
+                                project_batch_state,
+                            )
+                            .when(enabled, |checkbox| {
+                                checkbox.cursor_pointer().on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_sidebar_batch_ids(toggle_ids.clone(), cx);
+                                    }),
+                                )
+                            }),
+                        ),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -23051,6 +23283,10 @@ impl MobileApp {
             .state
             .or_else(|| session.map(|session| session.state))
             .unwrap_or(AgentSessionState::Idle);
+        // A request can open while the turn is still `Running`, so waiting is
+        // answered from the live index as well as from the persisted state; the
+        // row then says the same thing the timeline card does.
+        let awaiting_user = self.session_awaits_user_input(session_id.as_str(), session_state);
         // What the trailing column holds, resolved in one place. Every rule here
         // is a question about the whole column rather than about one mark — the
         // label and the hour share a slot, the pin takes the column, and a row
@@ -23059,6 +23295,7 @@ impl MobileApp {
         let scheduled_at_ms = self.scheduled_send_at(session_id.as_str(), session_state);
         let column = sidebar_session_column(
             session_state,
+            awaiting_user,
             row.pinned,
             row.unread,
             row.selected,
@@ -23209,39 +23446,16 @@ impl MobileApp {
                             .sidebar_state
                             .selected_ids
                             .contains(session_id.as_str());
-                        title.child(
-                            div()
-                                .id(format!("mobile-session-check-{}", row.id()))
-                                .aria_label(
-                                    locale::text("Select session", "选择会话", "選擇工作階段")
-                                        .to_string(),
-                                )
-                                .size(px(20.0))
-                                .flex_shrink_0()
-                                .rounded(px(4.0))
-                                .border_1()
-                                .border_color(if batch_selected {
-                                    theme::primary()
-                                } else {
-                                    theme::border_default()
-                                })
-                                .bg(if batch_selected {
-                                    theme::primary()
-                                } else {
-                                    theme::bg_primary()
-                                })
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .when(batch_selected, |mark| {
-                                    mark.child(
-                                        svg()
-                                            .path("icons/check.svg")
-                                            .size(px(14.0))
-                                            .text_color(theme::primary_foreground()),
-                                    )
-                                }),
-                        )
+                        let state = if batch_selected {
+                            SidebarBatchCheck::Checked
+                        } else {
+                            SidebarBatchCheck::Unchecked
+                        };
+                        title.child(Self::sidebar_batch_checkbox(
+                            format!("mobile-session-check-{}", row.id()),
+                            locale::text("Select session", "选择会话", "選擇工作階段"),
+                            state,
+                        ))
                     })
                     // The leading edge carries the Agent mark and nothing else,
                     // so a parent row and its child start from one column and the
@@ -23340,7 +23554,7 @@ impl MobileApp {
                         ))))
                     })
                     .when_some(column.label, |right, label| {
-                        right.child(sidebar_session_state_pill(label))
+                        right.child(sidebar_session_state_pill(label, column.label_attention))
                     })
                     .when(column.show_time, |right| {
                         right.child(
@@ -23872,6 +24086,10 @@ impl MobileApp {
                                 .h(px(theme::TOUCH_TARGET))
                                 .flex_shrink_0()
                                 .mx(px(theme::SPACING_MD))
+                                // A gap under the toolbar's rule, so the field
+                                // reads as its own control instead of a second
+                                // row welded to the header.
+                                .mt(px(theme::SPACING_SM))
                                 .mb(px(theme::SPACING_XS))
                                 .rounded(px(theme::RADIUS_CONTROL))
                                 .border_1()
@@ -23891,11 +24109,24 @@ impl MobileApp {
                                     div()
                                         .flex_1()
                                         .min_w_0()
-                                        .h_full()
+                                        // Centered rather than stretched: the
+                                        // Input carries its own fixed height, so
+                                        // a full-height child left it sitting at
+                                        // the top of the field.
+                                        .flex()
+                                        .items_center()
                                         .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                                         .child(
+                                            // The field sets its own type size:
+                                            // the kit's default is a rung below
+                                            // the tree it filters, which read as
+                                            // an afterthought beside it.
                                             Input::new(&self.sidebar_search_input)
-                                                .appearance(false),
+                                                .appearance(false)
+                                                .text_size(theme::font_sidebar_row())
+                                                .line_height(theme::line_height_for(
+                                                    theme::FONT_SIDEBAR_ROW,
+                                                )),
                                         ),
                                 )
                                 .child(
@@ -31368,6 +31599,152 @@ fn sidebar_workspace_status_color(state: Option<AgentSessionState>) -> gpui::Hsl
     }
 }
 
+/// Whether a row should report that the Agent is parked on the reader.
+///
+/// The persisted state parks a session in `NeedsInput` only once the authority
+/// writes it; a request that arrives while the provider turn is still open
+/// leaves the session `Running`, so the live request index is the tie-breaker.
+/// This is the desktop's own predicate, and it is the reason a row keeps asking
+/// after a permission card has appeared but before the state has settled.
+fn session_awaits_user_input(
+    state: AgentSessionState,
+    pending_user_requests: &BTreeMap<String, BTreeSet<String>>,
+    session_id: &str,
+) -> bool {
+    state == AgentSessionState::NeedsInput
+        || (state == AgentSessionState::Running && pending_user_requests.contains_key(session_id))
+}
+
+/// Folds one live timeline item into the per-session waiting index.
+///
+/// The desktop keeps the same index, and for the same reason: a permission or
+/// elicitation request arrives while the provider turn is still open, so it is
+/// the earliest reliable signal that the Agent stopped on the reader. A
+/// resolution, or a new non-steer prompt, retires the session's entry. Returns
+/// whether the index changed.
+fn track_pending_user_request(
+    pending: &mut BTreeMap<String, BTreeSet<String>>,
+    event: &TimelineLiveEvent,
+) -> bool {
+    use vibex_core::TimelinePayload;
+
+    let session_id = event.session_id.as_str().to_string();
+    match &event.item.payload {
+        TimelinePayload::PermissionRequest(request)
+            if request.status == vibex_core::PermissionRequestStatus::Pending =>
+        {
+            pending
+                .entry(session_id)
+                .or_default()
+                .insert(request.id.to_string())
+        }
+        TimelinePayload::ElicitationRequest(request)
+            if request.status == vibex_core::ElicitationRequestStatus::Pending =>
+        {
+            pending
+                .entry(session_id)
+                .or_default()
+                .insert(request.id.to_string())
+        }
+        TimelinePayload::PermissionResolution(resolution) => {
+            resolve_pending_user_request(pending, &session_id, resolution.request_id.as_str())
+        }
+        TimelinePayload::ElicitationResolution(resolution) => {
+            resolve_pending_user_request(pending, &session_id, resolution.request_id.as_str())
+        }
+        // A prompt typed past the card supersedes it; a steer joins the turn
+        // that is already running and supersedes nothing.
+        TimelinePayload::UserMessage(message)
+            if message.delivery != vibex_core::UserMessageDelivery::Steer =>
+        {
+            pending.remove(&session_id).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn resolve_pending_user_request(
+    pending: &mut BTreeMap<String, BTreeSet<String>>,
+    session_id: &str,
+    request_id: &str,
+) -> bool {
+    let Some(requests) = pending.get_mut(session_id) else {
+        return false;
+    };
+    let removed = requests.remove(request_id);
+    let now_empty = requests.is_empty();
+    if now_empty {
+        pending.remove(session_id);
+    }
+    removed
+}
+
+/// Every session a project row's batch checkbox governs.
+///
+/// Answered from the authoritative session list rather than from the visible
+/// projection: the checkbox speaks for the whole project, folded or not, and a
+/// collapsed project would otherwise govern nothing.
+fn sidebar_project_batch_ids(sessions: &[AgentSession], project_id: &str) -> Vec<String> {
+    sessions
+        .iter()
+        .filter(|session| {
+            session.deleted_at_ms.is_none() && session.project_id.as_str() == project_id
+        })
+        .map(|session| session.id.as_str().to_string())
+        .collect()
+}
+
+/// Every session a folder row's batch checkbox governs, at any depth.
+///
+/// A folder owns the items placed directly inside it, the sessions of the
+/// groups it holds, and the sessions of any project filed under it, so the walk
+/// descends the same placement tree the desktop builds. A folder never reaches
+/// a session that is filed outside it.
+fn sidebar_folder_batch_ids(
+    organization: &vibex_desktop_model::SidebarOrganizationState,
+    sessions: &[AgentSession],
+    folder_id: &str,
+) -> Vec<String> {
+    let mut children = BTreeMap::<String, Vec<SidebarOrganizationItem>>::new();
+    for placement in &organization.placements {
+        if let Some(parent) = &placement.parent_folder_id {
+            children
+                .entry(parent.clone())
+                .or_default()
+                .push(placement.item.clone());
+        }
+    }
+    let mut governed = BTreeSet::new();
+    let mut pending = vec![folder_id.to_string()];
+    let mut seen = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        for item in children.get(&id).into_iter().flatten() {
+            match item {
+                SidebarOrganizationItem::Folder(child) => {
+                    pending.push(child.clone());
+                }
+                SidebarOrganizationItem::Project(project_id) => {
+                    governed.extend(sidebar_project_batch_ids(sessions, project_id));
+                }
+                // A group answers for its members, which sit under its own row
+                // wherever that row is placed.
+                SidebarOrganizationItem::Group(group_id) => {
+                    if let Some(group) = organization.groups.get(group_id) {
+                        governed.extend(group.member_session_ids.iter().cloned());
+                    }
+                }
+                SidebarOrganizationItem::Session(session_id) => {
+                    governed.insert(session_id.clone());
+                }
+            }
+        }
+    }
+    governed.into_iter().collect()
+}
+
 /// Where a Worktree stands, in the desktop's own words.
 fn sidebar_worktree_lifecycle_label(state: WorktreeLifecycleDisplayState) -> &'static str {
     use WorktreeLifecycleDisplayState as State;
@@ -31674,11 +32051,13 @@ fn sidebar_attention_glyph(id: ElementId) -> gpui::AnyElement {
 /// A session that is still starting up and one that has been filed away are the
 /// two states where the mark alone is ambiguous — the same pulse as a working
 /// session, the same grey dot as a closed one — so they are the two the phone
-/// writes out. Everything else is answered by its mark: the question mark for a
-/// session parked on the user, the danger dot for a failed one, the pulse for a
-/// working one. That is the same gate the desktop's column applies.
+/// writes out. A session parked on the reader is written out too: the question
+/// mark says something is being asked, but the phone has no tooltip to say what
+/// it is waiting for, and "waiting for you" is the one state where the reader is
+/// the blocker. Everything else is answered by its mark.
 fn sidebar_session_state_label(state: AgentSessionState) -> Option<&'static str> {
     match state {
+        AgentSessionState::NeedsInput => Some(locale::text("WAITING", "等待输入", "等待輸入")),
         AgentSessionState::Initializing => Some(locale::text("INIT", "初始化", "初始化")),
         AgentSessionState::Archived => Some(locale::text("ARCHIVED", "已归档", "已封存")),
         _ => None,
@@ -31690,7 +32069,7 @@ fn sidebar_session_state_label(state: AgentSessionState) -> Option<&'static str>
 /// It is the desktop's pill at the phone's own scale: one quiet plate the height
 /// of the metadata line, so a labelled row never grows taller than its
 /// neighbours.
-fn sidebar_session_state_pill(label: &'static str) -> gpui::AnyElement {
+fn sidebar_session_state_pill(label: &'static str, attention: bool) -> gpui::AnyElement {
     div()
         .h(px(16.0))
         .flex_shrink_0()
@@ -31700,7 +32079,11 @@ fn sidebar_session_state_pill(label: &'static str) -> gpui::AnyElement {
         .items_center()
         .text_size(theme::font_micro())
         .bg(theme::bg_card_dim())
-        .text_color(theme::sidebar_text_muted())
+        .text_color(if attention {
+            theme::accent_yellow()
+        } else {
+            theme::sidebar_text_muted()
+        })
         .child(label)
         .into_any_element()
 }
@@ -31810,6 +32193,9 @@ struct SidebarSessionColumn {
     show_attention: bool,
     /// The state in words, when a mark cannot carry it.
     label: Option<&'static str>,
+    /// Whether those words are the call to action, so they wear the attention
+    /// colour rather than the quiet plate.
+    label_attention: bool,
     /// The hour, in the slot the words would take.
     show_time: bool,
     show_unread: bool,
@@ -31831,13 +32217,13 @@ struct SidebarSessionColumn {
 /// admitted for the states that can still send.
 fn sidebar_session_column(
     state: AgentSessionState,
+    awaiting_user: bool,
     pinned: bool,
     unread: bool,
     selected: bool,
     auto_continue_paused: bool,
     scheduled: bool,
 ) -> SidebarSessionColumn {
-    let awaiting_user = state == AgentSessionState::NeedsInput;
     let has_error = state == AgentSessionState::Error;
     let working = matches!(
         state,
@@ -31848,11 +32234,18 @@ fn sidebar_session_column(
     let has_unread_completion = unread && !selected;
     // A session that is still starting up, or one that has been filed away,
     // wears its state in words: neither a pulse nor a dot says which of the two
-    // it is. A pinned row keeps only its pin, which is the whole slot the
-    // desktop yields to it.
-    // A queued send is the row's posture while it waits, so it takes the state
-    // words with it: the row is not starting up, it is waiting on the clock.
-    let label = sidebar_session_state_label(state).filter(|_| !pinned && !scheduled);
+    // it is. A session parked on the reader wears them too, whether the parking
+    // is persisted or only visible in the live request index — the phone has no
+    // tooltip, so the mark alone would leave "what is it waiting for" unanswered.
+    // A pinned row keeps only its pin, which is the whole slot the desktop
+    // yields to it, and a queued send is the row's posture while it waits, so it
+    // takes the state words with it.
+    let label = if awaiting_user {
+        sidebar_session_state_label(AgentSessionState::NeedsInput)
+    } else {
+        sidebar_session_state_label(state)
+    }
+    .filter(|_| !pinned && !scheduled);
     SidebarSessionColumn {
         // The mark answers every state but the three that own one: the question
         // mark, the unread dot, and the danger dot. A queued send answers with
@@ -31864,6 +32257,9 @@ fn sidebar_session_column(
             && state != AgentSessionState::Idle,
         show_attention: awaiting_user,
         label,
+        // The waiting words carry the same yellow as the question mark beside
+        // them; every other label stays on the quiet plate.
+        label_attention: awaiting_user,
         // The words and the hour share the slot, and a row that is working,
         // waiting on the reader, unread, failed, suspended, or pinned does not
         // also report an hour.
@@ -38148,15 +38544,18 @@ fn session_opened(cx: &mut Context<Self>) {
         assert_eq!(sidebar_activity_cycle(), Duration::from_millis(800));
     }
 
-    /// The two states a mark cannot carry are the two that get words.
+    /// The states a mark cannot carry on its own are the ones that get words.
+    ///
+    /// Waiting is among them: the question mark says something is being asked,
+    /// but the phone has no tooltip to say what, so the state is written out.
     #[test]
     fn the_sidebar_state_label_names_the_ambiguous_states() {
         assert!(sidebar_session_state_label(AgentSessionState::Initializing).is_some());
         assert!(sidebar_session_state_label(AgentSessionState::Archived).is_some());
+        assert!(sidebar_session_state_label(AgentSessionState::NeedsInput).is_some());
         for state in [
             AgentSessionState::Idle,
             AgentSessionState::Running,
-            AgentSessionState::NeedsInput,
             AgentSessionState::Error,
             AgentSessionState::Closed,
         ] {
@@ -38188,13 +38587,21 @@ fn session_opened(cx: &mut Context<Self>) {
     /// hour it was pinned for.
     #[test]
     fn a_pinned_row_reports_its_pin_alone() {
-        let idle =
-            sidebar_session_column(AgentSessionState::Idle, true, false, false, false, false);
+        let idle = sidebar_session_column(
+            AgentSessionState::Idle,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(!idle.show_time, "a pinned row keeps no timestamp");
         assert_eq!(idle.label, None);
 
         let starting = sidebar_session_column(
             AgentSessionState::Initializing,
+            false,
             true,
             false,
             false,
@@ -38211,12 +38618,27 @@ fn session_opened(cx: &mut Context<Self>) {
     /// The session the reader has open is never marked unread.
     #[test]
     fn an_open_session_is_never_marked_unread() {
-        let closed =
-            sidebar_session_column(AgentSessionState::Idle, false, true, false, false, false);
+        let closed = sidebar_session_column(
+            AgentSessionState::Idle,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
         assert!(closed.show_unread);
         assert!(!closed.show_time, "the unread dot takes the hour's slot");
 
-        let open = sidebar_session_column(AgentSessionState::Idle, false, true, true, false, false);
+        let open = sidebar_session_column(
+            AgentSessionState::Idle,
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+        );
         assert!(
             !open.show_unread,
             "an open session has been read by the fact of being open"
@@ -38227,23 +38649,44 @@ fn session_opened(cx: &mut Context<Self>) {
     /// A suspended session shows the pause mark instead of an hour.
     #[test]
     fn a_suspended_session_reports_the_pause_and_no_hour() {
-        let paused =
-            sidebar_session_column(AgentSessionState::Idle, false, false, false, true, false);
+        let paused = sidebar_session_column(
+            AgentSessionState::Idle,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
         assert!(paused.show_paused);
         assert!(
             !paused.show_time,
             "a suspended row is not waiting on the clock"
         );
 
-        let working =
-            sidebar_session_column(AgentSessionState::Running, false, false, false, true, false);
+        let working = sidebar_session_column(
+            AgentSessionState::Running,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
         assert!(
             working.show_status && working.show_paused,
             "a working session that is suspended reports both"
         );
 
-        let plain =
-            sidebar_session_column(AgentSessionState::Idle, false, false, false, false, false);
+        let plain = sidebar_session_column(
+            AgentSessionState::Idle,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(!plain.show_paused);
         assert!(plain.show_time);
     }
@@ -38252,7 +38695,7 @@ fn session_opened(cx: &mut Context<Self>) {
     #[test]
     fn the_states_with_words_take_the_hour_slot() {
         for state in [AgentSessionState::Initializing, AgentSessionState::Archived] {
-            let column = sidebar_session_column(state, false, false, false, false, false);
+            let column = sidebar_session_column(state, false, false, false, false, false, false);
             assert!(column.label.is_some(), "{state:?} wears its state in words");
             assert!(!column.show_time, "{state:?} does not also report an hour");
             assert!(column.show_status, "{state:?} keeps its mark too");
@@ -38260,14 +38703,23 @@ fn session_opened(cx: &mut Context<Self>) {
 
         // A closed session has a mark and an hour, which is what tells it apart
         // from an archived one.
-        let closed =
-            sidebar_session_column(AgentSessionState::Closed, false, false, false, false, false);
+        let closed = sidebar_session_column(
+            AgentSessionState::Closed,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(closed.label, None);
         assert!(closed.show_status && closed.show_time);
 
-        // The two states that own a mark report nothing else.
+        // A parked session owns the question mark and now says what it is
+        // waiting for in words as well, because the phone has no tooltip.
         let waiting = sidebar_session_column(
             AgentSessionState::NeedsInput,
+            true,
             false,
             false,
             false,
@@ -38275,10 +38727,39 @@ fn session_opened(cx: &mut Context<Self>) {
             false,
         );
         assert!(waiting.show_attention);
-        assert!(!waiting.show_status && !waiting.show_time && waiting.label.is_none());
+        assert!(waiting.label_attention);
+        assert!(
+            waiting.label.is_some(),
+            "the waiting state is written out, not left to the glyph alone"
+        );
+        assert!(!waiting.show_status && !waiting.show_time);
 
-        let failed =
-            sidebar_session_column(AgentSessionState::Error, false, false, false, false, false);
+        // A request can open while the turn is still running, so the caller can
+        // ask for the attention column without the persisted state saying so.
+        let live_request = sidebar_session_column(
+            AgentSessionState::Running,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(
+            live_request.show_attention && !live_request.show_status,
+            "a live request outranks the working pulse"
+        );
+        assert!(!live_request.show_time, "and it takes the hour's slot");
+
+        let failed = sidebar_session_column(
+            AgentSessionState::Error,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(failed.show_error);
         assert!(!failed.show_status && !failed.show_time && failed.label.is_none());
     }
@@ -38381,12 +38862,91 @@ fn session_opened(cx: &mut Context<Self>) {
         );
     }
 
+    /// A live request parks the row even before the persisted state catches up,
+    /// and an answer or a new prompt releases it.
+    #[test]
+    fn a_live_request_holds_the_waiting_state_until_it_is_answered() {
+        fn live(sequence: i64, payload: TimelinePayload) -> TimelineLiveEvent {
+            TimelineLiveEvent {
+                session_id: VibexSessionId::parse("session_waiting").unwrap(),
+                sequence,
+                item: TimelineItem {
+                    id: vibex_core::TimelineItemId::new(),
+                    session_id: VibexSessionId::parse("session_waiting").unwrap(),
+                    sequence,
+                    timestamp_ms: sequence,
+                    source: TimelineSource::Agent,
+                    kind: payload.kind(),
+                    correlation_id: None,
+                    provider_correlation_id: None,
+                    redaction_state: TimelineRedactionState::None,
+                    execution_attribution: None,
+                    payload_depth: vibex_core::TimelinePayloadDepth::Detail,
+                    payload,
+                },
+            }
+        }
+
+        let request_id = RequestId::new();
+        let request = live(
+            1,
+            TimelinePayload::PermissionRequest(vibex_core::PermissionRequest {
+                id: request_id.clone(),
+                session_id: VibexSessionId::parse("session_waiting").unwrap(),
+                project_id: None,
+                workspace_id: None,
+                provider_request_id: None,
+                risk_category: PermissionRiskCategory::Command,
+                title: "Run a command".into(),
+                details: Vec::new(),
+                allowed_responses: vec![PermissionResponseKind::Approve],
+                response_options: Vec::new(),
+                status: vibex_core::PermissionRequestStatus::Pending,
+                requested_at_ms: 1,
+                expires_at_ms: None,
+            }),
+        );
+
+        let mut pending = BTreeMap::new();
+        assert!(track_pending_user_request(&mut pending, &request));
+        assert!(
+            session_awaits_user_input(AgentSessionState::Running, &pending, "session_waiting"),
+            "a request that arrived while the turn is running still parks the row"
+        );
+        assert!(
+            !session_awaits_user_input(AgentSessionState::Idle, &pending, "session_waiting"),
+            "a settled session is not waiting on anything"
+        );
+
+        // A resolution retires the request and the row stops asking.
+        let resolution = live(
+            2,
+            TimelinePayload::PermissionResolution(vibex_core::PermissionResolution {
+                request_id,
+                session_id: VibexSessionId::parse("session_waiting").unwrap(),
+                response: PermissionResponseKind::Approve,
+                responder_device_id: None,
+                provider_resolution_id: None,
+                note: None,
+                resolved_at_ms: 2,
+            }),
+        );
+        assert!(track_pending_user_request(&mut pending, &resolution));
+        assert!(pending.is_empty());
+        assert!(!session_awaits_user_input(
+            AgentSessionState::Running,
+            &pending,
+            "session_waiting"
+        ));
+    }
+
     /// A queued send takes the state words and the hour, and answers with a
     /// clock.
     #[test]
     fn a_queued_send_takes_the_state_words_and_the_hour() {
         let starting = sidebar_session_column(
             AgentSessionState::Initializing,
+            false,
             false,
             false,
             false,
@@ -38409,20 +38969,41 @@ fn session_opened(cx: &mut Context<Self>) {
 
         // A failed session keeps its own dot beside the clock: the row reports
         // both what it is and what happens next.
-        let failed =
-            sidebar_session_column(AgentSessionState::Error, false, false, false, false, true);
+        let failed = sidebar_session_column(
+            AgentSessionState::Error,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
         assert!(failed.show_scheduled && failed.show_error);
         assert!(!failed.show_time, "a failure takes no countdown with it");
 
         // A pinned row keeps the clock and yields the text slot to its pin.
-        let pinned =
-            sidebar_session_column(AgentSessionState::Idle, true, false, false, false, true);
+        let pinned = sidebar_session_column(
+            AgentSessionState::Idle,
+            false,
+            true,
+            false,
+            false,
+            false,
+            true,
+        );
         assert!(pinned.show_scheduled);
         assert!(!pinned.show_time);
 
         // Without a queued send the column is what it always was.
-        let plain =
-            sidebar_session_column(AgentSessionState::Idle, false, false, false, false, false);
+        let plain = sidebar_session_column(
+            AgentSessionState::Idle,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(!plain.show_scheduled);
         assert!(plain.show_time);
     }
@@ -38484,6 +39065,84 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             sheet.contains("SetSessionAutoContinuePaused"),
             "which lifts the suspension on the authority"
+        );
+    }
+
+    /// A container row's checkbox governs every session the container shows:
+    /// the whole project for a project row, and for a folder the sessions of
+    /// every group and project filed anywhere beneath it.
+    #[test]
+    fn container_batch_ids_cover_everything_the_row_governs() {
+        use vibex_desktop_model::SidebarOrganizationState;
+
+        fn session(id: &str, project_id: &str) -> AgentSession {
+            AgentSession {
+                id: VibexSessionId::parse(id).expect("valid session id"),
+                title: id.to_string(),
+                project_id: vibex_core::ProjectId::parse(project_id).expect("valid project"),
+                workspace_id: vibex_core::WorkspaceId::parse("workspace_a")
+                    .expect("valid workspace"),
+                workspace_root: "/tmp/a".to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                agent_id: AgentId::parse("claude").expect("valid agent id"),
+                state: AgentSessionState::Idle,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                last_message_at_ms: 0,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            }
+        }
+
+        let sessions = vec![
+            session("session_a", "project_a"),
+            session("session_b", "project_a"),
+            session("session_c", "project_a"),
+            session("session_other", "project_b"),
+        ];
+
+        // A project answers with its own sessions and no one else's.
+        assert_eq!(
+            sidebar_project_batch_ids(&sessions, "project_a"),
+            vec!["session_a", "session_b", "session_c"]
+        );
+
+        // A root folder holding project_a governs that project's sessions; a
+        // session filed under a second project is not reached.
+        let mut organization = SidebarOrganizationState::default();
+        assert!(organization.create_folder("folder_root", "Root", None, None));
+        organization
+            .placements
+            .push(vibex_desktop_model::SidebarOrganizationPlacement {
+                item: SidebarOrganizationItem::Project("project_a".into()),
+                parent_folder_id: Some("folder_root".into()),
+            });
+        let mut governed = sidebar_folder_batch_ids(&organization, &sessions, "folder_root");
+        governed.sort();
+        assert_eq!(governed, vec!["session_a", "session_b", "session_c"]);
+        assert!(
+            !governed.contains(&"session_other".to_string()),
+            "a folder never reaches a session filed outside it"
+        );
+
+        // A project-scoped folder owns the groups filed inside it, and answers
+        // through their membership rather than only through placements.
+        assert!(organization.create_folder("folder_a", "A", Some("project_a".into()), None,));
+        let session_workspaces =
+            BTreeMap::from([("session_c".to_string(), "workspace_a".to_string())]);
+        assert!(organization.create_group(
+            "group_one",
+            "Group",
+            "project_a",
+            "workspace_a",
+            &["session_c".to_string()],
+            &session_workspaces,
+            Some("folder_a".into()),
+        ));
+        assert_eq!(
+            sidebar_folder_batch_ids(&organization, &sessions, "folder_a"),
+            vec!["session_c"]
         );
     }
 
