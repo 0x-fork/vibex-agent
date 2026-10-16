@@ -883,6 +883,110 @@ fn the_prompt_names_the_account_the_runtime_runs_on() {
     );
 }
 
+/// The Agent is a face on the line under the composer rather than a word: the
+/// mark the session list and the switcher already wear for the same Agent, in
+/// the place the name used to be. The account and the model beside it stay the
+/// words a mark cannot say.
+///
+/// The name is what a terminal that cannot hold a picture keeps — the subject of
+/// `the_prompt_names_the_runtime_the_session_is_on` — so the two are one fact
+/// said two ways rather than a picture and a caption.
+#[test]
+fn the_prompt_wears_the_agents_mark_where_the_terminal_can_draw_one() {
+    use vibex_tui::terminal_image::{ImageProtocol, ImageSupport};
+    let mut app = app(140, 40);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.terminal_images = ImageSupport::forced(ImageProtocol::Kitty);
+    let catalog = run_option_catalog();
+    let desired = catalog.options[1].selection.clone();
+    app.runtime_options = Some(catalog);
+    open_session_on(&mut app, desired);
+
+    let lines = render(&mut app, 140, 40);
+    let screen = text(&lines);
+    let info_row = lines
+        .iter()
+        .find(|line| line.contains("gpt-5"))
+        .unwrap_or_else(|| panic!("the info line is on screen:\n{screen}"));
+    assert!(
+        !info_row.contains("codex"),
+        "the info line spelled out the Agent its own mark says: {info_row:?}"
+    );
+    // The name's columns are the mark's: the line reserves the two cells the
+    // picture covers where the name began, and the facts start after them.
+    let band = app
+        .regions
+        .composer_band
+        .expect("the composer is on screen");
+    // The box's edge, then the cell the caption is inset by under it.
+    let line_starts = usize::from(band.x) + 2;
+    let mark_width = usize::from(vibex_tui::row_marks::MARK_COLS);
+    assert_eq!(
+        &info_row[line_starts..line_starts + mark_width],
+        " ".repeat(mark_width),
+        "the mark's cells are not where the name was: {info_row:?}"
+    );
+    assert!(
+        info_row[line_starts + mark_width..].starts_with(" · bal · gpt-5"),
+        "the facts beside the mark moved: {:?}",
+        &info_row[line_starts + mark_width..]
+    );
+    // And the picture is really on the terminal: a picture's identity is not in
+    // the escapes, so the pool is what says which marks a frame wanted.
+    let held = app.row_marks.held_labels();
+    assert!(
+        held.iter()
+            .any(|label| label.starts_with("agent:") && label.contains("codex")),
+        "the info line did not want the Agent's mark: {held:?}"
+    );
+    assert!(
+        app.row_marks.is_holding(),
+        "the mark's cells were reserved but nothing was placed:\n{screen}"
+    );
+}
+
+/// The composing page wears the mark of the Agent a message written here would
+/// go through — the entry a creation would carry — and never the mark of the
+/// session behind the page, which the reader is leaving. The same rule the words
+/// beside it follow, because the two are one answer drawn twice.
+#[test]
+fn the_composing_prompt_wears_the_mark_of_the_entry_it_would_create_with() {
+    use vibex_tui::terminal_image::{ImageProtocol, ImageSupport};
+    let mut app = app(140, 40);
+    let catalog = run_option_catalog();
+    let desired = catalog.options[1].selection.clone();
+    app.runtime_options = Some(catalog);
+    // A session on the *other* Agent is open behind the page: the mark the page
+    // owes the reader is the one a creation would use, never this one.
+    open_session_on(&mut app, desired);
+    app.navigate_to(Page::NewSession);
+    app.terminal_images = ImageSupport::forced(ImageProtocol::Kitty);
+
+    let lines = render(&mut app, 140, 40);
+    let screen = text(&lines);
+    // The account is the line's own: the page above it names the Agent and the
+    // model on its setup row, and never the account.
+    let info_row = lines
+        .iter()
+        .find(|line| line.contains("bal · claude-sonnet"))
+        .unwrap_or_else(|| panic!("the info line is on screen:\n{screen}"));
+    assert!(
+        info_row.contains("· bal · claude-sonnet"),
+        "the info line lost the account or the model: {info_row:?}"
+    );
+    let held = app.row_marks.held_labels();
+    assert!(
+        held.iter()
+            .any(|label| label.starts_with("agent:") && label.contains("claude")),
+        "the composing page did not want the mark of the entry a creation would use: {held:?}"
+    );
+    assert!(
+        !held.iter().any(|label| label.contains("codex")),
+        "the composing page wore the mark of the session behind it: {held:?}"
+    );
+}
+
 /// A catalogue whose second entry publishes run options: a thinking ladder, a
 /// conversation mode, and a switch.
 fn run_option_catalog() -> vibex_core::SessionRuntimeOptionCatalog {
@@ -1087,8 +1191,9 @@ fn a_pinned_row_wears_its_agents_mark_where_the_terminal_can_draw_one() {
     let lines = render(&mut app, 140, 40);
     let screen = text(&lines);
     // The pinned row is the one inside the modal that carries the account and
-    // the model: the line under the composer names the Agent in words, which is
-    // exactly what this row no longer does.
+    // the model: the line under the composer says the Agent with the mark the
+    // row would otherwise have to repeat, and this row says it with the mark
+    // alone.
     let row = lines
         .iter()
         .find(|line| line.contains('│') && line.contains("bal · gpt-5"))
@@ -5809,9 +5914,16 @@ fn a_settled_turns_fold_names_the_agent_that_worked() {
     );
     let screen = text(&render(&mut app, 110, 40));
     assert!(screen.contains("Worked for"), "{screen}");
+    // The mark is the turn's own Agent — the two rows named codex — and the
+    // page's line under the composer has no Agent to wear, so a picture on the
+    // terminal can only be this one.
     assert!(
-        app.row_marks.is_holding(),
-        "the fold's title carries no Agent mark:\n{screen}"
+        app.row_marks
+            .held_labels()
+            .iter()
+            .any(|label| label == "agent:codex"),
+        "the fold's title carries no Agent mark: {:?}\n{screen}",
+        app.row_marks.held_labels()
     );
 }
 

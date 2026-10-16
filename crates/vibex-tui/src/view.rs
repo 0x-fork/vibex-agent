@@ -4895,11 +4895,13 @@ fn render_history_search(
 /// The runtime is named in full — the Agent, the account it will run on and the
 /// model — because an entry the reader picked in the picker is one of those
 /// three names, and a line that answered with two of them would leave the
-/// reader to remember which Provider Profile they chose.
+/// reader to remember which Provider Profile they chose. The Agent is drawn as
+/// its brand mark where the terminal can hold a picture and named where it
+/// cannot: the same fact, said the way that terminal can say it.
 fn render_composer_info(
     frame: &mut Frame<'_>,
     area: Rect,
-    app: &App,
+    app: &mut App,
     theme: &TuiTheme,
     strings: Strings,
 ) {
@@ -4907,7 +4909,21 @@ fn render_composer_info(
         return;
     }
     let (agent, model) = app.drawn_runtime_parts();
-    let mut left = vec![Span::styled(agent, theme.muted())];
+    // The identity is read from the page rather than from the drawn name, which
+    // is mid-transition noise on the frames after a switch: a mark matched
+    // against that would blink out exactly when the reader changed Agent.
+    let mark = composer_agent_mark(app, area, theme);
+    // The mark's cells are painted blank rather than left untouched, so nothing
+    // shows through around it: a picture sits above the text layer, not instead
+    // of it. A terminal that cannot hold one, and an Agent without a mark, keep
+    // the name — which is the other way of saying the same thing, never a blank
+    // column.
+    let mut left = match &mark {
+        Some(_) => vec![Span::raw(
+            " ".repeat(usize::from(crate::row_marks::MARK_COLS)),
+        )],
+        None => vec![Span::styled(agent, theme.muted())],
+    };
     // The account the message will run on sits between the Agent and the model,
     // which is the order the picker names an entry in: an Agent reached through
     // a Provider Profile is a different runtime from the same Agent on its own
@@ -4949,6 +4965,39 @@ fn render_composer_info(
         ));
     }
     render_zoned_line(frame, area, left, None, Vec::new());
+    // The mark goes where the Agent's name would have started, which is what
+    // "instead of the name" means for a picture: the same place, drawn, not
+    // written. It is *asked* for rather than placed, because the page draws
+    // before the frame knows what a modal covers and a picture cannot be covered
+    // once the terminal holds it.
+    if let Some(identity) = mark {
+        app.row_marks.want(
+            &app.terminal_images,
+            &crate::row_marks::Mark::Agent(identity),
+            crate::theme::color_rgb(theme.roles.foreground),
+            Rect {
+                width: crate::row_marks::MARK_COLS,
+                height: crate::row_marks::MARK_ROWS,
+                ..area
+            },
+        );
+    }
+}
+
+/// The Agent mark the composer's info line wants drawn, when there is one.
+///
+/// `None` is the caller's signal to name the Agent instead, which is the answer
+/// a terminal that cannot hold a picture, an Agent with no mark, and a line too
+/// narrow to seat one all get.
+fn composer_agent_mark(app: &App, area: Rect, theme: &TuiTheme) -> Option<String> {
+    if area.width < crate::row_marks::MARK_COLS {
+        return None;
+    }
+    drawable_agent_mark(
+        app.composer_agent_identity(),
+        app.terminal_images.supports_pixels(),
+        theme,
+    )
 }
 
 /// The completion popup, drawn directly above the composer.
@@ -10950,28 +10999,37 @@ fn runtime_picker_heading_line(
     (selected_line(spans, selected, width, theme), mark)
 }
 
-/// The Agent mark a catalogue row wants drawn, when there is one to want.
+/// The Agent mark an identity wants drawn, when there is one to want.
 ///
-/// Two conditions, and neither is the row's to answer: the terminal has to be
-/// able to hold a picture, and the Agent has to have a mark. `None` is the
-/// caller's signal to keep the Agent's name, which is always known — a mark that
-/// resolved to four pixels of half block would be a worse answer than the word
-/// it replaced, and a themed mark with no theme colour has nothing to draw in.
+/// Two conditions, and neither is the caller's to answer: the terminal has to be
+/// able to hold a picture, and the identity has to name an Agent with a mark.
+/// `None` is the caller's signal to keep the Agent's name, which is always
+/// known — a mark that resolved to four pixels of half block would be a worse
+/// answer than the word it replaced, and a themed mark with no theme colour has
+/// nothing to draw in.
+fn drawable_agent_mark(identity: String, pictures: bool, theme: &TuiTheme) -> Option<String> {
+    if !pictures {
+        return None;
+    }
+    vibex_brands::agent_mark(&identity)
+        .filter(|mark| {
+            !mark.uses_current_color || crate::theme::color_rgb(theme.roles.foreground).is_some()
+        })
+        .map(|_| identity)
+}
+
+/// The Agent mark a catalogue row wants drawn, when there is one to want.
 fn agent_mark_identity(
     app: &App,
     agent_id: &vibex_core::AgentId,
     label: &str,
     theme: &TuiTheme,
 ) -> Option<String> {
-    if !app.terminal_images.supports_pixels() {
-        return None;
-    }
-    let identity = app.agent_identity(agent_id, label);
-    vibex_brands::agent_mark(&identity)
-        .filter(|mark| {
-            !mark.uses_current_color || crate::theme::color_rgb(theme.roles.foreground).is_some()
-        })
-        .map(|_| identity)
+    drawable_agent_mark(
+        app.agent_identity(agent_id, label),
+        app.terminal_images.supports_pixels(),
+        theme,
+    )
 }
 
 /// One entry: its account and model, and what it says about itself.

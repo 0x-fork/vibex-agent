@@ -1914,6 +1914,24 @@ impl Banner {
     }
 }
 
+/// The runtime a page's next message would go through, as the surfaces under
+/// the composer draw it.
+///
+/// The Agent is one fact said two ways — its name, and the brand mark that
+/// stands for it — so the two come from one projection rather than from two
+/// reads on demand. A mark read from somewhere else than the words beside it is
+/// how the line under the composer would end up showing one Agent's face next
+/// to another one's model.
+struct ComposerRuntime {
+    /// The Agent's display name, or its id when the catalogue does not hold it.
+    agent: String,
+    /// The string [`vibex_brands::agent_mark`] is asked for, empty when the page
+    /// has no Agent to name at all.
+    identity: String,
+    /// The model's display name, empty while the runtime has not reported one.
+    model: String,
+}
+
 impl App {
     /// Build an app around an already-constructed backend facade.
     pub fn new(facade: BackendFacade, options: AppOptions) -> Self {
@@ -2639,28 +2657,56 @@ impl App {
     /// Agent the message would not go through. A choice the reader has tuned
     /// with a run option is still named by the entry it belongs to.
     ///
-    /// The composing page has no session to fall back to either: when it holds
-    /// no choice — a catalogue that has not arrived, or one that publishes
-    /// nothing — it names the entry a creation with no choice would use, says it
-    /// is loading while the read is still on its way, or says the runtime is
+    /// The Agent's brand mark is the same answer ([`Self::composer_agent_identity`]),
+    /// because the line under the composer draws one or the other.
+    pub fn composer_runtime_labels(&self) -> (String, String) {
+        let runtime = self.composer_runtime();
+        (runtime.agent, runtime.model)
+    }
+
+    /// The Agent a message from this page will be sent through, as the string
+    /// its brand mark is matched against.
+    ///
+    /// Read from the same projection as the name beside it
+    /// ([`Self::composer_runtime_labels`]), which is the whole point: the line
+    /// under the composer draws the mark *in place of* the name, so a mark read
+    /// separately from the words is how the two would come to describe different
+    /// Agents. Empty when the page has no Agent to name.
+    pub fn composer_agent_identity(&self) -> String {
+        self.composer_runtime().identity
+    }
+
+    /// The runtime this page's next message would go through: the Agent's name,
+    /// the string its brand mark is matched against, and the model.
+    ///
+    /// The composing page has no session to fall back to: when it holds no
+    /// choice — a catalogue that has not arrived, or one that publishes nothing
+    /// — it names the entry a creation with no choice would use, says it is
+    /// loading while the read is still on its way, or says the runtime is
     /// unavailable when the catalogue has none to name. Naming the session
     /// behind the page here is what made the page claim codex while the creation
     /// used the catalogue's default.
-    pub fn composer_runtime_labels(&self) -> (String, String) {
+    fn composer_runtime(&self) -> ComposerRuntime {
         if let Some(selection) = self.page_runtime_selection() {
             if let Some(option) = self.runtime_option_for(&selection) {
-                return (option.agent_label.clone(), option.model_label.clone());
+                return ComposerRuntime {
+                    agent: option.agent_label.clone(),
+                    identity: self.agent_identity(&option.selection.agent_id, &option.agent_label),
+                    model: option.model_label.clone(),
+                };
             }
             // The catalogue no longer publishes this selection (an Agent that
-            // has since gone away): its own words still name it.
-            return (
-                selection.agent_id.to_string(),
-                selection
+            // has since gone away): its own words still name it, and an id the
+            // catalogue does not hold is all the mark has to be matched against.
+            return ComposerRuntime {
+                agent: selection.agent_id.to_string(),
+                identity: self.agent_identity(&selection.agent_id, ""),
+                model: selection
                     .model
                     .model_id()
                     .map(str::to_string)
                     .unwrap_or_default(),
-            );
+            };
         }
         // A page showing a session whose runtime state has not arrived yet — or
         // the row the list holds for it — still names the Agent it records. No
@@ -2672,26 +2718,40 @@ impl App {
                     .and_then(|session_id| self.session_by_id(session_id))
             })
         {
-            return (session.agent_id.to_string(), String::new());
+            return ComposerRuntime {
+                agent: session.agent_id.to_string(),
+                // The catalogue's label for the Agent is what the mark was
+                // matched against when the list drew the same session, so this
+                // is the same face the reader has already seen on its row.
+                identity: self.session_agent_identity(session),
+                model: String::new(),
+            };
         }
         match self
             .runtime_options
             .as_ref()
             .and_then(|catalog| catalog.options.first())
         {
-            Some(option) => (option.agent_label.clone(), option.model_label.clone()),
+            Some(option) => ComposerRuntime {
+                agent: option.agent_label.clone(),
+                identity: self.agent_identity(&option.selection.agent_id, &option.agent_label),
+                model: option.model_label.clone(),
+            },
             // A catalogue that is still on its way has no entry to name yet,
             // and "unavailable" is a claim about the runtime rather than about
             // this read: the page says it is loading instead. A read that has
             // answered — with a catalogue that publishes nothing — leaves the
             // claim standing.
-            None if self.runtime_options_reading => {
-                (self.strings.loading().to_string(), String::new())
-            }
-            None => (
-                self.strings.runtime_unavailable().to_string(),
-                String::new(),
-            ),
+            None if self.runtime_options_reading => ComposerRuntime {
+                agent: self.strings.loading().to_string(),
+                identity: String::new(),
+                model: String::new(),
+            },
+            None => ComposerRuntime {
+                agent: self.strings.runtime_unavailable().to_string(),
+                identity: String::new(),
+                model: String::new(),
+            },
         }
     }
 
@@ -2796,16 +2856,16 @@ impl App {
 
     /// The account the page's runtime runs on, as this client names it.
     ///
-    /// The info line below the composer names what the message will go through —
-    /// the Agent, the account, the model — and the account is the one part of
-    /// that name this client has a name of its own for: an Agent account is the
-    /// product's own concept rather than a name the reader chose, so it is said
-    /// in the reader's language, while a Provider Profile keeps the name its
-    /// owner gave it. The catalogue holds the runtime's own label, written in
-    /// English for every client at once, which is why the picker's row and this
-    /// line name the same account the same way. A selection the catalogue does
-    /// not hold has no name to give: it records an id, and an id is not
-    /// something the reader has ever seen on that line.
+    /// The info line below the composer says what the message will go through —
+    /// the Agent as its mark, the account, the model — and the account is the one
+    /// part of that answer this client has a name of its own for: an Agent
+    /// account is the product's own concept rather than a name the reader chose,
+    /// so it is said in the reader's language, while a Provider Profile keeps the
+    /// name its owner gave it. The catalogue holds the runtime's own label,
+    /// written in English for every client at once, which is why the picker's row
+    /// and this line name the same account the same way. A selection the
+    /// catalogue does not hold has no name to give: it records an id, and an id
+    /// is not something the reader has ever seen on that line.
     pub fn composer_auth_source_label(&self) -> String {
         self.page_runtime_selection()
             .and_then(|selection| self.runtime_option_for(&selection))
