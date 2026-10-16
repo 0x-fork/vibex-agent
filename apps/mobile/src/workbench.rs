@@ -1736,7 +1736,7 @@ impl MobileWorkbench {
         };
         match self
             .sheet
-            .pull(key, pan, crate::bottom_sheet::max_height(window))
+            .pull(key, pan, crate::bottom_sheet::sheet_size(window))
         {
             SheetPull::Ignored => {}
             SheetPull::Pulling | SheetPull::Restored => {
@@ -5483,35 +5483,35 @@ impl MobileWorkbench {
         // asks the sheet where that panel is rather than only whether the page
         // still wants it. The frames are read here, before the element tree is
         // built, because the state behind them is the panel's.
-        let sheet_travel = crate::bottom_sheet::max_height(window);
+        let sheet_size = crate::bottom_sheet::sheet_size(window);
         let revert_sheet = self.sheet.presentation(
             SheetKey::GitRevert,
             self.git_revert_confirmation.is_some(),
-            sheet_travel,
+            sheet_size,
         );
         let branch_sheet = self.sheet.presentation(
             SheetKey::GitBranches,
             self.git_branch_sheet_open,
-            sheet_travel,
+            sheet_size,
         );
         let branch_scroll = self.sheet.body_scroll(SheetKey::GitBranches);
         let filter_sheet = self.sheet.presentation(
             SheetKey::GitFilter,
             self.git_author_sheet_open || self.git_date_sheet_open,
-            sheet_travel,
+            sheet_size,
         );
         let filter_scroll = self.sheet.body_scroll(SheetKey::GitFilter);
         let goto_sheet =
             self.sheet
-                .presentation(SheetKey::FileGoto, self.file_goto_open, sheet_travel);
+                .presentation(SheetKey::FileGoto, self.file_goto_open, sheet_size);
         let worktree_sheet = self.sheet.presentation(
             SheetKey::WorktreeConfirmation,
             self.worktree_confirmation.is_some(),
-            sheet_travel,
+            sheet_size,
         );
         let diff_sheet =
             self.sheet
-                .presentation(SheetKey::GitDiff, self.git_diff.is_some(), sheet_travel);
+                .presentation(SheetKey::GitDiff, self.git_diff.is_some(), sheet_size);
         let diff_scroll = self.sheet.body_scroll(SheetKey::GitDiff);
         let changes_active = mode == GitWorkbenchMode::Changes;
         let history_active = mode == GitWorkbenchMode::History;

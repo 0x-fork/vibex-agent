@@ -2,10 +2,20 @@
 //!
 //! Every bottom sheet on the native client is the same object seen from a
 //! different page: a scrim over what the reader was doing, a panel rising from
-//! the bottom edge with a grabber on top, and a finger that can push it back
-//! down. This module owns that object once — the rise, the fall, the scrim's
-//! own fade, and the pull that follows the finger — so a sheet's own code is
-//! only what it has to say.
+//! the bottom edge with a grabber on top, and a finger that moves it. This
+//! module owns that object once — the rise, the fall, the scrim's own fade, and
+//! the two pulls a finger can make — so a sheet's own code is only what it has
+//! to say.
+//!
+//! A sheet has two heights and two gestures. It rests at the height its page
+//! allows a sheet, which is a share of the screen rather than the whole of it;
+//! a finger that drags up anywhere on the panel pulls it open to the taller
+//! height it is allowed — nearer the top of the screen, and still short of it,
+//! because the page has to stay recognisable behind the scrim. A finger that
+//! drags down gives that height back first and only then moves the panel off
+//! the screen, so a sheet is never dismissed by a reader who was closing it.
+//! Both heights are bounded by the body inside the panel: a list that outgrows
+//! the sheet scrolls once the sheet has no more height to give.
 //!
 //! A page keeps its sheet's own flag as the source of truth for what the sheet
 //! shows. Closing a sheet does not clear that flag: the flag stays set for as
@@ -26,6 +36,7 @@ use gpui::{
     Window, div, prelude::*, px,
 };
 
+use crate::platform::WindowInsetsExt as _;
 use crate::theme;
 
 /// Which sheet a rise or fall belongs to.
@@ -80,14 +91,45 @@ pub enum SheetKey {
     GitDiff,
 }
 
-/// How tall a sheet may rise before its body scrolls instead.
+/// How tall a sheet may be: where it rests, and how far it may be pulled open.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct SheetSize {
+    /// The height a sheet keeps when the reader has not pulled it open. A sheet
+    /// never takes the whole page: whatever it explains stays in sight behind
+    /// the scrim, so it reads as a thing laid over the page.
+    pub resting: f32,
+    /// The height an upward pull may take it to, short of the whole screen.
+    pub expanded: f32,
+}
+
+impl SheetSize {
+    /// How much taller an upward pull may make the sheet.
+    fn extra(&self) -> f32 {
+        (self.expanded - self.resting).max(0.0)
+    }
+}
+
+/// The two heights a sheet works between, read from the window.
 ///
-/// A sheet never takes the whole page: whatever it explains stays in sight
-/// behind the scrim, so the sheet reads as a thing laid over the page rather
-/// than a page of its own. It is also the distance a panel travels, which is
-/// why the panel is capped here rather than by each sheet for itself.
+/// The resting height is the viewport's, because a sheet that fits the screen
+/// is what the reader sees. The expanded height is the page's — the viewport
+/// without the platform's own bars — so a sheet pulled wide open still leaves
+/// the page's edges in sight on a phone with tall insets.
+pub fn sheet_size(window: &Window) -> SheetSize {
+    let viewport = f32::from(window.viewport_size().height);
+    let insets = window.insets().effective();
+    let page = (viewport - f32::from(insets.top) - f32::from(insets.bottom)).max(1.0);
+    let resting = viewport * theme::SHEET_HEIGHT_RATIO;
+    let expanded = page * theme::SHEET_EXPANDED_HEIGHT_RATIO;
+    SheetSize {
+        resting,
+        expanded: expanded.max(resting),
+    }
+}
+
+/// How tall a sheet rests before its body scrolls instead.
 pub fn max_height(window: &Window) -> Pixels {
-    px(f32::from(window.viewport_size().height) * theme::SHEET_HEIGHT_RATIO)
+    px(sheet_size(window).resting)
 }
 
 /// One page's bottom sheets: every panel on screen, its rise or fall, and
@@ -105,8 +147,8 @@ struct Panel {
     motion: Option<Motion>,
     /// Whether the page has asked the sheet to close.
     closing: bool,
-    /// How far the panel may travel, read from the window on the last frame.
-    travel: f32,
+    /// How tall this sheet may be, read from the window on the last frame.
+    size: SheetSize,
     /// The handle the sheet's own body scrolls with, once it has one. The pan
     /// reads it: a finger that drags down inside a body which still has
     /// somewhere to scroll belongs to that body, not to the sheet.
@@ -122,31 +164,54 @@ struct Panel {
 
 impl Panel {
     /// A panel that has just been opened: it comes up from the foot of the
-    /// screen, wherever the last sheet left it.
-    fn opening(key: SheetKey, travel: f32) -> Self {
+    /// screen at its resting height, wherever the last sheet left it.
+    fn opening(key: SheetKey, size: SheetSize) -> Self {
         let mut panel = Self {
             key,
             motion: None,
             closing: false,
-            travel,
+            size,
             body_scroll: None,
             pull: None,
             released_at: None,
             next_id: 0,
         };
-        panel.start(travel, 0.0, theme::SHEET_RISE_MS, Easing::Rise, false);
+        panel.start(
+            Placement {
+                offset: size.resting,
+                ..Placement::REST
+            },
+            Placement::REST,
+            theme::SHEET_RISE_MS,
+            Easing::Rise,
+            false,
+        );
         panel
     }
 
     /// Where the panel is now: under a finger, that is where the finger put it;
     /// otherwise it is wherever the motion carrying it has got to.
-    fn offset_now(&self) -> f32 {
+    fn placement_now(&self) -> Placement {
         match self.claimed_pull() {
-            Some(pull) => pull.offset,
-            None => self
-                .motion
-                .map_or(0.0, |motion| motion.offset_at(motion.elapsed())),
+            Some(pull) => Placement {
+                offset: pull.offset,
+                extent: pull.opened,
+            },
+            None => self.motion.map_or(Placement::REST, |motion| {
+                motion.placement_at(motion.elapsed())
+            }),
         }
+    }
+
+    /// How tall the panel may be now: its resting height plus whatever the
+    /// finger or a motion has pulled it open by.
+    fn travel_now(&self) -> f32 {
+        self.size.resting + self.placement_now().extent
+    }
+
+    /// The height the panel would have if the reader pulled it open this far.
+    fn travel_at(&self, extent: f32) -> f32 {
+        self.size.resting + extent
     }
 
     /// The finger's pull, if it has claimed the panel.
@@ -161,7 +226,14 @@ impl Panel {
     }
 
     /// Starts a motion from wherever the panel is now.
-    fn start(&mut self, from: f32, to: f32, base_ms: u64, easing: Easing, falling: bool) {
+    fn start(
+        &mut self,
+        from: Placement,
+        to: Placement,
+        base_ms: u64,
+        easing: Easing,
+        falling: bool,
+    ) {
         self.next_id = self.next_id.wrapping_add(1);
         self.motion = Some(Motion {
             id: self.next_id,
@@ -175,7 +247,8 @@ impl Panel {
     }
 
     fn snapshot(&self) -> SheetPresentation {
-        let offset = self.offset_now();
+        let placement = self.placement_now();
+        let offset = placement.offset;
         SheetPresentation {
             offset,
             // A panel under a finger is placed by the finger, so the motion is
@@ -185,10 +258,40 @@ impl Panel {
             // reset whatever the panel happens to be holding — a field's
             // cursor, a list's place.
             motion: match self.claimed_pull() {
-                Some(_) => self.motion.map(|motion| motion.held_at(offset)),
+                Some(_) => self.motion.map(|motion| motion.held_at(placement)),
                 None => self.motion,
             },
-            travel: self.travel,
+            travel: self.travel_now(),
+            resting: self.size.resting,
+        }
+    }
+}
+
+/// Where a panel is.
+///
+/// A sheet has two things a finger can do to it, and they are separate axes: a
+/// pull downward moves the panel off the screen, and a pull upward makes it
+/// taller. Both are held in one placement so a motion carries them together.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Placement {
+    /// Pixels the panel sits below its resting place.
+    offset: f32,
+    /// Pixels of extra height the panel has been pulled open by.
+    extent: f32,
+}
+
+impl Placement {
+    /// A panel at its resting height, in its resting place.
+    const REST: Self = Self {
+        offset: 0.0,
+        extent: 0.0,
+    };
+
+    /// Part way from one placement to another, along the animation's curve.
+    fn between(from: Self, to: Self, delta: f32) -> Self {
+        Self {
+            offset: from.offset + (to.offset - from.offset) * delta,
+            extent: from.extent + (to.extent - from.extent) * delta,
         }
     }
 }
@@ -196,13 +299,17 @@ impl Panel {
 /// What the shell draws for one frame of a sheet.
 #[derive(Clone, Copy)]
 pub struct SheetPresentation {
-    /// Pixels the panel sits below its resting place: zero at rest, the whole
+    /// Where the panel is below its resting place: zero at rest, the whole
     /// travel once it has cleared the screen.
     offset: f32,
     /// The motion carrying the panel, when one is running.
     motion: Option<Motion>,
-    /// How far the panel may travel.
+    /// How tall the panel may be this frame: where it rests, plus however much
+    /// of its extra height it has been pulled open by.
     travel: f32,
+    /// The height it rests at, which is what an open panel's extra height is
+    /// measured from while a motion carries both.
+    resting: f32,
 }
 
 impl SheetPresentation {
@@ -218,7 +325,7 @@ impl SheetPresentation {
 fn scrim_curve(motion: Option<Motion>, offset: f32, travel: f32) -> impl Fn(f32) -> f32 {
     move |delta| {
         let offset = match motion {
-            Some(motion) => motion.offset_at_delta(delta),
+            Some(motion) => motion.placement_at_delta(delta).offset,
             None => offset,
         };
         theme::SHEET_BACKDROP_OPACITY * reveal_of(offset, travel)
@@ -321,9 +428,13 @@ impl BottomSheet {
         }
         panel.closing = true;
         panel.pull = None;
+        let placement = panel.placement_now();
         panel.start(
-            panel.offset_now(),
-            panel.travel,
+            placement,
+            Placement {
+                offset: panel.travel_at(placement.extent),
+                extent: placement.extent,
+            },
             theme::SHEET_FALL_MS,
             Easing::Fall,
             true,
@@ -357,21 +468,20 @@ impl BottomSheet {
         &mut self,
         key: SheetKey,
         up: bool,
-        travel: Pixels,
+        size: SheetSize,
     ) -> Option<SheetPresentation> {
-        let travel = f32::from(travel);
         let Some(index) = self.index_of(key) else {
             if !up {
                 return None;
             }
             // The first frame of a sheet the page has opened: it comes up
             // from the foot of the screen.
-            self.panels.push(Panel::opening(key, travel));
+            self.panels.push(Panel::opening(key, size));
             return self.panels.last().map(Panel::snapshot);
         };
         let dropped = {
             let panel = &mut self.panels[index];
-            panel.travel = travel;
+            panel.size = size;
             // A page that drops its flag without closing the sheet has no fall
             // to draw, so the panel leaves on this frame.
             !up && !panel.closing
@@ -401,25 +511,25 @@ impl BottomSheet {
     }
 
     /// Feeds one sheet one platform pan.
-    pub fn pull(&mut self, key: SheetKey, pan: SheetPan, travel: Pixels) -> SheetPull {
+    pub fn pull(&mut self, key: SheetKey, pan: SheetPan, size: SheetSize) -> SheetPull {
         // Every sheet on screen watches the same page, so only the one on top
         // answers: a pan that reached two of them would move two panels at once.
         if self.panels.last().is_some_and(|panel| panel.key != key) {
             return SheetPull::Ignored;
         }
-        let travel = f32::from(travel);
         let Some(index) = self.index_of(key) else {
             return SheetPull::Ignored;
         };
         let panel = &mut self.panels[index];
-        panel.travel = travel;
+        panel.size = size;
         if panel.closing {
             // A sheet that is already leaving is not caught again.
             return SheetPull::Ignored;
         }
         match pan {
             SheetPan::Started { dy } => {
-                panel.pull = Some(Pull::started(Instant::now()));
+                let opened = panel.placement_now().extent;
+                panel.pull = Some(Pull::started(Instant::now(), opened));
                 panel.advance(dy)
             }
             SheetPan::Moved { dy } => panel.advance(dy),
@@ -471,28 +581,69 @@ impl Panel {
     }
 
     /// Advances the pull by one translation, and reports who owns the pan now.
+    ///
+    /// A finger on its way down belongs to the body under it while that body
+    /// still has somewhere to scroll, and to the sheet once it does not. A
+    /// finger on its way up is the reader pulling the sheet open — from
+    /// anywhere on the panel, which is what makes the gesture worth having —
+    /// and only becomes the body's once there is no height left to take.
     fn advance(&mut self, dy: f32) -> SheetPull {
         let at_top = self.body_at_top();
+        let extra = self.size.extra();
         let Some(pull) = self.pull.as_mut() else {
             return SheetPull::Ignored;
         };
         pull.record(dy);
         if !pull.claimed {
-            if pull.offset <= 0.0 || !at_top {
-                // The finger is on its way up, or the body under it still has
-                // somewhere to scroll: either way the pan is not the sheet's.
-                return SheetPull::Ignored;
-            }
-            if pull.offset < theme::SHEET_PULL_THRESHOLD {
+            let opening = pull.travel < 0.0;
+            let moves_the_panel = if opening {
+                extra > 0.0 && pull.extent < extra - 0.5
+            } else {
+                at_top
+            };
+            if !moves_the_panel || pull.travel.abs() < theme::SHEET_PULL_THRESHOLD {
                 return SheetPull::Ignored;
             }
             pull.claimed = true;
         }
-        pull.offset = pull.offset.min(self.travel.max(1.0));
+        self.spend_pull();
         SheetPull::Pulling
     }
 
+    /// Spends the gesture's translation on the sheet's two axes, in the order
+    /// the reader feels them: a finger on its way down gives the extra height
+    /// back before it starts moving the panel off the screen, and one on its
+    /// way up takes the height before anything else.
+    fn spend_pull(&mut self) {
+        let extra = self.size.extra();
+        let Some(pull) = self.pull.as_ref() else {
+            return;
+        };
+        let mut remaining = pull.travel;
+        let mut opened = pull.extent;
+        let mut offset = 0.0;
+        if remaining > 0.0 {
+            let given_back = remaining.min(opened);
+            opened -= given_back;
+            remaining -= given_back;
+            // What is left moves the panel, and the panel travels its own
+            // height: a sheet pulled open has further to go before it is gone.
+            offset = remaining.min(self.travel_at(opened));
+        } else if remaining < 0.0 {
+            opened = (opened - remaining).min(extra);
+        }
+        if let Some(pull) = self.pull.as_mut() {
+            pull.opened = opened;
+            pull.offset = offset;
+        }
+    }
+
     /// Lets the panel go where the finger left it.
+    ///
+    /// The height settles at one of its two ends — a reader who pulled the
+    /// sheet more than half way open gets the whole of it, and one who gave
+    /// back more than half of it gets its resting height — while the panel
+    /// itself either leaves or comes back up.
     fn release(&mut self) -> SheetPull {
         self.released_at = Some(Instant::now());
         let Some(pull) = self.pull.take() else {
@@ -501,25 +652,45 @@ impl Panel {
         if !pull.claimed {
             return SheetPull::Ignored;
         }
+        let extra = self.size.extra();
+        let open = pull_opens(pull.opened, extra, pull.velocity);
+        let from = Placement {
+            offset: pull.offset,
+            extent: pull.opened,
+        };
         if pull_dismisses(pull.offset, pull.velocity) {
             self.closing = true;
             self.start(
-                pull.offset,
-                self.travel,
+                from,
+                Placement {
+                    offset: self.travel_at(pull.opened),
+                    extent: pull.opened,
+                },
                 theme::SHEET_FALL_MS,
                 Easing::Fall,
                 true,
             );
             SheetPull::Dismissed(self.key)
         } else {
-            self.start(pull.offset, 0.0, theme::SHEET_RISE_MS, Easing::Rise, false);
+            self.start(
+                from,
+                Placement {
+                    offset: 0.0,
+                    extent: if open { extra } else { 0.0 },
+                },
+                theme::SHEET_RISE_MS,
+                Easing::Rise,
+                false,
+            );
             SheetPull::Restored
         }
     }
 
     /// Puts the panel back when the platform takes the gesture away.
     ///
-    /// The reader did not finish the pull, so the sheet does not leave on it.
+    /// The reader did not finish the pull, so the sheet neither leaves on it
+    /// nor keeps the height it had taken: it goes back to where the gesture
+    /// found it.
     fn cancelled(&mut self) -> SheetPull {
         self.released_at = Some(Instant::now());
         let Some(pull) = self.pull.take() else {
@@ -528,7 +699,19 @@ impl Panel {
         if !pull.claimed {
             return SheetPull::Ignored;
         }
-        self.start(pull.offset, 0.0, theme::SHEET_RISE_MS, Easing::Rise, false);
+        self.start(
+            Placement {
+                offset: pull.offset,
+                extent: pull.opened,
+            },
+            Placement {
+                offset: 0.0,
+                extent: pull.extent,
+            },
+            theme::SHEET_RISE_MS,
+            Easing::Rise,
+            false,
+        );
         SheetPull::Restored
     }
 }
@@ -542,6 +725,22 @@ impl Panel {
 fn pull_dismisses(offset: f32, velocity: f32) -> bool {
     offset >= theme::SHEET_PULL_DISMISS_TRAVEL
         || (offset > 0.0 && velocity >= theme::SHEET_PULL_DISMISS_VELOCITY)
+}
+
+/// Whether a released pull leaves the sheet at its full height.
+///
+/// A pull that came past half way of the height it could take keeps it, and so
+/// does one that was still moving upward when it let go; anything else goes back
+/// to the height the sheet rests at, which is what keeps a nudge from leaving a
+/// half-open panel behind.
+fn pull_opens(opened: f32, extra: f32, velocity: f32) -> bool {
+    if velocity <= -theme::SHEET_EXPAND_VELOCITY {
+        return true;
+    }
+    if velocity >= theme::SHEET_EXPAND_VELOCITY {
+        return false;
+    }
+    extra > 0.0 && opened * 2.0 >= extra
 }
 
 /// How long a held motion's animation is given: long enough that the element
@@ -572,8 +771,8 @@ fn reveal_of(offset: f32, travel: f32) -> f32 {
 struct Motion {
     /// The identity the animation element keys on: a fresh one restarts it.
     id: u64,
-    from: f32,
-    to: f32,
+    from: Placement,
+    to: Placement,
     duration: Duration,
     easing: Easing,
     started: Instant,
@@ -597,24 +796,25 @@ impl Motion {
     /// Where the panel sits when the animation element reports this much of the
     /// curve. The element hands over an eased value, so the interpolation here
     /// is the straight line between the two ends.
-    fn offset_at_delta(&self, delta: f32) -> f32 {
-        self.from + (self.to - self.from) * delta
+    fn placement_at_delta(&self, delta: f32) -> Placement {
+        Placement::between(self.from, self.to, delta)
     }
 
     /// Where the panel sits now, read from the clock rather than from the
     /// element: a motion that is interrupted has to know where it got to.
-    fn offset_at(&self, elapsed: Duration) -> f32 {
+    fn placement_at(&self, elapsed: Duration) -> Placement {
         if self.duration.is_zero() {
             return self.to;
         }
         let delta = (elapsed.as_secs_f32() / self.duration.as_secs_f32()).clamp(0.0, 1.0);
-        self.offset_at_delta((self.easing.curve())(delta))
+        self.placement_at_delta((self.easing.curve())(delta))
     }
 
-    /// The same motion, held where it is: it renders that offset and no other.
-    fn held_at(mut self, offset: f32) -> Self {
-        self.from = offset;
-        self.to = offset;
+    /// The same motion, held where it is: it renders that placement and no
+    /// other.
+    fn held_at(mut self, placement: Placement) -> Self {
+        self.from = placement;
+        self.to = placement;
         self.duration = HELD_FLIGHT;
         self.started = Instant::now();
         self
@@ -656,8 +856,14 @@ impl Easing {
 /// The finger's own pull, from the moment it starts to the moment it lets go.
 #[derive(Clone, Copy, Debug)]
 struct Pull {
-    /// How far the finger has come down since the panel was still.
+    /// The gesture's own translation so far, positive downward.
+    travel: f32,
+    /// How far open the panel was when the gesture began.
+    extent: f32,
+    /// Where the gesture has put the panel below its resting place.
     offset: f32,
+    /// How far open the gesture has pulled the panel.
+    opened: f32,
     /// The finger's speed, in pixels per second, as a moving average.
     velocity: f32,
     /// How many samples the average is built from.
@@ -670,9 +876,12 @@ struct Pull {
 }
 
 impl Pull {
-    fn started(now: Instant) -> Self {
+    fn started(now: Instant, extent: f32) -> Self {
         Self {
+            travel: 0.0,
+            extent,
             offset: 0.0,
+            opened: extent,
             velocity: 0.0,
             samples: 0,
             sampled_at: now,
@@ -690,7 +899,7 @@ impl Pull {
         let now = Instant::now();
         let elapsed = now.duration_since(self.sampled_at);
         self.sampled_at = now;
-        self.offset = (self.offset + dy).max(0.0);
+        self.travel += dy;
         if elapsed < VELOCITY_SAMPLE_FLOOR {
             // Reports that arrive back to back describe coalesced input: the
             // gap between them is the platform's own jitter, and dividing by it
@@ -801,6 +1010,24 @@ impl BottomSheetShell {
             // height a sheet is allowed.
             .child(div().flex_1().min_h_0().flex().flex_col().children(content));
 
+        // The panel's own height is animated apart from its place, because a
+        // panel that is being pulled open grows while it stays where it is.
+        let panel: AnyElement = match motion {
+            Some(motion) => {
+                let resting = presentation.resting;
+                panel
+                    .with_animation(
+                        motion.element_id(&format!("{}-size", self.id)),
+                        motion.animation(),
+                        move |element, delta| {
+                            element.max_h(px(resting + motion.placement_at_delta(delta).extent))
+                        },
+                    )
+                    .into_any_element()
+            }
+            None => panel.into_any_element(),
+        };
+
         let positioner = div()
             .absolute()
             .left(px(0.0))
@@ -811,7 +1038,9 @@ impl BottomSheetShell {
                 .with_animation(
                     motion.element_id(&format!("{}-panel", self.id)),
                     motion.animation(),
-                    move |element, delta| element.bottom(px(-motion.offset_at_delta(delta))),
+                    move |element, delta| {
+                        element.bottom(px(-motion.placement_at_delta(delta).offset))
+                    },
                 )
                 .child(panel)
                 .into_any_element(),
@@ -926,12 +1155,20 @@ mod tests {
         }
     }
 
+    /// The height a sheet rests at in these tests, and the height it may be
+    /// pulled open to: the sheet the phone shows, without a window.
     const TRAVEL: f32 = 600.0;
-    const TRAVEL_PX: Pixels = px(TRAVEL);
+    const EXPANDED: f32 = 850.0;
+    const SIZE: SheetSize = SheetSize {
+        resting: TRAVEL,
+        expanded: EXPANDED,
+    };
+    /// How much taller the sheet may be pulled.
+    const EXTRA: f32 = EXPANDED - TRAVEL;
 
     fn up(sheet: &mut BottomSheet, key: SheetKey) -> SheetPresentation {
         sheet
-            .presentation(key, true, TRAVEL_PX)
+            .presentation(key, true, SIZE)
             .expect("the sheet should be on screen")
     }
 
@@ -951,11 +1188,34 @@ mod tests {
     fn flight_ends(presentation: &SheetPresentation) -> (f32, f32) {
         match presentation.motion {
             Some(motion) => (
-                motion.offset_at(Duration::ZERO),
-                motion.offset_at(motion.duration),
+                motion.placement_at(Duration::ZERO).offset,
+                motion.placement_at(motion.duration).offset,
             ),
             None => (presentation.offset, presentation.offset),
         }
+    }
+
+    /// Where a panel's flight leaves its height, and where it leaves the panel.
+    fn flight_heights(presentation: &SheetPresentation) -> (f32, f32) {
+        match presentation.motion {
+            Some(motion) => (
+                presentation.resting + motion.placement_at(Duration::ZERO).extent,
+                presentation.resting + motion.placement_at(motion.duration).extent,
+            ),
+            None => (presentation.travel, presentation.travel),
+        }
+    }
+
+    /// Pulls a settled sheet open, the way a reader does.
+    fn open(sheet: &mut BottomSheet, key: SheetKey) {
+        assert_eq!(
+            sheet.pull(key, SheetPan::Started { dy: -EXTRA }, SIZE),
+            SheetPull::Pulling
+        );
+        sheet.pull(key, SheetPan::Ended, SIZE);
+        sheet.settle(key);
+        let opened = up(sheet, key);
+        assert_place(opened.travel, EXPANDED, "the sheet should be open");
     }
 
     /// A sheet that is up, with its rise already run: where the reader sees it
@@ -975,7 +1235,7 @@ mod tests {
         let mut sheet = BottomSheet::default();
         assert!(
             sheet
-                .presentation(SheetKey::PairingFallback, false, TRAVEL_PX)
+                .presentation(SheetKey::PairingFallback, false, SIZE)
                 .is_none(),
             "a sheet nobody opened is not drawn"
         );
@@ -990,13 +1250,13 @@ mod tests {
         );
         assert!(
             sheet
-                .presentation(SheetKey::GitBranches, false, TRAVEL_PX)
+                .presentation(SheetKey::GitBranches, false, SIZE)
                 .is_none(),
             "another page's sheet is not this one's to draw"
         );
         assert!(
             sheet
-                .presentation(SheetKey::PairingFallback, false, TRAVEL_PX)
+                .presentation(SheetKey::PairingFallback, false, SIZE)
                 .is_none(),
             "a reset that drops the flag leaves no fall behind it"
         );
@@ -1020,7 +1280,7 @@ mod tests {
         assert!(sheet.land(SheetKey::SidebarRowMenu));
         assert!(
             sheet
-                .presentation(SheetKey::SidebarRowMenu, false, TRAVEL_PX)
+                .presentation(SheetKey::SidebarRowMenu, false, SIZE)
                 .is_none(),
             "a landed sheet leaves the screen"
         );
@@ -1067,6 +1327,7 @@ mod tests {
             offset: TRAVEL / 2.0,
             motion: None,
             travel: TRAVEL,
+            resting: TRAVEL,
         };
         assert!(half.scrim_opacity() > 0.0);
         assert!(half.scrim_opacity() < theme::SHEET_BACKDROP_OPACITY);
@@ -1086,11 +1347,7 @@ mod tests {
         let body = sheet.body_scroll(SheetKey::GitBranches);
 
         assert_eq!(
-            sheet.pull(
-                SheetKey::GitBranches,
-                SheetPan::Started { dy: 2.0 },
-                TRAVEL_PX
-            ),
+            sheet.pull(SheetKey::GitBranches, SheetPan::Started { dy: 2.0 }, SIZE),
             SheetPull::Ignored,
             "a tap that wobbles is a tap"
         );
@@ -1103,7 +1360,7 @@ mod tests {
                 SheetPan::Started {
                     dy: theme::SHEET_PULL_THRESHOLD
                 },
-                TRAVEL_PX
+                SIZE
             ),
             SheetPull::Ignored,
             "a body that can still scroll up owns the pan"
@@ -1117,7 +1374,7 @@ mod tests {
                 SheetPan::Moved {
                     dy: theme::SHEET_PULL_THRESHOLD
                 },
-                TRAVEL_PX
+                SIZE
             ),
             SheetPull::Pulling
         );
@@ -1125,15 +1382,11 @@ mod tests {
         // would have had somewhere to scroll.
         body.set_offset(point(px(0.0), px(-240.0)));
         assert_eq!(
-            sheet.pull(
-                SheetKey::GitBranches,
-                SheetPan::Moved { dy: 10.0 },
-                TRAVEL_PX
-            ),
+            sheet.pull(SheetKey::GitBranches, SheetPan::Moved { dy: 10.0 }, SIZE),
             SheetPull::Pulling
         );
         assert_eq!(
-            sheet.pull(SheetKey::GitBranches, SheetPan::Ended, TRAVEL_PX),
+            sheet.pull(SheetKey::GitBranches, SheetPan::Ended, SIZE),
             SheetPull::Restored
         );
     }
@@ -1148,7 +1401,7 @@ mod tests {
             sheet.pull(
                 SheetKey::ComposerAttach,
                 SheetPan::Started { dy: 40.0 },
-                TRAVEL_PX
+                SIZE
             ),
             SheetPull::Pulling
         );
@@ -1163,15 +1416,11 @@ mod tests {
         settled(&mut sheet, SheetKey::GitBranches);
 
         assert_eq!(
-            sheet.pull(
-                SheetKey::GitBranches,
-                SheetPan::Started { dy: 40.0 },
-                TRAVEL_PX
-            ),
+            sheet.pull(SheetKey::GitBranches, SheetPan::Started { dy: 40.0 }, SIZE),
             SheetPull::Pulling
         );
         let pulled = sheet
-            .presentation(SheetKey::GitBranches, true, TRAVEL_PX)
+            .presentation(SheetKey::GitBranches, true, SIZE)
             .expect("a pulled sheet is on screen");
         assert!(
             (pulled.offset - 40.0).abs() < 1.0,
@@ -1183,13 +1432,9 @@ mod tests {
         assert!(pulled.scrim_opacity() < theme::SHEET_BACKDROP_OPACITY);
 
         // And it keeps following the finger, rather than only the first sample.
-        sheet.pull(
-            SheetKey::GitBranches,
-            SheetPan::Moved { dy: 20.0 },
-            TRAVEL_PX,
-        );
+        sheet.pull(SheetKey::GitBranches, SheetPan::Moved { dy: 20.0 }, SIZE);
         let further = sheet
-            .presentation(SheetKey::GitBranches, true, TRAVEL_PX)
+            .presentation(SheetKey::GitBranches, true, SIZE)
             .expect("a pulled sheet is on screen");
         assert!(
             (further.offset - 60.0).abs() < 1.0,
@@ -1200,18 +1445,180 @@ mod tests {
         // Letting go hands the panel back to a curve, from where the finger
         // left it.
         assert_eq!(
-            sheet.pull(SheetKey::GitBranches, SheetPan::Ended, TRAVEL_PX),
+            sheet.pull(SheetKey::GitBranches, SheetPan::Ended, SIZE),
             SheetPull::Restored
         );
         let released = sheet
-            .presentation(SheetKey::GitBranches, true, TRAVEL_PX)
+            .presentation(SheetKey::GitBranches, true, SIZE)
             .expect("a released sheet is on screen");
         let motion = released.motion.expect("a released panel carries a motion");
-        assert!(motion.from > motion.to, "the panel is going back up");
         assert!(
-            (motion.from - 60.0).abs() < 1.0,
+            motion.from.offset > motion.to.offset,
+            "the panel is going back up"
+        );
+        assert!(
+            (motion.from.offset - 60.0).abs() < 1.0,
             "the release starts where the finger left the panel: {}",
-            motion.from
+            motion.from.offset
+        );
+    }
+
+    /// A finger that drags up anywhere on a sheet pulls it open, and the panel
+    /// is taller for it — the whole point of the gesture, since the reader is
+    /// usually looking at a list that is cut off.
+    #[test]
+    fn an_upward_pull_opens_the_sheet_to_its_full_height() {
+        let mut sheet = BottomSheet::default();
+        settled(&mut sheet, SheetKey::GitBranches);
+        let resting = up(&mut sheet, SheetKey::GitBranches);
+        assert_place(
+            resting.travel,
+            TRAVEL,
+            "a sheet rests at its resting height",
+        );
+
+        assert_eq!(
+            sheet.pull(SheetKey::GitBranches, SheetPan::Started { dy: -40.0 }, SIZE),
+            SheetPull::Pulling,
+            "an upward pull belongs to the sheet wherever the finger landed"
+        );
+        let pulled = up(&mut sheet, SheetKey::GitBranches);
+        assert_place(
+            pulled.travel,
+            TRAVEL + 40.0,
+            "the sheet should be as much taller as the finger has moved",
+        );
+        assert_place(pulled.offset, 0.0, "and it should not have moved down");
+
+        assert_eq!(
+            sheet.pull(SheetKey::GitBranches, SheetPan::Moved { dy: -400.0 }, SIZE),
+            SheetPull::Pulling
+        );
+        let wide = up(&mut sheet, SheetKey::GitBranches);
+        assert_place(
+            wide.travel,
+            EXPANDED,
+            "the sheet stops at the height it is allowed",
+        );
+
+        // Letting go past half way keeps the height it took.
+        assert_eq!(
+            sheet.pull(SheetKey::GitBranches, SheetPan::Ended, SIZE),
+            SheetPull::Restored
+        );
+        let (_, settled_height) = flight_heights(
+            &sheet
+                .presentation(SheetKey::GitBranches, true, SIZE)
+                .expect("the sheet is on screen"),
+        );
+        assert_place(settled_height, EXPANDED, "the sheet stays open");
+    }
+
+    /// A short pull that is let go springs back to the height the sheet rests
+    /// at, so a reader who only nudged it is not left with a half-open panel.
+    #[test]
+    fn a_short_upward_pull_springs_back_to_the_resting_height() {
+        let mut sheet = BottomSheet::default();
+        settled(&mut sheet, SheetKey::GitBranches);
+        assert_eq!(
+            sheet.pull(SheetKey::GitBranches, SheetPan::Started { dy: -20.0 }, SIZE),
+            SheetPull::Pulling
+        );
+        assert_eq!(
+            sheet.pull(SheetKey::GitBranches, SheetPan::Ended, SIZE),
+            SheetPull::Restored
+        );
+        let (_, settled_height) = flight_heights(
+            &sheet
+                .presentation(SheetKey::GitBranches, true, SIZE)
+                .expect("the sheet is on screen"),
+        );
+        assert_place(settled_height, TRAVEL, "the sheet goes back to its rest");
+    }
+
+    /// A finger on its way down gives the height back before it moves the
+    /// panel: an open sheet shrinks to its resting height before it starts
+    /// leaving, and only a pull that goes on past that dismisses it.
+    #[test]
+    fn a_downward_pull_gives_the_height_back_first() {
+        let mut sheet = BottomSheet::default();
+        settled(&mut sheet, SheetKey::GitBranches);
+        open(&mut sheet, SheetKey::GitBranches);
+
+        // Half of the extra height comes back with this much of the pull.
+        assert_eq!(
+            sheet.pull(
+                SheetKey::GitBranches,
+                SheetPan::Started { dy: EXTRA / 2.0 },
+                SIZE
+            ),
+            SheetPull::Pulling
+        );
+        let shrinking = up(&mut sheet, SheetKey::GitBranches);
+        assert_place(
+            shrinking.travel,
+            EXPANDED - EXTRA / 2.0,
+            "the sheet gives its height back first",
+        );
+        assert_place(shrinking.offset, 0.0, "and has not moved down yet");
+
+        // The rest of the height, and then the dismissal distance, take the
+        // finger further than the sheet was tall; past that the panel starts to
+        // move, and a release leaves.
+        assert_eq!(
+            sheet.pull(
+                SheetKey::GitBranches,
+                SheetPan::Moved {
+                    dy: EXTRA / 2.0 + theme::SHEET_PULL_DISMISS_TRAVEL
+                },
+                SIZE
+            ),
+            SheetPull::Pulling
+        );
+        let moving = up(&mut sheet, SheetKey::GitBranches);
+        assert_place(moving.travel, TRAVEL, "the height is back to its rest");
+        assert!(
+            moving.offset > 0.0,
+            "the panel is on its way down: {}",
+            moving.offset
+        );
+        assert_eq!(
+            sheet.pull(SheetKey::GitBranches, SheetPan::Ended, SIZE),
+            SheetPull::Dismissed(SheetKey::GitBranches)
+        );
+    }
+
+    /// A sheet that is already open has no height left to take, so an upward
+    /// pull belongs to the list inside it.
+    #[test]
+    fn an_open_sheet_leaves_an_upward_pull_to_its_body() {
+        let mut sheet = BottomSheet::default();
+        settled(&mut sheet, SheetKey::GitBranches);
+        open(&mut sheet, SheetKey::GitBranches);
+        assert_eq!(
+            sheet.pull(SheetKey::GitBranches, SheetPan::Started { dy: -40.0 }, SIZE),
+            SheetPull::Ignored,
+            "nothing left to open"
+        );
+    }
+
+    /// Half way is what decides whether a released pull leaves the sheet open,
+    /// and a flick decides the same way whatever the distance was.
+    #[test]
+    fn a_released_pull_settles_the_height_it_was_going() {
+        assert!(!pull_opens(EXTRA / 2.0 - 1.0, EXTRA, 0.0));
+        assert!(pull_opens(EXTRA / 2.0, EXTRA, 0.0));
+        assert!(
+            pull_opens(EXTRA / 4.0, EXTRA, -theme::SHEET_EXPAND_VELOCITY),
+            "an upward flick opens a sheet that a slow pull would not"
+        );
+        assert!(
+            !pull_opens(EXTRA - 1.0, EXTRA, theme::SHEET_EXPAND_VELOCITY),
+            "and a downward flick gives back a height a slow pull would keep"
+        );
+        assert!(
+            !pull_opens(0.0, 0.0, 0.0),
+            "a sheet with no extra height is never open"
         );
     }
 
@@ -1225,12 +1632,12 @@ mod tests {
             sheet.pull(
                 SheetKey::NewSessionPicker,
                 SheetPan::Started { dy: 120.0 },
-                TRAVEL_PX
+                SIZE
             ),
             SheetPull::Pulling
         );
         assert_eq!(
-            sheet.pull(SheetKey::NewSessionPicker, SheetPan::Ended, TRAVEL_PX),
+            sheet.pull(SheetKey::NewSessionPicker, SheetPan::Ended, SIZE),
             SheetPull::Dismissed(SheetKey::NewSessionPicker)
         );
         assert!(sheet.is_leaving(SheetKey::NewSessionPicker));
@@ -1241,15 +1648,11 @@ mod tests {
     fn a_pan_on_a_page_with_no_sheet_is_ignored() {
         let mut sheet = BottomSheet::default();
         assert_eq!(
-            sheet.pull(
-                SheetKey::FileGoto,
-                SheetPan::Started { dy: 40.0 },
-                TRAVEL_PX
-            ),
+            sheet.pull(SheetKey::FileGoto, SheetPan::Started { dy: 40.0 }, SIZE),
             SheetPull::Ignored
         );
         assert_eq!(
-            sheet.pull(SheetKey::FileGoto, SheetPan::Ended, TRAVEL_PX),
+            sheet.pull(SheetKey::FileGoto, SheetPan::Ended, SIZE),
             SheetPull::Ignored
         );
     }
@@ -1263,10 +1666,10 @@ mod tests {
         sheet.pull(
             SheetKey::WorktreePaths,
             SheetPan::Started { dy: 120.0 },
-            TRAVEL_PX,
+            SIZE,
         );
         assert_eq!(
-            sheet.pull(SheetKey::WorktreePaths, SheetPan::Cancelled, TRAVEL_PX),
+            sheet.pull(SheetKey::WorktreePaths, SheetPan::Cancelled, SIZE),
             SheetPull::Restored
         );
         assert!(!sheet.is_leaving(SheetKey::WorktreePaths));
@@ -1302,7 +1705,7 @@ mod tests {
 
         // A motion that is given time reaches its end.
         let motion = rising.motion.expect("a rising panel carries a motion");
-        assert_eq!(motion.offset_at(motion.duration), 0.0);
-        assert_eq!(motion.offset_at(Duration::ZERO), TRAVEL);
+        assert_eq!(motion.placement_at(motion.duration).offset, 0.0);
+        assert_eq!(motion.placement_at(Duration::ZERO).offset, TRAVEL);
     }
 }

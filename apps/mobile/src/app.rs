@@ -11986,23 +11986,23 @@ impl MobileApp {
     /// by pages that render from `&self`, so the page that owns the state reads
     /// their frames once and hands them down.
     fn overlay_sheets(&mut self, window: &Window) -> OverlaySheets {
-        let travel = bottom_sheet_max_height(window);
+        let size = crate::bottom_sheet::sheet_size(window);
         OverlaySheets {
             pairing: self.sheet.presentation(
                 SheetKey::PairingFallback,
                 self.pairing_panel != PairingPanel::None,
-                travel,
+                size,
             ),
             pairing_scroll: self.sheet.body_scroll(SheetKey::PairingFallback),
             host_actions: self.sheet.presentation(
                 SheetKey::HostActions,
                 self.overlay == Some(MobileOverlay::HostActions),
-                travel,
+                size,
             ),
             settings_palette: self.sheet.presentation(
                 SheetKey::SettingsPalette,
                 self.settings_palette_open,
-                travel,
+                size,
             ),
             settings_palette_scroll: self.sheet.body_scroll(SheetKey::SettingsPalette),
         }
@@ -12045,7 +12045,10 @@ impl MobileApp {
         let Some(pan) = crate::bottom_sheet::sheet_pan(event) else {
             return;
         };
-        match self.sheet.pull(key, pan, bottom_sheet_max_height(window)) {
+        match self
+            .sheet
+            .pull(key, pan, crate::bottom_sheet::sheet_size(window))
+        {
             SheetPull::Ignored => {}
             SheetPull::Pulling | SheetPull::Restored => {
                 // The panel owns the gesture now: the list inside the sheet
@@ -13379,62 +13382,62 @@ impl MobileApp {
         // asks the sheet where that panel is rather than only whether the page
         // still wants it. The presentations are read here, before the element
         // tree is built, because the state behind them is the page's.
-        let sheet_travel = bottom_sheet_max_height(window);
+        let sheet_size = crate::bottom_sheet::sheet_size(window);
         let batch_delete_sheet = self.sheet.presentation(
             SheetKey::BatchDelete,
             self.sidebar_batch_delete_confirmation,
-            sheet_travel,
+            sheet_size,
         );
         let project_remove_sheet = self.sheet.presentation(
             SheetKey::ProjectRemove,
             self.project_remove_confirmation.is_some(),
-            sheet_travel,
+            sheet_size,
         );
         let composer_attach_sheet = self.sheet.presentation(
             SheetKey::ComposerAttach,
             self.composer_attach_menu_open,
-            sheet_travel,
+            sheet_size,
         );
         let composer_history_sheet = self.sheet.presentation(
             SheetKey::ComposerHistory,
             self.composer_history_open,
-            sheet_travel,
+            sheet_size,
         );
         let composer_history_scroll = self.sheet.body_scroll(SheetKey::ComposerHistory);
         let row_menu_sheet = self.sheet.presentation(
             SheetKey::SidebarRowMenu,
             self.sidebar_row_menu.is_some(),
-            sheet_travel,
+            sheet_size,
         );
         let row_menu_scroll = self.sheet.body_scroll(SheetKey::SidebarRowMenu);
         let root_menu_sheet = self.sheet.presentation(
             SheetKey::SidebarRootMenu,
             self.sidebar_root_menu,
-            sheet_travel,
+            sheet_size,
         );
         let root_menu_scroll = self.sheet.body_scroll(SheetKey::SidebarRootMenu);
         let folder_archive_sheet = self.sheet.presentation(
             SheetKey::FolderArchiveMenu,
             self.sidebar_folder_archive_menu.is_some(),
-            sheet_travel,
+            sheet_size,
         );
         let folder_archive_scroll = self.sheet.body_scroll(SheetKey::FolderArchiveMenu);
         let reschedule_sheet = self.sheet.presentation(
             SheetKey::SidebarRescheduleMenu,
             self.sidebar_reschedule_menu.is_some(),
-            sheet_travel,
+            sheet_size,
         );
         let reschedule_scroll = self.sheet.body_scroll(SheetKey::SidebarRescheduleMenu);
         let picker_sheet = self.sheet.presentation(
             SheetKey::NewSessionPicker,
             self.new_session_picker.is_some(),
-            sheet_travel,
+            sheet_size,
         );
         let picker_scroll = self.sheet.body_scroll(SheetKey::NewSessionPicker);
         let new_session_options_sheet = self.sheet.presentation(
             SheetKey::NewSessionOptions,
             self.new_session_options_open,
-            sheet_travel,
+            sheet_size,
         );
         let options_scroll = self.sheet.body_scroll(SheetKey::NewSessionOptions);
         let overlay_sheets = self.overlay_sheets(window);
@@ -13581,8 +13584,7 @@ impl MobileApp {
                     // drawer itself and placed exactly like the panel: the strip
                     // above the phone's status bar turns with the panel's edge
                     // instead of flipping the whole width at once.
-                    let band =
-                        drawer_inset_band(page, self.drawer_offset, page_width, insets.clone());
+                    let band = drawer_inset_band(page, self.drawer_offset, page_width, insets);
                     // The band is measured again on every animated frame, so
                     // the closure owns the insets it measures with.
                     let band_insets = insets;
@@ -13613,12 +13615,8 @@ impl MobileApp {
                                 duration.clone(),
                                 move |element, delta| {
                                     let offset = snap.from + (snap.target - snap.from) * delta;
-                                    let (left, width) = drawer_band_frame(
-                                        page,
-                                        offset,
-                                        page_width,
-                                        band_insets.clone(),
-                                    );
+                                    let (left, width) =
+                                        drawer_band_frame(page, offset, page_width, band_insets);
                                     element.left(px(left)).w(px(width))
                                 },
                             )
@@ -35648,6 +35646,104 @@ mod tests {
         for panel in ["PairingPanel::Nearby", "PairingPanel::Manual"] {
             assert!(sheet.contains(panel), "the sheet should serve {panel}");
         }
+    }
+
+    /// Some nearby runtimes for a fallback sheet to list.
+    fn nearby_candidates(
+        count: usize,
+    ) -> BTreeMap<String, crate::discovery::LanDiscoveryCandidate> {
+        (0..count)
+            .map(|index| {
+                (
+                    format!("candidate-{index}"),
+                    crate::discovery::LanDiscoveryCandidate {
+                        advertisement_id: format!("advertisement-{index}"),
+                        service_instance: format!("instance-{index}"),
+                        display_name: format!("studio-{index}"),
+                        origin: "studio.local".to_string(),
+                        mode: crate::discovery::LanDiscoveryMode::ZeroConfig,
+                        server_id: None,
+                        server_identity_public_key: None,
+                        interface_scope: String::new(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// A finger that drags up anywhere on a sheet pulls it open: the panel grows
+    /// toward the height a sheet is allowed, and stops short of the whole screen
+    /// however far the pull goes.
+    #[gpui::test]
+    fn a_sheet_pulled_open_grows_short_of_the_whole_screen(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.pairing_panel = PairingPanel::Nearby;
+            app.nearby_pairing_state = NearbyPairingState::Discovering;
+            // More results than the sheet can show, so there is height to take.
+            app.nearby_candidates = nearby_candidates(20);
+            cx.notify();
+        });
+        settle_rise(&app, cx);
+        let resting = cx
+            .debug_bounds("pairing-sheet")
+            .expect("the find sheet should be laid out");
+        let (viewport, expanded) = cx.update(|window, _| {
+            (
+                window.viewport_size().height,
+                crate::bottom_sheet::sheet_size(window).expanded,
+            )
+        });
+        assert!(
+            resting.size.height < px(expanded),
+            "there should be height left to take: {:?} against {expanded}",
+            resting.size
+        );
+
+        // The finger lands a little under the panel's top edge, which is the
+        // worst case a listener that travelled with the panel could survive.
+        let touch = point(resting.center().x, resting.origin.y + px(24.0));
+        for (phase, dy) in [(TouchPhase::Started, -40.0), (TouchPhase::Moved, -400.0)] {
+            cx.simulate_event(ScrollWheelEvent {
+                position: touch,
+                delta: ScrollDelta::Pixels(point(px(0.0), px(dy))),
+                modifiers: Default::default(),
+                touch_phase: phase,
+            });
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
+        let opened = cx
+            .debug_bounds("pairing-sheet")
+            .expect("a pulled sheet stays on screen");
+        assert!(
+            opened.size.height > resting.size.height,
+            "the sheet should have grown: {opened:?} against {resting:?}"
+        );
+        assert!(
+            opened.size.height <= px(expanded) + px(1.0),
+            "the sheet should stop at the height it is allowed: {opened:?} vs {expanded}"
+        );
+        assert!(
+            opened.size.height < px(f32::from(viewport)),
+            "no sheet fills the screen: {opened:?} of {viewport:?}"
+        );
+        assert!(
+            opened.origin.y < resting.origin.y,
+            "it grows upward, away from the foot of the page"
+        );
+        assert!(
+            opened.origin.y + opened.size.height
+                >= resting.origin.y + resting.size.height - px(1.0),
+            "and its foot stays where it was"
+        );
     }
 
     /// A finger that drags down inside a sheet pulls the panel with it for as
