@@ -7078,6 +7078,10 @@ fn remote_capabilities_for_grant(
     // whose publication list has to be readable, or the client cannot say why
     // there is nothing to pair with.
     let has_pairing_publications = features.contains("device_pairing_publications");
+    // The trust store's newer verbs: a peer that predates them answers the RPC
+    // with a protocol error, so the client asks before it offers the key.
+    let has_restore_device = features.contains("device_restore");
+    let has_delete_device = features.contains("device_delete");
     let permits = |action: RemoteActionClass| {
         if assume_permitted {
             return true;
@@ -7498,11 +7502,11 @@ fn remote_capabilities_for_grant(
                 ),
                 (
                     BackendOperation::DeviceRestore,
-                    permits(RemoteActionClass::MutateDeviceManagement),
+                    has_restore_device && permits(RemoteActionClass::MutateDeviceManagement),
                 ),
                 (
                     BackendOperation::DeviceDelete,
-                    permits(RemoteActionClass::MutateDeviceManagement),
+                    has_delete_device && permits(RemoteActionClass::MutateDeviceManagement),
                 ),
                 (
                     BackendOperation::DeviceAudit,

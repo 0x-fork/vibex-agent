@@ -5959,6 +5959,11 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
         "terminal",
         "provider_settings",
         "device_management",
+        // The trust store's newer verbs, named so a client can tell a gateway
+        // that speaks them from one that predates them: the domain feature above
+        // says "device management works here", not which writes it accepts.
+        "device_restore",
+        "device_delete",
     ]
     .into_iter()
     .map(str::to_string)
