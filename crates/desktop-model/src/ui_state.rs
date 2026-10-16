@@ -482,12 +482,13 @@ pub const BACKGROUND_IMAGE_MAX_DIM_PERCENT: u16 = 90;
 
 /// The formats a background image may be stored in.
 ///
-/// Matches what the desktop image element decodes, minus SVG: a wallpaper is
-/// written once at import and never re-parsed per frame. The order is the
-/// picker's filter order.
-pub const BACKGROUND_IMAGE_EXTENSIONS: [&str; 9] = [
-    "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "avif",
-];
+/// Exactly what the desktop image element decodes, minus SVG: a wallpaper is
+/// written once at import and never re-parsed per frame, and a format the
+/// renderer cannot read would import successfully and then paint nothing. The
+/// order is the picker's filter order; `gif` and `webp` may be animations, which
+/// the renderer loops.
+pub const BACKGROUND_IMAGE_EXTENSIONS: [&str; 8] =
+    ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"];
 
 /// Whether `file_name` is a content-addressed background image name.
 ///
@@ -4081,6 +4082,8 @@ mod tests {
             String::new(),
             "background.png".to_string(),
             format!("{digest}.svg"),
+            // The renderer cannot decode it, so the picker must not offer it.
+            format!("{digest}.avif"),
             format!("{digest}.PNG"),
             format!("{}x.png", &digest[..63]),
             format!("{}.png", digest.to_uppercase()),

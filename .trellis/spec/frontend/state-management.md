@@ -195,6 +195,16 @@ theme::apply_appearance(appearance: &AppearanceUiState, backdrop: theme::Backdro
   keep resolving.
 - Legacy appearance JSON without `backgroundImage` decodes with the default
   (no image, `cover`, 40 percent veil).
+- `gif` and animated `webp` files loop as the wallpaper. The image element
+  carries an id, because the frame cursor lives in that element's state and an
+  element without one paints its first frame forever. The loop stops while the
+  window is inactive and under reduced motion — that gate is the framework's,
+  not an extra preference — and the thumbnail in the settings page keeps no
+  cursor, so a preview stays a still.
+- An animation is bounded by its whole decoded size, not by its canvas: the
+  renderer decodes and keeps every frame, so import counts the frames and
+  rejects a total past `BACKGROUND_IMAGE_MAX_ANIMATION_PIXELS` (48 million
+  pixels of frames, 192 MiB decoded). A still never pays for that budget.
 
 ### 4. Validation & Error Matrix
 
@@ -202,6 +212,7 @@ theme::apply_appearance(appearance: &AppearanceUiState, backdrop: theme::Backdro
 | --- | --- |
 | Source is not a regular decodable raster image in a supported format | Reject and show a localized notification |
 | Source exceeds 32 MiB or 40 million pixels | Reject before full decode |
+| Animation exceeds 48 million pixels of frames | Reject before the file is copied |
 | Storage directory/write/rename fails | Keep the previous wallpaper and report failure |
 | Persisted name is not `<64 lowercase hex>.<supported extension>` | Ignore it and paint the theme's page color |
 | Persisted file is missing | Paint the theme's page color |
@@ -211,13 +222,15 @@ theme::apply_appearance(appearance: &AppearanceUiState, backdrop: theme::Backdro
 ### 5. Good/Base/Bad Cases
 
 - Good: upload a 4K JPEG, store one content-addressed copy, paint it behind
-  translucent surfaces in both appearances, and restore it after restart.
+  translucent surfaces in both appearances, and restore it after restart; or
+  upload a small GIF loop and watch it animate behind the same surfaces.
 - Base: a state file written before the feature loads with no image, the veil at
   40 percent, and `cover`; clearing returns to the theme with no other setting
   changed.
 - Bad: persist the selected external path, copy the image bytes into UI-state
-  JSON, keep a translucent window base plate, or let a second window apply a
-  different backdrop than the workbench.
+  JSON, keep a translucent window base plate, let a second window apply a
+  different backdrop than the workbench, or paint the wallpaper with a bare
+  `img()` that has nowhere to keep an animation's frame cursor.
 
 ### 6. Tests Required
 
@@ -232,6 +245,11 @@ theme::apply_appearance(appearance: &AppearanceUiState, backdrop: theme::Backdro
   missing home, a traversal-like name, and a deleted file; the appearance pass is
   covered for both backdrops and both appearances, on both paint paths — the
   framework roles and the catalog roles — including the restored window plate.
+  An animation is covered end to end: the frame count a still never reports, the
+  budget that rejects a large one before it is copied, and the element id an
+  animated image's frame cursor needs. The loop itself only advances while the
+  window reports itself active, which the test platform never does, so no test
+  asserts a moving frame.
 - Run `cargo test -p vibex-desktop-model --locked`, the targeted desktop tests,
   and `cargo fmt --all -- --check` before commit.
 
@@ -247,13 +265,19 @@ theme::apply_appearance(&appearance, Backdrop::Wallpaper, Some(window), cx);
 // the panels around it fade, which reads as a flat block on the wallpaper.
 let card = theme::semantic_color_for(theme, "card");
 
+// Wrong: a bare image element has no id, so an animated file has nowhere to keep
+// its frame cursor and sticks on the first frame.
+img(path).size_full();
+
 // Correct: persist a managed name, paint the image over an opaque plate, keep
-// the window's own plate authored, and read every container through the
-// paint-time helper that applies the wallpaper policy.
+// the window's own plate authored, read every container through the paint-time
+// helper that applies the wallpaper policy, and give the image the id an
+// animation needs.
 appearance.background_image.file = Some(appearance_background::import(&selected_path, home)?);
 let backdrop = theme::Backdrop::for_wallpaper(appearance_background::resolve(Some(home), &appearance.background_image).is_some());
 theme::apply_appearance(&appearance, backdrop, Some(window), cx);
 let card = theme::semantic_color("card", cx.theme().is_dark());
+img(path).id("workbench-background-image").size_full();
 ```
 
 ## Scenario: Native First-Launch Locale
@@ -696,23 +720,35 @@ behind timeline turns that sink to ~10 fps.
 
 Memoize the walk per turn, keyed by a fingerprint of everything it reads, and
 hand out `Rc<Vec<TimelineProcessUnit>>` so the run and the renderer share one
-allocation. The turn-level estimate signature already digests the rows, groups,
-command expansion, reasoning expansion and display preferences the walk branches
-on; the memo key adds only what that signature omits — which timeline the turn
-came from (`rendering_child_agent_timeline` plus the child render session, since
-a rail preview can share a turn id with the workbench turn) and the turn's own
-`pending_permission`, which the command/permission pairing reads. Do not key on
-the expansion maps again; do not key on body lengths, which stream every frame.
+allocation. The key must stay O(1): prepaint asks for the units on every frame
+the turn is painted, so a key that walks the rows reintroduces exactly the
+per-frame O(process rows) cost the memo exists to remove. Use
+`timeline_turn_shape_key` — the turn's O(1) shape digest, already the key the
+layout signature is memoized against — and add only the two inputs it omits:
+which timeline the turn came from (`rendering_child_agent_timeline` plus the
+child render session, since a rail preview can share a turn id with the
+workbench turn) and the derived column count the first-layout estimates wrap
+against, so a pane resize reflows rather than stales.
+
+Do **not** key on `timeline_turn_estimate_signature`. It hashes every row's
+`last_sequence`, `streaming` and body length, so it both costs O(process rows)
+and misses on every frame of a streaming turn — the memo then rebuilds the rows
+it was holding, and the slow turn gets no faster. Body lengths are the specific
+trap: they move with every streamed chunk while the painted unit shape does not.
 
 Because the units are presentation geometry, they follow the same invalidation
 as `timeline_process_unit_heights`: clear the whole table in
 `invalidate_render_caches`, `invalidate_timeline_layout_measurements` and
 `invalidate_timeline_render_caches`; drop one turn's entry in
 `clear_timeline_turn_layout`; and retain only live turn ids in
-`rebuild_timeline_sizes` so a replaced projection cannot leak units. A pane
-resize is a reflow, not an invalidation: the memo key includes the derived
-column count, so the list rebuilds from the fingerprint rather than being
-dropped, exactly as the memoized estimate does.
+`rebuild_timeline_sizes` so a replaced projection cannot leak units. Clear it
+wherever `timeline_turn_layout_signature_cache` is cleared — in particular when
+`conversation_turns_cached` rebuilds the projection, because each unit carries a
+row's `last_sequence` as the revision the run resolves its measurement by, and a
+re-projection can advance those sequences without moving any count the shape key
+sees. A pane resize is a reflow, not an invalidation: the derived column count
+in the key rebuilds the list from the fingerprint rather than dropping it,
+exactly as the memoized estimate does.
 
 A memoized unit keeps the *estimate* it was built with, so read a measurement
 through `cached_timeline_process_unit_height` at both consumption sites — the
@@ -728,8 +764,29 @@ fn render_timeline_process_rows(&mut self, turn: &TimelineConversationTurn, ..) 
     if units.len() <= TIMELINE_PROCESS_RUN_FLOW_LIMIT { /* too late */ }
 }
 
-// Correct: the list is a fingerprinted function of the turn, retained across
-// frames, and consumed as the measurement resolves it.
+// Wrong: an O(process rows) key. It misses on every streamed chunk, so the
+// memo rebuilds the rows it is holding — on exactly the streaming turn that
+// needed the memo most.
+fn timeline_process_units_signature(&self, turn: &TimelineConversationTurn) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    self.timeline_turn_estimate_signature(turn, process_expansion)
+        .hash(&mut hasher); // hashes row.last_sequence / body.len()
+    hasher.finish()
+}
+
+// Correct: an O(1) key over the painted shape, plus the two inputs the shape
+// digest does not carry. The list is retained across frames and consumed as the
+// measurement resolves it.
+fn timeline_process_units_signature(&self, turn: &TimelineConversationTurn) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    self.rendering_child_agent_timeline().hash(&mut hasher);
+    self.child_agent_render_session.as_ref().map(VibexSessionId::as_str).hash(&mut hasher);
+    self.estimated_timeline_chars_per_line().hash(&mut hasher);
+    let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
+    self.timeline_turn_shape_key(turn, process_expansion).hash(&mut hasher);
+    hasher.finish()
+}
+
 fn timeline_process_units(&mut self, turn: &TimelineConversationTurn)
     -> Rc<Vec<TimelineProcessUnit>>
 {
