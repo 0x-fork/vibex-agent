@@ -38,6 +38,8 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.ExtractedText;
+import android.view.inputmethod.ExtractedTextRequest;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputConnectionWrapper;
 import android.view.inputmethod.InputMethodManager;
@@ -145,6 +147,13 @@ public final class GpuiHostActivity extends Activity {
 
     private SurfaceView surfaceView;
     private InputProxy input;
+    // What the focused field holds, as last reported by the app. The IME
+    // proxy's own buffer is a scratch pad it empties after every commit, so the
+    // keyboard's reads are answered from here. It lives on the Activity because
+    // a draft is reported before the proxy exists and outlives a keyboard hide.
+    private CharSequence imeDocument = "";
+    private int imeSelStart;
+    private int imeSelEnd;
     /** Width of the left-edge strip kept out of the system's back gesture. */
     private int drawerEdgeWidthPx;
     /** The strip already handed to the framework, so an unchanged one is not re-sent. */
@@ -728,6 +737,27 @@ public final class GpuiHostActivity extends Activity {
         });
     }
 
+    /**
+     * Hands the focused field's text and caret to the IME editor.
+     *
+     * The keyboard gates a held Backspace on what the editor it is bound to
+     * reports, and the proxy's own buffer is a scratch pad it empties after
+     * every commit. Reporting what the field actually holds keeps the caret the
+     * keyboard sees in step with the one GPUI moved, so a held Backspace keeps
+     * repeating for as long as there is something to delete. Offsets are UTF-16
+     * units, the unit Android counts cursor positions in.
+     */
+    public void gpuiSetDocument(String text, int selStart, int selEnd) {
+        runOnUiThread(() -> {
+            imeDocument = text == null ? "" : text;
+            imeSelStart = Math.max(0, Math.min(selStart, imeDocument.length()));
+            imeSelEnd = Math.max(0, Math.min(selEnd, imeDocument.length()));
+            if (input != null) {
+                input.reportSelection();
+            }
+        });
+    }
+
     /** The InputConnection host GPUI drives through {@code nativeIme}. */
     private final class InputProxy extends EditText {
         private long session;
@@ -764,6 +794,53 @@ public final class GpuiHostActivity extends Activity {
             depth = 0;
         }
 
+        /**
+         * Tells the IME the caret in the reported document moved.
+         *
+         * The keyboard's own cache of the editor only refreshes when it is told
+         * the selection changed, so without this call the caret it believes in
+         * stays wherever the last commit left it — which is why a held Backspace
+         * stopped after the first character.
+         */
+        void reportSelection() {
+            InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            imm.updateSelection(this, imeSelStart, imeSelEnd, -1, -1);
+        }
+
+        /** The text before {@code index} of the reported document, at most {@code n}. */
+        private CharSequence documentBeforeCursor(int index, int n) {
+            int end = Math.max(0, Math.min(index, imeDocument.length()));
+            int start = Math.max(0, end - n);
+            return imeDocument.subSequence(start, end);
+        }
+
+        /** The text after {@code index} of the reported document, at most {@code n}. */
+        private CharSequence documentAfterCursor(int index, int n) {
+            int start = Math.max(0, Math.min(index, imeDocument.length()));
+            int end = Math.min(imeDocument.length(), start + n);
+            return imeDocument.subSequence(start, end);
+        }
+
+        /** The reported selection, oriented start-to-end. */
+        private int[] documentSelection() {
+            return new int[] {
+                Math.min(imeSelStart, imeSelEnd),
+                Math.max(imeSelStart, imeSelEnd),
+            };
+        }
+
+        private ExtractedText extractedDocument() {
+            ExtractedText extracted = new ExtractedText();
+            extracted.text = imeDocument;
+            extracted.startOffset = 0;
+            // The whole document is handed over, so it is not a partial extract.
+            extracted.partialStartOffset = -1;
+            extracted.partialEndOffset = -1;
+            extracted.selectionStart = imeSelStart;
+            extracted.selectionEnd = imeSelEnd;
+            return extracted;
+        }
+
         private void endEdit() {
             if (--depth != 0) return;
             Editable text = getText();
@@ -789,12 +866,51 @@ public final class GpuiHostActivity extends Activity {
             return super.onKeyPreIme(code, event);
         }
 
+        /**
+         * Whether the widget is holding composition text the IME put there.
+         *
+         * While a composition is in flight its text lives in the widget's own
+         * buffer, which the IME reads back to place its candidates, so those
+         * reads are left to the widget; the mirror takes over between
+         * compositions, where the widget has been cleared.
+         */
+        private boolean holdsComposition() {
+            return marked || BaseInputConnection.getComposingSpanStart(getText()) >= 0;
+        }
+
         @Override
         public InputConnection onCreateInputConnection(EditorInfo info) {
             InputConnection connection = super.onCreateInputConnection(info);
             if (connection == null) return null;
+            // The keyboard reads the caret from the EditorInfo it is handed
+            // here, and the widget's own buffer is empty between commits, so it
+            // is told where the caret really is.
+            info.initialSelStart = imeSelStart;
+            info.initialSelEnd = imeSelEnd;
             final long connectionSession = session;
             return new InputConnectionWrapper(connection, false) {
+                @Override public CharSequence getTextBeforeCursor(int n, int flags) {
+                    if (connectionSession != session) return "";
+                    if (holdsComposition()) return super.getTextBeforeCursor(n, flags);
+                    return documentBeforeCursor(imeSelStart, n);
+                }
+                @Override public CharSequence getTextAfterCursor(int n, int flags) {
+                    if (connectionSession != session) return "";
+                    if (holdsComposition()) return super.getTextAfterCursor(n, flags);
+                    return documentAfterCursor(imeSelEnd, n);
+                }
+                @Override public CharSequence getSelectedText(int flags) {
+                    if (connectionSession != session) return null;
+                    if (holdsComposition()) return super.getSelectedText(flags);
+                    int[] selection = documentSelection();
+                    if (selection[0] == selection[1]) return null;
+                    return imeDocument.subSequence(selection[0], selection[1]);
+                }
+                @Override public ExtractedText getExtractedText(ExtractedTextRequest request, int flags) {
+                    if (connectionSession != session) return null;
+                    if (holdsComposition()) return super.getExtractedText(request, flags);
+                    return extractedDocument();
+                }
                 @Override public boolean beginBatchEdit() {
                     if (connectionSession != session) return false;
                     depth++;
@@ -832,6 +948,16 @@ public final class GpuiHostActivity extends Activity {
                 }
                 @Override public boolean setSelection(int start, int end) {
                     if (connectionSession != session) return false;
+                    // While a composition is in flight the widget holds the text
+                    // the caret places, so it takes the move. Between
+                    // compositions the widget is empty and the mirror is what
+                    // the keyboard reads, so the move is kept there instead of
+                    // indexing a cleared buffer. GPUI still owns the real caret.
+                    if (!holdsComposition()) {
+                        imeSelStart = Math.max(0, Math.min(start, imeDocument.length()));
+                        imeSelEnd = Math.max(0, Math.min(end, imeDocument.length()));
+                        return true;
+                    }
                     depth++;
                     try { return super.setSelection(start, end); }
                     finally { endEdit(); }

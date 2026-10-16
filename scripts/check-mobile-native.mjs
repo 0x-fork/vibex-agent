@@ -167,6 +167,17 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(entry.includes("gpui_component::init(cx)"), "native_component_init_missing");
   assert(platform.includes("gpui_mobile::show_keyboard()"), "native_text_input_keyboard_missing");
   assert(platform.includes("gpui_mobile::hide_keyboard()"), "native_text_input_keyboard_hide_missing");
+  // A held Backspace repeats only while the keyboard's editor reports the caret
+  // moving, and the host's editor is a cleared scratch widget between commits.
+  // The app therefore publishes the focused field's text and caret to the Java
+  // host, which answers the keyboard's reads from that report. Both halves are
+  // a JNI contract: losing either turns a held delete back into a single one.
+  assert(app.includes("crate::platform::sync_editor_document"), "native_ime_document_sync_missing");
+  assert(platform.includes("pub fn sync_editor_document"), "native_ime_document_publish_missing");
+  assert(platform.includes("gpuiSetDocument"), "native_ime_document_bridge_missing");
+  assert(androidActivity.includes("public void gpuiSetDocument"), "android_ime_document_entry_missing");
+  assert(androidActivity.includes("updateSelection"), "android_ime_selection_report_missing");
+  assert(androidActivity.includes("info.initialSelStart"), "android_ime_initial_selection_missing");
 
   assert(android.includes('android:name=".GpuiHostActivity"'), "android_gpui_activity_missing");
   assert(android.includes('android:windowSoftInputMode="adjustResize"'), "android_keyboard_resize_missing");
@@ -616,6 +627,26 @@ function runSelfTest() {
     "UpdateChannel::Stable",
     "UpdateChannel::Preview",
     "native_mobile_checker_self_test_accepted_prerelease_update_channel"
+  );
+  // Dropping the document publish or the Java side of it is exactly how the
+  // held-Backspace repeat regressed, so each half has to fail the check alone.
+  expectRejected(
+    "apps/mobile/src/app.rs",
+    "crate::platform::sync_editor_document",
+    "crate::platform::hidden_editor_document",
+    "native_mobile_checker_self_test_accepted_missing_ime_document_sync"
+  );
+  expectRejected(
+    "apps/mobile/src/platform.rs",
+    "gpuiSetDocument",
+    "gpuiSetHiddenDocument",
+    "native_mobile_checker_self_test_accepted_missing_ime_document_bridge"
+  );
+  expectRejected(
+    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java",
+    "info.initialSelStart",
+    "info.hiddenSelStart",
+    "native_mobile_checker_self_test_accepted_missing_ime_initial_selection"
   );
   expectRejected(
     "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java",

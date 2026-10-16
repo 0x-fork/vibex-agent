@@ -1759,6 +1759,11 @@ pub struct MobileApp {
     composer_state_flush_task: Option<Task<()>>,
     /// Observes the composer field, so typing counts as a change worth keeping.
     _composer_change_subscription: gpui::Subscription,
+    /// The document last published to the Android IME editor, alongside the
+    /// field it came from. A repeat delete needs the keyboard to see the caret
+    /// move, so the report follows focus and the caret; the copy is what keeps
+    /// a repaint from crossing the JNI bridge to say nothing new.
+    ime_report: Option<(gpui::SharedString, std::ops::Range<usize>)>,
     runtime_options_target: RuntimeOptionsTarget,
     runtime_draft: Option<SessionRuntimeSelection>,
     runtime_sheet_search: Option<Entity<InputState>>,
@@ -2621,6 +2626,31 @@ fn composer_placeholder() -> &'static str {
     )
 }
 
+/// The text and caret of whichever input holds focus, if it is an editor.
+///
+/// Only the kinds that own a document are read: a one-time-code field has no
+/// caret the keyboard could repeat a delete against.
+fn focused_document(
+    state: &gpui_component::input::AnyInputState,
+    cx: &gpui::App,
+) -> Option<(gpui::SharedString, std::ops::Range<usize>)> {
+    match state {
+        gpui_component::input::AnyInputState::Input(state) => {
+            let state = state.read(cx);
+            Some((state.value(), state.selected_range()))
+        }
+        gpui_component::input::AnyInputState::Textarea(state) => {
+            let state = state.read(cx);
+            Some((state.value(), state.selected_range()))
+        }
+        gpui_component::input::AnyInputState::Editor(state) => {
+            let state = state.read(cx);
+            Some((state.value(), state.selected_range()))
+        }
+        gpui_component::input::AnyInputState::Otp(_) => None,
+    }
+}
+
 /// One option inside a prompt card's control row.
 ///
 /// The option is what the reader sees, the row is what the reader aims at: a
@@ -3399,6 +3429,7 @@ impl MobileApp {
             composer_state_dirty: false,
             composer_state_flush_task: None,
             _composer_change_subscription: composer_change_subscription,
+            ime_report: None,
             runtime_options_target: RuntimeOptionsTarget::ActiveSession,
             runtime_draft: None,
             runtime_sheet_search: None,
@@ -4195,6 +4226,35 @@ impl MobileApp {
             self.keep_screen_on_applied = wanted;
             power::keep_screen_on(wanted);
         }
+    }
+
+    /// Keeps the Android keyboard's editor in step with the focused field.
+    ///
+    /// A held Backspace repeats only while the keyboard believes the caret can
+    /// still move back, and it reads that from the editor, not from this app.
+    /// Repainting is where the caret is known without subscribing to every
+    /// keystroke, and the published copy means a frame that changed nothing
+    /// does not cross the JNI bridge again.
+    fn sync_ime_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The focused input is read through the kit's root, which a window that
+        // is not built on `gpui_component::Root` does not have.
+        if window.root::<gpui_base::Root>().flatten().is_none() {
+            self.ime_report = None;
+            return;
+        }
+        use gpui_component::WindowExt as _;
+        // A field that lost focus publishes an empty document rather than
+        // leaving its last text behind: the keyboard must never delete against
+        // a field the user already left.
+        let document = window
+            .focused_input(cx)
+            .and_then(|state| focused_document(&state, cx))
+            .unwrap_or_else(|| (gpui::SharedString::default(), 0..0));
+        if self.ime_report.as_ref() == Some(&document) {
+            return;
+        }
+        crate::platform::sync_editor_document(&document.0, document.1.clone());
+        self.ime_report = Some(document);
     }
 
     /// Whether an answer still belongs to the connection the phone is on.
@@ -25269,6 +25329,7 @@ impl Render for MobileApp {
         // The display flag follows the work on screen; the call is a no-op
         // while the answer has not changed.
         self.sync_keep_screen_on(cx);
+        self.sync_ime_document(window, cx);
         if let Some(turn_id) = self.timeline_find_scroll_pending.take() {
             self.timeline_list.remeasure();
             self.scroll_to_timeline_turn(&turn_id, cx);
@@ -34582,6 +34643,84 @@ mod tests {
             assert_eq!(app.composer_queue[0].session_id, session_id);
             assert_eq!(app.composer_queue[0].text, "and then one more");
         });
+    }
+
+    /// A repaint is where the Android keyboard is told what the focused field
+    /// holds, so a held Backspace has something to repeat against.
+    #[gpui::test]
+    fn painting_publishes_the_focused_composer_to_the_keyboard(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().unwrap();
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            // The composer only exists on the workspace page.
+            app.mode = RootMode::Workspace;
+            app.composer_input.update(cx, |input, cx| {
+                input.set_value("你好", window, cx);
+                input.focus(window, cx);
+            });
+            app
+        });
+
+        // The build itself paints, and the recorder is process-thread local, so
+        // the frames this test is about are read from an empty one.
+        crate::platform::clear_editor_documents();
+
+        // The caret moving is what a repeat delete has to see, and moving it
+        // does not emit a change event, so the next paint is what publishes it.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.composer_input.update(cx, |input, cx| {
+                    // After "你": one UTF-16 unit in but three bytes in.
+                    input.set_selected_range(3..3, cx);
+                });
+            });
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            crate::platform::editor_documents(),
+            vec![("你好".to_owned(), 1..1)],
+            "the field's text and caret reach the keyboard in UTF-16 units"
+        );
+
+        // A frame that changed nothing does not cross the bridge again.
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(crate::platform::editor_documents().len(), 1);
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.composer_input.update(cx, |input, cx| {
+                    input.set_selected_range(0..0, cx);
+                });
+            });
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            crate::platform::editor_documents().last(),
+            Some(&("你好".to_owned(), 0..0)),
+            "every caret move is published, so a held delete can keep repeating"
+        );
+
+        // Text arriving with the caret staying put is published too: a commit
+        // that replaces the draft in place must still reach the keyboard.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.composer_input.update(cx, |input, cx| {
+                    input.set_value("你好呀", window, cx);
+                    input.set_selected_range(0..0, cx);
+                });
+            });
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            crate::platform::editor_documents().last(),
+            Some(&("你好呀".to_owned(), 0..0)),
+            "a text change publishes even when the caret did not move"
+        );
     }
 
     /// A half-filled elicitation belongs to the session that asked for it.

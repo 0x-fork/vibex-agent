@@ -23,6 +23,7 @@
 //!   on this platform; the host forwards iOS phases over FFI and Android phases
 //!   over JNI, both landing in [`notify_lifecycle`].
 
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{Edges, Pixels, Window, px};
@@ -149,6 +150,73 @@ pub fn resume_keyboard() {
     if !keyboard_visible() {
         show_keyboard();
     }
+}
+
+/// Tells the IME's editor what the focused field actually holds.
+///
+/// Android's keyboard decides whether a held Backspace can keep deleting from
+/// the editor it is bound to, not from the app. The host activity's editor is a
+/// 1×1 scratch widget that is cleared after every commit, so left alone it
+/// reports an empty document with the caret at position 0 and the keyboard
+/// stops repeating after the first character. Reporting the real text and
+/// caret keeps the repeat alive for as long as the field has anything to
+/// delete, which is how a held Backspace behaves in any other app.
+///
+/// `selection` is a byte range into `text`, the unit GPUI's inputs report;
+/// Android counts cursor positions in UTF-16 units, so it is converted here.
+/// `text` is written whole, so the caller passes the field's current value.
+pub fn sync_editor_document(text: &str, selection: Range<usize>) {
+    let utf16 = utf16_range(text, selection);
+    #[cfg(test)]
+    EDITOR_DOCUMENTS.with(|documents| {
+        documents
+            .borrow_mut()
+            .push((text.to_owned(), utf16.clone()));
+    });
+    #[cfg(target_os = "android")]
+    {
+        android::sync_editor_document(text, utf16);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = utf16;
+    }
+}
+
+/// A byte range in `text` as the UTF-16 range Android addresses the string by.
+///
+/// A byte inside a character is clamped back to that character's start, so an
+/// offset the platform hands over can never point between the halves of a
+/// surrogate pair.
+fn utf16_range(text: &str, selection: Range<usize>) -> Range<usize> {
+    fn offset(text: &str, byte: usize) -> usize {
+        let byte = byte.min(text.len());
+        text.char_indices()
+            .take_while(|(index, ch)| index + ch.len_utf8() <= byte)
+            .map(|(_, ch)| ch.len_utf16())
+            .sum()
+    }
+    offset(text, selection.start)..offset(text, selection.end)
+}
+
+// Every document published this thread's tests are about. A device call has no
+// visible effect to assert on, so the recorder stands in for the JNI bridge.
+#[cfg(test)]
+thread_local! {
+    static EDITOR_DOCUMENTS: std::cell::RefCell<Vec<(String, Range<usize>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The documents [`sync_editor_document`] has published on this thread.
+#[cfg(test)]
+pub fn editor_documents() -> Vec<(String, Range<usize>)> {
+    EDITOR_DOCUMENTS.with(|documents| documents.borrow().clone())
+}
+
+/// Clears the recorded documents, so one test reads only its own.
+#[cfg(test)]
+pub fn clear_editor_documents() {
+    EDITOR_DOCUMENTS.with(|documents| documents.borrow_mut().clear());
 }
 
 /// The tick a long press gets when it has something to show for itself.
@@ -307,6 +375,28 @@ pub fn open_external_url(url: &str) -> bool {
 mod android {
     use jni::objects::JString;
 
+    /// Hands the host activity's IME editor the focused field's text and caret.
+    ///
+    /// The activity keeps a copy of this report and answers the keyboard's
+    /// reads from it; see [`super::sync_editor_document`] for why the keyboard
+    /// needs it.
+    pub fn sync_editor_document(text: &str, selection: std::ops::Range<usize>) {
+        crate::android_bridge::with_activity(|env, activity| {
+            let text = env.new_string(text)?;
+            env.call_method(
+                activity,
+                jni::jni_str!("gpuiSetDocument"),
+                jni::jni_sig!((text: JString, start: jint, end: jint) -> ()),
+                &[
+                    (&text).into(),
+                    jni::JValue::Int(selection.start as i32),
+                    jni::JValue::Int(selection.end as i32),
+                ],
+            )?;
+            Ok(())
+        });
+    }
+
     /// Opens one web link in the system browser.
     pub fn open_external_url(url: &str) -> bool {
         crate::android_bridge::with_activity(|env, activity| {
@@ -336,5 +426,42 @@ mod android {
             Ok(result.is_ok())
         })
         .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clear_editor_documents, editor_documents, sync_editor_document, utf16_range};
+
+    #[test]
+    fn utf16_offsets_count_the_units_android_addresses_text_by() {
+        // "你" is one UTF-16 unit but three UTF-8 bytes, and an emoji is two
+        // units, so a byte caret cannot be handed over unchanged.
+        assert_eq!(utf16_range("你😀好", 0..0), 0..0);
+        assert_eq!(utf16_range("你😀好", 3..3), 1..1);
+        assert_eq!(utf16_range("你😀好", 7..7), 3..3);
+        assert_eq!(utf16_range("你😀好", 10..10), 4..4);
+        assert_eq!(utf16_range("你😀好", 0..10), 0..4);
+        assert_eq!(utf16_range("你😀好", 3..7), 1..3);
+    }
+
+    #[test]
+    fn a_byte_inside_a_character_clamps_to_its_start() {
+        // An offset past the end, or landing inside a multi-byte character,
+        // must not split a surrogate pair when Android turns it into a cursor.
+        assert_eq!(utf16_range("你😀", 1..2), 0..0);
+        assert_eq!(utf16_range("你😀", 4..6), 1..1);
+        assert_eq!(utf16_range("你好", 99..99), 2..2);
+    }
+
+    #[test]
+    fn a_published_document_carries_the_caret_as_utf16() {
+        clear_editor_documents();
+        sync_editor_document("你😀好", 3..7);
+        assert_eq!(
+            editor_documents(),
+            vec![("你😀好".to_owned(), 1..3)],
+            "the keyboard is told the caret in the units it counts in"
+        );
     }
 }
