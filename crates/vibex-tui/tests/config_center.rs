@@ -3990,3 +3990,92 @@ fn the_pane_wears_the_badge_the_row_wears() {
         "the badge was not drawn"
     );
 }
+
+/// The built-in tool panels are per Agent and per panel, and the reader's
+/// answer is the authority's record rather than this client's copy.
+///
+/// The panels reach an Agent the user never configured, so what is rendered is
+/// what the authority holds: a client that kept its own list would show a
+/// default the runtime does not share.
+#[test]
+fn the_builtin_tool_panels_are_switched_per_agent() {
+    use vibex_core::AgentBuiltinTool;
+
+    let mut app = loaded(140, 40);
+    app.management_data.agents = vec![agent()];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+
+    // Reading the area asks the authority for the panels it holds.
+    let outcome = app.perform(vibex_tui::action::Intent::ReloadManagement);
+    assert!(
+        outcome
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, vibex_tui::app::Effect::LoadAgentTools)),
+        "the area did not read the panels: {:#?}",
+        outcome.effects
+    );
+
+    // Both panels start on, which is the documented default.
+    let rows = vibex_tui::config_center::agent_rows(&app.management_data, app.strings);
+    let tools = rows[0]
+        .detail
+        .iter()
+        .find(|(label, _)| label == "Built-in tools")
+        .map(|(_, value)| value.clone())
+        .expect("the panels were not on the record");
+    assert!(
+        tools.contains("Browser tools on") && tools.contains("Computer use on"),
+        "the panels did not start from the default: {tools}"
+    );
+
+    // Switching one off writes one panel and only that one.
+    let outcome = app.run_config_action_by_key("codex", ConfigAction::ComputerTools);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::SetAgentTool {
+                agent_id,
+                tool,
+                enabled,
+            } = mutation
+            else {
+                panic!("the switch was something else: {mutation:?}");
+            };
+            assert_eq!(agent_id.as_str(), "codex");
+            assert_eq!(*tool, AgentBuiltinTool::Computer);
+            assert!(!enabled, "a panel that was on was switched on again");
+        }
+        other => panic!("the switch produced {other:?}"),
+    }
+
+    // The answer the authority gives is what the row then renders.
+    app.management_data
+        .agent_tools
+        .set_enabled("codex", AgentBuiltinTool::Computer, false);
+    let rows = vibex_tui::config_center::agent_rows(&app.management_data, app.strings);
+    let tools = rows[0]
+        .detail
+        .iter()
+        .find(|(label, _)| label == "Built-in tools")
+        .map(|(_, value)| value.clone())
+        .expect("the panels were not on the record");
+    assert!(
+        tools.contains("Browser tools on") && tools.contains("Computer use off"),
+        "the row did not follow the authority's answer: {tools}"
+    );
+
+    // The browser panel is its own switch, in the other direction.
+    app.config_center.pending.clear();
+    let outcome = app.run_config_action_by_key("codex", ConfigAction::BrowserTools);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::SetAgentTool { tool, enabled, .. } = mutation
+            else {
+                panic!("the switch was something else: {mutation:?}");
+            };
+            assert_eq!(*tool, AgentBuiltinTool::Browser);
+            assert!(!enabled, "the browser panel was not the one switched");
+        }
+        other => panic!("the switch produced {other:?}"),
+    }
+}

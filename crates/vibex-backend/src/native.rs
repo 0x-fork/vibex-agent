@@ -362,6 +362,36 @@ impl AgentBackend for NativeBackend {
         }))
     }
 
+    fn agent_tool_preferences(&self) -> BackendFuture<'_, vibex_core::AgentToolPreferences> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            Ok(runtime.agent().manager().agent_tool_preferences())
+        })
+    }
+
+    fn set_agent_tool_enabled(
+        &self,
+        request: MutationRequest<vibex_core::AgentToolPreferenceUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentToolPreferences> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            let manager = runtime.agent().manager();
+            manager.set_agent_tool_enabled(
+                request.payload.agent_id.as_str(),
+                request.payload.tool,
+                request.payload.enabled,
+            );
+            // The whole answer comes back rather than the one row that
+            // changed: the panels are stored as the disabled sets, and a
+            // client that patched its own copy would be guessing at the other
+            // one's state.
+            Ok(manager.agent_tool_preferences())
+        })
+    }
+
     fn list_sessions(&self, include_archived: bool) -> BackendFuture<'_, Vec<AgentSession>> {
         let runtime = self.runtime.clone();
         Box::pin(async move {

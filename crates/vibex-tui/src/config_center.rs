@@ -262,6 +262,10 @@ pub enum ConfigAction {
     Upgrade,
     /// Take an Agent into the roster the reader works with.
     AddToRoster,
+    /// Whether this Agent receives the embedded browser's tools.
+    BrowserTools,
+    /// Whether it receives the computer-use tools.
+    ComputerTools,
     /// Take an Agent out of it, without uninstalling anything.
     RemoveFromRoster,
     /// Move a profile one place earlier in its Agent's order.
@@ -302,6 +306,8 @@ impl ConfigAction {
             Self::Reinstall => strings.config_action_reinstall(),
             Self::Upgrade => strings.config_action_upgrade(),
             Self::AddToRoster => strings.config_action_add_roster(),
+            Self::BrowserTools => strings.config_action_browser_tools(),
+            Self::ComputerTools => strings.config_action_computer_tools(),
             Self::RemoveFromRoster => strings.config_action_remove_roster(),
             Self::MoveUp => strings.config_action_move_up(),
             Self::MoveDown => strings.config_action_move_down(),
@@ -1452,6 +1458,12 @@ pub fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
             // group has nowhere to go, and the reducer is where that is known.
             actions.push(ConfigAction::MoveUp);
             actions.push(ConfigAction::MoveDown);
+            // The two panels reach an Agent the user never configured, so the
+            // switch is per Agent and per panel: an Agent that cannot receive
+            // MCP tools at all gets the computer-use CLI instead, and one that
+            // can gets the tools.
+            actions.push(ConfigAction::BrowserTools);
+            actions.push(ConfigAction::ComputerTools);
             if agent.managed_install.managed {
                 // An Agent the authority already has at a newer version is
                 // upgraded rather than installed again: the two run the same
@@ -1542,16 +1554,6 @@ pub fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                 // A failure the reader cannot see is a failure they will meet
                 // again: the authority's own words are kept on the record, and
                 // the row is where they are read.
-                .detail(strings.config_col_roster(), roster)
-                .detail(
-                    strings.config_field_last_error(),
-                    agent
-                        .managed_install
-                        .last_error_message
-                        .clone()
-                        .or_else(|| agent.managed_install.last_error_code.clone())
-                        .unwrap_or_default(),
-                )
                 // The models the Agent advertises come before the flags: a
                 // detail pane scrolls, and what a reader opens this one for is
                 // what the Agent can run rather than whether it is configured.
@@ -1562,6 +1564,40 @@ pub fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                     } else {
                         agent.models.join(", ")
                     },
+                )
+                .detail(strings.config_col_roster(), roster)
+                .detail(
+                    strings.config_field_tools(),
+                    format!(
+                        "{} {} · {} {}",
+                        strings.config_action_browser_tools(),
+                        if data
+                            .agent_tools
+                            .enabled(agent.id.as_str(), vibex_core::AgentBuiltinTool::Browser)
+                        {
+                            strings.config_state_on()
+                        } else {
+                            strings.config_state_off()
+                        },
+                        strings.config_action_computer_tools(),
+                        if data
+                            .agent_tools
+                            .enabled(agent.id.as_str(), vibex_core::AgentBuiltinTool::Computer)
+                        {
+                            strings.config_state_on()
+                        } else {
+                            strings.config_state_off()
+                        }
+                    ),
+                )
+                .detail(
+                    strings.config_field_last_error(),
+                    agent
+                        .managed_install
+                        .last_error_message
+                        .clone()
+                        .or_else(|| agent.managed_install.last_error_code.clone())
+                        .unwrap_or_default(),
                 )
                 .detail(
                     strings.config_field_auth(),

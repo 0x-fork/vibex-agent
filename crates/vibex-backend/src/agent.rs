@@ -386,6 +386,33 @@ pub trait AgentBackend: BackendBound {
         request: MutationRequest<AgentRuntimeOptionProbeRequest>,
     ) -> BackendFuture<'_, AgentRuntimeOptionProbeResult>;
 
+    /// The per-Agent answers for the built-in tool panels.
+    ///
+    /// The panels reach an Agent the user never configured, so what a client
+    /// renders is the authority's own record of who switched what off: a client
+    /// that kept its own copy would show a default the runtime does not share.
+    fn agent_tool_preferences(&self) -> BackendFuture<'_, vibex_core::AgentToolPreferences> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_tools_unavailable",
+                "built-in tool panels are unavailable on this backend",
+            ))
+        })
+    }
+
+    /// Record one Agent's answer for one built-in tool panel.
+    fn set_agent_tool_enabled(
+        &self,
+        _request: MutationRequest<vibex_core::AgentToolPreferenceUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentToolPreferences> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_tools_unavailable",
+                "built-in tool panels are unavailable on this backend",
+            ))
+        })
+    }
+
     fn list_agent_auth_contexts(&self) -> BackendFuture<'_, Vec<AgentAuthContext>> {
         Box::pin(async {
             Err(crate::BackendError::unsupported(

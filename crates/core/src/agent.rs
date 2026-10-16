@@ -86,6 +86,19 @@ pub struct AgentToolPreferences {
     computer_disabled: BTreeSet<String>,
 }
 
+/// One Agent's answer for one built-in tool panel, as a client records it.
+///
+/// The panels reach an Agent the user never configured, so the answer is stored
+/// as the *disabled* set: a preference that is absent means the documented
+/// default rather than whatever the last client happened to write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentToolPreferenceUpdateRequest {
+    pub agent_id: AgentId,
+    pub tool: AgentBuiltinTool,
+    pub enabled: bool,
+}
+
 impl AgentToolPreferences {
     /// Whether one panel is on for one Agent.
     pub fn enabled(&self, agent_id: &str, tool: AgentBuiltinTool) -> bool {

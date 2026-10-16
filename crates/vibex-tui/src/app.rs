@@ -676,6 +676,9 @@ pub struct ManagementData {
     pub audit: Vec<vibex_core::RemoteAuditRecord>,
     pub profiles: Vec<vibex_core::ProviderProfileSummary>,
     pub providers: Vec<vibex_core::ProviderProfileSummary>,
+    /// Which built-in tool panels each Agent receives, as the authority holds
+    /// them.
+    pub agent_tools: vibex_core::AgentToolPreferences,
     /// The Skill document the reader is looking at, as the registry answered.
     ///
     /// It is kept because the install writes *this* document: a second read at
@@ -8756,6 +8759,12 @@ pub enum ConfigMutation {
         /// than a formality.
         confirmed_affected_session_count: usize,
     },
+    /// Record one Agent's answer for one built-in tool panel.
+    SetAgentTool {
+        agent_id: vibex_core::AgentId,
+        tool: vibex_core::AgentBuiltinTool,
+        enabled: bool,
+    },
     /// Exchange two Agents' places in the roster.
     SwapAgentOrder {
         first: vibex_core::AgentId,
@@ -8908,6 +8917,7 @@ impl ConfigMutation {
             Self::CreateCustomAgent(request) => request.agent_id.as_str().to_string(),
             Self::SetAgentAdded { agent_id, .. } => agent_id.as_str().to_string(),
             Self::SwapAgentOrder { first, .. } => first.as_str().to_string(),
+            Self::SetAgentTool { agent_id, .. } => agent_id.as_str().to_string(),
             Self::LogoutAgentAuthContext {
                 auth_context_id, ..
             } => auth_context_id.clone(),
@@ -8952,6 +8962,7 @@ impl ConfigMutation {
             Self::CreateCustomAgent(_) => "custom_agent_create",
             Self::SetAgentAdded { .. } => "agent_roster",
             Self::SwapAgentOrder { .. } => "agent_roster_order",
+            Self::SetAgentTool { .. } => "agent_tool",
             Self::LogoutAgentAuthContext { .. } => "agent_auth_sign_out",
             Self::CreateProviderProfile(_) => "provider_profile_create",
             Self::ApplyNativeExport { .. } => "provider_native_export_apply",
@@ -9005,6 +9016,13 @@ impl ConfigMutation {
             Self::AuthenticateAgentMethod { .. } => Verb::SignIn,
             Self::CreateCustomAgent(_) => Verb::Create,
             Self::SwapAgentOrder { .. } => Verb::Save,
+            Self::SetAgentTool { enabled, .. } => {
+                if *enabled {
+                    Verb::Enable
+                } else {
+                    Verb::Disable
+                }
+            }
             Self::SetAgentAdded { added, .. } => {
                 if *added {
                     Verb::Add
@@ -9402,6 +9420,8 @@ pub enum Effect {
     PreviewAgentAuthLogout {
         agent_id: vibex_core::AgentId,
     },
+    /// Read the per-Agent answers for the built-in tool panels.
+    LoadAgentTools,
     /// Probe this machine for the Agent CLIs that have not been added yet.
     ///
     /// It is one effect rather than a verb per candidate because the desktop's
@@ -9534,6 +9554,7 @@ impl Effect {
             Effect::VerifyAgentAuth { .. } => "agent_auth_verify",
             Effect::RefreshAgentAuthModels { .. } => "agent_auth_models",
             Effect::DiscoverLocalAgents => "agent_discovery",
+            Effect::LoadAgentTools => "agent_tools",
             Effect::NativeExportHistory { .. } => "provider_native_export_history",
             Effect::OpenSession { .. } => "open_session",
             Effect::RefreshTimeline => "timeline",

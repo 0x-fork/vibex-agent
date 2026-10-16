@@ -1225,7 +1225,7 @@ impl App {
     pub fn config_section_effects(&mut self) -> Vec<Effect> {
         use crate::config_center::ConfigSection;
         match (self.config_center.module, self.config_center.section) {
-            (_, ConfigSection::Agents) => vec![Effect::ListAgents],
+            (_, ConfigSection::Agents) => vec![Effect::ListAgents, Effect::LoadAgentTools],
             (_, ConfigSection::Providers) => {
                 let mut effects = vec![Effect::ListProfiles];
                 // The arrangement is a record of its own, read per Agent: a
@@ -1703,6 +1703,34 @@ impl App {
                 self.begin_config_mutation(crate::app::ConfigMutation::SetAgentAdded {
                     agent_id,
                     added: false,
+                })
+            }
+            (ConfigSection::Agents, ConfigAction::BrowserTools) => {
+                let Some(agent_id) = self.agent_id(key) else {
+                    return Outcome::quiet();
+                };
+                let enabled = self
+                    .management_data
+                    .agent_tools
+                    .enabled(key, vibex_core::AgentBuiltinTool::Browser);
+                self.begin_config_mutation(crate::app::ConfigMutation::SetAgentTool {
+                    agent_id,
+                    tool: vibex_core::AgentBuiltinTool::Browser,
+                    enabled: !enabled,
+                })
+            }
+            (ConfigSection::Agents, ConfigAction::ComputerTools) => {
+                let Some(agent_id) = self.agent_id(key) else {
+                    return Outcome::quiet();
+                };
+                let enabled = self
+                    .management_data
+                    .agent_tools
+                    .enabled(key, vibex_core::AgentBuiltinTool::Computer);
+                self.begin_config_mutation(crate::app::ConfigMutation::SetAgentTool {
+                    agent_id,
+                    tool: vibex_core::AgentBuiltinTool::Computer,
+                    enabled: !enabled,
                 })
             }
             (ConfigSection::Agents, ConfigAction::MoveUp) => self.move_agent(key, -1),

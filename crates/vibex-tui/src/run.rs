@@ -2717,6 +2717,10 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
+        AppMessage::AgentTools(result) => match result {
+            Ok(preferences) => app.management_data.agent_tools = preferences,
+            Err(error) => app.toast(Toast::danger(error.message)),
+        },
         AppMessage::Agents(result) => match result {
             Ok(agents) => {
                 // What the authority is doing with an install the reader asked

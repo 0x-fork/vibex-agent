@@ -181,6 +181,8 @@ pub enum AppMessage {
     ProviderOrder(BackendResult<Vec<vibex_core::AgentModelProviderDisplayOrderEntry>>),
     /// What other CLI tools on this machine hold.
     NativeImport(BackendResult<vibex_core::ProviderNativeImportPreview>),
+    /// Which built-in tool panels each Agent receives.
+    AgentTools(BackendResult<vibex_core::AgentToolPreferences>),
     /// One registry Skill, read in full.
     SkillMarketDocument(BackendResult<Box<vibex_core::SkillMarketDocument>>),
     /// The registry page after the one on screen.
@@ -710,6 +712,29 @@ impl Dispatch {
                     confirmed_affected_session_count,
                 )
                 .await
+            }
+            M::SetAgentTool {
+                agent_id,
+                tool,
+                enabled,
+            } => {
+                let request = vibex_backend::MutationRequest::new(
+                    vibex_core::AgentToolPreferenceUpdateRequest {
+                        agent_id,
+                        tool,
+                        enabled,
+                    },
+                );
+                match self.facade.agent().set_agent_tool_enabled(request).await {
+                    // The whole answer is what comes back, so the client keeps
+                    // the authority's record rather than its own guess at the
+                    // other panel's state.
+                    Ok(preferences) => {
+                        self.send(AppMessage::AgentTools(Ok(preferences)));
+                        Ok(crate::app::MutationOutcome::Plain)
+                    }
+                    Err(error) => Err(error),
+                }
             }
             M::SwapAgentOrder {
                 first,
@@ -1785,6 +1810,10 @@ impl Dispatch {
                     .preview_agent_auth_logout(context_id)
                     .await;
                 self.send(AppMessage::AgentAuthLogoutPreview(result.map(Box::new)));
+            }
+            Effect::LoadAgentTools => {
+                let result = self.facade.agent().agent_tool_preferences().await;
+                self.send(AppMessage::AgentTools(result));
             }
             Effect::DiscoverLocalAgents => {
                 let result = self
