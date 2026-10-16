@@ -1838,7 +1838,11 @@ impl MobileWorkbench {
             | SheetKey::ComposerHistory
             | SheetKey::ComposerAttach
             | SheetKey::NewSessionPicker
-            | SheetKey::NewSessionOptions
+            | SheetKey::RuntimeOptions
+            | SheetKey::RuntimeOption
+            // The question panel belongs to the conversation, not to the
+            // workbench page: the page that opened it clears it.
+            | SheetKey::AgentQuestion
             | SheetKey::SettingsPalette => {}
         }
         cx.notify();

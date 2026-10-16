@@ -1,3 +1,5 @@
+#[path = "question.rs"]
+mod question;
 #[path = "team.rs"]
 mod team;
 #[path = "timeline.rs"]
@@ -32,7 +34,9 @@ use vibex_core::{
     AgentCommandExecutionBehavior, AgentCommandSourceKind, AgentCommandTrigger, AgentId,
     AgentListRequest, AgentSession, AgentSessionState, AgentTimelineDisplaySettings,
     AgentTimelineReasoningDisplayMode, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    ElicitationFieldKind, ElicitationResolutionAction, ForkAgentSessionRequest,
+    ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationOption,
+    ElicitationRequest, ElicitationResolution, ElicitationResolutionAction,
+    ForkAgentSessionRequest,
     GitWorktreeCreateRequest, GoalPhase, GoalSnapshot, HumanDelegationRequest, MessageAttachment,
     OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PermissionRiskCategory,
     PlanStepPayload, PlanStepStatus, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState,
@@ -60,7 +64,7 @@ use vibex_remote_client::{
 };
 use vibex_ui::{
     AgentEventDecision, AgentMutationTicket, AgentWorkflowController, AsyncPhase,
-    ElicitationFormDraft, ElicitationSurfaceModel, ShellKind, locale::Locale,
+    ElicitationFormDraft, ShellKind, locale::Locale,
 };
 
 use crate::bottom_sheet::{
@@ -1601,7 +1605,17 @@ pub struct MobileApp {
     /// Live reasoning rows whose reader asked for the whole thought instead of
     /// the live window. The window is the default shape of an open live row.
     full_reasoning_rows: BTreeSet<String>,
-    expanded_approval: BTreeSet<String>,
+    /// Settled question rows the reader opened to read back the answers they
+    /// gave. A settled row is history, so it stays collapsed until asked.
+    expanded_settled_questions: BTreeSet<String>,
+    /// Which field of the open question form the reader is on. The form is a
+    /// pager — one field per screen, as a phone asks for one thing at a time —
+    /// so the position is the page's own state and outlives a redraw.
+    question_form_step: usize,
+    /// Questions the reader put away without answering. The request stays
+    /// parked in the timeline, so dismissing the panel is not declining it:
+    /// tapping its row brings the same panel back.
+    dismissed_questions: BTreeSet<String>,
     workspaces: Vec<WorkspaceRecord>,
     workspace_summaries: Vec<WorkspaceSummary>,
     sidebar_state: SidebarState,
@@ -3320,7 +3334,9 @@ impl MobileApp {
             expanded_timeline_rows: BTreeSet::new(),
             collapsed_timeline_rows: BTreeSet::new(),
             full_reasoning_rows: BTreeSet::new(),
-            expanded_approval: BTreeSet::new(),
+            expanded_settled_questions: BTreeSet::new(),
+            question_form_step: 0,
+            dismissed_questions: BTreeSet::new(),
             workspaces: Vec::new(),
             workspace_summaries: Vec::new(),
             sidebar_state: SidebarState::default(),
@@ -7344,7 +7360,9 @@ impl MobileApp {
         self.expanded_timeline_rows.clear();
         self.collapsed_timeline_rows.clear();
         self.full_reasoning_rows.clear();
-        self.expanded_approval.clear();
+        self.expanded_settled_questions.clear();
+        self.question_form_step = 0;
+        self.dismissed_questions.clear();
         self.timeline_markdown_views.borrow_mut().clear();
         self.timeline_detail_ready.clear();
         self.timeline_detail_in_flight.clear();
@@ -9926,6 +9944,13 @@ impl MobileApp {
         // A connection attempt can outlive the transport RPC budget (30s/120s)
         // with every button on the page disabled. Back has to be able to leave
         // it, otherwise the screen is a dead end for the whole timeout.
+        // The question panel rises over the composer, so back puts it away
+        // before it reaches anything behind it. Dismissal is not a decline: the
+        // request stays in the timeline, and its row brings the panel back.
+        if self.question_form_open() {
+            self.dismiss_question_sheet(cx);
+            return;
+        }
         // A row's own actions are a sheet over the whole page, so back closes
         // them before it reaches the drawer they were opened from.
         if self.sidebar_row_menu.is_some() {
@@ -10292,7 +10317,9 @@ impl MobileApp {
         self.expanded_timeline_rows.clear();
         self.collapsed_timeline_rows.clear();
         self.full_reasoning_rows.clear();
-        self.expanded_approval.clear();
+        self.expanded_settled_questions.clear();
+        self.question_form_step = 0;
+        self.dismissed_questions.clear();
         self.elicitation_form_requests.clear();
         self.elicitation_inputs.clear();
         self.elicitation_drafts.clear();
@@ -12146,13 +12173,6 @@ impl MobileApp {
         (!item.has_complete_payload()).then_some(item.sequence)
     }
 
-    fn toggle_approval_details(&mut self, id: String, cx: &mut Context<Self>) {
-        if !self.expanded_approval.insert(id.clone()) {
-            self.expanded_approval.remove(&id);
-        }
-        cx.notify();
-    }
-
     fn timeline_is_near_bottom(&self) -> bool {
         timeline_distance_to_bottom(
             f32::from(self.timeline_list.scroll_px_offset_for_scrollbar().y),
@@ -12648,6 +12668,10 @@ impl MobileApp {
             SheetKey::RuntimeOptions => self.close_runtime_options_sheet(key, cx),
             SheetKey::RuntimeOption => self.close_runtime_options_sheet(key, cx),
             SheetKey::SettingsPalette => self.settings_palette_open = false,
+            // The question form's own flag is the pending request, which the
+            // runtime owns: a resolution landing clears it. Only the pager's
+            // position is the page's, so that is what landing resets.
+            SheetKey::AgentQuestion => self.question_form_step = 0,
             // The workbench owns its own sheets.
             SheetKey::FileGoto
             | SheetKey::GitBranches
@@ -13951,6 +13975,14 @@ impl MobileApp {
             sheet_size,
         );
         let composer_history_scroll = self.sheet.body_scroll(SheetKey::ComposerHistory);
+        // The question panel is driven by the pending request rather than by a
+        // flag of its own: a resolution landing takes it away with the same
+        // motion a dismissal uses.
+        let question_sheet = self.sheet.presentation(
+            SheetKey::AgentQuestion,
+            self.question_form_open(),
+            sheet_size,
+        );
         let row_menu_sheet = self.sheet.presentation(
             SheetKey::SidebarRowMenu,
             self.sidebar_row_menu.is_some(),
@@ -14293,6 +14325,12 @@ impl MobileApp {
                         composer_history_scroll,
                         cx,
                     ))
+                })
+                // The question panel covers the composer, so it is painted after
+                // it: an answer is what the reader is being asked for, and the
+                // field behind the panel is not what they should be typing in.
+                .when_some(question_sheet, |root, presentation| {
+                    root.child(self.render_question_sheet(presentation, cx))
                 })
                 .when_some(
                     self.project_remove_confirmation.clone(),
@@ -19829,52 +19867,6 @@ impl MobileApp {
         }
     }
 
-    fn render_permission_request_card(
-        &self,
-        row: &TimelineRow,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let Some(TimelinePayload::PermissionRequest(request)) =
-            self.timeline_row_latest_payload(row)
-        else {
-            return self.render_fallback_process_row(row);
-        };
-        if request.status != vibex_core::PermissionRequestStatus::Pending {
-            return self.render_fallback_process_row(row);
-        }
-        let approval = self
-            .controller
-            .as_ref()
-            .and_then(|controller| {
-                controller
-                    .state
-                    .approval_surfaces(ShellKind::Compact)
-                    .into_iter()
-                    .find(|approval| approval.request_id == request.id)
-            })
-            .unwrap_or_else(|| {
-                vibex_ui::ApprovalSurfaceModel::from_request(request, ShellKind::Compact)
-            });
-        self.render_approval(&approval, cx).into_any_element()
-    }
-
-    fn render_elicitation_request_card(
-        &self,
-        row: &TimelineRow,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let Some(TimelinePayload::ElicitationRequest(request)) =
-            self.timeline_row_latest_payload(row)
-        else {
-            return self.render_fallback_process_row(row);
-        };
-        if request.status != vibex_core::ElicitationRequestStatus::Pending {
-            return self.render_fallback_process_row(row);
-        }
-        let surface = ElicitationSurfaceModel::from_request(request, ShellKind::Compact);
-        self.render_elicitation(&surface, cx).into_any_element()
-    }
-
     fn render_error_row(
         &self,
         row: &TimelineRow,
@@ -20294,544 +20286,6 @@ impl MobileApp {
         };
         self.timeline_file_diff = Some(MobileTimelineFileDiff { path, preview });
         cx.notify();
-    }
-
-    fn render_approval(
-        &self,
-        approval: &vibex_ui::ApprovalSurfaceModel,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let approve_id = approval.request_id.clone();
-        let deny_id = approval.request_id.clone();
-        let always_id = approval.request_id.clone();
-        let details_id = approval.request_id.to_string();
-        let details_expanded = self.expanded_approval.contains(&details_id);
-        let details_to_show = if details_expanded {
-            approval.details.len()
-        } else {
-            approval.details.len().min(3)
-        };
-        let resolving = self.controller.as_ref().is_some_and(|controller| {
-            controller
-                .state
-                .pending_permission_resolution(approval.request_id.as_str())
-        });
-        let can_approve = approval
-            .allowed_responses
-            .contains(&PermissionResponseKind::Approve);
-        let can_deny = approval
-            .allowed_responses
-            .contains(&PermissionResponseKind::Deny);
-        let can_always = approval
-            .allowed_responses
-            .contains(&PermissionResponseKind::AlwaysAllowForSession);
-        let approve_label = approval_response_label(
-            approval,
-            PermissionResponseKind::Approve,
-            locale::common("Approve"),
-        );
-        let deny_label = approval_response_label(
-            approval,
-            PermissionResponseKind::Deny,
-            locale::common("Deny"),
-        );
-        let always_label = approval_response_label(
-            approval,
-            PermissionResponseKind::AlwaysAllowForSession,
-            locale::common("Always allow"),
-        );
-        div()
-            .w_full()
-            .min_w_0()
-            .flex_shrink_0()
-            .rounded(px(theme::RADIUS_CARD))
-            .border_1()
-            .border_color(theme::accent_yellow())
-            .bg(theme::bg_card())
-            .p_3()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(theme::font_body())
-                            .text_color(theme::text_primary())
-                            .child(approval.title.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(theme::font_micro())
-                            .text_color(theme::accent_yellow())
-                            .child(permission_risk_label(approval.risk_category)),
-                    ),
-            )
-            .children(
-                approval
-                    .details
-                    .iter()
-                    .take(details_to_show)
-                    .map(|(label, value)| {
-                        div()
-                            .flex()
-                            .gap_2()
-                            .text_size(theme::font_caption())
-                            .child(div().text_color(theme::text_muted()).child(label.clone()))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_color(theme::text_secondary())
-                                    .child(value.clone()),
-                            )
-                    }),
-            )
-            .when(approval.details.len() > 3, |card| {
-                card.child(
-                    div()
-                        .id(format!("approval-details:{details_id}"))
-                        .h(px(36.0))
-                        .flex()
-                        .items_center()
-                        .text_size(theme::font_caption())
-                        .text_color(theme::text_muted())
-                        .cursor_pointer()
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                this.toggle_approval_details(details_id.clone(), cx)
-                            }),
-                        )
-                        .child(if details_expanded {
-                            locale::common("Show less").to_string()
-                        } else {
-                            format!(
-                                "{} {} {}",
-                                locale::text("Show all", "显示全部", "顯示全部"),
-                                approval.details.len(),
-                                locale::text("details", "项详情", "項詳細資料")
-                            )
-                        }),
-                )
-            })
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .justify_end()
-                    .gap_2()
-                    .when(resolving, |actions| {
-                        actions.child(
-                            div()
-                                .h(px(theme::TOUCH_TARGET))
-                                .flex()
-                                .items_center()
-                                .text_size(theme::font_body())
-                                .text_color(theme::text_muted())
-                                .child(locale::common("Resolving...")),
-                        )
-                    })
-                    .when(!resolving && can_deny, |actions| {
-                        actions.child(
-                            div()
-                                .id(format!("deny:{}", approval.request_id))
-                                .h(px(theme::TOUCH_TARGET))
-                                .px_4()
-                                .flex()
-                                .items_center()
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .border_1()
-                                .border_color(theme::border_default())
-                                .text_size(theme::font_body())
-                                .text_color(theme::text_secondary())
-                                .cursor_pointer()
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.resolve_permission(
-                                            deny_id.clone(),
-                                            PermissionResponseKind::Deny,
-                                            cx,
-                                        )
-                                    }),
-                                )
-                                .child(deny_label),
-                        )
-                    })
-                    .when(!resolving && can_always, |actions| {
-                        actions.child(
-                            div()
-                                .id(format!("always-allow:{}", approval.request_id))
-                                .h(px(theme::TOUCH_TARGET))
-                                .px_4()
-                                .flex()
-                                .items_center()
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .border_1()
-                                .border_color(theme::border_default())
-                                .text_size(theme::font_body())
-                                .text_color(theme::text_secondary())
-                                .cursor_pointer()
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.resolve_permission(
-                                            always_id.clone(),
-                                            PermissionResponseKind::AlwaysAllowForSession,
-                                            cx,
-                                        )
-                                    }),
-                                )
-                                .child(always_label),
-                        )
-                    })
-                    .when(!resolving && can_approve, |actions| {
-                        actions.child(
-                            div()
-                                .id(format!("approve:{}", approval.request_id))
-                                .h(px(theme::TOUCH_TARGET))
-                                .px_4()
-                                .flex()
-                                .items_center()
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .bg(theme::text_primary())
-                                .text_size(theme::font_body())
-                                .text_color(theme::bg_primary())
-                                .cursor_pointer()
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.resolve_permission(
-                                            approve_id.clone(),
-                                            PermissionResponseKind::Approve,
-                                            cx,
-                                        )
-                                    }),
-                                )
-                                .child(approve_label),
-                        )
-                    }),
-            )
-    }
-
-    fn render_elicitation(
-        &self,
-        surface: &ElicitationSurfaceModel,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let request = &surface.request;
-        let pending = self.controller.as_ref().is_some_and(|controller| {
-            controller
-                .state
-                .pending_elicitation_resolution(request.id.as_str())
-        });
-        let mut fields = Vec::new();
-        for field in &request.fields {
-            let control = match &field.kind {
-                ElicitationFieldKind::Text { options, .. } if !options.is_empty() => div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .children(options.iter().map(|option| {
-                        let request_id = request.id.clone();
-                        let field_id = field.id.clone();
-                        let value = option.value.clone();
-                        let selected = self
-                            .elicitation_drafts
-                            .get(request.id.as_str())
-                            .and_then(|draft| draft.text(&field.id))
-                            == Some(option.value.as_str());
-                        div()
-                            .id(format!("elicitation:{}:{}", field.id, option.value))
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .px_3()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(if selected {
-                                theme::text_primary()
-                            } else {
-                                theme::border_default()
-                            })
-                            .when(selected, |choice| choice.bg(theme::bg_card_dim()))
-                            .flex()
-                            .items_center()
-                            .text_size(theme::font_caption())
-                            .text_color(theme::text_secondary())
-                            .cursor_pointer()
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.set_elicitation_option(
-                                        request_id.clone(),
-                                        field_id.clone(),
-                                        value.clone(),
-                                        cx,
-                                    )
-                                }),
-                            )
-                            .child(option.title.clone())
-                    }))
-                    .into_any_element(),
-                ElicitationFieldKind::Text { .. }
-                | ElicitationFieldKind::Number { .. }
-                | ElicitationFieldKind::Integer { .. } => self
-                    .elicitation_inputs
-                    .get(&(request.id.as_str().to_string(), field.id.clone()))
-                    .cloned()
-                    .map(|input| {
-                        div()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_default())
-                            .bg(theme::bg_card_dim())
-                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
-                            .child(input)
-                            .into_any_element()
-                    })
-                    .unwrap_or_else(|| div().into_any_element()),
-                ElicitationFieldKind::Boolean { .. } => div()
-                    .flex()
-                    .gap_2()
-                    .children(
-                        [(false, locale::common("No")), (true, locale::common("Yes"))]
-                            .into_iter()
-                            .map(|(value, label)| {
-                                let request_id = request.id.clone();
-                                let field_id = field.id.clone();
-                                let selected = self
-                                    .elicitation_drafts
-                                    .get(request.id.as_str())
-                                    .and_then(|draft| draft.boolean(&field.id))
-                                    == Some(value);
-                                div()
-                                    .id(format!("elicitation:{}:{value}", field.id))
-                                    .h(px(theme::TOUCH_TARGET))
-                                    .px_4()
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .border_1()
-                                    .border_color(if selected {
-                                        theme::text_primary()
-                                    } else {
-                                        theme::border_default()
-                                    })
-                                    .when(selected, |choice| choice.bg(theme::bg_card_dim()))
-                                    .flex()
-                                    .items_center()
-                                    .text_size(theme::font_caption())
-                                    .text_color(theme::text_secondary())
-                                    .cursor_pointer()
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.set_elicitation_boolean(
-                                                request_id.clone(),
-                                                field_id.clone(),
-                                                value,
-                                                cx,
-                                            )
-                                        }),
-                                    )
-                                    .child(label)
-                            }),
-                    )
-                    .into_any_element(),
-                ElicitationFieldKind::MultiSelect { options, .. } => div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .children(options.iter().map(|option| {
-                        let request_id = request.id.clone();
-                        let field_id = field.id.clone();
-                        let value = option.value.clone();
-                        let selected = self
-                            .elicitation_drafts
-                            .get(request.id.as_str())
-                            .is_some_and(|draft| draft.multi_selected(&field.id, &option.value));
-                        div()
-                            .id(format!("elicitation:{}:{}", field.id, option.value))
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .px_3()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(if selected {
-                                theme::text_primary()
-                            } else {
-                                theme::border_default()
-                            })
-                            .when(selected, |choice| choice.bg(theme::bg_card_dim()))
-                            .flex()
-                            .items_center()
-                            .text_size(theme::font_caption())
-                            .text_color(theme::text_secondary())
-                            .cursor_pointer()
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.toggle_elicitation_multi_option(
-                                        request_id.clone(),
-                                        field_id.clone(),
-                                        value.clone(),
-                                        cx,
-                                    )
-                                }),
-                            )
-                            .child(option.title.clone())
-                    }))
-                    .into_any_element(),
-                ElicitationFieldKind::Unsupported { schema_type } => div()
-                    .text_size(theme::font_caption())
-                    .text_color(theme::accent_red())
-                    .child(format!(
-                        "{}: {schema_type}",
-                        locale::text(
-                            "Unsupported input type",
-                            "不支持的输入类型",
-                            "不支援的輸入類型"
-                        )
-                    ))
-                    .into_any_element(),
-            };
-            fields.push(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(theme::font_caption())
-                            .text_color(theme::text_secondary())
-                            .child(if field.required {
-                                format!("{} *", field.title)
-                            } else {
-                                field.title.clone()
-                            }),
-                    )
-                    .when_some(field.description.as_ref(), |container, description| {
-                        container.child(
-                            div()
-                                .text_size(theme::font_micro())
-                                .text_color(theme::text_muted())
-                                .child(description.clone()),
-                        )
-                    })
-                    .child(control)
-                    .into_any_element(),
-            );
-        }
-
-        let accept_id = request.id.clone();
-        let decline_id = request.id.clone();
-        div()
-            .w_full()
-            .min_w_0()
-            .flex_shrink_0()
-            .max_h(px(430.0))
-            .rounded(px(theme::RADIUS_CARD))
-            .border_1()
-            .border_color(theme::accent_blue())
-            .bg(theme::bg_card())
-            .p_3()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .text_size(theme::font_body())
-                    .text_color(theme::text_primary())
-                    .child(
-                        request
-                            .title
-                            .clone()
-                            .unwrap_or_else(|| locale::common("Input requested").to_string()),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(theme::font_caption())
-                    .text_color(theme::text_secondary())
-                    .child(request.message.clone()),
-            )
-            .child(
-                div()
-                    .id("elicitation-fields")
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .restrict_scroll_to_axis()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .children(fields),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id(format!("decline-elicitation:{}", request.id))
-                            .h(px(theme::TOUCH_TARGET))
-                            .px_4()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_default())
-                            .flex()
-                            .items_center()
-                            .text_size(theme::font_body())
-                            .text_color(theme::text_secondary())
-                            .when(!pending, |button| {
-                                button.cursor_pointer().on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.resolve_elicitation(
-                                            decline_id.clone(),
-                                            ElicitationResolutionAction::Decline,
-                                            cx,
-                                        )
-                                    }),
-                                )
-                            })
-                            .child(locale::common("Decline")),
-                    )
-                    .child(
-                        div()
-                            .id(format!("accept-elicitation:{}", request.id))
-                            .h(px(theme::TOUCH_TARGET))
-                            .px_4()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .bg(theme::text_primary())
-                            .flex()
-                            .items_center()
-                            .text_size(theme::font_body())
-                            .text_color(theme::bg_primary())
-                            .when(!pending, |button| {
-                                button.cursor_pointer().on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.resolve_elicitation(
-                                            accept_id.clone(),
-                                            ElicitationResolutionAction::Accept,
-                                            cx,
-                                        )
-                                    }),
-                                )
-                            })
-                            .child(if pending {
-                                locale::common("Submitting...")
-                            } else {
-                                locale::common("Submit")
-                            }),
-                    ),
-            )
     }
 
     fn render_composer(
@@ -25584,6 +25038,7 @@ impl MobileApp {
 impl Render for MobileApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_elicitation_form(window, cx);
+        self.sync_question_form();
         // Notices recorded by paths that have no window. The toast layer needs
         // one, so they are handed over here, where every frame has it. A notice
         // that reaches the layer never touches a page's layout, which is what

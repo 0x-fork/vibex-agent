@@ -93,6 +93,10 @@ pub enum SheetKey {
     GitRevert,
     /// The patch for one file, read over the tree it belongs to.
     GitDiff,
+    /// The question an Agent parked on: an approval, or a form it asked the
+    /// reader to fill in. The panel covers the composer while the reader
+    /// answers, and one asks for one request at a time.
+    AgentQuestion,
 }
 
 /// How tall a sheet may be: where it rests, and how far it may be pulled open.
