@@ -41,7 +41,8 @@ use gpui::{
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
     Subscription, SystemNotification, Task, TitlebarOptions, Unbind, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowId, WindowOptions, div, img, linear_color_stop, linear_gradient, point, prelude::*, px,
+    WindowId, WindowKind, WindowOptions, div, img, linear_color_stop, linear_gradient, point,
+    prelude::*, px,
     relative, rgb, size,
 };
 use gpui_component::{
@@ -146,7 +147,8 @@ use vibex_desktop_model::{
     BACKGROUND_IMAGE_EXTENSIONS, BACKGROUND_IMAGE_MAX_DIM_PERCENT,
     BACKGROUND_IMAGE_MIN_DIM_PERCENT, BackgroundImageFit, BrowserSearchEngine, BrowserStartPage,
     BrowserUiState, ComposerAttachment, ComposerQueueCommand, ComposerQueueEntry,
-    ComposerQueueSendMode, ComposerSuggestionSelection, ComposerTrigger, ComputerUiState,
+    ComposerQueueSendMode, ComposerSuggestionSelection, ComposerTrigger, ComputerPanelMode,
+    ComputerUiState,
     DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DEFAULT_NETWORK_PROXY_BYPASS, DesktopBehaviorUiState,
     DesktopUiStateV1, DeveloperUiState, EditorAutosaveMode, GitSelectionKey, GitWorkbenchMode,
     LocaleMode, MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey,
@@ -8645,6 +8647,12 @@ pub struct VibexWorkbench {
     computer_status: Option<ComputerSettingsStatus>,
     /// The install or check that is in flight, so the button can say so.
     computer_driver_task: Option<Task<()>>,
+    /// The open computer-use panel window, so a mode change can replace it
+    /// rather than stack a second panel beside the first.
+    computer_panel_window: Option<AnyWindowHandle>,
+    /// The subscription that notices the panel window going away, so the
+    /// workbench's handle is dropped with it.
+    _computer_panel_closed_subscription: Option<Subscription>,
     backend: Option<BackendFacade>,
     shared_workflow: Option<AgentFileGitController>,
     shared_terminal: Option<TerminalWorkflowController>,
@@ -10411,6 +10419,11 @@ impl VibexWorkbench {
             VibexWorkbench::handle_window_closed,
             cx,
         );
+        // The panel window can be closed from its own titlebar, so the
+        // workbench has to forget the handle when that happens rather than
+        // holding a stale one that would swallow the next open.
+        let computer_panel_closed_subscription =
+            observe_computer_panel_close(cx.weak_entity(), cx);
         let window_handle = Some(window.window_handle());
         let mut this = Self {
             focus_handle,
@@ -10420,6 +10433,8 @@ impl VibexWorkbench {
             computer_tokio: None,
             computer_status: None,
             computer_driver_task: None,
+            computer_panel_window: None,
+            _computer_panel_closed_subscription: Some(computer_panel_closed_subscription),
             backend: None,
             shared_workflow: None,
             shared_terminal: None,
@@ -10907,34 +10922,156 @@ impl VibexWorkbench {
         self.open_settings(window, cx);
     }
 
-    /// Opens the computer-use panel in its own window.
+    /// Opens the computer-use panel, reusing or replacing the open one.
     ///
     /// Its own window rather than a tab on purpose: the panel is what a reader
     /// keeps an eye on *while* working somewhere else, and the emergency stop
-    /// has to be reachable without hunting for a tab.
+    /// has to be reachable without hunting for a tab. A panel that is already
+    /// open is raised instead of duplicated, and a shell change replaces the
+    /// window rather than leaving two panels showing the same session.
     pub(crate) fn open_computer_panel(&mut self, cx: &mut Context<Self>) {
+        self.open_computer_panel_in(self.computer_panel_mode(), false, cx);
+    }
+
+    /// The shell the panel should open in.
+    fn computer_panel_mode(&self) -> ComputerPanelMode {
+        self.ui_state.computer.panel_mode
+    }
+
+    /// Stores the reader's shell choice and moves an open panel into it.
+    fn set_computer_panel_mode(&mut self, mode: ComputerPanelMode, cx: &mut Context<Self>) {
+        if self.ui_state.computer.panel_mode == mode {
+            return;
+        }
+        self.ui_state.computer.panel_mode = mode;
+        self.queue_ui_state();
+        if self.computer_panel_window.is_some() {
+            self.open_computer_panel_in(mode, true, cx);
+        }
+        cx.notify();
+    }
+
+    /// Opens the panel, optionally replacing a window that is already open.
+    fn open_computer_panel_in(
+        &mut self,
+        mode: ComputerPanelMode,
+        replace_open: bool,
+        cx: &mut Context<Self>,
+    ) {
         let (Some(runtime), Some(tokio)) =
             (self.computer_runtime.clone(), self.computer_tokio.clone())
         else {
             return;
         };
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(560.0), px(720.0)),
-                cx,
-            ))),
-            titlebar: Some(TitleBar::title_bar_options()),
-            window_min_size: Some(size(px(420.0), px(520.0))),
-            ..Default::default()
+        let existing = self.computer_panel_window.take();
+        if let Some(handle) = existing {
+            if !replace_open {
+                // Already open: raise it rather than stacking a second panel.
+                self.computer_panel_window = Some(handle);
+                let _ = handle.update(cx, |_, window, cx| {
+                    window.activate_window();
+                    cx.activate(true);
+                    window.refresh();
+                });
+                return;
+            }
+            // A shell change is a replacement, so the old window is dropped
+            // before the new one opens.
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+        // The floating shell is a small, always-ready strip; the window shell is
+        // the full surface. The platform decides how literally "floating" can be
+        // taken — macOS puts it at the floating window level, Windows and X11
+        // honor it best-effort, and Wayland compositors may keep it tiled.
+        let options = if mode.is_floating() {
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(360.0), px(300.0)),
+                    cx,
+                ))),
+                kind: WindowKind::Floating,
+                titlebar: Some(TitlebarOptions {
+                    title: Some(locale::text("Computer use", "电脑操作", "電腦操作").into()),
+                    ..Default::default()
+                }),
+                window_min_size: Some(size(px(280.0), px(220.0))),
+                app_id: release_application_id().ok().map(str::to_string),
+                icon: window_icon().ok(),
+                ..Default::default()
+            }
+        } else {
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(560.0), px(720.0)),
+                    cx,
+                ))),
+                titlebar: Some(TitleBar::title_bar_options()),
+                window_min_size: Some(size(px(420.0), px(520.0))),
+                app_id: release_application_id().ok().map(str::to_string),
+                icon: window_icon().ok(),
+                ..Default::default()
+            }
         };
+        let appearance = self.ui_state.appearance.clone();
+        let backdrop = self.backdrop();
+        let workbench = cx.weak_entity();
         let opened = cx.open_window(options, move |window, cx| {
-            let surface =
-                cx.new(|cx| crate::computer_surface::ComputerSurface::new(runtime, tokio, cx));
+            // A second window has to carry the same appearance the workbench
+            // last applied, or it would repaint every other window's palette.
+            theme::apply_appearance(&appearance, backdrop, Some(window), cx);
+            let surface = cx.new(|cx| {
+                crate::computer_surface::ComputerSurface::new_in(runtime, tokio, mode, cx)
+            });
+            // The shell toggle lives in the panel, but the shell is a window
+            // property, so the panel asks the workbench to reopen it.
+            let surface_for_mode = surface.clone();
+            cx.subscribe(
+                &surface_for_mode,
+                move |_, event: &crate::computer_surface::ComputerSurfaceEvent, cx| {
+                    let crate::computer_surface::ComputerSurfaceEvent::ModeRequested(mode) = event
+                    else {
+                        return;
+                    };
+                    let mode = *mode;
+                    let _ = workbench.update(cx, |workbench, cx| {
+                        workbench.set_computer_panel_mode(mode, cx)
+                    });
+                },
+            )
+            .detach();
             cx.new(|cx| gpui_component::Root::new(surface, window, cx))
         });
-        if let Err(error) = opened {
-            eprintln!("failed to open the computer-use panel: {error}");
+        match opened {
+            Ok(handle) => {
+                self.computer_panel_window = Some(handle.into());
+            }
+            Err(error) => {
+                let message = format!("failed to open the computer-use panel: {error}");
+                eprintln!("{message}");
+                if let Some(handle) = self.window_handle {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        hint_layer::push(
+                            window,
+                            hint_notification(NotificationType::Error, message.clone()),
+                            cx,
+                        );
+                    });
+                }
+            }
+        }
+    }
+
+    /// A panel window this workbench owns was closed by its titlebar button.
+    fn handle_computer_panel_closed(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
+        if self
+            .computer_panel_window
+            .map(|handle| handle.window_id())
+            == Some(window_id)
+        {
+            self.computer_panel_window = None;
+            cx.notify();
         }
     }
 
@@ -65512,6 +65649,28 @@ fn observe_preview_window_close<T: 'static>(
     })
 }
 
+/// Watches every window close so the workbench can forget the computer panel's
+/// handle when the reader closes it from the titlebar.
+///
+/// The panel has no hand-back to perform, so unlike the detached preview window
+/// this needs no "the owner did it" marker: clearing a handle that is already
+/// `None` is a no-op.
+fn observe_computer_panel_close(
+    owner: WeakEntity<VibexWorkbench>,
+    cx: &mut App,
+) -> Subscription {
+    cx.on_window_closed(move |cx, window_id| {
+        let Some(owner) = owner.upgrade() else {
+            return;
+        };
+        cx.defer(move |cx| {
+            owner.update(cx, |owner, cx| {
+                VibexWorkbench::handle_computer_panel_closed(owner, window_id, cx)
+            });
+        });
+    })
+}
+
 fn localize_network_proxy_error(error: &str) -> String {
     match error {
         "proxy address is required for a custom proxy" => locale::text(
@@ -79716,6 +79875,66 @@ impl FoundationSettings {
             cx,
         );
 
+        // The panel is the human's half of the feature, so the page that turns
+        // the feature on is also where the reader opens it and decides how it
+        // is hosted. Opening is offered whenever the feature is on, even before
+        // the driver answers, because the panel is also where the reason it
+        // cannot run is spelled out.
+        let panel_row = setting_row(
+            locale::text("Panel", "面板", "面板"),
+            locale::text(
+                "Watch and stop the Agent's desktop session in its own window, or as a small \
+                 strip that floats above other windows where the platform allows it.",
+                "在一个独立窗口里查看并随时停止 Agent 的桌面操作，或使用一个小巧的浮动条，在系统允许时始终位于其他窗口之上。",
+                "在一個獨立視窗裡檢視並隨時停止 Agent 的桌面操作，或使用一個小巧的浮動列，在系統允許時始終位於其他視窗之上。",
+            ),
+            v_flex()
+                .items_end()
+                .gap_2()
+                .child(
+                    Button::new("computer-open-panel")
+                        .small()
+                        .primary()
+                        .label(locale::text("Open panel", "打开面板", "開啟面板"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let _ = this.workbench.update(cx, |workbench, cx| {
+                                workbench.open_computer_panel(cx)
+                            });
+                        })),
+                )
+                .child(settings_segmented_control(
+                    "computer-panel-mode",
+                    vec![
+                        settings_segmented_option(
+                            locale::text("Window", "窗口", "視窗"),
+                            settings.panel_mode == ComputerPanelMode::Window,
+                            cx.listener(|this, _, _, cx| {
+                                let _ = this.workbench.update(cx, |workbench, cx| {
+                                    workbench.set_computer_panel_mode(
+                                        ComputerPanelMode::Window,
+                                        cx,
+                                    )
+                                });
+                            }),
+                        ),
+                        settings_segmented_option(
+                            locale::text("Floating", "浮动", "浮動"),
+                            settings.panel_mode == ComputerPanelMode::Floating,
+                            cx.listener(|this, _, _, cx| {
+                                let _ = this.workbench.update(cx, |workbench, cx| {
+                                    workbench.set_computer_panel_mode(
+                                        ComputerPanelMode::Floating,
+                                        cx,
+                                    )
+                                });
+                            }),
+                        ),
+                    ],
+                )),
+            stacked,
+            cx,
+        );
+
         let timeout_options: Vec<Tab> = vibex_core::COMPUTER_CALL_TIMEOUT_CHOICES_MS
             .iter()
             .map(|choice| {
@@ -79796,6 +80015,7 @@ impl FoundationSettings {
             ),
             vec![
                 SettingsGroup::unlabeled(vec![master, driver_row, permissions_row]),
+                SettingsGroup::new(locale::text("Panel", "面板", "面板"), vec![panel_row]),
                 SettingsGroup::new(
                     locale::text("Approval", "审批", "審批"),
                     vec![approval_row, self_row],
