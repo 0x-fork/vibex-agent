@@ -6689,6 +6689,25 @@ impl MobileApp {
     }
 
     fn open_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
+        // The completion has been read by the fact of the row being opened, and
+        // the authority is told: the badge is one fact seen from several seats,
+        // so a client that only hid its own dot would leave every other seat's
+        // lit. The row hides it immediately either way, which is what keeps the
+        // wait for the snapshot from showing.
+        if self
+            .sidebar_view
+            .unread_session_ids
+            .contains(session_id.as_str())
+        {
+            self.send_sidebar_mutation(
+                RemoteSidebarOrganizationMutation::SetSessionsUnread {
+                    session_ids: vec![session_id.as_str().to_string()],
+                    unread: false,
+                },
+                false,
+                cx,
+            );
+        }
         if let Some(team) = self.team_controller.as_mut() {
             team.select_session(session_id.clone());
         }
@@ -22241,6 +22260,7 @@ impl MobileApp {
                     group.child(sidebar_workspace_status_indicator(
                         Some(state),
                         None,
+                        row.auto_continue,
                         ElementId::from(format!("mobile-group-mark-{}", row.id())),
                     ))
                 })
@@ -22466,6 +22486,9 @@ impl MobileApp {
         let status_indicator = sidebar_workspace_status_indicator(
             row.state,
             row.lifecycle,
+            // A Worktree's own aggregate is not a setting of its own: the
+            // desktop forces this off for a worktree row too.
+            false,
             ElementId::from(format!("mobile-sidebar-workspace-mark-{workspace_id}")),
         );
         // Where the git layer stands is the one thing about a Worktree the
@@ -31532,9 +31555,12 @@ fn sidebar_session_running_color(auto_continue_enabled: bool) -> gpui::Hsla {
     }
 }
 
+/// `auto_continue` is whether the row's sessions continue on their own. Only a
+/// group carries one: a Worktree's aggregate is not a setting of its own.
 fn sidebar_workspace_status_indicator(
     state: Option<AgentSessionState>,
     lifecycle: Option<WorktreeLifecycleDisplayState>,
+    auto_continue: bool,
     id: ElementId,
 ) -> gpui::AnyElement {
     // A Worktree whose sessions are all quiet still reports where its git layer
@@ -31546,7 +31572,10 @@ fn sidebar_workspace_status_indicator(
     };
     match state {
         Some(AgentSessionState::Running | AgentSessionState::Initializing) => {
-            sidebar_running_indicator(id, color)
+            // The one mark that says "still working" is also the one that can
+            // say "and it will keep going by itself", which is the rule the
+            // desktop's aggregate applies to a group.
+            sidebar_running_indicator(id, sidebar_session_running_color(auto_continue))
         }
         // A worktree holding a session parked on the user answers with the same
         // question mark a session row does: a collapsed worktree leaves this row
@@ -35247,6 +35276,96 @@ mod tests {
         }
     }
 
+    /// A finger that drags down inside a sheet pulls the panel with it for as
+    /// long as the drag lasts.
+    ///
+    /// The gesture is watched from the scrim, which covers the page and never
+    /// moves. Watched from the panel instead, the listener travelled away from
+    /// the contact point with the panel, so the drag died after a few pixels —
+    /// the higher up the panel the finger landed, the sooner it stopped.
+    #[gpui::test]
+    fn a_dragged_sheet_follows_the_finger_all_the_way_down(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.sidebar_row_menu = Some(SidebarRowMenu {
+                row: SidebarRow {
+                    item: SidebarOrganizationItem::Project("project-1".to_string()),
+                    kind: SidebarRowKind::Project,
+                    depth: 0,
+                    indent: 0.0,
+                    label: "Vibex".to_string(),
+                    project_id: Some("project-1".to_string()),
+                    workspace_id: None,
+                    detail: None,
+                    child_count: 2,
+                    running_count: 0,
+                    lifecycle: None,
+                    collapsed: false,
+                    pinned: false,
+                    selected: false,
+                    state: None,
+                    session_id: None,
+                    unread: false,
+                    auto_continue: false,
+                    auto_continue_paused: false,
+                    delegated_child: false,
+                },
+            });
+            cx.notify();
+        });
+        settle_rise(&app, cx);
+        let sheet = cx
+            .debug_bounds("mobile-sidebar-row-menu-sheet")
+            .expect("the row's actions should be laid out");
+
+        // The contact point stays where it is while the panel travels under it,
+        // which is what a phone reports, and it sits at the panel's very top —
+        // the worst case for a listener that moved with the panel.
+        let touch = point(sheet.center().x, sheet.origin.y + px(2.0));
+        for (phase, dy) in [
+            (TouchPhase::Started, 20.0),
+            (TouchPhase::Moved, 40.0),
+            (TouchPhase::Moved, 40.0),
+        ] {
+            cx.simulate_event(ScrollWheelEvent {
+                position: touch,
+                delta: ScrollDelta::Pixels(point(px(0.0), px(dy))),
+                modifiers: Default::default(),
+                touch_phase: phase,
+            });
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
+        let pulled = cx
+            .debug_bounds("mobile-sidebar-row-menu-sheet")
+            .expect("a dragged sheet stays on screen");
+        assert!(
+            pulled.origin.y >= sheet.origin.y + px(90.0),
+            "the panel should have followed the whole drag: {pulled:?} against {sheet:?}"
+        );
+
+        // Letting go that far takes the sheet with it.
+        cx.simulate_event(ScrollWheelEvent {
+            position: touch,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Ended,
+        });
+        settle_sheet(&app, cx);
+        assert!(
+            app.read_with(cx, |app, _| app.sidebar_row_menu.is_none()),
+            "a pull this long dismisses the sheet"
+        );
+    }
+
     /// The drawer's header wears the same lockup as the pairing page, from the
     /// drawer's own title step.
     ///
@@ -37725,6 +37844,57 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             reschedule.contains("unix_timestamp_ms() + seconds * 1_000"),
             "and moving it counts from now, the way the desktop's countdown does"
+        );
+    }
+
+    /// Opening a session tells the authority that it has been read.
+    ///
+    /// The badge is one fact seen from several seats: a client that only hid its
+    /// own dot would leave every other seat's lit, which is exactly what the
+    /// phone did — it never sent the mark at all.
+    #[test]
+    fn opening_a_session_reports_it_as_read() {
+        let source = include_str!("app.rs");
+        let open = renderer_source(source, "open_session");
+        assert!(
+            open.contains("SetSessionsUnread"),
+            "the row the reader opens is reported as read"
+        );
+        assert!(
+            open.contains("unread: false"),
+            "and reported as read rather than toggled"
+        );
+        assert!(
+            open.contains("unread_session_ids") && open.contains("contains(session_id.as_str())"),
+            "only a session that is actually marked unread is worth a write"
+        );
+    }
+
+    /// The aggregate's running mark follows the row's auto continue.
+    #[test]
+    fn a_groups_running_mark_follows_its_auto_continue() {
+        let source = include_str!("app.rs");
+        let indicator = source
+            .split_once("fn sidebar_workspace_status_indicator(")
+            .map(|(_, tail)| {
+                tail.split_once("\n/// Where a Worktree stands, in the desktop's own words.")
+                    .map_or(tail, |(body, _)| body)
+            })
+            .expect("the aggregate indicator should stay inspectable");
+        assert!(
+            indicator.contains("sidebar_session_running_color(auto_continue)"),
+            "the one mark that says \"still working\" is the one that can say it keeps going"
+        );
+
+        let group = renderer_source(source, "render_sidebar_group_row");
+        assert!(
+            group.contains("row.auto_continue"),
+            "a group hands its own setting to the mark"
+        );
+        let workspace = renderer_source(source, "render_sidebar_workspace_row");
+        assert!(
+            workspace.contains("// A Worktree's own aggregate is not a setting of its own"),
+            "and a Worktree does not: the desktop forces it off there too"
         );
     }
 
