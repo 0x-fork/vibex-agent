@@ -43,7 +43,8 @@ use crate::bottom_sheet::{
 use crate::locale;
 use crate::markdown;
 use crate::theme;
-use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_component::ActiveTheme as _;
+use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
 
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(600);
 /// Cell metrics copied from the desktop terminal surface so both clients
@@ -83,24 +84,44 @@ const TERMINAL_HANDLE_TOUCH_RADIUS: f32 = 26.0;
 /// chrome between the session and the surface. The drawer's own old header was
 /// this tall, so the rail now carries a tab strip, a count, and the close
 /// control for the price the title row used to cost on its own.
-const WORKBENCH_HEADER_HEIGHT: f32 = 56.0;
-/// A surface tab inside that header. Every one of these is a navigation
-/// control, so each clears the platform's touch minimum on its own instead of
-/// borrowing the row's height.
-const WORKBENCH_TAB_HEIGHT: f32 = 44.0;
+///
+/// The band is a chrome strip, not a content row: it sits a step under the
+/// height that a touch target wants, because the reader passes through it on
+/// the way to the surface rather than working in it. The rows below pay for
+/// that step with the space they get back.
+const WORKBENCH_HEADER_HEIGHT: f32 = 44.0;
+/// A surface tab inside that header. The tab is the plate the reader sees; the
+/// header's own height is what makes it a target, so the plate stays close to
+/// its label instead of carrying a second touch minimum inside the row.
+const WORKBENCH_TAB_HEIGHT: f32 = 32.0;
 /// The contextual row under the header: a branch, a search field, a refresh.
-const WORKBENCH_CONTEXT_HEIGHT: f32 = 52.0;
+const WORKBENCH_CONTEXT_HEIGHT: f32 = 44.0;
+/// The file screen's own header. It is a step taller than the rail's chrome
+/// strip because it stacks the file's name over the directory that holds it,
+/// and it is the one header on the rail that carries a label rather than a tab.
+const FILE_HEADER_HEIGHT: f32 = 48.0;
 /// The row that carries a segmented switch and the actions that belong to the
 /// segment it is on.
-const WORKBENCH_FILTER_HEIGHT: f32 = 52.0;
-/// A control drawn inside one of those rows: the full touch minimum, so the
-/// four pixels of the row above and below it stay ink rather than hitbox.
-const WORKBENCH_CONTROL_SIZE: f32 = 44.0;
+const WORKBENCH_FILTER_HEIGHT: f32 = 44.0;
+/// A control drawn inside one of those rows: the row's own height less its
+/// padding, so the four pixels above and below it stay ink rather than hitbox.
+const WORKBENCH_CONTROL_SIZE: f32 = 36.0;
 /// A secondary control (a chip that names a filter) inside one of those rows.
-const WORKBENCH_CHIP_HEIGHT: f32 = 36.0;
+const WORKBENCH_CHIP_HEIGHT: f32 = 32.0;
 /// How far a tree row's fill is inset from the rail's edges. The fill is a
 /// rounded card, so it must not touch the border it sits under.
 const TREE_ROW_INSET: f32 = 4.0;
+/// A row in one of the rail's trees.
+///
+/// A tree is read by scanning, so its rows are sized by their pitch rather
+/// than by the touch minimum: a full 44 on every row spent a phone's screen on
+/// the gaps between the names. It stays a comfortable target at this height —
+/// the row is a name, not a form field — and it is the density the desktop
+/// tree and the readers' own file browsers use.
+const TREE_ROW_HEIGHT: f32 = 34.0;
+/// The gap between two controls in a toolbar row. Two of these are already a
+/// margin; a scale step each is what pushed the search field into a sliver.
+const TOOLBAR_GAP: f32 = 2.0;
 
 /// The two ends of a touch selection over the terminal grid.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -235,7 +256,7 @@ pub struct MobileWorkbench {
     /// Installed on first paint so the keyboard's action key submits a search.
     file_search_subscription: Option<gpui::Subscription>,
     file_search_mode: MobileFileSearchMode,
-    file_editor_input: Option<Entity<TextareaState>>,
+    file_editor_input: Option<Entity<EditorState>>,
     /// A chosen file takes over the whole Files surface as its own screen
     /// with a back button, instead of rendering inline under the tree.
     file_screen_open: bool,
@@ -681,7 +702,9 @@ impl MobileWorkbench {
             .state
             .view()
             .editor_content
-            .is_some_and(|content| textarea_value(&self.file_editor_input, cx).as_ref() != content)
+            .is_some_and(|content| {
+                file_editor_value(&self.file_editor_input, cx).as_ref() != content
+            })
     }
 
     fn select_file(&mut self, path: String, cx: &mut Context<Self>) {
@@ -978,51 +1001,6 @@ impl MobileWorkbench {
         }
     }
 
-    /// Opens the next level of the tree.
-    ///
-    /// A lazy tree cannot be opened all at once — the children of a directory
-    /// do not exist until the authority lists it — so this expands every
-    /// directory that is on screen and fetches what is under it. Tapping again
-    /// goes a level deeper, which is the honest shape of the operation rather
-    /// than a button that claims to finish a job it cannot.
-    fn expand_file_tree_level(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        const MAX_DIRECTORIES_PER_LEVEL: usize = 25;
-        let directories = self
-            .files
-            .state
-            .tree
-            .all_visible_rows()
-            .iter()
-            .filter(|row| row.kind == FileEntryKind::Directory)
-            .filter(|row| !self.files.state.tree.is_expanded(&row.path))
-            .map(|row| row.path.clone())
-            .take(MAX_DIRECTORIES_PER_LEVEL)
-            .collect::<Vec<_>>();
-        if directories.is_empty() {
-            self.show_notice(
-                locale::text(
-                    "Every folder on screen is already open",
-                    "屏幕上的文件夹都已展开",
-                    "螢幕上的資料夾都已展開",
-                )
-                .to_string(),
-                cx,
-            );
-            return;
-        }
-        for path in directories {
-            if self
-                .files
-                .state
-                .tree
-                .set_chain_expanded(std::slice::from_ref(&path), true)
-            {
-                self.load_file_tree_path(path, cx);
-            }
-        }
-        cx.notify();
-    }
-
     fn start_file_search(&mut self, cx: &mut Context<Self>) {
         let query = input_value(&self.file_search_input, cx).trim().to_string();
         if query.is_empty() {
@@ -1143,7 +1121,7 @@ impl MobileWorkbench {
         if self.busy || !self.file_editor_is_dirty(cx) {
             return;
         }
-        let content = textarea_value(&self.file_editor_input, cx).to_string();
+        let content = file_editor_value(&self.file_editor_input, cx).to_string();
         if let Err(error) = self.files.update_active_content(content) {
             self.error = Some(error);
             cx.notify();
@@ -2111,11 +2089,13 @@ impl MobileWorkbench {
         }
         if self.file_editor_input.is_none() {
             self.file_editor_input = Some(cx.new(|cx| {
-                TextareaState::new(window, cx).placeholder(locale::text(
-                    "File content",
-                    "文件内容",
-                    "檔案內容",
-                ))
+                // The code-editor kind rather than a plain textarea: it carries
+                // the line-number gutter, the indent guides, and the syntax
+                // highlight a source file is read with. The language is set
+                // from the file's path before its text lands.
+                EditorState::new(window, cx)
+                    .folding(false)
+                    .placeholder(locale::text("File content", "文件内容", "檔案內容"))
             }));
         }
         if self.terminal_input.is_none() {
@@ -2179,7 +2159,16 @@ impl MobileWorkbench {
         if let Some(content) = self.pending_file_editor_content.take()
             && let Some(input) = self.file_editor_input.clone()
         {
-            input.update(cx, |input, cx| input.set_value(content, window, cx));
+            // The language is chosen by the path, so it is set before the text
+            // lands: the highlight is parsed from the buffer the reader sees,
+            // and a buffer that arrives first is parsed again on the next
+            // frame.
+            let path = self.file_editor_path.clone().unwrap_or_default();
+            let language = file_language_for_path(&path);
+            input.update(cx, |input, cx| {
+                input.set_highlighter(language, cx);
+                input.set_value(content, window, cx);
+            });
         }
         // After the buffer write, and before the clears borrow the fields the
         // reveal also reads.
@@ -3698,24 +3687,16 @@ impl MobileWorkbench {
             .into_any_element()
     }
 
-    /// Full-screen file view opened from the file panel: a header with a back
-    /// button and file status, the editor filling the remaining height, and a
-    /// bottom action bar (save / conflict recovery).
+    /// The file's own screen: a flat header that names the file and carries its
+    /// two navigation actions, the buffer filling everything under it, and one
+    /// action bar at the foot.
+    ///
+    /// The screen is drawn as a page rather than as a card with a card inside
+    /// it. Its chrome is two hairlines and one button, because a reader who
+    /// opened a file came for the file: every rounded box above or beside the
+    /// buffer is a line of source they cannot see.
     fn render_file_screen(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let view = self.files.state.view();
-        let input_dirty = view
-            .editor_content
-            .is_some_and(|content| textarea_value(&self.file_editor_input, cx).as_ref() != content);
-        let status = if input_dirty {
-            locale::common("Unsaved")
-        } else {
-            file_status_label(view.status)
-        };
-        let status_color = if input_dirty {
-            theme::accent_yellow()
-        } else {
-            file_status_color(view.status)
-        };
         let has_conflict = view.status == FileEditorStatus::Conflict;
         let can_write = self
             .files
@@ -3731,6 +3712,10 @@ impl MobileWorkbench {
             .unwrap_or_default();
         let file_name = path.rsplit('/').next().unwrap_or(&path).to_string();
         let icon = file_icon_descriptor(&file_name, FileEntryKind::File);
+        // The file's own name is already the header's headline; the directory
+        // under it is what the tree ellipsises away, and it is dropped for a
+        // file that sits at the root rather than repeated as the same word.
+        let parent = path.rsplit_once('/').map(|(parent, _)| parent.to_string());
         // A Markdown file and an image both have a face the source cannot show;
         // everything else is only ever text, so the switch stays off them.
         let preview_kind = file_preview_kind_for_path(&path);
@@ -3738,6 +3723,17 @@ impl MobileWorkbench {
             || (preview_kind == FilePreviewKind::Image && self.file_image.is_some());
         let showing_preview =
             previewable && self.file_preview_mode == MobileFilePreviewMode::Preview;
+        // The plate a code buffer is read on is the appearance's authored
+        // `editor.background`, which is what the desktop editor paints and what
+        // the syntax palette beside it was tuned against. The kit's own editor
+        // would paint it too, but it would round the corners of a surface that
+        // is meant to run edge to edge.
+        let editor_bg = cx
+            .theme()
+            .highlight_theme
+            .style
+            .editor_background
+            .unwrap_or_else(theme::bg_card);
         let body = if showing_preview {
             match preview_kind {
                 FilePreviewKind::Markdown => {
@@ -3750,10 +3746,6 @@ impl MobileWorkbench {
                             .id("file-screen-markdown")
                             .flex_1()
                             .min_h_0()
-                            .m_2()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_default())
                             .bg(theme::bg_card())
                             .overflow_y_scroll()
                             .p_3()
@@ -3767,15 +3759,12 @@ impl MobileWorkbench {
                         .id("file-screen-image")
                         .flex_1()
                         .min_h_0()
-                        .m_2()
-                        .rounded(px(theme::RADIUS_CONTROL))
-                        .border_1()
-                        .border_color(theme::border_default())
                         .bg(theme::bg_card())
                         .flex()
                         .items_center()
                         .justify_center()
                         .overflow_hidden()
+                        .p_2()
                         .child(
                             img(image)
                                 .max_w_full()
@@ -3792,18 +3781,14 @@ impl MobileWorkbench {
                 .id("file-screen-editor")
                 .flex_1()
                 .min_h_0()
-                .m_2()
-                .rounded(px(theme::RADIUS_CONTROL))
-                .border_1()
-                .border_color(theme::border_default())
-                .bg(theme::bg_card())
+                .bg(editor_bg)
                 .overflow_hidden()
                 // A code buffer in the interface font reads as prose; the
                 // desktop editor is monospace and so is this one.
                 .font_family("IBM Plex Mono")
                 .text_size(theme::code_font_size())
                 .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
-                .child(textarea_element(self.file_editor_input.as_ref()))
+                .child(file_editor_element(self.file_editor_input.as_ref()))
                 .into_any_element()
         };
 
@@ -3815,18 +3800,20 @@ impl MobileWorkbench {
             .child(
                 div()
                     .flex_shrink_0()
-                    .h(px(48.0))
-                    .px_1()
+                    .h(px(FILE_HEADER_HEIGHT))
+                    .pl(px(TOOLBAR_GAP))
+                    .pr(px(theme::SPACING_XS))
                     .border_b_1()
                     .border_color(theme::border_subtle())
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap(px(TOOLBAR_GAP))
                     .child(
                         div()
                             .id("file-screen-back")
-                            .size(px(theme::TOUCH_TARGET))
+                            .size(px(WORKBENCH_CONTROL_SIZE))
                             .flex_shrink_0()
+                            .rounded(px(theme::RADIUS_CONTROL))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -3844,10 +3831,10 @@ impl MobileWorkbench {
                     .child(
                         div()
                             .min_w_0()
+                            .flex_1()
                             .flex()
                             .flex_col()
                             .justify_center()
-                            .gap(px(1.0))
                             .child(
                                 div()
                                     .min_w_0()
@@ -3859,33 +3846,24 @@ impl MobileWorkbench {
                                     .text_color(theme::text_primary())
                                     .child(file_name),
                             )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(theme::font_micro())
-                                    .text_color(theme::text_muted())
-                                    .child(path),
-                            ),
-                    )
-                    .child(
-                        div().flex_1().min_w_0().flex().justify_end().child(
-                            div()
-                                .flex_shrink_0()
-                                .px_2()
-                                .py(px(2.0))
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .bg(theme::bg_card_dim())
-                                .text_size(theme::font_micro())
-                                .text_color(status_color)
-                                .child(status),
-                        ),
+                            .when_some(parent, |stack, parent| {
+                                stack.child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_size(theme::font_micro())
+                                        .text_color(theme::text_muted())
+                                        .child(parent),
+                                )
+                            }),
                     )
                     // Find and go-to-line are the two things a long file
                     // needs on a phone, where scrolling to a place by hand is
-                    // the only alternative.
+                    // the only alternative. The preview switch is a word
+                    // rather than a framed button: it names a mode, and it is
+                    // the third control on a row that already has two.
                     .when(!showing_preview, |header| {
                         header
                             .child(
@@ -3916,26 +3894,19 @@ impl MobileWorkbench {
                             div()
                                 .id("file-preview-toggle")
                                 .flex_shrink_0()
-                                .h(px(32.0))
-                                .px_2()
-                                .mr_1()
+                                .h(px(WORKBENCH_CONTROL_SIZE))
+                                .px(px(theme::SPACING_SM))
                                 .rounded(px(theme::RADIUS_CONTROL))
-                                .border_1()
-                                .border_color(if showing_preview {
-                                    theme::primary()
-                                } else {
-                                    theme::border_default()
-                                })
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .cursor_pointer()
                                 .active(|style| style.bg(theme::row_pressed_bg()))
-                                .text_size(theme::font_micro())
+                                .text_size(theme::font_caption())
                                 .text_color(if showing_preview {
-                                    theme::primary()
+                                    theme::text_primary()
                                 } else {
-                                    theme::text_secondary()
+                                    theme::text_muted()
                                 })
                                 .on_mouse_up(
                                     MouseButton::Left,
@@ -3956,30 +3927,32 @@ impl MobileWorkbench {
             .child(
                 div()
                     .flex_shrink_0()
+                    .px(px(theme::SPACING_XS))
+                    .py(px(TOOLBAR_GAP))
                     .border_t_1()
                     .border_color(theme::border_subtle())
-                    .p_2()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .gap_2()
+                    .gap(px(TOOLBAR_GAP))
+                    .child(div().flex().items_center().gap(px(TOOLBAR_GAP)).when(
+                        has_conflict,
+                        |actions| {
+                            actions.child(
+                                action_button("reload-desktop-file", "Use desktop version")
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::reload_desktop_file),
+                                    ),
+                            )
+                        },
+                    ))
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .when(has_conflict, |actions| {
-                                actions.child(
-                                    action_button("reload-desktop-file", "Use desktop version")
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(Self::reload_desktop_file),
-                                        ),
-                                )
-                            }),
-                    )
-                    .child(
-                        action_button(
+                        // The buffer's own action, and the only filled control
+                        // on the screen: the reader came here to change a file,
+                        // and a screen whose one commit action is drawn exactly
+                        // like its two navigation glyphs buries it.
+                        primary_action(
                             "save-file",
                             if !can_write {
                                 "Read only"
@@ -3988,11 +3961,11 @@ impl MobileWorkbench {
                             } else {
                                 "Save"
                             },
+                            can_write && !self.busy,
                         )
                         .when(!self.busy && can_write, |button| {
                             button.on_mouse_up(MouseButton::Left, cx.listener(Self::save_file))
-                        })
-                        .when(!can_write, |button| button.opacity(0.55)),
+                        }),
                     ),
             )
             .into_any_element()
@@ -4018,27 +3991,25 @@ impl MobileWorkbench {
             .id("file-find-bar")
             .debug_selector(|| "file-find-bar".to_string())
             .flex_shrink_0()
-            .px_2()
-            .py_1()
+            .h(px(WORKBENCH_CONTEXT_HEIGHT))
+            .px(px(theme::SPACING_XS))
             .border_b_1()
             .border_color(theme::border_subtle())
             .bg(theme::bg_card())
             .flex()
             .items_center()
-            .gap_1()
+            .gap(px(TOOLBAR_GAP))
             .child(
                 div()
-                    .h(px(36.0))
+                    .h(px(WORKBENCH_CONTROL_SIZE))
                     .min_w_0()
                     .flex_1()
                     .rounded(px(theme::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(theme::border_default())
                     .bg(theme::workbench_panel_bg())
-                    .px_2()
+                    .px(px(theme::SPACING_SM))
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap(px(theme::SPACING_XS))
                     .child(
                         svg()
                             .path("icons/search.svg")
@@ -4056,10 +4027,6 @@ impl MobileWorkbench {
             .child(
                 div()
                     .flex_shrink_0()
-                    .min_w(px(56.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
                     .text_size(theme::font_micro())
                     .text_color(if has_query && matched == 0 {
                         theme::accent_red()
@@ -4067,7 +4034,7 @@ impl MobileWorkbench {
                         theme::text_muted()
                     })
                     .child(if has_query {
-                        format!("{} / {}", current.min(matched), matched)
+                        format!("{}/{}", current.min(matched), matched)
                     } else {
                         String::new()
                     }),
@@ -4916,20 +4883,6 @@ impl MobileWorkbench {
     /// The file tree panel (search bar + rows + search results).
     fn render_file_tree(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let view = self.files.state.view();
-        let input_dirty = view
-            .editor_content
-            .is_some_and(|content| textarea_value(&self.file_editor_input, cx).as_ref() != content);
-        let status = if input_dirty {
-            locale::common("Unsaved")
-        } else {
-            file_status_label(view.status)
-        };
-        let status_color = if input_dirty {
-            theme::accent_yellow()
-        } else {
-            file_status_color(view.status)
-        };
-        let selected_path = view.selected_path.clone();
         let rows = view.rows.clone();
         let search = view.search.clone();
         let query_present = !input_value(&self.file_search_input, cx).trim().is_empty();
@@ -4944,13 +4897,13 @@ impl MobileWorkbench {
                 div()
                     .flex_shrink_0()
                     .h(px(WORKBENCH_CONTEXT_HEIGHT))
-                    .px(px(theme::SPACING_SM))
+                    .px(px(theme::SPACING_XS))
                     .overflow_hidden()
                     .border_b_1()
                     .border_color(theme::border_subtle())
                     .flex()
                     .items_center()
-                    .gap(px(theme::SPACING_XS))
+                    .gap(px(TOOLBAR_GAP))
                     .child(
                         div()
                             .h(px(WORKBENCH_CONTROL_SIZE))
@@ -4997,21 +4950,21 @@ impl MobileWorkbench {
                                 ))
                             }),
                     )
-                    // One switch, two named halves: the old chip asked the
-                    // reader to tap a word to learn what the other word was,
-                    // and the keyboard's own action key is the search trigger.
+                    // One switch, two named halves, drawn as bare labels: the
+                    // frame and the plate the old control carried made two
+                    // words the heaviest thing in the row they sit in. The
+                    // mode a query means is a word, so it is drawn as one, and
+                    // the half that is not current is the one that reads as a
+                    // label rather than a button.
                     .child(
                         div()
                             .id("file-search-mode")
                             .flex_shrink_0()
                             .h(px(WORKBENCH_CONTROL_SIZE))
-                            .p(px(2.0))
-                            .rounded(px(theme::RADIUS_PILL))
-                            .bg(theme::workbench_panel_bg())
                             .flex()
                             .items_center()
                             .children(MobileFileSearchMode::ALL.into_iter().map(|mode| {
-                                segment(
+                                rail_switch_segment(
                                     format!("file-search-mode:{}", mode.label()),
                                     mode.label(),
                                     self.file_search_mode == mode,
@@ -5025,22 +4978,6 @@ impl MobileWorkbench {
                             })),
                     )
                     .child(
-                        toolbar_icon_button(
-                            "collapse-files",
-                            "icons/chevrons-down-up.svg",
-                            "Collapse folders",
-                        )
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::collapse_file_tree)),
-                    )
-                    .child(
-                        toolbar_icon_button(
-                            "expand-files",
-                            "icons/folder-open.svg",
-                            "Open the next level of folders",
-                        )
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::expand_file_tree_level)),
-                    )
-                    .child(
                         toolbar_icon_button("refresh-files", "icons/refresh.svg", "Refresh")
                             .on_mouse_up(
                                 MouseButton::Left,
@@ -5049,6 +4986,14 @@ impl MobileWorkbench {
                                     cx.notify();
                                 }),
                             ),
+                    )
+                    .child(
+                        toolbar_icon_button(
+                            "collapse-files",
+                            "icons/chevrons-down-up.svg",
+                            "Collapse folders",
+                        )
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::collapse_file_tree)),
                     ),
             )
             // The content search's switches sit under the field they change,
@@ -5099,12 +5044,10 @@ impl MobileWorkbench {
                     )
                 },
             )
-            // The path bar: the tree ellipsises long names, so the full path
-            // of the open file lives here and scrolls instead of truncating.
-            // It is a whisper, not a row: no seam of its own, one step below
-            // the tree's own text, so the first row still reads as the top of
-            // the list.
-            .child(self.render_file_path_bar(selected_path, status, status_color, cx))
+            // The tree starts at the top of the panel. The bar that used to sit
+            // here named the workspace root and repeated the selected row's
+            // path back to the reader; both are facts the tree already shows,
+            // and on a phone the row they cost is a row of files.
             .child(
                 div()
                     .id("mobile-files-scroll")
@@ -5220,148 +5163,6 @@ impl MobileWorkbench {
             .into_any_element()
     }
 
-    /// The strip under the Files toolbar: which file the tree has chosen, and
-    /// the way back into it.
-    ///
-    /// The tree ellipsises long names, so the full path lives here and scrolls
-    /// instead of truncating. When a file is chosen the strip is also its
-    /// handle: it was rendered at the far end of the tree, which is a place the
-    /// reader had to scroll to find, and it now sits at the top where the
-    /// question "what am I looking at" is already being asked.
-    fn render_file_path_bar(
-        &self,
-        selected_path: Option<String>,
-        status: &'static str,
-        status_color: gpui::Hsla,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        match selected_path {
-            Some(path) => div()
-                .id("mobile-file-open")
-                .flex_shrink_0()
-                .h(px(theme::TOUCH_TARGET))
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .cursor_pointer()
-                .active(|style| style.bg(theme::row_pressed_bg()))
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.file_screen_open = true;
-                        cx.notify();
-                    }),
-                )
-                .child(
-                    div()
-                        .id("mobile-files-path-bar")
-                        .flex_1()
-                        .min_w_0()
-                        .px(px(theme::SPACING_MD))
-                        .overflow_x_scroll()
-                        .restrict_scroll_to_axis()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(
-                            svg()
-                                .path("icons/pencil.svg")
-                                .size(px(11.0))
-                                .flex_shrink_0()
-                                .text_color(theme::text_muted()),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .whitespace_nowrap()
-                                .font_family("IBM Plex Mono")
-                                .text_size(theme::font_micro())
-                                .text_color(theme::text_secondary())
-                                .child(path.clone()),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(theme::font_micro())
-                        .text_color(status_color)
-                        .child(status),
-                )
-                // The path is the one thing on this bar a reader wants to take
-                // with them — into a prompt, a chat, a bug report — and the bar
-                // scrolls, so selecting it by hand is not possible.
-                .child({
-                    let copy_path = path.clone();
-                    div()
-                        .id("copy-file-path")
-                        .aria_label(locale::text("Copy path", "复制路径", "複製路徑").to_string())
-                        .size(px(28.0))
-                        .mr_1()
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(theme::RADIUS_CONTROL))
-                        .cursor_pointer()
-                        .active(|style| style.bg(theme::row_pressed_bg()))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
-                                this.show_notice(
-                                    locale::text("Path copied", "路径已复制", "路徑已複製")
-                                        .to_string(),
-                                    cx,
-                                );
-                            }),
-                        )
-                        .child(
-                            svg()
-                                .path("icons/copy.svg")
-                                .size(px(theme::ICON_SM))
-                                .text_color(theme::text_muted()),
-                        )
-                })
-                .child(
-                    svg()
-                        .path("icons/chevron-right.svg")
-                        .size(px(theme::ICON_SM))
-                        .mr(px(theme::SPACING_MD))
-                        .flex_shrink_0()
-                        .text_color(theme::text_muted()),
-                )
-                .into_any_element(),
-            None => div()
-                .id("mobile-files-path-bar")
-                .flex_shrink_0()
-                .h(px(28.0))
-                .px(px(theme::SPACING_MD))
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .child(
-                    svg()
-                        .path("icons/folder-open.svg")
-                        .size(px(11.0))
-                        .flex_shrink_0()
-                        .text_color(theme::text_muted()),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .whitespace_nowrap()
-                        .font_family("IBM Plex Mono")
-                        .text_size(theme::font_micro())
-                        .text_color(theme::text_muted())
-                        .child(
-                            locale::text("Workspace root", "工作区根目录", "工作區根目錄")
-                                .to_string(),
-                        ),
-                )
-                .into_any_element(),
-        }
-    }
-
     fn render_file_tree_row(
         &self,
         row: vibex_desktop_model::FileExplorerRow,
@@ -5389,15 +5190,18 @@ impl MobileWorkbench {
         div()
             .id(format!("file:{}", row.id))
             .relative()
-            // A file row is a touch target like every other list row; 30px was
-            // below the platform minimum and made the tree feel cramped.
-            .min_h(px(theme::TOUCH_TARGET))
+            // A tree row is read at the pitch of the list around it, not at the
+            // touch minimum: the row is a name to scan, and the desktop tree
+            // and the readers' own file browsers all run shorter than a form
+            // field. It is a floor rather than a height, so a reader who takes
+            // the text-size ladder up a step keeps a row that fits its label.
+            .min_h(px(TREE_ROW_HEIGHT))
             .mx(px(TREE_ROW_INSET))
             .px(px(theme::SPACING_XS))
             .rounded(px(theme::RADIUS_CONTROL))
             .flex()
             .items_center()
-            .gap_1()
+            .gap(px(6.0))
             .when(row.selected, |item| item.bg(theme::sidebar_selected_bg()))
             .when(!row.selected, |item| {
                 item.hover(|style| style.bg(theme::row_pressed_bg()))
@@ -5408,8 +5212,8 @@ impl MobileWorkbench {
             .child(div().w(px(row.depth as f32 * 20.0)).flex_none())
             .child(
                 div()
-                    .w(px(18.0))
-                    .h(px(24.0))
+                    .w(px(16.0))
+                    .h_full()
                     .flex_none()
                     .flex()
                     .items_center()
@@ -5453,7 +5257,7 @@ impl MobileWorkbench {
             .when_some(status, |item, signal| {
                 item.child(
                     div()
-                        .w(px(18.0))
+                        .w(px(16.0))
                         .flex_none()
                         .font_family("IBM Plex Mono")
                         .text_size(theme::font_micro())
@@ -5751,19 +5555,16 @@ impl MobileWorkbench {
                     .border_color(theme::border_subtle())
                     .flex()
                     .items_center()
-                    .gap(px(theme::SPACING_XS))
+                    .gap(px(TOOLBAR_GAP))
                     .child(
                         div()
                             .id("git-mode")
                             .flex_shrink_0()
                             .h(px(WORKBENCH_CONTROL_SIZE))
-                            .p(px(2.0))
-                            .rounded(px(theme::RADIUS_PILL))
-                            .bg(theme::workbench_panel_bg())
                             .flex()
                             .items_center()
                             .child(
-                                segment(
+                                rail_switch_segment(
                                     "git-mode:changes",
                                     locale::text("Changes", "更改", "變更"),
                                     changes_active,
@@ -5776,7 +5577,7 @@ impl MobileWorkbench {
                                 ),
                             )
                             .child(
-                                segment(
+                                rail_switch_segment(
                                     "git-mode:history",
                                     locale::common("Commits"),
                                     history_active,
@@ -6139,13 +5940,13 @@ impl MobileWorkbench {
         div()
             .id(format!("git-tree:{row_id}"))
             .relative()
-            .min_h(px(theme::TOUCH_TARGET))
+            .min_h(px(TREE_ROW_HEIGHT))
             .mx(px(TREE_ROW_INSET))
             .px(px(theme::SPACING_XS))
             .rounded(px(theme::RADIUS_CONTROL))
             .flex()
             .items_center()
-            .gap(px(theme::SPACING_XS))
+            .gap(px(6.0))
             .when(selected_path, |item| item.bg(theme::sidebar_selected_bg()))
             .when(!selected_path, |item| {
                 item.hover(|style| style.bg(theme::row_pressed_bg()))
@@ -7992,13 +7793,13 @@ impl MobileWorkbench {
         div()
             .flex_shrink_0()
             .h(px(WORKBENCH_HEADER_HEIGHT))
-            .pl(px(theme::SPACING_SM))
-            .pr(px(theme::SPACING_XS))
+            .pl(px(theme::SPACING_XS))
+            .pr(px(TOOLBAR_GAP))
             .border_b_1()
             .border_color(theme::border_subtle())
             .flex()
             .items_center()
-            .gap(px(theme::SPACING_XS))
+            .gap(px(TOOLBAR_GAP))
             .child(
                 // A plain row rather than a horizontal scroller: the tabs fit a
                 // phone at every text size the platform offers, and a scroller
@@ -8011,7 +7812,7 @@ impl MobileWorkbench {
                     .overflow_hidden()
                     .flex()
                     .items_center()
-                    .gap(px(theme::SPACING_XS))
+                    .gap(px(TOOLBAR_GAP))
                     .children(WorkbenchSurface::ALL.into_iter().map(|candidate| {
                         let selected = candidate == surface;
                         let badge = match candidate {
@@ -8023,18 +7824,20 @@ impl MobileWorkbench {
                             .id(format!("workbench-tab:{}", candidate.label()))
                             .h(px(WORKBENCH_TAB_HEIGHT))
                             .flex_shrink_0()
-                            .px(px(10.0))
+                            .px(px(theme::SPACING_SM))
                             .rounded(px(theme::RADIUS_CONTROL))
+                            // The selected tab is a plate, not a button: one
+                            // wash, the same one the desktop rail marks its
+                            // active row with, and no border of its own.
                             .when(selected, |tab| tab.bg(theme::row_active_bg()))
                             .flex()
                             .items_center()
-                            .gap(px(6.0))
-                            .text_size(theme::font_caption())
-                            .font_weight(if selected {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::NORMAL
-                            })
+                            .gap(px(theme::SPACING_XS))
+                            // The surface the rail is on is navigation text a
+                            // reader looks at all session, so it takes the body
+                            // step rather than the caption floor the old strip
+                            // sat on.
+                            .text_size(theme::font_body())
                             .text_color(if selected {
                                 theme::text_primary()
                             } else {
@@ -8054,11 +7857,7 @@ impl MobileWorkbench {
                                         .flex_shrink_0()
                                         .font_family("IBM Plex Mono")
                                         .text_size(theme::font_micro())
-                                        .text_color(if selected {
-                                            theme::text_secondary()
-                                        } else {
-                                            theme::text_muted()
-                                        })
+                                        .text_color(theme::text_muted())
                                         .child(badge.min(99).to_string()),
                                 )
                             })
@@ -8076,7 +7875,7 @@ impl MobileWorkbench {
         let handler = self.close_handler.clone();
         div()
             .id("close-right-rail")
-            .size(px(theme::HEADER_BUTTON_SIZE))
+            .size(px(WORKBENCH_CONTROL_SIZE))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -8180,20 +7979,24 @@ fn input_shell(input: Option<&Entity<InputState>>) -> gpui::Div {
         .child(input_element(input))
 }
 
-/// The kit textarea for a field created on first paint. The container already
-/// draws the frame, so the textarea contributes only its text surface.
-fn textarea_element(input: Option<&Entity<TextareaState>>) -> gpui::AnyElement {
+/// The kit editor for the buffer created on first paint.
+///
+/// The editor draws its own gutter and text surface and the panel around it
+/// draws no frame, so the file's pixels are the file's own: a source buffer
+/// that sits inside a card has a margin the reader pays for on every line.
+fn file_editor_element(input: Option<&Entity<EditorState>>) -> gpui::AnyElement {
     match input {
-        Some(input) => Textarea::new(input)
+        Some(input) => Editor::new(input)
             .appearance(false)
+            .bordered(false)
             .size_full()
             .into_any_element(),
         None => div().into_any_element(),
     }
 }
 
-/// The text of the lazily-created kit textarea, or empty before the first paint.
-fn textarea_value(input: &Option<Entity<TextareaState>>, cx: &gpui::App) -> gpui::SharedString {
+/// The text of the lazily-created file editor, or empty before the first paint.
+fn file_editor_value(input: &Option<Entity<EditorState>>, cx: &gpui::App) -> gpui::SharedString {
     input
         .as_ref()
         .map(|input| input.read(cx).value())
@@ -8217,6 +8020,12 @@ fn input_element(input: Option<&Entity<InputState>>) -> gpui::AnyElement {
     }
 }
 
+/// A glyph action that sits in a bar beside a label rather than in a field of
+/// its own.
+///
+/// The bar it is drawn in is the touch target — the control only owns the
+/// square its glyph needs — so the box is one step under the platform minimum
+/// instead of a second full-height square in every row.
 fn icon_button(
     id: impl Into<gpui::ElementId>,
     path: &'static str,
@@ -8224,7 +8033,8 @@ fn icon_button(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
-        .size(px(theme::TOUCH_TARGET))
+        .size(px(WORKBENCH_CONTROL_SIZE))
+        .flex_shrink_0()
         .rounded(px(theme::RADIUS_CONTROL))
         .flex()
         .items_center()
@@ -8295,9 +8105,15 @@ fn inline_icon_button(
         )
 }
 
-/// One half of a segmented switch. The caller owns the track and the handlers;
-/// this owns the one look a half has in either state.
-fn segment(
+/// One half of a two-word switch in a rail toolbar.
+///
+/// The control is two labels and nothing else: the rail already spends its
+/// frame on the header, the toolbar band, and the list, and a plate drawn
+/// around two words made the switcher the heaviest object in the row it is
+/// supposed to sort. The half that is current carries the reading color and
+/// the other half is a label a tap promotes, so the state is legible without a
+/// track to explain it.
+fn rail_switch_segment(
     id: impl Into<gpui::ElementId>,
     label: &'static str,
     selected: bool,
@@ -8306,18 +8122,12 @@ fn segment(
         .id(id)
         .h_full()
         .flex_shrink_0()
-        .px(px(10.0))
-        .rounded(px(theme::RADIUS_PILL))
-        .when(selected, |half| half.bg(theme::row_active_bg()))
+        .px(px(theme::SPACING_SM))
+        .rounded(px(theme::RADIUS_CONTROL))
         .flex()
         .items_center()
         .justify_center()
-        .text_size(theme::font_micro())
-        .font_weight(if selected {
-            FontWeight::SEMIBOLD
-        } else {
-            FontWeight::NORMAL
-        })
+        .text_size(theme::font_caption())
         .text_color(if selected {
             theme::text_primary()
         } else {
@@ -8552,7 +8362,8 @@ fn file_tree_guides_mobile(depth: usize) -> Vec<gpui::AnyElement> {
                 .bottom_0()
                 .left(px(index as f32 * 20.0 + 16.0 - TREE_ROW_INSET))
                 .w(px(1.0))
-                .bg(theme::border_default())
+                // The same hairline the desktop tree hangs its levels from.
+                .bg(theme::border_default().opacity(0.70))
                 .into_any_element()
         })
         .collect()
@@ -8576,6 +8387,49 @@ fn file_preview_kind_for_path(path: &str) -> FilePreviewKind {
         }
         Some("svg") => FilePreviewKind::Image,
         _ => FilePreviewKind::Text,
+    }
+}
+
+/// The grammar a path is read with, named the way the editor's registry names
+/// its languages.
+///
+/// It mirrors the desktop editor's own table, so the same file is highlighted
+/// the same way on both clients; an unknown extension is plain text rather than
+/// a guess, because a wrong grammar colors a file into nonsense.
+fn file_language_for_path(path: &str) -> &'static str {
+    let extension = path
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("rs") => "rust",
+        Some("ts") => "typescript",
+        Some("tsx") => "tsx",
+        Some("js" | "mjs" | "cjs") => "javascript",
+        Some("jsx") => "jsx",
+        Some("json" | "jsonl") => "json",
+        Some("md" | "mdx" | "markdown") => "markdown",
+        Some("toml") => "toml",
+        Some("yaml" | "yml") => "yaml",
+        Some("py") => "python",
+        Some("go") => "go",
+        Some("java") => "java",
+        Some("css") => "css",
+        Some("html" | "htm") => "html",
+        Some("sh" | "bash" | "zsh") => "bash",
+        Some("sql") => "sql",
+        Some("zig") => "zig",
+        Some("lua") => "lua",
+        Some("kt" | "kts") => "kotlin",
+        Some("swift") => "swift",
+        Some("rb") => "ruby",
+        Some("php") => "php",
+        Some("c" | "h") => "c",
+        Some("cpp" | "cc" | "hpp" | "cxx") => "cpp",
+        Some("cs") => "csharp",
+        Some("diff" | "patch") => "diff",
+        _ => "text",
     }
 }
 
@@ -8784,28 +8638,33 @@ fn mobile_file_icon_color(kind: FileIconKind, ignored: bool) -> gpui::Hsla {
     if ignored { color.opacity(0.35) } else { color }
 }
 
+/// The color a tree row's name carries when git has something to say about it.
+///
+/// The signals resolve through the same `right-rail-status-*` tokens the
+/// desktop tree paints with, so a modified file is the same blue on both
+/// clients and the label the row already shows keeps matching its own color.
 fn file_tree_row_text_color(row: &vibex_desktop_model::FileExplorerRow) -> gpui::Hsla {
     if row.ignored {
         return theme::text_muted();
     }
     match row.git.map(|git| git.signal) {
-        Some(FileGitSignal::Added) => theme::accent_green(),
-        Some(FileGitSignal::Untracked) => theme::accent_yellow(),
+        Some(FileGitSignal::Added) => theme::status_added(),
+        Some(FileGitSignal::Untracked) => theme::status_untracked(),
         Some(FileGitSignal::Ignored) => theme::text_muted(),
-        Some(_) => theme::accent_blue(),
+        Some(_) => theme::status_modified(),
         None => theme::text_primary(),
     }
 }
 
 fn file_git_signal_color(signal: FileGitSignal) -> gpui::Hsla {
     match signal {
-        FileGitSignal::Added => theme::accent_green(),
-        FileGitSignal::Untracked => theme::accent_yellow(),
+        FileGitSignal::Added => theme::status_added(),
+        FileGitSignal::Untracked => theme::status_untracked(),
         FileGitSignal::Modified
         | FileGitSignal::Deleted
         | FileGitSignal::Renamed
         | FileGitSignal::Copied
-        | FileGitSignal::Conflicted => theme::accent_blue(),
+        | FileGitSignal::Conflicted => theme::status_modified(),
         FileGitSignal::Ignored => theme::text_muted(),
     }
 }
@@ -8930,29 +8789,6 @@ fn action_button(id: impl Into<gpui::ElementId>, label: &'static str) -> gpui::S
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
         .child(locale::common(label))
-}
-
-fn file_status_label(status: FileEditorStatus) -> &'static str {
-    locale::common(match status {
-        FileEditorStatus::Loading => "Loading",
-        FileEditorStatus::Clean => "Clean",
-        FileEditorStatus::Dirty => "Unsaved",
-        FileEditorStatus::Saving => "Saving",
-        FileEditorStatus::Saved => "Saved",
-        FileEditorStatus::Conflict => "Conflict",
-        FileEditorStatus::Disconnected => "Offline",
-        FileEditorStatus::Unsupported => "Read only",
-        FileEditorStatus::TooLarge => "Too large",
-    })
-}
-
-fn file_status_color(status: FileEditorStatus) -> gpui::Hsla {
-    match status {
-        FileEditorStatus::Conflict | FileEditorStatus::Disconnected => theme::accent_red(),
-        FileEditorStatus::Dirty | FileEditorStatus::Saving => theme::accent_yellow(),
-        FileEditorStatus::Saved => theme::accent_green(),
-        _ => theme::text_muted(),
-    }
 }
 
 /// The cell a point falls in, given the geometry the grid was painted at.
@@ -9725,6 +9561,31 @@ mod tests {
         assert_eq!(file_icon_kind_for_path("src/main.rs"), FileIconKind::Rust);
         assert_eq!(file_icon_kind_for_path("README.md"), FileIconKind::Markdown);
         assert_eq!(file_icon_kind_for_path("config.toml"), FileIconKind::Config);
+    }
+
+    /// The viewer's grammar table is the desktop editor's, name for name.
+    ///
+    /// The two clients read the same file, so the same buffer has to be
+    /// highlighted by the same parser; a name the registry does not know would
+    /// quietly render a source file as plain text on the phone only.
+    #[test]
+    fn the_file_viewer_names_languages_the_way_the_desktop_does() {
+        assert_eq!(file_language_for_path("crates/core/src/lib.rs"), "rust");
+        assert_eq!(
+            file_language_for_path("apps/mobile/src/app.ts"),
+            "typescript"
+        );
+        assert_eq!(file_language_for_path("src/App.tsx"), "tsx");
+        assert_eq!(file_language_for_path("scripts/build.mjs"), "javascript");
+        assert_eq!(file_language_for_path("package.json"), "json");
+        assert_eq!(file_language_for_path("README.md"), "markdown");
+        assert_eq!(file_language_for_path("Cargo.toml"), "toml");
+        assert_eq!(file_language_for_path(".github/workflows/ci.yml"), "yaml");
+        assert_eq!(file_language_for_path("tools/run.sh"), "bash");
+        // Everything else is plain text rather than a guess: a wrong grammar
+        // colors a file into nonsense, and an unknown extension is not a hint.
+        assert_eq!(file_language_for_path("LICENSE"), "text");
+        assert_eq!(file_language_for_path("assets/logo.bin"), "text");
     }
 
     /// The rail owns its whole header, and exactly one control closes it.

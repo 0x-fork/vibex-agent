@@ -20,7 +20,36 @@ futures-channel.workspace = true
 futures-util.workspace = true
 gpui.workspace = true
 gpui_tokio.workspace = true
-gpui-component.workspace = true
+# The grammars the file viewer highlights with. The list is the desktop's own,
+# so a file opened on a phone is colored by the same grammar the desktop editor
+# parses it with; a language this build does not carry renders as plain text
+# rather than as a guess.
+gpui-component = { workspace = true, features = [
+  "tree-sitter-bash",
+  "tree-sitter-c",
+  "tree-sitter-cpp",
+  "tree-sitter-csharp",
+  "tree-sitter-css",
+  "tree-sitter-diff",
+  "tree-sitter-go",
+  "tree-sitter-html",
+  "tree-sitter-java",
+  "tree-sitter-javascript",
+  "tree-sitter-kotlin",
+  "tree-sitter-lua",
+  "tree-sitter-markdown",
+  "tree-sitter-php",
+  "tree-sitter-python",
+  "tree-sitter-ruby",
+  "tree-sitter-rust",
+  "tree-sitter-sql",
+  "tree-sitter-swift",
+  "tree-sitter-toml",
+  "tree-sitter-tsx",
+  "tree-sitter-typescript",
+  "tree-sitter-yaml",
+  "tree-sitter-zig",
+] }
 gpui-base.workspace = true
 gpui-kit-assets.workspace = true
 serde.workspace = true

@@ -6,11 +6,15 @@
 //! same product as the desktop shell in every palette. Views must go through
 //! these accessors instead of hardcoding colors.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use gpui::{Anchor, App, Hsla, Pixels, Rems, Rgba, Window, hsla, px, rems, rgb};
-use gpui_component::{Edges, Theme, ThemeMode as ComponentThemeMode};
+use gpui_component::{
+    Edges, Theme, ThemeMode as ComponentThemeMode,
+    highlighter::{HighlightTheme, HighlightThemeStyle},
+};
 use vibex_desktop_model::ThemeSelection;
 use vibex_ui::{
     GpuiThemeDefinition, GpuiThemeMode, default_theme, semantic_token, theme_at, theme_index,
@@ -1037,6 +1041,11 @@ pub fn apply_component_theme(window: Option<&mut Window>, cx: &mut App) {
         theme.mono_font_size = scaled_px(FONT_CODE);
         theme.radius = px(RADIUS_CONTROL);
         theme.radius_lg = px(RADIUS_CARD);
+        // The file viewer's syntax colors are the appearance's own authored
+        // block, the same one the desktop editor parses with. The framework
+        // would otherwise paint the highlight from its stock palette, which is
+        // a second syntax theme bolted onto the product's.
+        theme.highlight_theme = shared_highlight_theme(model_mode(dark));
 
         let background = token("background");
         let foreground = token("foreground");
@@ -1111,6 +1120,28 @@ pub fn apply_component_theme(window: Option<&mut Window>, cx: &mut App) {
         // view defaults, and refreshes every window.
         vibex_ui::apply_component_palette(theme, active_theme(model_mode(dark)));
     });
+}
+
+/// The syntax block of the appearance the phone is rendering.
+///
+/// A user theme's highlight block is validated structurally when its file
+/// loads, but only the highlighter can reject a style it cannot use, so this
+/// falls back to the appearance's built-in block rather than failing a frame.
+fn shared_highlight_theme(mode: GpuiThemeMode) -> Arc<HighlightTheme> {
+    let definition = active_theme(mode);
+    let style = serde_json::from_str::<HighlightThemeStyle>(definition.highlight_json)
+        .or_else(|_| {
+            serde_json::from_str::<HighlightThemeStyle>(default_theme(mode).highlight_json)
+        })
+        .expect("built-in syntax highlight tokens must be valid");
+    Arc::new(HighlightTheme {
+        name: definition.name.to_string(),
+        appearance: match mode {
+            GpuiThemeMode::Light => ComponentThemeMode::Light,
+            GpuiThemeMode::Dark => ComponentThemeMode::Dark,
+        },
+        style,
+    })
 }
 
 /// Points the kit's notification layer at the phone's own corner.
