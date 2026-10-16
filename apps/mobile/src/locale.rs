@@ -346,6 +346,28 @@ pub fn common_for(locale: Locale, en: &'static str) -> &'static str {
         "File saved on desktop" => ("文件已保存到桌面端", "檔案已儲存到桌面版"),
         "Desktop file version loaded" => ("已加载桌面端文件版本", "已載入桌面版檔案版本"),
         "Commit created on desktop" => ("已在桌面端创建提交", "已在桌面版建立提交"),
+        // A remote action reports itself the way the desktop's own hint does:
+        // one line naming the action that finished.
+        "Fetch completed" => ("获取已完成", "取得已完成"),
+        "Pull completed" => ("拉取已完成", "拉取已完成"),
+        "Push completed" => ("推送已完成", "推送已完成"),
+        "Fetch failed" => ("获取失败", "取得失敗"),
+        "Pull failed" => ("拉取失败", "拉取失敗"),
+        "Push failed" => ("推送失败", "推送失敗"),
+        // The file screen's two faces, named by the glyph the desktop puts on
+        // each: a pencil over the render, an eye over the source.
+        "Preview Markdown" => ("预览 Markdown", "預覽 Markdown"),
+        "Edit Markdown source" => ("编辑 Markdown 源文件", "編輯 Markdown 原始檔"),
+        // The commit message body's disclosure, from the desktop's own switch.
+        "Expand" => ("展开", "展開"),
+        "Collapse" => ("收起", "收起"),
+        "Commit message" => ("提交信息", "提交資訊"),
+        "Amend last commit" => ("修正上次提交", "修正上次提交"),
+        "Push after" => ("提交后推送", "提交後推送"),
+        "Staged" => ("已暂存", "已暫存"),
+        "Unstaged" => ("未暂存", "未暫存"),
+        "Patch" => ("补丁", "補丁"),
+        "New terminal" => ("新建终端", "新增終端機"),
         "Provider health probes completed" => ("供应商健康检查已完成", "供應商健康檢查已完成"),
         "Runtime selection sent to desktop" => {
             ("运行时选择已发送到桌面端", "執行環境選擇已傳送至桌面版")
@@ -411,6 +433,12 @@ pub fn common_for(locale: Locale, en: &'static str) -> &'static str {
         "No matching items" => ("没有匹配项", "沒有符合的項目"),
         "No matching files" => ("没有匹配的文件", "沒有符合的檔案"),
         "All authors" => ("全部作者", "全部作者"),
+        // The commit history's branch filter. The desktop spells the same
+        // chip "全部分支"; without the entry the phone printed the English
+        // key over a Chinese header.
+        "All branches" => ("全部分支", "全部分支"),
+        // The history tab's own name, matching the desktop's Commits tab.
+        "Commits" => ("提交", "提交"),
         "No repository" => ("没有仓库", "沒有儲存庫"),
         "Loading history" => ("正在加载历史", "正在載入歷史"),
         "No commits found" => ("没有找到提交", "找不到提交"),

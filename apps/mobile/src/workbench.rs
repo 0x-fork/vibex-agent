@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use gpui::{
     Bounds, ClipboardItem, Context, DispatchPhase, Entity, FontWeight, Image, ImageFormat,
-    IntoElement, LongPressEvent, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _, Pixels,
-    Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchDragEvent,
-    TouchPhase, WeakEntity, Window, canvas, div, img, point, prelude::*, px, rgb, svg,
+    IntoElement, LongPressEvent, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _,
+    PathBuilder, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _,
+    Task, TouchDragEvent, TouchPhase, WeakEntity, Window, canvas, div, img, point, prelude::*, px,
+    rgb, svg,
 };
 use vibex_backend::{
     BackendError, BackendOperation, BackendResult, GitBackend as _, MutationRequest,
@@ -33,8 +34,8 @@ use vibex_terminal_ui::{
     TerminalSearchMatch,
 };
 use vibex_ui::{
-    FileEditorStatus, FileWorkflowController, GitWorkflowController, ShellKind, TerminalInput,
-    TerminalKey, TerminalKeyModifiers, TerminalWorkflowCapabilities, TerminalWorkflowController,
+    FileWorkflowController, GitWorkflowController, ShellKind, TerminalInput, TerminalKey,
+    TerminalKeyModifiers, TerminalWorkflowCapabilities, TerminalWorkflowController,
 };
 
 use crate::bottom_sheet::{
@@ -43,8 +44,14 @@ use crate::bottom_sheet::{
 use crate::locale;
 use crate::markdown;
 use crate::theme;
+use crate::toast::{Hint, Tone};
 use gpui_component::ActiveTheme as _;
-use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_component::Sizable as _;
+use gpui_component::Size;
+use gpui_component::input::{
+    Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState,
+};
+use gpui_component::spinner::Spinner;
 
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(600);
 /// Cell metrics copied from the desktop terminal surface so both clients
@@ -52,6 +59,15 @@ const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(600);
 /// How much of a long diff is shown at once, and how much more each "show
 /// more" adds.
 const GIT_DIFF_PAGE_LINES: usize = 800;
+/// How many hits a file search may return. The desktop asks for the same
+/// number, and the shared workflow clamps anything above its own ceiling, so a
+/// query answered here lists exactly what the desktop would list.
+const FILE_SEARCH_RESULT_LIMIT: u32 = 200;
+/// How many lines of a commit's patch the detail screen paints. A commit that
+/// changes more than this is read in the desktop's own preview pane, which
+/// pages the same way; the phone draws the head of it rather than a scroll
+/// that would take a minute to move through.
+const GIT_COMMIT_PATCH_PAGE_LINES: usize = 2000;
 /// The terminal grid keeps absolute pixels on purpose: the PTY is sized to a
 /// row/column count, so a cell that grew with the text-size preference would
 /// desynchronize the rendered grid from the shell's belief about its size.
@@ -188,12 +204,188 @@ enum DiffLineKind {
     Added,
     Removed,
     Hunk,
+    /// A line that describes the patch rather than changing a file: the
+    /// `diff --git` header, the `index` line, the `---`/`+++` pair. The
+    /// desktop gives these their own dim wash so a reader can tell the
+    /// scaffolding of a patch from its contents.
+    Meta,
+}
+
+/// One painted row of a unified diff: what it is, which line it is, and the
+/// text without its leading marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitDiffRow {
+    kind: DiffLineKind,
+    line: Option<u32>,
+    content: String,
+}
+
+impl GitDiffRow {
+    /// The marker a row carries in front of its text, which is what makes a
+    /// copied line readable and what tells an empty added line from an empty
+    /// context one.
+    fn prefix(&self) -> &'static str {
+        match self.kind {
+            DiffLineKind::Added => "+",
+            DiffLineKind::Removed => "-",
+            DiffLineKind::Hunk => "",
+            DiffLineKind::Meta | DiffLineKind::Context => " ",
+        }
+    }
+}
+
+/// Reads a unified diff into paintable rows.
+///
+/// One walk serves both the working-tree diff and a commit's patch, so the two
+/// surfaces cannot drift: the desktop renders both through one row projection
+/// for the same reason. `limit` caps what is returned; the second half of the
+/// pair is how many lines were left over.
+fn parse_unified_diff(patch: &str, limit: usize) -> (Vec<GitDiffRow>, usize) {
+    let mut old_line = 0u32;
+    let mut new_line = 0u32;
+    let mut in_hunk = false;
+    let rows = patch
+        .lines()
+        .take(limit)
+        .map(|raw| {
+            let (kind, line, content) = if raw.starts_with("@@") {
+                // A hunk header carries the new file's starting line, which is
+                // what the gutter restarts from.
+                new_line = hunk_new_start(raw).unwrap_or(new_line);
+                old_line = hunk_old_start(raw).unwrap_or(old_line);
+                in_hunk = true;
+                (DiffLineKind::Hunk, None, raw.to_string())
+            } else if !in_hunk {
+                // Everything before the first hunk describes the file.
+                (DiffLineKind::Meta, None, raw.to_string())
+            } else if let Some(rest) = raw.strip_prefix('+') {
+                let line = new_line;
+                new_line += 1;
+                (DiffLineKind::Added, Some(line), rest.to_string())
+            } else if let Some(rest) = raw.strip_prefix('-') {
+                let line = old_line;
+                old_line += 1;
+                (DiffLineKind::Removed, Some(line), rest.to_string())
+            } else if let Some(rest) = raw.strip_prefix(' ') {
+                let line = new_line;
+                old_line += 1;
+                new_line += 1;
+                (DiffLineKind::Context, Some(line), rest.to_string())
+            } else if raw.starts_with("\\ No newline") {
+                (DiffLineKind::Meta, None, raw.to_string())
+            } else if raw.is_empty() {
+                // A blank line inside a hunk is an empty context line.
+                let line = new_line;
+                old_line += 1;
+                new_line += 1;
+                (DiffLineKind::Context, Some(line), String::new())
+            } else {
+                (DiffLineKind::Meta, None, raw.to_string())
+            };
+            GitDiffRow {
+                kind,
+                line,
+                content,
+            }
+        })
+        .collect::<Vec<_>>();
+    let remaining = patch.lines().count().saturating_sub(limit);
+    (rows, remaining)
+}
+
+/// The `-` side's starting line in a `@@ -a,b +c,d @@` header.
+fn hunk_old_start(header: &str) -> Option<u32> {
+    header
+        .split_whitespace()
+        .find(|part| part.starts_with('-'))
+        .and_then(|part| part.trim_start_matches('-').split(',').next())
+        .and_then(|value| value.parse().ok())
+}
+
+/// The `+` side's starting line in a `@@ -a,b +c,d @@` header.
+fn hunk_new_start(header: &str) -> Option<u32> {
+    header
+        .split_whitespace()
+        .find(|part| part.starts_with('+'))
+        .and_then(|part| part.trim_start_matches('+').split(',').next())
+        .and_then(|value| value.parse().ok())
+}
+
+/// The wash, the ink, and the marker of one diff row, in the desktop's own
+/// tones: an addition is a green-tinted band, a deletion a red one, a hunk
+/// header a blue one, and the patch's own scaffolding a dim grey.
+fn diff_row_palette(kind: DiffLineKind) -> (gpui::Hsla, gpui::Hsla) {
+    match kind {
+        DiffLineKind::Added => (
+            theme::accent_success().opacity(0.10),
+            theme::accent_success(),
+        ),
+        DiffLineKind::Removed => (theme::accent_red().opacity(0.10), theme::accent_red()),
+        DiffLineKind::Hunk => (theme::accent_blue().opacity(0.10), theme::accent_blue()),
+        DiffLineKind::Meta => (theme::text_muted().opacity(0.18), theme::text_muted()),
+        DiffLineKind::Context => (theme::workbench_bg(), theme::text_primary().opacity(0.85)),
+    }
+}
+
+/// The rail that marks a changed row, drawn from the pane's left edge so an
+/// addition or a deletion reads before the text does.
+fn diff_change_rail(kind: DiffLineKind) -> gpui::Div {
+    let color = match kind {
+        DiffLineKind::Added => theme::accent_success(),
+        DiffLineKind::Removed => theme::accent_red(),
+        _ => theme::text_primary().opacity(0.0),
+    };
+    div().w(px(3.0)).flex_none().bg(color)
+}
+
+/// One diff row, at the desktop's own spacing: the change rail, the line
+/// number, and the text behind its marker.
+fn render_diff_row(row: GitDiffRow) -> gpui::AnyElement {
+    let (background, foreground) = diff_row_palette(row.kind);
+    let text = if row.content.is_empty() {
+        row.prefix().to_string()
+    } else {
+        format!("{}{}", row.prefix(), row.content)
+    };
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .items_stretch()
+        .bg(background)
+        .border_b_1()
+        .border_color(theme::border_subtle())
+        .font_family("IBM Plex Mono")
+        .text_size(theme::font_micro())
+        .text_color(foreground)
+        .child(diff_change_rail(row.kind))
+        .child(
+            div()
+                .w(px(36.0))
+                .flex_none()
+                .px_1()
+                .py(px(2.0))
+                .text_right()
+                .text_color(theme::text_muted().opacity(0.70))
+                .child(row.line.map(|line| line.to_string()).unwrap_or_default()),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .px_2()
+                .py(px(2.0))
+                .whitespace_normal()
+                .child(text),
+        )
+        .into_any_element()
 }
 
 /// Which face of a file the full-screen viewer shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MobileFilePreviewMode {
-    /// The editor buffer, editable and saveable.
+    /// The buffer as text. Read-only on the phone: the workspace is written
+    /// from the desktop, and the rail only browses it.
     Source,
     /// The rendered file: Markdown as Markdown, an image as itself.
     Preview,
@@ -204,13 +396,6 @@ impl MobileFilePreviewMode {
         match self {
             Self::Source => Self::Preview,
             Self::Preview => Self::Source,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Source => locale::common("Source"),
-            Self::Preview => locale::common("Preview"),
         }
     }
 }
@@ -292,7 +477,11 @@ pub struct MobileWorkbench {
     /// A chosen file takes over the whole Files surface as its own screen
     /// with a back button, instead of rendering inline under the tree.
     file_screen_open: bool,
-    git_commit_input: Option<Entity<InputState>>,
+    /// The commit message, as the multi-line field the desktop commits from.
+    ///
+    /// A commit message is a subject and a body. A one-line field can only ever
+    /// hold the first, and it swallowed the second without saying so.
+    git_commit_input: Option<Entity<TextareaState>>,
     git_history_query_input: Option<Entity<InputState>>,
     /// Installed with the field so the keyboard's action key runs the query.
     git_history_query_subscription: Option<gpui::Subscription>,
@@ -334,10 +523,6 @@ pub struct MobileWorkbench {
     /// content-search result names a line, and opening the file without going
     /// there leaves the reader to find it again by hand.
     pending_file_reveal: Option<(String, usize)>,
-    /// A file the user asked to open while the editor still had unsaved edits.
-    /// Opening it immediately would overwrite the buffer, so the choice is
-    /// theirs to make first.
-    file_discard_prompt: Option<String>,
     /// Which face of a chosen file the screen shows. A Markdown file opens as
     /// its rendered self — that is what makes it readable on a phone — with
     /// the source one tap away; every other kind opens as source.
@@ -390,13 +575,13 @@ pub struct MobileWorkbench {
     /// Paths awaiting confirmation before a rollback. The desktop confirms this
     /// too; the phone used to discard local edits on a single tap.
     git_revert_confirmation: Option<Vec<String>>,
-    /// The last status failure. A failed load used to keep the loading label on
-    /// screen forever, next to "No repository", with no way to tell them apart.
-    git_status_error: Option<String>,
     /// One commit opened from the Commits list takes over the Git surface as
     /// its own full-screen view with a back button.
     git_commit_detail: Option<GitCommitDetail>,
     git_commit_detail_loading: bool,
+    /// Whether the open commit's message body is unfolded. One flag serves the
+    /// one commit the screen can show, and it resets with every new one.
+    git_commit_body_expanded: bool,
     git_commit_confirmation: bool,
     /// Rewrite the previous commit instead of adding one.
     git_commit_amend: bool,
@@ -425,6 +610,17 @@ pub struct MobileWorkbench {
     /// from the retained snapshot window.
     terminal_render_sequence: i64,
     terminal_close_confirmation: Option<TerminalId>,
+    /// The tab the reader was last on.
+    ///
+    /// Coming back to the terminal should land on the one they were using
+    /// rather than on whichever session the list happens to start with, so the
+    /// attachment is remembered here and the refresh puts it back.
+    terminal_last_selected: Option<TerminalId>,
+    /// Set when the reader enters the Terminal surface, and consumed by the
+    /// first session list that comes back empty: a phone that opens the
+    /// terminal on a workspace with none should have one, not an empty pane
+    /// with a button in it.
+    terminal_auto_create: bool,
     /// Rows/cols this client last requested, so repeated fits are no-ops.
     terminal_fit_size: Option<(u16, u16)>,
     /// The first auto-fit failure, kept so the paint-time fit reports it once
@@ -457,12 +653,37 @@ pub struct MobileWorkbench {
     terminal_search_subscription: Option<gpui::Subscription>,
     terminal_search_matches: Vec<TerminalSearchMatch>,
     terminal_active_search_match: usize,
+    /// Which remote action, if any, the authority is busy with.
+    ///
+    /// A push or a pull spends seconds on the wire, so the button that started
+    /// it turns into the spinner and the other two go quiet until it lands.
+    /// The row used to dim all three and show nothing moving, which read as a
+    /// frozen panel rather than work in progress.
+    git_remote_action: Option<GitRemoteActionKind>,
     busy: bool,
-    notice: Option<String>,
-    /// The timer that clears `notice` again, replaced whenever a new
-    /// confirmation is raised.
-    notice_clear_task: Option<Task<()>>,
-    error: Option<BackendError>,
+    /// Hints waiting for a paint that has the window the toast layer needs.
+    ///
+    /// A rail reports every completed action and every failure as a light hint
+    /// on the window's notification layer, never as a strip or a card inside a
+    /// panel: a phone has one narrow column, and a fixed line pushes the
+    /// content under it around and outlives the state it described. Most
+    /// producers here run inside a task that has only `cx`, so the hint waits
+    /// here until [`Self::present_pending_hints`] takes it.
+    pending_hints: Vec<Hint>,
+    /// The last failure the rail announced as a hint.
+    ///
+    /// A failed read is a light hint like every other result, but the terminal
+    /// poll repeats every fraction of a second and the Git poll every few
+    /// seconds; a hint per tick would fill the phone's screen with the same
+    /// card. Keeping the message here is what makes the announcement once per
+    /// distinct failure; a read that recovers clears it.
+    last_error: Option<String>,
+    /// The last Git status failure announced, kept apart from `last_error`.
+    ///
+    /// The two polls are independent and would otherwise clear each other's
+    /// slot, so a Git failure repeated under a healthy terminal would be
+    /// announced again on every poll.
+    git_status_error: Option<String>,
     /// The rail's own way out. The drawer belongs to the app, so the header
     /// reports the request instead of animating the panel itself; the app
     /// installs this when it creates the workbench.
@@ -514,7 +735,6 @@ impl MobileWorkbench {
             pending_file_editor_content: None,
             file_editor_path: None,
             pending_file_reveal: None,
-            file_discard_prompt: None,
             file_preview_mode: MobileFilePreviewMode::Source,
             file_image: None,
             file_image_loading: None,
@@ -540,6 +760,7 @@ impl MobileWorkbench {
             git_status_error: None,
             git_commit_detail: None,
             git_commit_detail_loading: false,
+            git_commit_body_expanded: false,
             git_commit_confirmation: false,
             git_commit_amend: false,
             git_commit_push_after: false,
@@ -554,6 +775,8 @@ impl MobileWorkbench {
             sheet_task: None,
             terminal_render_sequence: 0,
             terminal_close_confirmation: None,
+            terminal_last_selected: None,
+            terminal_auto_create: false,
             terminal_fit_size: None,
             terminal_fit_error: None,
             terminal_poll_generation: 0,
@@ -568,10 +791,10 @@ impl MobileWorkbench {
             terminal_search_subscription: None,
             terminal_search_matches: Vec::new(),
             terminal_active_search_match: 0,
+            git_remote_action: None,
             busy: false,
-            notice: None,
-            notice_clear_task: None,
-            error: None,
+            pending_hints: Vec::new(),
+            last_error: None,
             close_handler: None,
             tasks: Vec::new(),
         };
@@ -592,10 +815,7 @@ impl MobileWorkbench {
     }
 
     pub fn set_surface(&mut self, surface: WorkbenchSurface, cx: &mut Context<Self>) {
-        // A surface the reader is leaving takes its edits with it: the Files
-        // tab is not a place work is expected to be parked unsaved.
         if surface != WorkbenchSurface::Files {
-            self.save_active_file(cx);
             // The file's own sheet belongs to the surface that opens it, so it
             // comes down with it instead of rising over the next one.
             self.close_file_goto(cx);
@@ -614,7 +834,14 @@ impl MobileWorkbench {
                 self.refresh_git(cx);
                 self.refresh_worktree_lifecycle(cx);
             }
-            WorkbenchSurface::Terminal => self.refresh_terminals(cx),
+            // Entering the terminal is a request to work in one. If the list
+            // comes back empty, the refresh below opens the first one; the flag
+            // makes that a one-shot answer to this visit rather than a session
+            // created behind the reader's back on every poll.
+            WorkbenchSurface::Terminal => {
+                self.terminal_auto_create = self.terminal_last_selected.is_none();
+                self.refresh_terminals(cx)
+            }
         }
         cx.notify();
     }
@@ -630,9 +857,8 @@ impl MobileWorkbench {
         if self.workspace_id == workspace_id {
             return;
         }
-        // Another workspace is another file system: the open buffer has to be
-        // written before the editor is pointed somewhere else.
-        self.save_active_file(cx);
+        // Another workspace is another file system, so the viewer's buffer goes
+        // with the old one rather than showing a file from a tree it has left.
         self.workspace_id = workspace_id.clone();
         self.files.select_workspace(workspace_id.clone());
         self.git.select_workspace(workspace_id);
@@ -641,6 +867,7 @@ impl MobileWorkbench {
         self.git_diff = None;
         self.git_revert_confirmation = None;
         self.git_status_error = None;
+        self.last_error = None;
         self.git_commit_detail = None;
         self.git_commit_detail_loading = false;
         self.terminal_render_sequence = 0;
@@ -702,10 +929,6 @@ impl MobileWorkbench {
             .set_capabilities(TerminalWorkflowCapabilities::from_backend(&capabilities));
     }
 
-    fn refresh_active_surface(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.set_surface(self.surface, cx);
-    }
-
     fn refresh_files(&mut self, cx: &mut Context<Self>) {
         self.load_file_tree_path(String::new(), cx);
     }
@@ -714,7 +937,7 @@ impl MobileWorkbench {
         let ticket = match self.files.begin_tree_load(&path) {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -722,39 +945,17 @@ impl MobileWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, self.files.load_tree(ticket.clone()));
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
+            let failure = outcome.as_ref().err().cloned();
             let _ = entity.update(cx, |this, cx| {
                 this.files.apply_tree_load(&ticket, outcome);
-                this.error = this.files.state.last_error.clone();
+                this.hint_failure(failure);
                 cx.notify();
             });
         });
         self.tasks.push(task);
     }
 
-    /// Whether the editor holds edits the desktop copy does not have.
-    fn file_editor_is_dirty(&self, cx: &gpui::App) -> bool {
-        self.files
-            .state
-            .view()
-            .editor_content
-            .is_some_and(|content| {
-                file_editor_value(&self.file_editor_input, cx).as_ref() != content
-            })
-    }
-
     fn select_file(&mut self, path: String, cx: &mut Context<Self>) {
-        // Opening a file replaces the editor buffer outright, so the buffer
-        // that is leaving is written back first. It used to raise a discard
-        // prompt, which asked the reader to decide something the phone can
-        // answer itself.
-        self.save_active_file(cx);
-        if self.file_editor_is_dirty(cx) {
-            // The write did not go through — an offline host, a conflict — so
-            // the choice is the reader's again.
-            self.file_discard_prompt = Some(path);
-            cx.notify();
-            return;
-        }
         self.open_file_now(path, cx);
     }
 
@@ -769,7 +970,7 @@ impl MobileWorkbench {
         let ticket = match self.files.begin_open_file(path) {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -784,9 +985,10 @@ impl MobileWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, self.files.read_file(ticket.clone()));
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
+            let failure = outcome.as_ref().err().cloned();
             let _ = entity.update(cx, |this, cx| {
                 this.files.apply_file_read(&ticket, outcome);
-                this.error = this.files.state.last_error.clone();
+                this.hint_failure(failure);
                 this.file_preview_mode = match preview_kind {
                     FilePreviewKind::Markdown => MobileFilePreviewMode::Preview,
                     FilePreviewKind::Image if this.file_image.is_some() => {
@@ -854,7 +1056,7 @@ impl MobileWorkbench {
                             this.file_preview_mode = MobileFilePreviewMode::Preview;
                         }
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -954,9 +1156,9 @@ impl MobileWorkbench {
             .ok()
             .filter(|line| *line > 0)
         else {
-            self.show_notice(
-                locale::text("Enter a line number", "请输入行号", "請輸入行號").to_string(),
-                cx,
+            self.hint(
+                Tone::Warning,
+                locale::text("Enter a line number", "请输入行号", "請輸入行號"),
             );
             return;
         };
@@ -965,14 +1167,13 @@ impl MobileWorkbench {
         };
         let text = editor.read(cx).value().to_string();
         let Some((start, end)) = file_line_range(&text, line_number) else {
-            self.show_notice(
+            self.hint(
+                Tone::Warning,
                 locale::text(
                     "That line is past the end of the file",
                     "该行超出了文件末尾",
                     "該行超出了檔案結尾",
-                )
-                .to_string(),
-                cx,
+                ),
             );
             return;
         };
@@ -1048,26 +1249,50 @@ impl MobileWorkbench {
             return;
         }
         if let Err(error) = self.files.begin_search() {
-            self.error = Some(error);
+            self.fail(error);
             cx.notify();
             return;
         }
         let generation = self.files.state.generation;
+        let mode = self.file_search_mode;
+        // The three switches belong to the content search alone. Passing them
+        // in name mode let a query like "foo" be narrowed to whole words or
+        // matched case-sensitively because the reader had left those toggles on
+        // in the other mode, which quietly answered a question nobody asked.
+        // The desktop gates them the same way.
+        let content = mode == MobileFileSearchMode::Content;
         let request = FileSearchRequest {
             workspace_id: self.workspace_id.clone(),
             query,
-            include_content: self.file_search_mode == MobileFileSearchMode::Content,
-            case_sensitive: self.file_search_case_sensitive,
-            whole_word: self.file_search_whole_word,
-            regex: self.file_search_regex,
-            limit: Some(100),
+            include_content: content,
+            case_sensitive: content && self.file_search_case_sensitive,
+            whole_word: content && self.file_search_whole_word,
+            regex: content && self.file_search_regex,
+            // The shared workflow clamps this to its own ceiling, which is the
+            // limit the desktop passes too.
+            limit: Some(FILE_SEARCH_RESULT_LIMIT),
         };
         let runner = gpui_tokio::Tokio::spawn(cx, self.files.search_files(request));
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
+            let failure = outcome.as_ref().err().cloned();
             let _ = entity.update(cx, |this, cx| {
-                this.files.apply_search(generation, outcome);
-                this.error = this.files.state.last_error.clone();
+                // The backend answers one list for both modes: name matches
+                // carry no line and content matches always do. Without this
+                // split a name search listed the same file once per line that
+                // contained the word, which is what made the phone's results
+                // disagree with the desktop's for the same query.
+                this.files.apply_search(
+                    generation,
+                    outcome.map(|mut results| {
+                        results.retain(|result| match mode {
+                            MobileFileSearchMode::Name => result.line.is_none(),
+                            MobileFileSearchMode::Content => result.line.is_some(),
+                        });
+                        results
+                    }),
+                );
+                this.hint_failure(failure);
                 cx.notify();
             });
         });
@@ -1151,85 +1376,55 @@ impl MobileWorkbench {
         cx.notify();
     }
 
-    fn save_file(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.save_active_file(cx);
+    /// Queues a light hint for the window's notification layer.
+    ///
+    /// Nothing is painted from this queue: a hint takes no line in the rail's
+    /// layout, so a message cannot leave a strip behind on a surface it no
+    /// longer describes. It is handed over once per paint, where the window the
+    /// layer needs always exists.
+    fn hint(&mut self, tone: Tone, message: impl Into<String>) {
+        self.pending_hints.push(Hint::new(tone, message));
     }
 
-    /// Writes the open buffer back to the workspace.
+    /// Announces a failure the reader asked for and did not get.
+    fn fail(&mut self, error: BackendError) {
+        self.hint(Tone::Error, error.message);
+    }
+
+    /// Announces one of the repeated failures — the terminal poll, the Git
+    /// status poll — at most once while it stays the same.
     ///
-    /// The one path a save takes, whether the reader pressed Save or the screen
-    /// is being left: a phone that keeps unsaved work behind a control the
-    /// reader has to remember is a phone that loses edits.
-    fn save_active_file(&mut self, cx: &mut Context<Self>) {
-        if self.busy || !self.file_editor_is_dirty(cx) {
+    /// These producers run on a timer, and the same broken read would otherwise
+    /// push the same card on every tick. The message held in `last_error` is
+    /// what makes the announcement once per distinct failure; a read that
+    /// recovers clears the slot so the next failure is announced again.
+    fn hint_failure(&mut self, error: Option<BackendError>) {
+        let message = error.map(|error| error.message);
+        if message == self.last_error {
             return;
         }
-        let content = file_editor_value(&self.file_editor_input, cx).to_string();
-        if let Err(error) = self.files.update_active_content(content) {
-            self.error = Some(error);
-            cx.notify();
-            return;
+        self.last_error = message.clone();
+        if let Some(message) = message {
+            self.hint(Tone::Error, message);
         }
-        let operation = match self.files.begin_save_active() {
-            Ok(operation) => operation,
-            Err(error) => {
-                self.error = Some(error);
-                cx.notify();
-                return;
-            }
-        };
-        self.busy = true;
-        self.error = None;
-        let runner = gpui_tokio::Tokio::spawn(cx, self.files.save_file(operation.clone()));
-        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let outcome = flatten_join(runner.await);
-            let _ = entity.update(cx, |this, cx| {
-                this.files.apply_save_outcome(&operation, outcome);
-                this.busy = false;
-                this.error = this.files.state.last_error.clone();
-                if this.error.is_none() {
-                    this.notice = Some(locale::common("File saved on desktop").to_string());
-                }
-                let _ = &this;
-                cx.notify();
-            });
-        });
-        self.tasks.push(task);
-        cx.notify();
     }
 
-    /// Shows a transient confirmation above the surface.
+    /// Hands every queued hint to the window's notification layer.
     ///
-    /// The bar is a confirmation, not a log: it clears itself, so a stale
-    /// "Copied" never sits over the next thing the reader looks at. A newer
-    /// notice is left alone — the timer belongs to the text it was raised for.
-    fn show_notice(&mut self, text: String, cx: &mut Context<Self>) {
-        self.notice = Some(text.clone());
-        let entity = cx.weak_entity();
-        // One notice at a time: the timer that clears the previous one is
-        // replaced by the timer for this one.
-        self.notice_clear_task = Some(cx.spawn(async move |_, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(2_600))
-                .await;
-            let _ = entity.update(cx, |this, cx| {
-                if this.notice.as_deref() == Some(text.as_str()) {
-                    this.notice = None;
-                    cx.notify();
-                }
-            });
-        }));
-        cx.notify();
+    /// The layer lives on the kit's `Root`, which every window this app opens
+    /// carries, so a hint can only be pushed from a paint. The queue is taken
+    /// whole, oldest first, so a burst of producers — a save that failed while
+    /// a terminal refused a resize — still lands in the order it happened.
+    fn present_pending_hints(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let hints = std::mem::take(&mut self.pending_hints);
+        for hint in hints {
+            crate::toast::push(window, cx, &hint, None);
+        }
     }
 
-    /// Returns from the full-screen file view to the file tree. The editor
+    /// Returns from the full-screen file view to the file tree. The viewer
     /// keeps its loaded content so re-opening the file is instant.
     fn close_file_screen(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        // Leaving the file is when a phone is most likely to lose an edit: the
-        // Save button is behind a scroll and the back gesture is not. The
-        // buffer is written out here rather than merely kept, and the reader is
-        // told only when the write failed.
-        self.save_active_file(cx);
         self.file_screen_open = false;
         // The go-to-line sheet has nothing to point at once the buffer is off
         // screen, and it is drawn by the screen that is closing.
@@ -1237,53 +1432,11 @@ impl MobileWorkbench {
         cx.notify();
     }
 
-    /// Confirms discarding the dirty buffer and opens the queued file.
-    fn confirm_file_discard(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.file_discard_prompt.take() else {
-            return;
-        };
-        self.open_file_now(path, cx);
-    }
-
-    fn cancel_file_discard(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.file_discard_prompt = None;
-        cx.notify();
-    }
-
     /// Opens `path` in the Files surface, taking the surface over with the
-    /// editor. Used by the timeline, where a file the agent wrote is a link.
+    /// viewer. Used by the timeline, where a file the agent wrote is a link.
     pub fn open_file(&mut self, path: String, cx: &mut Context<Self>) {
         self.surface = WorkbenchSurface::Files;
-        self.save_active_file(cx);
-        if self.file_editor_is_dirty(cx) {
-            self.file_discard_prompt = Some(path);
-            cx.notify();
-            return;
-        }
         self.open_file_now(path, cx);
-    }
-
-    fn reload_desktop_file(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.files.state.reload_server_version() {
-            self.error = Some(BackendError::conflict(
-                "mobile_file_conflict_version_unavailable",
-                locale::text(
-                    "The desktop conflict version is no longer available.",
-                    "桌面端的冲突版本已不可用。",
-                    "桌面版的衝突版本已無法使用。",
-                ),
-            ));
-            cx.notify();
-            return;
-        }
-        if let Some(content) = self.files.state.view().editor_content {
-            self.pending_file_editor_content = Some(content);
-        }
-        self.error = None;
-        self.show_notice(
-            locale::common("Desktop file version loaded").to_string(),
-            cx,
-        );
     }
 
     /// Reads what the authority knows about this workspace's worktree.
@@ -1377,17 +1530,17 @@ impl MobileWorkbench {
             let _ = entity.update(cx, |this, cx| {
                 match outcome {
                     Ok(_) => {
-                        this.notice = Some(
+                        this.hint(
+                            Tone::Success,
                             locale::text(
                                 "Worktree marked",
                                 "Worktree 状态已更新",
                                 "Worktree 狀態已更新",
-                            )
-                            .to_string(),
+                            ),
                         );
                         this.refresh_worktree_lifecycle(cx);
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -1402,7 +1555,7 @@ impl MobileWorkbench {
             return;
         };
         let Some(target_workspace_id) = worktree.target_workspace_id.clone() else {
-            self.error = Some(BackendError::failed(
+            self.fail(BackendError::failed(
                 "worktree_target_missing",
                 locale::text(
                     "This worktree has no workspace to merge into.",
@@ -1437,9 +1590,8 @@ impl MobileWorkbench {
                     Ok(plan) => {
                         this.worktree_confirmation =
                             Some(WorktreeConfirmation::Merge(Box::new(plan)));
-                        this.error = None;
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -1475,13 +1627,14 @@ impl MobileWorkbench {
                 this.busy = false;
                 match outcome {
                     Ok(_) => {
-                        this.notice = Some(
-                            locale::text("Merge started", "已开始合并", "已開始合併").to_string(),
+                        this.hint(
+                            Tone::Success,
+                            locale::text("Merge started", "已开始合并", "已開始合併"),
                         );
                         this.refresh_worktree_lifecycle(cx);
                         this.refresh_git(cx);
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -1524,13 +1677,13 @@ impl MobileWorkbench {
             })
             .unwrap_or_default();
         if paths.is_empty() {
-            self.notice = Some(
+            self.hint(
+                Tone::Warning,
                 locale::text(
                     "No conflicted files are listed",
                     "没有列出冲突文件",
                     "沒有列出衝突檔案",
-                )
-                .to_string(),
+                ),
             );
             cx.notify();
             return;
@@ -1553,17 +1706,17 @@ impl MobileWorkbench {
                 this.busy = false;
                 match outcome {
                     Ok(_) => {
-                        this.notice = Some(
+                        this.hint(
+                            Tone::Success,
                             locale::text(
                                 "Conflicts staged",
                                 "冲突已标记为已解决",
                                 "衝突已標記為已解決",
-                            )
-                            .to_string(),
+                            ),
                         );
                         this.refresh_worktree_lifecycle(cx);
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -1616,7 +1769,8 @@ impl MobileWorkbench {
                 this.busy = false;
                 match outcome {
                     Ok(_) => {
-                        this.notice = Some(
+                        this.hint(
+                            Tone::Success,
                             match action {
                                 WorktreeOperationAction::Abort => {
                                     locale::text("Merge aborted", "已中止合并", "已中止合併")
@@ -1624,13 +1778,12 @@ impl MobileWorkbench {
                                 WorktreeOperationAction::Continue => {
                                     locale::text("Merge continued", "已继续合并", "已繼續合併")
                                 }
-                            }
-                            .to_string(),
+                            },
                         );
                         this.refresh_worktree_lifecycle(cx);
                         this.refresh_git(cx);
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -1665,9 +1818,8 @@ impl MobileWorkbench {
                     Ok(preflight) => {
                         this.worktree_confirmation =
                             Some(WorktreeConfirmation::Discard(Box::new(preflight)));
-                        this.error = None;
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -1706,18 +1858,18 @@ impl MobileWorkbench {
                 this.busy = false;
                 match outcome {
                     Ok(_) => {
-                        this.notice = Some(
+                        this.hint(
+                            Tone::Success,
                             locale::text(
                                 "Worktree discarded",
                                 "Worktree 已丢弃",
                                 "Worktree 已丟棄",
-                            )
-                            .to_string(),
+                            ),
                         );
                         this.refresh_worktree_lifecycle(cx);
                         this.refresh_git(cx);
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -1852,7 +2004,7 @@ impl MobileWorkbench {
         let ticket = match self.git.begin_status_load() {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -1863,17 +2015,29 @@ impl MobileWorkbench {
             let _ = entity.update(cx, |this, cx| {
                 let failed = outcome.is_err();
                 this.git.apply_status(&ticket, outcome);
-                this.error = this.git.state.last_error.clone();
-                this.git_status_error = failed
+                // A read that failed is a light hint, not a card inside the
+                // Changes list. The poll repeats it every few seconds, so the
+                // message is raised only when the failure changes: a reader who
+                // is not looking at the phone does not need it said again.
+                let failure = failed
                     .then(|| {
-                        this.error
+                        this.git
+                            .state
+                            .last_error
                             .as_ref()
                             .map(|error| error.message.clone())
-                            .unwrap_or_else(|| {
-                                locale::common("Could not read the repository").to_string()
-                            })
                     })
+                    .flatten()
                     .filter(|_| this.git.state.model.status.is_none());
+                if failure != this.git_status_error {
+                    this.git_status_error = failure.clone();
+                    this.hint(
+                        Tone::Error,
+                        failure.unwrap_or_else(|| {
+                            locale::common("Could not read the repository").to_string()
+                        }),
+                    );
+                }
                 if let Some(status) = this.git.state.model.status.as_ref() {
                     this.files.state.tree.set_git_changes(&status.changes);
                 }
@@ -1945,11 +2109,10 @@ impl MobileWorkbench {
                 match outcome {
                     Ok(branches) => {
                         this.git_branches = Some(branches.branches);
-                        this.error = None;
                     }
                     Err(error) => {
                         if report_error {
-                            this.error = Some(error);
+                            this.fail(error);
                         }
                     }
                 }
@@ -2050,11 +2213,10 @@ impl MobileWorkbench {
                         if !this.git.state.model.apply_history(&ticket, history, append) {
                             return;
                         }
-                        this.error = None;
                     }
                     Err(error) => {
                         this.git.state.model.fail_query(&ticket, &error.code);
-                        this.error = Some(error);
+                        this.fail(error);
                     }
                 }
                 cx.notify();
@@ -2129,11 +2291,12 @@ impl MobileWorkbench {
         }
         if self.git_commit_input.is_none() {
             self.git_commit_input = Some(cx.new(|cx| {
-                InputState::new(window, cx).placeholder(locale::text(
-                    "Commit message",
-                    "提交消息",
-                    "提交訊息",
-                ))
+                // Three rows, the desktop's own height for the same field: one
+                // for the subject and two to show that a body has somewhere to
+                // go.
+                TextareaState::new(window, cx)
+                    .rows(3)
+                    .placeholder(locale::text("Commit message", "提交消息", "提交訊息"))
             }));
         }
         if self.git_history_query_input.is_none() {
@@ -2170,6 +2333,13 @@ impl MobileWorkbench {
                     .folding(false)
                     .placeholder(locale::text("File content", "文件内容", "檔案內容"))
             }));
+            // Read-only, because the rail browses the workspace and the desktop
+            // is what writes it. The kind still answers a caret and a selection,
+            // so a reader can copy a line out of a file; it just cannot be typed
+            // into.
+            if let Some(editor) = self.file_editor_input.clone() {
+                editor.update(cx, |editor, cx| editor.set_readonly(true, cx));
+            }
         }
         if self.terminal_input.is_none() {
             self.terminal_input = Some(cx.new(|cx| InputState::new(window, cx)));
@@ -2249,12 +2419,10 @@ impl MobileWorkbench {
 
         let clears = [
             (&mut self.file_search_clear_pending, &self.file_search_input),
-            (&mut self.git_commit_clear_pending, &self.git_commit_input),
             (
                 &mut self.git_history_query_clear_pending,
                 &self.git_history_query_input,
             ),
-            (&mut self.terminal_clear_pending, &self.terminal_input),
         ];
         for (pending, input) in clears {
             if !*pending {
@@ -2262,6 +2430,25 @@ impl MobileWorkbench {
             }
             *pending = false;
             if let Some(input) = input.clone() {
+                input.update(cx, |input, cx| input.set_value("", window, cx));
+            }
+        }
+        if std::mem::take(&mut self.git_commit_clear_pending)
+            && let Some(input) = self.git_commit_input.clone()
+        {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        if std::mem::take(&mut self.terminal_clear_pending) {
+            // The terminal's field is a scratch buffer: every committed
+            // character is forwarded and the field is emptied again. The diff
+            // that reduces the next edit to what the user typed reads the
+            // field's previous value, so emptying the field has to empty that
+            // memory with it. Leaving it behind made the next character look
+            // like a replacement of the last one, and the sink dropped it —
+            // which is why only the first character of a session ever reached
+            // the shell.
+            self.terminal_sink_previous.clear();
+            if let Some(input) = self.terminal_input.clone() {
                 input.update(cx, |input, cx| input.set_value("", window, cx));
             }
         }
@@ -2382,6 +2569,7 @@ impl MobileWorkbench {
             branch: None,
         };
         self.busy = true;
+        self.git_remote_action = Some(kind);
         let backend = self.backend.clone();
         let runner =
             gpui_tokio::Tokio::spawn(cx, async move { backend.git_remote_action(request).await });
@@ -2389,15 +2577,52 @@ impl MobileWorkbench {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
                 this.busy = false;
+                this.git_remote_action = None;
                 match outcome {
                     Ok(result) => {
                         // Reconcile through the normal ticketed status path so
                         // the shared tree and selection model stay authoritative.
                         this.refresh_git(cx);
-                        this.notice = Some(result.summary);
-                        this.error = None;
+                        // The desktop answers a push or a pull with the action's
+                        // own name; a fetch is bookkeeping it does not announce.
+                        // The authority's own summary is the sentence for
+                        // anything else, so a runtime that reports more than the
+                        // desktop does is still heard.
+                        let notice = match kind {
+                            GitRemoteActionKind::Pull => {
+                                Some(locale::text("Pull completed", "拉取已完成", "拉取已完成"))
+                            }
+                            GitRemoteActionKind::Push => {
+                                Some(locale::text("Push completed", "推送已完成", "推送已完成"))
+                            }
+                            GitRemoteActionKind::Fetch => None,
+                        };
+                        this.hint(
+                            Tone::Success,
+                            notice.map(str::to_string).unwrap_or(result.summary),
+                        );
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => {
+                        // A failed push or pull names the action it failed at,
+                        // the way the desktop's own failure hint does.
+                        let label = match kind {
+                            GitRemoteActionKind::Fetch => {
+                                Some(locale::text("Fetch failed", "获取失败", "取得失敗"))
+                            }
+                            GitRemoteActionKind::Pull => {
+                                Some(locale::text("Pull failed", "拉取失败", "拉取失敗"))
+                            }
+                            GitRemoteActionKind::Push => {
+                                Some(locale::text("Push failed", "推送失败", "推送失敗"))
+                            }
+                        };
+                        match label {
+                            Some(label) => {
+                                this.hint(Tone::Error, format!("{label}: {}", error.message))
+                            }
+                            None => this.fail(error),
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -2459,11 +2684,12 @@ impl MobileWorkbench {
                 match outcome {
                     Ok(_) => {
                         this.refresh_git(cx);
-                        this.notice =
-                            Some(locale::common("Selected changes rolled back").to_string());
-                        this.error = None;
+                        this.hint(
+                            Tone::Success,
+                            locale::common("Selected changes rolled back"),
+                        );
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -2477,7 +2703,7 @@ impl MobileWorkbench {
         let ticket = match self.git.begin_diff_load(path, staged) {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -2485,6 +2711,7 @@ impl MobileWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, self.git.load_diff(ticket.clone()));
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
+            let failure = outcome.as_ref().err().cloned();
             let display = outcome.as_ref().ok().cloned();
             let _ = entity.update(cx, |this, cx| {
                 this.git.apply_diff(&ticket, outcome);
@@ -2493,7 +2720,7 @@ impl MobileWorkbench {
                 if opened {
                     this.git_diff_scroll.set_offset(gpui::Point::default());
                 }
-                this.error = this.git.state.last_error.clone();
+                this.hint_failure(failure);
                 cx.notify();
             });
         });
@@ -2506,6 +2733,9 @@ impl MobileWorkbench {
         self.git.state.model.select_commit(commit_hash.clone());
         self.git_commit_detail = None;
         self.git_commit_detail_loading = true;
+        // The message body starts folded, as it does on the desktop: the header
+        // already carries the subject, and the diff is what the screen is for.
+        self.git_commit_body_expanded = false;
         let request = GitCommitDetailRequest {
             workspace_id: self.workspace_id.clone(),
             commit_hash,
@@ -2520,7 +2750,7 @@ impl MobileWorkbench {
                 this.git_commit_detail_loading = false;
                 match outcome {
                     Ok(detail) => this.git_commit_detail = Some(detail),
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.fail(error),
                 }
                 cx.notify();
             });
@@ -2552,10 +2782,12 @@ impl MobileWorkbench {
         {
             return;
         }
-        let message = input_value(&self.git_commit_input, cx).trim().to_string();
+        let message = textarea_value(&self.git_commit_input, cx)
+            .trim()
+            .to_string();
         let paths = self.git.state.model.selected_change_paths();
         if paths.is_empty() {
-            self.error = Some(BackendError::failed(
+            self.fail(BackendError::failed(
                 "git_paths_empty",
                 locale::text(
                     "Select at least one change first.",
@@ -2569,9 +2801,8 @@ impl MobileWorkbench {
         match self.git.request_commit_confirmation(message, paths) {
             Ok(_) => {
                 self.git_commit_confirmation = true;
-                self.error = None;
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => self.fail(error),
         }
         cx.notify();
     }
@@ -2590,9 +2821,8 @@ impl MobileWorkbench {
         match self.git.set_commit_amend(amend) {
             Ok(()) => {
                 self.git_commit_amend = amend;
-                self.error = None;
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => self.fail(error),
         }
         cx.notify();
     }
@@ -2603,9 +2833,8 @@ impl MobileWorkbench {
         match self.git.set_commit_push_after(push) {
             Ok(()) => {
                 self.git_commit_push_after = push;
-                self.error = None;
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => self.fail(error),
         }
         cx.notify();
     }
@@ -2618,7 +2847,7 @@ impl MobileWorkbench {
         let operation = match operation {
             Ok(operation) => operation,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -2630,14 +2859,17 @@ impl MobileWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, self.git.run_commit(operation.clone()));
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
+            let failure = outcome.as_ref().err().cloned();
             let _ = entity.update(cx, |this, cx| {
                 this.git.apply_commit(&operation, outcome);
                 this.busy = false;
-                this.error = this.git.state.last_error.clone();
-                if this.error.is_none() {
-                    this.git_commit_clear_pending = true;
-                    this.notice = Some(locale::common("Commit created on desktop").to_string());
-                    this.refresh_git(cx);
+                match failure {
+                    Some(error) => this.fail(error),
+                    None => {
+                        this.git_commit_clear_pending = true;
+                        this.hint(Tone::Success, locale::common("Commit created on desktop"));
+                        this.refresh_git(cx);
+                    }
                 }
                 cx.notify();
             });
@@ -2651,17 +2883,18 @@ impl MobileWorkbench {
         // `begin_refresh` clears the attached session, so remember which one
         // the user was looking at and put it back when the list returns. A
         // refresh that dropped the attachment left the panel on "Select or
-        // create a terminal" until the user found the chip row.
+        // create a terminal" until the user found the tab strip.
         let previous = self
             .terminal
             .state
             .active_session
             .as_ref()
-            .map(|session| session.id.clone());
+            .map(|session| session.id.clone())
+            .or_else(|| self.terminal_last_selected.clone());
         let ticket = match self.terminal.begin_refresh(self.workspace_id.clone()) {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -2669,10 +2902,14 @@ impl MobileWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, self.terminal.load_sessions(ticket.clone()));
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
+            let failure = outcome.as_ref().err().cloned();
             let _ = entity.update(cx, |this, cx| {
                 this.terminal.apply_refresh(&ticket, outcome);
-                this.error = this.terminal.state.last_error.clone();
+                this.hint_failure(failure);
                 if this.terminal.state.active_session.is_none() {
+                    // The tab the reader left first, then any live terminal,
+                    // then the head of the list: coming back to the terminal
+                    // means coming back to work, not to a list.
                     let next = previous
                         .filter(|id| {
                             this.terminal
@@ -2696,9 +2933,27 @@ impl MobileWorkbench {
                                 .first()
                                 .map(|session| session.id.clone())
                         });
-                    if let Some(terminal_id) = next {
-                        this.attach_terminal(terminal_id, cx);
+                    match next {
+                        Some(terminal_id) => this.attach_terminal(terminal_id, cx),
+                        // Nothing to attach and the reader is standing on the
+                        // terminal: open one, once per visit.
+                        None => {
+                            if std::mem::take(&mut this.terminal_auto_create)
+                                && this.surface == WorkbenchSurface::Terminal
+                                && this
+                                    .terminal
+                                    .capabilities
+                                    .supports(BackendOperation::TerminalCreate)
+                                && !this.busy
+                            {
+                                this.create_terminal_now(cx);
+                            }
+                        }
                     }
+                } else {
+                    // A refresh that found something has answered the question
+                    // the auto-create was holding open.
+                    this.terminal_auto_create = false;
                 }
                 cx.notify();
             });
@@ -2711,7 +2966,8 @@ impl MobileWorkbench {
     }
 
     /// Opens a terminal session and attaches to it. The window the button has
-    /// is not needed for either, which is what lets a restart reuse this.
+    /// is not needed for either, which is what lets the surface's own
+    /// empty-list path open the first terminal without one.
     fn create_terminal_now(&mut self, cx: &mut Context<Self>) {
         let request = MutationRequest::new(TerminalCreateRequest {
             workspace_id: self.workspace_id.clone(),
@@ -2724,7 +2980,7 @@ impl MobileWorkbench {
         let operation = match self.terminal.begin_create(request) {
             Ok(operation) => operation,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -2734,62 +2990,15 @@ impl MobileWorkbench {
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let created_id = outcome.as_ref().ok().map(|session| session.id.clone());
+            let failure = outcome.as_ref().err().cloned();
             let _ = entity.update(cx, |this, cx| {
                 this.terminal.apply_create(&operation, outcome);
                 this.busy = false;
-                this.error = this.terminal.state.last_error.clone();
+                if let Some(error) = failure {
+                    this.fail(error);
+                }
                 if let Some(terminal_id) = created_id {
                     this.attach_terminal(terminal_id, cx);
-                }
-                cx.notify();
-            });
-        });
-        self.tasks.push(task);
-        cx.notify();
-    }
-
-    /// Replaces the running session with a fresh one.
-    ///
-    /// A phone has no way to type `exit` and start again in one gesture, and a
-    /// terminal that has wedged — a full-screen program that will not quit, a
-    /// shell waiting on something — leaves the reader with nothing to do. This
-    /// closes it without the confirmation the Close button asks for, because
-    /// restarting is itself the intent.
-    fn restart_terminal(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.busy
-            || !self
-                .terminal
-                .capabilities
-                .supports(BackendOperation::TerminalClose)
-        {
-            return;
-        }
-        if self.terminal.state.active_session.is_none() {
-            return;
-        }
-        self.terminal_close_confirmation = None;
-        let operation = match self.terminal.begin_close() {
-            Ok(operation) => operation,
-            Err(error) => {
-                self.error = Some(error);
-                cx.notify();
-                return;
-            }
-        };
-        self.busy = true;
-        let runner = gpui_tokio::Tokio::spawn(cx, self.terminal.run_close(operation.clone()));
-        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let outcome = flatten_join(runner.await);
-            let _ = entity.update(cx, |this, cx| {
-                this.terminal.apply_close(&operation, outcome);
-                this.busy = false;
-                this.terminal.state.render = None;
-                this.terminal_render_sequence = 0;
-                this.error = this.terminal.state.last_error.clone();
-                if this.error.is_none() {
-                    this.stop_terminal_poll();
-                    // A fresh session takes the place of the one that went.
-                    this.create_terminal_now(cx);
                 }
                 cx.notify();
             });
@@ -2803,14 +3012,16 @@ impl MobileWorkbench {
         self.reset_terminal_text_state();
         match self.terminal.attach(terminal_id.clone()) {
             Ok(()) => {
-                self.error = None;
                 self.terminal_fit_error = None;
                 self.terminal_render_sequence = 0;
                 self.terminal_fit_size = None;
+                // Remembered so the next visit — and the next refresh of the
+                // list — comes back to the tab the reader left.
+                self.terminal_last_selected = Some(terminal_id.clone());
                 self.start_terminal_poll(terminal_id, cx);
             }
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
             }
         }
@@ -2859,9 +3070,9 @@ impl MobileWorkbench {
                     match outcome {
                         Ok(snapshot) => {
                             this.apply_terminal_snapshot(snapshot);
-                            this.error = None;
+                            this.hint_failure(None);
                         }
-                        Err(error) => this.error = Some(error),
+                        Err(error) => this.hint_failure(Some(error)),
                     }
                     cx.notify();
                     true
@@ -2943,7 +3154,7 @@ impl MobileWorkbench {
                 self.terminal_fit_size = Some((rows, cols));
                 if self.terminal_fit_error.is_none() {
                     self.terminal_fit_error = Some(error.message.clone());
-                    self.error = Some(error);
+                    self.hint(Tone::Error, error.message);
                 }
                 return;
             }
@@ -2961,6 +3172,7 @@ impl MobileWorkbench {
                 if !current {
                     return;
                 }
+                let failure = outcome.as_ref().err().cloned();
                 let resized = this.terminal.apply_resize(&operation, outcome);
                 if resized {
                     if let Some(session) = this.terminal.state.active_session.as_ref()
@@ -2976,7 +3188,7 @@ impl MobileWorkbench {
                         this.refresh_terminal_search(cx);
                     }
                 }
-                this.error = this.terminal.state.last_error.clone();
+                this.hint_failure(failure);
                 cx.notify();
             });
         });
@@ -3086,14 +3298,13 @@ impl MobileWorkbench {
         if let Some(link) = link
             && crate::platform::open_external_url(&link)
         {
-            self.show_notice(
+            self.hint(
+                Tone::Info,
                 locale::text(
                     "Opened in the browser",
                     "已在浏览器中打开",
                     "已在瀏覽器中開啟",
-                )
-                .to_string(),
-                cx,
+                ),
             );
         }
     }
@@ -3498,7 +3709,7 @@ impl MobileWorkbench {
             && !text.is_empty()
         {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
-            self.show_notice(locale::text("Copied", "已复制", "已複製").to_string(), cx);
+            self.hint(Tone::Success, locale::text("Copied", "已复制", "已複製"));
         }
         self.dismiss_terminal_selection(cx);
     }
@@ -3591,7 +3802,7 @@ impl MobileWorkbench {
                 return;
             }
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -3600,11 +3811,13 @@ impl MobileWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, self.terminal.run_input(operation.clone()));
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
+            let failure = outcome.as_ref().err().cloned();
             let _ = entity.update(cx, |this, cx| {
                 this.terminal.apply_input(&operation, outcome);
                 this.busy = false;
-                this.error = this.terminal.state.last_error.clone();
-                if clear_input && this.error.is_none() {
+                if let Some(error) = failure {
+                    this.hint_failure(Some(error));
+                } else if clear_input {
                     this.terminal_clear_pending = true;
                 }
                 if let Some(terminal_id) = this
@@ -3623,7 +3836,17 @@ impl MobileWorkbench {
         cx.notify();
     }
 
-    fn request_close_terminal(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    /// Asks before closing the terminal a tab's own close control names.
+    ///
+    /// The strip draws one close control per tab, so the tab the reader
+    /// pressed is attached first: the confirmation that follows asks about the
+    /// terminal they pointed at, and the close itself runs on the active
+    /// session the way every other terminal action does.
+    fn request_close_terminal_id(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.attach_terminal(terminal_id, cx);
         self.terminal_close_confirmation = self
             .terminal
             .state
@@ -3649,7 +3872,7 @@ impl MobileWorkbench {
             .as_ref()
             .is_some_and(|session| session.id == confirmed_id)
         {
-            self.error = Some(BackendError::conflict(
+            self.fail(BackendError::conflict(
                 "mobile_terminal_close_target_changed",
                 locale::text(
                     "The selected terminal changed before close confirmation.",
@@ -3663,7 +3886,7 @@ impl MobileWorkbench {
         let operation = match self.terminal.begin_close() {
             Ok(operation) => operation,
             Err(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 cx.notify();
                 return;
             }
@@ -3672,14 +3895,15 @@ impl MobileWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, self.terminal.run_close(operation.clone()));
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
+            let failure = outcome.as_ref().err().cloned();
             let _ = entity.update(cx, |this, cx| {
                 this.terminal.apply_close(&operation, outcome);
                 this.busy = false;
                 this.terminal.state.render = None;
                 this.terminal_render_sequence = 0;
-                this.error = this.terminal.state.last_error.clone();
-                if this.error.is_none() {
-                    this.stop_terminal_poll();
+                match failure {
+                    None => this.stop_terminal_poll(),
+                    Some(error) => this.hint_failure(Some(error)),
                 }
                 cx.notify();
             });
@@ -3688,101 +3912,41 @@ impl MobileWorkbench {
         cx.notify();
     }
 
-    /// The Files surface: the tree, or the file the tree opened, under the
-    /// prompt the viewer's header raises.
+    /// The Files surface: the tree, or the file the tree opened.
+    ///
+    /// Nothing on this surface writes. The rail browses the workspace and the
+    /// desktop is what edits it, so there is no unsaved buffer to guard, no
+    /// prompt over the list, and no action bar under the file.
     fn render_files(&mut self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let body = if self.file_screen_open {
             self.render_file_screen(window, cx)
         } else {
             self.render_file_tree(cx)
         };
-        let discard_prompt = self
-            .file_discard_prompt
-            .is_some()
-            .then(|| self.render_file_discard_prompt(cx));
         div()
             .size_full()
             .relative()
             .flex()
             .flex_col()
-            .when_some(discard_prompt, |root, prompt| root.child(prompt))
             .child(div().flex_1().min_h_0().relative().child(body))
-            .into_any_element()
-    }
-
-    /// The unsaved-edits guard: the only way past it is an explicit choice.
-    fn render_file_discard_prompt(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        div()
-            .id("file-discard-prompt")
-            .flex_shrink_0()
-            .m(px(theme::SPACING_MD))
-            .rounded(px(theme::RADIUS_CARD))
-            .border_1()
-            .border_color(theme::accent_yellow())
-            .bg(theme::bg_card())
-            .p(px(theme::SPACING_MD))
-            .flex()
-            .flex_col()
-            .gap(px(theme::SPACING_SM))
-            .child(
-                div()
-                    .text_size(theme::font_detail())
-                    .text_color(theme::text_primary())
-                    .child(locale::text(
-                        "Discard unsaved edits?",
-                        "放弃未保存的修改？",
-                        "放棄未儲存的修改？",
-                    )),
-            )
-            .child(
-                div()
-                    .text_size(theme::font_micro())
-                    .text_color(theme::text_muted())
-                    .child(locale::text(
-                        "Opening another file replaces what you typed here.",
-                        "打开其它文件会替换你在此处的输入。",
-                        "開啟其他檔案會取代你在此處的輸入。",
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(theme::SPACING_SM))
-                    .child(
-                        action_button("file-discard-cancel", locale::common("Cancel"), "icons/x.svg")
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_file_discard)),
-                    )
-                    .child(
-                        action_button(
-                            "file-discard-confirm",
-                            locale::text("Discard", "放弃", "放棄"),
-                            "icons/rotate-ccw.svg",
-                        )
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::confirm_file_discard)),
-                    ),
-            )
             .into_any_element()
     }
 
     /// The file's own screen: a flat header that names the file and carries its
     /// two navigation actions, the buffer filling everything under it, and one
-    /// action bar at the foot.
+    /// A viewer with a back control at the top and the file filling everything
+    /// under it.
     ///
     /// The screen is drawn as a page rather than as a card with a card inside
-    /// it. Its chrome is two hairlines and one button, because a reader who
-    /// opened a file came for the file: every rounded box above or beside the
-    /// buffer is a line of source they cannot see.
+    /// it. A reader who opened a file came for the file, and the rail does not
+    /// write to the workspace, so there is no save bar under the buffer and no
+    /// framed control beside it: every rounded box here is a line of source
+    /// they cannot see.
     fn render_file_screen(&mut self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let view = self.files.state.view();
-        let has_conflict = view.status == FileEditorStatus::Conflict;
-        let can_write = self
-            .files
-            .capabilities()
-            .supports(BackendOperation::FileWrite);
         // The buffer's own path, not the row that happens to be selected: while
-        // a read is in flight those differ, and the header used to announce the
-        // new file over the old file's unsaved content.
+        // a read is in flight those differ, and the header would announce the
+        // new file over the old file's content.
         let path = self
             .file_editor_path
             .clone()
@@ -3945,9 +4109,8 @@ impl MobileWorkbench {
                     )
                     // Find and go-to-line are the two things a long file
                     // needs on a phone, where scrolling to a place by hand is
-                    // the only alternative. The preview switch is a word
-                    // rather than a framed button: it names a mode, and it is
-                    // the third control on a row that already has two.
+                    // the only alternative. Both belong to the source face: a
+                    // rendered Markdown preview has no lines to step through.
                     .when(!showing_preview, |header| {
                         header
                             .child(
@@ -3973,34 +4136,38 @@ impl MobileWorkbench {
                                     ),
                             )
                     })
+                    // The desktop switches a Markdown file between its render
+                    // and its source with one glyph: a pencil over the preview,
+                    // an eye over the buffer. The phone used to spell the two
+                    // words out, which cost the header a third of its width and
+                    // read as a label rather than the toggle it is.
                     .when(previewable, |header| {
                         header.child(
-                            div()
-                                .id("file-preview-toggle")
-                                .flex_shrink_0()
-                                .h(px(WORKBENCH_CONTROL_SIZE))
-                                .px(px(theme::SPACING_SM))
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .active(|style| style.bg(theme::row_pressed_bg()))
-                                .text_size(theme::font_caption())
-                                .text_color(if showing_preview {
-                                    theme::text_primary()
+                            icon_button(
+                                "file-preview-toggle",
+                                if showing_preview {
+                                    "icons/pencil.svg"
                                 } else {
-                                    theme::text_muted()
-                                })
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(Self::toggle_file_preview_mode),
-                                )
-                                .child(if showing_preview {
-                                    MobileFilePreviewMode::Source.label()
+                                    "icons/eye.svg"
+                                },
+                                if showing_preview {
+                                    locale::text(
+                                        "Edit Markdown source",
+                                        "编辑 Markdown 源文件",
+                                        "編輯 Markdown 原始檔",
+                                    )
                                 } else {
-                                    MobileFilePreviewMode::Preview.label()
-                                }),
+                                    locale::text(
+                                        "Preview Markdown",
+                                        "预览 Markdown",
+                                        "預覽 Markdown",
+                                    )
+                                },
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::toggle_file_preview_mode),
+                            ),
                         )
                     }),
             )
@@ -4008,54 +4175,6 @@ impl MobileWorkbench {
                 screen.child(self.render_file_find_bar(cx))
             })
             .child(body)
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .px(px(theme::SPACING_XS))
-                    .py(px(TOOLBAR_GAP))
-                    .border_t_1()
-                    .border_color(theme::border_subtle())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(TOOLBAR_GAP))
-                    .child(div().flex().items_center().gap(px(TOOLBAR_GAP)).when(
-                        has_conflict,
-                        |actions| {
-                            actions.child(
-                                action_button(
-                                    "reload-desktop-file",
-                                    "Use desktop version",
-                                    "icons/download.svg",
-                                )
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::reload_desktop_file),
-                                    ),
-                            )
-                        },
-                    ))
-                    .child(
-                        // The buffer's own action, and the only filled control
-                        // on the screen: the reader came here to change a file,
-                        // and a screen whose one commit action is drawn exactly
-                        // like its two navigation glyphs buries it.
-                        primary_action(
-                            "save-file",
-                            if !can_write {
-                                "Read only"
-                            } else if self.busy {
-                                "Saving..."
-                            } else {
-                                "Save"
-                            },
-                            can_write && !self.busy,
-                        )
-                        .when(!self.busy && can_write, |button| {
-                            button.on_mouse_up(MouseButton::Left, cx.listener(Self::save_file))
-                        }),
-                    ),
-            )
             .when_some(
                 self.sheet.presentation(
                     SheetKey::FileGoto,
@@ -4200,8 +4319,12 @@ impl MobileWorkbench {
                     .child(input_element(self.file_goto_input.as_ref())),
             )
             .child(
-                action_button("file-goto-confirm", locale::common("Go"), "icons/arrow-to-top.svg")
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::confirm_file_goto)),
+                action_button(
+                    "file-goto-confirm",
+                    locale::common("Go"),
+                    "icons/arrow-to-top.svg",
+                )
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::confirm_file_goto)),
             );
         bottom_sheet_shell("file-goto-prompt", presentation)
             .on_dismiss(cx.listener(|this, _, _, cx| this.tap_sheet_scrim(SheetKey::FileGoto, cx)))
@@ -4951,6 +5074,12 @@ impl MobileWorkbench {
     }
 
     /// One of the content search's switches.
+    ///
+    /// The desktop folds these into the search field's own frame. A phone has
+    /// no room for that, so they get the strip's tab treatment instead — the
+    /// same dim plate and square corner the surface tabs wear — rather than a
+    /// row of outlined pills, which read as a second wall of buttons standing
+    /// in front of the field they belong to.
     fn render_file_search_option(
         &self,
         id: &'static str,
@@ -4962,30 +5091,20 @@ impl MobileWorkbench {
         div()
             .id(id)
             .flex_shrink_0()
-            .h(px(28.0))
-            .px_2()
-            .rounded(px(theme::RADIUS_PILL))
-            .border_1()
-            .border_color(if on {
-                theme::primary()
-            } else {
-                theme::border_default()
-            })
-            .bg(if on {
-                theme::primary().opacity(0.12)
-            } else {
-                theme::bg_card()
-            })
+            .h(px(WORKBENCH_TAB_HEIGHT))
+            .px(px(theme::SPACING_SM))
+            .rounded(px(TAB_RADIUS))
+            .when(on, |chip| chip.bg(theme::rail_tab_bg()))
             .flex()
             .items_center()
             .justify_center()
             .cursor_pointer()
             .active(|style| style.bg(theme::row_pressed_bg()))
-            .text_size(theme::font_micro())
+            .text_size(theme::font_caption())
             .text_color(if on {
-                theme::primary()
+                theme::text_primary()
             } else {
-                theme::text_secondary()
+                theme::text_muted()
             })
             .on_mouse_up(
                 MouseButton::Left,
@@ -5058,11 +5177,20 @@ impl MobileWorkbench {
                                 )
                             })
                             .when(query_present, |bar| {
-                                bar.child(inline_icon_button(
-                                    "clear-file-search",
-                                    "icons/x.svg",
-                                    "Clear search",
-                                ))
+                                bar.child(
+                                    inline_icon_button(
+                                        "clear-file-search",
+                                        "icons/x.svg",
+                                        "Clear search",
+                                    )
+                                    // The glyph was drawn without a handler, so
+                                    // the only way out of a query was to delete
+                                    // it a character at a time.
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::clear_file_search),
+                                    ),
+                                )
                             }),
                     )
                     // One control that swaps its own value: what a query reads
@@ -5520,10 +5648,7 @@ impl MobileWorkbench {
                                         .as_ref()
                                         .and_then(|status| status.branch.clone())
                                         .unwrap_or_else(|| {
-                                            if self.git_status_error.is_some() {
-                                                locale::common("Could not read the repository")
-                                                    .to_string()
-                                            } else if status_loading {
+                                            if status_loading {
                                                 locale::common("Loading…").to_string()
                                             } else {
                                                 locale::common("No repository").to_string()
@@ -5598,11 +5723,22 @@ impl MobileWorkbench {
                                         .trim()
                                         .is_empty(),
                                     |bar| {
-                                        bar.child(inline_icon_button(
-                                            "clear-git-history-search",
-                                            "icons/x.svg",
-                                            "Clear commit search",
-                                        ))
+                                        bar.child(
+                                            inline_icon_button(
+                                                "clear-git-history-search",
+                                                "icons/x.svg",
+                                                "Clear commit search",
+                                            )
+                                            // Drawn without a handler, like the
+                                            // file search's own clear glyph: a
+                                            // reader who mistyped a hash had to
+                                            // erase it by hand to get back to
+                                            // the unfiltered list.
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(Self::clear_git_history_search),
+                                            ),
+                                        )
                                     },
                                 ),
                         )
@@ -5610,8 +5746,14 @@ impl MobileWorkbench {
                     // Fetch before pull: the phone has no terminal habit to
                     // fall back on, and "what is on the remote" is its own
                     // question that a pull would answer by merging.
-                    .child(
-                        toolbar_icon_button("git-fetch", "icons/refresh.svg", "Fetch")
+                    //
+                    // The row carries no refresh control of its own: the
+                    // desktop's own Changes header has none either, and the
+                    // fetch glyph beside these two already reads as one. A
+                    // reader who wants the status re-read has Fetch.
+                    .child({
+                        let running = self.git_remote_action == Some(GitRemoteActionKind::Fetch);
+                        remote_action_button("git-fetch", "icons/refresh.svg", "Fetch", running)
                             .when(can_remote && !self.busy, |button| {
                                 button.on_mouse_up(
                                     MouseButton::Left,
@@ -5620,10 +5762,11 @@ impl MobileWorkbench {
                                     }),
                                 )
                             })
-                            .when(!can_remote || self.busy, |button| button.opacity(0.55)),
-                    )
-                    .child(
-                        toolbar_icon_button("git-pull", "icons/download.svg", "Pull")
+                            .when(!can_remote || self.busy, |button| button.opacity(0.55))
+                    })
+                    .child({
+                        let running = self.git_remote_action == Some(GitRemoteActionKind::Pull);
+                        remote_action_button("git-pull", "icons/download.svg", "Pull", running)
                             .when(can_remote && !self.busy, |button| {
                                 button.on_mouse_up(
                                     MouseButton::Left,
@@ -5632,10 +5775,11 @@ impl MobileWorkbench {
                                     }),
                                 )
                             })
-                            .when(!can_remote || self.busy, |button| button.opacity(0.55)),
-                    )
-                    .child(
-                        toolbar_icon_button("git-push", "icons/upload.svg", "Push")
+                            .when(!can_remote || self.busy, |button| button.opacity(0.55))
+                    })
+                    .child({
+                        let running = self.git_remote_action == Some(GitRemoteActionKind::Push);
+                        remote_action_button("git-push", "icons/upload.svg", "Push", running)
                             .when(can_remote && !self.busy, |button| {
                                 button.on_mouse_up(
                                     MouseButton::Left,
@@ -5644,19 +5788,8 @@ impl MobileWorkbench {
                                     }),
                                 )
                             })
-                            .when(!can_remote || self.busy, |button| button.opacity(0.55)),
-                    )
-                    .child(
-                        toolbar_icon_button("git-refresh", "icons/rotate-ccw.svg", "Refresh").when(
-                            !self.busy,
-                            |button| {
-                                button.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(Self::refresh_active_surface),
-                                )
-                            },
-                        ),
-                    ),
+                            .when(!can_remote || self.busy, |button| button.opacity(0.55))
+                    }),
             )
             // ── what the list below is showing ───────────────────────────────
             .child(
@@ -5693,7 +5826,9 @@ impl MobileWorkbench {
                             .child(
                                 rail_switch_segment(
                                     "git-mode:history",
-                                    locale::common("Commits"),
+                                    // The desktop names this tab 提交, not the
+                                    // English "Commits".
+                                    locale::text("Commits", "提交", "提交"),
                                     history_active,
                                 )
                                 .on_mouse_up(
@@ -5808,70 +5943,29 @@ impl MobileWorkbench {
                     .restrict_scroll_to_axis()
                     .when(changes_active, |body| {
                         let row_count = self.git.state.model.change_tree_row_count();
-                        body.when_some(self.git_status_error.clone(), |body, message| {
-                            body.child(
-                                div()
-                                    .m(px(theme::SPACING_MD))
-                                    .p(px(theme::SPACING_MD))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .border_1()
-                                    .border_color(theme::accent_red())
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(theme::SPACING_SM))
-                                    .child(
-                                        div()
-                                            .text_size(theme::font_caption())
-                                            .text_color(theme::accent_red())
-                                            .child(locale::common("Could not read the repository")),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(theme::font_micro())
-                                            .text_color(theme::text_muted())
-                                            .child(message),
-                                    )
-                                    .child(
-                                        action_button(
-                                            "git-retry-status",
-                                            locale::common("Retry"),
-                                            "icons/rotate-ccw.svg",
-                                        )
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.git_status_error = None;
-                                                    this.refresh_git(cx);
-                                                }),
-                                            ),
-                                    ),
-                            )
+                        body.when(row_count == 0, |body| {
+                            body.child(empty_state(
+                                "icons/git-branch.svg",
+                                if status_loading {
+                                    locale::common("Loading repository status...")
+                                } else {
+                                    locale::common("Working tree is clean")
+                                },
+                            ))
                         })
-                        .when(self.git_status_error.is_none(), |body| {
-                            body.when(row_count == 0, |body| {
-                                body.child(empty_state(
-                                    "icons/git-branch.svg",
-                                    if status_loading {
-                                        locale::common("Loading repository status...")
-                                    } else {
-                                        locale::common("Working tree is clean")
-                                    },
-                                ))
-                            })
-                            .children((0..row_count).filter_map(|index| {
-                                self.git
-                                    .state
-                                    .model
-                                    .change_tree_row(index)
-                                    .map(|(row, change)| {
-                                        self.render_git_tree_row_mobile(
-                                            row.clone(),
-                                            change.cloned(),
-                                            cx,
-                                        )
-                                    })
-                            }))
-                        })
+                        .children((0..row_count).filter_map(|index| {
+                            self.git
+                                .state
+                                .model
+                                .change_tree_row(index)
+                                .map(|(row, change)| {
+                                    self.render_git_tree_row_mobile(
+                                        row.clone(),
+                                        change.cloned(),
+                                        cx,
+                                    )
+                                })
+                        }))
                     })
                     .when(history_active, |body| {
                         self.render_git_history_body(body, cx)
@@ -6027,13 +6121,6 @@ impl MobileWorkbench {
             .collect::<Vec<_>>()
             .join(" / ");
         let selection = self.git.state.model.path_selection_state(&path);
-        let selected_path = change.as_ref().is_some_and(|change| {
-            self.git
-                .state
-                .model
-                .selected_change_paths()
-                .contains(&change.path)
-        });
         let row_id = row.id.clone();
         let change_staged = change
             .as_ref()
@@ -6063,10 +6150,12 @@ impl MobileWorkbench {
             .flex()
             .items_center()
             .gap(px(6.0))
-            .when(selected_path, |item| item.bg(theme::sidebar_selected_bg()))
-            .when(!selected_path, |item| {
-                item.hover(|style| style.bg(theme::row_pressed_bg()))
-            })
+            // A checked row wears no wash of its own. The checkbox is what
+            // carries the state, exactly as it does on the desktop, where a
+            // selected path is drawn by the indicator and nothing else: a
+            // second highlight down the row repeated the same fact in a louder
+            // voice and turned a list of changes into a list of bars.
+            .hover(|style| style.bg(theme::row_pressed_bg()))
             .children(file_tree_guides_mobile(row.depth))
             .child(div().w(px(row.depth as f32 * 20.0)).flex_none())
             .child({
@@ -6334,15 +6423,82 @@ impl MobileWorkbench {
                                         ),
                                 )
                                 .when_some(detail.body.clone(), |meta, commit_body| {
-                                    let commit_body = commit_body.trim().to_string();
-                                    meta.when(!commit_body.is_empty(), |meta| {
+                                    // The message body is a disclosure, and it
+                                    // starts folded: `git show` repeats the
+                                    // subject as the first line, and the header
+                                    // above already draws it. The desktop folds
+                                    // the same lines behind the same switch.
+                                    let body_lines =
+                                        commit_body_content_lines(&commit_body, &summary.subject);
+                                    meta.when(!body_lines.is_empty(), |meta| {
                                         meta.child(
                                             div()
+                                                .id("git-commit-body")
                                                 .pt_1()
-                                                .text_size(theme::font_caption())
-                                                .whitespace_normal()
-                                                .text_color(theme::text_secondary())
-                                                .child(commit_body),
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .cursor_pointer()
+                                                .aria_label(locale::text(
+                                                    "Commit message",
+                                                    "提交信息",
+                                                    "提交資訊",
+                                                ))
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.git_commit_body_expanded =
+                                                            !this.git_commit_body_expanded;
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .when(self.git_commit_body_expanded, |body| {
+                                                    body.child(
+                                                        div()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .text_size(theme::font_caption())
+                                                            .whitespace_normal()
+                                                            .text_color(theme::text_secondary())
+                                                            .children(body_lines.into_iter().map(
+                                                                |line| {
+                                                                    div().child(
+                                                                        if line.is_empty() {
+                                                                            " ".to_string()
+                                                                        } else {
+                                                                            line
+                                                                        },
+                                                                    )
+                                                                },
+                                                            )),
+                                                    )
+                                                })
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1()
+                                                        .text_size(theme::font_caption())
+                                                        .text_color(theme::primary())
+                                                        .child(
+                                                            svg()
+                                                                .path(
+                                                                    if self.git_commit_body_expanded
+                                                                    {
+                                                                        "icons/chevron-down.svg"
+                                                                    } else {
+                                                                        "icons/chevron-right.svg"
+                                                                    },
+                                                                )
+                                                                .size(px(12.0))
+                                                                .flex_none(),
+                                                        )
+                                                        .child(if self.git_commit_body_expanded {
+                                                            locale::text("Collapse", "收起", "收起")
+                                                        } else {
+                                                            locale::text("Expand", "展开", "展開")
+                                                        }),
+                                                ),
                                         )
                                     })
                                 })
@@ -6511,39 +6667,19 @@ impl MobileWorkbench {
             .into_any_element()
     }
 
-    /// The patch body with per-line add/remove coloring, mirroring the desktop
-    /// diff surface.
+    /// A commit's patch, drawn through the same rows the working-tree diff
+    /// sheet uses.
+    ///
+    /// The desktop renders a commit's diff and a working-tree diff with one row
+    /// projection, so the two surfaces cannot disagree about what an addition
+    /// looks like. This is that projection: the change rail, the line number,
+    /// and the text, each on the desktop's own wash.
     fn render_git_patch_body(&self, patch: &str) -> gpui::AnyElement {
+        let (rows, _) = parse_unified_diff(patch, GIT_COMMIT_PATCH_PAGE_LINES);
         div()
-            .mx_2()
-            .my_1()
-            .rounded(px(theme::RADIUS_CONTROL))
-            .border_1()
-            .border_color(theme::border_subtle())
-            .bg(theme::bg_card())
-            .p_2()
             .flex()
             .flex_col()
-            .children(patch.lines().take(2000).map(|line| {
-                let line = line.to_string();
-                let color = if line.starts_with('+') && !line.starts_with("+++") {
-                    theme::accent_green()
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    theme::accent_red()
-                } else {
-                    theme::text_muted()
-                };
-                div()
-                    .font_family("IBM Plex Mono")
-                    .text_size(theme::font_micro())
-                    .text_color(color)
-                    .whitespace_normal()
-                    .child(if line.is_empty() {
-                        " ".to_string()
-                    } else {
-                        line
-                    })
-            }))
+            .children(rows.into_iter().map(render_diff_row))
             .into_any_element()
     }
 
@@ -6558,32 +6694,9 @@ impl MobileWorkbench {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let limit = self.git_diff_limit.max(GIT_DIFF_PAGE_LINES);
-        let mut old_line = 0u32;
-        let mut new_line = 0u32;
-        let lines = diff
-            .diff
-            .lines()
-            .take(limit)
-            .map(|raw| {
-                let raw = raw.to_string();
-                let (kind, number) = if raw.starts_with("@@") {
-                    (DiffLineKind::Hunk, String::new())
-                } else if raw.starts_with('+') && !raw.starts_with("+++") {
-                    new_line += 1;
-                    (DiffLineKind::Added, new_line.to_string())
-                } else if raw.starts_with('-') && !raw.starts_with("---") {
-                    old_line += 1;
-                    (DiffLineKind::Removed, old_line.to_string())
-                } else {
-                    old_line += 1;
-                    new_line += 1;
-                    (DiffLineKind::Context, new_line.to_string())
-                };
-                (kind, number, raw)
-            })
-            .collect::<Vec<_>>();
-        let total_lines = diff.diff.lines().count();
-        let remaining = total_lines.saturating_sub(limit);
+        // The same reduction a commit's patch goes through, so the working-tree
+        // sheet and the commit detail draw one diff the same way.
+        let (lines, remaining) = parse_unified_diff(&diff.diff, limit);
         let path = diff.path.clone();
         let sheet = div()
             .min_h_0()
@@ -6653,51 +6766,9 @@ impl MobileWorkbench {
                     .overflow_y_scroll()
                     .overflow_x_scroll()
                     .restrict_scroll_to_axis()
-                    .py(px(theme::SPACING_SM))
-                    .children(lines.into_iter().map(|(kind, number, raw)| {
-                        let color = match kind {
-                            DiffLineKind::Added => theme::accent_success(),
-                            DiffLineKind::Removed => theme::accent_red(),
-                            DiffLineKind::Hunk => theme::accent_blue(),
-                            DiffLineKind::Context => theme::text_secondary(),
-                        };
-                        div()
-                            .flex()
-                            .items_start()
-                            .gap(px(theme::SPACING_SM))
-                            .px(px(theme::SPACING_MD))
-                            .child(
-                                div()
-                                    .w(px(34.0))
-                                    .flex_shrink_0()
-                                    .text_right()
-                                    .font_family("IBM Plex Mono")
-                                    .text_size(theme::font_micro())
-                                    .text_color(theme::text_muted())
-                                    .child(number),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .pl(px(if matches!(kind, DiffLineKind::Hunk) {
-                                        0.0
-                                    } else {
-                                        8.0
-                                    }))
-                                    .border_l_1()
-                                    .border_color(match kind {
-                                        DiffLineKind::Added => theme::accent_success(),
-                                        DiffLineKind::Removed => theme::accent_red(),
-                                        _ => theme::border_subtle(),
-                                    })
-                                    .font_family("IBM Plex Mono")
-                                    .text_size(theme::font_micro())
-                                    .text_color(color)
-                                    .whitespace_normal()
-                                    .child(if raw.is_empty() { " ".to_string() } else { raw }),
-                            )
-                    })),
+                    .flex()
+                    .flex_col()
+                    .children(lines.into_iter().map(render_diff_row)),
             )
             // A long patch is paged rather than cut off: the rest of it is one
             // tap away instead of being a trip to the desktop.
@@ -6777,7 +6848,7 @@ impl MobileWorkbench {
             .flex()
             .flex_col()
             .gap(px(theme::SPACING_SM))
-            .child(input_shell(self.git_commit_input.as_ref()))
+            .child(commit_message_shell(self.git_commit_input.as_ref()))
             .when(self.git_commit_confirmation, |panel| {
                 panel
                     .child(
@@ -6898,15 +6969,23 @@ impl MobileWorkbench {
                                 }),
                         )
                         .child(
-                            primary_action("request-commit", action_label, action_enabled).when(
+                            // The desktop's own commit control: a 36px plate
+                            // carrying the verb and the number of paths it will
+                            // take. The phone drew a full-height bar stretched
+                            // across the foot of the panel, which read as the
+                            // screen's primary action rather than as the last
+                            // step of the list above it.
+                            commit_button(
+                                action_label,
+                                self.git.state.model.selected_path_count(),
                                 action_enabled,
-                                |button| {
-                                    button.on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::request_git_commit),
-                                    )
-                                },
-                            ),
+                            )
+                            .when(action_enabled, |button| {
+                                button.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::request_git_commit),
+                                )
+                            }),
                         ),
                 )
             })
@@ -6919,6 +6998,15 @@ impl MobileWorkbench {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let count = self.git.state.model.history_row_count();
+        // The graph is the branch's shape, so it is laid out over the whole
+        // loaded window at once: a lane only means something relative to the
+        // commits above and below it, and a row drawn one at a time had no way
+        // to know either. The algorithm is the desktop's own, run over the same
+        // `parents` the backend returns.
+        let commits = (0..count)
+            .filter_map(|index| self.git.state.model.history_row(index).cloned())
+            .collect::<Vec<_>>();
+        let graph = git_graph_layout(&commits);
         body.when(count == 0, |body| {
             body.child(empty_state(
                 "icons/message-square.svg",
@@ -6929,13 +7017,13 @@ impl MobileWorkbench {
                 },
             ))
         })
-        .children((0..count).filter_map(|index| {
-            self.git
-                .state
-                .model
-                .history_row(index)
+        .children(commits.into_iter().enumerate().map(|(index, commit)| {
+            let row = graph
+                .rows
+                .get(index)
                 .cloned()
-                .map(|commit| self.render_git_history_row(commit, cx))
+                .unwrap_or_else(GitGraphRow::default);
+            self.render_git_history_row(commit, row, graph.lane_count, cx)
         }))
         .when(self.git.state.model.history_has_more, |body| {
             body.child(
@@ -6962,13 +7050,23 @@ impl MobileWorkbench {
     fn render_git_history_row(
         &self,
         commit: GitCommitSummary,
+        graph_row: GitGraphRow,
+        graph_lane_count: usize,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let hash = commit.hash.clone();
         let selected = self.git.state.model.selected_commit_hash.as_deref() == Some(hash.as_str());
+        // The lane column is as wide as the graph needs, and the commits' own
+        // lanes are mirrored so the branch the reader is on sits beside the
+        // card: the desktop fans extra lanes out to the left for the same
+        // reason, which keeps the main line easy to follow downwards.
+        let graph_width = graph_lane_count.clamp(1, GIT_HISTORY_GRAPH_MAX_LANES) as f32
+            * GIT_HISTORY_GRAPH_LANE_WIDTH
+            + 4.0;
+        let graph_colors = git_graph_colors();
         div()
             .id(format!("git-history:{}", commit.hash))
-            .min_h(px(64.0))
+            .min_h(px(GIT_HISTORY_ROW_HEIGHT))
             .mx(px(TREE_ROW_INSET))
             .px(px(theme::SPACING_XS))
             .py_1()
@@ -6982,29 +7080,93 @@ impl MobileWorkbench {
                 item.hover(|style| style.bg(theme::row_pressed_bg()))
             })
             .child(
-                div()
-                    .w(px(18.0))
-                    .h(px(42.0))
-                    .flex_none()
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .w(px(1.0))
-                            .bg(theme::border_default()),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .size(px(if selected { 9.0 } else { 7.0 }))
-                            .rounded_full()
-                            .bg(theme::accent_blue()),
-                    ),
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let top = bounds.origin.y;
+                        let bottom = bounds.origin.y + bounds.size.height;
+                        let middle = bounds.origin.y + bounds.size.height / 2.0;
+                        let lane_x = |lane: usize| {
+                            let visual_lane =
+                                graph_lane_count.saturating_sub(1).saturating_sub(lane);
+                            bounds.origin.x
+                                + px(2.0 + visual_lane as f32 * GIT_HISTORY_GRAPH_LANE_WIDTH)
+                                + px(GIT_HISTORY_GRAPH_LANE_WIDTH / 2.0)
+                        };
+                        for edge in &graph_row.top_edges {
+                            let from = lane_x(edge.from);
+                            let to = lane_x(edge.to);
+                            let mut path = PathBuilder::stroke(px(1.5));
+                            path.move_to(point(from, top));
+                            if edge.from == edge.to {
+                                path.line_to(point(to, middle));
+                            } else {
+                                path.cubic_bezier_to(
+                                    point(to, middle),
+                                    point(from, top + bounds.size.height / 6.0),
+                                    point(to, middle - bounds.size.height / 6.0),
+                                );
+                            }
+                            if let Ok(path) = path.build() {
+                                window.paint_path(path, graph_colors[edge.to % graph_colors.len()]);
+                            }
+                        }
+                        for edge in &graph_row.bottom_edges {
+                            let from = lane_x(edge.from);
+                            let to = lane_x(edge.to);
+                            let mut path =
+                                PathBuilder::stroke(px(if edge.from == graph_row.lane {
+                                    1.8
+                                } else {
+                                    1.5
+                                }));
+                            path.move_to(point(from, middle));
+                            if edge.from == edge.to {
+                                path.line_to(point(to, bottom));
+                            } else {
+                                path.cubic_bezier_to(
+                                    point(to, bottom),
+                                    point(from, middle + bounds.size.height / 6.0),
+                                    point(to, bottom - bounds.size.height / 6.0),
+                                );
+                            }
+                            if let Ok(path) = path.build() {
+                                window.paint_path(path, graph_colors[edge.to % graph_colors.len()]);
+                            }
+                        }
+                        // The node is a filled disc, one step larger on the
+                        // commit the reader opened.
+                        let radius = px(if selected { 4.5 } else { 3.5 });
+                        let center = point(lane_x(graph_row.lane), middle);
+                        let mut node = PathBuilder::fill();
+                        node.move_to(point(center.x + radius, center.y));
+                        node.arc_to(
+                            point(radius, radius),
+                            px(0.0),
+                            false,
+                            true,
+                            point(center.x - radius, center.y),
+                        );
+                        node.arc_to(
+                            point(radius, radius),
+                            px(0.0),
+                            false,
+                            true,
+                            point(center.x + radius, center.y),
+                        );
+                        node.close();
+                        if let Ok(path) = node.build() {
+                            window.paint_path(
+                                path,
+                                graph_colors[graph_row.lane % graph_colors.len()],
+                            );
+                        }
+                    },
+                )
+                .h_full()
+                .w(px(graph_width))
+                .flex_none()
+                .into_any_element(),
             )
             .child(
                 div()
@@ -7086,7 +7248,6 @@ impl MobileWorkbench {
         let view = self.terminal.state.view(ShellKind::Compact);
         let sessions = self.terminal.state.sessions.clone();
         let active = self.terminal.state.active_session.clone();
-        let session = self.terminal.state.active_session.clone();
         let can_create = self
             .terminal
             .capabilities
@@ -7106,204 +7267,143 @@ impl MobileWorkbench {
             .size_full()
             .flex()
             .flex_col()
-            // ── session header ───────────────────────────────────────────────
-            // The row says which session this is and offers only what a running
-            // session needs; the two words that change its life ("New" and
-            // "Close") are filled pills, so the row has one hierarchy instead of
-            // five framed boxes of the same weight.
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .h(px(WORKBENCH_CONTEXT_HEIGHT))
-                    .pl(px(theme::SPACING_MD))
-                    .pr(px(theme::SPACING_XS))
-                    .overflow_hidden()
-                    .border_b_1()
-                    .border_color(theme::border_subtle())
-                    .flex()
-                    .items_center()
-                    .gap(px(theme::SPACING_XS))
-                    .child(
-                        div()
-                            .size(px(8.0))
-                            .flex_shrink_0()
-                            .rounded_full()
-                            .bg(session
-                                .as_ref()
-                                .map(|session| terminal_status_color(session.status))
-                                .unwrap_or_else(theme::text_muted)),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(theme::font_detail())
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::text_primary())
-                                    .child(
-                                        session
-                                            .as_ref()
-                                            .map(|session| session.title.clone())
-                                            .unwrap_or_else(|| {
-                                                locale::common("Terminal").to_string()
-                                            }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(theme::font_micro())
-                                    .text_color(theme::text_muted())
-                                    .child(match session.as_ref() {
-                                        Some(session) => format!(
-                                            "{} · {}\u{d7}{}",
-                                            terminal_status_label(session.status),
-                                            session.cols,
-                                            session.rows
-                                        ),
-                                        None => locale::text(
-                                            "No active session",
-                                            "没有活动会话",
-                                            "沒有活動會話",
-                                        )
-                                        .to_string(),
-                                    }),
-                            ),
-                    )
-                    .when_some(active.clone(), |bar, _| {
-                        bar.child(
-                            toolbar_icon_button("search-terminal", "icons/search.svg", "Find")
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, window, cx| {
-                                        this.toggle_terminal_search(window, cx)
-                                    }),
-                                ),
-                        )
-                    })
-                    .child(
-                        toolbar_icon_button("refresh-terminal", "icons/refresh.svg", "Refresh")
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.refresh_terminals(cx);
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .when_some(active.clone(), |bar, _| {
-                        bar.child(
-                            toolbar_icon_button(
-                                "restart-terminal",
-                                "icons/rotate-ccw.svg",
-                                "Restart",
-                            )
-                            .when(can_close && !self.busy, |button| {
-                                button.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(Self::restart_terminal),
-                                )
-                            })
-                            .when(!can_close || self.busy, |button| button.opacity(0.55)),
-                        )
-                    })
-                    .when_some(active.clone(), |bar, _| {
-                        bar.child(
-                            chip_action("close-terminal", locale::common("Close"), can_close).when(
-                                can_close,
-                                |button| {
-                                    button.on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::request_close_terminal),
-                                    )
-                                },
-                            ),
-                        )
-                    })
-                    .child(
-                        chip_action("create-terminal", locale::common("New"), can_create).when(
-                            can_create,
-                            |button| {
-                                button.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(Self::create_terminal),
-                                )
-                            },
-                        ),
-                    ),
-            )
             // ── in-terminal find ─────────────────────────────────────────────
             .when(self.terminal_search_open, |terminal| {
                 terminal.child(self.render_terminal_search(cx))
             })
-            // ── session chips ────────────────────────────────────────────────
+            // ── terminal tabs ────────────────────────────────────────────────
+            //
+            // The surface used to open with a status row above this one: a dot,
+            // the session's title, its grid size, and five framed actions. On a
+            // phone that row was a third of the surface spent on facts the tab
+            // strip already tells and actions the tabs can carry themselves.
+            // The tabs are now the whole chrome: each names its terminal, each
+            // closes its own, and the new-terminal control sits at the row's
+            // right edge where it cannot be scrolled away.
             .when(!sessions.is_empty(), |terminal| {
                 terminal.child(
                     div()
-                        .id("mobile-terminal-sessions")
                         .flex_shrink_0()
-                        .overflow_x_scroll()
-                        .restrict_scroll_to_axis()
                         .flex()
                         .items_center()
                         .gap(px(theme::SPACING_XS))
-                        .px(px(theme::SPACING_MD))
+                        .pl(px(theme::SPACING_MD))
+                        .pr(px(theme::SPACING_XS))
                         .py(px(theme::SPACING_SM))
-                        .children(sessions.iter().map(|item| {
-                            let terminal_id = item.id.clone();
-                            let selected =
-                                active.as_ref().is_some_and(|active| active.id == item.id);
+                        .child(
                             div()
-                                .id(format!("terminal-chip:{}", item.id))
-                                .flex_shrink_0()
-                                .h(px(WORKBENCH_CHIP_HEIGHT))
-                                .rounded_full()
-                                .bg(if selected {
-                                    theme::accent_blue().opacity(0.16)
-                                } else {
-                                    theme::workbench_panel_bg()
-                                })
-                                .px(px(theme::SPACING_MD))
+                                .id("mobile-terminal-sessions")
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_x_scroll()
+                                .restrict_scroll_to_axis()
                                 .flex()
                                 .items_center()
-                                .gap(px(6.0))
-                                .cursor_pointer()
-                                .active(|style| style.bg(theme::row_pressed_bg()))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.attach_terminal(terminal_id.clone(), cx)
-                                    }),
-                                )
-                                .child(
+                                .gap(px(theme::SPACING_XS))
+                                .children(sessions.iter().enumerate().map(|(index, item)| {
+                                    let terminal_id = item.id.clone();
+                                    let close_id = item.id.clone();
+                                    let selected =
+                                        active.as_ref().is_some_and(|active| active.id == item.id);
                                     div()
-                                        .size(px(6.0))
+                                        .id(format!("terminal-chip:{}", item.id))
+                                        .flex_shrink_0()
+                                        .h(px(WORKBENCH_CHIP_HEIGHT))
                                         .rounded_full()
-                                        .bg(terminal_status_color(item.status)),
-                                )
-                                .child(
-                                    div()
-                                        .max_w(px(140.0))
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .text_size(theme::font_caption())
-                                        .text_color(if selected {
-                                            theme::text_primary()
+                                        .bg(if selected {
+                                            theme::accent_blue().opacity(0.16)
                                         } else {
-                                            theme::text_secondary()
+                                            theme::workbench_panel_bg()
                                         })
-                                        .child(item.title.clone()),
+                                        .pl(px(theme::SPACING_MD))
+                                        .pr(px(theme::SPACING_XS))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.attach_terminal(terminal_id.clone(), cx)
+                                            }),
+                                        )
+                                        .child(
+                                            div()
+                                                .size(px(6.0))
+                                                .flex_shrink_0()
+                                                .rounded_full()
+                                                .bg(terminal_status_color(item.status)),
+                                        )
+                                        .child(
+                                            // Tabs are numbered in the order the
+                                            // strip shows them: "终端 1", "终端
+                                            // 2", and so on. A reader counting
+                                            // tabs on a phone needs the number
+                                            // more than the shell's own name for
+                                            // itself, which is the same word on
+                                            // every tab.
+                                            div()
+                                                .max_w(px(140.0))
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .text_size(theme::font_caption())
+                                                .text_color(if selected {
+                                                    theme::text_primary()
+                                                } else {
+                                                    theme::text_secondary()
+                                                })
+                                                .child(terminal_tab_label(index)),
+                                        )
+                                        .child(
+                                            inline_icon_button(
+                                                format!("terminal-close:{}", item.id),
+                                                "icons/x.svg",
+                                                "Close terminal",
+                                            )
+                                            .when(
+                                                can_close && !self.busy,
+                                                |button| {
+                                                    button.on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            this.request_close_terminal_id(
+                                                                close_id.clone(),
+                                                                cx,
+                                                            )
+                                                        }),
+                                                    )
+                                                },
+                                            ),
+                                        )
+                                })),
+                        )
+                        .when(active.is_some(), |row| {
+                            row.child(
+                                toolbar_icon_button("search-terminal", "icons/search.svg", "Find")
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.toggle_terminal_search(window, cx)
+                                        }),
+                                    ),
+                            )
+                        })
+                        .child(
+                            toolbar_icon_button(
+                                "create-terminal",
+                                "icons/plus.svg",
+                                "New terminal",
+                            )
+                            .when(can_create && !self.busy, |button| {
+                                button.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::create_terminal),
                                 )
-                        })),
+                            })
+                            .when(!can_create || self.busy, |button| button.opacity(0.55)),
+                        ),
                 )
             })
             .when_some(self.terminal_close_confirmation.clone(), |terminal, _| {
@@ -8016,6 +8116,11 @@ impl MobileWorkbench {
 impl Render for MobileWorkbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_inputs(window, cx);
+        // Every result and failure the rail produced since the last frame goes
+        // to the window's hint layer. Nothing about it takes a line in this
+        // element tree, which is what keeps a message from leaving a strip on a
+        // surface it no longer describes.
+        self.present_pending_hints(window, cx);
         let surface = self.surface;
         div()
             .size_full()
@@ -8023,30 +8128,6 @@ impl Render for MobileWorkbench {
             .flex()
             .flex_col()
             .child(self.render_header(surface, cx))
-            .when_some(self.notice.clone(), |root, notice| {
-                root.child(
-                    div()
-                        .flex_shrink_0()
-                        .px(px(theme::SPACING_MD))
-                        .py_2()
-                        .bg(theme::bg_card_dim())
-                        .text_size(theme::font_caption())
-                        .text_color(theme::accent_success())
-                        .child(notice),
-                )
-            })
-            .when_some(self.error.clone(), |root, error| {
-                root.child(
-                    div()
-                        .flex_shrink_0()
-                        .px(px(theme::SPACING_MD))
-                        .py_2()
-                        .bg(theme::bg_card_dim())
-                        .text_size(theme::font_caption())
-                        .text_color(theme::accent_red())
-                        .child(error.message),
-                )
-            })
             .child(div().flex_1().min_h_0().child(match surface {
                 WorkbenchSurface::Files => self.render_files(window, cx),
                 WorkbenchSurface::Git => self.render_git(window, cx),
@@ -8070,21 +8151,27 @@ struct ChoiceSheet<T> {
     choose: fn(&mut MobileWorkbench, T, &mut Context<MobileWorkbench>),
 }
 
-/// The frame around a one-line kit field the rail owns.
+/// The frame around the commit message.
 ///
 /// A field is a surface, not a box: on a phone the border around an empty
 /// rectangle is ink that says nothing, so the fill alone marks where the text
-/// goes and the row it sits in supplies the inset.
-fn input_shell(input: Option<&Entity<InputState>>) -> gpui::Div {
+/// goes and the row it sits in supplies the inset. Three rows tall and a step
+/// above the caption size, because this is the one thing on the panel the
+/// reader actually types and a commit message is read back before it is sent.
+fn commit_message_shell(input: Option<&Entity<TextareaState>>) -> gpui::Div {
     div()
-        .h(px(theme::TOUCH_TARGET))
         .flex_1()
         .min_w_0()
         .rounded(px(theme::RADIUS_CONTROL))
         .bg(theme::workbench_panel_bg())
         .px_2()
+        .py_1()
+        .text_size(theme::font_detail())
         .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
-        .child(input_element(input))
+        .child(match input {
+            Some(input) => Textarea::new(input).appearance(false).into_any_element(),
+            None => div().into_any_element(),
+        })
 }
 
 /// The kit editor for the buffer created on first paint.
@@ -8103,16 +8190,17 @@ fn file_editor_element(input: Option<&Entity<EditorState>>) -> gpui::AnyElement 
     }
 }
 
-/// The text of the lazily-created file editor, or empty before the first paint.
-fn file_editor_value(input: &Option<Entity<EditorState>>, cx: &gpui::App) -> gpui::SharedString {
+/// The text of a lazily-created kit input, or empty before the first paint.
+fn input_value(input: &Option<Entity<InputState>>, cx: &gpui::App) -> gpui::SharedString {
     input
         .as_ref()
         .map(|input| input.read(cx).value())
         .unwrap_or_default()
 }
 
-/// The text of a lazily-created kit input, or empty before the first paint.
-fn input_value(input: &Option<Entity<InputState>>, cx: &gpui::App) -> gpui::SharedString {
+/// The text of a lazily-created multi-line field, or empty before the first
+/// paint.
+fn textarea_value(input: &Option<Entity<TextareaState>>, cx: &gpui::App) -> gpui::SharedString {
     input
         .as_ref()
         .map(|input| input.read(cx).value())
@@ -8162,6 +8250,48 @@ fn sync_badge(count: u32, arrow: &'static str, color: gpui::Hsla) -> gpui::AnyEl
         .text_color(color)
         .child(format!("{arrow} {count}"))
         .into_any_element()
+}
+
+/// A remote action in the Changes header, drawn as its glyph or — while the
+/// authority is busy with it — as the spinner that took its place.
+///
+/// The desktop answers a press on Push or Pull with a control that spins for
+/// as long as the work takes. The phone previously dimmed all three buttons and
+/// showed nothing moving, so a push that had not landed looked like a panel
+/// that had stopped responding.
+fn remote_action_button(
+    id: impl Into<gpui::ElementId>,
+    path: &'static str,
+    label: &'static str,
+    running: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(WORKBENCH_CONTROL_SIZE))
+        .flex_shrink_0()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .flex()
+        .items_center()
+        .justify_center()
+        .aria_label(locale::common(label))
+        .when(running, |button| {
+            button.child(
+                Spinner::new()
+                    .with_size(Size::Small)
+                    .color(theme::text_secondary()),
+            )
+        })
+        .when(!running, |button| {
+            button
+                .cursor_pointer()
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .child(
+                    svg()
+                        .path(path)
+                        .size(px(theme::ICON_SM))
+                        .text_color(theme::text_secondary()),
+                )
+        })
 }
 
 /// A glyph action that sits in a bar beside a label rather than in a field of
@@ -8309,18 +8439,23 @@ fn chip_action(
         .child(label.into())
 }
 
-/// The one action a surface exists to offer. It is the only filled control on
-/// the rail, so the eye lands on it before anything else in the row.
-fn primary_action(
-    id: impl Into<gpui::ElementId>,
+/// The commit action: the one filled control on the Changes surface, drawn at
+/// the desktop's own weight.
+///
+/// It carries the count of paths the commit will take in a small plate beside
+/// the verb, exactly as the desktop's does, so the reader can see what the
+/// press costs without reading the line above it. It stays a control rather
+/// than a bar: the desktop's is 36px tall and only as wide as its own label.
+fn commit_button(
     label: impl Into<gpui::SharedString>,
+    count: usize,
     enabled: bool,
 ) -> gpui::Stateful<gpui::Div> {
     div()
-        .id(id)
+        .id("request-commit")
         .flex_shrink_0()
-        .h(px(theme::TOUCH_TARGET))
-        .px(px(theme::SPACING_LG))
+        .h(px(WORKBENCH_CONTROL_SIZE))
+        .px_3()
         .rounded(px(theme::RADIUS_CONTROL))
         .bg(if enabled {
             theme::primary()
@@ -8330,6 +8465,7 @@ fn primary_action(
         .flex()
         .items_center()
         .justify_center()
+        .gap(px(6.0))
         .text_size(theme::font_caption())
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(if enabled {
@@ -8341,6 +8477,24 @@ fn primary_action(
             button.cursor_pointer().active(|style| style.opacity(0.85))
         })
         .child(label.into())
+        .child(
+            // The count plate the desktop draws: one box the eye finds without
+            // reading the sentence it belongs to.
+            div()
+                .min_w(px(18.0))
+                .h(px(18.0))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.0))
+                .bg(theme::primary_foreground().opacity(0.18))
+                .px_1()
+                .font_family("IBM Plex Mono")
+                .text_size(theme::font_micro())
+                .text_color(theme::primary_foreground())
+                .child(count.to_string()),
+        )
 }
 
 /// What a change is, as a tinted pill rather than a framed box: the status is
@@ -8814,14 +8968,25 @@ fn file_git_signal_color(signal: FileGitSignal) -> gpui::Hsla {
 }
 
 /// Same geometry and tones as the desktop `git_selection_indicator`.
+/// The checkbox a changed path carries in the Changes tree.
+///
+/// It is the only thing that reports whether a path is in the commit, because
+/// the row itself carries no wash: the desktop draws a selected path exactly
+/// this way. An empty box is a hairline outline on the panel; a checked one is
+/// a solid plate with the mark on it.
+///
+/// The mark's colour is set on the glyph itself rather than inherited from the
+/// plate. A one-pixel stroke at 10px had to survive being scaled down from a
+/// 24px viewBox, and at the alpha the desktop's own indicator uses it faded
+/// into the plate; a phone is read at arm's length under whatever light the
+/// room has, so the check is drawn at full contrast and a step larger.
 fn git_selection_indicator_mobile(state: GitPathSelectionState) -> gpui::AnyElement {
     let selected = state != GitPathSelectionState::Unchecked;
     let mut selected_border = theme::accent_foreground();
     selected_border.a = 0.18;
-    let mut marker_color = theme::accent_foreground();
-    marker_color.a = 0.72;
+    let marker_color = theme::accent_foreground();
     div()
-        .size(px(14.0))
+        .size(px(16.0))
         .flex_none()
         .flex()
         .items_center()
@@ -8838,25 +9003,22 @@ fn git_selection_indicator_mobile(state: GitPathSelectionState) -> gpui::AnyElem
         } else {
             theme::workbench_bg()
         })
-        .text_color(marker_color)
         .when(state == GitPathSelectionState::Checked, |item| {
             item.child(
                 svg()
                     .path("icons/check.svg")
-                    .size(px(10.0))
-                    .relative()
-                    .left(px(0.5))
-                    .top(px(0.5)),
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(marker_color),
             )
         })
         .when(state == GitPathSelectionState::Indeterminate, |item| {
             item.child(
                 svg()
                     .path("icons/minus.svg")
-                    .size(px(10.0))
-                    .relative()
-                    .left(px(0.5))
-                    .top(px(0.5)),
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(marker_color),
             )
         })
         .into_any_element()
@@ -8891,6 +9053,156 @@ fn git_change_label_mobile(kind: GitChangeKind) -> &'static str {
         GitChangeKind::Unmerged => "!",
         GitChangeKind::Modified | GitChangeKind::TypeChanged | GitChangeKind::Unknown => "M",
     }
+}
+
+/// One curve of the commit graph, drawn from the lane it leaves to the lane it
+/// arrives at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GitGraphEdge {
+    from: usize,
+    to: usize,
+}
+
+/// One commit's place in the graph: the lane its node sits on, the curves that
+/// arrive from the commit above it, and the curves that leave towards the one
+/// below.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct GitGraphRow {
+    lane: usize,
+    top_edges: Vec<GitGraphEdge>,
+    bottom_edges: Vec<GitGraphEdge>,
+}
+
+/// The whole graph for a loaded window of history.
+#[derive(Debug, Clone, Default)]
+struct GitGraphLayout {
+    rows: Vec<GitGraphRow>,
+    lane_count: usize,
+}
+
+/// How many lanes the graph may draw before it is capped.
+///
+/// A repository with hundreds of live branches would otherwise spend the whole
+/// rail on curves. The desktop caps it at the same number and so does the
+/// column width, which is why a deep branch is drawn as a busier graph rather
+/// than as a wider one.
+const GIT_HISTORY_GRAPH_MAX_LANES: usize = 8;
+/// The width one lane occupies, and the height one commit row occupies.
+const GIT_HISTORY_GRAPH_LANE_WIDTH: f32 = 12.0;
+const GIT_HISTORY_ROW_HEIGHT: f32 = 64.0;
+
+/// The lane colours, in the desktop's own order.
+///
+/// Two clients reading one branch should not have to relearn which line is
+/// which, so the palette is the same list of semantic tones in the same
+/// sequence.
+fn git_graph_colors() -> [gpui::Hsla; 8] {
+    [
+        theme::primary(),
+        theme::accent_blue(),
+        theme::accent_success(),
+        theme::accent_yellow(),
+        theme::accent_red(),
+        theme::accent_foreground(),
+        theme::text_muted(),
+        theme::text_primary(),
+    ]
+}
+
+/// Assigns every commit in `commits` a lane, and every parent link a curve.
+///
+/// This is the desktop's own walk. Lanes are a list of the commit hashes the
+/// graph is still waiting to place, ordered from the newest branch down. A
+/// commit takes the lane already holding its hash, or the head of the list if
+/// nothing is waiting for it; its parents are then inserted just under it, so
+/// a merge fans out where the two histories meet and a linear history keeps
+/// one lane for its whole length.
+fn git_graph_layout(commits: &[GitCommitSummary]) -> GitGraphLayout {
+    let mut lanes: Vec<String> = Vec::new();
+    let mut rows = Vec::with_capacity(commits.len());
+    let mut lane_count = 1;
+    for commit in commits {
+        let top_lanes = lanes.clone();
+        let mut middle_lanes = top_lanes.clone();
+        let lane = middle_lanes
+            .iter()
+            .position(|hash| hash == &commit.hash)
+            .filter(|lane| *lane < GIT_HISTORY_GRAPH_MAX_LANES)
+            .unwrap_or_else(|| {
+                middle_lanes.retain(|hash| hash != &commit.hash);
+                middle_lanes.insert(0, commit.hash.clone());
+                0
+            });
+        middle_lanes.truncate(GIT_HISTORY_GRAPH_MAX_LANES);
+
+        let top_edges = top_lanes
+            .iter()
+            .enumerate()
+            .filter(|(from, _)| *from < GIT_HISTORY_GRAPH_MAX_LANES)
+            .filter_map(|(from, hash)| {
+                middle_lanes
+                    .iter()
+                    .position(|candidate| candidate == hash)
+                    .map(|to| GitGraphEdge { from, to })
+            })
+            .collect::<Vec<_>>();
+
+        let mut next = middle_lanes.clone();
+        next.remove(lane);
+        let mut inserted_parents = 0;
+        for parent in &commit.parents {
+            if next.iter().any(|candidate| candidate == parent) {
+                continue;
+            }
+            let insert_at = lane.saturating_add(inserted_parents).min(next.len());
+            next.insert(insert_at, parent.clone());
+            inserted_parents += 1;
+        }
+        next.truncate(GIT_HISTORY_GRAPH_MAX_LANES);
+
+        let mut bottom_edges = middle_lanes
+            .iter()
+            .enumerate()
+            .filter(|(from, _)| *from != lane)
+            .filter_map(|(from, hash)| {
+                next.iter()
+                    .position(|candidate| candidate == hash)
+                    .map(|to| GitGraphEdge { from, to })
+            })
+            .collect::<Vec<_>>();
+        bottom_edges.extend(commit.parents.iter().filter_map(|parent| {
+            next.iter()
+                .position(|candidate| candidate == parent)
+                .map(|to| GitGraphEdge { from: lane, to })
+        }));
+        bottom_edges.dedup();
+
+        lane_count = lane_count
+            .max(top_lanes.len())
+            .max(middle_lanes.len())
+            .max(next.len());
+        rows.push(GitGraphRow {
+            lane,
+            top_edges,
+            bottom_edges,
+        });
+        lanes = next;
+    }
+    GitGraphLayout { rows, lane_count }
+}
+
+/// The lines of a commit message body, without the subject `git show` repeats.
+///
+/// `git show --pretty=%B` returns the whole message, so its first line is the
+/// subject the header already draws, and the blank line that separates the two
+/// is what would otherwise open the folded body on an empty row.
+fn commit_body_content_lines(body: &str, subject: &str) -> Vec<String> {
+    let subject = subject.trim();
+    body.split('\n')
+        .map(str::to_string)
+        .skip_while(|line| line.trim() == subject)
+        .skip_while(|line| line.trim().is_empty())
+        .collect()
 }
 
 fn history_relative_time(authored_at_ms: Option<i64>) -> String {
@@ -9107,13 +9419,17 @@ fn terminal_status_color(status: TerminalStatus) -> gpui::Hsla {
     }
 }
 
-fn terminal_status_label(status: TerminalStatus) -> &'static str {
-    locale::common(match status {
-        TerminalStatus::Running => "running",
-        TerminalStatus::Exited => "exited",
-        TerminalStatus::Killed => "killed",
-        TerminalStatus::Stale => "stale",
-    })
+/// What a terminal tab is called: its place in the strip, one-based.
+///
+/// The authority names every session this client asks for the same thing, so
+/// the session's own title is the same word on every tab and says nothing about
+/// which one the reader is looking at. The number is what a reader counts by,
+/// and the desktop numbers its preview terminals the same way.
+fn terminal_tab_label(index: usize) -> gpui::SharedString {
+    let number = index.saturating_add(1);
+    locale::text("Terminal {}", "终端 {}", "終端機 {}")
+        .replace("{}", &number.to_string())
+        .into()
 }
 
 /// The blank cell used wherever the host frame has no explicit cell, matching
@@ -9384,6 +9700,133 @@ mod tests {
         assert!(terminal_feed_snapshot(&mut render, &mut applied, &gapped));
         assert_eq!(applied, 10);
         assert_eq!(terminal_visible_text(&render), "tail");
+    }
+
+    /// The commit graph's lanes have to come from the commits' own parents, or
+    /// the left column is decoration. These are the desktop's own expectations
+    /// run against this client's copy of the walk: a straight history stays on
+    /// one lane, a merge fans out to the branch it merged, and a merge wider
+    /// than the cap is drawn truncated rather than off the edge.
+    #[test]
+    fn the_commit_graph_tracks_linear_forks_and_merges() {
+        let commit = |hash: &str, parents: &[&str]| GitCommitSummary {
+            hash: hash.to_string(),
+            short_hash: hash.to_string(),
+            parents: parents.iter().map(|parent| (*parent).to_string()).collect(),
+            author_name: "Ada".into(),
+            author_email: "ada@example.test".into(),
+            authored_at_ms: None,
+            subject: hash.to_string(),
+            refs: Vec::new(),
+        };
+
+        let linear =
+            git_graph_layout(&[commit("a", &["b"]), commit("b", &["c"]), commit("c", &[])]);
+        assert_eq!(linear.lane_count, 1);
+        assert!(linear.rows[0].top_edges.is_empty());
+        assert_eq!(
+            linear.rows[0].bottom_edges,
+            [GitGraphEdge { from: 0, to: 0 }]
+        );
+        assert_eq!(linear.rows[1].top_edges, [GitGraphEdge { from: 0, to: 0 }]);
+
+        let merged = git_graph_layout(&[
+            commit("merge", &["left", "right"]),
+            commit("left", &["base"]),
+            commit("right", &["base"]),
+            commit("base", &[]),
+        ]);
+        assert_eq!(merged.lane_count, 2);
+        assert_eq!(
+            merged.rows[0].bottom_edges,
+            [
+                GitGraphEdge { from: 0, to: 0 },
+                GitGraphEdge { from: 0, to: 1 },
+            ]
+        );
+        assert_eq!(merged.rows[1].lane, 0);
+        assert_eq!(merged.rows[2].lane, 1);
+        assert!(
+            merged.rows[2]
+                .bottom_edges
+                .contains(&GitGraphEdge { from: 1, to: 0 })
+        );
+        assert_eq!(merged.rows[3].lane, 0);
+
+        let wide_merge = std::iter::once(commit(
+            "wide",
+            &["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"],
+        ))
+        .chain((0..10).map(|index| commit(&format!("p{index}"), &[])))
+        .collect::<Vec<_>>();
+        let capped = git_graph_layout(&wide_merge);
+        assert_eq!(capped.lane_count, GIT_HISTORY_GRAPH_MAX_LANES);
+        assert!(capped.rows.iter().all(|row| {
+            row.lane < GIT_HISTORY_GRAPH_MAX_LANES
+                && row.top_edges.iter().all(|edge| {
+                    edge.from < GIT_HISTORY_GRAPH_MAX_LANES && edge.to < GIT_HISTORY_GRAPH_MAX_LANES
+                })
+                && row.bottom_edges.iter().all(|edge| {
+                    edge.from < GIT_HISTORY_GRAPH_MAX_LANES && edge.to < GIT_HISTORY_GRAPH_MAX_LANES
+                })
+        }));
+    }
+
+    /// A unified diff is read once and painted twice — the working-tree sheet and
+    /// a commit's patch — so the parse has to give both the same answer: the
+    /// hunk header restarts the gutter, the marker is stripped from the text and
+    /// carried separately, and everything before the first hunk is scaffolding.
+    #[test]
+    fn a_unified_diff_parses_into_numbered_rows() {
+        let patch = "\
+diff --git a/src/main.rs b/src/main.rs
+index 1111111..2222222 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,3 +10,4 @@ fn main() {
+ let a = 1;
+-let b = 2;
++let b = 3;
++let c = 4;
+";
+        let (rows, remaining) = parse_unified_diff(patch, 100);
+        assert_eq!(remaining, 0);
+
+        // The four header lines carry no number and are scaffolding.
+        assert!(rows[..4].iter().all(|row| row.kind == DiffLineKind::Meta));
+        assert!(rows[..4].iter().all(|row| row.line.is_none()));
+
+        let hunk = &rows[4];
+        assert_eq!(hunk.kind, DiffLineKind::Hunk);
+        assert!(hunk.line.is_none());
+
+        // The hunk starts at 10 on the new side, so the first context line is
+        // line 10; the deletion takes its number from the old side.
+        assert_eq!(rows[5].kind, DiffLineKind::Context);
+        assert_eq!(rows[5].line, Some(10));
+        assert_eq!(rows[5].content, "let a = 1;");
+
+        assert_eq!(rows[6].kind, DiffLineKind::Removed);
+        assert_eq!(rows[6].line, Some(11));
+        assert_eq!(rows[6].content, "let b = 2;");
+
+        assert_eq!(rows[7].kind, DiffLineKind::Added);
+        assert_eq!(rows[7].line, Some(11));
+        assert_eq!(rows[7].content, "let b = 3;");
+
+        assert_eq!(rows[8].kind, DiffLineKind::Added);
+        assert_eq!(rows[8].line, Some(12));
+
+        // The marker is what a reader copies, so it is drawn rather than kept
+        // in the text.
+        assert_eq!(rows[7].prefix(), "+");
+        assert_eq!(rows[6].prefix(), "-");
+        assert_eq!(rows[5].prefix(), " ");
+
+        // A page that runs out reports how much is left rather than dropping it.
+        let (short, remaining) = parse_unified_diff(patch, 5);
+        assert_eq!(short.len(), 5);
+        assert_eq!(remaining, 4);
     }
 
     /// A tap inside an application that asked for mouse reporting has to arrive
