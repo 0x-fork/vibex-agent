@@ -1281,6 +1281,24 @@ impl App {
             return Outcome::quiet();
         }
         let pages = self.config_center.registry_pages(&self.management_data);
+        // Paging past the last page the client holds asks the registry for the
+        // page after it, when the registry said there is one. The cursor is the
+        // registry's, so the answer is a page it chose rather than a window the
+        // client widened on its own.
+        if delta > 0 && self.config_center.registry.page + 1 >= pages {
+            let cursor = self
+                .management_data
+                .market_note
+                .as_ref()
+                .and_then(|note| note.cursor.clone());
+            if let Some(cursor) = cursor {
+                return Outcome::effects(vec![Effect::LoadMoreSkillMarket {
+                    cursor,
+                    query: self.config_center.filter.clone(),
+                    registry: self.config_center.registry,
+                }]);
+            }
+        }
         if !self.config_center.registry.step_page(delta, pages) {
             return Outcome::quiet();
         }

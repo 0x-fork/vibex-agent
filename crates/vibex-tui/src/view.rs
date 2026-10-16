@@ -5861,6 +5861,15 @@ fn push_registry_segment(
 /// the client cut is described by what it cut rather than by what it fetched.
 fn registry_note(app: &App, shown: usize, strings: Strings) -> Option<String> {
     let note = app.management_data.market_note.as_ref()?;
+    // A registry that refused is the state the list is in, so it is drawn where
+    // the list is rather than toasted once and forgotten: the reader who looked
+    // away would otherwise find an empty table and no reason for it.
+    if let Some((code, message)) = &note.error {
+        return Some(format!(
+            "{} · {code} · {message}",
+            strings.config_registry_failed()
+        ));
+    }
     let mut line = match note.matched {
         Some(matched) => format!(
             "{} {shown} {} {matched} {}",
@@ -5877,6 +5886,10 @@ fn registry_note(app: &App, shown: usize, strings: Strings) -> Option<String> {
     if !note.exhausted {
         line.push_str(" · ");
         line.push_str(strings.config_registry_indexing());
+    }
+    if note.cursor.is_some() {
+        line.push_str(" · ");
+        line.push_str(strings.config_registry_load_more());
     }
     Some(line)
 }

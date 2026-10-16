@@ -2574,6 +2574,47 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
+        AppMessage::SkillMarketPage(result) => match result {
+            Ok(page) => {
+                // A page is appended rather than replacing what is on screen,
+                // and by identity: a registry that shifted under the reader
+                // between two reads would otherwise show the same Skill twice.
+                let known = app
+                    .management_data
+                    .skill_market
+                    .iter()
+                    .map(|entry| entry.id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                let added = page
+                    .entries
+                    .iter()
+                    .filter(|entry| !known.contains(&entry.id))
+                    .count();
+                app.management_data.skill_market.extend(
+                    page.entries
+                        .into_iter()
+                        .filter(|entry| !known.contains(&entry.id)),
+                );
+                let shown = app.management_data.skill_market.len();
+                app.management_data.market_note = Some(crate::app::MarketNote {
+                    matched: Some(shown),
+                    exhausted: !page.has_more,
+                    cursor: page.next_cursor.clone(),
+                    error: None,
+                });
+                app.toast(Toast::success(
+                    app.strings
+                        .config_registry_more()
+                        .replace("{count}", &added.to_string()),
+                ));
+            }
+            Err(error) => {
+                app.toast(Toast::danger(error.message.clone()));
+                if let Some(note) = app.management_data.market_note.as_mut() {
+                    note.error = Some((error.code, error.message));
+                }
+            }
+        },
         AppMessage::SkillMarketDocument(result) => match result {
             Ok(document) => {
                 let entry_id = document.entry_id.clone();

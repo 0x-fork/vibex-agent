@@ -1088,7 +1088,11 @@ impl ConfigCenter {
             return 1;
         }
         let total = match self.module {
-            ConfigModule::Mcp => data.market_note.and_then(|note| note.matched).unwrap_or(0),
+            ConfigModule::Mcp => data
+                .market_note
+                .as_ref()
+                .and_then(|note| note.matched)
+                .unwrap_or(0),
             _ => data.skill_market.len(),
         };
         total.div_ceil(MARKET_PAGE_SIZE).max(1)
@@ -1894,16 +1898,34 @@ pub fn market_entry_url(entry: &vibex_core::McpMarketEntry) -> Option<String> {
         .filter(|url| !url.trim().is_empty())
 }
 
-fn skill_market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+pub fn skill_market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
     data.skill_market
         .iter()
         .map(|entry| {
+            // A Skill the reader already installed is one the registry entry
+            // points at: the stored record keeps the registry identity it came
+            // from, so the card can say so rather than offering a first install
+            // over an installed Skill.
+            let installed = data.skills.iter().any(|skill| {
+                skill.source_uri.as_deref() == Some(format!("market:{}", entry.id).as_str())
+            });
             ConfigRow::new(entry.id.clone(), entry.name.clone())
                 .cell(strings.config_kind_skill())
                 .cell(entry.version.clone().unwrap_or_default())
                 .cell(entry.owner_handle.clone().unwrap_or_default())
-                .cell(entry.installs.to_string())
-                .chip(strings.config_source_market(), ConfigTone::Muted)
+                .cell(skill_reach(entry))
+                .chip(
+                    if installed {
+                        strings.config_state_installed()
+                    } else {
+                        strings.config_source_market()
+                    },
+                    if installed {
+                        ConfigTone::Ok
+                    } else {
+                        ConfigTone::Muted
+                    },
+                )
                 .summary(entry.summary.clone().unwrap_or_default())
                 .detail(strings.config_field_id(), entry.id.clone())
                 .detail(strings.config_field_slug(), entry.slug.clone())
@@ -1916,9 +1938,29 @@ fn skill_market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> 
                     strings.config_field_downloads(),
                     entry.downloads.to_string(),
                 )
-                .actions(&[ConfigAction::Install])
+                .actions(&[if installed {
+                    ConfigAction::Reinstall
+                } else {
+                    ConfigAction::Install
+                }])
         })
         .collect()
+}
+
+/// How far a registry Skill has reached, by the first count it publishes.
+///
+/// A registry fills in what it knows: a Skill that has been downloaded but
+/// never installed has installs of zero, and a row that says "0" over nine
+/// downloads reads as a Skill nobody wanted. The first count that is not zero
+/// is the one that says something.
+pub fn skill_reach(entry: &vibex_core::SkillMarketEntry) -> String {
+    if entry.installs > 0 {
+        entry.installs.to_string()
+    } else if entry.downloads > 0 {
+        entry.downloads.to_string()
+    } else {
+        entry.stars.to_string()
+    }
 }
 
 fn mcp_source_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {

@@ -183,6 +183,8 @@ pub enum AppMessage {
     NativeImport(BackendResult<vibex_core::ProviderNativeImportPreview>),
     /// One registry Skill, read in full.
     SkillMarketDocument(BackendResult<Box<vibex_core::SkillMarketDocument>>),
+    /// The registry page after the one on screen.
+    SkillMarketPage(BackendResult<Box<vibex_core::SkillMarketSearchResponse>>),
     /// What one profile's export would write.
     NativeExport(BackendResult<Box<vibex_core::ProviderNativeExportPreview>>),
     /// What has been exported for one profile.
@@ -515,15 +517,25 @@ impl Dispatch {
                         note: Some(crate::app::MarketNote {
                             matched: Some(response.total_matches),
                             exhausted: response.catalog_exhausted,
+                            // The MCP market pages by offset, so there is no
+                            // cursor to carry: the client names the page it
+                            // wants rather than the one it was given.
+                            cursor: None,
+                            error: None,
                         }),
                         mcp: Ok(response.entries),
                         skill: None,
                     },
                     Err(error) => AppMessage::Registry {
                         module,
+                        note: Some(crate::app::MarketNote {
+                            matched: None,
+                            exhausted: true,
+                            cursor: None,
+                            error: Some((error.code.clone(), error.message.clone())),
+                        }),
                         mcp: Err(error.clone()),
                         skill: Some(Err(error)),
-                        note: None,
                     },
                 }
             }
@@ -543,15 +555,22 @@ impl Dispatch {
                             // rather than inventing one.
                             matched: Some(response.entries.len()),
                             exhausted: !response.has_more,
+                            cursor: response.next_cursor.clone(),
+                            error: None,
                         }),
                         mcp: Ok(Vec::new()),
                         skill: Some(Ok(response.entries)),
                     },
                     Err(error) => AppMessage::Registry {
                         module,
+                        note: Some(crate::app::MarketNote {
+                            matched: None,
+                            exhausted: true,
+                            cursor: None,
+                            error: Some((error.code.clone(), error.message.clone())),
+                        }),
                         mcp: Err(error.clone()),
                         skill: Some(Err(error)),
-                        note: None,
                     },
                 }
             }
@@ -1844,6 +1863,20 @@ impl Dispatch {
                 };
                 let result = self.facade.management().native_exports(request).await;
                 self.send(AppMessage::NativeExportHistory(result));
+            }
+            Effect::LoadMoreSkillMarket {
+                cursor,
+                query,
+                registry,
+            } => {
+                let request = vibex_core::SkillMarketSearchRequest {
+                    query: (!query.trim().is_empty()).then_some(query),
+                    limit: Some(crate::config_center::SKILL_MARKET_FETCH_LIMIT as u32),
+                    cursor: Some(cursor),
+                    sort: Some(registry.sort.wire()),
+                };
+                let result = self.facade.management().search_skill_market(request).await;
+                self.send(AppMessage::SkillMarketPage(result.map(Box::new)));
             }
             Effect::PreviewSkillMarket {
                 entry_id,

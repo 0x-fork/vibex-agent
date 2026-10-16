@@ -725,7 +725,7 @@ pub struct ManagementData {
 /// The numbers travel together so the line under the table can say which of the
 /// two it is, instead of leaving the reader to guess whether to press search
 /// again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MarketNote {
     /// Entries the registry holds for this question, when it reports one. What
     /// is on screen is counted from the rows themselves, so a page the client
@@ -734,6 +734,17 @@ pub struct MarketNote {
     /// Whether the runtime had walked the registry to its last page. `false`
     /// means the list is a window that is still widening.
     pub exhausted: bool,
+    /// The cursor for the page after this one, when the registry named one.
+    ///
+    /// An opaque value the client echoes back untouched: reading further is a
+    /// request to the registry rather than a page the client cut for itself.
+    pub cursor: Option<String>,
+    /// The read's own failure, kept on the surface that asked.
+    ///
+    /// A toast is gone before a reader who looked away can read it, and a
+    /// registry that refused is a state the list is in rather than an event
+    /// that happened once.
+    pub error: Option<(String, String)>,
 }
 
 /// The reader's own arrangement of the session list.
@@ -5478,6 +5489,7 @@ impl App {
             && self
                 .management_data
                 .market_note
+                .as_ref()
                 .is_some_and(|note| !note.exhausted);
         if self.config_center.poll_registry(widening) {
             effects.extend(self.config_section_effects());
@@ -9303,6 +9315,12 @@ pub enum Effect {
     NativeExportHistory {
         profile_id: vibex_core::ProviderProfileId,
     },
+    /// Read the registry page after the one on screen.
+    LoadMoreSkillMarket {
+        cursor: String,
+        query: String,
+        registry: crate::config_center::RegistryQuery,
+    },
     /// Read one registry Skill in full, before it is installed.
     PreviewSkillMarket {
         entry_id: String,
@@ -9391,6 +9409,7 @@ impl Effect {
             Effect::LoadProviderOrder { .. } => "provider_order",
             Effect::PreviewNativeImport { .. } => "provider_native_import",
             Effect::PreviewSkillMarket { .. } => "skill_market_preview",
+            Effect::LoadMoreSkillMarket { .. } => "skill_market_more",
             Effect::PreviewNativeExport { .. } => "provider_native_export",
             Effect::LoadAgentAuthCatalog { .. } => "agent_auth_catalog",
             Effect::PreviewAgentAuthLogout { .. } => "agent_auth_logout_preview",

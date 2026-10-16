@@ -1265,6 +1265,8 @@ fn a_registry_page_says_how_much_of_the_registry_it_covers() {
     app.management_data.market_note = Some(vibex_tui::app::MarketNote {
         matched: Some(312),
         exhausted: false,
+        cursor: None,
+        error: None,
     });
     app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Catalog));
     let screen = text(&mut app, 140, 40);
@@ -1340,6 +1342,8 @@ fn the_registry_pages_step_within_what_the_registry_answered() {
     app.management_data.market_note = Some(vibex_tui::app::MarketNote {
         matched: Some(312),
         exhausted: false,
+        cursor: None,
+        error: None,
     });
     app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Catalog));
     app.config_center.set_cursor(3);
@@ -1374,6 +1378,8 @@ fn the_skill_registry_pages_the_window_it_was_handed() {
     app.management_data.market_note = Some(vibex_tui::app::MarketNote {
         matched: Some(45),
         exhausted: true,
+        cursor: None,
+        error: None,
     });
     app.show_config_module(ConfigModule::Skills, Some(ConfigSection::Catalog));
 
@@ -1530,6 +1536,8 @@ fn a_widening_registry_is_asked_again_without_a_key() {
     app.management_data.market_note = Some(vibex_tui::app::MarketNote {
         matched: Some(312),
         exhausted: false,
+        cursor: None,
+        error: None,
     });
     app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Catalog));
 
@@ -1560,6 +1568,8 @@ fn a_widening_registry_is_asked_again_without_a_key() {
     app.management_data.market_note = Some(vibex_tui::app::MarketNote {
         matched: Some(312),
         exhausted: true,
+        cursor: None,
+        error: None,
     });
     app.config_center.registry_poll_ticks = 0;
     for _ in 0..vibex_tui::config_center::REGISTRY_POLL_TICKS * 2 {
@@ -1570,6 +1580,8 @@ fn a_widening_registry_is_asked_again_without_a_key() {
     app.management_data.market_note = Some(vibex_tui::app::MarketNote {
         matched: Some(312),
         exhausted: false,
+        cursor: None,
+        error: None,
     });
     app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Servers));
     for _ in 0..vibex_tui::config_center::REGISTRY_POLL_TICKS * 2 {
@@ -3305,4 +3317,99 @@ fn a_skill_too_large_to_install_is_refused_at_the_preview() {
         "the preview closed on a refusal"
     );
     assert!(app.toast.is_some(), "the refusal gave no reason");
+}
+
+/// A Skill the reader already installed says so, and its card counts what it has.
+///
+/// The registry has no idea what this machine holds, so the match is against
+/// the stored Skill's origin: a card that offered a first install over an
+/// installed Skill would be offering to do what has been done. The count is the
+/// first one the registry published rather than a zero it filled in.
+#[test]
+fn a_skill_the_reader_already_has_says_so() {
+    let mut app = loaded(140, 40);
+    let mut entry = skill_market_entry("entry_reader");
+    entry.installs = 0;
+    entry.downloads = 9;
+    entry.stars = 1;
+    app.management_data.skill_market = vec![entry];
+    app.show_config_module(ConfigModule::Skills, Some(ConfigSection::Catalog));
+
+    // Nothing stored: the card offers the install and counts the downloads it
+    // has, because a zero over nine downloads reads as a Skill nobody wanted.
+    let rows = vibex_tui::config_center::skill_market_rows(&app.management_data, app.strings);
+    assert!(rows[0].actions.contains(&ConfigAction::Install));
+    assert_eq!(rows[0].cells[3], "9", "the count did not fall back");
+    assert_eq!(rows[0].chip, "Registry");
+
+    // The same Skill, stored: the card offers it again by its other name.
+    app.management_data.skills = vec![
+        serde_json::from_value(serde_json::json!({
+            "id": "skill_reader",
+            "displayName": "Trace reader",
+            "sourceKind": "marketplace",
+            "status": "enabled",
+            "scopeKind": "user",
+            "sourceUri": "market:entry_reader",
+            "description": "Read a trace",
+            "instructions": "Read a trace.",
+            "tags": [],
+            "providerMatrix": [],
+            "agentMatrix": [],
+            "createdAtMs": 1,
+            "updatedAtMs": 1
+        }))
+        .expect("skill fixture"),
+    ];
+    let rows = vibex_tui::config_center::skill_market_rows(&app.management_data, app.strings);
+    assert!(
+        rows[0].actions.contains(&ConfigAction::Reinstall)
+            && !rows[0].actions.contains(&ConfigAction::Install),
+        "an installed Skill offered a first install: {:?}",
+        rows[0].actions
+    );
+    assert_eq!(rows[0].chip, "Installed");
+}
+
+/// Reading further is the registry's next page, not a window the client widened.
+///
+/// The cursor is the registry's own value, echoed back untouched, and paging
+/// past the last page the client holds is what asks for it.
+#[test]
+fn paging_past_the_last_page_asks_the_registry_for_more() {
+    let mut app = loaded(140, 40);
+    // More entries than one page holds, so there is a page to be past.
+    app.management_data.skill_market = (0..45)
+        .map(|index| skill_market_entry(&format!("entry_{index}")))
+        .collect();
+    app.management_data.market_note = Some(vibex_tui::app::MarketNote {
+        matched: Some(45),
+        exhausted: false,
+        cursor: Some("cursor_two".to_string()),
+        error: None,
+    });
+    app.show_config_module(ConfigModule::Skills, Some(ConfigSection::Catalog));
+    // The last page the client holds.
+    app.config_center.registry.page = 2;
+
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigRegistryPageNext);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::LoadMoreSkillMarket { cursor, .. }] => {
+            assert_eq!(cursor, "cursor_two", "the client invented a page")
+        }
+        other => panic!("paging past the end produced {other:?}"),
+    }
+
+    // A registry with nothing after it keeps the reader where they are.
+    app.management_data.market_note = Some(vibex_tui::app::MarketNote {
+        matched: Some(45),
+        exhausted: true,
+        cursor: None,
+        error: None,
+    });
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigRegistryPageNext);
+    assert!(
+        outcome.effects.is_empty(),
+        "a page was asked for at the end"
+    );
 }
