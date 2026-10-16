@@ -22637,6 +22637,12 @@ impl VibexWorkbench {
             // The projection just moved, so every memoized render fingerprint
             // describes a turn shape that no longer exists.
             self.timeline_turn_layout_signature_cache.clear();
+            // The unit walk is keyed on the turn's shape rather than on its row
+            // revisions, and each unit carries a row's `last_sequence` as the
+            // revision the run resolves its measurement by. A re-projection can
+            // advance those sequences without moving any count the shape key
+            // sees, so drop the walk here as well.
+            self.timeline_process_units_cache.clear();
             self.sync_conversation_turns_render_cache();
         }
         self.conversation_turns_cache.clone()
@@ -57496,12 +57502,23 @@ impl VibexWorkbench {
 
     /// Fingerprint of every input the process-unit walk reads.
     ///
-    /// The walk is memoized against this. The turn-level estimate signature
-    /// already digests the rows, groups, expansions and display preferences the
-    /// walk branches on, so the only input it is missing is which timeline the
-    /// turn came from: a child Agent's rail preview can hold a turn id the
-    /// workbench turn shares, and reusing one for the other would paint a
-    /// preview's rows into the main conversation.
+    /// The walk is memoized against this, so the key has to stay cheap: prepaint
+    /// asks for the units on every frame the turn is painted, and a key that
+    /// walks the rows would reintroduce O(process rows) work per frame — the very
+    /// cost the memo exists to remove. [`Self::timeline_turn_shape_key`] is the
+    /// turn's O(1) shape digest (row and group counts, disclosures, display
+    /// preferences) and is what the layout signature is already memoized
+    /// against. It deliberately excludes `last_sequence` and body lengths, which
+    /// move with every streamed chunk: a key that saw those would miss on every
+    /// frame of a streaming turn and rebuild the rows the memo is holding.
+    ///
+    /// Two inputs that key does not carry still change the walk:
+    ///
+    /// - which timeline the turn came from. A child Agent's rail preview can
+    ///   hold a turn id the workbench turn shares, and reusing one for the other
+    ///   would paint a preview's rows into the main conversation.
+    /// - the derived column count the walk's first-layout estimates wrap
+    ///   against, so a pane resize reflows the units even though no row moved.
     fn timeline_process_units_signature(&self, turn: &TimelineConversationTurn) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.rendering_child_agent_timeline().hash(&mut hasher);
@@ -57509,12 +57526,9 @@ impl VibexWorkbench {
             .as_ref()
             .map(VibexSessionId::as_str)
             .hash(&mut hasher);
+        self.estimated_timeline_chars_per_line().hash(&mut hasher);
         let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
-        // The estimate signature carries the per-row fields but not the turn's
-        // own pending-permission flag, and the command/permission pairing picks
-        // its height from it.
-        turn.pending_permission.hash(&mut hasher);
-        self.timeline_turn_estimate_signature(turn, process_expansion)
+        self.timeline_turn_shape_key(turn, process_expansion)
             .hash(&mut hasher);
         hasher.finish()
     }
@@ -57532,7 +57546,8 @@ impl VibexWorkbench {
     /// every frame the turn is painted. A turn that carries a whole session's
     /// work therefore rebuilt the same units twice per frame for a shape that
     /// had not moved. The list is retained by turn and only rebuilt when
-    /// [`Self::timeline_process_units_signature`] moves.
+    /// [`Self::timeline_process_units_signature`] moves — and that key is O(1)
+    /// by design, so an unchanged turn costs a hash rather than a walk.
     fn timeline_process_units(
         &mut self,
         turn: &TimelineConversationTurn,
@@ -102153,6 +102168,56 @@ mod tests {
         assert!(layout_signature.contains("row.body.is_empty()"));
         assert!(layout_signature.contains("row.body.contains(\"](\")"));
         assert!(!layout_signature.contains("row.body.len()"));
+    }
+
+    /// The process-unit walk is asked for on every frame the turn paints, so its
+    /// memo key has to be O(1). Keying it on the turn estimate signature looked
+    /// equivalent and was not: that signature hashes every row's `last_sequence`
+    /// and body length, which move with each streamed chunk. The memo then
+    /// missed on every frame of a streaming turn and rebuilt exactly the rows it
+    /// was holding — the cost the memo exists to remove, on the turns that most
+    /// need it.
+    #[test]
+    fn timeline_process_unit_memo_keys_on_the_cheap_turn_shape() {
+        let source = include_str!("app.rs");
+        let signature = source
+            .split_once("    fn timeline_process_units_signature(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The units a turn's process section"))
+            .map(|(body, _)| body)
+            .expect("the process unit signature should remain inspectable");
+
+        assert!(
+            signature.contains("self.timeline_turn_shape_key(turn, process_expansion)"),
+            "the key must be the O(1) turn shape digest"
+        );
+        assert!(
+            !signature.contains("timeline_turn_estimate_signature"),
+            "the O(process rows) estimate signature moves with every streamed \
+             chunk, so the memo would miss on every frame of a streaming turn"
+        );
+        assert!(
+            !signature.contains("row.last_sequence") && !signature.contains("row.body.len()"),
+            "no per-row field belongs in a key that is recomputed every frame"
+        );
+        // The two inputs the shape digest does not carry.
+        assert!(signature.contains("rendering_child_agent_timeline()"));
+        assert!(signature.contains("child_agent_render_session"));
+        assert!(signature.contains("estimated_timeline_chars_per_line()"));
+
+        // A re-projection can advance row sequences without changing any count
+        // the shape key sees, and each unit carries its row's sequence as the
+        // revision the run measures by, so the table is dropped with the
+        // projection.
+        let projection = source
+            .split_once("    fn conversation_turns_cached(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn select_session("))
+            .map(|(body, _)| body)
+            .expect("the turn projection cache should remain inspectable");
+        assert!(
+            projection.contains("self.timeline_turn_layout_signature_cache.clear();")
+                && projection.contains("self.timeline_process_units_cache.clear();"),
+            "the unit walk is dropped with the projection that produced it"
+        );
     }
 
     #[test]
