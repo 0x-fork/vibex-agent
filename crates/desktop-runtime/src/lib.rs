@@ -4647,6 +4647,7 @@ mod tests {
                 status: AgentAuthModelCatalogStatus::AgentDefaultOnly,
                 models: Vec::new(),
                 runtime_options_complete: true,
+                model_names_complete: true,
                 default_reasoning_efforts: Vec::new(),
                 default_modes: Vec::new(),
                 default_features: Vec::new(),

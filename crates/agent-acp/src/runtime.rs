@@ -146,7 +146,7 @@ use crate::session_attachment_registry::{
 };
 use crate::session_config::{
     CanonicalSessionConfigKey, SessionConfigFieldKind, SessionConfigFieldRequest,
-    SessionConfigOperationEvidence, SessionConfigPlan, SessionConfigPlanner,
+    SessionConfigOperationEvidence, SessionConfigPlan, SessionConfigPlanner, bounded_catalog_label,
     legacy_variant_model_name, normalize_identifier, normalize_parameterized_model_options,
     validate_effort_value, validate_mode_value, validate_model_value,
 };
@@ -1323,8 +1323,10 @@ fn opencode_stream_error_disposition(message: &str) -> OpenCodeStreamErrorDispos
         "usage limit exceeded",
         "quota exceeded",
         "insufficient account balance",
+        "insufficient account funds",
         "insufficient balance",
         "insufficient credit",
+        "insufficient funds",
         "payment required",
         "subscribe to go",
         "billing limit",
@@ -1875,8 +1877,10 @@ fn provider_access_requires_user_action(message: &str) -> bool {
         "usage limit exceeded",
         "quota exceeded",
         "insufficient account balance",
+        "insufficient account funds",
         "insufficient balance",
         "insufficient credit",
+        "insufficient funds",
         "payment required",
         "billing limit",
         "余额不足",
@@ -1964,8 +1968,10 @@ fn provider_terminal_error_text(text: &str) -> bool {
         "high demand",
         "at capacity",
         "insufficient account balance",
+        "insufficient account funds",
         "insufficient balance",
         "insufficient credit",
+        "insufficient funds",
         "rate limit",
         "rate_limit",
         "too many requests",
@@ -10887,6 +10893,10 @@ impl AcpRuntimeClient {
                 .model_results
                 .iter()
                 .all(|(_, result)| result.is_ok());
+        // The names the Agent published, read before the batch's per-Model
+        // results are consumed. An Agent that named its Models is the only
+        // source that says which account each one belongs to.
+        let model_labels = &probe_batch.initial.model_labels;
         let models = probe_batch
             .model_results
             .into_iter()
@@ -10912,9 +10922,13 @@ impl AcpRuntimeClient {
                             })
                     })
                     .collect();
+                let label = model_labels
+                    .get(&model_id)
+                    .cloned()
+                    .unwrap_or_else(|| model_id.clone());
                 Some(AgentAuthModelDescriptor {
-                    label: model_id.clone(),
                     model_id,
+                    label,
                     reasoning_efforts,
                     modes: probe
                         .as_ref()
@@ -10963,6 +10977,9 @@ impl AcpRuntimeClient {
             },
             models,
             runtime_options_complete,
+            // The names come from the `session/new` response this discovery
+            // already reads, so a snapshot it writes always kept them.
+            model_names_complete: true,
             default_reasoning_efforts,
             default_modes,
             default_features,
@@ -18037,27 +18054,36 @@ async fn runtime_session_probe_from_response(
     if process.agent_id.as_str() == "antigravity" {
         reasoning_efforts = antigravity_reasoning_efforts();
     }
-    Ok(AcpRuntimeSessionProbe {
-        models: target_model
-            .map(|model| vec![model.to_string()])
-            .unwrap_or_else(|| {
-                let models = {
-                    let models = extract_model_ids(session);
-                    if models.is_empty() {
-                        extract_model_ids(initialize)
-                    } else {
-                        models
-                    }
-                };
-                let mut product_models = Vec::with_capacity(models.len());
-                for model in models {
-                    let model = process.product_model_id(&model);
-                    if !product_models.contains(&model) {
-                        product_models.push(model);
-                    }
+    // A probe for one explicit Model only confirms that target; the Model list
+    // and the names beside it come from the stateless response.
+    let (models, model_labels) = match target_model {
+        Some(model) => (vec![model.to_string()], BTreeMap::new()),
+        None => {
+            let advertised = {
+                let advertised = extract_advertised_models(session);
+                if advertised.is_empty() {
+                    extract_advertised_models(initialize)
+                } else {
+                    advertised
                 }
-                product_models
-            }),
+            };
+            let mut product_models = Vec::with_capacity(advertised.len());
+            let mut product_labels = BTreeMap::new();
+            for (model, label) in advertised {
+                let model = process.product_model_id(&model);
+                if let Some(label) = label {
+                    product_labels.entry(model.clone()).or_insert(label);
+                }
+                if !product_models.contains(&model) {
+                    product_models.push(model);
+                }
+            }
+            (product_models, product_labels)
+        }
+    };
+    Ok(AcpRuntimeSessionProbe {
+        models,
+        model_labels,
         modes,
         reasoning_efforts,
         options,
@@ -20320,8 +20346,17 @@ fn parse_available_commands(value: Option<&Value>) -> Vec<AcpRuntimeCommand> {
         .unwrap_or_default()
 }
 
-pub(crate) fn extract_model_ids(response: &Value) -> Vec<String> {
-    let mut ids = Vec::new();
+/// The Model ids one `session/new` or `initialize` response advertises, in the
+/// order the Agent wrote them, each with the name the Agent published for it.
+///
+/// A Model entry is either a bare id or an object whose id lives under
+/// `modelId`, `value`, or `id` and whose name lives under `name` or `label`.
+/// The name is what tells one account's Model from another's when a single
+/// Agent offers the same id through several gateways — OpenCode answers with
+/// `OpenCode Go/DeepSeek V4.1 Flash` beside `Personal / OpenCode/DeepSeek V4.1
+/// Flash` — so it travels beside the id instead of being dropped here.
+fn extract_advertised_models(response: &Value) -> Vec<(String, Option<String>)> {
+    let mut models: Vec<(String, Option<String>)> = Vec::new();
     let mut push_model = |value: &Value| {
         let id = if let Some(id) = value.as_str() {
             Some(id.to_string())
@@ -20333,12 +20368,31 @@ pub(crate) fn extract_model_ids(response: &Value) -> Vec<String> {
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
         };
-        if let Some(id) = id {
-            let id = id.trim().to_string();
-            if !id.is_empty() && !looks_sensitive(&id) && !ids.contains(&id) {
-                ids.push(id);
-            }
+        let Some(id) = id else {
+            return;
+        };
+        let id = id.trim().to_string();
+        if id.is_empty() || looks_sensitive(&id) {
+            return;
         }
+        let label = value
+            .get("name")
+            .or_else(|| value.get("label"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .filter(|label| !looks_sensitive(label))
+            .map(bounded_catalog_label);
+        if let Some((_, existing)) = models.iter_mut().find(|(existing, _)| existing == &id) {
+            // One id may be advertised more than once, and a list that offers
+            // the id alone can come before the option set that names it. The
+            // first name published for the id is the one that survives.
+            if existing.is_none() {
+                *existing = label;
+            }
+            return;
+        }
+        models.push((id, label));
     };
 
     let candidates = [
@@ -20369,7 +20423,14 @@ pub(crate) fn extract_model_ids(response: &Value) -> Vec<String> {
             }
         }
     }
-    ids
+    models
+}
+
+pub(crate) fn extract_model_ids(response: &Value) -> Vec<String> {
+    extract_advertised_models(response)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
 }
 
 /// Reasoning-effort choices advertised by a `session/new` response. Efforts
@@ -21578,6 +21639,7 @@ mod tests {
     fn provider_terminal_error_text_covers_attributed_codex_failures() {
         for text in [
             "403 Insufficient account balance",
+            "Upstream request failed: Insufficient account funds",
             "The service is currently at high demand",
             "Selected model is at capacity. Please try a different model.",
             "429 Too Many Requests",
@@ -22561,6 +22623,20 @@ mod tests {
         assert!(provider_access_requires_user_action(&message));
         assert!(!provider_access_requires_user_action(
             "Internal error: temporary upstream disconnect"
+        ));
+    }
+
+    /// Account exhaustion reaches Vibex by more than one road: the same
+    /// upstream wording can arrive as the ACP error text of a prompt that
+    /// failed, not only on OpenCode's stderr. Either way it names the account,
+    /// so a retry cannot fix it.
+    #[test]
+    fn account_exhaustion_is_an_account_failure_in_rpc_text_too() {
+        assert!(provider_access_requires_user_action(
+            "Upstream request failed: Insufficient account funds"
+        ));
+        assert!(provider_access_requires_user_action(
+            "AI_APICallError: Insufficient funds"
         ));
     }
 
@@ -23804,6 +23880,11 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             "AI_APICallError: Rate limit exceeded. Please try again later.",
             "AI_APICallError: exceeded retry limit, last status: 429 Too Many Requests",
             "AI_APICallError: Insufficient account balance for the selected group",
+            // Zen's own wording for an account with nothing left to spend, and
+            // the one OpenCode 1.18.35 reports for a Model the account's plan
+            // does not cover. Read as retryable, it spends the turn's whole
+            // error budget on a request that can never succeed.
+            "AI_APICallError: Upstream request failed: Insufficient account funds",
         ] {
             let parsed = parse_opencode_stream_error(
                 &line.replace("AI_APICallError: Service Unavailable", message),
@@ -23980,6 +24061,77 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         assert_eq!(
             extract_current_model_id(&response).as_deref(),
             Some("anthropic/claude-sonnet-4")
+        );
+    }
+
+    /// One Agent can serve the same Model id through more than one account, and
+    /// the id cannot say which is which: OpenCode offers
+    /// `opencode/deepseek-v4.1-flash` on its pay-as-you-go account beside
+    /// `opencode-go/deepseek-v4.1-flash` on its subscription. The name the
+    /// Agent publishes is the only thing that tells them apart, so the probe
+    /// keeps it, and an id the Agent left unnamed keeps the id.
+    #[test]
+    fn advertised_model_names_travel_beside_the_ids_they_name() {
+        let response = json!({
+            "sessionId": "s1",
+            "configOptions": [
+                {
+                    "id": "model",
+                    "category": "model",
+                    "options": [
+                        {
+                            "value": "opencode-go/deepseek-v4.1-flash",
+                            "name": "OpenCode Go/DeepSeek V4.1 Flash"
+                        },
+                        {
+                            "value": "opencode/deepseek-v4.1-flash",
+                            "name": "Personal / OpenCode/DeepSeek V4.1 Flash"
+                        },
+                        { "value": "test-1/gpt-5.5" }
+                    ]
+                }
+            ]
+        });
+
+        assert_eq!(
+            extract_advertised_models(&response),
+            vec![
+                (
+                    "opencode-go/deepseek-v4.1-flash".to_string(),
+                    Some("OpenCode Go/DeepSeek V4.1 Flash".to_string()),
+                ),
+                (
+                    "opencode/deepseek-v4.1-flash".to_string(),
+                    Some("Personal / OpenCode/DeepSeek V4.1 Flash".to_string()),
+                ),
+                ("test-1/gpt-5.5".to_string(), None),
+            ]
+        );
+        assert_eq!(
+            extract_model_ids(&response),
+            vec![
+                "opencode-go/deepseek-v4.1-flash".to_string(),
+                "opencode/deepseek-v4.1-flash".to_string(),
+                "test-1/gpt-5.5".to_string(),
+            ]
+        );
+
+        // A catalog list may offer the id alone before the option set that
+        // names it; the name still has to reach the id it belongs to.
+        let unnamed_first = json!({
+            "sessionId": "s1",
+            "models": { "availableModels": [{ "modelId": "mock/model-1" }] },
+            "configOptions": [
+                {
+                    "id": "model",
+                    "category": "model",
+                    "options": [{ "value": "mock/model-1", "label": "Model 1" }]
+                }
+            ]
+        });
+        assert_eq!(
+            extract_advertised_models(&unnamed_first),
+            vec![("mock/model-1".to_string(), Some("Model 1".to_string()))]
         );
     }
 
@@ -28332,6 +28484,7 @@ for line in sys.stdin:
                 account_model_descriptor("model-b", "low", "review", false),
             ],
             runtime_options_complete: true,
+            model_names_complete: true,
             default_reasoning_efforts: Vec::new(),
             default_modes: Vec::new(),
             default_features: Vec::new(),
@@ -28534,6 +28687,17 @@ for line in sys.stdin:
         );
         assert_eq!(snapshot.status, AgentAuthModelCatalogStatus::Available);
         assert_eq!(snapshot.models.len(), 2);
+        // The catalog carries the names the Agent published for its Models:
+        // they are what say which account a Model is billed to, and the
+        // fallback to the id is covered where the Agent names none.
+        assert_eq!(
+            snapshot
+                .models
+                .iter()
+                .map(|model| model.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Model 1", "Model 2"]
+        );
         assert_eq!(
             snapshot.models[0]
                 .reasoning_efforts

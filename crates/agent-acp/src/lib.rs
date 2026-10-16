@@ -5,6 +5,7 @@
 //! deterministic tests can validate Vibex timeline mapping without starting a
 //! real ACP CLI.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -469,6 +470,13 @@ pub struct AcpRuntimeCommand {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AcpRuntimeSessionProbe {
     pub models: Vec<String>,
+    /// The names the Agent published for those ids, keyed by id.
+    ///
+    /// An id alone does not say which account a Model belongs to when one Agent
+    /// advertises the same Model under two gateways, so the Agent's own name
+    /// travels with it. Ids the Agent left unnamed are simply absent, and the id
+    /// is then all a caller has to show.
+    pub model_labels: BTreeMap<String, String>,
     pub modes: Vec<ProviderSessionConfigValue>,
     pub reasoning_efforts: Vec<AgentReasoningEffort>,
     pub options: Vec<ProviderSessionConfigOption>,
@@ -665,6 +673,7 @@ pub trait AcpClient: Send + Sync {
     ) -> VibexResult<AcpRuntimeSessionProbe> {
         Ok(AcpRuntimeSessionProbe {
             models: self.list_runtime_models(provider_profile_id).await?,
+            model_labels: BTreeMap::new(),
             modes: Vec::new(),
             reasoning_efforts: Vec::new(),
             options: Vec::new(),

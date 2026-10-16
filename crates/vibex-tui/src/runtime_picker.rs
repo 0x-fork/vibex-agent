@@ -594,6 +594,14 @@ pub fn entry_matches(option: &SessionRuntimeOption, query: &str, strings: &Strin
             .to_lowercase()
             .contains(query)
         || option.model_label.to_lowercase().contains(query)
+        // A Model's id answers a filter beside its label: an Agent that names
+        // its Models has moved the id out of the label, and the id is still what
+        // the Agent's own documentation and commands call that Model.
+        || option
+            .selection
+            .model
+            .model_id()
+            .is_some_and(|model_id| model_id.to_lowercase().contains(query))
 }
 
 /// The account one catalogue entry runs on, as a row names it.
@@ -691,6 +699,36 @@ mod tests {
             normalized_query("  DeepSeek   Harness "),
             "deepseek harness"
         );
+    }
+
+    /// An Agent that names its Models moves their ids out of the label, and a
+    /// reader who knows a Model by the id its own commands use must still find
+    /// it: the picker matches the id beside the label.
+    #[test]
+    fn a_filter_finds_a_model_by_the_id_beside_its_label() {
+        let mut named = option(
+            selection("opencode", "opencode-go/deepseek-v4.1-flash"),
+            "Agent account",
+        );
+        named.model_label = "OpenCode Go/DeepSeek V4.1 Flash".to_string();
+        let strings = Strings::for_locale(crate::locale::Locale::En);
+        for query in [
+            "go",
+            "deepseek",
+            "flash",
+            "opencode-go",
+            "opencode-go/deepseek-v4.1-flash",
+        ] {
+            assert!(
+                entry_matches(&named, &normalized_query(query), &strings),
+                "{query} did not match"
+            );
+        }
+        assert!(!entry_matches(
+            &named,
+            &normalized_query("opencode/deepseek-v4.1-flash"),
+            &strings
+        ));
     }
 
     #[test]

@@ -431,6 +431,8 @@ struct AgentAuthModelCatalogPayload {
     #[serde(default)]
     runtime_options_complete: bool,
     #[serde(default)]
+    model_names_complete: bool,
+    #[serde(default)]
     default_reasoning_efforts: Vec<SessionConfigValue>,
     #[serde(default)]
     default_modes: Vec<SessionConfigValue>,
@@ -463,6 +465,7 @@ impl AgentAuthModelCatalogRepository {
                 json_to_db(&AgentAuthModelCatalogPayload {
                     models: snapshot.models.clone(),
                     runtime_options_complete: snapshot.runtime_options_complete,
+                    model_names_complete: snapshot.model_names_complete,
                     default_reasoning_efforts: snapshot.default_reasoning_efforts.clone(),
                     default_modes: snapshot.default_modes.clone(),
                     default_features: snapshot.default_features.clone(),
@@ -523,6 +526,7 @@ impl AgentAuthModelCatalogRepository {
                     status: enum_from_db(raw.1)?,
                     models: Vec::new(),
                     runtime_options_complete: false,
+                    model_names_complete: false,
                     default_reasoning_efforts: Vec::new(),
                     default_modes: Vec::new(),
                     default_features: Vec::new(),
@@ -584,6 +588,7 @@ impl AgentAuthModelCatalogRepository {
                         status: enum_from_db(raw.2)?,
                         models: Vec::new(),
                         runtime_options_complete: false,
+                        model_names_complete: false,
                         default_reasoning_efforts: Vec::new(),
                         default_modes: Vec::new(),
                         default_features: Vec::new(),
@@ -624,6 +629,7 @@ fn decode_catalog_snapshot_json(
     let payload: AgentAuthModelCatalogPayload = json_from_db(raw.to_string())?;
     metadata.models = payload.models;
     metadata.runtime_options_complete = payload.runtime_options_complete;
+    metadata.model_names_complete = payload.model_names_complete;
     metadata.default_reasoning_efforts = payload.default_reasoning_efforts;
     metadata.default_modes = payload.default_modes;
     metadata.default_features = payload.default_features;
@@ -686,6 +692,7 @@ mod tests {
                 status: AgentAuthModelCatalogStatus::AgentDefaultOnly,
                 models: Vec::new(),
                 runtime_options_complete: false,
+                model_names_complete: false,
                 default_reasoning_efforts: Vec::new(),
                 default_modes: Vec::new(),
                 default_features: Vec::new(),
@@ -749,6 +756,7 @@ mod tests {
             status: AgentAuthModelCatalogStatus::AgentDefaultOnly,
             models: Vec::new(),
             runtime_options_complete: true,
+            model_names_complete: true,
             default_reasoning_efforts: vec![SessionConfigValue {
                 value: "high".to_string(),
                 label: Some("High".to_string()),
@@ -806,6 +814,9 @@ mod tests {
         assert!(legacy.default_reasoning_efforts.is_empty());
         assert!(legacy.default_modes.is_empty());
         assert!(legacy.default_features.is_empty());
+        // A row written before the Agent's own Model names travelled with the
+        // catalog reads as incomplete, which is what schedules its one refresh.
+        assert!(!legacy.model_names_complete);
     }
 
     #[test]

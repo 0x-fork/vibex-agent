@@ -1655,7 +1655,11 @@ fn enrich_feature_value_label(
     value
 }
 
-fn bounded_catalog_label(value: &str) -> String {
+/// One catalog label, trimmed and bounded.
+///
+/// Shared with the ACP probe so a name the Agent publishes for its Model is
+/// bounded before it reaches a snapshot, not only when a client renders it.
+pub(crate) fn bounded_catalog_label(value: &str) -> String {
     let value = value.trim();
     if value.len() <= MAX_CATALOG_LABEL_LEN {
         return value.to_string();
@@ -2263,6 +2267,7 @@ mod tests {
             status: AgentAuthModelCatalogStatus::AgentDefaultOnly,
             models: Vec::new(),
             runtime_options_complete: true,
+            model_names_complete: true,
             default_reasoning_efforts: vec![SessionConfigValue {
                 value: "high".to_string(),
                 label: Some("High".to_string()),

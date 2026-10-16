@@ -107,7 +107,8 @@ impl AgentAuthContextService {
     }
 
     /// Refreshes authenticated account catalogs created before model-scoped
-    /// runtime controls were persisted. Current snapshots remain process-free.
+    /// runtime controls, or the Agent's own Model names, were persisted.
+    /// Current snapshots remain process-free.
     pub(crate) async fn refresh_incomplete_model_catalogs(&self) -> VibexResult<usize> {
         let contexts = self.list()?;
         let conn = open_database(&self.db_path)?;
@@ -127,9 +128,9 @@ impl AgentAuthContextService {
         let mut refreshed = 0;
         for context in contexts.into_iter().filter(|context| {
             context.status == AgentAuthContextStatus::Authenticated
-                && current_by_context
-                    .get(&context.id)
-                    .is_none_or(|snapshot| !snapshot.runtime_options_complete)
+                && current_by_context.get(&context.id).is_none_or(|snapshot| {
+                    !snapshot.runtime_options_complete || !snapshot.model_names_complete
+                })
         }) {
             let operation_lock = self.operation_lock(&context.id)?;
             let _guard = operation_lock.lock().await;

@@ -157,6 +157,15 @@ agent_auth_model_catalog_snapshots(
 - Agent account model snapshots are keyed by context id, positive context
   revision, and runtime fingerprint. Their model descriptors and per-model
   reasoning/mode/features are evidence from that exact authenticated launch.
+- A model descriptor's label is the name the Agent published for that model id,
+  and the id itself only when the Agent published no name. The name is what
+  separates accounts: one Agent may serve the same model id through more than one
+  gateway or plan — OpenCode offers `opencode/deepseek-v4.1-flash` on its
+  pay-as-you-go account beside `opencode-go/deepseek-v4.1-flash` on the Go
+  subscription — and the id alone cannot say which one the authenticated account
+  is entitled to use. The probe therefore carries the names beside the ids; a
+  name is bounded like any other catalog label, and a name that looks like a
+  credential is dropped rather than published.
 - Account discovery normally switches each enumerated model inside the same
   short-lived authenticated ACP session and captures the resulting reasoning,
   mode, and generic options. A direct catalog such as Codex `model/list`
@@ -177,7 +186,8 @@ agent_auth_model_catalog_snapshots(
   controls advertised by that default session remain selectable and are fenced
   against the same snapshot as explicit-model controls.
 - Persist whether an account snapshot contains complete model-scoped runtime
-  options. Older snapshot JSON remains readable but defaults to incomplete;
+  options, and whether the discovery that built it kept the Agent's own Model
+  names. Older snapshot JSON remains readable but defaults to incomplete;
   desktop startup refreshes an authenticated incomplete snapshot once and
   publishes the normal runtime-option invalidation. Complete current snapshots
   never launch an Agent process during ordinary startup catalog reads.
@@ -3810,6 +3820,10 @@ retryable main stream error -> provider/opencode_model_api_retrying
   and existing flags are not duplicated.
 - Unit tests classify real OpenCode 1.18.1 usage-limit/rate-limit text as
   user-action-required while leaving 5xx/service-unavailable errors retryable.
+  Account exhaustion counts as user-action-required in every wording the gateway
+  uses for it, including the `Insufficient account funds` a plan that does not
+  cover the selected model produces: read as retryable, it spends the turn's
+  whole error budget on a request that can never succeed.
 - Mock-process tests emit one correlated usage-limit error and assert immediate
   `opencode_model_api_error`, session `error`, a persisted Timeline error, and one
   `session/cancel` notification.

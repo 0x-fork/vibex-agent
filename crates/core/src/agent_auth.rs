@@ -141,6 +141,11 @@ pub enum AgentAuthModelCatalogStatus {
 #[serde(rename_all = "camelCase")]
 pub struct AgentAuthModelDescriptor {
     pub model_id: String,
+    /// How the Agent names this Model.
+    ///
+    /// It is the Agent's own wording, which is what carries the account a
+    /// Model is billed to when one id is served through more than one gateway;
+    /// the model id stands in only when the Agent published no name.
     pub label: String,
     #[serde(default)]
     pub reasoning_efforts: Vec<SessionConfigValue>,
@@ -163,6 +168,14 @@ pub struct AgentAuthModelCatalogSnapshot {
     /// controls. Older snapshots deserialize as incomplete and are refreshed.
     #[serde(default)]
     pub runtime_options_complete: bool,
+    /// Whether the discovery that built this snapshot kept the names the Agent
+    /// publishes for its Models.
+    ///
+    /// Older snapshots deserialize as incomplete and are refreshed as well: a
+    /// catalog that replaced every name with its model id cannot say which
+    /// account or plan a Model belongs to when one id is served by several.
+    #[serde(default)]
+    pub model_names_complete: bool,
     /// Runtime controls advertised for the semantic Agent-default model when
     /// the Agent does not enumerate concrete model ids.
     #[serde(default)]
