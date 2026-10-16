@@ -5620,6 +5620,45 @@ fn render_config_table(
     if let Some(spans) = render_registry_bar(area, app, rows.len(), theme, strings) {
         lines.push(Line::from(spans));
     }
+    // The install card. A managed install is one the reader cannot see happen:
+    // it runs on the authority, and without this the row would simply change
+    // under them a while later with nothing in between.
+    if let Some(watch) = app.install_watch.as_ref().filter(|watch| watch.running()) {
+        lines.push(Line::from(vec![
+            Span::styled(" ".repeat(TABLE_PREFIX), Style::default()),
+            Span::styled(
+                format!(
+                    " {} ",
+                    crate::glyphs::frame_at(
+                        crate::glyphs::spinner_frames(app.glyph_tier()),
+                        app.animation_phase(),
+                        crate::glyphs::SPINNER_TICKS_PER_FRAME,
+                    )
+                ),
+                Style::default().fg(theme.roles.accent_user),
+            ),
+            Span::styled(
+                strings
+                    .config_install_watching()
+                    .replace("{agent}", &watch.label),
+                Style::default()
+                    .fg(theme.roles.foreground)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {}", watch.phase_label(strings)),
+                Style::default().fg(theme.roles.text_secondary),
+            ),
+            Span::styled(
+                watch
+                    .version
+                    .as_ref()
+                    .map(|version| format!(" · v{version}"))
+                    .unwrap_or_default(),
+                Style::default().fg(theme.roles.gray_bright),
+            ),
+        ]));
+    }
     let body_top = lines.len() as u16;
     if rows.is_empty() {
         // An empty list and a list nobody has read yet look the same on screen

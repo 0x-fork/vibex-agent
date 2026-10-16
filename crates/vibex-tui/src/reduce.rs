@@ -1145,6 +1145,7 @@ impl App {
             Intent::ConfigModels => self.open_model_editor(),
             Intent::ConfigImport => self.open_native_import(),
             Intent::ConfigExport => self.open_native_export(),
+            Intent::ConfigDiscover => self.discover_local_agents(),
             // The Model editor's own keys, reaching here only when no overlay is
             // open to receive them.
             Intent::ConfigModelToggle
@@ -1621,6 +1622,16 @@ impl App {
                 };
                 let agent_id = agent.id.clone();
                 let subject = agent.label.clone();
+                // The grant is checked before the watch starts: a press this
+                // client cannot make is not one it should be waiting on.
+                if let Some(outcome) = self.unavailable_outcome(BackendOperation::ManagementAgents)
+                {
+                    return outcome;
+                }
+                // A managed install runs on the authority and answers nothing
+                // until it is done, so the client watches the record it will
+                // change rather than the request it sent.
+                self.watch_install(agent_id.clone(), subject.clone());
                 self.guard_record(
                     BackendOperation::ManagementAgents,
                     key,
@@ -1633,6 +1644,11 @@ impl App {
                 let Some(agent_id) = self.agent_id(key) else {
                     return Outcome::quiet();
                 };
+                if let Some(outcome) = self.unavailable_outcome(BackendOperation::ManagementAgents)
+                {
+                    return outcome;
+                }
+                self.watch_install(agent_id.clone(), self.config_row_subject(key));
                 self.begin_config_mutation(crate::app::ConfigMutation::RollbackAgent { agent_id })
             }
             (ConfigSection::Agents, ConfigAction::CheckUpdate) => {
@@ -1656,6 +1672,11 @@ impl App {
                     return Outcome::quiet();
                 };
                 let subject = self.config_row_subject(key);
+                if let Some(outcome) = self.unavailable_outcome(BackendOperation::ManagementAgents)
+                {
+                    return outcome;
+                }
+                self.watch_install(agent_id.clone(), subject.clone());
                 self.guard_record(
                     BackendOperation::ManagementAgents,
                     key,
@@ -2188,6 +2209,35 @@ impl App {
                 Outcome::quiet()
             }
         }
+    }
+
+    /// Start watching what the authority does with a managed install.
+    fn watch_install(&mut self, agent_id: vibex_core::AgentId, label: String) {
+        self.install_watch = Some(crate::config_center::InstallWatch::new(agent_id, label));
+    }
+
+    /// `Ctrl+F`: probe the machine for Agent CLIs that have not been added.
+    ///
+    /// The pass is about the Agents area as a whole rather than about a record,
+    /// so it is refused where it would do nothing — nothing left to probe — and
+    /// otherwise runs as one effect.
+    fn discover_local_agents(&mut self) -> Outcome {
+        use crate::config_center::ConfigSection;
+        if self.config_center.section != ConfigSection::Agents {
+            return Outcome::quiet();
+        }
+        if !self.management_data.agents.iter().any(|agent| !agent.added) {
+            self.toast(Toast::info(
+                self.strings.config_discover_no_candidates().to_string(),
+            ));
+            return Outcome::quiet();
+        }
+        self.begin_record_work(
+            "agents".to_string(),
+            self.strings.config_action_discover().to_string(),
+            crate::config_center::ConfigVerb::RefreshSnapshot,
+            vec![Effect::DiscoverLocalAgents],
+        )
     }
 
     /// `x`: write this profile into another tool's own settings.

@@ -1344,6 +1344,13 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::ConfigImport,
         |strings| Intent::ConfigImport.label(strings),
     ),
+    // `Ctrl+F` probes the machine for Agent CLIs that have not been added.
+    binding(
+        Scope::Management,
+        Chord::ctrl('f'),
+        Intent::ConfigDiscover,
+        |strings| Intent::ConfigDiscover.label(strings),
+    ),
     binding(
         Scope::Management,
         Chord::plain(KeyCode::Char('x')),

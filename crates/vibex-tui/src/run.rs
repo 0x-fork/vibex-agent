@@ -2719,6 +2719,16 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         },
         AppMessage::Agents(result) => match result {
             Ok(agents) => {
+                // What the authority is doing with an install the reader asked
+                // for is on the record, not on the request: the phase the card
+                // shows is read from here.
+                if let Some(watch) = app.install_watch.as_mut()
+                    && let Some(agent) = agents.iter().find(|agent| agent.id == watch.agent_id)
+                {
+                    watch.phase = Some(agent.managed_install.status);
+                    watch.error = agent.managed_install.last_error_message.clone();
+                    watch.version = agent.managed_install.available_version.clone();
+                }
                 app.management_data.agents = agents;
                 app.management_data.mark_read(
                     crate::config_center::ConfigModule::Agent,

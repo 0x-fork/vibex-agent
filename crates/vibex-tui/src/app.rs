@@ -1117,6 +1117,12 @@ pub struct App {
     /// the cursor's index, so an answer that arrives after a refresh still
     /// names the record the question was asked about.
     pub pending_config_action: Option<(String, crate::config_center::ConfigAction)>,
+    /// An Agent the reader asked the machine to install, while it works.
+    ///
+    /// A managed install runs on the authority and answers nothing until it is
+    /// done, so the client watches the record it will change rather than the
+    /// request it sent: the phases a reader sees are the authority's own.
+    pub install_watch: Option<crate::config_center::InstallWatch>,
     /// The form a discard question is holding, so answering "no" gives back
     /// what the reader typed rather than the empty form they started with.
     pub pending_form: Option<crate::config_center::ConfigForm>,
@@ -1975,6 +1981,7 @@ impl App {
             management_data: ManagementData::default(),
             pending_provider_open: None,
             pending_form: None,
+            install_watch: None,
             config_center: crate::config_center::ConfigCenter::default(),
             device_center: crate::device_center::DeviceCenter::default(),
             pending_config_action: None,
@@ -5537,6 +5544,36 @@ impl App {
             effects.extend(self.config_section_effects());
             dirty = true;
         }
+        // An install is watched rather than awaited: the authority answers the
+        // request with nothing and changes the record when it is done, so the
+        // client asks about the record until the authority stops working.
+        if let Some(watch) = self.install_watch.as_mut() {
+            let settled = watch.phase.is_some() && !watch.running();
+            if settled {
+                // Nothing left to watch: the answer is read once more so the
+                // row the reader is looking at shows what landed.
+                let label = watch.label.clone();
+                let failed = watch.phase == Some(vibex_core::AgentManagedInstallStatus::Failed);
+                let error = watch.error.clone();
+                self.install_watch = None;
+                if failed {
+                    self.toast(Toast::danger(match error {
+                        Some(message) => message,
+                        None => format!("{}: {label}", self.strings.config_install_failed()),
+                    }));
+                } else {
+                    self.toast(Toast::success(
+                        self.strings
+                            .config_install_done()
+                            .replace("{agent}", &label),
+                    ));
+                }
+                dirty = true;
+            } else if watch.poll() {
+                effects.push(Effect::ListAgents);
+                dirty = true;
+            }
+        }
         crate::reduce::Outcome {
             effects,
             dirty: dirty || moved || counting || poll,
@@ -9001,6 +9038,8 @@ pub enum MutationOutcome {
     },
     /// A model catalogue was read.
     Models { count: usize },
+    /// Local Agent CLIs were probed for, and this is what was found.
+    Discovered { found: usize },
     /// The Agent is signing in somewhere this client cannot follow.
     ///
     /// The runtime keeps the operation open and names where the reader has to
@@ -9334,6 +9373,13 @@ pub enum Effect {
     PreviewAgentAuthLogout {
         agent_id: vibex_core::AgentId,
     },
+    /// Probe this machine for the Agent CLIs that have not been added yet.
+    ///
+    /// It is one effect rather than a verb per candidate because the desktop's
+    /// discovery is one pass: add the candidate, probe the machine, enable what
+    /// answered. A client that stopped between the steps would leave an Agent
+    /// added but never probed.
+    DiscoverLocalAgents,
     /// Read one Agent's account: the methods it advertises, and the context it
     /// holds.
     LoadAgentAuthCatalog {
@@ -9458,6 +9504,7 @@ impl Effect {
             Effect::OpenUrl { .. } => "open_url",
             Effect::VerifyAgentAuth { .. } => "agent_auth_verify",
             Effect::RefreshAgentAuthModels { .. } => "agent_auth_models",
+            Effect::DiscoverLocalAgents => "agent_discovery",
             Effect::NativeExportHistory { .. } => "provider_native_export_history",
             Effect::OpenSession { .. } => "open_session",
             Effect::RefreshTimeline => "timeline",

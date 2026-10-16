@@ -3553,3 +3553,129 @@ fn a_half_written_form_is_not_discarded_without_asking() {
         "an untouched form asked about discarding"
     );
 }
+
+/// Finding the local Agent CLIs is one pass, and it says what it found.
+///
+/// The pass is about the Agents area as a whole rather than about a record, and
+/// it is refused where it would do nothing: a machine with nothing left to
+/// probe gets the reason rather than a request that would answer nothing.
+#[test]
+fn finding_local_agents_is_one_pass_over_what_is_not_added() {
+    let mut app = loaded(140, 40);
+    app.capabilities.management = vibex_backend::DomainCapabilities::available([
+        vibex_backend::BackendOperation::ManagementAgents,
+    ]);
+    let mut not_added = second_agent();
+    not_added.added = false;
+    app.management_data.agents = vec![agent(), not_added];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigDiscover);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::DiscoverLocalAgents] => {}
+        other => panic!("the probe asked nothing: {other:?}"),
+    }
+    assert!(
+        app.config_center.pending.contains_key("agents"),
+        "the area did not say it was working"
+    );
+
+    // Nothing left to probe: the reader is told rather than sent a request.
+    let mut added = agent();
+    added.added = true;
+    app.management_data.agents = vec![added];
+    app.config_center.pending.clear();
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigDiscover);
+    assert!(outcome.effects.is_empty(), "an empty pass was sent");
+    assert!(app.toast.is_some(), "the refusal gave no reason");
+
+    // And it belongs to the Agents area, not to the centre as a whole.
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Servers));
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigDiscover);
+    assert!(
+        outcome.effects.is_empty(),
+        "another area probed the machine"
+    );
+}
+
+/// An install is watched on the record, and the card says what it is doing.
+///
+/// A managed install runs on the authority and answers nothing until it is
+/// done, so the client asks about the record until the authority stops working
+/// — and the phases the reader sees are the authority's own rather than the
+/// client's guess at what a download looks like.
+#[test]
+fn an_install_is_watched_until_the_authority_stops_working() {
+    use vibex_core::AgentManagedInstallStatus;
+
+    let mut app = loaded(140, 40);
+    app.capabilities.management = vibex_backend::DomainCapabilities::available([
+        vibex_backend::BackendOperation::ManagementAgents,
+    ]);
+    let mut managed = agent();
+    managed.managed_install.status = AgentManagedInstallStatus::Installing;
+    managed.managed_install.available_version = Some("0.9.2".to_string());
+    app.management_data.agents = vec![managed];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+
+    // The press starts the watch.
+    app.run_config_action_by_key("codex", ConfigAction::Install);
+    let watch = app.install_watch.as_ref().expect("the watch did not start");
+    assert_eq!(watch.agent_id.as_str(), "codex");
+    assert_eq!(watch.label, "Codex");
+    assert!(
+        !watch.running(),
+        "a watch with no phase claims to be running"
+    );
+
+    // The record's own phase is what the card shows, and the version it named
+    // travels with it: an upgrade that says what it is moving to is a different
+    // wait from one that does not.
+    {
+        let watch = app.install_watch.as_mut().unwrap();
+        watch.phase = Some(AgentManagedInstallStatus::Installing);
+        watch.version = Some("0.9.2".to_string());
+    }
+    assert!(app.install_watch.as_ref().unwrap().running());
+    assert_eq!(
+        app.install_watch.as_ref().unwrap().phase_label(app.strings),
+        "Downloading"
+    );
+    let screen = text(&mut app, 140, 40);
+    assert!(
+        screen.contains("Working on Codex")
+            && screen.contains("Downloading")
+            && screen.contains("v0.9.2"),
+        "the card did not draw the work:\n{screen}"
+    );
+
+    // The authority stops working: the watch ends and says what landed.
+    app.install_watch.as_mut().unwrap().phase = Some(AgentManagedInstallStatus::Installed);
+    app.tick();
+    assert!(
+        app.install_watch.is_none(),
+        "the watch outlived the install"
+    );
+    assert!(
+        app.toast.is_some(),
+        "the end of the install was not reported"
+    );
+
+    // A failed install says what the authority said about it.
+    app.toast = None;
+    app.config_center.pending.clear();
+    app.run_config_action_by_key("codex", ConfigAction::Install);
+    {
+        let watch = app.install_watch.as_mut().unwrap();
+        watch.phase = Some(AgentManagedInstallStatus::Failed);
+        watch.error = Some("the download was refused".to_string());
+    }
+    app.tick();
+    assert!(app.install_watch.is_none());
+    assert!(
+        app.toast
+            .as_ref()
+            .is_some_and(|toast| format!("{toast:?}").contains("the download was refused")),
+        "the failure did not carry the authority's reason"
+    );
+}

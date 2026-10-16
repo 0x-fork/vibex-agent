@@ -252,6 +252,8 @@ pub enum ConfigAction {
     Duplicate,
     /// Open the page an Agent that is missing can be installed from.
     InstallDocs,
+    /// Probe this machine for Agent CLIs that have not been added yet.
+    Discover,
     /// Open the page a market card names for itself.
     OpenPage,
     /// Install a market entry that is already installed.
@@ -289,6 +291,7 @@ impl ConfigAction {
             Self::Import => strings.config_action_import(),
             Self::Duplicate => strings.config_action_duplicate(),
             Self::InstallDocs => strings.config_action_install_docs(),
+            Self::Discover => strings.config_action_discover(),
             Self::OpenPage => strings.config_action_open_page(),
             Self::Reinstall => strings.config_action_reinstall(),
             Self::MoveUp => strings.config_action_move_up(),
@@ -730,6 +733,14 @@ impl PendingWrite {
             Outcome::Models { count } => {
                 Some(format!("{count} {}", strings.config_result_models()))
             }
+            Outcome::Discovered { found } => Some(
+                if *found == 0 {
+                    strings.config_discover_none()
+                } else {
+                    strings.config_discover_found()
+                }
+                .replace("{count}", &found.to_string()),
+            ),
             Outcome::AuthWaiting { location, detail } => {
                 let template = match location {
                     vibex_core::AgentAuthExecutionLocation::HostTerminal => {
@@ -3728,6 +3739,77 @@ pub fn skill_preview_lines(
             .collect(),
         skipped: document.skipped_files.clone(),
         body: document.body.lines().map(ToString::to_string).collect(),
+    }
+}
+
+/// An Agent whose install the reader is watching, and the tick that watches it.
+///
+/// The desktop polls every 500ms; this client's tick is 200ms, so it asks every
+/// third one. The count is kept here rather than in the app so the clock stops
+/// when the watch does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallWatch {
+    pub agent_id: vibex_core::AgentId,
+    pub label: String,
+    /// What the authority last said it was doing.
+    pub phase: Option<vibex_core::AgentManagedInstallStatus>,
+    /// What the authority said when it gave up.
+    pub error: Option<String>,
+    /// The version the authority is moving to, when it named one. An upgrade
+    /// that says what it is upgrading to is a different wait from one that does
+    /// not.
+    pub version: Option<String>,
+    ticks: u8,
+}
+
+/// How many ticks between two questions about an install.
+pub const INSTALL_POLL_TICKS: u8 = 3;
+
+impl InstallWatch {
+    pub fn new(agent_id: vibex_core::AgentId, label: String) -> Self {
+        Self {
+            agent_id,
+            label,
+            phase: None,
+            error: None,
+            version: None,
+            ticks: 0,
+        }
+    }
+
+    /// Whether the authority is still working on this Agent.
+    pub fn running(&self) -> bool {
+        matches!(
+            self.phase,
+            Some(
+                vibex_core::AgentManagedInstallStatus::Installing
+                    | vibex_core::AgentManagedInstallStatus::Upgrading
+                    | vibex_core::AgentManagedInstallStatus::Uninstalling
+            )
+        )
+    }
+
+    /// What the phase is called on screen.
+    pub fn phase_label(&self, strings: Strings) -> &'static str {
+        match self.phase {
+            Some(vibex_core::AgentManagedInstallStatus::Upgrading) => {
+                strings.config_install_phase_upgrading()
+            }
+            Some(vibex_core::AgentManagedInstallStatus::Uninstalling) => {
+                strings.config_install_phase_uninstalling()
+            }
+            _ => strings.config_install_phase_installing(),
+        }
+    }
+
+    /// Count one tick towards asking again. Answers whether the question is due.
+    pub fn poll(&mut self) -> bool {
+        if self.ticks > 0 {
+            self.ticks -= 1;
+            return false;
+        }
+        self.ticks = INSTALL_POLL_TICKS;
+        true
     }
 }
 

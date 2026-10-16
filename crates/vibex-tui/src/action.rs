@@ -225,6 +225,7 @@ intents! {
     ConfigModels => { scope: Management, id: "config_models", label: label_config_models, help: help_config_models },
     ConfigImport => { scope: Management, id: "config_import", label: label_config_import, help: help_config_import },
     ConfigExport => { scope: Management, id: "config_export", label: label_config_export, help: help_config_export },
+    ConfigDiscover => { scope: Management, id: "config_discover", label: label_config_discover, help: help_config_discover },
     ConfigModelToggle => { scope: Overlay, id: "config_model_toggle", label: label_config_model_toggle, help: help_config_model_toggle },
     ConfigModelAdd => { scope: Overlay, id: "config_model_add", label: label_config_model_add, help: help_config_model_add },
     ConfigModelRemove => { scope: Overlay, id: "config_model_remove", label: label_config_model_remove, help: help_config_model_remove },
