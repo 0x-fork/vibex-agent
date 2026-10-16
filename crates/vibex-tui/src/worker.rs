@@ -181,6 +181,8 @@ pub enum AppMessage {
     ProviderOrder(BackendResult<Vec<vibex_core::AgentModelProviderDisplayOrderEntry>>),
     /// What other CLI tools on this machine hold.
     NativeImport(BackendResult<vibex_core::ProviderNativeImportPreview>),
+    /// One registry Skill, read in full.
+    SkillMarketDocument(BackendResult<Box<vibex_core::SkillMarketDocument>>),
     /// What one profile's export would write.
     NativeExport(BackendResult<Box<vibex_core::ProviderNativeExportPreview>>),
     /// What has been exported for one profile.
@@ -1003,19 +1005,27 @@ impl Dispatch {
                 owner_handle,
                 version,
                 agent_ids,
+                document,
             } => {
-                let document_request = vibex_core::SkillMarketDocumentRequest {
-                    entry_id: entry_id.clone(),
-                    slug,
-                    owner_handle,
-                    version,
+                // The document the reader read travels with the write. Only a
+                // client that could not read one asks the registry again, and
+                // then it is asking for exactly what it could not show.
+                let read = match document {
+                    Some(document) => Ok(*document),
+                    None => {
+                        let document_request = vibex_core::SkillMarketDocumentRequest {
+                            entry_id: entry_id.clone(),
+                            slug,
+                            owner_handle,
+                            version,
+                        };
+                        self.facade
+                            .management()
+                            .skill_market_document(document_request)
+                            .await
+                    }
                 };
-                match self
-                    .facade
-                    .management()
-                    .skill_market_document(document_request)
-                    .await
-                {
+                match read {
                     Ok(document) => {
                         let request = MutationRequest::new(vibex_core::SkillMarketInstallRequest {
                             entry_id,
@@ -1834,6 +1844,25 @@ impl Dispatch {
                 };
                 let result = self.facade.management().native_exports(request).await;
                 self.send(AppMessage::NativeExportHistory(result));
+            }
+            Effect::PreviewSkillMarket {
+                entry_id,
+                slug,
+                owner_handle,
+                version,
+            } => {
+                let request = vibex_core::SkillMarketDocumentRequest {
+                    entry_id,
+                    slug,
+                    owner_handle,
+                    version,
+                };
+                let result = self
+                    .facade
+                    .management()
+                    .skill_market_document(request)
+                    .await;
+                self.send(AppMessage::SkillMarketDocument(result.map(Box::new)));
             }
             Effect::PreviewNativeImport { sources } => {
                 let request = vibex_core::ProviderNativeImportPreviewRequest { sources };

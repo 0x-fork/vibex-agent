@@ -8627,6 +8627,124 @@ fn render_entry_actions(
     frame.render_widget(Paragraph::new(lines), layout.content);
 }
 
+/// One registry Skill, read before it is installed.
+///
+/// The preview draws what the install would write: the bundle, the files the
+/// registry refused to send, and the instructions themselves. A reader who
+/// cannot see the bundle is not in a position to agree to it.
+fn render_skill_preview(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    view: &crate::config_center::SkillPreviewView,
+    theme: &TuiTheme,
+) {
+    use crate::config_center as cc;
+    let strings = app.strings;
+    let title = format!("{} · {}", strings.config_preview_title(), view.title);
+    let chrome = modal_chrome(
+        app,
+        &title,
+        ModalSizing::new(72, 96, 44, 2, 2, 1, 1),
+        vec![
+            ModalHint::new("↑↓", strings.hint_nav()),
+            ModalHint::new("Enter", strings.config_action_install()),
+            ModalHint::new("Esc", strings.close()),
+        ],
+    );
+    let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
+        return;
+    };
+    let document = app.management_data.skill_preview.as_deref();
+    let lines = cc::skill_preview_lines(document, strings);
+    let mut drawn: Vec<Line<'static>> = Vec::new();
+    drawn.push(Line::from(Span::styled(
+        format!("  {}", strings.config_preview_hint()),
+        Style::default().fg(theme.roles.gray_dim),
+    )));
+    if let Some(banner) = &lines.banner {
+        drawn.push(Line::from(Span::styled(
+            format!("  {banner} "),
+            chip_style(cc::ConfigTone::Bad, theme).add_modifier(Modifier::BOLD),
+        )));
+    }
+    if lines.is_empty() && document.is_none() {
+        drawn.push(Line::from(Span::styled(
+            format!(
+                "  {}",
+                if view.loading {
+                    strings.config_preview_loading()
+                } else {
+                    strings.config_preview_empty()
+                }
+            ),
+            Style::default().fg(theme.roles.gray_dim),
+        )));
+    }
+    if let Some(bundle) = &lines.bundle {
+        drawn.push(Line::from(Span::styled(
+            format!("  {bundle}"),
+            Style::default().fg(theme.roles.text_secondary),
+        )));
+    }
+    if !lines.files.is_empty() || !lines.skipped.is_empty() {
+        drawn.push(Line::from(Span::styled(
+            format!("  {}", strings.config_preview_files()),
+            Style::default()
+                .fg(theme.roles.text_secondary)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    for file in &lines.files {
+        drawn.push(Line::from(vec![
+            Span::styled("    ", Style::default()),
+            Span::styled(
+                format!(" {:<10}", strings.config_state_available()),
+                chip_style(cc::ConfigTone::Ok, theme),
+            ),
+            Span::styled(file.clone(), Style::default().fg(theme.roles.foreground)),
+        ]));
+    }
+    for skipped in &lines.skipped {
+        drawn.push(Line::from(vec![
+            Span::styled("    ", Style::default()),
+            Span::styled(
+                format!(" {:<10}", strings.config_preview_skipped()),
+                chip_style(cc::ConfigTone::Warn, theme),
+            ),
+            Span::styled(
+                skipped.clone(),
+                Style::default().fg(theme.roles.gray_bright),
+            ),
+        ]));
+    }
+    if !lines.body.is_empty() {
+        drawn.push(Line::from(Span::styled(
+            format!("  {}", strings.config_preview_body()),
+            Style::default()
+                .fg(theme.roles.text_secondary)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for line in &lines.body {
+            drawn.push(Line::from(Span::styled(
+                format!("    {line}"),
+                Style::default().fg(theme.roles.foreground),
+            )));
+        }
+    }
+    // The window is the body of the modal; the reader scrolls the whole thing
+    // rather than the instructions alone, because the file list is what they
+    // are agreeing to first.
+    let window = usize::from(layout.content.height).saturating_sub(1);
+    let first = view.scroll.min(drawn.len().saturating_sub(1));
+    let visible = drawn
+        .into_iter()
+        .skip(first)
+        .take(window.max(1))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), layout.content);
+}
+
 /// One Agent's account: the ways in, and what can be done with what it holds.
 ///
 /// The status is the first line because it is the question the reader came
@@ -9385,6 +9503,7 @@ fn render_overlay(
         Overlay::Models { view } => render_models(frame, area, app, view, theme),
         Overlay::NativeImport { view } => render_native_import(frame, area, app, view, theme),
         Overlay::NativeExport { view } => render_native_export(frame, area, app, view, theme),
+        Overlay::SkillPreview { view } => render_skill_preview(frame, area, app, view, theme),
         Overlay::AgentAuth { view } => render_agent_auth(frame, area, app, view, theme),
         Overlay::Approval { selected } => render_approval(frame, area, app, *selected, theme),
         // The question card is not a box over the page: it is drawn in the

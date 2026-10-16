@@ -216,6 +216,10 @@ pub enum Overlay {
     NativeImport {
         view: crate::config_center::NativeImportView,
     },
+    /// One registry Skill, read before it is installed.
+    SkillPreview {
+        view: crate::config_center::SkillPreviewView,
+    },
     /// One profile, offered to another tool's own settings.
     NativeExport {
         view: Box<crate::config_center::NativeExportView>,
@@ -672,6 +676,12 @@ pub struct ManagementData {
     pub audit: Vec<vibex_core::RemoteAuditRecord>,
     pub profiles: Vec<vibex_core::ProviderProfileSummary>,
     pub providers: Vec<vibex_core::ProviderProfileSummary>,
+    /// The Skill document the reader is looking at, as the registry answered.
+    ///
+    /// It is kept because the install writes *this* document: a second read at
+    /// install time could return a different revision, and what lands would
+    /// then not be what the reader read.
+    pub skill_preview: Option<Box<vibex_core::SkillMarketDocument>>,
     /// What the last native-settings scan found.
     pub native_import: Option<vibex_core::ProviderNativeImportPreview>,
     /// The order the reader arranged the profiles in, per Agent.
@@ -8759,6 +8769,9 @@ pub enum ConfigMutation {
         owner_handle: Option<String>,
         version: Option<String>,
         agent_ids: Vec<vibex_core::AgentId>,
+        /// The document the reader read. `None` only when this client could not
+        /// read one, and the runtime is then asked for it as it was before.
+        document: Option<Box<vibex_core::SkillMarketDocument>>,
     },
     // ---- Prompts ---------------------------------------------------------
     CreatePrompt(Box<vibex_core::PromptCreateRequest>),
@@ -9290,6 +9303,13 @@ pub enum Effect {
     NativeExportHistory {
         profile_id: vibex_core::ProviderProfileId,
     },
+    /// Read one registry Skill in full, before it is installed.
+    PreviewSkillMarket {
+        entry_id: String,
+        slug: String,
+        owner_handle: Option<String>,
+        version: Option<String>,
+    },
     /// Read what other CLI tools on this machine hold, ready to import.
     PreviewNativeImport {
         sources: Vec<vibex_core::ProviderNativeImportSource>,
@@ -9370,6 +9390,7 @@ impl Effect {
             Effect::LoadProviderProfile { .. } => "provider_profile_detail",
             Effect::LoadProviderOrder { .. } => "provider_order",
             Effect::PreviewNativeImport { .. } => "provider_native_import",
+            Effect::PreviewSkillMarket { .. } => "skill_market_preview",
             Effect::PreviewNativeExport { .. } => "provider_native_export",
             Effect::LoadAgentAuthCatalog { .. } => "agent_auth_catalog",
             Effect::PreviewAgentAuthLogout { .. } => "agent_auth_logout_preview",

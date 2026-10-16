@@ -2574,6 +2574,27 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
+        AppMessage::SkillMarketDocument(result) => match result {
+            Ok(document) => {
+                let entry_id = document.entry_id.clone();
+                app.management_data.skill_preview = Some(document);
+                if let Some(Overlay::SkillPreview { view }) = app.overlay.as_mut() {
+                    view.loading = false;
+                    view.scroll = 0;
+                    view.notice = None;
+                    // The answer names the entry it belongs to: a preview that
+                    // arrived after the reader moved on is not theirs to read.
+                    view.entry_id = entry_id;
+                }
+            }
+            Err(error) => {
+                app.toast(Toast::danger(error.message.clone()));
+                if let Some(Overlay::SkillPreview { view }) = app.overlay.as_mut() {
+                    view.loading = false;
+                    view.notice = Some((error.message, crate::config_center::ConfigTone::Bad));
+                }
+            }
+        },
         AppMessage::NativeImport(result) => match result {
             Ok(preview) => {
                 app.management_data.native_import = Some(preview);

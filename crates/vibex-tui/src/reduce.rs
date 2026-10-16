@@ -2750,15 +2750,91 @@ impl App {
         else {
             return Outcome::quiet();
         };
-        // A Skill is stored once and enabled per Agent, so the install asks who
-        // receives it before it writes anything.
-        let form = crate::config_center::skill_market_install_form(
-            &entry,
-            &self.management_data.agents,
+        // A published Skill is a folder with instructions in it, so the
+        // install shows what would be written before it asks who receives it:
+        // a reader who has not seen the bundle is not in a position to agree
+        // to it.
+        self.overlay = Some(Overlay::SkillPreview {
+            view: crate::config_center::SkillPreviewView {
+                entry_id: entry.id.clone(),
+                title: entry.name.clone(),
+                scroll: 0,
+                loading: true,
+                notice: None,
+            },
+        });
+        Outcome::effects(vec![Effect::PreviewSkillMarket {
+            entry_id: entry.id.clone(),
+            slug: entry.slug.clone(),
+            owner_handle: entry.owner_handle.clone(),
+            version: entry.version.clone(),
+        }])
+    }
+
+    /// The keys of a Skill preview.
+    fn perform_skill_preview(
+        &mut self,
+        intent: Intent,
+        mut view: crate::config_center::SkillPreviewView,
+    ) -> Outcome {
+        let lines = crate::config_center::skill_preview_lines(
+            self.management_data.skill_preview.as_deref(),
             self.strings,
         );
-        self.overlay = Some(Overlay::Form { form });
-        Outcome::effects(vec![])
+        let last = lines.len().saturating_sub(1);
+        match intent {
+            Intent::SelectNext | Intent::ScrollPageDown => {
+                view.scroll = (view.scroll + 1).min(last);
+                self.overlay = Some(Overlay::SkillPreview { view });
+                Outcome::effects(vec![])
+            }
+            Intent::SelectPrevious | Intent::ScrollPageUp => {
+                view.scroll = view.scroll.saturating_sub(1);
+                self.overlay = Some(Overlay::SkillPreview { view });
+                Outcome::effects(vec![])
+            }
+            Intent::ConfirmOverlay => {
+                // A document the runtime would refuse to write is refused here,
+                // with the size that makes it too large, rather than after the
+                // reader has answered the rest of the questions.
+                if let Some(document) = self.management_data.skill_preview.as_deref()
+                    && document.too_large
+                {
+                    self.toast(Toast::warning(
+                        self.strings
+                            .config_preview_too_large()
+                            .replace("{bytes}", &document.bytes.to_string()),
+                    ));
+                    return Outcome::quiet();
+                }
+                let Some(entry) = self
+                    .management_data
+                    .skill_market
+                    .iter()
+                    .find(|entry| entry.id == view.entry_id)
+                    .cloned()
+                else {
+                    return Outcome::quiet();
+                };
+                // A Skill is stored once and enabled per Agent, so the install
+                // asks who receives it before it writes anything.
+                let form = crate::config_center::skill_market_install_form(
+                    &entry,
+                    &self.management_data.agents,
+                    self.strings,
+                );
+                self.overlay = Some(Overlay::Form { form });
+                Outcome::effects(vec![])
+            }
+            Intent::CloseOverlay | Intent::Back => {
+                self.overlay = None;
+                Outcome::effects(vec![])
+            }
+            _ => {
+                self.overlay = Some(Overlay::SkillPreview { view });
+                Outcome::quiet()
+            }
+        }
     }
 
     /// Check one registry entry's launcher before it is installed.
@@ -3581,12 +3657,21 @@ impl App {
                     // find afterwards, so the authority would refuse it anyway.
                     return Err("no-agent");
                 }
+                // Only the document for *this* entry travels: a preview left
+                // over from another Skill would install the wrong bundle.
+                let document = self
+                    .management_data
+                    .skill_preview
+                    .as_ref()
+                    .filter(|document| document.entry_id == *entry_id)
+                    .cloned();
                 Ok(ConfigMutation::InstallSkillMarketEntry {
                     entry_id: entry_id.clone(),
                     slug: slug.clone(),
                     owner_handle: owner_handle.clone(),
                     version: version.clone(),
                     agent_ids,
+                    document,
                 })
             }
             // Reached only through the sign-in hook above, which handles this
@@ -4268,6 +4353,7 @@ impl App {
             Overlay::Models { view } => self.perform_models(intent, view),
             Overlay::NativeImport { view } => self.perform_native_import(intent, view),
             Overlay::NativeExport { view } => self.perform_native_export(intent, *view),
+            Overlay::SkillPreview { view } => self.perform_skill_preview(intent, view),
             Overlay::AgentAuth { view } => self.perform_agent_auth(intent, view),
             Overlay::Approval { selected } => match intent {
                 Intent::ApprovalApprove

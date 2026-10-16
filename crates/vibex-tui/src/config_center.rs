@@ -1351,6 +1351,15 @@ fn managed_line(agent: &vibex_core::AgentSnapshotEntry, strings: Strings) -> Str
 pub fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
     data.agents
         .iter()
+        // The desktop hides the integrations Vibex is not ready to expose, and
+        // the two clients read the same roster: an Agent the desktop will not
+        // show is one the reader cannot meet in the TUI either. A Custom Agent
+        // is the reader's own and stays visible whatever its id, which is the
+        // same rule the desktop applies.
+        .filter(|agent| {
+            agent.source_kind == vibex_core::AgentSourceKind::Custom
+                || vibex_core::is_user_visible_agent(&agent.id)
+        })
         .map(|agent| {
             let install = match agent.install_status {
                 vibex_core::AgentInstallStatus::Installed => strings.config_state_installed(),
@@ -3607,6 +3616,74 @@ pub enum AgentAuthAction {
     Credentials {
         url: String,
     },
+}
+
+/// One registry Skill as the preview draws it: the manifest's own words, the
+/// bundle beside it, and what the registry refused to send.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SkillPreviewLines {
+    /// The banner, when the document is one the runtime would refuse to write.
+    pub banner: Option<String>,
+    /// The bundle's own summary: how many files and how many bytes.
+    pub bundle: Option<String>,
+    /// Each bundled file, in write order.
+    pub files: Vec<String>,
+    /// Files the bundle carried that will not be written, with the reason.
+    pub skipped: Vec<String>,
+    /// The instructions, one line each.
+    pub body: Vec<String>,
+}
+
+impl SkillPreviewLines {
+    /// Everything the reader scrolls through, in the order it is drawn.
+    pub fn len(&self) -> usize {
+        self.files.len() + self.skipped.len() + self.body.len() + 4
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() <= 4
+    }
+}
+
+pub fn skill_preview_lines(
+    document: Option<&vibex_core::SkillMarketDocument>,
+    strings: Strings,
+) -> SkillPreviewLines {
+    let Some(document) = document else {
+        return SkillPreviewLines::default();
+    };
+    SkillPreviewLines {
+        banner: document.too_large.then(|| {
+            strings
+                .config_preview_too_large()
+                .replace("{bytes}", &document.bytes.to_string())
+        }),
+        bundle: Some(
+            strings
+                .config_preview_bundle()
+                .replace("{files}", &document.files.len().to_string())
+                .replace("{bytes}", &document.bundle_bytes.to_string()),
+        ),
+        files: document
+            .files
+            .iter()
+            .map(|file| format!("{} · {} bytes", file.path, file.bytes))
+            .collect(),
+        skipped: document.skipped_files.clone(),
+        body: document.body.lines().map(ToString::to_string).collect(),
+    }
+}
+
+/// Which registry Skill the preview is on, and how far down it has been read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillPreviewView {
+    pub entry_id: String,
+    pub title: String,
+    /// Index of the first line drawn, so the body scrolls rather than stopping
+    /// at the height of the window.
+    pub scroll: usize,
+    pub loading: bool,
+    pub notice: Option<(String, ConfigTone)>,
 }
 
 /// The form a Skill install asks for.

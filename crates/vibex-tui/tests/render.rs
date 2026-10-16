@@ -11882,3 +11882,75 @@ fn the_key_bar_is_localized() {
         );
     }
 }
+
+/// A Skill is read on screen before it is installed.
+///
+/// The preview is the reader's only look at what the install would write, so
+/// the frame has to carry the bundle, the files the registry refused to send,
+/// and the size that makes an oversized document uninstallable.
+#[test]
+fn the_skill_preview_draws_what_would_be_written() {
+    use vibex_tui::app::{Overlay, Page};
+
+    let mut app = capable_app(140, 44);
+    let document: vibex_core::SkillMarketDocument = serde_json::from_value(serde_json::json!({
+        "entryId": "entry_reader",
+        "name": "Trace reader",
+        "body": "# Trace reader\nRead a trace.",
+        "bytes": 30,
+        "tooLarge": false,
+        "files": [{"path": "reference/trace.md", "content": "notes", "bytes": 5}],
+        "bundleBytes": 39,
+        "skippedFiles": ["binary/trace.png: not a text file"]
+    }))
+    .expect("skill document fixture");
+    app.management_data.skill_preview = Some(Box::new(document));
+    app.overlay = Some(Overlay::SkillPreview {
+        view: vibex_tui::config_center::SkillPreviewView {
+            entry_id: "entry_reader".to_string(),
+            title: "Trace reader".to_string(),
+            scroll: 0,
+            loading: false,
+            notice: None,
+        },
+    });
+    app.page = Page::Management;
+
+    let screen = text(&render(&mut app, 140, 44));
+    assert!(screen.contains("Skill preview"), "{screen}");
+    assert!(
+        screen.contains("reference/trace.md"),
+        "the bundle was not drawn:\n{screen}"
+    );
+    assert!(
+        screen.contains("not a text file"),
+        "a file that will not be written was not disclosed:\n{screen}"
+    );
+    assert!(
+        screen.contains("Read a trace"),
+        "the instructions were not drawn:\n{screen}"
+    );
+
+    // An oversized document says so where the reader is looking.
+    if let Some(Overlay::SkillPreview { .. }) = app.overlay {
+        let mut too_large: vibex_core::SkillMarketDocument =
+            serde_json::from_value(serde_json::json!({
+                "entryId": "entry_reader",
+                "name": "Trace reader",
+                "body": "x",
+                "bytes": 4_194_304,
+                "tooLarge": true,
+                "files": [],
+                "bundleBytes": 0,
+                "skippedFiles": []
+            }))
+            .expect("skill document fixture");
+        too_large.too_large = true;
+        app.management_data.skill_preview = Some(Box::new(too_large));
+    }
+    let screen = text(&render(&mut app, 140, 44));
+    assert!(
+        screen.contains("4194304"),
+        "the preview did not say how large it was:\n{screen}"
+    );
+}

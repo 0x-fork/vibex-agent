@@ -2978,7 +2978,23 @@ fn installing_a_skill_asks_which_agents_receive_it() {
     app.management_data.skill_market = vec![skill_market_entry("entry_reader")];
     app.show_config_module(ConfigModule::Skills, Some(ConfigSection::Catalog));
 
+    // The install reads the Skill before it asks anything: a reader who has not
+    // seen the bundle is not in a position to agree to it.
     let outcome = app.run_config_action_by_key("entry_reader", ConfigAction::Install);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::PreviewSkillMarket { entry_id, .. }] => {
+            assert_eq!(entry_id, "entry_reader")
+        }
+        other => panic!("the install did not read the Skill first: {other:?}"),
+    }
+    assert!(
+        matches!(app.overlay, Some(Overlay::SkillPreview { .. })),
+        "the preview did not open"
+    );
+
+    // What the registry answered is what the install would write.
+    app.management_data.skill_preview = Some(Box::new(skill_document("entry_reader")));
+    let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
     assert!(
         outcome.effects.is_empty(),
         "the install ran without asking who receives it: {:#?}",
@@ -3025,6 +3041,7 @@ fn installing_a_skill_asks_which_agents_receive_it() {
             let vibex_tui::app::ConfigMutation::InstallSkillMarketEntry {
                 entry_id,
                 agent_ids,
+                document,
                 ..
             } = mutation
             else {
@@ -3034,6 +3051,14 @@ fn installing_a_skill_asks_which_agents_receive_it() {
             assert_eq!(
                 agent_ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
                 vec!["codex"]
+            );
+            // The bytes the reader read travel with the write: a second read
+            // could return another revision, and what landed would then not be
+            // what was previewed.
+            assert_eq!(
+                document.as_deref().map(|document| document.body.as_str()),
+                Some("# Trace reader\nRead a trace."),
+                "the previewed document was not the one written"
             );
         }
         other => panic!("the install produced {other:?}"),
@@ -3063,4 +3088,124 @@ fn a_provider_form_carries_its_headers_as_json() {
         serde_json::json!({"variable": "session_id"}),
         "a variable came back as a literal: {preview}"
     );
+}
+
+/// One registry Skill's document, as the authority answers it.
+fn skill_document(entry_id: &str) -> vibex_core::SkillMarketDocument {
+    serde_json::from_value(serde_json::json!({
+        "entryId": entry_id,
+        "name": "Trace reader",
+        "description": "Read a trace",
+        "body": "# Trace reader\nRead a trace.",
+        "bytes": 30,
+        "tooLarge": false,
+        "files": [
+            {"path": "reference/trace.md", "content": "notes", "bytes": 5},
+            {"path": "scripts/trace.sh", "content": "echo", "bytes": 4}
+        ],
+        "bundleBytes": 39,
+        "skippedFiles": ["binary/trace.png: not a text file"]
+    }))
+    .expect("skill document fixture")
+}
+
+/// A Skill is read before it is installed, and what was read is what is written.
+///
+/// A published Skill is a folder, not one file: the preview shows the bundle,
+/// the files the registry refused to send, and the instructions themselves —
+/// and the document the reader read is the document the install writes, so a
+/// revision published in between cannot land unnoticed.
+#[test]
+fn a_skill_is_previewed_before_it_is_installed() {
+    let mut app = loaded(140, 40);
+    app.management_data.agents = vec![agent()];
+    app.management_data.skill_market = vec![skill_market_entry("entry_reader")];
+    app.show_config_module(ConfigModule::Skills, Some(ConfigSection::Catalog));
+
+    let outcome = app.run_config_action_by_key("entry_reader", ConfigAction::Install);
+    match outcome.effects.as_slice() {
+        [
+            vibex_tui::app::Effect::PreviewSkillMarket {
+                entry_id,
+                slug,
+                version,
+                ..
+            },
+        ] => {
+            assert_eq!(entry_id, "entry_reader");
+            assert_eq!(slug, "entry_reader");
+            assert_eq!(version.as_deref(), Some("1.0.0"));
+        }
+        other => panic!("the preview asked for nothing: {other:?}"),
+    }
+
+    app.management_data.skill_preview = Some(Box::new(skill_document("entry_reader")));
+    let lines = vibex_tui::config_center::skill_preview_lines(
+        app.management_data.skill_preview.as_deref(),
+        app.strings,
+    );
+    assert_eq!(
+        lines.files,
+        vec![
+            "reference/trace.md · 5 bytes".to_string(),
+            "scripts/trace.sh · 4 bytes".to_string()
+        ],
+        "the bundle was not listed with its sizes"
+    );
+    assert_eq!(
+        lines.skipped,
+        vec!["binary/trace.png: not a text file".to_string()],
+        "a file that will not be written was not disclosed"
+    );
+    assert!(
+        lines
+            .bundle
+            .as_deref()
+            .is_some_and(|bundle| bundle.contains('2')),
+        "the bundle summary did not count the files: {:?}",
+        lines.bundle
+    );
+    assert!(lines.banner.is_none(), "a writable document warned");
+    assert!(lines.body.iter().any(|line| line.contains("Read a trace")));
+}
+
+/// A document too large to install is refused where it is read.
+///
+/// The runtime would reject it after the reader had answered everything else,
+/// so the preview says so and the install does not open.
+#[test]
+fn a_skill_too_large_to_install_is_refused_at_the_preview() {
+    let mut app = loaded(140, 40);
+    app.management_data.agents = vec![agent()];
+    app.management_data.skill_market = vec![skill_market_entry("entry_reader")];
+    app.show_config_module(ConfigModule::Skills, Some(ConfigSection::Catalog));
+    app.run_config_action_by_key("entry_reader", ConfigAction::Install);
+
+    let mut document = skill_document("entry_reader");
+    document.too_large = true;
+    document.bytes = 4_194_304;
+    app.management_data.skill_preview = Some(Box::new(document));
+    let lines = vibex_tui::config_center::skill_preview_lines(
+        app.management_data.skill_preview.as_deref(),
+        app.strings,
+    );
+    assert!(
+        lines
+            .banner
+            .as_deref()
+            .is_some_and(|banner| banner.contains("4194304")),
+        "the preview did not say how large it was: {:?}",
+        lines.banner
+    );
+
+    let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    assert!(
+        outcome.effects.is_empty(),
+        "an oversized Skill was installed"
+    );
+    assert!(
+        matches!(app.overlay, Some(Overlay::SkillPreview { .. })),
+        "the preview closed on a refusal"
+    );
+    assert!(app.toast.is_some(), "the refusal gave no reason");
 }
