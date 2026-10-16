@@ -4288,3 +4288,55 @@ fn a_failed_read_is_a_state_the_area_is_in() {
         "the failure outlived the answer that replaced it:\n{screen}"
     );
 }
+
+/// A switch answers the press before the authority does.
+///
+/// It is the one record write whose intent cannot be misread: the reader is
+/// looking at a row that says "off" and asking for "on". Nothing here survives
+/// a refusal — the write re-reads the area it touched — so a switch the
+/// authority declined is drawn back the way it was.
+#[test]
+fn a_switch_answers_the_press_before_the_authority_does() {
+    let mut app = loaded(140, 40);
+    app.management_data.agents = vec![agent()];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+
+    // The row says on, and the press turns it off on the spot.
+    let before = vibex_tui::config_center::agent_rows(&app.management_data, app.strings);
+    assert_eq!(before[0].chip, "Enabled");
+    app.run_config_action_by_key("codex", ConfigAction::Toggle);
+    let after = vibex_tui::config_center::agent_rows(&app.management_data, app.strings);
+    assert_eq!(
+        after[0].chip, "Disabled",
+        "the row waited for the authority"
+    );
+    assert!(
+        app.config_center.pending.contains_key("codex"),
+        "the write was not filed"
+    );
+
+    // A record the reader did not switch is not touched: the flip is about the
+    // row the press was on.
+    let mut other = second_agent();
+    other.id = vibex_core::AgentId::parse("gemini".to_string()).expect("agent id");
+    other.label = "Gemini".to_string();
+    app.management_data.agents.push(other);
+    app.config_center.pending.clear();
+    app.run_config_action_by_key("codex", ConfigAction::Toggle);
+    let rows = vibex_tui::config_center::agent_rows(&app.management_data, app.strings);
+    let gemini = rows
+        .iter()
+        .find(|row| row.key == "gemini")
+        .expect("the other Agent");
+    assert_eq!(gemini.chip, "Enabled", "another row moved with the press");
+
+    // The panels are switches too, and they answer the same way.
+    app.config_center.pending.clear();
+    app.run_config_action_by_key("codex", ConfigAction::BrowserTools);
+    assert!(
+        !app.management_data
+            .agent_tools
+            .enabled("codex", vibex_core::AgentBuiltinTool::Browser),
+        "the panel waited for the authority"
+    );
+}

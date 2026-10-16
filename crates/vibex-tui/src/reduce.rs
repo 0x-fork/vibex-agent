@@ -1635,11 +1635,22 @@ impl App {
                 else {
                     return Outcome::quiet();
                 };
-                let request = crate::app::ConfigMutation::ToggleAgent {
-                    agent_id: agent.id.clone(),
-                    enabled: !agent.enabled,
-                };
-                self.begin_config_mutation(request)
+                // The row answers the press before the authority does; the
+                // write re-reads the area, so a refusal is drawn back.
+                let agent_id = agent.id.clone();
+                let enabled = !agent.enabled;
+                if let Some(agent) = self
+                    .management_data
+                    .agents
+                    .iter_mut()
+                    .find(|candidate| candidate.id.as_str() == key)
+                {
+                    agent.enabled = enabled;
+                }
+                self.begin_config_mutation(crate::app::ConfigMutation::ToggleAgent {
+                    agent_id,
+                    enabled,
+                })
             }
             // An upgrade is the same call as an install: what differs is the
             // verb the reader pressed and the version the authority moves to.
@@ -1743,6 +1754,11 @@ impl App {
                     .management_data
                     .agent_tools
                     .enabled(key, vibex_core::AgentBuiltinTool::Browser);
+                self.management_data.agent_tools.set_enabled(
+                    key,
+                    vibex_core::AgentBuiltinTool::Browser,
+                    !enabled,
+                );
                 self.begin_config_mutation(crate::app::ConfigMutation::SetAgentTool {
                     agent_id,
                     tool: vibex_core::AgentBuiltinTool::Browser,
@@ -1757,6 +1773,11 @@ impl App {
                     .management_data
                     .agent_tools
                     .enabled(key, vibex_core::AgentBuiltinTool::Computer);
+                self.management_data.agent_tools.set_enabled(
+                    key,
+                    vibex_core::AgentBuiltinTool::Computer,
+                    !enabled,
+                );
                 self.begin_config_mutation(crate::app::ConfigMutation::SetAgentTool {
                     agent_id,
                     tool: vibex_core::AgentBuiltinTool::Computer,
@@ -4282,6 +4303,12 @@ impl App {
         } else {
             crate::config_center::ConfigVerb::Disable
         };
+        // A switch is the one record write whose intent cannot be misread: the
+        // reader is looking at a row that says "off" and asking for "on", and
+        // the row answering immediately is the difference between a switch and
+        // a request. Everything else waits for the authority, because a record
+        // patched from a form would be this client's guess at what it wrote.
+        self.flip_toggled_record(key, enabled);
         let subject = self.config_row_subject(key);
         self.begin_record_work(key.to_string(), subject, verb, vec![effect])
     }
@@ -4290,6 +4317,59 @@ impl App {
         match self.unavailable_outcome(operation) {
             Some(outcome) => outcome,
             None => Outcome::effects(vec![effect]),
+        }
+    }
+
+    /// Move the record a switch is about, before the authority answers.
+    ///
+    /// Nothing here survives a refusal: the write re-reads the area it touched,
+    /// so a switch the authority declined is drawn back the way it was.
+    fn flip_toggled_record(&mut self, key: &str, enabled: bool) {
+        use crate::config_center::ConfigSection;
+        match self.config_center.section {
+            ConfigSection::Servers => {
+                if let Some(server) = self
+                    .management_data
+                    .mcp
+                    .iter_mut()
+                    .find(|server| server.id.as_str() == key)
+                {
+                    server.status = if enabled {
+                        vibex_core::McpServerStatus::Enabled
+                    } else {
+                        vibex_core::McpServerStatus::Disabled
+                    };
+                }
+            }
+            ConfigSection::Installed => {
+                if let Some(skill) = self
+                    .management_data
+                    .skills
+                    .iter_mut()
+                    .find(|skill| skill.id.as_str() == key)
+                {
+                    skill.status = if enabled {
+                        vibex_core::SkillStatus::Enabled
+                    } else {
+                        vibex_core::SkillStatus::Disabled
+                    };
+                }
+            }
+            ConfigSection::Prompts => {
+                if let Some(prompt) = self
+                    .management_data
+                    .prompts
+                    .iter_mut()
+                    .find(|prompt| prompt.id.as_str() == key)
+                {
+                    prompt.status = if enabled {
+                        vibex_core::PromptStatus::Enabled
+                    } else {
+                        vibex_core::PromptStatus::Disabled
+                    };
+                }
+            }
+            _ => {}
         }
     }
 
